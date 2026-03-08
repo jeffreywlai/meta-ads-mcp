@@ -49,6 +49,12 @@ def test_search_behaviors_uses_behavior_class(monkeypatch) -> None:
     assert result["items"][0]["class"] == "behaviors"
 
 
+def test_get_targeting_categories_uses_given_class(monkeypatch) -> None:
+    monkeypatch.setattr(targeting, "get_graph_api_client", lambda: FakeTargetingClient())
+    result = asyncio.run(targeting.get_targeting_categories(category_class="life_events", query="new"))
+    assert result["items"][0]["class"] == "life_events"
+
+
 def test_get_interest_suggestions_rejects_empty_interest_list() -> None:
     with pytest.raises(targeting.ValidationError):
         asyncio.run(targeting.get_interest_suggestions(interest_list=[]))

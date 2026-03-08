@@ -86,6 +86,24 @@ async def search_behaviors(
 
 
 @mcp_server.tool()
+async def get_targeting_categories(
+    category_class: str,
+    query: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Search generic targeting categories by class."""
+    if not category_class:
+        raise ValidationError("category_class is required.")
+    client = get_graph_api_client()
+    payload = await client.search_targeting_categories(
+        category_class=category_class,
+        query=query,
+        limit=limit,
+    )
+    return normalize_collection(payload)
+
+
+@mcp_server.tool()
 async def search_demographics(
     demographic_class: str = "demographics",
     query: str | None = None,

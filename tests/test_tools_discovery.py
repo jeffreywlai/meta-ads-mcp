@@ -27,6 +27,9 @@ class FakeDiscoveryClient:
             return {"data": []}
         if edge == "client_pages":
             return {"data": [{"id": "page_1", "name": "Test Page"}]}
+        if edge == "instagram_accounts":
+            assert parent_id == "act_123"
+            return {"data": [{"id": "ig_1", "username": "test_brand"}]}
         raise AssertionError(f"Unexpected edge {edge}")
 
 
@@ -43,3 +46,11 @@ def test_get_account_pages_falls_back_to_client_pages(monkeypatch) -> None:
     assert result["summary"]["count"] == 1
     assert result["summary"]["source"] == "client_pages"
     assert result["summary"]["source_attempts"] == ["assigned_pages", "client_pages"]
+
+
+def test_list_instagram_accounts_uses_ad_account_scope(monkeypatch) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+    result = asyncio.run(discovery.list_instagram_accounts(account_id="123"))
+    assert result["summary"]["count"] == 1
+    assert result["summary"]["source"] == "instagram_accounts"
+    assert result["items"][0]["username"] == "test_brand"

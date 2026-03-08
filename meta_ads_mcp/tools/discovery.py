@@ -69,6 +69,14 @@ PAGE_FIELDS = [
     "instagram_business_account",
 ]
 
+INSTAGRAM_ACCOUNT_FIELDS = [
+    "id",
+    "name",
+    "username",
+    "profile_pic",
+    "ig_id",
+]
+
 
 def _resolve_account_id(account_id: str | None) -> str:
     """Resolve an ad account id, using the default when omitted."""
@@ -269,3 +277,24 @@ async def get_account_pages(
         [],
         summary={"count": 0, "source": None, "source_attempts": attempted_edges},
     )
+
+
+@mcp_server.tool()
+async def list_instagram_accounts(
+    account_id: str | None = None,
+    limit: int = 50,
+    after: str | None = None,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """List Instagram accounts linked to an ad account for creative setup flows."""
+    client = get_graph_api_client()
+    params = _page_params(limit, after)
+    payload = await client.list_objects(
+        _resolve_account_id(account_id),
+        "instagram_accounts",
+        fields=fields or INSTAGRAM_ACCOUNT_FIELDS,
+        params=params,
+    )
+    normalized = normalize_collection(payload)
+    normalized["summary"].update({"source": "instagram_accounts"})
+    return normalized

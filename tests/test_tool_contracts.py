@@ -67,9 +67,11 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "create_custom_audience": {"customer_file_source": "USER_PROVIDED_ONLY"},
     "create_lookalike_audience": {"country": "US", "ratio": 0.02},
     "list_campaigns": {"account_id": "123"},
+    "list_instagram_accounts": {"account_id": "123"},
     "list_adsets": {"account_id": "123"},
     "list_ads": {"account_id": "123"},
     "get_interest_suggestions": {"interest_list": ["running"]},
+    "get_targeting_categories": {"category_class": "life_events"},
     "validate_interests": {"interest_list": ["running"]},
     "preview_ad": {"ad_id": "ad_123"},
     "upload_creative_asset": {"image_url": "https://example.com/image.png"},
@@ -128,6 +130,16 @@ class UniversalFakeClient:
                         "objective": "OUTCOME_SALES",
                         "daily_budget": "5000",
                         "currency": "USD",
+                    }
+                ]
+            }
+        if edge == "instagram_accounts":
+            return {
+                "data": [
+                    {
+                        "id": "ig_123",
+                        "username": "test_brand",
+                        "name": "Test Brand",
                     }
                 ]
             }
@@ -640,6 +652,7 @@ def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) 
         (execution.update_campaign_budget, {"campaign_id": "cmp_123"}),
         (execution.set_campaign_status, {"campaign_id": "cmp_123", "status": "DELETED"}),
         (targeting.get_interest_suggestions, {"interest_list": []}),
+        (targeting.get_targeting_categories, {"category_class": ""}),
         (targeting.validate_interests, {}),
         (research.search_ads_archive, {"search_terms": "shirts", "ad_reached_countries": []}),
     ],
