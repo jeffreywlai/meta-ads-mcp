@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import csv
 from datetime import date
+from io import StringIO
 import json
 from typing import Any
 
@@ -33,6 +36,20 @@ DEFAULT_INSIGHTS_FIELDS = [
     "actions",
     "action_values",
 ]
+
+DEFAULT_COMPARE_METRICS = [
+    "spend",
+    "impressions",
+    "clicks",
+    "ctr",
+    "cpc",
+    "cpm",
+    "conversions",
+    "cpa",
+    "roas",
+]
+
+LOWER_IS_BETTER_METRICS = {"cpc", "cpm", "cpa", "cpp", "cost_per_result", "spend"}
 
 
 def _build_date_params(
@@ -92,6 +109,110 @@ def _normalize_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         normalized["metrics"] = derive_core_metrics(normalized)
         rows.append(normalized)
     return rows
+
+
+def _serialize_cell(value: Any) -> str:
+    """Convert nested row values into a CSV-safe string."""
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def _rows_to_csv(rows: list[dict[str, Any]]) -> str:
+    """Render normalized insights rows to CSV."""
+    if not rows:
+        return ""
+
+    fieldnames = sorted({key for row in rows for key in row})
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: _serialize_cell(row.get(key)) for key in fieldnames})
+    return output.getvalue()
+
+
+async def _object_name(object_id: str) -> str | None:
+    """Best-effort name lookup for comparison output."""
+    client = get_graph_api_client()
+    try:
+        payload = await client.get_object(object_id, fields=["name"])
+    except Exception:
+        return None
+    name = payload.get("name")
+    return str(name) if name is not None else None
+
+
+async def _comparison_row(
+    *,
+    level: str,
+    object_id: str,
+    date_preset: str | None,
+    since: str | None,
+    until: str | None,
+    fields: list[str] | None,
+    breakdowns: list[str] | None,
+    action_breakdowns: list[str] | None,
+    time_increment: int | str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Fetch one object's insights summary for compare_performance."""
+    try:
+        payload = await get_entity_insights(
+            level=level,
+            object_id=object_id,
+            date_preset=date_preset,
+            since=since,
+            until=until,
+            fields=fields,
+            breakdowns=breakdowns,
+            action_breakdowns=action_breakdowns,
+            time_increment=time_increment,
+            limit=limit,
+        )
+        return {
+            "object_id": object_id,
+            "object_name": await _object_name(object_id) or object_id,
+            "metrics": payload["summary"]["metrics"],
+            "record_count": payload["summary"]["count"],
+        }
+    except Exception as exc:
+        return {
+            "object_id": object_id,
+            "object_name": object_id,
+            "error": str(exc),
+        }
+
+
+def _rank_comparisons(
+    comparisons: list[dict[str, Any]],
+    metrics: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Rank successful comparisons by metric."""
+    rankings: dict[str, list[dict[str, Any]]] = {}
+    successful = [item for item in comparisons if "metrics" in item]
+    for metric in metrics:
+        ranked = []
+        for item in successful:
+            value = item["metrics"].get(metric)
+            if value is None:
+                continue
+            ranked.append(
+                {
+                    "object_id": item["object_id"],
+                    "object_name": item["object_name"],
+                    "value": value,
+                }
+            )
+        ranked.sort(
+            key=lambda item: float(item["value"]),
+            reverse=metric not in LOWER_IS_BETTER_METRICS,
+        )
+        if ranked:
+            rankings[metric] = ranked
+    return rankings
 
 
 def _aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -256,6 +377,114 @@ async def compare_time_ranges(
 
 
 @mcp_server.tool()
+async def compare_performance(
+    level: str,
+    object_ids: list[str],
+    date_preset: str | None = "last_7d",
+    since: str | None = None,
+    until: str | None = None,
+    fields: list[str] | None = None,
+    breakdowns: list[str] | None = None,
+    action_breakdowns: list[str] | None = None,
+    time_increment: int | str | None = None,
+    limit: int = 100,
+    metrics: list[str] | None = None,
+) -> dict[str, Any]:
+    """Compare multiple objects over the same reporting window."""
+    if not object_ids:
+        raise ValidationError("Provide at least one object_id.")
+    comparisons = await asyncio.gather(
+        *[
+            _comparison_row(
+                level=level,
+                object_id=object_id,
+                date_preset=date_preset,
+                since=since,
+                until=until,
+                fields=fields,
+                breakdowns=breakdowns,
+                action_breakdowns=action_breakdowns,
+                time_increment=time_increment,
+                limit=limit,
+            )
+            for object_id in object_ids
+        ]
+    )
+    metrics_to_rank = metrics or DEFAULT_COMPARE_METRICS
+    rankings = _rank_comparisons(comparisons, metrics_to_rank)
+    successful = sum(1 for item in comparisons if "metrics" in item)
+    failed = len(comparisons) - successful
+    return collection_response(
+        comparisons,
+        summary={
+            "count": len(comparisons),
+            "successful": successful,
+            "failed": failed,
+            "metrics_compared": metrics_to_rank,
+            "rankings": rankings,
+            "window": {
+                "date_preset": date_preset,
+                "since": since,
+                "until": until,
+            },
+        },
+    )
+
+
+@mcp_server.tool()
+async def export_insights(
+    level: str,
+    object_id: str,
+    format: str = "json",
+    date_preset: str | None = "last_30d",
+    since: str | None = None,
+    until: str | None = None,
+    fields: list[str] | None = None,
+    breakdowns: list[str] | None = None,
+    action_breakdowns: list[str] | None = None,
+    time_increment: int | str | None = None,
+    limit: int = 1000,
+) -> dict[str, Any]:
+    """Export normalized insights as JSON or CSV."""
+    export_format = format.lower()
+    if export_format not in {"json", "csv"}:
+        raise ValidationError("format must be 'json' or 'csv'.")
+    payload = await get_entity_insights(
+        level=level,
+        object_id=object_id,
+        date_preset=date_preset,
+        since=since,
+        until=until,
+        fields=fields,
+        breakdowns=breakdowns,
+        action_breakdowns=action_breakdowns,
+        time_increment=time_increment,
+        limit=limit,
+    )
+    data = (
+        json.dumps(payload["items"], indent=2, sort_keys=True)
+        if export_format == "json"
+        else _rows_to_csv(payload["items"])
+    )
+    return {
+        "format": export_format,
+        "mime_type": "application/json" if export_format == "json" else "text/csv",
+        "record_count": len(payload["items"]),
+        "summary": payload["summary"],
+        "query": {
+            "level": level,
+            "object_id": object_id,
+            "date_preset": date_preset,
+            "since": since,
+            "until": until,
+            "breakdowns": breakdowns or [],
+            "action_breakdowns": action_breakdowns or [],
+        },
+        "data": data,
+    }
+
+
+@mcp_server.tool()
 async def create_async_insights_report(
     level: str,
     object_id: str,
@@ -318,4 +547,3 @@ async def get_async_insights_report(
             ),
         }
     return {"status": payload["status"], "rows": {"items": [], "paging": {}, "summary": {"count": 0}}}
-

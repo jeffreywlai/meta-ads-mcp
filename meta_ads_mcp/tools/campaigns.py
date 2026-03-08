@@ -39,6 +39,8 @@ async def create_campaign(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a campaign."""
+    if daily_budget is not None and lifetime_budget is not None:
+        raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     payload: dict[str, Any] = {
         "name": name,
         "objective": objective,
@@ -139,6 +141,8 @@ async def create_ad_set(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create an ad set."""
+    if daily_budget is not None and lifetime_budget is not None:
+        raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     payload: dict[str, Any] = {
         "campaign_id": campaign_id,
         "name": name,
@@ -169,4 +173,3 @@ async def create_ad_set(
         "target": {"account_id": normalize_account_id(account_id), "campaign_id": campaign_id},
         "created": result,
     }
-

@@ -16,6 +16,7 @@ from .tools import (
     insights,
     recommendations,
     targeting,
+    utility,
 )
 
 TOOLS = [
@@ -30,6 +31,7 @@ TOOLS = [
     insights,
     recommendations,
     targeting,
+    utility,
 ]
 
 

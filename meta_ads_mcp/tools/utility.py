@@ -1,0 +1,168 @@
+"""Operational utility tools for Claude-friendly MCP use."""
+
+from __future__ import annotations
+
+from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.graph_api import get_graph_api_client
+
+TOOL_GROUPS = {
+    "discovery": [
+        "list_ad_accounts",
+        "get_ad_account",
+        "list_campaigns",
+        "get_campaign",
+        "list_adsets",
+        "get_adset",
+        "list_ads",
+        "get_ad",
+    ],
+    "insights": [
+        "get_entity_insights",
+        "get_performance_breakdown",
+        "compare_time_ranges",
+        "compare_performance",
+        "export_insights",
+        "create_async_insights_report",
+        "get_async_insights_report",
+    ],
+    "optimization": [
+        "get_account_optimization_snapshot",
+        "get_campaign_optimization_snapshot",
+        "get_budget_pacing_report",
+        "get_creative_performance_report",
+        "get_creative_fatigue_report",
+        "get_audience_performance_report",
+        "get_delivery_risk_report",
+        "get_learning_phase_report",
+        "get_recommendations",
+    ],
+    "targeting": [
+        "list_audiences",
+        "search_interests",
+        "search_geo_locations",
+        "estimate_audience_size",
+        "get_reach_frequency_predictions",
+    ],
+    "writes": [
+        "create_campaign",
+        "update_campaign",
+        "delete_campaign",
+        "create_ad_set",
+        "set_campaign_status",
+        "set_adset_status",
+        "set_ad_status",
+        "update_campaign_budget",
+        "update_adset_budget",
+        "create_custom_audience",
+        "create_lookalike_audience",
+        "update_custom_audience",
+        "delete_audience",
+        "list_creatives",
+        "create_ad_creative",
+        "preview_ad",
+        "upload_creative_asset",
+        "setup_ab_test",
+        "update_creative",
+        "delete_creative",
+    ],
+    "auth": [
+        "generate_auth_url",
+        "exchange_code_for_token",
+        "refresh_to_long_lived_token",
+        "generate_system_user_token",
+        "get_token_info",
+        "validate_token",
+    ],
+    "docs": [
+        "get_meta_object_model",
+        "get_metrics_reference",
+        "get_v25_notes",
+        "get_optimization_playbook",
+    ],
+    "utility": [
+        "health_check",
+        "get_capabilities",
+    ],
+}
+
+RESOURCE_URIS = [
+    "meta://docs/object-model",
+    "meta://docs/insights-metrics",
+    "meta://docs/v25-notes",
+    "meta://docs/optimization-playbook",
+]
+
+
+@mcp_server.tool()
+async def health_check() -> dict[str, object]:
+    """Check whether the server is configured and can read from Meta."""
+    settings = get_settings()
+    checks = {
+        "access_token_present": bool(settings.access_token),
+        "api_version": settings.api_version,
+        "default_account_id": settings.default_account_id,
+        "app_credentials_present": bool(settings.app_id and settings.app_secret),
+    }
+    if not settings.access_token:
+        return {
+            "status": "unhealthy",
+            "checks": checks,
+            "meta_api_connection": "not_attempted",
+            "message": "META_ACCESS_TOKEN is not configured.",
+        }
+
+    client = get_graph_api_client()
+    try:
+        payload = await client.list_objects(
+            "me",
+            "adaccounts",
+            fields=["id", "name", "account_status"],
+            params={"limit": 3},
+        )
+        accounts = payload.get("data", [])
+        return {
+            "status": "healthy",
+            "checks": checks,
+            "meta_api_connection": "connected",
+            "accessible_account_count_sample": len(accounts),
+            "accessible_accounts_sample": accounts,
+        }
+    except Exception as exc:
+        return {
+            "status": "unhealthy",
+            "checks": checks,
+            "meta_api_connection": "failed",
+            "message": str(exc),
+        }
+
+
+@mcp_server.tool()
+async def get_capabilities() -> dict[str, object]:
+    """Return the server's supported tool groups and resources."""
+    settings = get_settings()
+    return {
+        "server": {
+            "name": "Meta Ads FastMCP",
+            "api_version": settings.api_version,
+            "optimization_first": True,
+            "primary_transport": "stdio",
+            "secondary_transport": "streamable-http",
+        },
+        "auth": {
+            "required": ["META_ACCESS_TOKEN"],
+            "optional": [
+                "META_DEFAULT_ACCOUNT_ID",
+                "META_APP_ID",
+                "META_APP_SECRET",
+                "META_REDIRECT_URI",
+            ],
+        },
+        "tool_groups": TOOL_GROUPS,
+        "resources": RESOURCE_URIS,
+        "notes": [
+            "Use discovery and diagnostics before write operations.",
+            "compare_performance and export_insights are convenience wrappers over the core insights surface.",
+            "Write operations still depend on the token having ads_management-level permissions.",
+        ],
+    }

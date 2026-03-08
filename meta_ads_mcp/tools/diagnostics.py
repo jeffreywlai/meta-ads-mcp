@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import (
@@ -12,6 +13,7 @@ from meta_ads_mcp.diagnostics import (
     metric_evidence,
     rank_rows,
 )
+from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tools.insights import (
     DEFAULT_INSIGHTS_FIELDS,
@@ -20,6 +22,15 @@ from meta_ads_mcp.tools.insights import (
     _normalize_rows,
     get_entity_insights,
 )
+from meta_ads_mcp.errors import ValidationError
+
+
+def _require_object_id(*, account_id: str | None = None, campaign_id: str | None = None, adset_id: str | None = None) -> str:
+    """Require at least one object id for multi-scope reporting helpers."""
+    object_id = adset_id or campaign_id or account_id
+    if not object_id:
+        raise ValidationError("Provide at least one relevant object id.")
+    return object_id
 
 
 def _snapshot_suggestions(findings: list[dict[str, Any]]) -> list[str]:
@@ -166,7 +177,7 @@ async def get_creative_performance_report(
     top_n: int = 10,
 ) -> dict[str, Any]:
     """Rank ad-level creative performance."""
-    object_id = adset_id or campaign_id or account_id
+    object_id = _require_object_id(account_id=account_id, campaign_id=campaign_id, adset_id=adset_id)
     level = "ad"
     rows = await _child_insights(object_id, level=level, date_preset=date_preset)
     ranked = rank_rows(rows, "roas")
@@ -192,7 +203,7 @@ async def get_creative_fatigue_report(
     previous_window_days: int = 7,
 ) -> dict[str, Any]:
     """Detect simple creative fatigue signals."""
-    object_id = adset_id or campaign_id
+    object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
     today = date.today()
     current_until = today - timedelta(days=1)
     current_since = current_until - timedelta(days=current_window_days - 1)
@@ -290,7 +301,7 @@ async def get_delivery_risk_report(
     date_preset: str | None = "last_7d",
 ) -> dict[str, Any]:
     """Highlight delivery or efficiency risks."""
-    object_id = adset_id or campaign_id
+    object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
     level = "adset" if adset_id else "campaign"
     payload = await get_entity_insights(level=level, object_id=object_id, date_preset=date_preset)
     metrics = payload["summary"]["metrics"]
@@ -316,7 +327,7 @@ async def get_learning_phase_report(
 ) -> dict[str, Any]:
     """Return learning-relevant metadata for a campaign or ad set."""
     client = get_graph_api_client()
-    object_id = adset_id or campaign_id
+    object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
     fields = [
         "id",
         "name",

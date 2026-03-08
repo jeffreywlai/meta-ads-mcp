@@ -127,6 +127,10 @@ async def preview_ad(
     """Generate an ad preview for an existing ad or creative payload."""
     if creative:
         _ensure_v25_creative_payload(creative)
+    if not ad_id and not creative_id and not creative:
+        raise ValidationError("Provide ad_id, creative_id, or creative.")
+    if (creative_id or creative) and not account_id and not ad_id:
+        raise ValidationError("account_id is required when previewing from creative_id or creative.")
     client = get_graph_api_client()
     result = await client.preview_ad(
         ad_id=ad_id,
@@ -146,6 +150,8 @@ async def upload_creative_asset(
     name: str | None = None,
 ) -> dict[str, Any]:
     """Upload an image asset for creative use."""
+    if bool(file_path) == bool(image_url):
+        raise ValidationError("Provide exactly one of file_path or image_url.")
     client = get_graph_api_client()
     result = await client.upload_ad_image(
         normalize_account_id(account_id),
