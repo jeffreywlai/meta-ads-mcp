@@ -168,7 +168,7 @@ ROUTING_HINTS = {
 
 @mcp_server.tool()
 async def health_check() -> dict[str, object]:
-    """Check whether the server is configured and can read from Meta."""
+    """Use this first when auth or connectivity is uncertain before trying account-specific tools."""
     settings = get_settings()
     checks = {
         "access_token_present": bool(settings.access_token),
@@ -211,7 +211,7 @@ async def health_check() -> dict[str, object]:
 
 @mcp_server.tool()
 async def get_capabilities() -> dict[str, object]:
-    """Return the server's supported tool groups and resources."""
+    """Use this when Claude needs to inspect the current tool groups, routing hints, and available resources."""
     settings = get_settings()
     return {
         "server": {

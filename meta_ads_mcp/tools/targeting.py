@@ -26,7 +26,7 @@ async def search_interests(
     account_id: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Search interest targeting options."""
+    """Use this when the user wants to find interest targeting options from a free-text query."""
     client = get_graph_api_client()
     payload = await client.search_interests(query=query, limit=limit)
     return normalize_collection(payload)
@@ -37,7 +37,7 @@ async def get_interest_suggestions(
     interest_list: list[str],
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Get related interest suggestions for seed interests."""
+    """Use this when the user already has seed interests and wants closely related targeting ideas."""
     if not interest_list:
         raise ValidationError("interest_list must contain at least one interest.")
     client = get_graph_api_client()
@@ -50,7 +50,7 @@ async def validate_interests(
     interest_list: list[str] | None = None,
     interest_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Validate interest names or ids against Meta's targeting catalog."""
+    """Use this when the user wants to confirm that proposed interests still resolve in Meta's targeting catalog."""
     if not interest_list and not interest_ids:
         raise ValidationError("Provide interest_list or interest_ids.")
     client = get_graph_api_client()
@@ -64,7 +64,7 @@ async def search_geo_locations(
     location_types: list[str] | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Search geo targeting options."""
+    """Use this when the user wants countries, regions, cities, or other geo targeting matches from text."""
     client = get_graph_api_client()
     payload = await client.search_geo_locations(query=query, location_types=location_types, limit=limit)
     return normalize_collection(payload)
@@ -75,7 +75,7 @@ async def search_behaviors(
     query: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Search behavior-based targeting categories."""
+    """Use this when the user wants behavior-based targeting options rather than interests or demographics."""
     client = get_graph_api_client()
     payload = await client.search_targeting_categories(
         category_class="behaviors",
@@ -91,7 +91,7 @@ async def get_targeting_categories(
     query: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Search generic targeting categories by class."""
+    """Use this when the user knows the targeting category class they want and needs matching options."""
     if not category_class:
         raise ValidationError("category_class is required.")
     client = get_graph_api_client()
@@ -109,7 +109,7 @@ async def search_demographics(
     query: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """Search demographic targeting categories."""
+    """Use this when the user wants demographic targeting options such as age, education, or life-stage categories."""
     if not demographic_class:
         raise ValidationError("demographic_class is required.")
     client = get_graph_api_client()
@@ -127,7 +127,7 @@ async def estimate_audience_size(
     account_id: str | None = None,
     optimization_goal: str | None = None,
 ) -> dict[str, Any]:
-    """Estimate audience size for a targeting spec."""
+    """Use this when the user wants a reach-size estimate for a draft targeting spec before creating an ad set."""
     client = get_graph_api_client()
     payload = await client.estimate_audience_size(
         _resolve_account_id(account_id),
@@ -142,7 +142,7 @@ async def get_reach_frequency_predictions(
     account_id: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
-    """List reach frequency predictions."""
+    """Use this when the user wants existing reach-and-frequency prediction objects for an account."""
     client = get_graph_api_client()
     payload = await client.get_reach_frequency_predictions(_resolve_account_id(account_id), limit=limit)
     return normalize_collection(payload)

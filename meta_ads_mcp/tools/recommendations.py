@@ -23,7 +23,7 @@ async def get_recommendations(
     account_id: str | None = None,
     campaign_id: str | None = None,
 ) -> dict[str, object]:
-    """Fetch recommendation and opportunity surfaces when available."""
+    """Use this when the user wants Meta-native recommendations or opportunity surfaces for an account or campaign."""
     client = get_graph_api_client()
     try:
         payload = await client.get_recommendations(
@@ -38,4 +38,3 @@ async def get_recommendations(
             "summary": {"count": 0},
         }
     return {"supported": True, **normalize_collection(payload)}
-

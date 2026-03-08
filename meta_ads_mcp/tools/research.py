@@ -27,7 +27,7 @@ async def search_ads_archive(
     limit: int = 25,
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Search the public Meta Ads Library for competitor or market research."""
+    """Use this when the user wants competitor or market research from the public Meta Ads Library."""
     if not ad_reached_countries:
         raise ValidationError("ad_reached_countries must contain at least one country code.")
     client = get_graph_api_client()

@@ -38,24 +38,23 @@ def resource_optimization_playbook() -> str:
 
 @mcp_server.tool()
 async def get_meta_object_model() -> dict[str, str]:
-    """Get compact docs for the Meta Ads object model."""
+    """Use this when Claude needs a refresher on how accounts, campaigns, ad sets, and ads relate."""
     return {"name": "object_model", "content": _read_doc("object_model.md")}
 
 
 @mcp_server.tool()
 async def get_metrics_reference() -> dict[str, str]:
-    """Get compact docs for common insights metrics and breakdowns."""
+    """Use this when Claude needs metric or breakdown reference help before building an insights query."""
     return {"name": "insights_metrics", "content": _read_doc("insights_metrics.md")}
 
 
 @mcp_server.tool()
 async def get_v25_notes() -> dict[str, str]:
-    """Get compact implementation notes for Marketing API v25."""
+    """Use this when Claude needs v25-specific implementation notes or deprecation guidance."""
     return {"name": "v25_notes", "content": _read_doc("v25_notes.md")}
 
 
 @mcp_server.tool()
 async def get_optimization_playbook() -> dict[str, str]:
-    """Get compact optimization guidance for the LLM."""
+    """Use this when Claude wants packaged optimization heuristics before interpreting account performance."""
     return {"name": "optimization_playbook", "content": _read_doc("optimization_playbook.md")}
-

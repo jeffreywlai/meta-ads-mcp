@@ -50,6 +50,8 @@ DEFAULT_COMPARE_METRICS = [
 ]
 
 LOWER_IS_BETTER_METRICS = {"cpc", "cpm", "cpa", "cpp", "cost_per_result", "spend"}
+DEFAULT_EXPORT_LIMIT = 100
+DEFAULT_INLINE_EXPORT_ROWS = 100
 
 NAME_FIELD_BY_LEVEL = {
     "account": "account_name",
@@ -78,8 +80,11 @@ def _build_date_params(
     if (since and not until) or (until and not since):
         raise ValidationError("Provide both since and until.")
     if since and until:
-        date.fromisoformat(since)
-        date.fromisoformat(until)
+        try:
+            date.fromisoformat(since)
+            date.fromisoformat(until)
+        except ValueError as exc:
+            raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.") from exc
         return {"time_range": json.dumps({"since": since, "until": until})}
     return {"date_preset": date_preset or "last_7d"}
 
@@ -313,7 +318,7 @@ async def get_entity_insights(
     action_attribution_windows: list[str] | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Return normalized insights for an account, campaign, ad set, or ad."""
+    """Use this for the primary reporting read: normalized insights for one account, campaign, ad set, or ad."""
     client = get_graph_api_client()
     payload = await client.get_insights(
         object_id,
@@ -349,7 +354,7 @@ async def get_performance_breakdown(
     fields: list[str] | None = None,
     sort_by: str = "spend",
 ) -> dict[str, Any]:
-    """Return a ranked performance breakdown."""
+    """Use this when the user wants ranked segment performance, such as by country, device, or age."""
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -388,7 +393,7 @@ async def compare_time_ranges(
     previous_until: str,
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Compare two windows for the same entity."""
+    """Use this when the user asks what changed between two explicit time windows for one entity."""
     current_payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -436,7 +441,7 @@ async def compare_performance(
     limit: int = 100,
     metrics: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Compare multiple objects over the same reporting window."""
+    """Use this when the user wants the same metrics compared across multiple campaigns, ad sets, ads, or accounts."""
     if not object_ids:
         raise ValidationError("Provide at least one object_id.")
     comparisons = await asyncio.gather(
@@ -489,12 +494,18 @@ async def export_insights(
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
-    limit: int = 1000,
+    limit: int = DEFAULT_EXPORT_LIMIT,
+    inline_limit: int = DEFAULT_INLINE_EXPORT_ROWS,
+    allow_large_output: bool = False,
 ) -> dict[str, Any]:
-    """Export normalized insights as JSON or CSV."""
+    """Use this when the user explicitly wants export-style output; JSON returns structured rows, CSV returns serialized text."""
     export_format = format.lower()
     if export_format not in {"json", "csv"}:
         raise ValidationError("format must be 'json' or 'csv'.")
+    if limit < 1:
+        raise ValidationError("limit must be at least 1.")
+    if inline_limit < 1:
+        raise ValidationError("inline_limit must be at least 1.")
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -507,16 +518,17 @@ async def export_insights(
         time_increment=time_increment,
         limit=limit,
     )
-    data = (
-        json.dumps(payload["items"], indent=2, sort_keys=True)
-        if export_format == "json"
-        else _rows_to_csv(payload["items"])
-    )
-    return {
+    rows = payload["items"]
+    returned_rows = rows if allow_large_output else rows[:inline_limit]
+    truncated = len(returned_rows) < len(rows)
+    response = {
         "format": export_format,
         "mime_type": "application/json" if export_format == "json" else "text/csv",
-        "record_count": len(payload["items"]),
+        "record_count": len(rows),
+        "returned_count": len(returned_rows),
+        "truncated": truncated,
         "summary": payload["summary"],
+        "scope": {"level": level, "object_id": object_id},
         "query": {
             "level": level,
             "object_id": object_id,
@@ -525,9 +537,21 @@ async def export_insights(
             "until": until,
             "breakdowns": breakdowns or [],
             "action_breakdowns": action_breakdowns or [],
+            "limit": limit,
+            "inline_limit": inline_limit,
+            "allow_large_output": allow_large_output,
         },
-        "data": data,
     }
+    if export_format == "json":
+        response["rows"] = returned_rows
+    else:
+        response["data"] = _rows_to_csv(returned_rows)
+    if truncated:
+        response["next_step"] = (
+            "Rerun export_insights with allow_large_output=true for the full inline payload, "
+            "or use create_async_insights_report for larger exports."
+        )
+    return response
 
 
 @mcp_server.tool()
@@ -543,7 +567,7 @@ async def create_async_insights_report(
     time_increment: int | str | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Start an async insights report."""
+    """Use this when the reporting query is large enough that a synchronous insights call would be too heavy."""
     client = get_graph_api_client()
     payload = await client.create_async_insights_report(
         object_id,
@@ -573,7 +597,7 @@ async def get_async_insights_report(
     limit: int = 100,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Poll and fetch an async insights report."""
+    """Use this after create_async_insights_report to poll status and fetch rows when the job is ready."""
     client = get_graph_api_client()
     payload = await client.get_async_report(
         report_run_id,
@@ -582,7 +606,7 @@ async def get_async_insights_report(
         after=after,
     )
     rows_payload = payload.get("rows", {})
-    if rows_payload:
+    if isinstance(rows_payload, dict) and rows_payload:
         rows = _normalize_rows(rows_payload)
         return {
             "status": payload["status"],
@@ -592,4 +616,7 @@ async def get_async_insights_report(
                 summary={"count": len(rows), "metrics": _aggregate_metrics(rows)},
             ),
         }
-    return {"status": payload["status"], "rows": {"items": [], "paging": {}, "summary": {"count": 0}}}
+    return {
+        "status": payload["status"],
+        "rows": collection_response([], summary={"count": 0}),
+    }

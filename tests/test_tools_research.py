@@ -49,3 +49,27 @@ def test_search_ads_archive_returns_collection(monkeypatch) -> None:
 def test_search_ads_archive_requires_countries() -> None:
     with pytest.raises(research.ValidationError):
         asyncio.run(research.search_ads_archive(search_terms="shirts", ad_reached_countries=[]))
+
+
+def test_search_ads_archive_supports_custom_fields_and_ad_type(monkeypatch) -> None:
+    monkeypatch.setattr(research, "get_graph_api_client", lambda: FakeResearchClient())
+    result = asyncio.run(
+        research.search_ads_archive(
+            search_terms="shirts",
+            ad_reached_countries=["US"],
+            ad_type="POLITICAL_AND_ISSUE_ADS",
+            fields=["id", "page_name"],
+        )
+    )
+    assert result["items"][0]["ad_type"] == "POLITICAL_AND_ISSUE_ADS"
+    assert result["items"][0]["fields"] == ["id", "page_name"]
+
+
+def test_search_ads_archive_handles_empty_results(monkeypatch) -> None:
+    class EmptyResearchClient(FakeResearchClient):
+        async def search_ads_archive(self, **kwargs):
+            return {"data": []}
+
+    monkeypatch.setattr(research, "get_graph_api_client", lambda: EmptyResearchClient())
+    result = asyncio.run(research.search_ads_archive(search_terms="shirts", ad_reached_countries=["US"]))
+    assert result["items"] == []

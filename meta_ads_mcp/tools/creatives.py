@@ -58,7 +58,7 @@ async def list_creatives(
     after: str | None = None,
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
-    """List ad creatives."""
+    """Use this when the user needs creative ids or lightweight creative metadata before previewing or creating ads."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit}
     if after:
@@ -84,7 +84,7 @@ async def create_ad_creative(
     degrees_of_freedom_spec: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create an ad creative."""
+    """Use this when the user wants to build a reusable creative before attaching it to an ad."""
     if object_story_spec:
         _ensure_v25_creative_payload(object_story_spec)
     if asset_feed_spec:
@@ -124,7 +124,7 @@ async def preview_ad(
     creative: dict[str, Any] | None = None,
     ad_format: str = "DESKTOP_FEED_STANDARD",
 ) -> dict[str, Any]:
-    """Generate an ad preview for an existing ad or creative payload."""
+    """Use this when the user wants a rendered preview for an existing ad, creative id, or draft creative payload."""
     if creative:
         _ensure_v25_creative_payload(creative)
     if not ad_id and not creative_id and not creative:
@@ -149,7 +149,7 @@ async def upload_creative_asset(
     image_url: str | None = None,
     name: str | None = None,
 ) -> dict[str, Any]:
-    """Upload an image asset for creative use."""
+    """Use this when the user needs an image asset uploaded before creating or updating a creative."""
     if bool(file_path) == bool(image_url):
         raise ValidationError("Provide exactly one of file_path or image_url.")
     client = get_graph_api_client()
@@ -181,7 +181,7 @@ async def setup_ab_test(
     hypothesis: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a Meta ad study / split test."""
+    """Use this when the user explicitly wants to create a Meta split test or ad study object."""
     payload: dict[str, Any] = {"name": name, "type": ad_study_type}
     if description:
         payload["description"] = description
@@ -218,7 +218,7 @@ async def update_creative(
     asset_feed_spec: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Update an ad creative."""
+    """Use this when the user already has a creative id and wants to change creative metadata or payload fields."""
     if object_story_spec is not None:
         _ensure_v25_creative_payload(object_story_spec)
     if asset_feed_spec is not None:
@@ -258,7 +258,7 @@ async def update_creative(
 
 @mcp_server.tool()
 async def delete_creative(creative_id: str) -> dict[str, Any]:
-    """Delete an ad creative."""
+    """Use this only when the user explicitly wants to delete a creative instead of leaving it unused."""
     client = get_graph_api_client()
     result = await client.delete_object(creative_id)
     return {

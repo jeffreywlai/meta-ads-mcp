@@ -57,7 +57,7 @@ async def list_audiences(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """List custom audiences for an ad account."""
+    """Use this when the user needs audience ids, sizes, or subtype metadata for one ad account."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit}
     if subtype:
@@ -85,7 +85,7 @@ async def create_custom_audience(
     prefill: bool = False,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a custom audience."""
+    """Use this when the user wants to create a first-party or rule-based custom audience."""
     payload: dict[str, Any] = {"name": name, "subtype": subtype, "prefill": prefill}
     if description:
         payload["description"] = description
@@ -124,7 +124,7 @@ async def create_lookalike_audience(
     description: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a lookalike audience."""
+    """Use this when the user wants to expand from a seed audience into a lookalike audience."""
     payload: dict[str, Any] = {
         "name": name,
         "subtype": "LOOKALIKE",
@@ -164,7 +164,7 @@ async def update_custom_audience(
     customer_file_source: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Update a custom audience."""
+    """Use this when the user already has an audience id and needs to change audience metadata."""
     payload: dict[str, Any] = {}
     if name is not None:
         payload["name"] = name
@@ -196,7 +196,7 @@ async def update_custom_audience(
 
 @mcp_server.tool()
 async def delete_audience(audience_id: str) -> dict[str, Any]:
-    """Delete a custom audience."""
+    """Use this only when the user explicitly wants to remove a custom audience."""
     client = get_graph_api_client()
     result = await client.delete_object(audience_id)
     return {

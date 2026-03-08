@@ -5,7 +5,7 @@ from __future__ import annotations
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
-from meta_ads_mcp.normalize import normalize_budget_value
+from meta_ads_mcp.normalize import ZERO_DECIMAL_CURRENCIES, normalize_budget_value
 from meta_ads_mcp.schemas import mutation_response
 
 
@@ -32,19 +32,19 @@ async def _set_status(object_id: str, object_type: str, status: str) -> dict[str
 
 @mcp_server.tool()
 async def set_campaign_status(campaign_id: str, status: str) -> dict[str, object]:
-    """Pause or enable a campaign."""
+    """Use this for a simple campaign pause or resume without changing any other campaign fields."""
     return await _set_status(campaign_id, "campaign", status)
 
 
 @mcp_server.tool()
 async def set_adset_status(adset_id: str, status: str) -> dict[str, object]:
-    """Pause or enable an ad set."""
+    """Use this for a simple ad set pause or resume without changing targeting or budget fields."""
     return await _set_status(adset_id, "adset", status)
 
 
 @mcp_server.tool()
 async def set_ad_status(ad_id: str, status: str) -> dict[str, object]:
-    """Pause or enable an ad."""
+    """Use this for a simple ad pause or resume without editing the ad creative or placement."""
     return await _set_status(ad_id, "ad", status)
 
 
@@ -66,13 +66,22 @@ async def _update_budget(
         object_id,
         fields=["id", "daily_budget", "lifetime_budget", "currency"],
     )
+    currency = previous.get("currency")
     data: dict[str, object] = {}
     current: dict[str, object] = {}
     if daily_budget is not None:
-        data["daily_budget"] = int(daily_budget * 100)
+        data["daily_budget"] = (
+            int(daily_budget)
+            if currency and currency.upper() in ZERO_DECIMAL_CURRENCIES
+            else int(daily_budget * 100)
+        )
         current["daily_budget"] = daily_budget
     if lifetime_budget is not None:
-        data["lifetime_budget"] = int(lifetime_budget * 100)
+        data["lifetime_budget"] = (
+            int(lifetime_budget)
+            if currency and currency.upper() in ZERO_DECIMAL_CURRENCIES
+            else int(lifetime_budget * 100)
+        )
         current["lifetime_budget"] = lifetime_budget
 
     await client.update_object(object_id, data=data)
@@ -93,7 +102,7 @@ async def update_campaign_budget(
     daily_budget: float | None = None,
     lifetime_budget: float | None = None,
 ) -> dict[str, object]:
-    """Update a campaign budget."""
+    """Use this when the user wants to change only campaign budget, not other campaign configuration."""
     return await _update_budget(
         campaign_id,
         "campaign",
@@ -108,11 +117,10 @@ async def update_adset_budget(
     daily_budget: float | None = None,
     lifetime_budget: float | None = None,
 ) -> dict[str, object]:
-    """Update an ad set budget."""
+    """Use this when the user wants to change only ad set budget, not other ad set settings."""
     return await _update_budget(
         adset_id,
         "adset",
         daily_budget=daily_budget,
         lifetime_budget=lifetime_budget,
     )
-

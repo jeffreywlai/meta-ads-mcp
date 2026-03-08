@@ -27,7 +27,7 @@ async def generate_auth_url(
     app_id: str | None = None,
     response_type: str = "code",
 ) -> dict[str, str]:
-    """Generate a Meta OAuth dialog URL."""
+    """Use this only when the user wants to start an interactive Meta OAuth browser flow."""
     resolved_app_id = app_id or get_settings().app_id
     if not resolved_app_id:
         raise ConfigError("app_id is required unless META_APP_ID is set.")
@@ -55,7 +55,7 @@ async def exchange_code_for_token(
     app_id: str | None = None,
     app_secret: str | None = None,
 ) -> dict[str, object]:
-    """Exchange an OAuth authorization code for a user access token."""
+    """Use this after Meta redirects back with a code and the user needs to exchange it for a token."""
     resolved_app_id, resolved_app_secret = resolve_app_credentials(
         app_id=app_id,
         app_secret=app_secret,
@@ -77,7 +77,7 @@ async def refresh_to_long_lived_token(
     app_id: str | None = None,
     app_secret: str | None = None,
 ) -> dict[str, object]:
-    """Exchange a short-lived token for a long-lived token."""
+    """Use this when the user already has a short-lived Meta token and wants a longer-lived replacement."""
     resolved_app_id, resolved_app_secret = resolve_app_credentials(
         app_id=app_id,
         app_secret=app_secret,
@@ -101,7 +101,7 @@ async def generate_system_user_token(
     access_token: str | None = None,
     app_id: str | None = None,
 ) -> dict[str, object]:
-    """Generate a system-user access token."""
+    """Use this when the user explicitly needs a business system-user token rather than a user token."""
     resolved_business_app = business_app or app_id or get_settings().app_id
     if not resolved_business_app:
         raise ConfigError("business_app or app_id is required for generate_system_user_token.")
@@ -121,7 +121,7 @@ async def get_token_info(
     app_id: str | None = None,
     app_secret: str | None = None,
 ) -> dict[str, object]:
-    """Inspect a token with debug_token."""
+    """Use this when the user wants raw token metadata such as scopes, expiry, or app binding."""
     client = get_graph_api_client()
     effective_debug_access_token = debug_access_token
     if effective_debug_access_token is None and (app_id or app_secret or get_settings().app_id):
@@ -140,7 +140,7 @@ async def validate_token(
     app_id: str | None = None,
     app_secret: str | None = None,
 ) -> dict[str, object]:
-    """Validate whether a token is usable."""
+    """Use this for a compact token validity check before trying account reads or writes."""
     info = await get_token_info(
         input_token=input_token,
         debug_access_token=debug_access_token,

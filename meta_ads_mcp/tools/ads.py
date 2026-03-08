@@ -118,7 +118,7 @@ async def create_ad(
     tracking_specs: list[dict[str, Any]] | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create an ad from an existing creative and attach it to an ad set."""
+    """Use this when the user already has an ad set and creative and wants to create the final ad object."""
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
     payload: dict[str, Any] = {
@@ -150,7 +150,7 @@ async def create_ad(
 
 @mcp_server.tool()
 async def get_ad_image(ad_id: str) -> dict[str, Any]:
-    """Resolve the primary image URLs for an ad's creative."""
+    """Use this when the user wants Claude to inspect the main image assets behind an existing ad."""
     client = get_graph_api_client()
     ad = await client.get_object(ad_id, fields=["id", "name", "account_id", "creative{id}"])
     creative_ref = ad.get("creative") or {}

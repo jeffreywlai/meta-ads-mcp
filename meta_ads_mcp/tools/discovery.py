@@ -114,7 +114,7 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
 
 @mcp_server.tool()
 async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[str, Any]:
-    """List accessible ad accounts."""
+    """Use this first when the user needs to discover which ad accounts are available."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit}
     if after:
@@ -127,7 +127,7 @@ async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[st
 
 @mcp_server.tool()
 async def get_ad_account(account_id: str) -> dict[str, Any]:
-    """Get an ad account."""
+    """Use this when the user already has one account id and wants core metadata for that account."""
     client = get_graph_api_client()
     account = await client.get_object(_resolve_account_id(account_id), fields=ACCOUNT_FIELDS)
     return {"item": _normalize_budgets([account])[0], "summary": {"count": 1}}
@@ -140,7 +140,7 @@ async def list_campaigns(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """List campaigns for an ad account."""
+    """Use this to discover campaign ids and high-level campaign metadata inside one ad account."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
     if after:
@@ -158,7 +158,7 @@ async def list_campaigns(
 
 @mcp_server.tool()
 async def get_campaign(campaign_id: str) -> dict[str, Any]:
-    """Get a campaign."""
+    """Use this when the user already has a campaign id and wants the current campaign configuration."""
     client = get_graph_api_client()
     campaign = await client.get_object(campaign_id, fields=CAMPAIGN_FIELDS)
     return {"item": _normalize_budgets([campaign])[0], "summary": {"count": 1}}
@@ -172,7 +172,7 @@ async def list_adsets(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """List ad sets by account or campaign."""
+    """Use this to discover ad sets under one account or one campaign."""
     if not account_id and not campaign_id:
         raise ValidationError("Provide account_id or campaign_id.")
     parent_id = campaign_id or _resolve_account_id(account_id)
@@ -188,7 +188,7 @@ async def list_adsets(
 
 @mcp_server.tool()
 async def get_adset(adset_id: str) -> dict[str, Any]:
-    """Get an ad set."""
+    """Use this when the user already has an ad set id and wants its current settings."""
     client = get_graph_api_client()
     adset = await client.get_object(adset_id, fields=ADSET_FIELDS)
     return {"item": _normalize_budgets([adset])[0], "summary": {"count": 1}}
@@ -203,7 +203,7 @@ async def list_ads(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """List ads by account, campaign, or ad set."""
+    """Use this to discover ads under exactly one scope: one account, one campaign, or one ad set."""
     scope_count = sum(value is not None for value in (account_id, campaign_id, adset_id))
     if scope_count != 1:
         raise ValidationError("Provide exactly one of account_id, campaign_id, or adset_id.")
@@ -218,7 +218,7 @@ async def list_ads(
 
 @mcp_server.tool()
 async def get_ad(ad_id: str, include_creative_summary: bool = False) -> dict[str, Any]:
-    """Get an ad, optionally with creative details."""
+    """Use this when the user already has an ad id and wants ad metadata, optionally with a lightweight creative summary."""
     client = get_graph_api_client()
     fields = list(AD_FIELDS)
     if include_creative_summary:
@@ -234,7 +234,7 @@ async def get_account_pages(
     after: str | None = None,
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
-    """List pages available for creative and ad setup workflows."""
+    """Use this before creative creation when the user needs Facebook Pages available to the account."""
     client = get_graph_api_client()
     requested_fields = fields or PAGE_FIELDS
     params = _page_params(limit, after)
@@ -286,7 +286,7 @@ async def list_instagram_accounts(
     after: str | None = None,
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
-    """List Instagram accounts linked to an ad account for creative setup flows."""
+    """Use this before creative creation when the user needs Instagram identities linked to the account."""
     client = get_graph_api_client()
     params = _page_params(limit, after)
     payload = await client.list_objects(

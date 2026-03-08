@@ -61,3 +61,87 @@ def test_generate_auth_url_requires_app_id_or_env(monkeypatch) -> None:
     reload_settings()
     with pytest.raises(auth_tools.ConfigError):
         asyncio.run(auth_tools.generate_auth_url(redirect_uri="https://example.com/callback"))
+
+
+def test_generate_auth_url_requires_redirect_uri_or_env(monkeypatch) -> None:
+    monkeypatch.setenv("META_APP_ID", "123")
+    monkeypatch.delenv("META_REDIRECT_URI", raising=False)
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    with pytest.raises(auth_tools.ConfigError):
+        asyncio.run(auth_tools.generate_auth_url())
+
+
+def test_exchange_code_for_token_uses_resolved_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("META_APP_ID", "123")
+    monkeypatch.setenv("META_APP_SECRET", "secret")
+    monkeypatch.setenv("META_REDIRECT_URI", "https://example.com/callback")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(auth_tools, "get_graph_api_client", lambda *args, **kwargs: FakeAuthClient())
+    result = asyncio.run(auth_tools.exchange_code_for_token(code="oauth-code"))
+    assert result["params"]["client_id"] == "123"
+    assert result["params"]["client_secret"] == "secret"
+    assert result["params"]["code"] == "oauth-code"
+
+
+def test_refresh_to_long_lived_token_uses_app_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("META_APP_ID", "123")
+    monkeypatch.setenv("META_APP_SECRET", "secret")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(auth_tools, "get_graph_api_client", lambda *args, **kwargs: FakeAuthClient())
+    result = asyncio.run(auth_tools.refresh_to_long_lived_token(access_token="short-token"))
+    assert result["params"]["grant_type"] == "fb_exchange_token"
+    assert result["params"]["fb_exchange_token"] == "short-token"
+
+
+def test_generate_system_user_token_uses_explicit_or_env_token(monkeypatch) -> None:
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setenv("META_APP_ID", "123")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(auth_tools, "get_graph_api_client", lambda *args, **kwargs: FakeAuthClient())
+    result = asyncio.run(
+        auth_tools.generate_system_user_token(system_user_id="sys_123", scope=["ads_management"])
+    )
+    assert result["system_user_id"] == "sys_123"
+    assert result["access_token_used"] == "user-token"
+
+
+def test_get_token_info_builds_app_debug_token_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("META_APP_ID", "123")
+    monkeypatch.setenv("META_APP_SECRET", "secret")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(auth_tools, "get_graph_api_client", lambda *args, **kwargs: FakeAuthClient())
+    result = asyncio.run(auth_tools.get_token_info(input_token="user-token"))
+    assert result["input_token"] == "user-token"
+    assert result["debug_access_token"] == "123|secret"
+
+
+def test_validate_token_handles_invalid_or_expired_token(monkeypatch) -> None:
+    class InvalidAuthClient(FakeAuthClient):
+        async def debug_token(self, *, input_token: str, debug_access_token: str | None = None):
+            return {
+                "data": {
+                    "is_valid": False,
+                    "app_id": "123",
+                    "type": "USER",
+                    "scopes": ["ads_read"],
+                    "expires_at": 0,
+                    "input_token": input_token,
+                    "debug_access_token": debug_access_token,
+                }
+            }
+
+    monkeypatch.setattr(auth_tools, "get_graph_api_client", lambda *args, **kwargs: InvalidAuthClient())
+    result = asyncio.run(auth_tools.validate_token(input_token="expired-token", debug_access_token="debug"))
+    assert result["is_valid"] is False
+    assert result["expires_at"] == 0
+    assert result["scopes"] == ["ads_read"]

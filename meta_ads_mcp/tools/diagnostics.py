@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, timedelta
 from typing import Any
 
@@ -80,13 +81,15 @@ async def get_account_optimization_snapshot(
     compare_to_previous: bool = False,
     top_n: int = 5,
 ) -> dict[str, Any]:
-    """Build an account-level optimization briefing."""
-    account_scope = await get_entity_insights(
-        level="account",
-        object_id=account_id,
-        date_preset=date_preset,
+    """Use this for a top-level account briefing before asking narrower optimization questions."""
+    account_scope, campaigns = await asyncio.gather(
+        get_entity_insights(
+            level="account",
+            object_id=account_id,
+            date_preset=date_preset,
+        ),
+        _child_insights(account_id, level="campaign", date_preset=date_preset),
     )
-    campaigns = await _child_insights(account_id, level="campaign", date_preset=date_preset)
     findings = detect_snapshot_findings(account_scope["summary"]["metrics"], campaigns)
     ranked_by_spend = rank_rows(campaigns, "spend")
     ranked_by_roas = rank_rows(campaigns, "roas")
@@ -114,14 +117,16 @@ async def get_campaign_optimization_snapshot(
     top_n_adsets: int = 5,
     top_n_ads: int = 5,
 ) -> dict[str, Any]:
-    """Build a campaign-level optimization briefing."""
-    campaign_scope = await get_entity_insights(
-        level="campaign",
-        object_id=campaign_id,
-        date_preset=date_preset,
+    """Use this for a campaign summary that ranks the most important ad sets and ads."""
+    campaign_scope, adsets, ads = await asyncio.gather(
+        get_entity_insights(
+            level="campaign",
+            object_id=campaign_id,
+            date_preset=date_preset,
+        ),
+        _child_insights(campaign_id, level="adset", date_preset=date_preset),
+        _child_insights(campaign_id, level="ad", date_preset=date_preset),
     )
-    adsets = await _child_insights(campaign_id, level="adset", date_preset=date_preset)
-    ads = await _child_insights(campaign_id, level="ad", date_preset=date_preset)
     findings = detect_snapshot_findings(campaign_scope["summary"]["metrics"], adsets)
     return analysis_response(
         scope={"level": "campaign", "object_id": campaign_id},
@@ -142,7 +147,7 @@ async def get_budget_pacing_report(
     object_id: str,
     date_preset: str | None = "last_7d",
 ) -> dict[str, Any]:
-    """Report simple pacing and spend-trend signals."""
+    """Use this when the user asks about spend pacing, spend trend, or daily delivery consistency."""
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -176,7 +181,7 @@ async def get_creative_performance_report(
     date_preset: str | None = "last_7d",
     top_n: int = 10,
 ) -> dict[str, Any]:
-    """Rank ad-level creative performance."""
+    """Use this when the user wants top and worst ad-level creative performers within an account, campaign, or ad set."""
     object_id = _require_object_id(account_id=account_id, campaign_id=campaign_id, adset_id=adset_id)
     level = "ad"
     rows = await _child_insights(object_id, level=level, date_preset=date_preset)
@@ -202,7 +207,7 @@ async def get_creative_fatigue_report(
     current_window_days: int = 7,
     previous_window_days: int = 7,
 ) -> dict[str, Any]:
-    """Detect simple creative fatigue signals."""
+    """Use this when the user asks whether ads are fatiguing between a current and previous window."""
     object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
     today = date.today()
     current_until = today - timedelta(days=1)
@@ -210,19 +215,21 @@ async def get_creative_fatigue_report(
     previous_until = current_since - timedelta(days=1)
     previous_since = previous_until - timedelta(days=previous_window_days - 1)
 
-    current_rows = await _child_insights(
-        object_id,
-        level="ad",
-        since=current_since.isoformat(),
-        until=current_until.isoformat(),
-        date_preset=None,
-    )
-    previous_rows = await _child_insights(
-        object_id,
-        level="ad",
-        since=previous_since.isoformat(),
-        until=previous_until.isoformat(),
-        date_preset=None,
+    current_rows, previous_rows = await asyncio.gather(
+        _child_insights(
+            object_id,
+            level="ad",
+            since=current_since.isoformat(),
+            until=current_until.isoformat(),
+            date_preset=None,
+        ),
+        _child_insights(
+            object_id,
+            level="ad",
+            since=previous_since.isoformat(),
+            until=previous_until.isoformat(),
+            date_preset=None,
+        ),
     )
     previous_by_id = {row.get("ad_id") or row.get("id"): row for row in previous_rows}
     findings: list[dict[str, Any]] = []
@@ -273,7 +280,7 @@ async def get_audience_performance_report(
     segment_by: str = "country",
     date_preset: str | None = "last_7d",
 ) -> dict[str, Any]:
-    """Rank audience segments by performance."""
+    """Use this when the user wants performance ranked by one audience-like breakdown, such as country or region."""
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -300,7 +307,7 @@ async def get_delivery_risk_report(
     adset_id: str | None = None,
     date_preset: str | None = "last_7d",
 ) -> dict[str, Any]:
-    """Highlight delivery or efficiency risks."""
+    """Use this when the user asks about delivery risk, weak efficiency, or whether a campaign/ad set looks unhealthy."""
     object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
     level = "adset" if adset_id else "campaign"
     payload = await get_entity_insights(level=level, object_id=object_id, date_preset=date_preset)
@@ -325,7 +332,7 @@ async def get_learning_phase_report(
     campaign_id: str | None = None,
     adset_id: str | None = None,
 ) -> dict[str, Any]:
-    """Return learning-relevant metadata for a campaign or ad set."""
+    """Use this when the user asks about learning-phase context or setup metadata for a campaign or ad set."""
     client = get_graph_api_client()
     object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
     fields = [
