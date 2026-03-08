@@ -44,12 +44,15 @@ except ImportError:  # pragma: no cover - fallback for tests without the package
 mcp_server = FastMCP(
     name="Meta Ads FastMCP",
     instructions=(
-        "Optimization-first Meta Ads MCP server. Prefer discovery and diagnostics "
-        "before mutations. Use account or campaign snapshots before drilling into "
-        "entity details. Ask for confirmation before spend-affecting changes. "
-        "Treat all ids as strings and prefer comparison windows and ranked "
-        "outputs when deciding what to optimize."
+        "Optimization-first Meta Ads MCP server. Start with health_check if auth "
+        "or connectivity is uncertain, then use list_ad_accounts and discovery "
+        "tools to find ids. For detailed reporting use get_entity_insights. For "
+        "multi-entity comparisons use compare_performance. For exports use "
+        "export_insights. For optimization questions prefer the snapshot and "
+        "diagnostic tools before mutations. Use planning tools for audience or "
+        "targeting questions. Ask for confirmation before spend-affecting "
+        "changes. Treat all ids as strings and prefer ranked outputs when "
+        "deciding what to optimize."
     ),
     mask_error_details=False,
 )
-

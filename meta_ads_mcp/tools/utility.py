@@ -16,8 +16,10 @@ TOOL_GROUPS = {
         "get_adset",
         "list_ads",
         "get_ad",
+        "list_audiences",
+        "list_creatives",
     ],
-    "insights": [
+    "analysis": [
         "get_entity_insights",
         "get_performance_breakdown",
         "compare_time_ranges",
@@ -37,8 +39,7 @@ TOOL_GROUPS = {
         "get_learning_phase_report",
         "get_recommendations",
     ],
-    "targeting": [
-        "list_audiences",
+    "planning": [
         "search_interests",
         "search_geo_locations",
         "estimate_audience_size",
@@ -58,13 +59,14 @@ TOOL_GROUPS = {
         "create_lookalike_audience",
         "update_custom_audience",
         "delete_audience",
-        "list_creatives",
         "create_ad_creative",
+        "update_creative",
+        "delete_creative",
+    ],
+    "creative_ops": [
         "preview_ad",
         "upload_creative_asset",
         "setup_ab_test",
-        "update_creative",
-        "delete_creative",
     ],
     "auth": [
         "generate_auth_url",
@@ -92,6 +94,51 @@ RESOURCE_URIS = [
     "meta://docs/v25-notes",
     "meta://docs/optimization-playbook",
 ]
+
+ROUTING_HINTS = {
+    "check_connectivity_or_auth": ["health_check"],
+    "discover_accounts_or_ids": [
+        "list_ad_accounts",
+        "list_campaigns",
+        "list_adsets",
+        "list_ads",
+    ],
+    "inspect_single_entity_performance": ["get_entity_insights", "get_performance_breakdown"],
+    "compare_multiple_entities": ["compare_performance"],
+    "compare_current_vs_previous_window": ["compare_time_ranges"],
+    "export_reporting_data": ["export_insights", "create_async_insights_report", "get_async_insights_report"],
+    "find_optimization_opportunities": [
+        "get_account_optimization_snapshot",
+        "get_campaign_optimization_snapshot",
+        "get_budget_pacing_report",
+        "get_creative_fatigue_report",
+        "get_delivery_risk_report",
+        "get_recommendations",
+    ],
+    "plan_targeting_or_audiences": [
+        "search_interests",
+        "search_geo_locations",
+        "estimate_audience_size",
+        "get_reach_frequency_predictions",
+        "list_audiences",
+    ],
+    "creative_workflows": [
+        "list_creatives",
+        "preview_ad",
+        "upload_creative_asset",
+        "create_ad_creative",
+    ],
+    "writes_after_confirmation": [
+        "set_campaign_status",
+        "set_adset_status",
+        "set_ad_status",
+        "update_campaign_budget",
+        "update_adset_budget",
+        "create_campaign",
+        "update_campaign",
+        "create_ad_set",
+    ],
+}
 
 
 @mcp_server.tool()
@@ -159,10 +206,12 @@ async def get_capabilities() -> dict[str, object]:
             ],
         },
         "tool_groups": TOOL_GROUPS,
+        "routing_hints": ROUTING_HINTS,
         "resources": RESOURCE_URIS,
         "notes": [
             "Use discovery and diagnostics before write operations.",
-            "compare_performance and export_insights are convenience wrappers over the core insights surface.",
+            "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
+            "export_insights is a convenience wrapper over the core insights surface.",
             "Write operations still depend on the token having ads_management-level permissions.",
         ],
     }

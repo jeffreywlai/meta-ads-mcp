@@ -64,6 +64,32 @@ def test_compare_performance_ranks_multiple_objects(monkeypatch) -> None:
     assert result["summary"]["rankings"]["cpc"][0]["object_id"] == "cmp_2"
 
 
+def test_compare_performance_uses_name_from_insights_rows(monkeypatch) -> None:
+    async def fake_get_entity_insights(*, object_id: str, **_: object) -> dict[str, object]:
+        return {
+            "items": [
+                {
+                    "campaign_id": object_id,
+                    "campaign_name": f"Campaign {object_id}",
+                    "metrics": {"spend": 100.0, "roas": 2.0},
+                }
+            ],
+            "summary": {"count": 1, "metrics": {"spend": 100.0, "roas": 2.0}},
+        }
+
+    async def fail_object_name(_: str) -> str:
+        raise AssertionError("_object_name should not be called when the insights row already has a name")
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    monkeypatch.setattr(insights, "_object_name", fail_object_name)
+
+    result = asyncio.run(
+        insights.compare_performance(level="campaign", object_ids=["cmp_1"], fields=["spend"])
+    )
+
+    assert result["items"][0]["object_name"] == "Campaign cmp_1"
+
+
 def test_export_insights_supports_json_and_csv(monkeypatch) -> None:
     async def fake_get_entity_insights(**_: object) -> dict[str, object]:
         return {

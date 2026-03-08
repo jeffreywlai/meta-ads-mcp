@@ -51,6 +51,20 @@ DEFAULT_COMPARE_METRICS = [
 
 LOWER_IS_BETTER_METRICS = {"cpc", "cpm", "cpa", "cpp", "cost_per_result", "spend"}
 
+NAME_FIELD_BY_LEVEL = {
+    "account": "account_name",
+    "campaign": "campaign_name",
+    "adset": "adset_name",
+    "ad": "ad_name",
+}
+
+ID_FIELD_BY_LEVEL = {
+    "account": "account_id",
+    "campaign": "campaign_id",
+    "adset": "adset_id",
+    "ad": "ad_id",
+}
+
 
 def _build_date_params(
     *,
@@ -145,6 +159,37 @@ async def _object_name(object_id: str) -> str | None:
     return str(name) if name is not None else None
 
 
+def _comparison_fields(level: str, fields: list[str] | None) -> list[str] | None:
+    """Ensure comparison requests can resolve names without extra lookups when possible."""
+    if fields is None:
+        return None
+    required_fields = [field for field in (NAME_FIELD_BY_LEVEL.get(level), ID_FIELD_BY_LEVEL.get(level)) if field]
+    combined: list[str] = []
+    for field in [*fields, *required_fields]:
+        if field not in combined:
+            combined.append(field)
+    return combined
+
+
+def _extract_object_name(level: str, items: list[dict[str, Any]], object_id: str) -> str | None:
+    """Read the object's display name from insights rows when available."""
+    name_field = NAME_FIELD_BY_LEVEL.get(level)
+    id_field = ID_FIELD_BY_LEVEL.get(level)
+    if not name_field:
+        return None
+    for item in items:
+        if id_field and str(item.get(id_field) or "") not in {"", object_id}:
+            continue
+        value = item.get(name_field)
+        if value:
+            return str(value)
+    for item in items:
+        value = item.get(name_field)
+        if value:
+            return str(value)
+    return None
+
+
 async def _comparison_row(
     *,
     level: str,
@@ -166,15 +211,16 @@ async def _comparison_row(
             date_preset=date_preset,
             since=since,
             until=until,
-            fields=fields,
+            fields=_comparison_fields(level, fields),
             breakdowns=breakdowns,
             action_breakdowns=action_breakdowns,
             time_increment=time_increment,
             limit=limit,
         )
+        object_name = _extract_object_name(level, payload.get("items", []), object_id)
         return {
             "object_id": object_id,
-            "object_name": await _object_name(object_id) or object_id,
+            "object_name": object_name or await _object_name(object_id) or object_id,
             "metrics": payload["summary"]["metrics"],
             "record_count": payload["summary"]["count"],
         }

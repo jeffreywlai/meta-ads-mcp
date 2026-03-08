@@ -41,5 +41,6 @@ def test_health_check_reports_missing_token(monkeypatch) -> None:
 def test_get_capabilities_lists_new_helpers() -> None:
     result = asyncio.run(utility.get_capabilities())
     assert "health_check" in result["tool_groups"]["utility"]
-    assert "compare_performance" in result["tool_groups"]["insights"]
-    assert "export_insights" in result["tool_groups"]["insights"]
+    assert "compare_performance" in result["tool_groups"]["analysis"]
+    assert "export_insights" in result["tool_groups"]["analysis"]
+    assert result["routing_hints"]["compare_multiple_entities"] == ["compare_performance"]
