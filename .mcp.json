@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "MetaAds": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${META_ADS_MCP_DIR}",
+        "-m",
+        "meta_ads_mcp.stdio"
+      ],
+      "env": {
+        "META_ACCESS_TOKEN": "${META_ACCESS_TOKEN}",
+        "META_DEFAULT_ACCOUNT_ID": "${META_DEFAULT_ACCOUNT_ID}"
+      }
+    }
+  }
+}
+

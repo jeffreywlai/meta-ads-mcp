@@ -1,0 +1,42 @@
+[project]
+name = "meta-ads-fastmcp"
+version = "0.1.0"
+description = "Optimization-first FastMCP server for Meta Ads."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "Jeff Lai" }
+]
+license = "MIT"
+dependencies = [
+  "fastmcp==2.14.5",
+  "mcp>=1.26.0",
+  "httpx[http2]>=0.28.1",
+  "pydantic>=2.10.0",
+  "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+run-meta-ads-mcp = "meta_ads_mcp.stdio:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"meta_ads_mcp" = ["context/*.md"]
