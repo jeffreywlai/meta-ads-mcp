@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import (
@@ -11,17 +10,14 @@ from meta_ads_mcp.diagnostics import (
     compare_metric_sets,
     detect_snapshot_findings,
     metric_evidence,
-    previous_window,
     rank_rows,
 )
-from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tools.insights import (
     DEFAULT_INSIGHTS_FIELDS,
     _aggregate_metrics,
     _insights_params,
     _normalize_rows,
-    compare_time_ranges,
     get_entity_insights,
 )
 
@@ -341,4 +337,3 @@ async def get_learning_phase_report(
         missing_signals=["Learning-phase state is not always exposed consistently across objects."],
         extra={"item": item},
     )
-

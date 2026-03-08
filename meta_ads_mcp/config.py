@@ -25,6 +25,7 @@ class Settings:
     default_account_id: str | None
     app_id: str | None
     app_secret: str | None
+    redirect_uri: str | None
     log_level: str
     host: str
     port: int
@@ -41,6 +42,7 @@ def get_settings() -> Settings:
         default_account_id=os.getenv("META_DEFAULT_ACCOUNT_ID"),
         app_id=os.getenv("META_APP_ID"),
         app_secret=os.getenv("META_APP_SECRET"),
+        redirect_uri=os.getenv("META_REDIRECT_URI"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         host=os.getenv("FASTMCP_HOST", "127.0.0.1"),
         port=int(os.getenv("FASTMCP_PORT", "8000")),
@@ -53,4 +55,3 @@ def reload_settings() -> Settings:
     """Clear and rebuild cached settings for tests."""
     get_settings.cache_clear()
     return get_settings()
-

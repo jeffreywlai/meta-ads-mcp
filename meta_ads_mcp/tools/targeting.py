@@ -28,7 +28,7 @@ async def search_interests(
 ) -> dict[str, Any]:
     """Search interest targeting options."""
     client = get_graph_api_client()
-    payload = await client.search_interests(_resolve_account_id(account_id), query=query, limit=limit)
+    payload = await client.search_interests(query=query, limit=limit)
     return normalize_collection(payload)
 
 
@@ -69,4 +69,3 @@ async def get_reach_frequency_predictions(
     client = get_graph_api_client()
     payload = await client.get_reach_frequency_predictions(_resolve_account_id(account_id), limit=limit)
     return normalize_collection(payload)
-

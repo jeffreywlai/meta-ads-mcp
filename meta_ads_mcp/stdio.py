@@ -3,9 +3,25 @@
 from __future__ import annotations
 
 from .coordinator import mcp_server
-from .tools import diagnostics, discovery, docs, execution, insights, recommendations, targeting
+from .tools import (
+    audiences,
+    auth_tools,
+    campaigns,
+    creatives,
+    diagnostics,
+    discovery,
+    docs,
+    execution,
+    insights,
+    recommendations,
+    targeting,
+)
 
 TOOLS = [
+    audiences,
+    auth_tools,
+    campaigns,
+    creatives,
     diagnostics,
     discovery,
     docs,
@@ -23,4 +39,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
 
-from .auth import build_auth_headers
+from .auth import build_app_access_token, build_auth_headers
 from .config import Settings, get_settings
 from .errors import (
     AsyncJobError,
@@ -39,6 +40,21 @@ class GraphAPIClient:
         """Return the base Graph API URL."""
         return f"https://graph.facebook.com/{self.settings.api_version}"
 
+    @staticmethod
+    def _encode_value(value: Any) -> Any:
+        """Convert Graph payload values into transport-safe forms."""
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, (list, dict)):
+            return json.dumps(value)
+        return value
+
+    def _encode_mapping(self, mapping: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Encode dict/list/bool values for querystring or form data."""
+        if mapping is None:
+            return None
+        return {key: self._encode_value(value) for key, value in mapping.items()}
+
     async def request(
         self,
         method: str,
@@ -46,23 +62,30 @@ class GraphAPIClient:
         *,
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        base_url: str | None = None,
+        use_auth_header: bool = True,
     ) -> dict[str, Any]:
         """Make a Graph API request with basic retries."""
-        headers = {
-            **build_auth_headers(self.access_token_override, settings=self.settings),
-            "User-Agent": USER_AGENT,
-        }
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        headers = {"User-Agent": USER_AGENT}
+        if use_auth_header:
+            headers.update(
+                build_auth_headers(self.access_token_override, settings=self.settings)
+            )
+        url = f"{(base_url or self.base_url).rstrip('/')}/{endpoint.lstrip('/')}"
         retries = self.settings.max_retries + 1
+        encoded_params = self._encode_mapping(params)
+        encoded_data = self._encode_mapping(data)
 
         async with httpx.AsyncClient(timeout=self.settings.request_timeout) as client:
             for attempt in range(retries):
                 response = await client.request(
                     method=method,
                     url=url,
-                    params=params,
-                    data=data,
+                    params=encoded_params,
+                    data=encoded_data,
                     headers=headers,
+                    files=files,
                 )
                 if response.status_code == 429:
                     if attempt + 1 < retries:
@@ -76,7 +99,26 @@ class GraphAPIClient:
                         await asyncio.sleep(2**attempt)
                         continue
 
-                payload = response.json()
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {
+                        "text_response": response.text,
+                        "content_type": response.headers.get("content-type"),
+                        "status_code": response.status_code,
+                    }
+                    if response.is_error:
+                        raise MetaApiError(
+                            message="Non-JSON error response from Meta API",
+                            status_code=response.status_code,
+                            details=payload,
+                        )
+                    return payload
+
+                if isinstance(payload, bool):
+                    payload = {"success": payload}
+                elif isinstance(payload, list):
+                    payload = {"data": payload}
                 if response.is_error or "error" in payload:
                     error = MetaApiError.from_payload(payload, status_code=response.status_code)
                     if error.status_code == 400 and error.code == 100:
@@ -122,6 +164,21 @@ class GraphAPIClient:
         """Send an object update."""
         return await self.request("POST", object_id, data=data)
 
+    async def create_edge_object(
+        self,
+        parent_id: str,
+        edge: str,
+        *,
+        data: dict[str, Any],
+        files: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create an object on a collection edge."""
+        return await self.request("POST", f"{parent_id}/{edge}", data=data, files=files)
+
+    async def delete_object(self, object_id: str) -> dict[str, Any]:
+        """Delete an object."""
+        return await self.request("DELETE", object_id)
+
     async def get_insights(
         self,
         object_id: str,
@@ -158,7 +215,16 @@ class GraphAPIClient:
         """Poll report status and fetch results when complete."""
         status = await self.get_object(
             report_run_id,
-            fields=["id", "async_status", "async_percent_completion"],
+            fields=[
+                "id",
+                "async_status",
+                "async_percent_completion",
+                "error_code",
+                "error_message",
+                "error_subcode",
+                "error_user_title",
+                "error_user_msg",
+            ],
         )
         if status.get("async_status") not in {"Job Completed", "COMPLETED"}:
             return {"status": status, "rows": []}
@@ -173,15 +239,14 @@ class GraphAPIClient:
 
     async def search_interests(
         self,
-        account_id: str,
         *,
         query: str,
         limit: int = 25,
     ) -> dict[str, Any]:
         """Search targeting interests."""
-        return await self.list_objects(
-            normalize_account_id(account_id),
-            "targetingsearch",
+        return await self.request(
+            "GET",
+            "search",
             params={"q": query, "type": "adinterest", "limit": limit},
         )
 
@@ -245,6 +310,95 @@ class GraphAPIClient:
             "recommendations",
             params=params,
         )
+
+    async def oauth_access_token(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Exchange OAuth credentials or codes for access tokens."""
+        return await self.request(
+            "GET",
+            "oauth/access_token",
+            params=params,
+            base_url=self.base_url,
+            use_auth_header=False,
+        )
+
+    async def debug_token(
+        self,
+        *,
+        input_token: str,
+        debug_access_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Inspect token metadata via debug_token."""
+        params = {
+            "input_token": input_token,
+            "access_token": debug_access_token
+            or build_app_access_token(settings=self.settings),
+        }
+        return await self.request("GET", "debug_token", params=params, use_auth_header=False)
+
+    async def generate_system_user_token(
+        self,
+        system_user_id: str,
+        *,
+        business_app: str,
+        scope: list[str],
+        access_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Request a system user token."""
+        headers = build_auth_headers(access_token or self.access_token_override, settings=self.settings)
+        return await self.request(
+            "POST",
+            f"{system_user_id}/access_tokens",
+            data={"business_app": business_app, "scope": scope},
+            use_auth_header=False,
+            params={"access_token": headers["Authorization"].split(" ", 1)[1]},
+        )
+
+    async def preview_ad(
+        self,
+        *,
+        ad_id: str | None = None,
+        account_id: str | None = None,
+        creative_id: str | None = None,
+        creative: dict[str, Any] | None = None,
+        ad_format: str = "DESKTOP_FEED_STANDARD",
+    ) -> dict[str, Any]:
+        """Generate an ad preview from an ad or creative."""
+        if ad_id:
+            return await self.list_objects(ad_id, "previews", params={"ad_format": ad_format})
+        if not account_id:
+            raise UnsupportedFeatureError("account_id is required when previewing from creative input.")
+        params: dict[str, Any] = {"ad_format": ad_format}
+        if creative_id:
+            params["creative_id"] = creative_id
+        if creative:
+            params["creative"] = creative
+        return await self.request(
+            "GET",
+            f"{normalize_account_id(account_id)}/generatepreviews",
+            params=params,
+        )
+
+    async def upload_ad_image(
+        self,
+        account_id: str,
+        *,
+        file_path: str | None = None,
+        image_url: str | None = None,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload an image asset for creative use."""
+        if bool(file_path) == bool(image_url):
+            raise UnsupportedFeatureError("Provide exactly one of file_path or image_url.")
+        data: dict[str, Any] = {}
+        files: dict[str, Any] | None = None
+        if image_url:
+            data["url"] = image_url
+        if file_path:
+            path = Path(file_path).expanduser()
+            files = {"filename": (path.name, path.read_bytes())}
+        if name:
+            data["name"] = name
+        return await self.create_edge_object(normalize_account_id(account_id), "adimages", data=data, files=files)
 
 
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:
