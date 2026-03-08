@@ -33,6 +33,32 @@ async def search_interests(
 
 
 @mcp_server.tool()
+async def get_interest_suggestions(
+    interest_list: list[str],
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Get related interest suggestions for seed interests."""
+    if not interest_list:
+        raise ValidationError("interest_list must contain at least one interest.")
+    client = get_graph_api_client()
+    payload = await client.get_interest_suggestions(interest_list=interest_list, limit=limit)
+    return normalize_collection(payload)
+
+
+@mcp_server.tool()
+async def validate_interests(
+    interest_list: list[str] | None = None,
+    interest_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Validate interest names or ids against Meta's targeting catalog."""
+    if not interest_list and not interest_ids:
+        raise ValidationError("Provide interest_list or interest_ids.")
+    client = get_graph_api_client()
+    payload = await client.validate_interests(interest_list=interest_list, interest_ids=interest_ids)
+    return normalize_collection(payload)
+
+
+@mcp_server.tool()
 async def search_geo_locations(
     query: str,
     location_types: list[str] | None = None,
@@ -41,6 +67,39 @@ async def search_geo_locations(
     """Search geo targeting options."""
     client = get_graph_api_client()
     payload = await client.search_geo_locations(query=query, location_types=location_types, limit=limit)
+    return normalize_collection(payload)
+
+
+@mcp_server.tool()
+async def search_behaviors(
+    query: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Search behavior-based targeting categories."""
+    client = get_graph_api_client()
+    payload = await client.search_targeting_categories(
+        category_class="behaviors",
+        query=query,
+        limit=limit,
+    )
+    return normalize_collection(payload)
+
+
+@mcp_server.tool()
+async def search_demographics(
+    demographic_class: str = "demographics",
+    query: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Search demographic targeting categories."""
+    if not demographic_class:
+        raise ValidationError("demographic_class is required.")
+    client = get_graph_api_client()
+    payload = await client.search_targeting_categories(
+        category_class=demographic_class,
+        query=query,
+        limit=limit,
+    )
     return normalize_collection(payload)
 
 

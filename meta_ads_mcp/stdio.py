@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .coordinator import mcp_server
 from .tools import (
+    ads,
     audiences,
     auth_tools,
     campaigns,
@@ -14,11 +15,13 @@ from .tools import (
     execution,
     insights,
     recommendations,
+    research,
     targeting,
     utility,
 )
 
 TOOLS = [
+    ads,
     audiences,
     auth_tools,
     campaigns,
@@ -29,6 +32,7 @@ TOOLS = [
     execution,
     insights,
     recommendations,
+    research,
     targeting,
     utility,
 ]

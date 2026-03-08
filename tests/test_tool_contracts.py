@@ -14,6 +14,7 @@ from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.tools import (
+    ads,
     audiences,
     auth_tools,
     campaigns,
@@ -23,6 +24,7 @@ from meta_ads_mcp.tools import (
     execution,
     insights,
     recommendations,
+    research,
     targeting,
     utility,
 )
@@ -60,12 +62,15 @@ SAMPLE_INSIGHTS_ROW = {
 
 TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "create_campaign": {"daily_budget": 50.0},
+    "create_ad": {"bid_amount": 12.34},
     "create_ad_set": {"daily_budget": 25.0},
     "create_custom_audience": {"customer_file_source": "USER_PROVIDED_ONLY"},
     "create_lookalike_audience": {"country": "US", "ratio": 0.02},
     "list_campaigns": {"account_id": "123"},
     "list_adsets": {"account_id": "123"},
     "list_ads": {"account_id": "123"},
+    "get_interest_suggestions": {"interest_list": ["running"]},
+    "validate_interests": {"interest_list": ["running"]},
     "preview_ad": {"ad_id": "ad_123"},
     "upload_creative_asset": {"image_url": "https://example.com/image.png"},
     "update_campaign": {"name": "Updated Campaign"},
@@ -90,6 +95,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "export_insights": {"format": "json"},
     "create_async_insights_report": {"fields": ["spend", "impressions"]},
     "get_async_insights_report": {"fields": ["spend", "impressions"]},
+    "search_ads_archive": {"ad_reached_countries": ["US"]},
 }
 
 
@@ -122,6 +128,17 @@ class UniversalFakeClient:
                         "objective": "OUTCOME_SALES",
                         "daily_budget": "5000",
                         "currency": "USD",
+                    }
+                ]
+            }
+        if edge in {"assigned_pages", "client_pages", "accounts"}:
+            return {
+                "data": [
+                    {
+                        "id": "page_123",
+                        "name": "Test Page",
+                        "category": "Retail",
+                        "link": "https://facebook.com/test-page",
                     }
                 ]
             }
@@ -179,17 +196,33 @@ class UniversalFakeClient:
                     }
                 ]
             }
+        if edge == "previews":
+            return {"data": [{"body": "<html>preview</html>"}]}
         if edge == "reachfrequencypredictions":
             return {"data": [{"id": "rf_123", "status": 1, "daily_impression_curve": []}]}
         if edge == "recommendations":
             return {"data": [{"id": "rec_123", "message": "Increase budget"}]}
-        if edge == "previews":
-            return {"data": [{"body": "<html>preview</html>"}]}
         if edge == "insights":
             return {"data": [SAMPLE_INSIGHTS_ROW]}
         return {"data": [{"id": f"{edge}_123", "name": f"{edge} item"}]}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
+        if object_id == "ad_123":
+            return {
+                "id": "ad_123",
+                "name": "Ad 123",
+                "account_id": "act_123",
+                "creative": {"id": "crt_123", "name": "Creative 123"},
+            }
+        if object_id == "crt_123":
+            return {
+                "id": "crt_123",
+                "name": "Creative 123",
+                "image_hash": "hash_123",
+                "thumbnail_url": "https://example.com/thumb.png",
+                "asset_feed_spec": {"images": [{"hash": "hash_456", "url": "https://example.com/feed.png"}]},
+                "object_story_spec": {"link_data": {"picture": "https://example.com/story.png"}},
+            }
         payload = {
             "id": object_id,
             "name": f"Object {object_id}",
@@ -249,8 +282,26 @@ class UniversalFakeClient:
     async def search_interests(self, *, query: str, limit: int = 25):
         return {"data": [{"id": "int_123", "name": query}]}
 
+    async def get_interest_suggestions(self, *, interest_list, limit: int = 25):
+        return {"data": [{"id": "int_suggestion_123", "name": interest_list[0]}]}
+
+    async def validate_interests(self, *, interest_list=None, interest_ids=None):
+        return {
+            "data": [
+                {
+                    "id": "int_valid_123",
+                    "valid": True,
+                    "interest_list": interest_list,
+                    "interest_ids": interest_ids,
+                }
+            ]
+        }
+
     async def search_geo_locations(self, *, query: str, location_types=None, limit: int = 25):
         return {"data": [{"key": "geo_123", "name": query, "type": "country"}]}
+
+    async def search_targeting_categories(self, *, category_class: str, query: str | None = None, limit: int = 25):
+        return {"data": [{"id": "cat_123", "name": query or category_class, "class": category_class}]}
 
     async def estimate_audience_size(self, account_id: str, *, targeting_spec, optimization_goal=None):
         return {"data": [{"users": 12345, "estimate_mau": 12000, "estimate_dau": 4000}]}
@@ -292,11 +343,43 @@ class UniversalFakeClient:
     async def upload_ad_image(self, account_id: str, **kwargs):
         return {"account_id": account_id, "images": {"image.png": {"hash": "hash_123"}}, "request": kwargs}
 
+    async def get_ad_images_by_hashes(self, account_id: str, *, hashes, fields=None):
+        return {
+            "data": [
+                {"hash": image_hash, "url": f"https://cdn.example.com/{image_hash}.png"}
+                for image_hash in hashes
+            ]
+        }
+
+    async def search_ads_archive(
+        self,
+        *,
+        search_terms: str,
+        ad_reached_countries,
+        ad_type: str = "ALL",
+        limit: int = 25,
+        fields=None,
+    ):
+        return {
+            "data": [
+                {
+                    "id": "archive_123",
+                    "page_name": "Competitor",
+                    "ad_snapshot_url": "https://facebook.com/ads/library",
+                    "search_terms": search_terms,
+                    "ad_reached_countries": ad_reached_countries,
+                    "ad_type": ad_type,
+                    "fields": fields,
+                }
+            ]
+        }
+
 
 def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
     """Patch all client factories to return a single fake client."""
     client = UniversalFakeClient()
     for module in [
+        ads,
         audiences,
         auth_tools,
         campaigns,
@@ -306,6 +389,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         execution,
         insights,
         recommendations,
+        research,
         targeting,
         utility,
     ]:
@@ -421,6 +505,8 @@ def _required_value(param_name: str) -> Any:
         "creative_id": "crt_123",
         "audience_id": "aud_123",
         "origin_audience_id": "aud_origin_123",
+        "interest_list": ["running"],
+        "ad_reached_countries": ["US"],
         "system_user_id": "sys_123",
         "report_run_id": "rpt_123",
         "owner_id": "act_123",
@@ -434,6 +520,7 @@ def _required_value(param_name: str) -> Any:
         "targeting": SAMPLE_TARGETING,
         "targeting_spec": SAMPLE_TARGETING,
         "query": "running",
+        "search_terms": "shirts",
         "code": "oauth_code",
         "scope": ["ads_management"],
         "status": "PAUSED",
@@ -526,6 +613,7 @@ def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) 
         ),
         (creatives.preview_ad, {}),
         (creatives.upload_creative_asset, {"account_id": "123"}),
+        (ads.create_ad, {"account_id": "123", "name": "Bad Ad", "adset_id": "adset_123", "creative_id": "crt_123", "status": "DELETED"}),
         (diagnostics.get_creative_performance_report, {}),
         (diagnostics.get_creative_fatigue_report, {}),
         (diagnostics.get_delivery_risk_report, {}),
@@ -551,6 +639,9 @@ def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) 
         ),
         (execution.update_campaign_budget, {"campaign_id": "cmp_123"}),
         (execution.set_campaign_status, {"campaign_id": "cmp_123", "status": "DELETED"}),
+        (targeting.get_interest_suggestions, {"interest_list": []}),
+        (targeting.validate_interests, {}),
+        (research.search_ads_archive, {"search_terms": "shirts", "ad_reached_countries": []}),
     ],
 )
 def test_edge_case_validations_raise(monkeypatch: pytest.MonkeyPatch, fn, kwargs: dict[str, Any]) -> None:

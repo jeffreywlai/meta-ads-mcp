@@ -6,9 +6,10 @@ from typing import Any
 
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaApiError, NotFoundError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import normalize_budget_value, normalize_collection
+from meta_ads_mcp.schemas import collection_response
 
 ACCOUNT_FIELDS = [
     "id",
@@ -59,6 +60,15 @@ AD_FIELDS = [
     "creative",
 ]
 
+PAGE_FIELDS = [
+    "id",
+    "name",
+    "category",
+    "link",
+    "tasks",
+    "instagram_business_account",
+]
+
 
 def _resolve_account_id(account_id: str | None) -> str:
     """Resolve an ad account id, using the default when omitted."""
@@ -84,6 +94,14 @@ def _status_filter(effective_status: list[str] | None) -> dict[str, Any]:
     if not effective_status:
         return {}
     return {"effective_status": effective_status}
+
+
+def _page_params(limit: int, after: str | None) -> dict[str, Any]:
+    """Build pagination params for page discovery."""
+    params: dict[str, Any] = {"limit": limit}
+    if after:
+        params["after"] = after
+    return params
 
 
 @mcp_server.tool()
@@ -200,3 +218,54 @@ async def get_ad(ad_id: str, include_creative_summary: bool = False) -> dict[str
     ad = await client.get_object(ad_id, fields=fields)
     return {"item": ad, "summary": {"count": 1}}
 
+
+@mcp_server.tool()
+async def get_account_pages(
+    account_id: str = "me",
+    limit: int = 50,
+    after: str | None = None,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """List pages available for creative and ad setup workflows."""
+    client = get_graph_api_client()
+    requested_fields = fields or PAGE_FIELDS
+    params = _page_params(limit, after)
+
+    if account_id == "me":
+        payload = await client.list_objects("me", "accounts", fields=requested_fields, params=params)
+        normalized = normalize_collection(payload)
+        normalized["summary"].update({"source": "accounts", "source_attempts": ["accounts"]})
+        return normalized
+
+    normalized_account_id = normalize_account_id(account_id)
+    attempted_edges: list[str] = []
+    last_error: Exception | None = None
+    empty_result: dict[str, Any] | None = None
+
+    for edge in ("assigned_pages", "client_pages"):
+        attempted_edges.append(edge)
+        try:
+            payload = await client.list_objects(
+                normalized_account_id,
+                edge,
+                fields=requested_fields,
+                params=params,
+            )
+        except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+            last_error = exc
+            continue
+        normalized = normalize_collection(payload)
+        if normalized["items"]:
+            normalized["summary"].update({"source": edge, "source_attempts": attempted_edges[:]})
+            return normalized
+        empty_result = normalized
+
+    if empty_result is not None:
+        empty_result["summary"].update({"source": None, "source_attempts": attempted_edges})
+        return empty_result
+    if last_error is not None:
+        raise last_error
+    return collection_response(
+        [],
+        summary={"count": 0, "source": None, "source_attempts": attempted_edges},
+    )

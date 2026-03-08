@@ -10,6 +10,7 @@ TOOL_GROUPS = {
     "discovery": [
         "list_ad_accounts",
         "get_ad_account",
+        "get_account_pages",
         "list_campaigns",
         "get_campaign",
         "list_adsets",
@@ -41,7 +42,11 @@ TOOL_GROUPS = {
     ],
     "planning": [
         "search_interests",
+        "get_interest_suggestions",
+        "validate_interests",
         "search_geo_locations",
+        "search_behaviors",
+        "search_demographics",
         "estimate_audience_size",
         "get_reach_frequency_predictions",
     ],
@@ -60,13 +65,18 @@ TOOL_GROUPS = {
         "update_custom_audience",
         "delete_audience",
         "create_ad_creative",
+        "create_ad",
         "update_creative",
         "delete_creative",
     ],
     "creative_ops": [
+        "get_ad_image",
         "preview_ad",
         "upload_creative_asset",
         "setup_ab_test",
+    ],
+    "research": [
+        "search_ads_archive",
     ],
     "auth": [
         "generate_auth_url",
@@ -99,6 +109,7 @@ ROUTING_HINTS = {
     "check_connectivity_or_auth": ["health_check"],
     "discover_accounts_or_ids": [
         "list_ad_accounts",
+        "get_account_pages",
         "list_campaigns",
         "list_adsets",
         "list_ads",
@@ -117,17 +128,25 @@ ROUTING_HINTS = {
     ],
     "plan_targeting_or_audiences": [
         "search_interests",
+        "get_interest_suggestions",
+        "validate_interests",
         "search_geo_locations",
+        "search_behaviors",
+        "search_demographics",
         "estimate_audience_size",
         "get_reach_frequency_predictions",
         "list_audiences",
     ],
     "creative_workflows": [
+        "get_account_pages",
         "list_creatives",
+        "get_ad_image",
         "preview_ad",
         "upload_creative_asset",
         "create_ad_creative",
+        "create_ad",
     ],
+    "research_competitor_ads": ["search_ads_archive"],
     "writes_after_confirmation": [
         "set_campaign_status",
         "set_adset_status",
@@ -137,6 +156,7 @@ ROUTING_HINTS = {
         "create_campaign",
         "update_campaign",
         "create_ad_set",
+        "create_ad",
     ],
 }
 
@@ -212,6 +232,8 @@ async def get_capabilities() -> dict[str, object]:
             "Use discovery and diagnostics before write operations.",
             "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
             "export_insights is a convenience wrapper over the core insights surface.",
+            "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
+            "search_ads_archive is public research data and does not depend on an ad account id.",
             "Write operations still depend on the token having ads_management-level permissions.",
         ],
     }

@@ -250,6 +250,37 @@ class GraphAPIClient:
             params={"q": query, "type": "adinterest", "limit": limit},
         )
 
+    async def get_interest_suggestions(
+        self,
+        *,
+        interest_list: list[str],
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        """Fetch interest suggestions related to seed interests."""
+        return await self.request(
+            "GET",
+            "search",
+            params={
+                "type": "adinterestsuggestion",
+                "interest_list": interest_list,
+                "limit": limit,
+            },
+        )
+
+    async def validate_interests(
+        self,
+        *,
+        interest_list: list[str] | None = None,
+        interest_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate interest names or ids against Meta's targeting search."""
+        params: dict[str, Any] = {"type": "adinterestvalid"}
+        if interest_list:
+            params["interest_list"] = interest_list
+        if interest_ids:
+            params["interest_fbid_list"] = interest_ids
+        return await self.request("GET", "search", params=params)
+
     async def search_geo_locations(
         self,
         *,
@@ -265,6 +296,23 @@ class GraphAPIClient:
         }
         if location_types:
             params["location_types"] = ",".join(location_types)
+        return await self.request("GET", "search", params=params)
+
+    async def search_targeting_categories(
+        self,
+        *,
+        category_class: str,
+        query: str | None = None,
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        """Search targeting categories such as behaviors or demographics."""
+        params: dict[str, Any] = {
+            "type": "adTargetingCategory",
+            "class": category_class,
+            "limit": limit,
+        }
+        if query:
+            params["q"] = query
         return await self.request("GET", "search", params=params)
 
     async def estimate_audience_size(
@@ -399,6 +447,43 @@ class GraphAPIClient:
         if name:
             data["name"] = name
         return await self.create_edge_object(normalize_account_id(account_id), "adimages", data=data, files=files)
+
+    async def get_ad_images_by_hashes(
+        self,
+        account_id: str,
+        *,
+        hashes: list[str],
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve ad image hashes into hosted image metadata."""
+        params: dict[str, Any] = {"hashes": hashes}
+        if fields:
+            params["fields"] = ",".join(fields)
+        return await self.request(
+            "GET",
+            f"{normalize_account_id(account_id)}/adimages",
+            params=params,
+        )
+
+    async def search_ads_archive(
+        self,
+        *,
+        search_terms: str,
+        ad_reached_countries: list[str],
+        ad_type: str = "ALL",
+        limit: int = 25,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Search the public Ads Library / archive endpoint."""
+        params: dict[str, Any] = {
+            "search_terms": search_terms,
+            "ad_reached_countries": ad_reached_countries,
+            "ad_type": ad_type,
+            "limit": limit,
+        }
+        if fields:
+            params["fields"] = ",".join(fields)
+        return await self.request("GET", "ads_archive", params=params)
 
 
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:

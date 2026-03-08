@@ -43,4 +43,7 @@ def test_get_capabilities_lists_new_helpers() -> None:
     assert "health_check" in result["tool_groups"]["utility"]
     assert "compare_performance" in result["tool_groups"]["analysis"]
     assert "export_insights" in result["tool_groups"]["analysis"]
+    assert "get_account_pages" in result["tool_groups"]["discovery"]
+    assert "create_ad" in result["tool_groups"]["writes"]
+    assert "search_ads_archive" in result["tool_groups"]["research"]
     assert result["routing_hints"]["compare_multiple_entities"] == ["compare_performance"]

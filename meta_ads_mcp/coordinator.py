@@ -46,13 +46,15 @@ mcp_server = FastMCP(
     instructions=(
         "Optimization-first Meta Ads MCP server. Start with health_check if auth "
         "or connectivity is uncertain, then use list_ad_accounts and discovery "
-        "tools to find ids. For detailed reporting use get_entity_insights. For "
-        "multi-entity comparisons use compare_performance. For exports use "
-        "export_insights. For optimization questions prefer the snapshot and "
-        "diagnostic tools before mutations. Use planning tools for audience or "
-        "targeting questions. Ask for confirmation before spend-affecting "
-        "changes. Treat all ids as strings and prefer ranked outputs when "
-        "deciding what to optimize."
+        "tools to find ids. Use get_account_pages before creative creation when "
+        "a Page or Instagram-linked asset is needed. For detailed reporting use "
+        "get_entity_insights. For multi-entity comparisons use "
+        "compare_performance. For exports use export_insights. For optimization "
+        "questions prefer the snapshot and diagnostic tools before mutations. "
+        "Use planning tools for audience or targeting questions, and "
+        "search_ads_archive for public competitor/ad research. Ask for "
+        "confirmation before spend-affecting changes. Treat all ids as strings "
+        "and prefer ranked outputs when deciding what to optimize."
     ),
     mask_error_details=False,
 )
