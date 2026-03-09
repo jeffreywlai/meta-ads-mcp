@@ -5,6 +5,7 @@ from __future__ import annotations
 from importlib.resources import files
 
 from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.tools.utility import tool_routing_markdown
 
 
 def _read_doc(name: str) -> str:
@@ -34,6 +35,12 @@ def resource_v25_notes() -> str:
 def resource_optimization_playbook() -> str:
     """Return optimization playbook notes."""
     return _read_doc("optimization_playbook.md")
+
+
+@mcp_server.resource(uri="meta://docs/tool-routing")
+def resource_tool_routing() -> str:
+    """Return the compact tool-routing guide."""
+    return tool_routing_markdown()
 
 
 @mcp_server.tool()

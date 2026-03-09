@@ -10,7 +10,11 @@ from meta_ads_mcp.tools import recommendations
 class FakeRecommendationsClient:
     """Fake recommendations client."""
 
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def get_recommendations(self, account_id: str, *, campaign_id=None):
+        self.calls += 1
         return {
             "data": [
                 {"id": "rec_1", "message": "Increase budget on strong ad sets", "campaign_id": campaign_id},
@@ -23,6 +27,7 @@ class FakeRecommendationsClient:
 
 
 def test_get_recommendations_returns_supported_collection(monkeypatch) -> None:
+    recommendations._RECOMMENDATION_CACHE.clear()
     monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: FakeRecommendationsClient())
     result = asyncio.run(recommendations.get_recommendations(account_id="123", campaign_id="cmp_123"))
     assert result["supported"] is True
@@ -32,6 +37,7 @@ def test_get_recommendations_returns_supported_collection(monkeypatch) -> None:
 
 
 def test_typed_opportunity_tools_filter_by_category(monkeypatch) -> None:
+    recommendations._RECOMMENDATION_CACHE.clear()
     monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: FakeRecommendationsClient())
 
     budget = asyncio.run(recommendations.get_budget_opportunities(account_id="123"))
@@ -75,6 +81,7 @@ def test_get_recommendations_flattens_nested_recommendation_payloads(monkeypatch
                 ]
             }
 
+    recommendations._RECOMMENDATION_CACHE.clear()
     monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: NestedRecommendationsClient())
     result = asyncio.run(recommendations.get_recommendations(account_id="123"))
     bidding = asyncio.run(recommendations.get_bidding_opportunities(account_id="123"))
@@ -90,6 +97,7 @@ def test_get_recommendations_handles_unsupported_surface(monkeypatch) -> None:
         async def get_recommendations(self, account_id: str, *, campaign_id=None):
             raise recommendations.UnsupportedFeatureError("unsupported")
 
+    recommendations._RECOMMENDATION_CACHE.clear()
     monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: UnsupportedRecommendationsClient())
     result = asyncio.run(recommendations.get_recommendations(account_id="123"))
     assert result["supported"] is False
@@ -101,7 +109,32 @@ def test_typed_opportunity_tools_preserve_unsupported_surface(monkeypatch) -> No
         async def get_recommendations(self, account_id: str, *, campaign_id=None):
             raise recommendations.UnsupportedFeatureError("unsupported")
 
+    recommendations._RECOMMENDATION_CACHE.clear()
     monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: UnsupportedRecommendationsClient())
     result = asyncio.run(recommendations.get_budget_opportunities(account_id="123"))
     assert result["supported"] is False
     assert result["category"] == "budget"
+
+
+def test_recommendation_tools_reuse_short_lived_cache(monkeypatch) -> None:
+    recommendations._RECOMMENDATION_CACHE.clear()
+    client = FakeRecommendationsClient()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: client)
+
+    broad = asyncio.run(recommendations.get_recommendations(account_id="123"))
+    budget = asyncio.run(recommendations.get_budget_opportunities(account_id="123"))
+
+    assert broad["supported"] is True
+    assert budget["summary"]["filtered_from_total"] == 5
+    assert client.calls == 1
+
+
+def test_recommendation_refresh_bypasses_cache(monkeypatch) -> None:
+    recommendations._RECOMMENDATION_CACHE.clear()
+    client = FakeRecommendationsClient()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: client)
+
+    asyncio.run(recommendations.get_recommendations(account_id="123"))
+    asyncio.run(recommendations.get_budget_opportunities(account_id="123", refresh=True))
+
+    assert client.calls == 2

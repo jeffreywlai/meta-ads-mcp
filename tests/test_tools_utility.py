@@ -50,6 +50,24 @@ def test_get_capabilities_lists_new_helpers() -> None:
     assert "get_targeting_categories" in result["tool_groups"]["planning"]
     assert "get_budget_opportunities" in result["tool_groups"]["optimization"]
     assert "search_ads_archive" in result["tool_groups"]["research"]
-    assert result["routing_hints"]["compare_multiple_entities"] == ["compare_performance"]
+    assert result["routing_hints"]["compare_multiple_entities"][0] == "compare_performance"
     assert "get_bidding_opportunities" in result["routing_hints"]["find_optimization_opportunities"]
     assert any("Ads Library API access" in note for note in result["notes"])
+    assert "meta://docs/tool-routing" in result["resources"]
+
+
+def test_get_capabilities_can_return_compact_intent_guide() -> None:
+    result = asyncio.run(utility.get_capabilities(intent="find_optimization_opportunities"))
+    assert result["selected_intent"]["intent"] == "find_optimization_opportunities"
+    assert result["selected_intent"]["recommended_order"][0] == "get_account_optimization_snapshot"
+    assert "get_budget_opportunities" in result["selected_intent"]["avoid_unless_needed"]
+    assert "meta://docs/tool-routing" in result["resources"]
+
+
+def test_get_capabilities_rejects_unknown_intent() -> None:
+    try:
+        asyncio.run(utility.get_capabilities(intent="not_real"))
+    except utility.ValidationError as exc:
+        assert "Valid intents" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("Expected ValidationError for unknown intent")

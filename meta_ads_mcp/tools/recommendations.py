@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
+from time import monotonic
 
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import normalize_collection
+
+_RECOMMENDATION_CACHE_TTL_SECONDS = 15.0
+_RECOMMENDATION_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, object]]] = {}
 
 
 def _resolve_account_id(account_id: str | None) -> str:
@@ -111,26 +116,67 @@ def _normalize_recommendations(payload: dict[str, object]) -> dict[str, object]:
     return normalized
 
 
+def _cache_key(*, account_id: str, campaign_id: str | None) -> tuple[str, str, str]:
+    """Build a short-lived cache key scoped to the current token and target ids."""
+    return (
+        get_settings().access_token or "",
+        account_id,
+        campaign_id or "",
+    )
+
+
+def _get_cached_recommendations(key: tuple[str, str, str]) -> dict[str, object] | None:
+    """Return a deep-copied cached recommendation payload when it is still fresh."""
+    cached = _RECOMMENDATION_CACHE.get(key)
+    if cached is None:
+        return None
+    expires_at, payload = cached
+    if expires_at < monotonic():
+        _RECOMMENDATION_CACHE.pop(key, None)
+        return None
+    return deepcopy(payload)
+
+
+def _store_cached_recommendations(key: tuple[str, str, str], payload: dict[str, object]) -> None:
+    """Store a normalized recommendation payload for a short time."""
+    _RECOMMENDATION_CACHE[key] = (
+        monotonic() + _RECOMMENDATION_CACHE_TTL_SECONDS,
+        deepcopy(payload),
+    )
+
+
 async def _recommendation_collection(
     *,
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
     """Fetch recommendations and return a normalized supported/unsupported response."""
+    resolved_account_id = _resolve_account_id(account_id)
+    cache_key = _cache_key(account_id=resolved_account_id, campaign_id=campaign_id)
+    if not refresh:
+        cached = _get_cached_recommendations(cache_key)
+        if cached is not None:
+            return cached
+
     client = get_graph_api_client()
     try:
         payload = await client.get_recommendations(
-            _resolve_account_id(account_id),
+            resolved_account_id,
             campaign_id=campaign_id,
         )
     except UnsupportedFeatureError as exc:
-        return {
+        result = {
             "supported": False,
             "reason": str(exc),
             "items": [],
             "summary": {"count": 0, "category_counts": {}},
         }
-    return {"supported": True, **_normalize_recommendations(payload)}
+        _store_cached_recommendations(cache_key, result)
+        return result
+    result = {"supported": True, **_normalize_recommendations(payload)}
+    _store_cached_recommendations(cache_key, result)
+    return result
 
 
 async def _typed_opportunities(
@@ -138,9 +184,10 @@ async def _typed_opportunities(
     *,
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
     """Return one filtered opportunity category with stable summary metadata."""
-    result = await _recommendation_collection(account_id=account_id, campaign_id=campaign_id)
+    result = await _recommendation_collection(account_id=account_id, campaign_id=campaign_id, refresh=refresh)
     if not result["supported"]:
         return {**result, "category": category}
     items = [item for item in result["items"] if category in item.get("opportunity_categories", [])]
@@ -160,51 +207,57 @@ async def _typed_opportunities(
 async def get_recommendations(
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
-    """Use this when the user wants Meta-native recommendations or opportunity surfaces for an account or campaign."""
-    return await _recommendation_collection(account_id=account_id, campaign_id=campaign_id)
+    """Use this for a broad Meta-native opportunity scan. Prefer this once before category-specific opportunity tools."""
+    return await _recommendation_collection(account_id=account_id, campaign_id=campaign_id, refresh=refresh)
 
 
 @mcp_server.tool()
 async def get_budget_opportunities(
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
-    """Use this when the user specifically wants budget, spend, or scaling opportunities from Meta's recommendation surface."""
-    return await _typed_opportunities("budget", account_id=account_id, campaign_id=campaign_id)
+    """Use this only when the user specifically wants budget, spend, or scaling opportunities from Meta's recommendation surface."""
+    return await _typed_opportunities("budget", account_id=account_id, campaign_id=campaign_id, refresh=refresh)
 
 
 @mcp_server.tool()
 async def get_creative_opportunities(
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
-    """Use this when the user wants creative-specific opportunities such as asset, copy, or format improvements."""
-    return await _typed_opportunities("creative", account_id=account_id, campaign_id=campaign_id)
+    """Use this only when the user wants creative-specific opportunities such as asset, copy, or format improvements."""
+    return await _typed_opportunities("creative", account_id=account_id, campaign_id=campaign_id, refresh=refresh)
 
 
 @mcp_server.tool()
 async def get_audience_opportunities(
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
-    """Use this when the user wants audience or targeting opportunities rather than general recommendations."""
-    return await _typed_opportunities("audience", account_id=account_id, campaign_id=campaign_id)
+    """Use this only when the user wants audience or targeting opportunities rather than general recommendations."""
+    return await _typed_opportunities("audience", account_id=account_id, campaign_id=campaign_id, refresh=refresh)
 
 
 @mcp_server.tool()
 async def get_delivery_opportunities(
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
-    """Use this when the user wants delivery, reach, or learning-related opportunities from the recommendation surface."""
-    return await _typed_opportunities("delivery", account_id=account_id, campaign_id=campaign_id)
+    """Use this only when the user wants delivery, reach, or learning-related opportunities from the recommendation surface."""
+    return await _typed_opportunities("delivery", account_id=account_id, campaign_id=campaign_id, refresh=refresh)
 
 
 @mcp_server.tool()
 async def get_bidding_opportunities(
     account_id: str | None = None,
     campaign_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, object]:
-    """Use this when the user wants bid-cap, cost-cap, or bidding-strategy opportunities from Meta's recommendations."""
-    return await _typed_opportunities("bidding", account_id=account_id, campaign_id=campaign_id)
+    """Use this only when the user wants bid-cap, cost-cap, or bidding-strategy opportunities from Meta's recommendations."""
+    return await _typed_opportunities("bidding", account_id=account_id, campaign_id=campaign_id, refresh=refresh)
