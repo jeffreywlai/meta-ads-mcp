@@ -21,7 +21,7 @@ from .errors import (
 )
 
 USER_AGENT = "meta-ads-fastmcp/0.1.0"
-_CLIENT_POOL: dict[tuple[int, str, str | None, float], httpx.AsyncClient] = {}
+_CLIENT_POOL: dict[tuple[asyncio.AbstractEventLoop, str, str | None, float], httpx.AsyncClient] = {}
 
 
 def normalize_account_id(account_id: str) -> str:
@@ -74,11 +74,15 @@ class GraphAPIClient:
             return None
         return {key: self._encode_value(value) for key, value in mapping.items()}
 
-    def _client_key(self, *, base_url: str | None = None) -> tuple[int, str, str | None, float]:
+    def _client_key(
+        self,
+        *,
+        base_url: str | None = None,
+    ) -> tuple[asyncio.AbstractEventLoop, str, str | None, float]:
         """Build the shared-client pool key."""
-        loop_id = id(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
         return (
-            loop_id,
+            loop,
             (base_url or self.base_url).rstrip("/"),
             self.access_token_override or self.settings.access_token,
             self.settings.request_timeout,

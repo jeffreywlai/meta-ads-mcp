@@ -74,20 +74,48 @@ def _build_date_params(
     date_preset: str | None,
     since: str | None,
     until: str | None,
+    default_date_preset: str,
 ) -> dict[str, Any]:
     """Build a Graph API date filter."""
-    if date_preset and (since or until):
+    normalized_date_preset = date_preset.strip() if isinstance(date_preset, str) else date_preset
+    normalized_since = since.strip() if isinstance(since, str) else since
+    normalized_until = until.strip() if isinstance(until, str) else until
+    if normalized_date_preset == "":
+        normalized_date_preset = None
+    if normalized_since == "":
+        normalized_since = None
+    if normalized_until == "":
+        normalized_until = None
+
+    if normalized_date_preset and (normalized_since or normalized_until):
         raise ValidationError("Use date_preset or since/until, not both.")
-    if (since and not until) or (until and not since):
+    if (normalized_since and not normalized_until) or (normalized_until and not normalized_since):
         raise ValidationError("Provide both since and until.")
-    if since and until:
+    if normalized_since and normalized_until:
         try:
-            date.fromisoformat(since)
-            date.fromisoformat(until)
+            date.fromisoformat(normalized_since)
+            date.fromisoformat(normalized_until)
         except ValueError as exc:
             raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.") from exc
-        return {"time_range": json.dumps({"since": since, "until": until})}
-    return {"date_preset": date_preset or "last_7d"}
+        return {"time_range": json.dumps({"since": normalized_since, "until": normalized_until})}
+    return {"date_preset": normalized_date_preset or default_date_preset}
+
+
+def _normalize_date_inputs(
+    *,
+    date_preset: str | None,
+    since: str | None,
+    until: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Normalize blank optional date inputs to None for MCP callers."""
+    normalized_date_preset = date_preset.strip() if isinstance(date_preset, str) else date_preset
+    normalized_since = since.strip() if isinstance(since, str) else since
+    normalized_until = until.strip() if isinstance(until, str) else until
+    return (
+        normalized_date_preset or None,
+        normalized_since or None,
+        normalized_until or None,
+    )
 
 
 def _insights_params(
@@ -96,6 +124,7 @@ def _insights_params(
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    default_date_preset: str = "last_7d",
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
@@ -104,11 +133,21 @@ def _insights_params(
     limit: int = 100,
 ) -> dict[str, Any]:
     """Build insights params."""
+    date_preset, since, until = _normalize_date_inputs(
+        date_preset=date_preset,
+        since=since,
+        until=until,
+    )
     params: dict[str, Any] = {
         "level": level,
         "limit": limit,
         "use_unified_attribution_setting": str(use_unified_attribution_setting).lower(),
-        **_build_date_params(date_preset=date_preset, since=since, until=until),
+        **_build_date_params(
+            date_preset=date_preset,
+            since=since,
+            until=until,
+            default_date_preset=default_date_preset,
+        ),
     }
     if breakdowns:
         params["breakdowns"] = ",".join(breakdowns)
@@ -315,7 +354,7 @@ def _aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
 async def get_entity_insights(
     level: str,
     object_id: str,
-    date_preset: str | None = "last_7d",
+    date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
@@ -337,6 +376,7 @@ async def get_entity_insights(
             date_preset=date_preset,
             since=since,
             until=until,
+            default_date_preset="last_7d",
             breakdowns=breakdowns,
             action_breakdowns=action_breakdowns,
             time_increment=time_increment,
@@ -357,7 +397,7 @@ async def get_performance_breakdown(
     level: str,
     object_id: str,
     breakdown: str,
-    date_preset: str | None = "last_7d",
+    date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
@@ -440,7 +480,7 @@ async def compare_time_ranges(
 async def compare_performance(
     level: str,
     object_ids: list[str],
-    date_preset: str | None = "last_7d",
+    date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
@@ -496,7 +536,7 @@ async def export_insights(
     level: str,
     object_id: str,
     format: str = "json",
-    date_preset: str | None = "last_30d",
+    date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
@@ -515,12 +555,17 @@ async def export_insights(
         raise ValidationError("limit must be at least 1.")
     if inline_limit < 1:
         raise ValidationError("inline_limit must be at least 1.")
-    payload = await get_entity_insights(
-        level=level,
-        object_id=object_id,
+    normalized_date_preset, normalized_since, normalized_until = _normalize_date_inputs(
         date_preset=date_preset,
         since=since,
         until=until,
+    )
+    payload = await get_entity_insights(
+        level=level,
+        object_id=object_id,
+        date_preset=normalized_date_preset or ("last_30d" if not (normalized_since or normalized_until) else None),
+        since=normalized_since,
+        until=normalized_until,
         fields=fields,
         breakdowns=breakdowns,
         action_breakdowns=action_breakdowns,
@@ -567,7 +612,7 @@ async def export_insights(
 async def create_async_insights_report(
     level: str,
     object_id: str,
-    date_preset: str | None = "last_7d",
+    date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
@@ -588,6 +633,7 @@ async def create_async_insights_report(
             date_preset=date_preset,
             since=since,
             until=until,
+            default_date_preset="last_7d",
             breakdowns=breakdowns,
             action_breakdowns=action_breakdowns,
             time_increment=time_increment,

@@ -130,6 +130,36 @@ def test_live_active_spend_account_insights(monkeypatch: pytest.MonkeyPatch) -> 
     assert result["summary"]["count"] >= 0
 
 
+def test_live_active_spend_account_insights_accept_since_until_without_date_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+    result = _run(
+        insights.get_entity_insights(
+            level="account",
+            object_id=account_id,
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert result["summary"]["count"] >= 0
+
+
+def test_live_invalid_date_preset_returns_useful_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+    with pytest.raises(Exception) as excinfo:
+        _run(
+            insights.get_entity_insights(
+                level="account",
+                object_id=account_id,
+                date_preset="__not_a_real_preset__",
+            )
+        )
+    assert str(excinfo.value)
+
+
 def test_live_ads_read_token_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
     info = _run(auth_tools.validate_token())

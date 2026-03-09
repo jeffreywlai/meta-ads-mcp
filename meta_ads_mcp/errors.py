@@ -48,6 +48,10 @@ class MetaApiError(MetaAdsError):
     subcode: int | None = None
     details: dict[str, Any] | None = None
 
+    def __str__(self) -> str:
+        """Return the primary Meta error message for user-facing tool failures."""
+        return self.message
+
     @classmethod
     def from_payload(
         cls,
@@ -64,4 +68,3 @@ class MetaApiError(MetaAdsError):
             subcode=error.get("error_subcode"),
             details=payload,
         )
-

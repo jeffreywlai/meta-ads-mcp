@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 
+from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import insights
 
 
@@ -77,6 +78,60 @@ def test_get_entity_insights_rejects_invalid_date_combinations(monkeypatch) -> N
                 date_preset="last_7d",
                 since="2026-03-01",
                 until="2026-03-07",
+            )
+        )
+
+
+def test_get_entity_insights_accepts_since_until_without_explicit_date_preset(monkeypatch) -> None:
+    class DateRangeClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert "date_preset" not in params
+            assert params["time_range"] == '{"since": "2026-03-01", "until": "2026-03-07"}'
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: DateRangeClient())
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_entity_insights_treats_blank_date_inputs_as_missing(monkeypatch) -> None:
+    class BlankDateClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["date_preset"] == "last_7d"
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: BlankDateClient())
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            date_preset="",
+            since="",
+            until="",
+        )
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_entity_insights_surfaces_meta_validation_errors(monkeypatch) -> None:
+    class InvalidPresetClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            raise MetaApiError(message="Invalid date_preset value.", status_code=400, code=100)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: InvalidPresetClient())
+    with pytest.raises(MetaApiError, match="Invalid date_preset value"):
+        asyncio.run(
+            insights.get_entity_insights(
+                level="account",
+                object_id="act_123",
+                date_preset="this_week_mon_sun",
             )
         )
 
@@ -408,6 +463,29 @@ def test_create_async_insights_report_returns_poll_hint(monkeypatch) -> None:
     assert result["report_run_id"] == "rpt_created"
     assert result["requested_fields"] == insights.DEFAULT_INSIGHTS_FIELDS
     assert "get_async_insights_report" in result["poll_hint"]
+
+
+def test_create_async_insights_report_accepts_since_until_without_explicit_date_preset(monkeypatch) -> None:
+    class DateRangeAsyncClient(FakeAsyncInsightsClient):
+        async def create_async_insights_report(self, object_id: str, *, fields, params):
+            assert "date_preset" not in params
+            assert params["time_range"] == '{"since": "2026-03-01", "until": "2026-03-07"}'
+            return await super().create_async_insights_report(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(
+        insights,
+        "get_graph_api_client",
+        lambda: DateRangeAsyncClient({"report_run_id": "rpt_created", "async_status": "Job Running"}),
+    )
+    result = asyncio.run(
+        insights.create_async_insights_report(
+            level="campaign",
+            object_id="cmp_1",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert result["report_run_id"] == "rpt_created"
 
 
 def test_get_async_insights_report_handles_in_progress_state(monkeypatch) -> None:
