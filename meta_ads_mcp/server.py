@@ -4,39 +4,9 @@ from __future__ import annotations
 
 from .config import get_settings
 from .coordinator import mcp_server
-from .tools import (
-    ads,
-    audiences,
-    auth_tools,
-    campaigns,
-    creatives,
-    diagnostics,
-    discovery,
-    docs,
-    execution,
-    insights,
-    recommendations,
-    research,
-    targeting,
-    utility,
-)
+from .tools import TOOL_MODULES
 
-TOOLS = [
-    ads,
-    audiences,
-    auth_tools,
-    campaigns,
-    creatives,
-    diagnostics,
-    discovery,
-    docs,
-    execution,
-    insights,
-    recommendations,
-    research,
-    targeting,
-    utility,
-]
+TOOLS = TOOL_MODULES
 
 
 def main() -> None:
