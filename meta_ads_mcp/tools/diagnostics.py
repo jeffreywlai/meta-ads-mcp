@@ -29,13 +29,54 @@ from meta_ads_mcp.tools.insights import (
 from meta_ads_mcp.errors import ValidationError
 
 
-def _require_object_id(*, account_id: str | None = None, campaign_id: str | None = None, adset_id: str | None = None) -> str:
-    """Require at least one object id for multi-scope reporting helpers."""
-    object_id = adset_id or campaign_id or account_id
-    if not object_id:
-        raise ValidationError("Provide at least one relevant object id.")
-    return object_id
+def _resolve_scope(
+    *,
+    allowed_levels: tuple[str, ...],
+    level: str | None = None,
+    object_id: str | None = None,
+    account_id: str | None = None,
+    campaign_id: str | None = None,
+    adset_id: str | None = None,
+) -> tuple[str, str]:
+    """Resolve generic or legacy scope inputs into one normalized level/object_id pair."""
+    alias_candidates = [
+        ("adset", adset_id),
+        ("campaign", campaign_id),
+        ("account", account_id),
+    ]
+    alias_level: str | None = None
+    alias_object_id: str | None = None
+    for candidate_level, candidate_id in alias_candidates:
+        if candidate_id:
+            alias_level = candidate_level
+            alias_object_id = normalize_account_id(candidate_id) if candidate_level == "account" else candidate_id
+            break
 
+    normalized_level = level.strip() if isinstance(level, str) else level
+    normalized_object_id = object_id.strip() if isinstance(object_id, str) else object_id
+    if normalized_level == "":
+        normalized_level = None
+    if normalized_object_id == "":
+        normalized_object_id = None
+
+    if normalized_level is not None or normalized_object_id is not None:
+        if not normalized_level or not normalized_object_id:
+            raise ValidationError("Provide both level and object_id when using generic scope arguments.")
+        if normalized_level not in allowed_levels:
+            raise ValidationError(f"level must be one of {sorted(allowed_levels)}.")
+        resolved_object_id = (
+            normalize_account_id(normalized_object_id) if normalized_level == "account" else normalized_object_id
+        )
+        if alias_level and alias_object_id and (alias_level != normalized_level or alias_object_id != resolved_object_id):
+            raise ValidationError("Conflicting scope arguments. Use either level/object_id or entity-specific params.")
+        return normalized_level, resolved_object_id
+
+    if alias_level and alias_object_id:
+        if alias_level not in allowed_levels:
+            raise ValidationError(f"level must be one of {sorted(allowed_levels)}.")
+        return alias_level, alias_object_id
+
+    raise ValidationError("Provide a valid scope using level/object_id or the tool's entity-specific params.")
 
 def _snapshot_suggestions(findings: list[dict[str, Any]]) -> list[str]:
     """Map findings to simple next actions."""
@@ -256,6 +297,8 @@ async def get_budget_pacing_report(
 
 @mcp_server.tool()
 async def get_creative_performance_report(
+    level: str | None = None,
+    object_id: str | None = None,
     account_id: str | None = None,
     campaign_id: str | None = None,
     adset_id: str | None = None,
@@ -264,16 +307,26 @@ async def get_creative_performance_report(
     until: str | None = None,
     top_n: int = 10,
 ) -> dict[str, Any]:
-    """Use this when the user wants top and worst ad-level creative performers within an account, campaign, or ad set."""
-    object_id = _require_object_id(account_id=account_id, campaign_id=campaign_id, adset_id=adset_id)
-    level = "ad"
-    rows = await _child_insights(object_id, level=level, **_window_kwargs(date_preset=date_preset, since=since, until=until))
+    """Use this when the user wants top and worst ad-level creative performers within an account, campaign, or ad set. Prefer level/object_id for consistency."""
+    _scope_level, resolved_object_id = _resolve_scope(
+        allowed_levels=("account", "campaign", "adset"),
+        level=level,
+        object_id=object_id,
+        account_id=account_id,
+        campaign_id=campaign_id,
+        adset_id=adset_id,
+    )
+    rows = await _child_insights(
+        resolved_object_id,
+        level="ad",
+        **_window_kwargs(date_preset=date_preset, since=since, until=until),
+    )
     rows = annotate_share_metrics(rows)
     ranked = rank_rows(rows, "roas")
     summary_metrics = _aggregate_metrics(rows)
     findings = detect_snapshot_findings(summary_metrics, rows)
     return analysis_response(
-        scope={"level": level, "object_id": object_id},
+        scope={"level": "ad", "object_id": resolved_object_id},
         metrics=summary_metrics,
         findings=findings,
         evidence=summary_metric_evidence(summary_metrics),
@@ -287,6 +340,8 @@ async def get_creative_performance_report(
 
 @mcp_server.tool()
 async def get_creative_fatigue_report(
+    level: str | None = None,
+    object_id: str | None = None,
     campaign_id: str | None = None,
     adset_id: str | None = None,
     since: str | None = None,
@@ -296,8 +351,14 @@ async def get_creative_fatigue_report(
     current_window_days: int = 7,
     previous_window_days: int = 7,
 ) -> dict[str, Any]:
-    """Use this when the user asks whether ads are fatiguing between a current and previous window."""
-    object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
+    """Use this when the user asks whether ads are fatiguing between a current and previous window. Prefer level/object_id for consistency."""
+    _scope_level, resolved_object_id = _resolve_scope(
+        allowed_levels=("campaign", "adset"),
+        level=level,
+        object_id=object_id,
+        campaign_id=campaign_id,
+        adset_id=adset_id,
+    )
     current_window, previous_window_range = _fatigue_windows(
         since=since,
         until=until,
@@ -309,14 +370,14 @@ async def get_creative_fatigue_report(
 
     current_rows, previous_rows = await asyncio.gather(
         _child_insights(
-            object_id,
+            resolved_object_id,
             level="ad",
             since=current_window["since"],
             until=current_window["until"],
             date_preset=None,
         ),
         _child_insights(
-            object_id,
+            resolved_object_id,
             level="ad",
             since=previous_window_range["since"],
             until=previous_window_range["until"],
@@ -370,7 +431,7 @@ async def get_creative_fatigue_report(
                 )
             )
     return analysis_response(
-        scope={"level": "ad", "object_id": object_id},
+        scope={"level": "ad", "object_id": resolved_object_id},
         metrics={},
         findings=findings or [
             build_finding(
@@ -421,25 +482,32 @@ async def get_audience_performance_report(
 
 @mcp_server.tool()
 async def get_delivery_risk_report(
+    level: str | None = None,
+    object_id: str | None = None,
     campaign_id: str | None = None,
     adset_id: str | None = None,
     date_preset: str | None = "last_7d",
     since: str | None = None,
     until: str | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user asks about delivery risk, weak efficiency, or whether a campaign/ad set looks unhealthy."""
-    object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
-    level = "adset" if adset_id else "campaign"
-    payload = await get_entity_insights(
+    """Use this when the user asks about delivery risk, weak efficiency, or whether a campaign/ad set looks unhealthy. Prefer level/object_id for consistency."""
+    resolved_level, resolved_object_id = _resolve_scope(
+        allowed_levels=("campaign", "adset"),
         level=level,
         object_id=object_id,
+        campaign_id=campaign_id,
+        adset_id=adset_id,
+    )
+    payload = await get_entity_insights(
+        level=resolved_level,
+        object_id=resolved_object_id,
         **_window_kwargs(date_preset=date_preset, since=since, until=until),
     )
     metrics = payload["summary"]["metrics"]
     findings = detect_snapshot_findings(metrics)
     evidence = summary_metric_evidence(metrics)
     return analysis_response(
-        scope={"level": level, "object_id": object_id},
+        scope={"level": resolved_level, "object_id": resolved_object_id},
         metrics=metrics,
         findings=findings,
         evidence=evidence,
@@ -449,12 +517,20 @@ async def get_delivery_risk_report(
 
 @mcp_server.tool()
 async def get_learning_phase_report(
+    level: str | None = None,
+    object_id: str | None = None,
     campaign_id: str | None = None,
     adset_id: str | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user asks about learning-phase context or setup metadata for a campaign or ad set."""
+    """Use this when the user asks about learning-phase context or setup metadata for a campaign or ad set. Prefer level/object_id for consistency."""
     client = get_graph_api_client()
-    object_id = _require_object_id(campaign_id=campaign_id, adset_id=adset_id)
+    resolved_level, resolved_object_id = _resolve_scope(
+        allowed_levels=("campaign", "adset"),
+        level=level,
+        object_id=object_id,
+        campaign_id=campaign_id,
+        adset_id=adset_id,
+    )
     fields = [
         "id",
         "name",
@@ -467,9 +543,9 @@ async def get_learning_phase_report(
         "start_time",
         "end_time",
     ]
-    item = await client.get_object(object_id, fields=fields)
+    item = await client.get_object(resolved_object_id, fields=fields)
     return analysis_response(
-        scope={"level": "adset" if adset_id else "campaign", "object_id": object_id},
+        scope={"level": resolved_level, "object_id": resolved_object_id},
         metrics={},
         findings=[],
         missing_signals=["Learning-phase state is not always exposed consistently across objects."],

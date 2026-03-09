@@ -160,6 +160,33 @@ def test_creative_performance_report_ranks_mixed_roas(monkeypatch) -> None:
     assert "spend_share" in result["top_creatives"][0]["metrics"]
 
 
+def test_creative_performance_report_accepts_level_and_object_id(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_child_insights(object_id: str, *, level: str, **kwargs):
+        calls.append({"object_id": object_id, "level": level, **kwargs})
+        return [{"ad_id": "ad1", "metrics": {"spend": 100.0, "roas": 1.2}}]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(
+        diagnostics.get_creative_performance_report(level="campaign", object_id="cmp_123")
+    )
+    assert calls[0]["object_id"] == "cmp_123"
+    assert calls[0]["level"] == "ad"
+    assert result["scope"]["object_id"] == "cmp_123"
+
+
+def test_creative_performance_report_rejects_conflicting_scope_inputs(monkeypatch) -> None:
+    with pytest.raises(diagnostics.ValidationError):
+        asyncio.run(
+            diagnostics.get_creative_performance_report(
+                level="campaign",
+                object_id="cmp_123",
+                adset_id="adset_123",
+            )
+        )
+
+
 def test_creative_fatigue_report_detects_declining_ctr_with_rising_frequency(monkeypatch) -> None:
     async def fake_child_insights(object_id: str, *, since: str | None = None, **kwargs):
         if since == "2026-03-01":
@@ -176,6 +203,28 @@ def test_creative_fatigue_report_detects_declining_ctr_with_rising_frequency(mon
     result = asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123"))
     assert any(finding["type"] == "creative_fatigue_risk" for finding in result["findings"])
     assert result["findings"][0]["evidence"]
+
+
+def test_creative_fatigue_report_accepts_level_and_object_id(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_child_insights(object_id: str, *, since: str | None = None, **kwargs):
+        calls.append(object_id)
+        if since == "2026-03-01":
+            return [{"ad_id": "ad1", "metrics": {"ctr": 0.01, "frequency": 3.0}}]
+        return [{"ad_id": "ad1", "metrics": {"ctr": 0.03, "frequency": 2.0}}]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(
+        diagnostics.get_creative_fatigue_report(
+            level="campaign",
+            object_id="cmp_123",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert calls == ["cmp_123", "cmp_123"]
+    assert result["scope"]["object_id"] == "cmp_123"
 
 
 def test_creative_fatigue_report_returns_insufficient_data_when_no_signal(monkeypatch) -> None:
@@ -264,6 +313,20 @@ def test_delivery_risk_report_includes_metric_evidence(monkeypatch) -> None:
     assert any(finding["type"] == "low_roas" for finding in result["findings"])
 
 
+def test_delivery_risk_report_accepts_level_and_object_id(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs):
+        calls.append(kwargs)
+        return {"summary": {"metrics": {"frequency": 3.0, "ctr": 0.005, "roas": 0.8}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(diagnostics.get_delivery_risk_report(level="adset", object_id="adset_123"))
+    assert calls[0]["level"] == "adset"
+    assert calls[0]["object_id"] == "adset_123"
+    assert result["scope"]["level"] == "adset"
+
+
 def test_learning_phase_report_returns_missing_signal_note(monkeypatch) -> None:
     class FakeClient:
         async def get_object(self, object_id: str, *, fields=None, params=None):
@@ -274,3 +337,14 @@ def test_learning_phase_report_returns_missing_signal_note(monkeypatch) -> None:
     assert result["scope"]["level"] == "adset"
     assert result["missing_signals"]
     assert result["item"]["id"] == "adset_123"
+
+
+def test_learning_phase_report_accepts_level_and_object_id(monkeypatch) -> None:
+    class FakeClient:
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            return {"id": object_id, "name": "Campaign", "status": "ACTIVE"}
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: FakeClient())
+    result = asyncio.run(diagnostics.get_learning_phase_report(level="campaign", object_id="cmp_123"))
+    assert result["scope"]["level"] == "campaign"
+    assert result["item"]["id"] == "cmp_123"
