@@ -125,6 +125,19 @@ def test_get_token_info_builds_app_debug_token_from_env(monkeypatch) -> None:
     assert result["debug_access_token"] == "123|secret"
 
 
+def test_get_token_info_falls_back_to_access_token_when_app_credentials_missing(monkeypatch) -> None:
+    monkeypatch.setenv("META_ACCESS_TOKEN", "token_123")
+    monkeypatch.delenv("META_APP_ID", raising=False)
+    monkeypatch.delenv("META_APP_SECRET", raising=False)
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(auth_tools, "get_graph_api_client", lambda *args, **kwargs: FakeAuthClient())
+    result = asyncio.run(auth_tools.get_token_info())
+    assert result["input_token"] == "token_123"
+    assert result["debug_access_token"] == "token_123"
+
+
 def test_validate_token_handles_invalid_or_expired_token(monkeypatch) -> None:
     class InvalidAuthClient(FakeAuthClient):
         async def debug_token(self, *, input_token: str, debug_access_token: str | None = None):

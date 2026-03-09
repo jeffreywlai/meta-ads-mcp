@@ -46,6 +46,10 @@ def test_get_capabilities_lists_new_helpers() -> None:
     assert "get_account_pages" in result["tool_groups"]["discovery"]
     assert "list_instagram_accounts" in result["tool_groups"]["discovery"]
     assert "create_ad" in result["tool_groups"]["writes"]
+    assert "update_adset_bid_amount" in result["tool_groups"]["writes"]
     assert "get_targeting_categories" in result["tool_groups"]["planning"]
+    assert "get_budget_opportunities" in result["tool_groups"]["optimization"]
     assert "search_ads_archive" in result["tool_groups"]["research"]
     assert result["routing_hints"]["compare_multiple_entities"] == ["compare_performance"]
+    assert "get_bidding_opportunities" in result["routing_hints"]["find_optimization_opportunities"]
+    assert any("Ads Library API access" in note for note in result["notes"])

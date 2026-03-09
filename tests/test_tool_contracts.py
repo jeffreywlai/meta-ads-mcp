@@ -71,18 +71,28 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_adsets": {"account_id": "123"},
     "list_ads": {"account_id": "123"},
     "get_interest_suggestions": {"interest_list": ["running"]},
-    "get_targeting_categories": {"category_class": "life_events"},
+    "get_targeting_categories": {"category_class": "life_events", "account_id": "123"},
+    "search_behaviors": {"account_id": "123"},
+    "search_demographics": {"account_id": "123"},
     "validate_interests": {"interest_list": ["running"]},
     "preview_ad": {"ad_id": "ad_123"},
     "upload_creative_asset": {"image_url": "https://example.com/image.png"},
     "update_campaign": {"name": "Updated Campaign"},
     "update_campaign_budget": {"daily_budget": 40.0},
+    "update_campaign_bid_strategy": {"bid_strategy": "COST_CAP", "bid_amount": 20.0},
     "update_adset_budget": {"daily_budget": 35.0},
+    "update_adset_bid_amount": {"bid_amount": 15.0},
+    "update_adset_bid_strategy": {"bid_strategy": "LOWEST_COST_WITH_BID_CAP", "bid_amount": 12.5},
     "update_custom_audience": {"name": "Updated Audience"},
     "update_creative": {"name": "Updated Creative"},
     "estimate_audience_size": {"account_id": "123"},
     "get_reach_frequency_predictions": {"account_id": "123"},
     "get_recommendations": {"account_id": "123"},
+    "get_budget_opportunities": {"account_id": "123"},
+    "get_creative_opportunities": {"account_id": "123"},
+    "get_audience_opportunities": {"account_id": "123"},
+    "get_delivery_opportunities": {"account_id": "123"},
+    "get_bidding_opportunities": {"account_id": "123"},
     "get_creative_performance_report": {"account_id": "123"},
     "get_creative_fatigue_report": {"campaign_id": "cmp_123"},
     "get_delivery_risk_report": {"campaign_id": "cmp_123"},
@@ -143,7 +153,7 @@ class UniversalFakeClient:
                     }
                 ]
             }
-        if edge in {"assigned_pages", "client_pages", "accounts"}:
+        if edge in {"assigned_pages", "accounts"}:
             return {
                 "data": [
                     {
@@ -243,6 +253,7 @@ class UniversalFakeClient:
             "objective": "OUTCOME_SALES",
             "daily_budget": "5000",
             "lifetime_budget": "25000",
+            "bid_amount": "1250",
             "currency": "USD",
             "optimization_goal": "OFFSITE_CONVERSIONS",
             "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
@@ -312,8 +323,24 @@ class UniversalFakeClient:
     async def search_geo_locations(self, *, query: str, location_types=None, limit: int = 25):
         return {"data": [{"key": "geo_123", "name": query, "type": "country"}]}
 
-    async def search_targeting_categories(self, *, category_class: str, query: str | None = None, limit: int = 25):
-        return {"data": [{"id": "cat_123", "name": query or category_class, "class": category_class}]}
+    async def search_targeting_categories(
+        self,
+        *,
+        account_id: str,
+        category_class: str,
+        query: str | None = None,
+        limit: int = 25,
+    ):
+        return {
+            "data": [
+                {
+                    "id": "cat_123",
+                    "name": query or category_class,
+                    "class": category_class,
+                    "account_id": account_id,
+                }
+            ]
+        }
 
     async def estimate_audience_size(self, account_id: str, *, targeting_spec, optimization_goal=None):
         return {"data": [{"users": 12345, "estimate_mau": 12000, "estimate_dau": 4000}]}
@@ -322,7 +349,13 @@ class UniversalFakeClient:
         return {"data": [{"id": "rf_123", "status": 1}]}
 
     async def get_recommendations(self, account_id: str, *, campaign_id=None):
-        return {"data": [{"id": "rec_123", "message": "Increase budget"}]}
+        return {
+            "data": [
+                {"id": "rec_123", "message": "Increase budget"},
+                {"id": "rec_124", "title": "Refresh creative assets"},
+                {"id": "rec_125", "recommendation_type": "BID_CAP_ADJUSTMENT"},
+            ]
+        }
 
     async def oauth_access_token(self, params):
         return {"access_token": "token_123", "token_type": "bearer", "expires_in": 3600, "params": params}
@@ -650,7 +683,10 @@ def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) 
             },
         ),
         (execution.update_campaign_budget, {"campaign_id": "cmp_123"}),
+        (execution.update_campaign_bid_strategy, {"campaign_id": "cmp_123", "bid_strategy": ""}),
         (execution.set_campaign_status, {"campaign_id": "cmp_123", "status": "DELETED"}),
+        (execution.update_adset_bid_amount, {"adset_id": "adset_123", "bid_amount": 0}),
+        (execution.update_adset_bid_strategy, {"adset_id": "adset_123", "bid_strategy": "COST_CAP", "bid_amount": -1}),
         (targeting.get_interest_suggestions, {"interest_list": []}),
         (targeting.get_targeting_categories, {"category_class": ""}),
         (targeting.validate_interests, {}),

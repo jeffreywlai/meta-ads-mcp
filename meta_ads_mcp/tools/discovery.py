@@ -6,7 +6,7 @@ from typing import Any
 
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaApiError, NotFoundError, UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import normalize_budget_value, normalize_collection
 from meta_ads_mcp.schemas import collection_response
@@ -47,6 +47,8 @@ ADSET_FIELDS = [
     "bid_strategy",
     "daily_budget",
     "lifetime_budget",
+    "start_time",
+    "end_time",
     "targeting",
 ]
 
@@ -238,45 +240,12 @@ async def get_account_pages(
     client = get_graph_api_client()
     requested_fields = fields or PAGE_FIELDS
     params = _page_params(limit, after)
-
-    if account_id == "me":
-        payload = await client.list_objects("me", "accounts", fields=requested_fields, params=params)
-        normalized = normalize_collection(payload)
-        normalized["summary"].update({"source": "accounts", "source_attempts": ["accounts"]})
-        return normalized
-
-    normalized_account_id = normalize_account_id(account_id)
-    attempted_edges: list[str] = []
-    last_error: Exception | None = None
-    empty_result: dict[str, Any] | None = None
-
-    for edge in ("assigned_pages", "client_pages"):
-        attempted_edges.append(edge)
-        try:
-            payload = await client.list_objects(
-                normalized_account_id,
-                edge,
-                fields=requested_fields,
-                params=params,
-            )
-        except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
-            last_error = exc
-            continue
-        normalized = normalize_collection(payload)
-        if normalized["items"]:
-            normalized["summary"].update({"source": edge, "source_attempts": attempted_edges[:]})
-            return normalized
-        empty_result = normalized
-
-    if empty_result is not None:
-        empty_result["summary"].update({"source": None, "source_attempts": attempted_edges})
-        return empty_result
-    if last_error is not None:
-        raise last_error
-    return collection_response(
-        [],
-        summary={"count": 0, "source": None, "source_attempts": attempted_edges},
-    )
+    payload = await client.list_objects("me", "accounts", fields=requested_fields, params=params)
+    normalized = normalize_collection(payload)
+    normalized["summary"].update({"source": "accounts", "source_attempts": ["accounts"]})
+    if account_id != "me":
+        normalized["summary"]["account_id_context"] = normalize_account_id(account_id)
+    return normalized
 
 
 @mcp_server.tool()
@@ -289,12 +258,49 @@ async def list_instagram_accounts(
     """Use this before creative creation when the user needs Instagram identities linked to the account."""
     client = get_graph_api_client()
     params = _page_params(limit, after)
-    payload = await client.list_objects(
-        _resolve_account_id(account_id),
-        "instagram_accounts",
-        fields=fields or INSTAGRAM_ACCOUNT_FIELDS,
-        params=params,
+    source_attempts = ["instagram_accounts"]
+    try:
+        payload = await client.list_objects(
+            _resolve_account_id(account_id),
+            "instagram_accounts",
+            fields=fields or INSTAGRAM_ACCOUNT_FIELDS,
+            params=params,
+        )
+        normalized = normalize_collection(payload)
+        normalized["summary"].update({"source": "instagram_accounts", "source_attempts": source_attempts})
+        return normalized
+    except UnsupportedFeatureError:
+        source_attempts.append("accounts.instagram_business_account")
+
+    pages = await get_account_pages(
+        account_id=account_id,
+        limit=limit,
+        after=after,
+        fields=["id", "name", "instagram_business_account"],
     )
-    normalized = normalize_collection(payload)
-    normalized["summary"].update({"source": "instagram_accounts"})
-    return normalized
+    items: list[dict[str, Any]] = []
+    for page in pages["items"]:
+        instagram_account = page.get("instagram_business_account") or {}
+        instagram_id = instagram_account.get("id") or instagram_account.get("ig_id")
+        if not instagram_id:
+            continue
+        items.append(
+            {
+                "id": instagram_id,
+                "ig_id": instagram_account.get("ig_id") or instagram_id,
+                "username": instagram_account.get("username"),
+                "name": instagram_account.get("name") or page.get("name"),
+                "profile_pic": instagram_account.get("profile_pic"),
+                "page_id": page.get("id"),
+                "page_name": page.get("name"),
+            }
+        )
+    return collection_response(
+        items,
+        paging=pages["paging"],
+        summary={
+            "count": len(items),
+            "source": "accounts.instagram_business_account",
+            "source_attempts": source_attempts,
+        },
+    )

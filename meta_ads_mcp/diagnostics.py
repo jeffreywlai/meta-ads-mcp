@@ -73,6 +73,58 @@ def derive_core_metrics(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def summary_metric_evidence(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build evidence records for available derived summary metrics."""
+    evidence: list[dict[str, Any]] = []
+    clicks = to_float(metrics.get("clicks"))
+    impressions = to_float(metrics.get("impressions"))
+    spend = to_float(metrics.get("spend"))
+    frequency = to_float(metrics.get("frequency"))
+    conversions = to_float(metrics.get("conversions"))
+    conversion_value = to_float(metrics.get("conversion_value"))
+    ctr = to_float(metrics.get("ctr"))
+    cpc = to_float(metrics.get("cpc"))
+    cpm = to_float(metrics.get("cpm"))
+    cvr = to_float(metrics.get("cvr"))
+    cpa = to_float(metrics.get("cpa"))
+    roas = to_float(metrics.get("roas"))
+    covered_metrics: set[str] = set()
+
+    if clicks is not None and impressions is not None:
+        evidence.append(metric_evidence("ctr", ctr, "clicks / impressions", {"clicks": clicks, "impressions": impressions}))
+        covered_metrics.add("ctr")
+    if spend is not None and clicks is not None and clicks > 0:
+        evidence.append(metric_evidence("cpc", cpc, "spend / clicks", {"spend": spend, "clicks": clicks}))
+        covered_metrics.add("cpc")
+    if spend is not None and impressions is not None and impressions > 0:
+        evidence.append(metric_evidence("cpm", cpm, "(spend / impressions) * 1000", {"spend": spend, "impressions": impressions}))
+        covered_metrics.add("cpm")
+    if conversions is not None and clicks is not None and clicks > 0:
+        evidence.append(metric_evidence("cvr", cvr, "conversions / clicks", {"conversions": conversions, "clicks": clicks}))
+        covered_metrics.add("cvr")
+    if spend is not None and conversions is not None and conversions > 0:
+        evidence.append(metric_evidence("cpa", cpa, "spend / conversions", {"spend": spend, "conversions": conversions}))
+        covered_metrics.add("cpa")
+    if conversion_value is not None and spend is not None and spend > 0:
+        evidence.append(metric_evidence("roas", roas, "conversion_value / spend", {"conversion_value": conversion_value, "spend": spend}))
+        covered_metrics.add("roas")
+
+    fallback_metrics = [
+        ("frequency", frequency),
+        ("ctr", ctr),
+        ("cpc", cpc),
+        ("cpm", cpm),
+        ("cvr", cvr),
+        ("cpa", cpa),
+        ("roas", roas),
+    ]
+    for name, value in fallback_metrics:
+        if value is None or name in covered_metrics:
+            continue
+        evidence.append(metric_evidence(name, value, "provided_by_meta", {name: value}))
+    return evidence
+
+
 def compare_metric_sets(
     current: dict[str, Any],
     previous: dict[str, Any],
@@ -113,6 +165,27 @@ def rank_rows(
         return to_float(nested.get(metric)) or 0.0
 
     return sorted(rows, key=metric_value, reverse=reverse)
+
+
+def annotate_share_metrics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add spend_share and result_share to row metrics when totals are available."""
+    def row_metric(row: dict[str, Any], name: str) -> float | None:
+        nested = to_float((row.get("metrics") or {}).get(name))
+        if nested is not None:
+            return nested
+        return to_float(row.get(name))
+
+    total_spend = sum((row_metric(row, "spend") or 0.0) for row in rows)
+    total_results = sum((row_metric(row, "conversions") or 0.0) for row in rows)
+    for row in rows:
+        metrics = row.setdefault("metrics", {})
+        spend = row_metric(row, "spend")
+        conversions = row_metric(row, "conversions")
+        if total_spend > 0 and spend is not None:
+            metrics["spend_share"] = spend / total_spend
+        if total_results > 0 and conversions is not None:
+            metrics["result_share"] = conversions / total_results
+    return rows
 
 
 def build_finding(
@@ -182,10 +255,14 @@ def detect_snapshot_findings(
 
     if child_rows:
         sorted_rows = rank_rows(child_rows, "spend")
-        total_spend = sum((to_float(row.get("spend")) or 0.0) for row in sorted_rows)
-        top_three_spend = sum(
-            (to_float(row.get("spend")) or 0.0) for row in sorted_rows[:3]
-        )
+        def row_spend(row: dict[str, Any]) -> float:
+            direct = to_float(row.get("spend"))
+            if direct is not None:
+                return direct
+            return to_float((row.get("metrics") or {}).get("spend")) or 0.0
+
+        total_spend = sum(row_spend(row) for row in sorted_rows)
+        top_three_spend = sum(row_spend(row) for row in sorted_rows[:3])
         if total_spend and (top_three_spend / total_spend) >= 0.8:
             findings.append(
                 build_finding(

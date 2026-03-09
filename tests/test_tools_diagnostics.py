@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import pytest
 
 from meta_ads_mcp.tools import diagnostics
 
@@ -34,6 +35,8 @@ def test_account_snapshot_ranks_children(monkeypatch) -> None:
     result = asyncio.run(diagnostics.get_account_optimization_snapshot(account_id="act_123"))
     assert result["top_spend_drivers"][0]["campaign_id"] == "1"
     assert any(finding["type"] == "high_spend_low_conversion" for finding in result["findings"])
+    assert result["evidence"]
+    assert "spend_share" in result["top_spend_drivers"][0]["metrics"]
 
 
 def test_campaign_snapshot_includes_top_adsets_and_ads(monkeypatch) -> None:
@@ -56,6 +59,37 @@ def test_campaign_snapshot_includes_top_adsets_and_ads(monkeypatch) -> None:
     result = asyncio.run(diagnostics.get_campaign_optimization_snapshot(campaign_id="cmp_123"))
     assert result["top_adsets_by_spend"][0]["adset_id"] == "a1"
     assert result["top_ads_by_roas"][0]["ad_id"] == "ad2"
+    assert result["evidence"]
+    assert "spend_share" in result["top_adsets_by_spend"][0]["metrics"]
+
+
+def test_account_snapshot_supports_explicit_since_until(monkeypatch) -> None:
+    entity_calls: list[dict[str, object]] = []
+    child_calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs):
+        entity_calls.append(kwargs)
+        return {"items": [], "summary": {"metrics": {"spend": 200.0, "clicks": 20, "impressions": 1000}}}
+
+    async def fake_child_insights(object_id: str, *, level: str, **kwargs):
+        child_calls.append({"object_id": object_id, "level": level, **kwargs})
+        return []
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    asyncio.run(
+        diagnostics.get_account_optimization_snapshot(
+            account_id="act_123",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert entity_calls[0]["since"] == "2026-03-01"
+    assert entity_calls[0]["until"] == "2026-03-07"
+    assert entity_calls[0]["date_preset"] is None
+    assert child_calls[0]["since"] == "2026-03-01"
+    assert child_calls[0]["until"] == "2026-03-07"
+    assert child_calls[0]["date_preset"] is None
 
 
 def test_budget_pacing_report_handles_no_rows(monkeypatch) -> None:
@@ -67,6 +101,28 @@ def test_budget_pacing_report_handles_no_rows(monkeypatch) -> None:
     assert result["daily_rows"] == []
     assert result["trend_summary"]["days"] == 0
     assert result["trend_summary"]["first_day_spend"] is None
+
+
+def test_budget_pacing_report_supports_explicit_since_until(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs):
+        calls.append(kwargs)
+        return {"items": [], "summary": {"metrics": {"spend": 100.0, "clicks": 10, "impressions": 1000}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.get_budget_pacing_report(
+            level="campaign",
+            object_id="cmp_123",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert calls[0]["since"] == "2026-03-01"
+    assert calls[0]["until"] == "2026-03-07"
+    assert calls[0]["date_preset"] is None
+    assert result["evidence"]
 
 
 def test_creative_performance_report_ranks_mixed_roas(monkeypatch) -> None:
@@ -81,6 +137,7 @@ def test_creative_performance_report_ranks_mixed_roas(monkeypatch) -> None:
     result = asyncio.run(diagnostics.get_creative_performance_report(account_id="act_123", top_n=2))
     assert result["top_creatives"][0]["ad_id"] == "ad2"
     assert result["worst_creatives"][0]["ad_id"] == "ad1"
+    assert "spend_share" in result["top_creatives"][0]["metrics"]
 
 
 def test_creative_fatigue_report_detects_declining_ctr_with_rising_frequency(monkeypatch) -> None:
@@ -98,6 +155,7 @@ def test_creative_fatigue_report_detects_declining_ctr_with_rising_frequency(mon
     monkeypatch.setattr(diagnostics, "date", FixedDate)
     result = asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123"))
     assert any(finding["type"] == "creative_fatigue_risk" for finding in result["findings"])
+    assert result["findings"][0]["evidence"]
 
 
 def test_creative_fatigue_report_returns_insufficient_data_when_no_signal(monkeypatch) -> None:
@@ -115,12 +173,54 @@ def test_creative_fatigue_report_returns_insufficient_data_when_no_signal(monkey
     assert result["findings"][0]["type"] == "insufficient_data"
 
 
+def test_creative_fatigue_report_supports_explicit_windows(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_child_insights(object_id: str, *, since: str | None = None, until: str | None = None, **kwargs):
+        calls.append((since or "", until or ""))
+        return []
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(
+        diagnostics.get_creative_fatigue_report(
+            campaign_id="cmp_123",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert calls == [("2026-03-01", "2026-03-07"), ("2026-02-22", "2026-02-28")]
+    assert result["current_window"] == {"since": "2026-03-01", "until": "2026-03-07"}
+    assert result["previous_window"] == {"since": "2026-02-22", "until": "2026-02-28"}
+
+
+def test_creative_fatigue_report_rejects_invalid_explicit_dates() -> None:
+    with pytest.raises(diagnostics.ValidationError):
+        asyncio.run(
+            diagnostics.get_creative_fatigue_report(
+                campaign_id="cmp_123",
+                since="bad-date",
+                until="2026-03-07",
+            )
+        )
+
+
+def test_creative_fatigue_report_rejects_reversed_explicit_windows() -> None:
+    with pytest.raises(diagnostics.ValidationError):
+        asyncio.run(
+            diagnostics.get_creative_fatigue_report(
+                campaign_id="cmp_123",
+                since="2026-03-07",
+                until="2026-03-01",
+            )
+        )
+
+
 def test_audience_performance_report_uses_segment_breakdown(monkeypatch) -> None:
     async def fake_get_entity_insights(**kwargs):
         return {
             "items": [
-                {"country": "US", "metrics": {"roas": 2.1}},
-                {"country": "CA", "metrics": {"roas": 0.9}},
+                {"country": "US", "metrics": {"roas": 2.1, "spend": 60.0, "conversions": 3.0}},
+                {"country": "CA", "metrics": {"roas": 0.9, "spend": 40.0, "conversions": 1.0}},
             ],
             "summary": {"metrics": {"spend": 100.0, "roas": 1.5}},
         }
@@ -131,6 +231,7 @@ def test_audience_performance_report_uses_segment_breakdown(monkeypatch) -> None
     )
     assert result["segment_by"] == "country"
     assert result["top_segments"][0]["country"] == "US"
+    assert "result_share" in result["top_segments"][0]["metrics"]
 
 
 def test_delivery_risk_report_includes_metric_evidence(monkeypatch) -> None:
@@ -139,7 +240,7 @@ def test_delivery_risk_report_includes_metric_evidence(monkeypatch) -> None:
 
     monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
     result = asyncio.run(diagnostics.get_delivery_risk_report(campaign_id="cmp_123"))
-    assert result["evidence"][0]["metric"] == "frequency"
+    assert any(item["metric"] == "ctr" for item in result["evidence"])
     assert any(finding["type"] == "low_roas" for finding in result["findings"])
 
 

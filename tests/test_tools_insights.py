@@ -184,6 +184,40 @@ def test_compare_time_ranges_compares_previous_zero_metrics(monkeypatch) -> None
     assert result["comparison"]["spend"]["pct_delta"] is None
 
 
+def test_compare_time_ranges_includes_metric_evidence(monkeypatch) -> None:
+    async def fake_get_entity_insights(*, since: str, until: str, **_: object) -> dict[str, object]:
+        return {
+            "summary": {
+                "metrics": {
+                    "spend": 100.0,
+                    "clicks": 10,
+                    "impressions": 1000,
+                    "conversions": 2.0,
+                    "conversion_value": 300.0,
+                    "ctr": 0.01,
+                    "cpc": 10.0,
+                    "cpm": 100.0,
+                    "cvr": 0.2,
+                    "cpa": 50.0,
+                    "roas": 3.0,
+                }
+            }
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        insights.compare_time_ranges(
+            level="campaign",
+            object_id="cmp_1",
+            current_since="2026-03-01",
+            current_until="2026-03-07",
+            previous_since="2026-02-22",
+            previous_until="2026-02-28",
+        )
+    )
+    assert any(item["metric"] == "roas" for item in result["evidence"])
+
+
 def test_compare_time_ranges_rejects_invalid_date_strings(monkeypatch) -> None:
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
     with pytest.raises(insights.ValidationError):
@@ -361,6 +395,7 @@ def test_create_async_insights_report_returns_poll_hint(monkeypatch) -> None:
     )
     result = asyncio.run(insights.create_async_insights_report(level="campaign", object_id="cmp_1"))
     assert result["report_run_id"] == "rpt_created"
+    assert result["requested_fields"] == insights.DEFAULT_INSIGHTS_FIELDS
     assert "get_async_insights_report" in result["poll_hint"]
 
 
@@ -371,6 +406,17 @@ def test_get_async_insights_report_handles_in_progress_state(monkeypatch) -> Non
     assert result["status"]["async_status"] == "Job Running"
     assert result["rows"]["items"] == []
     assert result["rows"]["paging"]["after"] is None
+
+
+def test_get_async_insights_report_does_not_force_default_fields(monkeypatch) -> None:
+    class NoDefaultFieldsClient(FakeAsyncInsightsClient):
+        async def get_async_report(self, report_run_id: str, *, fields=None, limit=100, after=None):
+            assert fields is None
+            return {"status": {"id": report_run_id, "async_status": "Job Running"}, "rows": []}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: NoDefaultFieldsClient({}))
+    result = asyncio.run(insights.get_async_insights_report(report_run_id="rpt_123"))
+    assert result["status"]["async_status"] == "Job Running"
 
 
 def test_get_async_insights_report_handles_completed_rows_and_paging(monkeypatch) -> None:

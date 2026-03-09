@@ -26,8 +26,24 @@ class FakeTargetingClient:
             ]
         }
 
-    async def search_targeting_categories(self, *, category_class: str, query: str | None = None, limit: int = 25):
-        return {"data": [{"id": "cat_123", "name": query or category_class, "class": category_class}]}
+    async def search_targeting_categories(
+        self,
+        *,
+        account_id: str,
+        category_class: str,
+        query: str | None = None,
+        limit: int = 25,
+    ):
+        return {
+            "data": [
+                {
+                    "id": "cat_123",
+                    "name": query or category_class,
+                    "class": category_class,
+                    "account_id": account_id,
+                }
+            ]
+        }
 
 
 def test_get_interest_suggestions_returns_collection(monkeypatch) -> None:
@@ -54,20 +70,23 @@ def test_validate_interests_supports_names_and_ids_together(monkeypatch) -> None
 
 def test_search_behaviors_uses_behavior_class(monkeypatch) -> None:
     monkeypatch.setattr(targeting, "get_graph_api_client", lambda: FakeTargetingClient())
-    result = asyncio.run(targeting.search_behaviors(query="travel"))
+    result = asyncio.run(targeting.search_behaviors(query="travel", account_id="123"))
     assert result["items"][0]["class"] == "behaviors"
+    assert result["items"][0]["account_id"] == "act_123"
 
 
 def test_get_targeting_categories_uses_given_class(monkeypatch) -> None:
     monkeypatch.setattr(targeting, "get_graph_api_client", lambda: FakeTargetingClient())
-    result = asyncio.run(targeting.get_targeting_categories(category_class="life_events", query="new"))
+    result = asyncio.run(targeting.get_targeting_categories(category_class="life_events", query="new", account_id="123"))
     assert result["items"][0]["class"] == "life_events"
+    assert result["items"][0]["account_id"] == "act_123"
 
 
 def test_search_demographics_supports_unusual_category_class(monkeypatch) -> None:
     monkeypatch.setattr(targeting, "get_graph_api_client", lambda: FakeTargetingClient())
-    result = asyncio.run(targeting.search_demographics(demographic_class="work", query="manager"))
+    result = asyncio.run(targeting.search_demographics(demographic_class="work", query="manager", account_id="123"))
     assert result["items"][0]["class"] == "work"
+    assert result["items"][0]["account_id"] == "act_123"
 
 
 def test_validate_interests_can_return_empty_results(monkeypatch) -> None:

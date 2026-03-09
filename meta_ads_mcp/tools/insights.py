@@ -11,6 +11,7 @@ from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import compare_metric_sets, derive_core_metrics
+from meta_ads_mcp.diagnostics import summary_metric_evidence
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.normalize import normalize_collection, normalize_insights_row
@@ -417,7 +418,7 @@ async def compare_time_ranges(
     return analysis_response(
         scope={"level": level, "object_id": object_id},
         metrics=current_payload["summary"]["metrics"],
-        evidence=[],
+        evidence=summary_metric_evidence(current_payload["summary"]["metrics"]),
         extra={
             "previous_metrics": previous_payload["summary"]["metrics"],
             "comparison": comparison,
@@ -569,9 +570,10 @@ async def create_async_insights_report(
 ) -> dict[str, Any]:
     """Use this when the reporting query is large enough that a synchronous insights call would be too heavy."""
     client = get_graph_api_client()
+    requested_fields = fields or DEFAULT_INSIGHTS_FIELDS
     payload = await client.create_async_insights_report(
         object_id,
-        fields=fields or DEFAULT_INSIGHTS_FIELDS,
+        fields=requested_fields,
         params=_insights_params(
             level=level,
             date_preset=date_preset,
@@ -586,6 +588,7 @@ async def create_async_insights_report(
     return {
         "report_run_id": payload.get("report_run_id") or payload.get("id"),
         "status": payload,
+        "requested_fields": requested_fields,
         "poll_hint": "Use get_async_insights_report with the returned report_run_id.",
     }
 
@@ -601,7 +604,7 @@ async def get_async_insights_report(
     client = get_graph_api_client()
     payload = await client.get_async_report(
         report_run_id,
-        fields=fields or DEFAULT_INSIGHTS_FIELDS,
+        fields=fields,
         limit=limit,
         after=after,
     )

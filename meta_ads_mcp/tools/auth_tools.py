@@ -124,8 +124,12 @@ async def get_token_info(
     """Use this when the user wants raw token metadata such as scopes, expiry, or app binding."""
     client = get_graph_api_client()
     effective_debug_access_token = debug_access_token
-    if effective_debug_access_token is None and (app_id or app_secret or get_settings().app_id):
-        effective_debug_access_token = build_app_access_token(app_id=app_id, app_secret=app_secret)
+    if effective_debug_access_token is None:
+        if app_id or app_secret or get_settings().app_id:
+            effective_debug_access_token = build_app_access_token(app_id=app_id, app_secret=app_secret)
+        else:
+            # Meta accepts a user token from the same app in many debug_token flows; use it as a best-effort fallback.
+            effective_debug_access_token = resolve_access_token()
     payload = await client.debug_token(
         input_token=resolve_access_token(input_token),
         debug_access_token=effective_debug_access_token,

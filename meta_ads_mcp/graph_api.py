@@ -28,6 +28,16 @@ def normalize_account_id(account_id: str) -> str:
     return account_id if account_id.startswith("act_") else f"act_{account_id}"
 
 
+def _is_unsupported_surface_error(error: MetaApiError) -> bool:
+    """Decide whether a Graph API error is best treated as an unavailable surface."""
+    message = error.message.lower()
+    if error.status_code == 400 and error.code == 100:
+        return message.startswith("unsupported get request") or message.startswith("unsupported post request")
+    if error.status_code == 400 and error.code == 2500:
+        return message.startswith("unknown path components")
+    return False
+
+
 @dataclass(slots=True)
 class GraphAPIClient:
     """Thin async client around the Marketing API."""
@@ -121,7 +131,7 @@ class GraphAPIClient:
                     payload = {"data": payload}
                 if response.is_error or "error" in payload:
                     error = MetaApiError.from_payload(payload, status_code=response.status_code)
-                    if error.status_code == 400 and error.code == 100:
+                    if _is_unsupported_surface_error(error):
                         raise UnsupportedFeatureError(error.message) from error
                     raise error
                 return payload
@@ -301,19 +311,23 @@ class GraphAPIClient:
     async def search_targeting_categories(
         self,
         *,
+        account_id: str,
         category_class: str,
         query: str | None = None,
         limit: int = 25,
     ) -> dict[str, Any]:
         """Search targeting categories such as behaviors or demographics."""
         params: dict[str, Any] = {
-            "type": "adTargetingCategory",
             "class": category_class,
             "limit": limit,
         }
         if query:
-            params["q"] = query
-        return await self.request("GET", "search", params=params)
+            params["query"] = query
+        return await self.request(
+            "GET",
+            f"{normalize_account_id(account_id)}/broadtargetingcategories",
+            params=params,
+        )
 
     async def estimate_audience_size(
         self,

@@ -73,11 +73,13 @@ async def search_geo_locations(
 @mcp_server.tool()
 async def search_behaviors(
     query: str | None = None,
+    account_id: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
     """Use this when the user wants behavior-based targeting options rather than interests or demographics."""
     client = get_graph_api_client()
     payload = await client.search_targeting_categories(
+        account_id=_resolve_account_id(account_id),
         category_class="behaviors",
         query=query,
         limit=limit,
@@ -89,6 +91,7 @@ async def search_behaviors(
 async def get_targeting_categories(
     category_class: str,
     query: str | None = None,
+    account_id: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
     """Use this when the user knows the targeting category class they want and needs matching options."""
@@ -96,6 +99,7 @@ async def get_targeting_categories(
         raise ValidationError("category_class is required.")
     client = get_graph_api_client()
     payload = await client.search_targeting_categories(
+        account_id=_resolve_account_id(account_id),
         category_class=category_class,
         query=query,
         limit=limit,
@@ -107,6 +111,7 @@ async def get_targeting_categories(
 async def search_demographics(
     demographic_class: str = "demographics",
     query: str | None = None,
+    account_id: str | None = None,
     limit: int = 25,
 ) -> dict[str, Any]:
     """Use this when the user wants demographic targeting options such as age, education, or life-stage categories."""
@@ -114,6 +119,7 @@ async def search_demographics(
         raise ValidationError("demographic_class is required.")
     client = get_graph_api_client()
     payload = await client.search_targeting_categories(
+        account_id=_resolve_account_id(account_id),
         category_class=demographic_class,
         query=query,
         limit=limit,

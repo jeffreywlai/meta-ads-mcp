@@ -21,6 +21,8 @@ class FakeExecutionClient:
             "id": object_id,
             "status": "PAUSED",
             "effective_status": "ACTIVE",
+            "bid_amount": "1250" if self.currency != "JPY" else "1250",
+            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
             "daily_budget": "5000" if self.currency != "JPY" else "5000",
             "lifetime_budget": "15000" if self.currency != "JPY" else "15000",
             "currency": self.currency,
@@ -75,3 +77,35 @@ def test_update_adset_budget_requires_exactly_one_budget(monkeypatch) -> None:
         asyncio.run(
             execution.update_adset_budget(adset_id="adset_123", daily_budget=10.0, lifetime_budget=20.0)
         )
+
+
+def test_update_adset_bid_amount_returns_previous_and_current(monkeypatch) -> None:
+    client = FakeExecutionClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(execution.update_adset_bid_amount(adset_id="adset_123", bid_amount=15.0))
+    assert result["previous"]["bid_amount"] == 12.5
+    assert result["current"]["bid_amount"] == 15.0
+    assert client.updated_payloads[0] == ("adset_123", {"bid_amount": 1500})
+
+
+def test_update_campaign_bid_strategy_supports_optional_bid_amount(monkeypatch) -> None:
+    client = FakeExecutionClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        execution.update_campaign_bid_strategy(
+            campaign_id="cmp_123",
+            bid_strategy="COST_CAP",
+            bid_amount=25.0,
+        )
+    )
+    assert result["previous"]["bid_strategy"] == "LOWEST_COST_WITHOUT_CAP"
+    assert result["current"] == {"bid_strategy": "COST_CAP", "bid_amount": 25.0}
+    assert client.updated_payloads[0] == ("cmp_123", {"bid_strategy": "COST_CAP", "bid_amount": 2500})
+
+
+def test_update_adset_bid_strategy_rejects_invalid_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: FakeExecutionClient())
+    with pytest.raises(execution.ValidationError):
+        asyncio.run(execution.update_adset_bid_strategy(adset_id="adset_123", bid_strategy=""))
+    with pytest.raises(execution.ValidationError):
+        asyncio.run(execution.update_adset_bid_strategy(adset_id="adset_123", bid_strategy="COST_CAP", bid_amount=0))

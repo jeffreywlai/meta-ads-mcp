@@ -19,6 +19,19 @@ def test_detect_snapshot_findings_flags_high_spend_low_conversion() -> None:
     assert any(finding["type"] == "high_spend_low_conversion" for finding in findings)
 
 
+def test_detect_snapshot_findings_supports_nested_child_spend() -> None:
+    findings = detect_snapshot_findings(
+        {"spend": 400.0, "conversions": 4.0},
+        child_rows=[
+            {"id": "a", "metrics": {"spend": 200.0}},
+            {"id": "b", "metrics": {"spend": 120.0}},
+            {"id": "c", "metrics": {"spend": 80.0}},
+            {"id": "d", "metrics": {"spend": 0.0}},
+        ],
+    )
+    assert any(finding["type"] == "budget_concentration" for finding in findings)
+
+
 def test_rank_rows_supports_nested_metrics() -> None:
     rows = [
         {"id": "a", "metrics": {"roas": 1.2}},
