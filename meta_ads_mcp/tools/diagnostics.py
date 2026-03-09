@@ -28,6 +28,36 @@ from meta_ads_mcp.tools.insights import (
 )
 from meta_ads_mcp.errors import ValidationError
 
+LEARNING_PHASE_FIELDS_BY_LEVEL = {
+    "campaign": [
+        "id",
+        "name",
+        "status",
+        "effective_status",
+        "objective",
+        "buying_type",
+        "bid_strategy",
+        "daily_budget",
+        "lifetime_budget",
+        "special_ad_categories",
+    ],
+    "adset": [
+        "id",
+        "name",
+        "status",
+        "effective_status",
+        "campaign_id",
+        "optimization_goal",
+        "billing_event",
+        "bid_strategy",
+        "daily_budget",
+        "lifetime_budget",
+        "start_time",
+        "end_time",
+        "targeting",
+    ],
+}
+
 
 def _resolve_scope(
     *,
@@ -531,23 +561,15 @@ async def get_learning_phase_report(
         campaign_id=campaign_id,
         adset_id=adset_id,
     )
-    fields = [
-        "id",
-        "name",
-        "status",
-        "effective_status",
-        "optimization_goal",
-        "bid_strategy",
-        "daily_budget",
-        "lifetime_budget",
-        "start_time",
-        "end_time",
-    ]
+    fields = LEARNING_PHASE_FIELDS_BY_LEVEL[resolved_level]
     item = await client.get_object(resolved_object_id, fields=fields)
+    missing_signals = ["Learning-phase state is not always exposed consistently across objects."]
+    if resolved_level == "campaign":
+        missing_signals.append("optimization_goal is available on ad sets, not campaigns.")
     return analysis_response(
         scope={"level": resolved_level, "object_id": resolved_object_id},
         metrics={},
         findings=[],
-        missing_signals=["Learning-phase state is not always exposed consistently across objects."],
+        missing_signals=missing_signals,
         extra={"item": item},
     )

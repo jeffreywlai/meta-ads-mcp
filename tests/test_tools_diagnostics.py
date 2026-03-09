@@ -348,3 +348,18 @@ def test_learning_phase_report_accepts_level_and_object_id(monkeypatch) -> None:
     result = asyncio.run(diagnostics.get_learning_phase_report(level="campaign", object_id="cmp_123"))
     assert result["scope"]["level"] == "campaign"
     assert result["item"]["id"] == "cmp_123"
+
+
+def test_learning_phase_report_uses_level_specific_fields(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeClient:
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            calls.append({"object_id": object_id, "fields": fields})
+            return {"id": object_id, "name": "Campaign", "status": "ACTIVE"}
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: FakeClient())
+    result = asyncio.run(diagnostics.get_learning_phase_report(level="campaign", object_id="cmp_123"))
+    assert "optimization_goal" not in calls[0]["fields"]
+    assert "objective" in calls[0]["fields"]
+    assert any("optimization_goal is available on ad sets" in item for item in result["missing_signals"])

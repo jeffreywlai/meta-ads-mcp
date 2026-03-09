@@ -302,6 +302,15 @@ def test_live_creative_inspection_reads(monkeypatch: pytest.MonkeyPatch) -> None
     assert preview["summary"]["count"] == 1
 
 
+def test_live_learning_phase_report_for_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+    context = _run(_discover_active_context(account_id))
+    result = _run(diagnostics.get_learning_phase_report(level="campaign", object_id=context["campaign_id"]))
+    assert result["scope"]["level"] == "campaign"
+    assert result["item"]["id"] == context["campaign_id"]
+
+
 def test_live_gated_reach_frequency_predictions(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_WRITE")
     account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
