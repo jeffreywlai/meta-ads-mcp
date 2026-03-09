@@ -311,14 +311,16 @@ Once connected, just talk naturally:
 ```
 meta-ads-mcp/
 ├── meta_ads_mcp/
-│   ├── coordinator.py         # Shared FastMCP instance
+│   ├── coordinator.py         # Shared FastMCP instance & tool search config
 │   ├── stdio.py               # Server entry point (Claude Code / stdio)
 │   ├── server.py              # Server entry point (Gemini / SSE)
 │   ├── config.py              # Configuration and env loading
 │   ├── auth.py                # Auth utilities
+│   ├── diagnostics.py         # Derived metrics & optimization heuristics
 │   ├── errors.py              # Error handling
 │   ├── graph_api.py           # Meta Graph API client
 │   ├── normalize.py           # Response normalization
+│   ├── pagination.py          # Graph API pagination helpers
 │   ├── schemas.py             # Pydantic schemas
 │   ├── tools/
 │   │   ├── ads.py             # Ad management
