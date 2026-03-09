@@ -65,21 +65,63 @@ def _flatten_recommendation_items(items: list[dict[str, object]]) -> list[dict[s
     return flattened
 
 
-def _recommendation_text(item: dict[str, object]) -> str:
-    """Flatten recommendation text-like fields into one lowercase string."""
+def _dedupe_recommendation_item(raw_item: dict[str, object]) -> dict[str, object]:
+    """Promote useful recommendation content fields and drop duplicate text wrappers."""
+    item = dict(raw_item)
     recommendation_content = item.get("recommendation_content")
     content = recommendation_content if isinstance(recommendation_content, dict) else {}
+
+    promoted_title = item.get("title") or content.get("title")
+    promoted_body = item.get("body") or content.get("body") or item.get("message") or item.get("description")
+    promoted_lift_estimate = item.get("lift_estimate") or content.get("lift_estimate")
+    promoted_opportunity_score_lift = item.get("opportunity_score_lift") or content.get("opportunity_score_lift")
+
+    if promoted_title:
+        item["title"] = promoted_title
+    if promoted_body:
+        item["body"] = promoted_body
+    if promoted_lift_estimate:
+        item["lift_estimate"] = promoted_lift_estimate
+    if promoted_opportunity_score_lift:
+        item["opportunity_score_lift"] = promoted_opportunity_score_lift
+
+    if item.get("message") == item.get("body"):
+        item.pop("message", None)
+    if item.get("description") == item.get("body"):
+        item.pop("description", None)
+
+    if content:
+        remaining_content = {
+            key: value
+            for key, value in content.items()
+            if (
+                (key == "title" and value != item.get("title"))
+                or (key == "body" and value != item.get("body"))
+                or (key == "lift_estimate" and value != item.get("lift_estimate"))
+                or (key == "opportunity_score_lift" and value != item.get("opportunity_score_lift"))
+                or key not in {"title", "body", "lift_estimate", "opportunity_score_lift"}
+            )
+        }
+        if remaining_content:
+            item["recommendation_content"] = remaining_content
+        else:
+            item.pop("recommendation_content", None)
+
+    return item
+
+
+def _recommendation_text(item: dict[str, object]) -> str:
+    """Flatten recommendation text-like fields into one lowercase string."""
     parts = [
         item.get("recommendation_type"),
         item.get("type"),
         item.get("category"),
         item.get("title"),
         item.get("name"),
+        item.get("body"),
         item.get("message"),
         item.get("description"),
-        content.get("title"),
-        content.get("body"),
-        content.get("lift_estimate"),
+        item.get("lift_estimate"),
     ]
     return " ".join(str(part) for part in parts if part).lower().replace("_", " ")
 
@@ -105,7 +147,7 @@ def _normalize_recommendations(payload: dict[str, object]) -> dict[str, object]:
     items: list[dict[str, object]] = []
     counts: Counter[str] = Counter()
     for raw_item in normalized["items"]:
-        item = dict(raw_item)
+        item = _dedupe_recommendation_item(raw_item)
         categories = _opportunity_categories(item)
         item["opportunity_categories"] = categories
         items.append(item)

@@ -137,6 +137,20 @@ def _window_kwargs(
     }
 
 
+def _compact_timeseries_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a token-efficient daily row shape for pacing-style outputs."""
+    compact_rows: list[dict[str, Any]] = []
+    for row in rows:
+        compact_rows.append(
+            {
+                "date_start": row.get("date_start"),
+                "date_stop": row.get("date_stop"),
+                "metrics": dict(row.get("metrics") or {}),
+            }
+        )
+    return compact_rows
+
+
 def _fatigue_windows(
     *,
     since: str | None,
@@ -297,6 +311,7 @@ async def get_budget_pacing_report(
     date_preset: str | None = "last_7d",
     since: str | None = None,
     until: str | None = None,
+    include_full_daily_rows: bool = False,
 ) -> dict[str, Any]:
     """Use this when the user asks about spend pacing, spend trend, or daily delivery consistency."""
     payload = await get_entity_insights(
@@ -315,7 +330,8 @@ async def get_budget_pacing_report(
         evidence=summary_metric_evidence(summary_metrics),
         suggestions=_snapshot_suggestions(findings),
         extra={
-            "daily_rows": rows,
+            "daily_rows": rows if include_full_daily_rows else _compact_timeseries_rows(rows),
+            "daily_row_detail": "full" if include_full_daily_rows else "compact",
             "trend_summary": {
                 "days": len(rows),
                 "first_day_spend": rows[0]["metrics"]["spend"] if rows else None,

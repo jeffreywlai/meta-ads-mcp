@@ -119,6 +119,7 @@ def test_budget_pacing_report_handles_no_rows(monkeypatch) -> None:
     monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
     result = asyncio.run(diagnostics.get_budget_pacing_report(level="campaign", object_id="cmp_123"))
     assert result["daily_rows"] == []
+    assert result["daily_row_detail"] == "compact"
     assert result["trend_summary"]["days"] == 0
     assert result["trend_summary"]["first_day_spend"] is None
 
@@ -143,6 +144,60 @@ def test_budget_pacing_report_supports_explicit_since_until(monkeypatch) -> None
     assert calls[0]["until"] == "2026-03-07"
     assert calls[0]["date_preset"] is None
     assert result["evidence"]
+
+
+def test_budget_pacing_report_compacts_daily_rows_by_default(monkeypatch) -> None:
+    async def fake_get_entity_insights(**kwargs):
+        return {
+            "items": [
+                {
+                    "date_start": "2026-03-01",
+                    "date_stop": "2026-03-01",
+                    "spend": 100.0,
+                    "actions": [{"action_type": "purchase", "value": "2"}],
+                    "action_values": [{"action_type": "purchase", "value": "250"}],
+                    "actions_map": {"purchase": 2.0},
+                    "action_values_map": {"purchase": 250.0},
+                    "metrics": {"spend": 100.0, "roas": 2.5},
+                }
+            ],
+            "summary": {"metrics": {"spend": 100.0, "roas": 2.5}},
+        }
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(diagnostics.get_budget_pacing_report(level="campaign", object_id="cmp_123"))
+    assert result["daily_row_detail"] == "compact"
+    assert result["daily_rows"] == [
+        {
+            "date_start": "2026-03-01",
+            "date_stop": "2026-03-01",
+            "metrics": {"spend": 100.0, "roas": 2.5},
+        }
+    ]
+
+
+def test_budget_pacing_report_can_return_full_daily_rows(monkeypatch) -> None:
+    row = {
+        "date_start": "2026-03-01",
+        "date_stop": "2026-03-01",
+        "spend": 100.0,
+        "actions_map": {"purchase": 2.0},
+        "metrics": {"spend": 100.0, "roas": 2.5},
+    }
+
+    async def fake_get_entity_insights(**kwargs):
+        return {"items": [row], "summary": {"metrics": {"spend": 100.0, "roas": 2.5}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.get_budget_pacing_report(
+            level="campaign",
+            object_id="cmp_123",
+            include_full_daily_rows=True,
+        )
+    )
+    assert result["daily_row_detail"] == "full"
+    assert result["daily_rows"] == [row]
 
 
 def test_creative_performance_report_ranks_mixed_roas(monkeypatch) -> None:

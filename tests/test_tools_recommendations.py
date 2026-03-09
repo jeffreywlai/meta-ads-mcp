@@ -87,9 +87,37 @@ def test_get_recommendations_flattens_nested_recommendation_payloads(monkeypatch
     bidding = asyncio.run(recommendations.get_bidding_opportunities(account_id="123"))
     creative = asyncio.run(recommendations.get_creative_opportunities(account_id="123"))
     assert result["summary"]["count"] == 2
-    assert result["items"][0]["message"] == "Duplicate ad sets to maximize value of conversions."
+    assert result["items"][0]["body"] == "Duplicate ad sets to maximize value of conversions."
+    assert "message" not in result["items"][0]
+    assert "recommendation_content" not in result["items"][0]
     assert bidding["items"][0]["id"] == "rec_nested_1"
     assert creative["items"][0]["id"] == "rec_nested_2"
+
+
+def test_get_recommendations_dedupes_duplicate_text_wrappers(monkeypatch) -> None:
+    class DuplicateTextClient(FakeRecommendationsClient):
+        async def get_recommendations(self, account_id: str, *, campaign_id=None):
+            return {
+                "data": [
+                    {
+                        "id": "rec_1",
+                        "message": "Increase budget on strong ad sets",
+                        "recommendation_content": {
+                            "body": "Increase budget on strong ad sets",
+                            "title": "Increase budget",
+                        },
+                    }
+                ]
+            }
+
+    recommendations._RECOMMENDATION_CACHE.clear()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: DuplicateTextClient())
+    result = asyncio.run(recommendations.get_recommendations(account_id="123"))
+    item = result["items"][0]
+    assert item["title"] == "Increase budget"
+    assert item["body"] == "Increase budget on strong ad sets"
+    assert "message" not in item
+    assert "recommendation_content" not in item
 
 
 def test_get_recommendations_handles_unsupported_surface(monkeypatch) -> None:
