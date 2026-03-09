@@ -202,13 +202,21 @@ Don't have a token? Use the built-in auth helper tools (`generate_auth_url` → 
 #### Option A: Claude Code (recommended)
 
 ```bash
+# Install from repo
+claude mcp add --transport stdio MetaAds \
+  --env META_ACCESS_TOKEN=YOUR_META_ACCESS_TOKEN \
+  --env META_DEFAULT_ACCOUNT_ID=act_1234567890 \
+  -- pipx run --spec git+https://github.com/jeffreywlai/meta-ads-mcp.git run-meta-ads-mcp
+```
+
+Or from a local clone:
+
+```bash
 claude mcp add --transport stdio MetaAds \
   --env META_ACCESS_TOKEN=YOUR_META_ACCESS_TOKEN \
   --env META_DEFAULT_ACCOUNT_ID=act_1234567890 \
   -- uv run --directory /path/to/meta-ads-mcp -m meta_ads_mcp.stdio
 ```
-
-Or use the project-scoped config in `.mcp.json`.
 
 Type `/mcp` in Claude Code to verify the server is connected.
 
@@ -220,13 +228,11 @@ Add to your Gemini MCP configuration:
 {
   "mcpServers": {
     "MetaAds": {
-      "command": "uv",
+      "command": "pipx",
       "args": [
-        "run",
-        "--directory",
-        "/path/to/meta-ads-mcp",
-        "-m",
-        "meta_ads_mcp.stdio"
+        "run", "--spec",
+        "git+https://github.com/jeffreywlai/meta-ads-mcp.git",
+        "run-meta-ads-mcp"
       ],
       "env": {
         "META_ACCESS_TOKEN": "YOUR_META_ACCESS_TOKEN",
