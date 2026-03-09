@@ -54,6 +54,9 @@ def test_get_capabilities_lists_new_helpers() -> None:
     assert "get_bidding_opportunities" in result["routing_hints"]["find_optimization_opportunities"]
     assert any("Ads Library API access" in note for note in result["notes"])
     assert "meta://docs/tool-routing" in result["resources"]
+    assert result["server"]["fastmcp_version_target"] == "3.1.0"
+    assert result["server"]["tool_search_enabled"] is True
+    assert result["server"]["dynamic_search_tools"] == ["search_tools", "call_tool"]
 
 
 def test_get_capabilities_can_return_compact_intent_guide() -> None:

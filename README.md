@@ -2,7 +2,7 @@
 
 Optimization-first MCP server for Meta Ads, designed for Claude Code, Claude Desktop, Gemini CLI, and similar MCP clients.
 
-Built on FastMCP with direct Meta Marketing API access, pinned to `v25.0` by default.
+Built on FastMCP `3.1.0` with direct Meta Marketing API access, pinned to `v25.0` by default.
 
 This is not an officially supported Meta product.
 
@@ -10,6 +10,7 @@ This is not an officially supported Meta product.
 
 - `71` MCP tools covering discovery, reporting, diagnostics, targeting, research, auth helpers, and controlled writes
 - `stdio`-first local setup for Claude Code and other CLI MCP clients
+- FastMCP `3.1` tool search enabled to reduce upfront tool-context usage in Claude-compatible clients
 - Meta Marketing API `v25.0` by default
 - Built-in docs and MCP resources for object model, metrics, optimization guidance, and v25 notes
 - Optimization-first tool surface: not just CRUD, but pacing, fatigue, audience, and snapshot diagnostics
@@ -115,12 +116,20 @@ This is not an officially supported Meta product.
 - `health_check`
 - `get_capabilities`
 
+FastMCP `3.1` also exposes dynamic search tools at runtime:
+
+- `search_tools`
+- `call_tool`
+
+Those let Claude discover the right hidden tool on demand instead of loading the full tool catalog into context up front.
+
 ## MCP Resources
 
 - `meta://docs/object-model`
 - `meta://docs/insights-metrics`
 - `meta://docs/v25-notes`
 - `meta://docs/optimization-playbook`
+- `meta://docs/tool-routing`
 
 ## Quick Start
 
@@ -166,6 +175,8 @@ claude mcp add --transport stdio MetaAds \
 Or use the project-scoped config in [.mcp.json](/Users/jefflai/Documents/GitHub/meta-ads-mcp/.mcp.json).
 
 Type `/mcp` in Claude Code to verify the server is connected.
+
+Because FastMCP `3.1` tool search is enabled, Claude may show `search_tools` and `call_tool` as part of the active runtime surface.
 
 #### Option B: Gemini CLI
 

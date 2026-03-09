@@ -29,7 +29,27 @@ from meta_ads_mcp.tools import (
     utility,
 )
 
-REGISTERED_TOOLS = dict(sorted(getattr(mcp_server, "_tools", {}).items()))
+
+def _registered_tools() -> dict[str, Any]:
+    """Read registered tools across FastMCP 2-style and 3.1-style registries."""
+    legacy = getattr(mcp_server, "_tools", None)
+    if isinstance(legacy, dict) and legacy:
+        return dict(sorted(legacy.items()))
+
+    provider = getattr(mcp_server, "local_provider", None)
+    components = getattr(provider, "_components", {}) if provider is not None else {}
+    tools: dict[str, Any] = {}
+    for key, component in components.items():
+        if not key.startswith("tool:"):
+            continue
+        name = getattr(component, "name", None)
+        fn = getattr(component, "fn", None)
+        if isinstance(name, str) and fn is not None:
+            tools[name] = fn
+    return dict(sorted(tools.items()))
+
+
+REGISTERED_TOOLS = _registered_tools()
 SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 SAMPLE_TARGETING = {

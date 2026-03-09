@@ -13,11 +13,11 @@ diagnose performance problems, and recommend changes with evidence.
 As of March 7, 2026, the implementation baseline is:
 
 - Meta Marketing API `v25.0`
-- FastMCP latest stable `2.14.5`
+- FastMCP latest stable `3.1.0`
 - Python `3.12+`
 
-FastMCP `3.0.0rc1` exists, but v1 should avoid release candidates. Re-check the
-latest stable FastMCP version immediately before scaffolding the project.
+FastMCP `3.1.0` is the stable target and should be used with tool-search
+transforms enabled to reduce upfront tool-context usage in compatible clients.
 
 ## Product Goals
 
@@ -101,7 +101,7 @@ guessing.
 ## Technical Baseline
 
 - Runtime: Python `3.12+`
-- Framework: FastMCP stable `2.14.5` at project start
+- Framework: FastMCP stable `3.1.0` at project start
 - Protocol: MCP over `stdio` first, HTTP second
 - Upstream API: Meta Marketing API `v25.0`
 - HTTP client: `httpx.AsyncClient`
@@ -1092,7 +1092,7 @@ Suggested console script:
 
 ## Suggested Dependencies
 
-- `fastmcp==2.14.5`
+- `fastmcp==3.1.0`
 - `mcp>=1.26.0`
 - `httpx[http2]>=0.28.1`
 - `pydantic>=2`
@@ -1156,7 +1156,7 @@ Suggested console script:
 These assumptions should be re-verified immediately before implementation:
 
 - Meta Marketing API target version is `v25.0`
-- FastMCP latest stable is `2.14.5` as of March 7, 2026
+- FastMCP latest stable is `3.1.0` as of March 9, 2026
 
 ## Source Notes
 

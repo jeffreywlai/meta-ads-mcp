@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.coordinator import ALWAYS_VISIBLE_TOOLS
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
@@ -248,7 +249,14 @@ ROUTING_HINTS = {
 
 def tool_routing_markdown() -> str:
     """Return a compact markdown routing guide for Claude."""
-    lines = ["# Tool Routing Guide", "", "Use `get_capabilities(intent=...)` for a compact routing response.", ""]
+    lines = [
+        "# Tool Routing Guide",
+        "",
+        "FastMCP 3.1 tool search is enabled. If the exact tool is not visible, use `search_tools` and then `call_tool`.",
+        "",
+        "Use `get_capabilities(intent=...)` for a compact routing response.",
+        "",
+    ]
     for intent, route in INTENT_GUIDE.items():
         lines.append(f"## {intent}")
         lines.append(route["description"])
@@ -272,10 +280,14 @@ def _server_metadata() -> dict[str, object]:
     settings = get_settings()
     return {
         "name": "Meta Ads FastMCP",
+        "fastmcp_version_target": "3.1.0",
         "api_version": settings.api_version,
         "optimization_first": True,
         "primary_transport": "stdio",
         "secondary_transport": "streamable-http",
+        "tool_search_enabled": True,
+        "always_visible_tools": ALWAYS_VISIBLE_TOOLS,
+        "dynamic_search_tools": ["search_tools", "call_tool"],
     }
 
 
@@ -342,6 +354,7 @@ async def get_capabilities(intent: str | None = None) -> dict[str, object]:
             "notes": [
                 "Use the recommended_order list first and only fall back to avoid_unless_needed when the primary tools cannot answer the question.",
                 "For opportunity scans, prefer get_recommendations once before typed opportunity tools.",
+                "When the exact tool is not visible, use search_tools and then call_tool because FastMCP 3.1 tool search is enabled.",
             ],
         }
 
@@ -363,6 +376,7 @@ async def get_capabilities(intent: str | None = None) -> dict[str, object]:
         "resources": RESOURCE_URIS,
         "notes": [
             "Use discovery and diagnostics before write operations.",
+            "FastMCP 3.1 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
             "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
             "export_insights is a convenience wrapper over the core insights surface.",
             "Pass intent to get_capabilities for a compact routing response instead of the full manifest.",
