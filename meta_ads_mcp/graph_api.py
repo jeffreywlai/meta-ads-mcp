@@ -21,6 +21,7 @@ from .errors import (
 )
 
 USER_AGENT = "meta-ads-fastmcp/0.1.0"
+_CLIENT_POOL: dict[tuple[int, str, str | None, float], httpx.AsyncClient] = {}
 
 
 def normalize_account_id(account_id: str) -> str:
@@ -73,6 +74,25 @@ class GraphAPIClient:
             return None
         return {key: self._encode_value(value) for key, value in mapping.items()}
 
+    def _client_key(self, *, base_url: str | None = None) -> tuple[int, str, str | None, float]:
+        """Build the shared-client pool key."""
+        loop_id = id(asyncio.get_running_loop())
+        return (
+            loop_id,
+            (base_url or self.base_url).rstrip("/"),
+            self.access_token_override or self.settings.access_token,
+            self.settings.request_timeout,
+        )
+
+    def _get_shared_client(self, *, base_url: str | None = None) -> httpx.AsyncClient:
+        """Return a pooled async client for repeated Graph API calls."""
+        key = self._client_key(base_url=base_url)
+        client = _CLIENT_POOL.get(key)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(timeout=self.settings.request_timeout, http2=True)
+            _CLIENT_POOL[key] = client
+        return client
+
     async def request(
         self,
         method: str,
@@ -95,59 +115,59 @@ class GraphAPIClient:
         encoded_params = self._encode_mapping(params)
         encoded_data = self._encode_mapping(data)
 
-        async with httpx.AsyncClient(timeout=self.settings.request_timeout) as client:
-            for attempt in range(retries):
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    params=encoded_params,
-                    data=encoded_data,
-                    headers=headers,
-                    files=files,
-                )
-                if response.status_code == 429:
-                    if attempt + 1 < retries:
-                        await asyncio.sleep(2**attempt)
-                        continue
-                    raise RateLimitError("Meta API rate limit reached.")
-                if response.status_code == 404:
-                    raise NotFoundError(f"Meta object or edge not found: {endpoint}")
-                if response.status_code in {501, 503}:
-                    if attempt + 1 < retries:
-                        await asyncio.sleep(2**attempt)
-                        continue
+        client = self._get_shared_client(base_url=base_url)
+        for attempt in range(retries):
+            response = await client.request(
+                method=method,
+                url=url,
+                params=encoded_params,
+                data=encoded_data,
+                headers=headers,
+                files=files,
+            )
+            if response.status_code == 429:
+                if attempt + 1 < retries:
+                    await asyncio.sleep(2**attempt)
+                    continue
+                raise RateLimitError("Meta API rate limit reached.")
+            if response.status_code == 404:
+                raise NotFoundError(f"Meta object or edge not found: {endpoint}")
+            if response.status_code in {501, 503}:
+                if attempt + 1 < retries:
+                    await asyncio.sleep(2**attempt)
+                    continue
 
-                try:
-                    payload = response.json()
-                except ValueError:
-                    payload = {
-                        "text_response": response.text,
-                        "content_type": response.headers.get("content-type"),
-                        "status_code": response.status_code,
-                    }
-                    if response.is_error:
-                        raise MetaApiError(
-                            message="Non-JSON error response from Meta API",
-                            status_code=response.status_code,
-                            details=payload,
-                        )
-                    return payload
-
-                if isinstance(payload, bool):
-                    payload = {"success": payload}
-                elif isinstance(payload, list):
-                    payload = {"data": payload}
-                if response.is_error or "error" in payload:
-                    error = MetaApiError.from_payload(payload, status_code=response.status_code)
-                    if _is_rate_limit_error(error):
-                        if attempt + 1 < retries:
-                            await asyncio.sleep(2**attempt)
-                            continue
-                        raise RateLimitError(error.message) from error
-                    if _is_unsupported_surface_error(error):
-                        raise UnsupportedFeatureError(error.message) from error
-                    raise error
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {
+                    "text_response": response.text,
+                    "content_type": response.headers.get("content-type"),
+                    "status_code": response.status_code,
+                }
+                if response.is_error:
+                    raise MetaApiError(
+                        message="Non-JSON error response from Meta API",
+                        status_code=response.status_code,
+                        details=payload,
+                    )
                 return payload
+
+            if isinstance(payload, bool):
+                payload = {"success": payload}
+            elif isinstance(payload, list):
+                payload = {"data": payload}
+            if response.is_error or "error" in payload:
+                error = MetaApiError.from_payload(payload, status_code=response.status_code)
+                if _is_rate_limit_error(error):
+                    if attempt + 1 < retries:
+                        await asyncio.sleep(2**attempt)
+                        continue
+                    raise RateLimitError(error.message) from error
+                if _is_unsupported_surface_error(error):
+                    raise UnsupportedFeatureError(error.message) from error
+                raise error
+            return payload
 
         raise AsyncJobError(f"Request retries exhausted for endpoint: {endpoint}")
 
@@ -516,3 +536,12 @@ class GraphAPIClient:
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:
     """Return a configured Graph API client."""
     return GraphAPIClient(settings=get_settings(), access_token_override=access_token_override)
+
+
+async def close_graph_api_clients() -> None:
+    """Close all pooled async HTTP clients."""
+    clients = list(_CLIENT_POOL.values())
+    _CLIENT_POOL.clear()
+    for client in clients:
+        if not client.is_closed:
+            await client.aclose()

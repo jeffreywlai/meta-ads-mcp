@@ -9,7 +9,7 @@ import pytest
 
 from meta_ads_mcp.config import Settings
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError
-from meta_ads_mcp.graph_api import GraphAPIClient
+from meta_ads_mcp.graph_api import GraphAPIClient, _CLIENT_POOL, close_graph_api_clients
 
 
 class FakeResponse:
@@ -33,9 +33,11 @@ class FakeAsyncClient:
     """Minimal async client that returns one configured response."""
 
     responses: deque[FakeResponse]
+    instances: list["FakeAsyncClient"] = []
 
     def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
-        pass
+        self.is_closed = False
+        FakeAsyncClient.instances.append(self)
 
     async def __aenter__(self) -> "FakeAsyncClient":
         return self
@@ -45,6 +47,9 @@ class FakeAsyncClient:
 
     async def request(self, *args, **kwargs) -> FakeResponse:  # noqa: ANN002, ANN003
         return self.responses.popleft()
+
+    async def aclose(self) -> None:
+        self.is_closed = True
 
 
 def _client(*, max_retries: int = 0) -> GraphAPIClient:
@@ -63,6 +68,15 @@ def _client(*, max_retries: int = 0) -> GraphAPIClient:
             max_retries=max_retries,
         )
     )
+
+
+@pytest.fixture(autouse=True)
+def clear_client_pool() -> None:
+    _CLIENT_POOL.clear()
+    FakeAsyncClient.instances.clear()
+    yield
+    _CLIENT_POOL.clear()
+    FakeAsyncClient.instances.clear()
 
 
 def test_request_maps_unsupported_get_request_to_unsupported_feature(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,3 +160,48 @@ def test_request_raises_rate_limit_error_for_exhausted_payload_throttle(monkeypa
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     with pytest.raises(RateLimitError):
         asyncio.run(_client().request("GET", "retry-edge"))
+
+
+def test_request_reuses_shared_async_client_within_one_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(200, {"data": [{"id": "first"}]}),
+            FakeResponse(200, {"data": [{"id": "second"}]}),
+        ]
+    )
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    client = _client()
+    async def run_two() -> tuple[dict[str, object], dict[str, object]]:
+        first_result = await client.request("GET", "one")
+        second_result = await client.request("GET", "two")
+        return first_result, second_result
+
+    first, second = asyncio.run(run_two())
+    assert first["data"][0]["id"] == "first"
+    assert second["data"][0]["id"] == "second"
+    assert len(FakeAsyncClient.instances) == 1
+
+
+def test_request_uses_separate_clients_across_event_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(200, {"data": [{"id": "first"}]}),
+            FakeResponse(200, {"data": [{"id": "second"}]}),
+        ]
+    )
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    client = _client()
+    asyncio.run(client.request("GET", "one"))
+    asyncio.run(client.request("GET", "two"))
+    assert len(FakeAsyncClient.instances) == 2
+
+
+def test_close_graph_api_clients_closes_pooled_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"data": [{"id": "first"}]})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    asyncio.run(_client().request("GET", "one"))
+    assert len(FakeAsyncClient.instances) == 1
+    assert not FakeAsyncClient.instances[0].is_closed
+    asyncio.run(close_graph_api_clients())
+    assert FakeAsyncClient.instances[0].is_closed is True
+    assert _CLIENT_POOL == {}
