@@ -46,3 +46,17 @@ def test_compact_search_serializer_returns_minimal_markdown() -> None:
     assert "properties" not in result
     assert "additionalProperties" not in result
     assert "Next: use `call_tool`" in result
+
+
+def test_compact_search_serializer_surfaces_required_archive_params() -> None:
+    components = mcp_server.local_provider.__dict__["_components"]
+    result = serialize_search_results_compact([components["tool:search_ads_archive@"]])
+    assert "`search_ads_archive` | req: search_terms, ad_reached_countries" in result
+    assert "opt: ad_type, limit, fields" in result
+
+
+def test_compact_search_serializer_surfaces_required_targeting_category_params() -> None:
+    components = mcp_server.local_provider.__dict__["_components"]
+    result = serialize_search_results_compact([components["tool:get_targeting_categories@"]])
+    assert "`get_targeting_categories` | req: category_class" in result
+    assert "opt: query, account_id, limit" in result
