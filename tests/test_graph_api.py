@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 
 import pytest
 
 from meta_ads_mcp.config import Settings
-from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError
+from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError
 from meta_ads_mcp.graph_api import GraphAPIClient
 
 
@@ -31,7 +32,7 @@ class FakeResponse:
 class FakeAsyncClient:
     """Minimal async client that returns one configured response."""
 
-    response: FakeResponse
+    responses: deque[FakeResponse]
 
     def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
         pass
@@ -43,10 +44,10 @@ class FakeAsyncClient:
         return None
 
     async def request(self, *args, **kwargs) -> FakeResponse:  # noqa: ANN002, ANN003
-        return self.response
+        return self.responses.popleft()
 
 
-def _client() -> GraphAPIClient:
+def _client(*, max_retries: int = 0) -> GraphAPIClient:
     return GraphAPIClient(
         settings=Settings(
             access_token="token_123",
@@ -59,15 +60,19 @@ def _client() -> GraphAPIClient:
             host="127.0.0.1",
             port=8000,
             request_timeout=30.0,
-            max_retries=0,
+            max_retries=max_retries,
         )
     )
 
 
 def test_request_maps_unsupported_get_request_to_unsupported_feature(monkeypatch: pytest.MonkeyPatch) -> None:
-    FakeAsyncClient.response = FakeResponse(
-        400,
-        {"error": {"message": "Unsupported get request.", "code": 100}},
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                400,
+                {"error": {"message": "Unsupported get request.", "code": 100}},
+            )
+        ]
     )
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     with pytest.raises(UnsupportedFeatureError):
@@ -75,9 +80,13 @@ def test_request_maps_unsupported_get_request_to_unsupported_feature(monkeypatch
 
 
 def test_request_keeps_invalid_field_errors_as_meta_api_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    FakeAsyncClient.response = FakeResponse(
-        400,
-        {"error": {"message": "(#100) Tried accessing nonexisting field (assigned_pages)", "code": 100}},
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                400,
+                {"error": {"message": "(#100) Tried accessing nonexisting field (assigned_pages)", "code": 100}},
+            )
+        ]
     )
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     with pytest.raises(MetaApiError) as exc_info:
@@ -86,16 +95,54 @@ def test_request_keeps_invalid_field_errors_as_meta_api_errors(monkeypatch: pyte
 
 
 def test_request_keeps_invalid_async_fields_as_meta_api_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    FakeAsyncClient.response = FakeResponse(
-        400,
-        {
-            "error": {
-                "message": "(#100) Cannot include adset_id in fields param because it was not in the report run",
-                "code": 100,
-            }
-        },
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                400,
+                {
+                    "error": {
+                        "message": "(#100) Cannot include adset_id in fields param because it was not in the report run",
+                        "code": 100,
+                    }
+                },
+            )
+        ]
     )
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     with pytest.raises(MetaApiError) as exc_info:
         asyncio.run(_client().request("GET", "bad-edge"))
     assert "fields param" in exc_info.value.message
+
+
+def test_request_retries_payload_rate_limit_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                400,
+                {"error": {"message": "User request limit reached", "code": 17, "error_subcode": 2446079}},
+            ),
+            FakeResponse(200, {"data": [{"id": "ok"}]}),
+        ]
+    )
+    async def fake_sleep(*_args, **_kwargs) -> None:
+        return None
+
+    client = _client(max_retries=1)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    result = asyncio.run(client.request("GET", "retry-edge"))
+    assert result["data"][0]["id"] == "ok"
+
+
+def test_request_raises_rate_limit_error_for_exhausted_payload_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                400,
+                {"error": {"message": "User request limit reached", "code": 17, "error_subcode": 2446079}},
+            )
+        ]
+    )
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError):
+        asyncio.run(_client().request("GET", "retry-edge"))

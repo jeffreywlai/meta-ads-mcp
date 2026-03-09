@@ -38,6 +38,14 @@ def _is_unsupported_surface_error(error: MetaApiError) -> bool:
     return False
 
 
+def _is_rate_limit_error(error: MetaApiError) -> bool:
+    """Decide whether a Graph API error is actually throttling."""
+    message = error.message.lower()
+    if error.code in {4, 17, 32, 613}:
+        return True
+    return "rate limit" in message or "limit reached" in message or "too many calls" in message
+
+
 @dataclass(slots=True)
 class GraphAPIClient:
     """Thin async client around the Marketing API."""
@@ -131,6 +139,11 @@ class GraphAPIClient:
                     payload = {"data": payload}
                 if response.is_error or "error" in payload:
                     error = MetaApiError.from_payload(payload, status_code=response.status_code)
+                    if _is_rate_limit_error(error):
+                        if attempt + 1 < retries:
+                            await asyncio.sleep(2**attempt)
+                            continue
+                        raise RateLimitError(error.message) from error
                     if _is_unsupported_surface_error(error):
                         raise UnsupportedFeatureError(error.message) from error
                     raise error

@@ -17,7 +17,7 @@ from meta_ads_mcp.diagnostics import (
     rank_rows,
     summary_metric_evidence,
 )
-from meta_ads_mcp.graph_api import get_graph_api_client
+from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tools.insights import (
     DEFAULT_INSIGHTS_FIELDS,
@@ -149,13 +149,18 @@ async def get_account_optimization_snapshot(
     top_n: int = 5,
 ) -> dict[str, Any]:
     """Use this for a top-level account briefing before asking narrower optimization questions."""
+    resolved_account_id = normalize_account_id(account_id)
     account_scope, campaigns = await asyncio.gather(
         get_entity_insights(
             level="account",
-            object_id=account_id,
+            object_id=resolved_account_id,
             **_window_kwargs(date_preset=date_preset, since=since, until=until),
         ),
-        _child_insights(account_id, level="campaign", **_window_kwargs(date_preset=date_preset, since=since, until=until)),
+        _child_insights(
+            resolved_account_id,
+            level="campaign",
+            **_window_kwargs(date_preset=date_preset, since=since, until=until),
+        ),
     )
     campaigns = annotate_share_metrics(campaigns)
     findings = detect_snapshot_findings(account_scope["summary"]["metrics"], campaigns)
@@ -169,7 +174,7 @@ async def get_account_optimization_snapshot(
         extra["comparison_hint"] = "Use compare_time_ranges for explicit date windows."
 
     return analysis_response(
-        scope={"level": "account", "object_id": account_id},
+        scope={"level": "account", "object_id": resolved_account_id},
         metrics=account_scope["summary"]["metrics"],
         findings=findings,
         evidence=summary_metric_evidence(account_scope["summary"]["metrics"]),

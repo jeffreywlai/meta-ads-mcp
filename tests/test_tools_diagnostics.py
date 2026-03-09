@@ -92,6 +92,26 @@ def test_account_snapshot_supports_explicit_since_until(monkeypatch) -> None:
     assert child_calls[0]["date_preset"] is None
 
 
+def test_account_snapshot_normalizes_numeric_account_id(monkeypatch) -> None:
+    entity_calls: list[dict[str, object]] = []
+    child_calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs):
+        entity_calls.append(kwargs)
+        return {"items": [], "summary": {"metrics": {}}}
+
+    async def fake_child_insights(object_id: str, *, level: str, **kwargs):
+        child_calls.append({"object_id": object_id, "level": level, **kwargs})
+        return []
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_account_optimization_snapshot(account_id="123"))
+    assert entity_calls[0]["object_id"] == "act_123"
+    assert child_calls[0]["object_id"] == "act_123"
+    assert result["scope"]["object_id"] == "act_123"
+
+
 def test_budget_pacing_report_handles_no_rows(monkeypatch) -> None:
     async def fake_get_entity_insights(**kwargs):
         return {"items": [], "summary": {"metrics": {}}}

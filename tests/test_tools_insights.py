@@ -40,6 +40,17 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+def test_get_entity_insights_normalizes_numeric_account_ids(monkeypatch) -> None:
+    class NumericAccountClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert object_id == "act_123"
+            return await super().get_insights("act_123", fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: NumericAccountClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="123"))
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
 def test_get_entity_insights_preserves_paging(monkeypatch) -> None:
     class PagingInsightsClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):

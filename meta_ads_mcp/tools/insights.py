@@ -13,7 +13,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import compare_metric_sets, derive_core_metrics
 from meta_ads_mcp.diagnostics import summary_metric_evidence
 from meta_ads_mcp.errors import ValidationError
-from meta_ads_mcp.graph_api import get_graph_api_client
+from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import normalize_collection, normalize_insights_row
 from meta_ads_mcp.schemas import analysis_response, collection_response
 
@@ -119,6 +119,13 @@ def _insights_params(
     if action_attribution_windows:
         params["action_attribution_windows"] = ",".join(action_attribution_windows)
     return params
+
+
+def _normalize_reporting_object_id(level: str, object_id: str) -> str:
+    """Normalize account-level ids while leaving other entity ids untouched."""
+    if level == "account":
+        return normalize_account_id(object_id)
+    return object_id
 
 
 def _normalize_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -321,8 +328,9 @@ async def get_entity_insights(
 ) -> dict[str, Any]:
     """Use this for the primary reporting read: normalized insights for one account, campaign, ad set, or ad."""
     client = get_graph_api_client()
+    resolved_object_id = _normalize_reporting_object_id(level, object_id)
     payload = await client.get_insights(
-        object_id,
+        resolved_object_id,
         fields=fields or DEFAULT_INSIGHTS_FIELDS,
         params=_insights_params(
             level=level,
@@ -571,8 +579,9 @@ async def create_async_insights_report(
     """Use this when the reporting query is large enough that a synchronous insights call would be too heavy."""
     client = get_graph_api_client()
     requested_fields = fields or DEFAULT_INSIGHTS_FIELDS
+    resolved_object_id = _normalize_reporting_object_id(level, object_id)
     payload = await client.create_async_insights_report(
-        object_id,
+        resolved_object_id,
         fields=requested_fields,
         params=_insights_params(
             level=level,
