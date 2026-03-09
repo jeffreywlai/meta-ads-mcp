@@ -5,7 +5,7 @@
 [![FastMCP 3.1](https://img.shields.io/badge/FastMCP-3.1-green.svg)](https://github.com/jlowin/fastmcp)
 [![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
-**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 71 tools for querying, managing, and optimizing your ad accounts through natural language.**
+**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 79 tools for querying, managing, and optimizing your ad accounts through natural language.**
 
 > Ask Claude or Gemini to "show me which creatives are fatiguing" or "give me an optimization snapshot for this account" — and it just works.
 
@@ -13,16 +13,16 @@
 
 ## ✨ Features
 
-- 📊 **71 Tools** — Discovery, reporting, diagnostics, targeting, research, auth helpers, and controlled writes
+- 📊 **79 Tools** — Discovery, reporting, diagnostics, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, and v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 71 up front
+- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 79 up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (71)
+## 📋 Available Tools (79)
 
 ### 🔍 Discovery
 
@@ -65,7 +65,12 @@
 | `get_audience_performance_report` | Audience segment performance analysis |
 | `get_delivery_risk_report` | Delivery risks and issues |
 | `get_learning_phase_report` | Learning phase status for ad sets |
-| `get_recommendations` | AI-powered optimization recommendations |
+| `get_recommendations` | Broad Meta-native opportunity scan |
+| `get_budget_opportunities` | Budget and scaling opportunities |
+| `get_creative_opportunities` | Creative asset and format opportunities |
+| `get_audience_opportunities` | Audience and targeting opportunities |
+| `get_delivery_opportunities` | Delivery and reach opportunities |
+| `get_bidding_opportunities` | Bid strategy opportunities |
 
 ### 🎯 Planning & Targeting
 
@@ -95,6 +100,9 @@
 | `set_ad_status` | Pause or enable an ad |
 | `update_campaign_budget` | Update a campaign's budget |
 | `update_adset_budget` | Update an ad set's budget |
+| `update_adset_bid_amount` | Update an ad set's bid amount |
+| `update_campaign_bid_strategy` | Update a campaign's bidding strategy |
+| `update_adset_bid_strategy` | Update an ad set's bidding strategy |
 | `create_custom_audience` | Create a custom audience |
 | `create_lookalike_audience` | Create a lookalike audience |
 | `update_custom_audience` | Update a custom audience |
