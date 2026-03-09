@@ -81,9 +81,79 @@ ALWAYS_VISIBLE_TOOLS = [
     "list_ad_accounts",
 ]
 
+
+def _first_sentence(text: str | None) -> str:
+    """Return the first sentence from a tool description."""
+    if not text:
+        return ""
+    stripped = " ".join(text.strip().split())
+    head, _sep, _tail = stripped.partition(". ")
+    return head.rstrip(".")
+
+
+def _compact_description(text: str | None) -> str:
+    """Trim repetitive docstring prefixes to keep search output compact."""
+    sentence = _first_sentence(text)
+    prefixes = (
+        "Use this first when ",
+        "Use this only when ",
+        "Use this when ",
+        "Use this before ",
+        "Use this after ",
+        "Use this for ",
+    )
+    for prefix in prefixes:
+        if sentence.startswith(prefix):
+            return sentence[len(prefix) :]
+    return sentence
+
+
+def _argument_summary(tool: Any) -> str:
+    """Render a compact argument summary from the tool parameter schema."""
+    parameters = getattr(tool, "parameters", None) or {}
+    properties = parameters.get("properties", {}) or {}
+    required = list(parameters.get("required", []) or [])
+    optional = [name for name in properties if name not in required]
+
+    def _format_names(names: list[str], *, label: str) -> str:
+        if not names:
+            return ""
+        shown = names[:3]
+        extra = len(names) - len(shown)
+        suffix = f" +{extra}" if extra > 0 else ""
+        return f"{label}: {', '.join(shown)}{suffix}"
+
+    parts = []
+    required_part = _format_names(required, label="req")
+    optional_part = _format_names(optional, label="opt")
+    if required_part:
+        parts.append(required_part)
+    if optional_part:
+        parts.append(optional_part)
+    return " | ".join(parts) if parts else "no args"
+
+
+def serialize_search_results_compact(tools: list[Any]) -> str:
+    """Serialize search results as compact markdown with minimal argument hints."""
+    if not tools:
+        return "No tools matched. Try a narrower query or call get_capabilities(intent=...)."
+
+    lines = ["Matches:"]
+    for tool in tools:
+        name = getattr(tool, "name", "unknown_tool")
+        description = _compact_description(getattr(tool, "description", None))
+        args = _argument_summary(tool)
+        line = f"- `{name}` | {args}"
+        if description:
+            line += f" | {description}"
+        lines.append(line)
+    lines.append("Next: use `call_tool` with the exact tool name and JSON arguments.")
+    return "\n".join(lines)
+
 TOOL_SEARCH_TRANSFORM = BM25SearchTransform(
     max_results=6,
     always_visible=ALWAYS_VISIBLE_TOOLS,
+    search_result_serializer=serialize_search_results_compact,
 )
 
 

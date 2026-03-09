@@ -255,6 +255,7 @@ def tool_routing_markdown() -> str:
         "FastMCP 3.1 tool search is enabled. If the exact tool is not visible, use `search_tools` and then `call_tool`.",
         "",
         "Use `get_capabilities(intent=...)` for a compact routing response.",
+        "Use `get_capabilities(include_full_manifest=true)` only when the compact response is insufficient.",
         "",
     ]
     for intent, route in INTENT_GUIDE.items():
@@ -335,8 +336,11 @@ async def health_check() -> dict[str, object]:
 
 
 @mcp_server.tool()
-async def get_capabilities(intent: str | None = None) -> dict[str, object]:
-    """Use this when Claude is unsure which tool to use. Pass intent for a compact routing response instead of the full manifest."""
+async def get_capabilities(
+    intent: str | None = None,
+    include_full_manifest: bool = False,
+) -> dict[str, object]:
+    """Use this when Claude is unsure which tool to use. Prefer intent for compact routing, and request the full manifest only when needed."""
     if intent is not None:
         route = INTENT_GUIDE.get(intent)
         if route is None:
@@ -358,32 +362,49 @@ async def get_capabilities(intent: str | None = None) -> dict[str, object]:
             ],
         }
 
-    settings = get_settings()
+    auth = {
+        "required": ["META_ACCESS_TOKEN"],
+        "optional": [
+            "META_DEFAULT_ACCOUNT_ID",
+            "META_APP_ID",
+            "META_APP_SECRET",
+            "META_REDIRECT_URI",
+        ],
+    }
+    notes = [
+        "Use discovery and diagnostics before write operations.",
+        "FastMCP 3.1 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
+        "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
+        "export_insights is a convenience wrapper over the core insights surface.",
+        "Pass intent to get_capabilities for a compact routing response instead of the full manifest.",
+        "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
+        "Use list_instagram_accounts when creative setup requires an Instagram identity rather than a Facebook Page.",
+        "Use get_recommendations once for a broad Meta-native opportunity scan, and use typed opportunity tools only for category-specific follow-up.",
+        "search_ads_archive is public research data and does not depend on an ad account id, but the app still needs Ads Library API access.",
+        "Write operations still depend on the token having ads_management-level permissions.",
+    ]
+    if include_full_manifest:
+        return {
+            "server": _server_metadata(),
+            "auth": auth,
+            "tool_groups": TOOL_GROUPS,
+            "routing_hints": ROUTING_HINTS,
+            "intent_guide": INTENT_GUIDE,
+            "resources": RESOURCE_URIS,
+            "notes": notes,
+        }
+
     return {
         "server": _server_metadata(),
-        "auth": {
-            "required": ["META_ACCESS_TOKEN"],
-            "optional": [
-                "META_DEFAULT_ACCOUNT_ID",
-                "META_APP_ID",
-                "META_APP_SECRET",
-                "META_REDIRECT_URI",
-            ],
+        "auth": auth,
+        "valid_intents": sorted(INTENT_GUIDE),
+        "tool_group_counts": {group: len(tools) for group, tools in TOOL_GROUPS.items()},
+        "recommended_start": {
+            "if_auth_or_connectivity_is_unclear": "health_check",
+            "if_the_needed_tool_is_not_visible": "search_tools",
+            "if_you_need_intent_specific_routing": "get_capabilities(intent=...)",
+            "if_you_need_the_entire_manifest": "get_capabilities(include_full_manifest=true)",
         },
-        "tool_groups": TOOL_GROUPS,
-        "routing_hints": ROUTING_HINTS,
-        "intent_guide": INTENT_GUIDE,
         "resources": RESOURCE_URIS,
-        "notes": [
-            "Use discovery and diagnostics before write operations.",
-            "FastMCP 3.1 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
-            "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
-            "export_insights is a convenience wrapper over the core insights surface.",
-            "Pass intent to get_capabilities for a compact routing response instead of the full manifest.",
-            "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
-            "Use list_instagram_accounts when creative setup requires an Instagram identity rather than a Facebook Page.",
-            "Use get_recommendations once for a broad Meta-native opportunity scan, and use typed opportunity tools only for category-specific follow-up.",
-            "search_ads_archive is public research data and does not depend on an ad account id, but the app still needs Ads Library API access.",
-            "Write operations still depend on the token having ads_management-level permissions.",
-        ],
+        "notes": notes,
     }

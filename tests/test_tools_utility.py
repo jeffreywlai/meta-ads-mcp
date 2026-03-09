@@ -38,8 +38,25 @@ def test_health_check_reports_missing_token(monkeypatch) -> None:
     assert result["meta_api_connection"] == "not_attempted"
 
 
-def test_get_capabilities_lists_new_helpers() -> None:
+def test_get_capabilities_returns_compact_summary_by_default() -> None:
     result = asyncio.run(utility.get_capabilities())
+    assert "tool_groups" not in result
+    assert "routing_hints" not in result
+    assert "intent_guide" not in result
+    assert "find_optimization_opportunities" in result["valid_intents"]
+    assert result["tool_group_counts"]["analysis"] >= 1
+    assert result["tool_group_counts"]["optimization"] >= 1
+    assert result["recommended_start"]["if_the_needed_tool_is_not_visible"] == "search_tools"
+    assert result["recommended_start"]["if_you_need_the_entire_manifest"] == "get_capabilities(include_full_manifest=true)"
+    assert any("Ads Library API access" in note for note in result["notes"])
+    assert "meta://docs/tool-routing" in result["resources"]
+    assert result["server"]["fastmcp_version_target"] == "3.1.0"
+    assert result["server"]["tool_search_enabled"] is True
+    assert result["server"]["dynamic_search_tools"] == ["search_tools", "call_tool"]
+
+
+def test_get_capabilities_can_return_full_manifest() -> None:
+    result = asyncio.run(utility.get_capabilities(include_full_manifest=True))
     assert "health_check" in result["tool_groups"]["utility"]
     assert "compare_performance" in result["tool_groups"]["analysis"]
     assert "export_insights" in result["tool_groups"]["analysis"]
@@ -52,11 +69,6 @@ def test_get_capabilities_lists_new_helpers() -> None:
     assert "search_ads_archive" in result["tool_groups"]["research"]
     assert result["routing_hints"]["compare_multiple_entities"][0] == "compare_performance"
     assert "get_bidding_opportunities" in result["routing_hints"]["find_optimization_opportunities"]
-    assert any("Ads Library API access" in note for note in result["notes"])
-    assert "meta://docs/tool-routing" in result["resources"]
-    assert result["server"]["fastmcp_version_target"] == "3.1.0"
-    assert result["server"]["tool_search_enabled"] is True
-    assert result["server"]["dynamic_search_tools"] == ["search_tools", "call_tool"]
 
 
 def test_get_capabilities_can_return_compact_intent_guide() -> None:
