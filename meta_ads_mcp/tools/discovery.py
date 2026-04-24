@@ -232,7 +232,7 @@ async def list_ads(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover ads under exactly one scope: one account, one campaign, or one ad set."""
+    """Use this to discover ads under at most one scope; if none is provided, META_DEFAULT_ACCOUNT_ID is used."""
     scope_count = sum(value is not None for value in (account_id, campaign_id, adset_id))
     if scope_count > 1:
         raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")

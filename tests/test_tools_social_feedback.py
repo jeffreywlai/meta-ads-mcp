@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import social_feedback
 
@@ -218,6 +220,11 @@ def test_list_ad_comments_auto_keeps_fetching_after_empty_surface(monkeypatch) -
     assert result["summary"]["surfaces"] == ["facebook", "instagram"]
     assert result["summary"]["count"] == 1
     assert result["items"][0]["surface"] == "instagram"
+
+
+def test_list_ad_comments_rejects_auto_pagination_cursor() -> None:
+    with pytest.raises(social_feedback.ValidationError, match="one concrete surface"):
+        asyncio.run(social_feedback.list_ad_comments(ad_id="ad_full", after="after_fb"))
 
 
 def test_list_page_recommendations_compacts_reviews(monkeypatch) -> None:

@@ -484,7 +484,7 @@ async def get_capabilities(
                 "server": _server_metadata(),
                 "unmatched_intent": intent,
                 "closest_intents": closest,
-                "suggested_search": {"tool": "search_tools", "query": intent},
+                "suggested_search": {"tool": "search_tools", "arguments": {"query": intent}},
                 "resources": RESOURCE_URIS,
                 "valid_intents": sorted(INTENT_GUIDE),
                 "notes": [

@@ -88,7 +88,10 @@ def test_get_capabilities_falls_forward_on_unknown_intent() -> None:
     result = asyncio.run(utility.get_capabilities(intent="customer feedback product reviews testimonials"))
     assert result["unmatched_intent"] == "customer feedback product reviews testimonials"
     assert result["closest_intents"][0]["intent"] == "read_ad_comments_or_quality_signals"
-    assert result["suggested_search"]["tool"] == "search_tools"
+    assert result["suggested_search"] == {
+        "tool": "search_tools",
+        "arguments": {"query": "customer feedback product reviews testimonials"},
+    }
 
 
 def test_get_capabilities_routes_terse_intents() -> None:

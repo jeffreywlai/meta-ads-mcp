@@ -636,6 +636,9 @@ async def summarize_actions(
 ) -> dict[str, Any]:
     """Use this for appointment, purchase, lead, or custom action counts over last 30 days or any trailing window."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
+    effective_date_preset = None
+    if not (resolved_since and resolved_until):
+        effective_date_preset = _normalize_date_preset(date_preset) or _normalize_date_preset("last_30d")
     fields = [
         ID_FIELD_BY_LEVEL.get(level, "campaign_id"),
         NAME_FIELD_BY_LEVEL.get(level, "campaign_name"),
@@ -650,7 +653,7 @@ async def summarize_actions(
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
-        date_preset=date_preset,
+        date_preset=effective_date_preset,
         since=resolved_since,
         until=resolved_until,
         fields=[field for field in fields if field],
@@ -661,9 +664,6 @@ async def summarize_actions(
     )
     rows = payload["items"]
     totals = _action_totals(rows)
-    effective_date_preset = None
-    if not (resolved_since and resolved_until):
-        effective_date_preset = _normalize_date_preset(date_preset) or _normalize_date_preset("last_7d")
     response: dict[str, Any] = {
         "scope": {"level": level, "object_id": object_id},
         "window": {
