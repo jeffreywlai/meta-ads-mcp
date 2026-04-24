@@ -148,7 +148,8 @@ def test_list_ad_comments_direct_story_id_compacts_and_truncates(monkeypatch) ->
 
     assert result["summary"]["api_calls"] == 1
     assert result["summary"]["surfaces"] == ["facebook"]
-    assert result["items"][0]["message"] == "This is a..."
+    assert result["items"][0]["message"] == "This is..."
+    assert len(result["items"][0]["message"]) <= 10
     assert result["items"][0]["message_truncated"] is True
     assert "author" not in result["items"][0]
     assert client.list_calls[0][3] == {
@@ -170,6 +171,22 @@ def test_list_ad_comments_can_truncate_messages_to_zero_chars(monkeypatch) -> No
     )
 
     assert result["items"][0]["message"] == ""
+    assert result["items"][0]["message_truncated"] is True
+
+
+def test_list_ad_comments_respects_tiny_message_limits(monkeypatch) -> None:
+    client = FakeSocialClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(
+        social_feedback.list_ad_comments(
+            object_story_id="page_1_post_1",
+            max_message_chars=2,
+        )
+    )
+
+    assert result["items"][0]["message"] == ".."
+    assert len(result["items"][0]["message"]) == 2
     assert result["items"][0]["message_truncated"] is True
 
 
@@ -263,6 +280,22 @@ def test_list_page_recommendations_compacts_reviews(monkeypatch) -> None:
     assert result["items"][0]["message"] == "Great store and great service"
     assert result["items"][0]["reviewer"] == {"name": "Customer"}
     assert client.list_calls[0][0:2] == ("page_1", "ratings")
+
+
+def test_list_page_recommendations_normalizes_page_id(monkeypatch) -> None:
+    client = FakeSocialClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(social_feedback.list_page_recommendations(" page_1 "))
+
+    assert result["scope"] == {"page_id": "page_1"}
+    assert result["summary"]["page_id"] == "page_1"
+    assert client.list_calls[0][0] == "page_1"
+
+
+def test_list_page_recommendations_rejects_blank_page_id() -> None:
+    with pytest.raises(social_feedback.ValidationError, match="page_id is required"):
+        asyncio.run(social_feedback.list_page_recommendations(" "))
 
 
 def test_social_permission_errors_return_structured_unavailable(monkeypatch) -> None:

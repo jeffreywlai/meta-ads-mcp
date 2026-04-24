@@ -57,11 +57,13 @@ def _truncate_text(value: Any, max_chars: int) -> tuple[str | None, bool]:
     if value is None:
         return None, False
     text = str(value)
-    if max_chars == 0:
+    if max_chars <= 0:
         return "", bool(text)
-    if len(text) > max_chars:
-        return text[:max_chars].rstrip() + "...", True
-    return text, False
+    if len(text) <= max_chars:
+        return text, False
+    if max_chars <= 3:
+        return "..."[:max_chars], True
+    return text[: max_chars - 3].rstrip() + "...", True
 
 
 def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
@@ -461,6 +463,9 @@ async def list_page_recommendations(
     max_message_chars: int = 500,
 ) -> dict[str, Any]:
     """Use this to read compact Facebook Page recommendations, reviews, or testimonials for an owned Page."""
+    normalized_page_id = blank_to_none(page_id)
+    if not normalized_page_id:
+        raise ValidationError("page_id is required.")
     _validate_limit("limit", limit)
     _validate_limit("max_message_chars", max_message_chars, minimum=0, maximum=5000)
     fields = ["created_time", "review_text", "rating", "recommendation_type", "open_graph_story{id}"]
@@ -470,10 +475,10 @@ async def list_page_recommendations(
     if after:
         params["after"] = after
     try:
-        payload = await get_graph_api_client().list_objects(page_id, "ratings", fields=fields, params=params)
+        payload = await get_graph_api_client().list_objects(normalized_page_id, "ratings", fields=fields, params=params)
     except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
         return _social_error_payload(
-            scope={"page_id": page_id},
+            scope={"page_id": normalized_page_id},
             error=exc,
             api_calls=1,
             permission_notes=PAGE_RECOMMENDATION_PERMISSION_NOTES,
@@ -501,11 +506,11 @@ async def list_page_recommendations(
     return {
         "items": items,
         "paging": normalized["paging"],
-        "scope": {"page_id": page_id},
+        "scope": {"page_id": normalized_page_id},
         "summary": {
             "count": len(items),
             "api_calls": 1,
-            "page_id": page_id,
+            "page_id": normalized_page_id,
             "max_message_chars": max_message_chars,
         },
         "missing_signals": SOCIAL_MISSING_SIGNALS,
