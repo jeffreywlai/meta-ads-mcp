@@ -91,7 +91,15 @@ def test_get_ad_social_context_uses_expanded_creative_without_extra_call(monkeyp
     assert result["summary"]["api_calls"] == 1
     assert result["creative"]["page_id"] == "page_1"
     assert result["available_feedback_paths"][0]["surface"] == "facebook"
+    assert result["available_feedback_paths"][0]["arguments"] == {
+        "object_story_id": "page_1_post_1",
+        "surface": "facebook",
+    }
     assert result["available_feedback_paths"][1]["surface"] == "instagram"
+    assert result["available_feedback_paths"][1]["arguments"] == {
+        "instagram_media_id": "ig_media_1",
+        "surface": "instagram",
+    }
     assert [call[0] for call in client.get_calls] == ["ad_full"]
 
 

@@ -310,7 +310,7 @@ class UniversalFakeClient:
             "customer_file_source": "USER_PROVIDED_ONLY",
             "retention_days": 30,
             "description": "Old description",
-                "creative": {"id": "crt_123", "name": "Creative 123"},
+            "creative": {"id": "crt_123", "name": "Creative 123"},
             "targeting": SAMPLE_TARGETING,
             "account_status": 1,
             "app_id": "app_123",

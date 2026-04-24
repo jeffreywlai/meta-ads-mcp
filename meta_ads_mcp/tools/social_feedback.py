@@ -91,7 +91,7 @@ def _social_paths(ad_id: str, creative: dict[str, Any]) -> list[dict[str, Any]]:
                 "surface": "facebook",
                 "object_story_id": story_id,
                 "tool": "list_ad_comments",
-                "arguments": {"ad_id": ad_id, "surface": "facebook"},
+                "arguments": {"object_story_id": story_id, "surface": "facebook"},
             }
         )
     if instagram_media_id:
@@ -100,7 +100,7 @@ def _social_paths(ad_id: str, creative: dict[str, Any]) -> list[dict[str, Any]]:
                 "surface": "instagram",
                 "instagram_media_id": instagram_media_id,
                 "tool": "list_ad_comments",
-                "arguments": {"ad_id": ad_id, "surface": "instagram"},
+                "arguments": {"instagram_media_id": instagram_media_id, "surface": "instagram"},
             }
         )
     return paths
