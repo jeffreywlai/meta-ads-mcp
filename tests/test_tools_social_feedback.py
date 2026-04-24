@@ -158,6 +158,21 @@ def test_list_ad_comments_direct_story_id_compacts_and_truncates(monkeypatch) ->
     }
 
 
+def test_list_ad_comments_can_truncate_messages_to_zero_chars(monkeypatch) -> None:
+    client = FakeSocialClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(
+        social_feedback.list_ad_comments(
+            object_story_id="page_1_post_1",
+            max_message_chars=0,
+        )
+    )
+
+    assert result["items"][0]["message"] == ""
+    assert result["items"][0]["message_truncated"] is True
+
+
 def test_reply_author_fields_are_requested_when_author_enabled() -> None:
     facebook_fields = social_feedback._facebook_comment_fields(
         include_replies=True,

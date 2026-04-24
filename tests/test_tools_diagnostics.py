@@ -376,6 +376,15 @@ def test_get_ad_feedback_signals_ignores_blank_alias_scope(monkeypatch) -> None:
     assert result["scope"] == {"level": "campaign", "object_id": "cmp_123"}
 
 
+def test_get_ad_feedback_signals_ignores_blank_ad_id(monkeypatch) -> None:
+    async def fake_child_insights(*args, **kwargs):
+        return [{"ad_id": "ad1", "metrics": {"spend": 100.0}}]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_ad_feedback_signals(ad_id=" ", campaign_id="cmp_123"))
+    assert result["scope"] == {"level": "campaign", "object_id": "cmp_123"}
+
+
 def test_creative_performance_report_rejects_conflicting_scope_inputs(monkeypatch) -> None:
     with pytest.raises(diagnostics.ValidationError):
         asyncio.run(
@@ -630,3 +639,20 @@ def test_detect_auction_overlap_deduplicates_campaign_ids(monkeypatch) -> None:
     assert result["campaign_count"] == 1
     assert result["findings"][0]["type"] == "no_platform_overlap_detected"
     assert result["overlap_platforms"] == {}
+
+
+def test_detect_auction_overlap_ignores_blank_dates_for_default_window(monkeypatch) -> None:
+    insight_calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(*, object_id: str, **kwargs):
+        insight_calls.append(kwargs)
+        return {"items": [], "summary": {"metrics": {"spend": 0.0}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.detect_auction_overlap(account_id="123", campaign_ids=["cmp_1"], since=" ", until=" ")
+    )
+    assert insight_calls[0]["date_preset"] == "last_30d"
+    assert insight_calls[0]["since"] is None
+    assert insight_calls[0]["until"] is None
+    assert result["window"] == {"date_preset": "last_30d", "since": None, "until": None}

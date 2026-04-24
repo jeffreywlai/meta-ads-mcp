@@ -57,7 +57,9 @@ def _truncate_text(value: Any, max_chars: int) -> tuple[str | None, bool]:
     if value is None:
         return None, False
     text = str(value)
-    if max_chars and len(text) > max_chars:
+    if max_chars == 0:
+        return "", bool(text)
+    if len(text) > max_chars:
         return text[:max_chars].rstrip() + "...", True
     return text, False
 

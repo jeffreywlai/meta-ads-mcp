@@ -863,13 +863,20 @@ async def export_insights(
         raise ValidationError("limit must be at least 1.")
     if inline_limit < 1:
         raise ValidationError("inline_limit must be at least 1.")
-    normalized_date_preset = date_preset.strip() if isinstance(date_preset, str) else date_preset
-    normalized_since = since.strip() if isinstance(since, str) else since
-    normalized_until = until.strip() if isinstance(until, str) else until
+    requested_window = {"date_preset": date_preset, "since": since, "until": until}
+    normalized_date_preset = _normalize_date_preset(blank_to_none(date_preset))
+    normalized_since = blank_to_none(since)
+    normalized_until = blank_to_none(until)
+    effective_date_preset = normalized_date_preset or ("last_30d" if not (normalized_since or normalized_until) else None)
+    effective_window = {
+        "date_preset": effective_date_preset,
+        "since": normalized_since,
+        "until": normalized_until,
+    }
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
-        date_preset=normalized_date_preset or ("last_30d" if not (normalized_since or normalized_until) else None),
+        date_preset=effective_date_preset,
         since=normalized_since,
         until=normalized_until,
         fields=fields,
@@ -893,9 +900,11 @@ async def export_insights(
         "query": {
             "level": level,
             "object_id": object_id,
-            "date_preset": date_preset,
-            "since": since,
-            "until": until,
+            "date_preset": effective_window["date_preset"],
+            "since": effective_window["since"],
+            "until": effective_window["until"],
+            "requested_window": requested_window,
+            "effective_window": effective_window,
             "breakdowns": breakdowns or [],
             "action_breakdowns": action_breakdowns or [],
             "action_types": action_types or [],

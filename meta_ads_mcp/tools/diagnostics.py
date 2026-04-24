@@ -173,6 +173,9 @@ def _window_kwargs(
     until: str | None = None,
 ) -> dict[str, Any]:
     """Build shared date-window kwargs for diagnostics reads."""
+    date_preset = blank_to_none(date_preset)
+    since = blank_to_none(since)
+    until = blank_to_none(until)
     return {
         "date_preset": None if (since or until) else date_preset,
         "since": since,
@@ -182,6 +185,9 @@ def _window_kwargs(
 
 def _window_descriptor(date_preset: str | None, since: str | None, until: str | None) -> dict[str, Any]:
     """Return the caller-facing window shape used in analysis extras."""
+    date_preset = blank_to_none(date_preset)
+    since = blank_to_none(since)
+    until = blank_to_none(until)
     return {
         "date_preset": None if (since or until) else date_preset,
         "since": since,
@@ -750,6 +756,7 @@ async def get_ad_feedback_signals(
     top_n: int = 10,
 ) -> dict[str, Any]:
     """Use this when the user asks for ad comments, reviews, testimonials, customer feedback, negative feedback, or quality rankings."""
+    ad_id = blank_to_none(ad_id)
     if not any([level, object_id, account_id, campaign_id, adset_id, ad_id]):
         available_signals = [
             "raw Facebook or Instagram comments when an ad exposes a social story/media id",

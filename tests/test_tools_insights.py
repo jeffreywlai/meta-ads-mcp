@@ -568,6 +568,40 @@ def test_export_insights_supports_json_and_csv(monkeypatch) -> None:
     assert "campaign_id" in csv_result["data"]
 
 
+def test_export_insights_reports_effective_window(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"items": [], "summary": {"count": 0, "metrics": {}}}
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        insights.export_insights(
+            level="campaign",
+            object_id="cmp_1",
+            date_preset="last_30_days",
+            since=" ",
+            until=" ",
+        )
+    )
+
+    assert calls[0]["date_preset"] == "last_30d"
+    assert calls[0]["since"] is None
+    assert calls[0]["until"] is None
+    assert result["query"]["date_preset"] == "last_30d"
+    assert result["query"]["requested_window"] == {
+        "date_preset": "last_30_days",
+        "since": " ",
+        "until": " ",
+    }
+    assert result["query"]["effective_window"] == {
+        "date_preset": "last_30d",
+        "since": None,
+        "until": None,
+    }
+
+
 def test_export_insights_truncates_large_inline_payloads_by_default(monkeypatch) -> None:
     async def fake_get_entity_insights(**_: object) -> dict[str, object]:
         items = [{"campaign_id": f"cmp_{index}", "metrics": {"spend": float(index)}} for index in range(150)]
