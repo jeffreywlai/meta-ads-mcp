@@ -80,7 +80,7 @@ def _story_page_id(story_id: str | None, object_story_spec: dict[str, Any] | Non
     return None
 
 
-def _social_paths(ad_id: str, creative: dict[str, Any]) -> list[dict[str, Any]]:
+def _social_paths(creative: dict[str, Any]) -> list[dict[str, Any]]:
     """Build compact next-call hints from creative social ids."""
     story_id = _first_present(creative, "effective_object_story_id", "object_story_id")
     instagram_media_id = creative.get("effective_instagram_media_id")
@@ -126,24 +126,28 @@ async def _resolve_ad_social_context(ad_id: str, *, resolve_creative: bool = Tru
     """Resolve social comment ids for an ad with the fewest useful calls."""
     client = get_graph_api_client()
     api_calls = 1
-    ad = await client.get_object(ad_id, fields=AD_SOCIAL_FIELDS)
-    creative = ad.get("creative") if isinstance(ad.get("creative"), dict) else {}
-    creative_id = creative.get("id")
-    has_social_ids = any(
-        creative.get(key)
-        for key in (
-            "object_story_id",
-            "effective_object_story_id",
-            "effective_instagram_media_id",
-            "effective_instagram_story_id",
+    try:
+        ad = await client.get_object(ad_id, fields=AD_SOCIAL_FIELDS)
+        creative = ad.get("creative") if isinstance(ad.get("creative"), dict) else {}
+        creative_id = creative.get("id")
+        has_social_ids = any(
+            creative.get(key)
+            for key in (
+                "object_story_id",
+                "effective_object_story_id",
+                "effective_instagram_media_id",
+                "effective_instagram_story_id",
+            )
         )
-    )
-    if resolve_creative and creative_id and not has_social_ids:
-        creative = await client.get_object(str(creative_id), fields=SOCIAL_CREATIVE_FIELDS)
-        api_calls += 1
+        if resolve_creative and creative_id and not has_social_ids:
+            api_calls += 1
+            creative = await client.get_object(str(creative_id), fields=SOCIAL_CREATIVE_FIELDS)
+    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+        setattr(exc, "_meta_ads_api_calls", api_calls)
+        raise
 
     compact_creative = _compact_creative(creative)
-    paths = _social_paths(ad_id, compact_creative)
+    paths = _social_paths(compact_creative)
     return {
         "scope": {"ad_id": ad_id},
         "ad": {
@@ -419,7 +423,8 @@ async def list_ad_comments(
                 api_calls=api_calls,
             )
     except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
-        return _social_error_payload(scope=scope, error=exc, api_calls=max(api_calls, 1))
+        attempted_calls = getattr(exc, "_meta_ads_api_calls", 1)
+        return _social_error_payload(scope=scope, error=exc, api_calls=max(api_calls, attempted_calls))
 
     items = [item for result in fetched for item in result["items"]]
     one_surface = len(fetched) == 1
@@ -492,6 +497,7 @@ async def list_page_recommendations(
     return {
         "items": items,
         "paging": normalized["paging"],
+        "scope": {"page_id": page_id},
         "summary": {
             "count": len(items),
             "api_calls": 1,

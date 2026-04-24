@@ -52,7 +52,7 @@ async def set_campaign_status(campaign_id: str, status: str) -> dict[str, object
 
 @mcp_server.tool()
 async def set_adset_status(adset_id: str, status: str) -> dict[str, object]:
-    """Use this for a simple ad set pause or resume without changing targeting or budget fields."""
+    """Use this for pause ad set, resume ad set, or simple ad set status changes without changing targeting or budget fields."""
     return await _set_status(adset_id, "adset", status)
 
 

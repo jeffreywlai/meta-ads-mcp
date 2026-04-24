@@ -81,6 +81,23 @@ def test_get_entity_insights_rejects_invalid_date_combinations(monkeypatch) -> N
         )
 
 
+def test_get_entity_insights_rejects_reversed_date_window_before_api(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            raise AssertionError("date window validation should happen before the API call")
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="until must be on or after since"):
+        asyncio.run(
+            insights.get_entity_insights(
+                level="account",
+                object_id="act_123",
+                since="2026-03-07",
+                until="2026-03-01",
+            )
+        )
+
+
 def test_get_entity_insights_accepts_since_until_without_explicit_date_preset(monkeypatch) -> None:
     class DateRangeClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):
@@ -98,6 +115,24 @@ def test_get_entity_insights_accepts_since_until_without_explicit_date_preset(mo
         )
     )
     assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_entity_insights_action_filter_adds_required_fields(monkeypatch) -> None:
+    class ActionFieldClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert fields == ["campaign_id", "spend", "impressions", "clicks", "actions", "action_values"]
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ActionFieldClient())
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            fields=["campaign_id"],
+            action_types=["purchase"],
+        )
+    )
+    assert result["summary"]["action_filter"]["matched"] == ["purchase"]
 
 
 def test_get_entity_insights_treats_blank_date_inputs_as_missing(monkeypatch) -> None:
@@ -195,6 +230,36 @@ def test_summarize_actions_filters_requested_action_types(monkeypatch) -> None:
     assert result["requested_action_types"] == ["appointment"]
     assert result["action_filter_mode"] == "filtered"
     assert "Snowplow" in result["meta_attribution_notice"]
+
+
+def test_summarize_actions_matches_pixel_purchase_alias(monkeypatch) -> None:
+    class PixelPurchaseClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"] = [{"action_type": "offsite_conversion.fb_pixel_purchase", "value": "2"}]
+            payload["data"][0]["action_values"] = [
+                {"action_type": "offsite_conversion.fb_pixel_purchase", "value": "250"}
+            ]
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PixelPurchaseClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            action_types=["purchase"],
+        )
+    )
+
+    assert result["action_totals"] == [
+        {
+            "action_type": "offsite_conversion.fb_pixel_purchase",
+            "count": 2.0,
+            "value": 250.0,
+            "cost_per_action": 50.0,
+        }
+    ]
+    assert result["summary_metrics"]["roas"] == 2.5
 
 
 def test_summarize_actions_reports_explicit_window_without_default_preset(monkeypatch) -> None:
@@ -566,6 +631,23 @@ def test_create_async_insights_report_accepts_since_until_without_explicit_date_
         )
     )
     assert result["report_run_id"] == "rpt_created"
+
+
+def test_create_async_insights_report_rejects_reversed_date_window(monkeypatch) -> None:
+    monkeypatch.setattr(
+        insights,
+        "get_graph_api_client",
+        lambda: FakeAsyncInsightsClient({"report_run_id": "rpt_created", "async_status": "Job Running"}),
+    )
+    with pytest.raises(insights.ValidationError, match="until must be on or after since"):
+        asyncio.run(
+            insights.create_async_insights_report(
+                level="campaign",
+                object_id="cmp_1",
+                since="2026-03-07",
+                until="2026-03-01",
+            )
+        )
 
 
 def test_get_async_insights_report_handles_in_progress_state(monkeypatch) -> None:

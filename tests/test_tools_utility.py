@@ -91,6 +91,16 @@ def test_get_capabilities_falls_forward_on_unknown_intent() -> None:
     assert result["suggested_search"]["tool"] == "search_tools"
 
 
+def test_get_capabilities_routes_terse_intents() -> None:
+    pause = asyncio.run(utility.get_capabilities(intent="pause ad set"))
+    campaigns = asyncio.run(utility.get_capabilities(intent="campaigns"))
+    appointments = asyncio.run(utility.get_capabilities(intent="appointments last 30 days"))
+
+    assert pause["closest_intents"][0]["intent"] == "writes_after_confirmation"
+    assert campaigns["closest_intents"][0]["intent"] == "discover_accounts_or_ids"
+    assert appointments["closest_intents"][0]["intent"] == "inspect_single_entity_performance"
+
+
 def test_get_capabilities_has_feedback_intent() -> None:
     result = asyncio.run(utility.get_capabilities(intent="read_ad_comments_or_quality_signals"))
     assert result["selected_intent"]["recommended_order"][0] == "list_ad_comments"

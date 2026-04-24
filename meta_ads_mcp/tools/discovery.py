@@ -165,7 +165,7 @@ async def list_campaigns(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to list campaign names and ids so callers can find campaigns by scanning returned names, with optional status filtering."""
+    """Use this first to find campaign by name: list campaigns with names and ids, with optional status filtering."""
     client = get_graph_api_client()
     resolved_account_id = _resolve_account_id(account_id)
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
@@ -202,8 +202,8 @@ async def list_adsets(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this to discover ad sets under one account or one campaign."""
-    if not account_id and not campaign_id:
-        raise ValidationError("Provide account_id or campaign_id.")
+    if account_id and campaign_id:
+        raise ValidationError("Provide only one of account_id or campaign_id.")
     parent_id = campaign_id or _resolve_account_id(account_id)
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
@@ -234,8 +234,8 @@ async def list_ads(
 ) -> dict[str, Any]:
     """Use this to discover ads under exactly one scope: one account, one campaign, or one ad set."""
     scope_count = sum(value is not None for value in (account_id, campaign_id, adset_id))
-    if scope_count != 1:
-        raise ValidationError("Provide exactly one of account_id, campaign_id, or adset_id.")
+    if scope_count > 1:
+        raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")
     parent_id = adset_id or campaign_id or _resolve_account_id(account_id)
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
@@ -303,7 +303,7 @@ async def list_instagram_accounts(
         source_attempts.append("accounts.instagram_business_account")
 
     pages = await get_account_pages(
-        account_id=account_id,
+        account_id=account_id or "me",
         limit=limit,
         after=after,
         fields=["id", "name", "instagram_business_account"],

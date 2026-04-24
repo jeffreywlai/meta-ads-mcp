@@ -114,6 +114,24 @@ def test_get_ad_social_context_fetches_creative_only_when_social_ids_missing(mon
     assert [call[0] for call in client.get_calls] == ["ad_needs_creative", "crt_1"]
 
 
+def test_list_ad_comments_counts_failed_creative_resolution(monkeypatch) -> None:
+    class FailingCreativeClient(FakeSocialClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            if object_id == "crt_1":
+                self.get_calls.append((object_id, fields))
+                raise MetaApiError("Creative unavailable", code=190)
+            return await super().get_object(object_id, fields=fields, params=params)
+
+    client = FailingCreativeClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(social_feedback.list_ad_comments(ad_id="ad_needs_creative"))
+
+    assert result["summary"]["api_calls"] == 2
+    assert result["summary"]["unavailable"] is True
+    assert [call[0] for call in client.get_calls] == ["ad_needs_creative", "crt_1"]
+
+
 def test_list_ad_comments_direct_story_id_compacts_and_truncates(monkeypatch) -> None:
     client = FakeSocialClient()
     monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
@@ -191,6 +209,7 @@ def test_list_page_recommendations_compacts_reviews(monkeypatch) -> None:
     result = asyncio.run(social_feedback.list_page_recommendations("page_1", include_reviewer=True))
 
     assert result["summary"]["api_calls"] == 1
+    assert result["scope"] == {"page_id": "page_1"}
     assert result["items"][0]["message"] == "Great store and great service"
     assert result["items"][0]["reviewer"] == {"name": "Customer"}
     assert client.list_calls[0][0:2] == ("page_1", "ratings")

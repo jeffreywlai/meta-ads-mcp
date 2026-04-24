@@ -80,6 +80,7 @@ def test_account_health_snapshot_compares_explicit_windows(monkeypatch) -> None:
         )
     )
     assert result["scope"]["object_id"] == "act_123"
+    assert result["current_window"] == {"date_preset": None, "since": "2026-03-01", "until": "2026-03-31"}
     assert result["comparisons"]["previous"]["comparison"]["spend"]["delta"] == 100.0
     assert calls[1] == ("2026-02-01", "2026-02-28")
     assert calls[2] == ("2025-03-01", "2025-03-31")
@@ -279,6 +280,8 @@ def test_creative_performance_report_accepts_level_and_object_id(monkeypatch) ->
 
 def test_get_ad_feedback_signals_returns_guidance_without_scope() -> None:
     result = asyncio.run(diagnostics.get_ad_feedback_signals())
+    assert result["scope"] == {"level": None, "object_id": None}
+    assert result["metrics"] == {}
     assert "quality_ranking" in result["available_signals"]
     assert "raw Facebook or Instagram comments" in result["available_signals"][0]
     assert result["unavailable_signals"]
@@ -286,7 +289,10 @@ def test_get_ad_feedback_signals_returns_guidance_without_scope() -> None:
 
 
 def test_get_ad_feedback_signals_flags_weak_quality(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
     async def fake_child_insights(*args, **kwargs):
+        calls.append(kwargs)
         return [
             {
                 "ad_id": "ad1",
@@ -297,10 +303,24 @@ def test_get_ad_feedback_signals_flags_weak_quality(monkeypatch) -> None:
         ]
 
     monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
-    result = asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123"))
+    result = asyncio.run(
+        diagnostics.get_ad_feedback_signals(campaign_id="cmp_123", since="2026-03-01", until="2026-03-07")
+    )
     assert result["findings"][0]["type"] == "weak_ad_quality_ranking"
     assert result["weak_quality_ads"][0]["ad_id"] == "ad1"
+    assert result["window"] == {"date_preset": None, "since": "2026-03-01", "until": "2026-03-07"}
+    assert calls[0]["date_preset"] is None
     assert result["missing_signals"]
+
+
+def test_get_ad_feedback_signals_rejects_conflicting_ad_scope_inputs() -> None:
+    with pytest.raises(diagnostics.ValidationError):
+        asyncio.run(diagnostics.get_ad_feedback_signals(ad_id="ad_1", campaign_id="cmp_123"))
+
+
+def test_get_ad_feedback_signals_rejects_multiple_entity_scopes() -> None:
+    with pytest.raises(diagnostics.ValidationError):
+        asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123", adset_id="adset_123"))
 
 
 def test_creative_performance_report_rejects_conflicting_scope_inputs(monkeypatch) -> None:
@@ -493,6 +513,8 @@ def test_learning_phase_report_uses_level_specific_fields(monkeypatch) -> None:
 
 
 def test_detect_auction_overlap_flags_shared_platform(monkeypatch) -> None:
+    insight_calls: list[dict[str, object]] = []
+
     class FakeClient:
         async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
             assert parent_id == "act_123"
@@ -505,6 +527,7 @@ def test_detect_auction_overlap_flags_shared_platform(monkeypatch) -> None:
             }
 
     async def fake_get_entity_insights(*, object_id: str, **kwargs):
+        insight_calls.append(kwargs)
         return {
             "items": [
                 {
@@ -518,6 +541,12 @@ def test_detect_auction_overlap_flags_shared_platform(monkeypatch) -> None:
 
     monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: FakeClient())
     monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
-    result = asyncio.run(diagnostics.detect_auction_overlap(account_id="123"))
+    result = asyncio.run(
+        diagnostics.detect_auction_overlap(account_id="123", since="2026-03-01", until="2026-03-07")
+    )
     assert result["findings"][0]["type"] == "potential_auction_overlap"
     assert "facebook" in result["overlap_platforms"]
+    assert result["window"] == {"date_preset": None, "since": "2026-03-01", "until": "2026-03-07"}
+    assert insight_calls[0]["date_preset"] is None
+    assert "actions" not in insight_calls[0]["fields"]
+    assert "cost_per_action_type" not in insight_calls[0]["fields"]

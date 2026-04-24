@@ -91,11 +91,26 @@ def normalize_insights_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized["action_values_map"] = action_list_to_map(row.get("action_values"))
     normalized["results"] = first_present(
         normalized["actions_map"],
-        ["purchase", "offsite_conversion.purchase", "lead", "omni_purchase"],
+        [
+            "purchase",
+            "omni_purchase",
+            "offsite_conversion.purchase",
+            "offsite_conversion.fb_pixel_purchase",
+            "onsite_conversion.purchase",
+            "lead",
+            "onsite_conversion.lead",
+            "offsite_conversion.fb_pixel_lead",
+        ],
     )
     normalized["result_value"] = first_present(
         normalized["action_values_map"],
-        ["purchase", "offsite_conversion.purchase", "omni_purchase"],
+        [
+            "purchase",
+            "omni_purchase",
+            "offsite_conversion.purchase",
+            "offsite_conversion.fb_pixel_purchase",
+            "onsite_conversion.purchase",
+        ],
     )
     return normalized
 

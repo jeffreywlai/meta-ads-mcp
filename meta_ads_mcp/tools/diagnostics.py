@@ -69,7 +69,7 @@ AD_QUALITY_FIELDS = [*DEFAULT_INSIGHTS_FIELDS, *QUALITY_RANKING_FIELDS]
 
 OVERLAP_INSIGHTS_FIELDS = (
     "campaign_id campaign_name publisher_platform spend impressions reach "
-    "frequency cpm actions cost_per_action_type"
+    "frequency cpm"
 ).split()
 
 WEAK_RANKINGS = {"BELOW_AVERAGE_10", "BELOW_AVERAGE_20", "BELOW_AVERAGE_35"}
@@ -95,13 +95,14 @@ def _resolve_scope(
         ("campaign", campaign_id),
         ("account", account_id),
     ]
+    provided_aliases = [(candidate_level, candidate_id) for candidate_level, candidate_id in alias_candidates if candidate_id]
+    if len(provided_aliases) > 1:
+        raise ValidationError("Provide only one entity-specific scope argument.")
     alias_level: str | None = None
     alias_object_id: str | None = None
-    for candidate_level, candidate_id in alias_candidates:
-        if candidate_id:
-            alias_level = candidate_level
-            alias_object_id = normalize_account_id(candidate_id) if candidate_level == "account" else candidate_id
-            break
+    if provided_aliases:
+        alias_level, candidate_id = provided_aliases[0]
+        alias_object_id = normalize_account_id(candidate_id) if alias_level == "account" else candidate_id
 
     normalized_level = level.strip() if isinstance(level, str) else level
     normalized_object_id = object_id.strip() if isinstance(object_id, str) else object_id
@@ -180,7 +181,11 @@ def _window_kwargs(
 
 def _window_descriptor(date_preset: str | None, since: str | None, until: str | None) -> dict[str, Any]:
     """Return the caller-facing window shape used in analysis extras."""
-    return {"date_preset": date_preset, "since": since, "until": until}
+    return {
+        "date_preset": None if (since or until) else date_preset,
+        "since": since,
+        "until": until,
+    }
 
 
 def _compact_timeseries_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -560,7 +565,7 @@ async def detect_auction_overlap(
     max_campaigns: int = 12,
     min_platform_spend: float = 1.0,
 ) -> dict[str, Any]:
-    """Use this for a compact cannibalization screen across campaigns sharing publisher platforms."""
+    """Use this for a compact cannibalization or platform-overlap screen across selected campaign ids."""
     resolved_account_id = normalize_account_id(account_id)
     if campaign_ids:
         selected_campaigns = [{"id": campaign_id, "name": campaign_id} for campaign_id in campaign_ids[:max_campaigns]]
@@ -706,25 +711,35 @@ async def get_ad_feedback_signals(
 ) -> dict[str, Any]:
     """Use this when the user asks for ad comments, reviews, testimonials, customer feedback, negative feedback, or quality rankings."""
     if not any([level, object_id, account_id, campaign_id, adset_id, ad_id]):
-        return {
-            "available_signals": [
-                "raw Facebook or Instagram comments when an ad exposes a social story/media id",
-                "Facebook Page recommendations for owned Pages",
-                *QUALITY_RANKING_FIELDS,
-                "creative fatigue and performance from ad-level insights",
-            ],
-            "unavailable_signals": FEEDBACK_UNAVAILABLE_SIGNALS,
-            "recommended_tools": [
-                "list_ad_comments(ad_id='...')",
-                "list_page_recommendations(page_id='...')",
-                "get_ad_social_context(ad_id='...')",
-                "get_ad_feedback_signals(level='campaign', object_id='...')",
-                "get_creative_performance_report(level='campaign', object_id='...')",
-                "get_creative_fatigue_report(campaign_id='...')",
-            ],
-        }
+        available_signals = [
+            "raw Facebook or Instagram comments when an ad exposes a social story/media id",
+            "Facebook Page recommendations for owned Pages",
+            *QUALITY_RANKING_FIELDS,
+            "creative fatigue and performance from ad-level insights",
+        ]
+        recommended_tools = [
+            "list_ad_comments(ad_id='...')",
+            "list_page_recommendations(page_id='...')",
+            "get_ad_social_context(ad_id='...')",
+            "get_ad_feedback_signals(level='campaign', object_id='...')",
+            "get_creative_performance_report(level='campaign', object_id='...')",
+            "get_creative_fatigue_report(campaign_id='...')",
+        ]
+        return analysis_response(
+            scope={"level": None, "object_id": None},
+            metrics={},
+            missing_signals=FEEDBACK_UNAVAILABLE_SIGNALS,
+            suggestions=["Use a recommended tool with a concrete ad, campaign, ad set, account, or Page id."],
+            extra={
+                "available_signals": available_signals,
+                "unavailable_signals": FEEDBACK_UNAVAILABLE_SIGNALS,
+                "recommended_tools": recommended_tools,
+            },
+        )
 
     if ad_id:
+        if any([level, object_id, account_id, campaign_id, adset_id]):
+            raise ValidationError("When using ad_id, do not provide other scope arguments.")
         resolved_level, resolved_object_id = "ad", ad_id
     else:
         resolved_level, resolved_object_id = _resolve_scope(

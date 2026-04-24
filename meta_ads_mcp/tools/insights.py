@@ -105,13 +105,26 @@ ACTION_TYPE_ALIASES = {
     "appointments": ["appointment", "schedule", "scheduled"],
     "lead": ["lead", "onsite_conversion.lead", "offsite_conversion.fb_pixel_lead"],
     "leads": ["lead", "onsite_conversion.lead", "offsite_conversion.fb_pixel_lead"],
-    "purchase": ["purchase", "omni_purchase", "offsite_conversion.purchase", "onsite_conversion.purchase"],
-    "purchases": ["purchase", "omni_purchase", "offsite_conversion.purchase", "onsite_conversion.purchase"],
+    "purchase": [
+        "purchase",
+        "omni_purchase",
+        "offsite_conversion.purchase",
+        "offsite_conversion.fb_pixel_purchase",
+        "onsite_conversion.purchase",
+    ],
+    "purchases": [
+        "purchase",
+        "omni_purchase",
+        "offsite_conversion.purchase",
+        "offsite_conversion.fb_pixel_purchase",
+        "onsite_conversion.purchase",
+    ],
 }
 
 ACTION_ATTRIBUTION_NOTICE = (
     "Action counts and values come from Meta attribution. For purchase truth, reconcile with Snowplow/Snowflake."
 )
+ACTION_FILTER_REQUIRED_FIELDS = ["spend", "impressions", "clicks", "actions", "action_values"]
 
 NAME_FIELD_BY_LEVEL = {
     "account": "account_name",
@@ -155,10 +168,12 @@ def _build_date_params(
         raise ValidationError("Provide both since and until.")
     if normalized_since and normalized_until:
         try:
-            date.fromisoformat(normalized_since)
-            date.fromisoformat(normalized_until)
+            since_date = date.fromisoformat(normalized_since)
+            until_date = date.fromisoformat(normalized_until)
         except ValueError as exc:
             raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.") from exc
+        if until_date < since_date:
+            raise ValidationError("until must be on or after since.")
         return {"time_range": json.dumps({"since": normalized_since, "until": normalized_until})}
     return {"date_preset": normalized_date_preset or _normalize_date_preset(default_date_preset)}
 
@@ -240,6 +255,17 @@ def _filter_action_arrays(row: dict[str, Any], patterns: list[str]) -> dict[str,
             if isinstance(item, dict) and _matches_action_type(item.get("action_type"), patterns)
         ]
     return filtered
+
+
+def _insights_fields(fields: list[str] | None, *, action_types: list[str] | None = None) -> list[str]:
+    """Return requested fields with action-filter dependencies when needed."""
+    requested = list(fields or DEFAULT_INSIGHTS_FIELDS)
+    if not action_types:
+        return requested
+    for field in ACTION_FILTER_REQUIRED_FIELDS:
+        if field not in requested:
+            requested.append(field)
+    return requested
 
 
 def _insights_params(
@@ -531,7 +557,7 @@ async def get_entity_insights(
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
     payload = await client.get_insights(
         resolved_object_id,
-        fields=fields or DEFAULT_INSIGHTS_FIELDS,
+        fields=_insights_fields(fields, action_types=action_types),
         params=_insights_params(
             level=level,
             date_preset=date_preset,
@@ -608,7 +634,7 @@ async def summarize_actions(
     include_rows: bool = False,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Use this when asking how many appointments, purchases, leads, or custom actions a campaign drove over a trailing window."""
+    """Use this for appointment, purchase, lead, or custom action counts over last 30 days or any trailing window."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
     fields = [
         ID_FIELD_BY_LEVEL.get(level, "campaign_id"),

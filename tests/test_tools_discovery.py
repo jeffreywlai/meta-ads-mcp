@@ -101,6 +101,40 @@ def test_list_instagram_accounts_falls_back_to_page_instagram_accounts(monkeypat
     assert result["items"][0]["username"] == "fallback_brand"
 
 
+def test_list_instagram_accounts_default_fallback_uses_me_pages(monkeypatch) -> None:
+    class DefaultFallbackInstagramClient(FakeDiscoveryClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            if edge == "instagram_accounts":
+                assert parent_id == "act_123"
+                raise UnsupportedFeatureError("instagram_accounts unsupported")
+            if parent_id == "me" and edge == "accounts":
+                return {
+                    "data": [
+                        {
+                            "id": "page_1",
+                            "name": "Test Page",
+                            "instagram_business_account": {
+                                "id": "ig_2",
+                                "username": "fallback_brand",
+                                "name": "Fallback Brand",
+                            },
+                        }
+                    ]
+                }
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DefaultFallbackInstagramClient())
+    result = asyncio.run(discovery.list_instagram_accounts())
+    assert result["summary"]["source"] == "accounts.instagram_business_account"
+    assert result["summary"]["source_attempts"] == ["instagram_accounts", "accounts.instagram_business_account"]
+    assert "account_id_context" not in result["summary"]
+    assert result["items"][0]["username"] == "fallback_brand"
+
+
 def test_list_campaigns_uses_default_account_id(monkeypatch) -> None:
     monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
     from meta_ads_mcp.config import reload_settings
@@ -108,6 +142,38 @@ def test_list_campaigns_uses_default_account_id(monkeypatch) -> None:
     reload_settings()
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
     result = asyncio.run(discovery.list_campaigns())
+    assert result["summary"]["count"] == 1
+
+
+def test_list_adsets_uses_default_account_id(monkeypatch) -> None:
+    class DefaultAccountClient(FakeDiscoveryClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            if edge == "adsets":
+                assert parent_id == "act_123"
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DefaultAccountClient())
+    result = asyncio.run(discovery.list_adsets())
+    assert result["summary"]["count"] == 1
+
+
+def test_list_ads_uses_default_account_id(monkeypatch) -> None:
+    class DefaultAccountClient(FakeDiscoveryClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            if edge == "ads":
+                assert parent_id == "act_123"
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DefaultAccountClient())
+    result = asyncio.run(discovery.list_ads())
     assert result["summary"]["count"] == 1
 
 
@@ -125,6 +191,11 @@ def test_list_adsets_supports_campaign_scope(monkeypatch) -> None:
     result = asyncio.run(discovery.list_adsets(campaign_id="cmp_1"))
     assert result["summary"]["count"] == 1
     assert result["items"][0]["daily_budget"] == 25.0
+
+
+def test_list_adsets_rejects_multiple_scopes() -> None:
+    with pytest.raises(discovery.ValidationError):
+        asyncio.run(discovery.list_adsets(account_id="123", campaign_id="cmp_1"))
 
 
 def test_list_adsets_includes_schedule_fields_when_present(monkeypatch) -> None:

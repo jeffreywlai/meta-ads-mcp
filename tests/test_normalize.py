@@ -23,6 +23,19 @@ def test_normalize_insights_row_extracts_actions() -> None:
     assert row["result_value"] == 400.0
 
 
+def test_normalize_insights_row_extracts_pixel_purchase_actions() -> None:
+    row = normalize_insights_row(
+        {
+            "spend": "120.50",
+            "actions": [{"action_type": "offsite_conversion.fb_pixel_purchase", "value": "4"}],
+            "action_values": [{"action_type": "offsite_conversion.fb_pixel_purchase", "value": "400"}],
+        }
+    )
+
+    assert row["results"] == 4.0
+    assert row["result_value"] == 400.0
+
+
 def test_derive_core_metrics_computes_kpis() -> None:
     metrics = derive_core_metrics(
         {
@@ -39,4 +52,3 @@ def test_derive_core_metrics_computes_kpis() -> None:
     assert metrics["cpm"] == 120.0
     assert metrics["cpa"] == 30.0
     assert round(metrics["roas"], 2) == 3.33
-

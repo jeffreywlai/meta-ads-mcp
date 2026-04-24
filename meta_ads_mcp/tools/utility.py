@@ -303,7 +303,15 @@ INTENT_SEARCH_SYNONYMS = {
 
 def _search_tokens(text: str) -> set[str]:
     """Tokenize routing text for tiny local fuzzy matching."""
-    return set(re.findall(r"[a-z0-9_]+", text.lower()))
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9_]+", text.lower()):
+        tokens.add(token)
+        tokens.update(part for part in token.split("_") if part)
+        if token.endswith("s") and len(token) > 3:
+            tokens.add(token[:-1])
+        if token in {"adset", "adsets"}:
+            tokens.update({"ad", "set", "ad_set"})
+    return tokens
 
 
 def _closest_intents(query: str, limit: int = 3) -> list[dict[str, object]]:
@@ -323,6 +331,41 @@ def _closest_intents(query: str, limit: int = 3) -> list[dict[str, object]]:
         route_tokens = _search_tokens(route_text)
         overlap = query_tokens & route_tokens
         score = float(len(overlap))
+        if intent == "discover_accounts_or_ids" and query_tokens & {
+            "account",
+            "accounts",
+            "campaign",
+            "campaigns",
+            "adset",
+            "adsets",
+            "ad",
+            "ads",
+        }:
+            score += 2.0
+        if intent == "writes_after_confirmation" and query_tokens & {
+            "pause",
+            "resume",
+            "enable",
+            "disable",
+            "status",
+            "budget",
+            "bid",
+            "create",
+            "update",
+            "delete",
+        }:
+            score += 3.0
+        if intent == "inspect_single_entity_performance" and query_tokens & {
+            "appointment",
+            "appointments",
+            "purchase",
+            "purchases",
+            "lead",
+            "leads",
+            "conversion",
+            "conversions",
+        }:
+            score += 2.0
         if query.lower() in route_text.lower():
             score += 3.0
         if score > 0:

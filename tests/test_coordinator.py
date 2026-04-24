@@ -83,12 +83,18 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
     page_reviews = asyncio.run(search("page reviews testimonials"))
     actions = asyncio.run(search("how many appointments campaign trailing 30 days"))
     campaign_lookup = asyncio.run(search("find campaign by name"))
+    terse_campaigns = asyncio.run(search("campaigns"))
+    terse_actions = asyncio.run(search("appointments last 30 days"))
+    terse_pause = asyncio.run(search("pause ad set"))
 
     assert feedback.splitlines()[1].startswith("- `get_ad_feedback_signals`")
     assert raw_comments.splitlines()[1].startswith("- `list_ad_comments`")
     assert page_reviews.splitlines()[1].startswith("- `list_page_recommendations`")
     assert actions.splitlines()[1].startswith("- `summarize_actions`")
     assert campaign_lookup.splitlines()[1].startswith("- `list_campaigns`")
+    assert terse_campaigns.splitlines()[1].startswith("- `list_campaigns`")
+    assert terse_actions.splitlines()[1].startswith("- `summarize_actions`")
+    assert terse_pause.splitlines()[1].startswith("- `set_adset_status`")
 
 
 def test_compare_performance_responds_through_tool_layer(monkeypatch) -> None:
