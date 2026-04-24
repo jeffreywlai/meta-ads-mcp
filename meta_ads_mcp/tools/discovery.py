@@ -114,6 +114,23 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
     return params
 
 
+def _campaign_suggested_next_tools(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return compact routing hints after campaign discovery."""
+    campaign_ids = [str(item.get("id")) for item in items[:5] if item.get("id")]
+    if not campaign_ids:
+        return {}
+    first_campaign_id = campaign_ids[0]
+    return {
+        "campaign_health": f"get_campaign_optimization_snapshot(campaign_id={first_campaign_id})",
+        "compare_visible_campaigns": {
+            "tool": "compare_performance",
+            "arguments": {"level": "campaign", "object_ids": campaign_ids},
+        },
+        "whole_account_health": "get_account_optimization_snapshot(account_id=...)",
+        "writes_catalog": "list_mutation_tools()",
+    }
+
+
 @mcp_server.tool()
 async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[str, Any]:
     """Use this first when the user needs to discover which ad accounts are available."""
@@ -142,7 +159,7 @@ async def list_campaigns(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover campaign ids and high-level campaign metadata inside one ad account."""
+    """Use this to list campaigns in an account, find campaign ids by name, and prepare deeper diagnostics."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
     if after:
@@ -155,6 +172,9 @@ async def list_campaigns(
     )
     normalized = normalize_collection(payload)
     normalized["items"] = _normalize_budgets(normalized["items"])
+    suggestions = _campaign_suggested_next_tools(normalized["items"])
+    if suggestions:
+        normalized["suggested_next_tools"] = suggestions
     return normalized
 
 
@@ -224,7 +244,10 @@ async def get_ad(ad_id: str, include_creative_summary: bool = False) -> dict[str
     client = get_graph_api_client()
     fields = list(AD_FIELDS)
     if include_creative_summary:
-        fields[-1] = "creative{id,name,title,body,object_story_spec}"
+        fields[-1] = (
+            "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+            "effective_instagram_media_id,effective_instagram_story_id,object_story_spec}"
+        )
     ad = await client.get_object(ad_id, fields=fields)
     return {"item": ad, "summary": {"count": 1}}
 

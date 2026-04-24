@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import insights
 
 
@@ -120,13 +119,13 @@ def test_get_entity_insights_treats_blank_date_inputs_as_missing(monkeypatch) ->
     assert result["summary"]["metrics"]["spend"] == 100.0
 
 
-def test_get_entity_insights_surfaces_meta_validation_errors(monkeypatch) -> None:
-    class InvalidPresetClient(FakeInsightsClient):
+def test_get_entity_insights_rejects_unknown_date_preset_before_api(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):
-            raise MetaApiError(message="Invalid date_preset value.", status_code=400, code=100)
+            raise AssertionError("date preset validation should happen before the API call")
 
-    monkeypatch.setattr(insights, "get_graph_api_client", lambda: InvalidPresetClient())
-    with pytest.raises(MetaApiError, match="Invalid date_preset value"):
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="Supported values"):
         asyncio.run(
             insights.get_entity_insights(
                 level="account",
@@ -134,6 +133,65 @@ def test_get_entity_insights_surfaces_meta_validation_errors(monkeypatch) -> Non
                 date_preset="this_week_mon_sun",
             )
         )
+
+
+def test_get_entity_insights_translates_lifetime_date_alias(monkeypatch) -> None:
+    class LifetimeAliasClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["date_preset"] == "maximum"
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: LifetimeAliasClient())
+    result = asyncio.run(
+        insights.get_entity_insights(level="account", object_id="act_123", date_preset="lifetime")
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_insights_alias_accepts_time_range(monkeypatch) -> None:
+    class TimeRangeClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["time_range"] == '{"since": "2026-03-01", "until": "2026-03-07"}'
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: TimeRangeClient())
+    result = asyncio.run(
+        insights.get_insights(
+            level="account",
+            object_id="act_123",
+            time_range={"since": "2026-03-01", "until": "2026-03-07"},
+        )
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_summarize_actions_filters_requested_action_types(monkeypatch) -> None:
+    class ActionClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"].append({"action_type": "onsite_conversion.schedule_appointment", "value": "3"})
+            payload["data"][0]["action_values"].append(
+                {"action_type": "onsite_conversion.schedule_appointment", "value": "0"}
+            )
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ActionClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            action_types=["appointment"],
+        )
+    )
+    assert result["action_totals"] == [
+        {
+            "action_type": "onsite_conversion.schedule_appointment",
+            "count": 3.0,
+            "value": 0.0,
+            "cost_per_action": 100.0 / 3.0,
+        }
+    ]
+    assert "Snowplow" in result["meta_attribution_notice"]
 
 
 def test_compare_performance_ranks_multiple_objects(monkeypatch) -> None:

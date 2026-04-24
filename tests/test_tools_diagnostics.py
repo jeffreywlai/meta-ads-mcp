@@ -63,6 +63,28 @@ def test_campaign_snapshot_includes_top_adsets_and_ads(monkeypatch) -> None:
     assert "spend_share" in result["top_adsets_by_spend"][0]["metrics"]
 
 
+def test_account_health_snapshot_compares_explicit_windows(monkeypatch) -> None:
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fake_get_entity_insights(*, since: str | None = None, until: str | None = None, **kwargs):
+        calls.append((since, until))
+        spend = 300.0 if since == "2026-03-01" else 200.0
+        return {"summary": {"metrics": {"spend": spend, "clicks": 10, "impressions": 1000}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.get_account_health_snapshot(
+            account_id="123",
+            since="2026-03-01",
+            until="2026-03-31",
+        )
+    )
+    assert result["scope"]["object_id"] == "act_123"
+    assert result["comparisons"]["previous"]["comparison"]["spend"]["delta"] == 100.0
+    assert calls[1] == ("2026-02-01", "2026-02-28")
+    assert calls[2] == ("2025-03-01", "2025-03-31")
+
+
 def test_account_snapshot_supports_explicit_since_until(monkeypatch) -> None:
     entity_calls: list[dict[str, object]] = []
     child_calls: list[dict[str, object]] = []
@@ -228,7 +250,34 @@ def test_creative_performance_report_accepts_level_and_object_id(monkeypatch) ->
     )
     assert calls[0]["object_id"] == "cmp_123"
     assert calls[0]["level"] == "ad"
+    assert "quality_ranking" in calls[0]["fields"]
     assert result["scope"]["object_id"] == "cmp_123"
+
+
+def test_get_ad_feedback_signals_returns_guidance_without_scope() -> None:
+    result = asyncio.run(diagnostics.get_ad_feedback_signals())
+    assert "quality_ranking" in result["available_signals"]
+    assert "raw Facebook or Instagram comments" in result["available_signals"][0]
+    assert result["unavailable_signals"]
+    assert "list_ad_comments" in result["recommended_tools"][0]
+
+
+def test_get_ad_feedback_signals_flags_weak_quality(monkeypatch) -> None:
+    async def fake_child_insights(*args, **kwargs):
+        return [
+            {
+                "ad_id": "ad1",
+                "ad_name": "Ad One",
+                "quality_ranking": "BELOW_AVERAGE_20",
+                "metrics": {"spend": 100.0, "impressions": 1000},
+            }
+        ]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123"))
+    assert result["findings"][0]["type"] == "weak_ad_quality_ranking"
+    assert result["weak_quality_ads"][0]["ad_id"] == "ad1"
+    assert result["missing_signals"]
 
 
 def test_creative_performance_report_rejects_conflicting_scope_inputs(monkeypatch) -> None:
@@ -418,3 +467,34 @@ def test_learning_phase_report_uses_level_specific_fields(monkeypatch) -> None:
     assert "optimization_goal" not in calls[0]["fields"]
     assert "objective" in calls[0]["fields"]
     assert any("optimization_goal is available on ad sets" in item for item in result["missing_signals"])
+
+
+def test_detect_auction_overlap_flags_shared_platform(monkeypatch) -> None:
+    class FakeClient:
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            assert parent_id == "act_123"
+            assert edge == "campaigns"
+            return {
+                "data": [
+                    {"id": "cmp_1", "name": "Campaign One"},
+                    {"id": "cmp_2", "name": "Campaign Two"},
+                ]
+            }
+
+    async def fake_get_entity_insights(*, object_id: str, **kwargs):
+        return {
+            "items": [
+                {
+                    "publisher_platform": "facebook",
+                    "reach": 1000,
+                    "metrics": {"spend": 50.0 if object_id == "cmp_1" else 25.0, "frequency": 1.5, "cpm": 10.0},
+                }
+            ],
+            "summary": {"metrics": {"spend": 50.0 if object_id == "cmp_1" else 25.0}},
+        }
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: FakeClient())
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(diagnostics.detect_auction_overlap(account_id="123"))
+    assert result["findings"][0]["type"] == "potential_auction_overlap"
+    assert "facebook" in result["overlap_platforms"]

@@ -174,6 +174,7 @@ meta_ads_mcp/
 │   │   ├── targeting.py
 │   │   ├── recommendations.py
 │   │   ├── creatives.py
+│   │   ├── social_feedback.py
 │   │   ├── execution.py
 │   │   └── docs.py
 │   └── context/
@@ -384,14 +385,21 @@ These are the core v1 tools.
 - `create_async_insights_report`
 - `get_async_insights_report`
 
-### Group C: Audience and Planning
+### Group C: Social Feedback
+
+- `get_ad_social_context`
+- `list_ad_comments`
+- `list_page_recommendations`
+- `get_ad_feedback_signals`
+
+### Group D: Audience and Planning
 
 - `search_interests`
 - `search_geo_locations`
 - `estimate_audience_size`
 - `get_reach_frequency_predictions`
 
-### Group D: Recommendations and Docs
+### Group E: Recommendations and Docs
 
 - `get_recommendations`
 - `get_metrics_reference`
@@ -399,7 +407,7 @@ These are the core v1 tools.
 - `get_v25_notes`
 - `get_optimization_playbook`
 
-### Group E: Controlled Execution
+### Group F: Controlled Execution
 
 These are deliberately narrow and should be secondary to analysis tools.
 
@@ -535,6 +543,21 @@ Inputs:
 
 ## Core Analysis Tools
 
+### `get_insights`
+
+Purpose:
+Backward-compatible alias for older Claude calls that used `time_range`.
+New clients should prefer `get_entity_insights`.
+
+Inputs:
+
+- same as `get_entity_insights`
+- optional `time_range` object with `since` and `until`
+
+Output:
+
+- same envelope as `get_entity_insights`
+
 ### `get_entity_insights`
 
 Purpose:
@@ -551,6 +574,7 @@ Inputs:
 - `object_id`
 - `date_preset` or `since` and `until`
 - `fields`
+- `action_types` to filter large Meta action arrays
 - `breakdowns`
 - `action_breakdowns`
 - `time_increment`
@@ -564,6 +588,28 @@ Output:
 - summary totals
 - extracted actions and conversion values
 - derived KPIs when possible
+
+### `summarize_actions`
+
+Purpose:
+Count appointments, purchases, leads, or custom Meta action types without
+returning the full `actions` arrays.
+
+Inputs:
+
+- `level`
+- `object_id`
+- `action_types`
+- `date_preset` or `since` and `until`
+- optional `breakdowns`
+- optional `include_rows`
+
+Output:
+
+- compact action totals
+- matched action types
+- summary metrics
+- Meta attribution notice for conversion-source caveats
 
 ### `get_performance_breakdown`
 
@@ -663,6 +709,125 @@ Output:
 - creative concentration
 - delivery risks
 - suggested next tools
+
+### `get_account_health_snapshot`
+
+Purpose:
+Collapse current, previous-window, and year-over-year account totals into one
+call when explicit dates are provided.
+
+Inputs:
+
+- `account_id`
+- `date_preset` or `since` and `until`
+- `include_previous`
+- `include_year_over_year`
+
+Output:
+
+- current account metrics
+- previous-window comparison when explicit dates are present
+- year-over-year comparison when explicit dates are present
+- compact findings and evidence
+
+### `detect_auction_overlap`
+
+Purpose:
+Provide a directional cannibalization screen by comparing campaign spend across
+shared publisher-platform breakdowns.
+
+Inputs:
+
+- `account_id`
+- optional `campaign_ids`
+- `date_preset` or `since` and `until`
+- `max_campaigns`
+- `min_platform_spend`
+
+Output:
+
+- campaigns checked
+- shared publisher-platform spend
+- potential overlap findings
+- missing-signal notes clarifying this is not person-level auction overlap
+
+### `get_ad_feedback_signals`
+
+Purpose:
+Handle asks for ad comments, reviews, testimonials, customer feedback, negative
+feedback, or quality rankings.
+
+Inputs:
+
+- optional `level` and `object_id`
+- optional `account_id`, `campaign_id`, `adset_id`, or `ad_id`
+- `date_preset` or `since` and `until`
+
+Output:
+
+- available quality ranking fields when scoped
+- direct users toward `list_ad_comments` and `list_page_recommendations` for raw social feedback
+- unavailable customer feedback score, negative-feedback counts, and commerce/catalog review-feed signals
+- weak-quality findings when Meta ranking fields are below average
+
+### `get_ad_social_context`
+
+Purpose:
+Resolve the Facebook Page post id or Instagram media id behind an ad creative
+before reading comments. This avoids blind calls to multiple social edges.
+
+Inputs:
+
+- `ad_id`
+- `resolve_creative`
+
+Output:
+
+- compact ad and creative identity
+- available Facebook/Instagram feedback paths
+- missing-path explanations
+- permission notes and stable unavailable signals
+
+### `list_ad_comments`
+
+Purpose:
+Read compact raw Facebook or Instagram comments for one ad, Page post id, or
+Instagram media id.
+
+Inputs:
+
+- exactly one of `ad_id`, `object_story_id`, or `instagram_media_id`
+- `surface` as `auto`, `facebook`, `instagram`, or `all`
+- pagination and token-control options: `limit`, `after`, `include_replies`,
+  `reply_limit`, `include_author`, and `max_message_chars`
+- Facebook comment options: `comment_filter` and `order`
+
+Output:
+
+- compact normalized comments with message, time, likes, surface, and optional replies
+- paging cursor for one surface, or per-surface paging when `surface="all"`
+- API-call count and parent ids used
+- structured unavailable output for permission-gated Page/Instagram surfaces
+
+### `list_page_recommendations`
+
+Purpose:
+Read compact Facebook Page recommendations, reviews, or testimonials for an
+owned Page.
+
+Inputs:
+
+- `page_id`
+- `limit` and optional `after`
+- `include_reviewer`
+- `max_message_chars`
+
+Output:
+
+- compact recommendation rows
+- paging cursor
+- permission notes
+- stable unavailable signals for customer feedback score and catalog review feeds
 
 ### `get_budget_pacing_report`
 
@@ -949,6 +1114,18 @@ Examples:
 - when CTR changes matter
 - when budget concentration may be a problem
 - what signals are too weak to act on
+
+### `list_mutation_tools`
+
+Purpose:
+Expose the write catalog and common mutation paths without requiring a full
+manifest dump.
+
+Output:
+
+- write tool list
+- common pause, budget, bid, creation, and audience paths
+- safety notes
 
 ## Controlled Execution Tools
 

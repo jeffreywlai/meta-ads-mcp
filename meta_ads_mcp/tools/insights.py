@@ -54,6 +54,65 @@ LOWER_IS_BETTER_METRICS = {"cpc", "cpm", "cpa", "cpp", "cost_per_result", "spend
 DEFAULT_EXPORT_LIMIT = 100
 DEFAULT_INLINE_EXPORT_ROWS = 100
 
+META_DATE_PRESETS = {
+    "data_maximum",
+    "last_14d",
+    "last_28d",
+    "last_30d",
+    "last_3d",
+    "last_7d",
+    "last_90d",
+    "last_month",
+    "last_quarter",
+    "last_week_mon_sun",
+    "last_week_sun_sat",
+    "last_year",
+    "maximum",
+    "this_month",
+    "this_quarter",
+    "this_week_mon_today",
+    "this_week_sun_today",
+    "this_year",
+    "today",
+    "yesterday",
+}
+
+DATE_PRESET_ALIASES = {
+    "alltime": "maximum",
+    "all_time": "maximum",
+    "all": "maximum",
+    "lifetime": "maximum",
+    "max": "maximum",
+    "mtd": "this_month",
+    "month_to_date": "this_month",
+    "qtd": "this_quarter",
+    "quarter_to_date": "this_quarter",
+    "ytd": "this_year",
+    "year_to_date": "this_year",
+    "last_3_days": "last_3d",
+    "last_7_days": "last_7d",
+    "last_14_days": "last_14d",
+    "last_28_days": "last_28d",
+    "last_30_days": "last_30d",
+    "last_90_days": "last_90d",
+    "previous_month": "last_month",
+    "previous_quarter": "last_quarter",
+    "previous_year": "last_year",
+}
+
+ACTION_TYPE_ALIASES = {
+    "appointment": ["appointment", "schedule", "scheduled"],
+    "appointments": ["appointment", "schedule", "scheduled"],
+    "lead": ["lead", "onsite_conversion.lead", "offsite_conversion.fb_pixel_lead"],
+    "leads": ["lead", "onsite_conversion.lead", "offsite_conversion.fb_pixel_lead"],
+    "purchase": ["purchase", "omni_purchase", "offsite_conversion.purchase", "onsite_conversion.purchase"],
+    "purchases": ["purchase", "omni_purchase", "offsite_conversion.purchase", "onsite_conversion.purchase"],
+}
+
+ACTION_ATTRIBUTION_NOTICE = (
+    "Action counts and values come from Meta attribution. For purchase truth, reconcile with Snowplow/Snowflake."
+)
+
 NAME_FIELD_BY_LEVEL = {
     "account": "account_name",
     "campaign": "campaign_name",
@@ -69,6 +128,11 @@ ID_FIELD_BY_LEVEL = {
 }
 
 
+def _normalize_key(value: Any) -> str:
+    """Normalize loose LLM labels into enum-like keys."""
+    return "_".join(str(value).strip().lower().replace("-", "_").split())
+
+
 def _build_date_params(
     *,
     date_preset: str | None,
@@ -77,11 +141,9 @@ def _build_date_params(
     default_date_preset: str,
 ) -> dict[str, Any]:
     """Build a Graph API date filter."""
-    normalized_date_preset = date_preset.strip() if isinstance(date_preset, str) else date_preset
+    normalized_date_preset = _normalize_date_preset(date_preset)
     normalized_since = since.strip() if isinstance(since, str) else since
     normalized_until = until.strip() if isinstance(until, str) else until
-    if normalized_date_preset == "":
-        normalized_date_preset = None
     if normalized_since == "":
         normalized_since = None
     if normalized_until == "":
@@ -98,24 +160,86 @@ def _build_date_params(
         except ValueError as exc:
             raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.") from exc
         return {"time_range": json.dumps({"since": normalized_since, "until": normalized_until})}
-    return {"date_preset": normalized_date_preset or default_date_preset}
+    return {"date_preset": normalized_date_preset or _normalize_date_preset(default_date_preset)}
 
 
-def _normalize_date_inputs(
+def _normalize_date_preset(date_preset: str | None) -> str | None:
+    """Normalize LLM-friendly date aliases to Meta's current date_preset enum."""
+    if date_preset is None:
+        return None
+    normalized = _normalize_key(date_preset)
+    if not normalized:
+        return None
+    normalized = DATE_PRESET_ALIASES.get(normalized, normalized)
+    if normalized not in META_DATE_PRESETS:
+        supported = ", ".join(sorted(META_DATE_PRESETS))
+        aliases = "lifetime->maximum, all_time->maximum, ytd->this_year, last_30_days->last_30d"
+        raise ValidationError(
+            f"Unsupported date_preset '{date_preset}'. Supported values: {supported}. Common aliases: {aliases}."
+        )
+    return normalized
+
+
+def _coerce_time_range(
+    time_range: dict[str, str] | None,
     *,
-    date_preset: str | None,
     since: str | None,
     until: str | None,
-) -> tuple[str | None, str | None, str | None]:
-    """Normalize blank optional date inputs to None for MCP callers."""
-    normalized_date_preset = date_preset.strip() if isinstance(date_preset, str) else date_preset
-    normalized_since = since.strip() if isinstance(since, str) else since
-    normalized_until = until.strip() if isinstance(until, str) else until
-    return (
-        normalized_date_preset or None,
-        normalized_since or None,
-        normalized_until or None,
+) -> tuple[str | None, str | None]:
+    """Accept the older get_insights time_range shape without changing the core API."""
+    if time_range is None:
+        return since, until
+    if since or until:
+        raise ValidationError("Use either time_range or since/until, not both.")
+    range_since = time_range.get("since")
+    range_until = time_range.get("until")
+    if not range_since or not range_until:
+        raise ValidationError("time_range must include since and until.")
+    return str(range_since), str(range_until)
+
+
+def _action_patterns(action_types: list[str] | None) -> list[str]:
+    """Normalize requested action types and expand common aliases."""
+    return list(
+        dict.fromkeys(
+            candidate
+            for raw_action_type in (action_types or [])
+            if (action_type := _normalize_key(raw_action_type))
+            for candidate in ACTION_TYPE_ALIASES.get(action_type, [action_type])
+        )
     )
+
+
+def _matches_action_type(action_type: Any, patterns: list[str]) -> bool:
+    """Return whether a Meta action_type matches exact, suffix, or narrow alias patterns."""
+    if not patterns:
+        return True
+    normalized = str(action_type or "").strip().lower()
+    if not normalized:
+        return False
+    for pattern in patterns:
+        if normalized == pattern or normalized.endswith(f".{pattern}"):
+            return True
+        if pattern in {"appointment", "schedule", "scheduled"} and pattern in normalized:
+            return True
+    return False
+
+
+def _filter_action_arrays(row: dict[str, Any], patterns: list[str]) -> dict[str, Any]:
+    """Filter action-style arrays while preserving all non-action fields."""
+    if not patterns:
+        return row
+    filtered = dict(row)
+    for key, value in row.items():
+        if not isinstance(value, list):
+            continue
+        if not any(isinstance(item, dict) and "action_type" in item for item in value):
+            continue
+        filtered[key] = [
+            item for item in value
+            if isinstance(item, dict) and _matches_action_type(item.get("action_type"), patterns)
+        ]
+    return filtered
 
 
 def _insights_params(
@@ -133,11 +257,6 @@ def _insights_params(
     limit: int = 100,
 ) -> dict[str, Any]:
     """Build insights params."""
-    date_preset, since, until = _normalize_date_inputs(
-        date_preset=date_preset,
-        since=since,
-        until=until,
-    )
     params: dict[str, Any] = {
         "level": level,
         "limit": limit,
@@ -167,14 +286,53 @@ def _normalize_reporting_object_id(level: str, object_id: str) -> str:
     return object_id
 
 
-def _normalize_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _normalize_rows(payload: dict[str, Any], action_types: list[str] | None = None) -> list[dict[str, Any]]:
     """Normalize insights rows and attach derived metrics."""
-    rows = []
-    for row in payload.get("data", []):
-        normalized = normalize_insights_row(row)
-        normalized["metrics"] = derive_core_metrics(normalized)
-        rows.append(normalized)
+    action_patterns = _action_patterns(action_types)
+    rows = [normalize_insights_row(_filter_action_arrays(row, action_patterns)) for row in payload.get("data", [])]
+    for row in rows:
+        row["metrics"] = derive_core_metrics(row)
     return rows
+
+
+def _action_totals(rows: list[dict[str, Any]], action_types: list[str] | None = None) -> list[dict[str, Any]]:
+    """Aggregate requested action counts and values from normalized rows."""
+    patterns = _action_patterns(action_types)
+    totals = {"actions_map": {}, "action_values_map": {}}
+    spend = sum((row.get("metrics") or {}).get("spend") or 0.0 for row in rows)
+
+    for row in rows:
+        for map_name, target in totals.items():
+            for action_type, value in (row.get(map_name) or {}).items():
+                if _matches_action_type(action_type, patterns):
+                    target[action_type] = target.get(action_type, 0.0) + float(value or 0.0)
+
+    counts = totals["actions_map"]
+    values = totals["action_values_map"]
+    action_keys = sorted(counts, key=lambda key: counts[key], reverse=True)
+    return [
+        {
+            "action_type": action_type,
+            "count": counts[action_type],
+            "value": values.get(action_type),
+            "cost_per_action": (spend / counts[action_type]) if spend and counts[action_type] else None,
+        }
+        for action_type in action_keys
+    ]
+
+
+def _compact_action_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return compact row-level action evidence for optional drill-down."""
+    return [
+        {
+            "date_start": row.get("date_start"),
+            "date_stop": row.get("date_stop"),
+            "actions": row.get("actions_map") or {},
+            "action_values": row.get("action_values_map") or {},
+            "metrics": row.get("metrics") or {},
+        }
+        for row in rows
+    ]
 
 
 def _serialize_cell(value: Any) -> str:
@@ -253,6 +411,7 @@ async def _comparison_row(
     breakdowns: list[str] | None,
     action_breakdowns: list[str] | None,
     time_increment: int | str | None,
+    action_types: list[str] | None,
     limit: int,
 ) -> dict[str, Any]:
     """Fetch one object's insights summary for compare_performance."""
@@ -267,6 +426,7 @@ async def _comparison_row(
             breakdowns=breakdowns,
             action_breakdowns=action_breakdowns,
             time_increment=time_increment,
+            action_types=action_types,
             limit=limit,
         )
         object_name = _extract_object_name(level, payload.get("items", []), object_id)
@@ -358,6 +518,7 @@ async def get_entity_insights(
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
+    action_types: list[str] | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
@@ -365,7 +526,7 @@ async def get_entity_insights(
     action_attribution_windows: list[str] | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Use this for the primary reporting read: normalized insights for one account, campaign, ad set, or ad."""
+    """Use this for primary reporting reads. For action counts, use summarize_actions; for campaign health, use get_campaign_optimization_snapshot."""
     client = get_graph_api_client()
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
     payload = await client.get_insights(
@@ -385,10 +546,110 @@ async def get_entity_insights(
             limit=limit,
         ),
     )
-    rows = _normalize_rows(payload)
+    rows = _normalize_rows(payload, action_types=action_types)
     response = normalize_collection(payload)
     response["items"] = rows
     response["summary"]["metrics"] = _aggregate_metrics(rows)
+    if action_types:
+        response["summary"]["action_filter"] = {
+            "requested": action_types,
+            "matched": [item["action_type"] for item in _action_totals(rows)],
+        }
+    return response
+
+
+@mcp_server.tool()
+async def get_insights(
+    level: str,
+    object_id: str,
+    date_preset: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    time_range: dict[str, str] | None = None,
+    fields: list[str] | None = None,
+    action_types: list[str] | None = None,
+    breakdowns: list[str] | None = None,
+    action_breakdowns: list[str] | None = None,
+    time_increment: int | str | None = None,
+    use_unified_attribution_setting: bool = True,
+    action_attribution_windows: list[str] | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Compatibility alias for older Claude calls; prefer get_entity_insights for new reporting reads."""
+    resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
+    return await get_entity_insights(
+        level=level,
+        object_id=object_id,
+        date_preset=date_preset,
+        since=resolved_since,
+        until=resolved_until,
+        fields=fields,
+        action_types=action_types,
+        breakdowns=breakdowns,
+        action_breakdowns=action_breakdowns,
+        time_increment=time_increment,
+        use_unified_attribution_setting=use_unified_attribution_setting,
+        action_attribution_windows=action_attribution_windows,
+        limit=limit,
+    )
+
+
+@mcp_server.tool()
+async def summarize_actions(
+    level: str,
+    object_id: str,
+    action_types: list[str] | None = None,
+    date_preset: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    time_range: dict[str, str] | None = None,
+    breakdowns: list[str] | None = None,
+    time_increment: int | str | None = None,
+    include_rows: bool = False,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Use this when asking how many appointments, purchases, leads, or custom actions a campaign drove over a trailing window."""
+    resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
+    fields = [
+        ID_FIELD_BY_LEVEL.get(level, "campaign_id"),
+        NAME_FIELD_BY_LEVEL.get(level, "campaign_name"),
+        "date_start",
+        "date_stop",
+        "spend",
+        "impressions",
+        "clicks",
+        "actions",
+        "action_values",
+    ]
+    payload = await get_entity_insights(
+        level=level,
+        object_id=object_id,
+        date_preset=date_preset,
+        since=resolved_since,
+        until=resolved_until,
+        fields=[field for field in fields if field],
+        action_types=action_types,
+        breakdowns=breakdowns,
+        time_increment=time_increment,
+        limit=limit,
+    )
+    rows = payload["items"]
+    totals = _action_totals(rows)
+    response: dict[str, Any] = {
+        "scope": {"level": level, "object_id": object_id},
+        "window": {
+            "date_preset": _normalize_date_preset(date_preset) if date_preset else None,
+            "since": resolved_since,
+            "until": resolved_until,
+        },
+        "requested_action_types": action_types or "all",
+        "action_totals": totals,
+        "summary_metrics": payload["summary"]["metrics"],
+        "cost_note": "cost_per_action uses selected-window spend divided by each action count; action types can overlap.",
+        "meta_attribution_notice": ACTION_ATTRIBUTION_NOTICE,
+    }
+    if include_rows:
+        response["rows"] = _compact_action_rows(rows)
     return response
 
 
@@ -487,6 +748,7 @@ async def compare_performance(
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
+    action_types: list[str] | None = None,
     limit: int = 100,
     metrics: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -505,6 +767,7 @@ async def compare_performance(
                 breakdowns=breakdowns,
                 action_breakdowns=action_breakdowns,
                 time_increment=time_increment,
+                action_types=action_types,
                 limit=limit,
             )
             for object_id in object_ids
@@ -526,6 +789,7 @@ async def compare_performance(
                 "date_preset": date_preset,
                 "since": since,
                 "until": until,
+                "action_types": action_types,
             },
         },
     )
@@ -540,6 +804,7 @@ async def export_insights(
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
+    action_types: list[str] | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
@@ -555,11 +820,9 @@ async def export_insights(
         raise ValidationError("limit must be at least 1.")
     if inline_limit < 1:
         raise ValidationError("inline_limit must be at least 1.")
-    normalized_date_preset, normalized_since, normalized_until = _normalize_date_inputs(
-        date_preset=date_preset,
-        since=since,
-        until=until,
-    )
+    normalized_date_preset = date_preset.strip() if isinstance(date_preset, str) else date_preset
+    normalized_since = since.strip() if isinstance(since, str) else since
+    normalized_until = until.strip() if isinstance(until, str) else until
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -567,6 +830,7 @@ async def export_insights(
         since=normalized_since,
         until=normalized_until,
         fields=fields,
+        action_types=action_types,
         breakdowns=breakdowns,
         action_breakdowns=action_breakdowns,
         time_increment=time_increment,
@@ -591,6 +855,7 @@ async def export_insights(
             "until": until,
             "breakdowns": breakdowns or [],
             "action_breakdowns": action_breakdowns or [],
+            "action_types": action_types or [],
             "limit": limit,
             "inline_limit": inline_limit,
             "allow_large_output": allow_large_output,
