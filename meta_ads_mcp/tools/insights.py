@@ -14,7 +14,7 @@ from meta_ads_mcp.diagnostics import compare_metric_sets, derive_core_metrics
 from meta_ads_mcp.diagnostics import summary_metric_evidence
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import normalize_collection, normalize_insights_row
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, normalize_insights_row
 from meta_ads_mcp.schemas import analysis_response, collection_response
 
 DEFAULT_INSIGHTS_FIELDS = [
@@ -195,14 +195,6 @@ def _normalize_date_preset(date_preset: str | None) -> str | None:
     return normalized
 
 
-def _blank_to_none(value: str | None) -> str | None:
-    """Treat blank optional strings as omitted."""
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
-
-
 def _coerce_time_range(
     time_range: dict[str, str] | None,
     *,
@@ -214,8 +206,8 @@ def _coerce_time_range(
         return since, until
     if since or until:
         raise ValidationError("Use either time_range or since/until, not both.")
-    range_since = _blank_to_none(time_range.get("since"))
-    range_until = _blank_to_none(time_range.get("until"))
+    range_since = blank_to_none(time_range.get("since"))
+    range_until = blank_to_none(time_range.get("until"))
     if not range_since or not range_until:
         raise ValidationError("time_range must include since and until.")
     return range_since, range_until
@@ -640,9 +632,13 @@ async def summarize_actions(
     breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
     include_rows: bool = False,
+    max_action_types: int = 25,
+    include_all_action_totals: bool = False,
     limit: int = 100,
 ) -> dict[str, Any]:
     """Use this for appointment, purchase, lead, or custom action counts over last 30 days or any trailing window."""
+    if max_action_types < 1 or max_action_types > 100:
+        raise ValidationError("max_action_types must be between 1 and 100.")
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
     effective_date_preset = None
     if not (resolved_since and resolved_until):
@@ -671,7 +667,8 @@ async def summarize_actions(
         limit=limit,
     )
     rows = payload["items"]
-    totals = _action_totals(rows)
+    all_totals = _action_totals(rows)
+    totals = all_totals if include_all_action_totals else all_totals[:max_action_types]
     response: dict[str, Any] = {
         "scope": {"level": level, "object_id": object_id},
         "window": {
@@ -682,10 +679,18 @@ async def summarize_actions(
         "requested_action_types": action_types or [],
         "action_filter_mode": "filtered" if action_types else "all",
         "action_totals": totals,
+        "action_totals_summary": {
+            "returned": len(totals),
+            "total_action_types": len(all_totals),
+            "truncated": len(totals) < len(all_totals),
+            "max_action_types": None if include_all_action_totals else max_action_types,
+        },
         "summary_metrics": payload["summary"]["metrics"],
         "cost_note": "cost_per_action uses selected-window spend divided by each action count; action types can overlap.",
         "meta_attribution_notice": ACTION_ATTRIBUTION_NOTICE,
     }
+    if include_all_action_totals:
+        response["all_action_totals_included"] = True
     if include_rows:
         response["rows"] = _compact_action_rows(rows)
     return response

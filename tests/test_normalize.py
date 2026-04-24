@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from meta_ads_mcp.diagnostics import derive_core_metrics
-from meta_ads_mcp.normalize import normalize_insights_row
+from meta_ads_mcp.normalize import blank_to_none, normalize_insights_row
+
+
+def test_blank_to_none_strips_optional_strings() -> None:
+    assert blank_to_none(None) is None
+    assert blank_to_none("  ") is None
+    assert blank_to_none(" act_123 ") == "act_123"
 
 
 def test_normalize_insights_row_extracts_actions() -> None:

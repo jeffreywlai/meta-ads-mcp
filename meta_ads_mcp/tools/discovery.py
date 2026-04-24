@@ -8,7 +8,7 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import normalize_budget_value, normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_budget_value, normalize_collection
 from meta_ads_mcp.schemas import collection_response
 
 ACCOUNT_FIELDS = [
@@ -89,14 +89,6 @@ def _resolve_account_id(account_id: str | None) -> str:
     raise ValidationError("account_id is required when META_DEFAULT_ACCOUNT_ID is not set.")
 
 
-def _blank_to_none(value: str | None) -> str | None:
-    """Treat blank optional ids as omitted."""
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
-
-
 def _normalize_budgets(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize budget fields in-place."""
     for item in items:
@@ -175,7 +167,7 @@ async def list_campaigns(
 ) -> dict[str, Any]:
     """Use this first to find campaign by name: list campaigns with names and ids, with optional status filtering."""
     client = get_graph_api_client()
-    account_id = _blank_to_none(account_id)
+    account_id = blank_to_none(account_id)
     resolved_account_id = _resolve_account_id(account_id)
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
     if after:
@@ -211,8 +203,8 @@ async def list_adsets(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this to discover ad sets under one account or one campaign."""
-    account_id = _blank_to_none(account_id)
-    campaign_id = _blank_to_none(campaign_id)
+    account_id = blank_to_none(account_id)
+    campaign_id = blank_to_none(campaign_id)
     if account_id and campaign_id:
         raise ValidationError("Provide only one of account_id or campaign_id.")
     parent_id = campaign_id or _resolve_account_id(account_id)
@@ -244,9 +236,9 @@ async def list_ads(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this to discover ads under at most one scope; if none is provided, META_DEFAULT_ACCOUNT_ID is used."""
-    account_id = _blank_to_none(account_id)
-    campaign_id = _blank_to_none(campaign_id)
-    adset_id = _blank_to_none(adset_id)
+    account_id = blank_to_none(account_id)
+    campaign_id = blank_to_none(campaign_id)
+    adset_id = blank_to_none(adset_id)
     scope_count = sum(value is not None for value in (account_id, campaign_id, adset_id))
     if scope_count > 1:
         raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")
@@ -301,7 +293,7 @@ async def list_instagram_accounts(
 ) -> dict[str, Any]:
     """Use this before creative creation when the user needs Instagram identities linked to the account."""
     client = get_graph_api_client()
-    account_id = _blank_to_none(account_id)
+    account_id = blank_to_none(account_id)
     params = _page_params(limit, after)
     source_attempts = ["instagram_accounts"]
     try:

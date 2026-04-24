@@ -18,7 +18,7 @@ from meta_ads_mcp.diagnostics import (
     summary_metric_evidence,
 )
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import to_float
+from meta_ads_mcp.normalize import blank_to_none, to_float
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tools.insights import (
@@ -92,9 +92,9 @@ def _resolve_scope(
 ) -> tuple[str, str]:
     """Resolve generic or legacy scope inputs into one normalized level/object_id pair."""
     alias_candidates = [
-        ("adset", _blank_to_none(adset_id)),
-        ("campaign", _blank_to_none(campaign_id)),
-        ("account", _blank_to_none(account_id)),
+        ("adset", blank_to_none(adset_id)),
+        ("campaign", blank_to_none(campaign_id)),
+        ("account", blank_to_none(account_id)),
     ]
     provided_aliases = [(candidate_level, candidate_id) for candidate_level, candidate_id in alias_candidates if candidate_id]
     if len(provided_aliases) > 1:
@@ -130,14 +130,6 @@ def _resolve_scope(
         return alias_level, alias_object_id
 
     raise ValidationError("Provide a valid scope using level/object_id or the tool's entity-specific params.")
-
-
-def _blank_to_none(value: str | None) -> str | None:
-    """Treat blank optional ids as omitted."""
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
 
 
 def _snapshot_suggestions(findings: list[dict[str, Any]]) -> list[str]:

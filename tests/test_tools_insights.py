@@ -279,6 +279,65 @@ def test_summarize_actions_matches_pixel_purchase_alias(monkeypatch) -> None:
     assert result["summary_metrics"]["roas"] == 2.5
 
 
+def test_summarize_actions_caps_totals_by_default(monkeypatch) -> None:
+    class ManyActionsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"] = [
+                {"action_type": f"custom_{idx}", "value": str(30 - idx)}
+                for idx in range(30)
+            ]
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ManyActionsClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            max_action_types=5,
+        )
+    )
+
+    assert [item["action_type"] for item in result["action_totals"]] == [
+        "custom_0",
+        "custom_1",
+        "custom_2",
+        "custom_3",
+        "custom_4",
+    ]
+    assert result["action_totals_summary"] == {
+        "returned": 5,
+        "total_action_types": 30,
+        "truncated": True,
+        "max_action_types": 5,
+    }
+
+
+def test_summarize_actions_can_include_all_totals(monkeypatch) -> None:
+    class ManyActionsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"] = [
+                {"action_type": f"custom_{idx}", "value": "1"}
+                for idx in range(30)
+            ]
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ManyActionsClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            max_action_types=5,
+            include_all_action_totals=True,
+        )
+    )
+
+    assert len(result["action_totals"]) == 30
+    assert result["action_totals_summary"]["truncated"] is False
+    assert result["all_action_totals_included"] is True
+
+
 def test_summarize_actions_reports_explicit_window_without_default_preset(monkeypatch) -> None:
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
     result = asyncio.run(

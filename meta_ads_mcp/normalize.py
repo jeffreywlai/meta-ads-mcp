@@ -43,6 +43,14 @@ def to_int(value: Any) -> int | None:
     return None if numeric is None else int(numeric)
 
 
+def blank_to_none(value: str | None) -> str | None:
+    """Treat blank optional strings as omitted."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def normalize_budget_value(value: Any, currency: str | None = None) -> float | None:
     """Convert minor-unit budgets to human-readable amounts."""
     numeric = to_float(value)
