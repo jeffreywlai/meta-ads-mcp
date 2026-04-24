@@ -191,7 +191,25 @@ def test_summarize_actions_filters_requested_action_types(monkeypatch) -> None:
             "cost_per_action": 100.0 / 3.0,
         }
     ]
+    assert result["window"]["date_preset"] == "last_7d"
     assert "Snowplow" in result["meta_attribution_notice"]
+
+
+def test_summarize_actions_reports_explicit_window_without_default_preset(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert result["window"] == {
+        "date_preset": None,
+        "since": "2026-03-01",
+        "until": "2026-03-07",
+    }
 
 
 def test_compare_performance_ranks_multiple_objects(monkeypatch) -> None:

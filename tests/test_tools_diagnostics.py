@@ -85,6 +85,27 @@ def test_account_health_snapshot_compares_explicit_windows(monkeypatch) -> None:
     assert calls[2] == ("2025-03-01", "2025-03-31")
 
 
+def test_account_health_snapshot_uses_equal_length_previous_window_for_multi_month_ranges(monkeypatch) -> None:
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fake_get_entity_insights(*, since: str | None = None, until: str | None = None, **kwargs):
+        calls.append((since, until))
+        return {"summary": {"metrics": {"spend": 300.0, "clicks": 10, "impressions": 1000}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.get_account_health_snapshot(
+            account_id="123",
+            since="2026-01-01",
+            until="2026-03-31",
+            include_year_over_year=False,
+        )
+    )
+
+    assert result["previous_window"] == {"since": "2025-10-03", "until": "2025-12-31"}
+    assert calls[1] == ("2025-10-03", "2025-12-31")
+
+
 def test_account_snapshot_supports_explicit_since_until(monkeypatch) -> None:
     entity_calls: list[dict[str, object]] = []
     child_calls: list[dict[str, object]] = []

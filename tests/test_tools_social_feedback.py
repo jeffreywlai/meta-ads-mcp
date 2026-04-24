@@ -143,6 +143,24 @@ def test_list_ad_comments_can_fetch_all_available_ad_surfaces(monkeypatch) -> No
     assert result["paging"]["by_surface"]["instagram"]["after"] == "after_ig"
 
 
+def test_list_ad_comments_auto_falls_back_to_instagram_when_facebook_errors(monkeypatch) -> None:
+    class FallbackClient(FakeSocialClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            if parent_id == "page_1_post_1" and edge == "comments":
+                raise MetaApiError("Missing Page permission", code=200)
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    client = FallbackClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(social_feedback.list_ad_comments(ad_id="ad_full"))
+
+    assert result["summary"]["api_calls"] == 3
+    assert result["summary"]["surfaces"] == ["instagram"]
+    assert result["summary"]["unavailable_surfaces"][0]["surface"] == "facebook"
+    assert result["items"][0]["surface"] == "instagram"
+
+
 def test_list_page_recommendations_compacts_reviews(monkeypatch) -> None:
     client = FakeSocialClient()
     monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
@@ -167,3 +185,17 @@ def test_social_permission_errors_return_structured_unavailable(monkeypatch) -> 
     assert result["summary"]["unavailable"] is True
     assert result["summary"]["reason"] == "Missing Page permission"
     assert result["permission_notes"]
+
+
+def test_page_recommendation_permission_errors_use_page_specific_notes(monkeypatch) -> None:
+    class PermissionClient(FakeSocialClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            raise MetaApiError("Missing Page ratings permission", code=200)
+
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: PermissionClient())
+
+    result = asyncio.run(social_feedback.list_page_recommendations("page_1"))
+
+    assert result["summary"]["unavailable"] is True
+    assert result["permission_notes"] == social_feedback.PAGE_RECOMMENDATION_PERMISSION_NOTES
+    assert "Instagram" not in " ".join(result["permission_notes"])

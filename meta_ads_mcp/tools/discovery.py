@@ -121,13 +121,19 @@ def _campaign_suggested_next_tools(items: list[dict[str, Any]]) -> dict[str, Any
         return {}
     first_campaign_id = campaign_ids[0]
     return {
-        "campaign_health": f"get_campaign_optimization_snapshot(campaign_id={first_campaign_id})",
+        "campaign_health": {
+            "tool": "get_campaign_optimization_snapshot",
+            "arguments": {"campaign_id": first_campaign_id},
+        },
         "compare_visible_campaigns": {
             "tool": "compare_performance",
             "arguments": {"level": "campaign", "object_ids": campaign_ids},
         },
-        "whole_account_health": "get_account_optimization_snapshot(account_id=...)",
-        "writes_catalog": "list_mutation_tools()",
+        "whole_account_health": {
+            "tool": "get_account_optimization_snapshot",
+            "arguments": {"account_id": "..."},
+        },
+        "writes_catalog": {"tool": "list_mutation_tools", "arguments": {}},
     }
 
 
@@ -159,7 +165,7 @@ async def list_campaigns(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to list campaigns in an account, find campaign ids by name, and prepare deeper diagnostics."""
+    """Use this to list campaign names and ids so callers can find campaigns by scanning returned names, with optional status filtering."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
     if after:

@@ -35,6 +35,9 @@ SOCIAL_PERMISSION_NOTES = [
     "Facebook comments require access to the parent Page/post, usually a Page token with Page tasks and pages_read_user_content or pages_manage_engagement.",
     "Instagram comments require an Instagram business/creator media id and Instagram comment permissions on the connected account.",
 ]
+PAGE_RECOMMENDATION_PERMISSION_NOTES = [
+    "Page recommendations require a Page access token from a person who can perform Page tasks and pages_read_user_content.",
+]
 
 SOCIAL_MISSING_SIGNALS = [
     "Customer feedback score is not exposed here as a stable public Marketing API field.",
@@ -268,7 +271,13 @@ async def _comments_for_surface(
     }
 
 
-def _social_error_payload(*, scope: dict[str, Any], error: Exception, api_calls: int) -> dict[str, Any]:
+def _social_error_payload(
+    *,
+    scope: dict[str, Any],
+    error: Exception,
+    api_calls: int,
+    permission_notes: list[str] | None = None,
+) -> dict[str, Any]:
     """Return compact unavailable output for permission-gated social surfaces."""
     return {
         "items": [],
@@ -281,7 +290,7 @@ def _social_error_payload(*, scope: dict[str, Any], error: Exception, api_calls:
         },
         "scope": scope,
         "missing_signals": SOCIAL_MISSING_SIGNALS,
-        "permission_notes": SOCIAL_PERMISSION_NOTES,
+        "permission_notes": permission_notes or SOCIAL_PERMISSION_NOTES,
     }
 
 
@@ -343,7 +352,7 @@ async def list_ad_comments(
 
         if surface in {"auto", "facebook", "all"} and facebook_id:
             targets.append(("facebook", str(facebook_id)))
-        if surface in {"auto", "instagram", "all"} and instagram_id and (surface != "auto" or not targets):
+        if surface in {"auto", "instagram", "all"} and instagram_id:
             targets.append(("instagram", str(instagram_id)))
 
         if not targets:
@@ -362,38 +371,66 @@ async def list_ad_comments(
             }
 
         fetched = []
+        unavailable_surfaces: list[dict[str, str]] = []
         for target_surface, parent_id in targets:
             api_calls += 1
-            fetched.append(
-                await _comments_for_surface(
-                    parent_id=parent_id,
-                    surface=target_surface,
-                    limit=limit,
-                    after=after,
-                    include_replies=include_replies,
-                    reply_limit=reply_limit,
-                    include_author=include_author,
-                    max_message_chars=max_message_chars,
-                    comment_filter=comment_filter,
-                    order=order,
+            try:
+                fetched.append(
+                    await _comments_for_surface(
+                        parent_id=parent_id,
+                        surface=target_surface,
+                        limit=limit,
+                        after=after,
+                        include_replies=include_replies,
+                        reply_limit=reply_limit,
+                        include_author=include_author,
+                        max_message_chars=max_message_chars,
+                        comment_filter=comment_filter,
+                        order=order,
+                    )
                 )
+                if surface == "auto":
+                    break
+            except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+                unavailable_surfaces.append(
+                    {
+                        "surface": target_surface,
+                        "parent_id": parent_id,
+                        "reason": str(exc),
+                    }
+                )
+                if surface not in {"auto", "all"}:
+                    raise
+        if not fetched and unavailable_surfaces:
+            reasons = (
+                unavailable_surfaces[0]["reason"]
+                if len(unavailable_surfaces) == 1
+                else "; ".join(f"{item['surface']}: {item['reason']}" for item in unavailable_surfaces)
+            )
+            return _social_error_payload(
+                scope=scope,
+                error=UnsupportedFeatureError(reasons),
+                api_calls=api_calls,
             )
     except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
         return _social_error_payload(scope=scope, error=exc, api_calls=max(api_calls, 1))
 
     items = [item for result in fetched for item in result["items"]]
     one_surface = len(fetched) == 1
+    summary = {
+        "count": len(items),
+        "api_calls": api_calls,
+        "surfaces": [result["surface"] for result in fetched],
+        "parents": {result["surface"]: result["parent_id"] for result in fetched},
+        "include_replies": include_replies,
+        "max_message_chars": max_message_chars,
+    }
+    if unavailable_surfaces:
+        summary["unavailable_surfaces"] = unavailable_surfaces
     return {
         "items": items,
         "paging": fetched[0]["paging"] if one_surface else {"by_surface": {result["surface"]: result["paging"] for result in fetched}},
-        "summary": {
-            "count": len(items),
-            "api_calls": api_calls,
-            "surfaces": [result["surface"] for result in fetched],
-            "parents": {result["surface"]: result["parent_id"] for result in fetched},
-            "include_replies": include_replies,
-            "max_message_chars": max_message_chars,
-        },
+        "summary": summary,
         "scope": scope,
         "missing_signals": SOCIAL_MISSING_SIGNALS,
         "permission_notes": SOCIAL_PERMISSION_NOTES,
@@ -420,7 +457,12 @@ async def list_page_recommendations(
     try:
         payload = await get_graph_api_client().list_objects(page_id, "ratings", fields=fields, params=params)
     except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
-        return _social_error_payload(scope={"page_id": page_id}, error=exc, api_calls=1)
+        return _social_error_payload(
+            scope={"page_id": page_id},
+            error=exc,
+            api_calls=1,
+            permission_notes=PAGE_RECOMMENDATION_PERMISSION_NOTES,
+        )
 
     normalized = normalize_collection(payload)
     items: list[dict[str, Any]] = []
@@ -451,7 +493,5 @@ async def list_page_recommendations(
             "max_message_chars": max_message_chars,
         },
         "missing_signals": SOCIAL_MISSING_SIGNALS,
-        "permission_notes": [
-            "Page recommendations require a Page access token from a person who can perform Page tasks and pages_read_user_content.",
-        ],
+        "permission_notes": PAGE_RECOMMENDATION_PERMISSION_NOTES,
     }

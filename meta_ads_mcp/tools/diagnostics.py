@@ -289,8 +289,13 @@ def _year_ago_window(since: date, until: date) -> tuple[date, date]:
 
 def _previous_comparable_window(since: date, until: date) -> tuple[date, date]:
     """Return previous calendar month for full-month windows, otherwise equal-length prior window."""
-    is_full_month = since.day == 1 and (until + timedelta(days=1)).day == 1
-    if is_full_month:
+    is_single_full_month = (
+        since.day == 1
+        and (until + timedelta(days=1)).day == 1
+        and since.year == until.year
+        and since.month == until.month
+    )
+    if is_single_full_month:
         previous_until = since - timedelta(days=1)
         return previous_until.replace(day=1), previous_until
     return previous_window(since, until)

@@ -42,6 +42,14 @@ def test_list_campaigns_uses_account_scope(monkeypatch) -> None:
     result = asyncio.run(discovery.list_campaigns(account_id="123"))
     assert result["summary"]["count"] == 1
     assert result["items"][0]["daily_budget"] == 50.0
+    assert result["suggested_next_tools"]["campaign_health"] == {
+        "tool": "get_campaign_optimization_snapshot",
+        "arguments": {"campaign_id": "cmp_1"},
+    }
+    assert result["suggested_next_tools"]["writes_catalog"] == {
+        "tool": "list_mutation_tools",
+        "arguments": {},
+    }
 
 
 def test_get_account_pages_uses_assigned_pages_for_account_scope(monkeypatch) -> None:
