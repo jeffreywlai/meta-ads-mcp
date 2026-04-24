@@ -202,6 +202,24 @@ def test_list_ad_comments_auto_falls_back_to_instagram_when_facebook_errors(monk
     assert result["items"][0]["surface"] == "instagram"
 
 
+def test_list_ad_comments_auto_keeps_fetching_after_empty_surface(monkeypatch) -> None:
+    class EmptyFacebookClient(FakeSocialClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            if parent_id == "page_1_post_1" and edge == "comments":
+                return {"data": [], "paging": {"cursors": {"after": "after_empty_fb"}}}
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    client = EmptyFacebookClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(social_feedback.list_ad_comments(ad_id="ad_full"))
+
+    assert result["summary"]["api_calls"] == 3
+    assert result["summary"]["surfaces"] == ["facebook", "instagram"]
+    assert result["summary"]["count"] == 1
+    assert result["items"][0]["surface"] == "instagram"
+
+
 def test_list_page_recommendations_compacts_reviews(monkeypatch) -> None:
     client = FakeSocialClient()
     monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)

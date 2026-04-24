@@ -385,21 +385,20 @@ async def list_ad_comments(
         for target_surface, parent_id in targets:
             api_calls += 1
             try:
-                fetched.append(
-                    await _comments_for_surface(
-                        parent_id=parent_id,
-                        surface=target_surface,
-                        limit=limit,
-                        after=after,
-                        include_replies=include_replies,
-                        reply_limit=reply_limit,
-                        include_author=include_author,
-                        max_message_chars=max_message_chars,
-                        comment_filter=comment_filter,
-                        order=order,
-                    )
+                result = await _comments_for_surface(
+                    parent_id=parent_id,
+                    surface=target_surface,
+                    limit=limit,
+                    after=after,
+                    include_replies=include_replies,
+                    reply_limit=reply_limit,
+                    include_author=include_author,
+                    max_message_chars=max_message_chars,
+                    comment_filter=comment_filter,
+                    order=order,
                 )
-                if surface == "auto":
+                fetched.append(result)
+                if surface == "auto" and result["items"]:
                     break
             except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
                 unavailable_surfaces.append(
