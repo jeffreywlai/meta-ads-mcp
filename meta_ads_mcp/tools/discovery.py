@@ -89,6 +89,14 @@ def _resolve_account_id(account_id: str | None) -> str:
     raise ValidationError("account_id is required when META_DEFAULT_ACCOUNT_ID is not set.")
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    """Treat blank optional ids as omitted."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _normalize_budgets(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize budget fields in-place."""
     for item in items:
@@ -233,6 +241,9 @@ async def list_ads(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this to discover ads under at most one scope; if none is provided, META_DEFAULT_ACCOUNT_ID is used."""
+    account_id = _blank_to_none(account_id)
+    campaign_id = _blank_to_none(campaign_id)
+    adset_id = _blank_to_none(adset_id)
     scope_count = sum(value is not None for value in (account_id, campaign_id, adset_id))
     if scope_count > 1:
         raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")

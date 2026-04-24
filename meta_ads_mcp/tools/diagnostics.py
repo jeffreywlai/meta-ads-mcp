@@ -19,6 +19,7 @@ from meta_ads_mcp.diagnostics import (
 )
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import to_float
+from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tools.insights import (
     DEFAULT_INSIGHTS_FIELDS,
@@ -256,20 +257,35 @@ async def _child_insights(
 ) -> list[dict[str, Any]]:
     """Fetch child-entity insights rows."""
     client = get_graph_api_client()
-    payload = await client.get_insights(
-        object_id,
-        fields=fields or DEFAULT_INSIGHTS_FIELDS,
-        params=_insights_params(
-            level=level,
-            date_preset=date_preset,
-            since=since,
-            until=until,
-            breakdowns=breakdowns,
-            action_breakdowns=action_breakdowns,
-            limit=limit,
-        ),
+    base_params = _insights_params(
+        level=level,
+        date_preset=date_preset,
+        since=since,
+        until=until,
+        breakdowns=breakdowns,
+        action_breakdowns=action_breakdowns,
+        limit=limit,
     )
-    return _normalize_rows(payload)
+    rows: list[dict[str, Any]] = []
+    after: str | None = None
+    seen_after: set[str] = set()
+    while True:
+        params = dict(base_params)
+        if after:
+            params["after"] = after
+        payload = await client.get_insights(
+            object_id,
+            fields=fields or DEFAULT_INSIGHTS_FIELDS,
+            params=params,
+        )
+        rows.extend(_normalize_rows(payload))
+        paging = extract_paging(payload)
+        next_after = paging.get("after") if paging.get("next") else None
+        if not next_after or next_after in seen_after:
+            break
+        seen_after.add(next_after)
+        after = next_after
+    return rows
 
 
 def _parse_required_date(value: str, *, field: str) -> date:

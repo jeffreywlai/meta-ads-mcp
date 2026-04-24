@@ -8,6 +8,31 @@ import pytest
 from meta_ads_mcp.tools import diagnostics
 
 
+def test_child_insights_paginates_before_returning_rows(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class PagingInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            calls.append(dict(params))
+            if "after" not in params:
+                return {
+                    "data": [{"campaign_id": "cmp_1", "spend": "100"}],
+                    "paging": {"cursors": {"after": "cursor_2"}, "next": "next"},
+                }
+            assert params["after"] == "cursor_2"
+            return {
+                "data": [{"campaign_id": "cmp_2", "spend": "200"}],
+                "paging": {"cursors": {"after": None}},
+            }
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: PagingInsightsClient())
+    rows = asyncio.run(diagnostics._child_insights("act_123", level="campaign"))
+
+    assert [row["campaign_id"] for row in rows] == ["cmp_1", "cmp_2"]
+    assert [row["metrics"]["spend"] for row in rows] == [100.0, 200.0]
+    assert len(calls) == 2
+
+
 def test_account_snapshot_ranks_children(monkeypatch) -> None:
     async def fake_get_entity_insights(**kwargs):
         return {

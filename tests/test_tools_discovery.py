@@ -177,6 +177,18 @@ def test_list_ads_uses_default_account_id(monkeypatch) -> None:
     assert result["summary"]["count"] == 1
 
 
+def test_list_ads_treats_blank_scope_values_as_missing(monkeypatch) -> None:
+    class CampaignScopedClient(FakeDiscoveryClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            if edge == "ads":
+                assert parent_id == "cmp_1"
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: CampaignScopedClient())
+    result = asyncio.run(discovery.list_ads(account_id="  ", campaign_id="cmp_1"))
+    assert result["summary"]["count"] == 1
+
+
 def test_list_campaigns_requires_account_when_no_default(monkeypatch) -> None:
     monkeypatch.delenv("META_DEFAULT_ACCOUNT_ID", raising=False)
     from meta_ads_mcp.config import reload_settings
