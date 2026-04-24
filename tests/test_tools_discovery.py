@@ -135,6 +135,17 @@ def test_list_instagram_accounts_default_fallback_uses_me_pages(monkeypatch) -> 
     assert result["items"][0]["username"] == "fallback_brand"
 
 
+def test_list_instagram_accounts_treats_blank_account_as_default(monkeypatch) -> None:
+    monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+    result = asyncio.run(discovery.list_instagram_accounts(account_id=" "))
+    assert result["summary"]["source"] == "instagram_accounts"
+    assert result["items"][0]["username"] == "test_brand"
+
+
 def test_list_campaigns_uses_default_account_id(monkeypatch) -> None:
     monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
     from meta_ads_mcp.config import reload_settings
@@ -142,6 +153,16 @@ def test_list_campaigns_uses_default_account_id(monkeypatch) -> None:
     reload_settings()
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
     result = asyncio.run(discovery.list_campaigns())
+    assert result["summary"]["count"] == 1
+
+
+def test_list_campaigns_treats_blank_account_as_default(monkeypatch) -> None:
+    monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
+    from meta_ads_mcp.config import reload_settings
+
+    reload_settings()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+    result = asyncio.run(discovery.list_campaigns(account_id="  "))
     assert result["summary"]["count"] == 1
 
 
@@ -203,6 +224,12 @@ def test_list_adsets_supports_campaign_scope(monkeypatch) -> None:
     result = asyncio.run(discovery.list_adsets(campaign_id="cmp_1"))
     assert result["summary"]["count"] == 1
     assert result["items"][0]["daily_budget"] == 25.0
+
+
+def test_list_adsets_treats_blank_account_as_missing(monkeypatch) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+    result = asyncio.run(discovery.list_adsets(account_id=" ", campaign_id="cmp_1"))
+    assert result["summary"]["count"] == 1
 
 
 def test_list_adsets_rejects_multiple_scopes() -> None:

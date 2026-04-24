@@ -69,7 +69,7 @@ QUALITY_RANKING_FIELDS = (
 AD_QUALITY_FIELDS = [*DEFAULT_INSIGHTS_FIELDS, *QUALITY_RANKING_FIELDS]
 
 OVERLAP_INSIGHTS_FIELDS = (
-    "campaign_id campaign_name publisher_platform spend impressions reach "
+    "campaign_id campaign_name spend impressions reach "
     "frequency cpm"
 ).split()
 
@@ -92,9 +92,9 @@ def _resolve_scope(
 ) -> tuple[str, str]:
     """Resolve generic or legacy scope inputs into one normalized level/object_id pair."""
     alias_candidates = [
-        ("adset", adset_id),
-        ("campaign", campaign_id),
-        ("account", account_id),
+        ("adset", _blank_to_none(adset_id)),
+        ("campaign", _blank_to_none(campaign_id)),
+        ("account", _blank_to_none(account_id)),
     ]
     provided_aliases = [(candidate_level, candidate_id) for candidate_level, candidate_id in alias_candidates if candidate_id]
     if len(provided_aliases) > 1:
@@ -130,6 +130,14 @@ def _resolve_scope(
         return alias_level, alias_object_id
 
     raise ValidationError("Provide a valid scope using level/object_id or the tool's entity-specific params.")
+
+
+def _blank_to_none(value: str | None) -> str | None:
+    """Treat blank optional ids as omitted."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _snapshot_suggestions(findings: list[dict[str, Any]]) -> list[str]:

@@ -348,6 +348,15 @@ def test_get_ad_feedback_signals_rejects_multiple_entity_scopes() -> None:
         asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123", adset_id="adset_123"))
 
 
+def test_get_ad_feedback_signals_ignores_blank_alias_scope(monkeypatch) -> None:
+    async def fake_child_insights(*args, **kwargs):
+        return [{"ad_id": "ad1", "metrics": {"spend": 100.0}}]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123", account_id="  "))
+    assert result["scope"] == {"level": "campaign", "object_id": "cmp_123"}
+
+
 def test_creative_performance_report_rejects_conflicting_scope_inputs(monkeypatch) -> None:
     with pytest.raises(diagnostics.ValidationError):
         asyncio.run(
@@ -573,6 +582,7 @@ def test_detect_auction_overlap_flags_shared_platform(monkeypatch) -> None:
     assert "facebook" in result["overlap_platforms"]
     assert result["window"] == {"date_preset": None, "since": "2026-03-01", "until": "2026-03-07"}
     assert insight_calls[0]["date_preset"] is None
+    assert "publisher_platform" not in insight_calls[0]["fields"]
     assert "actions" not in insight_calls[0]["fields"]
     assert "cost_per_action_type" not in insight_calls[0]["fields"]
 

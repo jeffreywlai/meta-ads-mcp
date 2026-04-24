@@ -175,6 +175,7 @@ async def list_campaigns(
 ) -> dict[str, Any]:
     """Use this first to find campaign by name: list campaigns with names and ids, with optional status filtering."""
     client = get_graph_api_client()
+    account_id = _blank_to_none(account_id)
     resolved_account_id = _resolve_account_id(account_id)
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
     if after:
@@ -210,6 +211,8 @@ async def list_adsets(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this to discover ad sets under one account or one campaign."""
+    account_id = _blank_to_none(account_id)
+    campaign_id = _blank_to_none(campaign_id)
     if account_id and campaign_id:
         raise ValidationError("Provide only one of account_id or campaign_id.")
     parent_id = campaign_id or _resolve_account_id(account_id)
@@ -298,6 +301,7 @@ async def list_instagram_accounts(
 ) -> dict[str, Any]:
     """Use this before creative creation when the user needs Instagram identities linked to the account."""
     client = get_graph_api_client()
+    account_id = _blank_to_none(account_id)
     params = _page_params(limit, after)
     source_attempts = ["instagram_accounts"]
     try:
