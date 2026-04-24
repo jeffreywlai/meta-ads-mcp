@@ -151,6 +151,29 @@ def test_account_health_snapshot_uses_equal_length_previous_window_for_multi_mon
     assert calls[1] == ("2025-10-03", "2025-12-31")
 
 
+def test_account_health_snapshot_treats_blank_dates_as_default_window(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs):
+        calls.append(kwargs)
+        return {"summary": {"metrics": {"spend": 300.0, "clicks": 10, "impressions": 1000}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.get_account_health_snapshot(
+            account_id="123",
+            since=" ",
+            until=" ",
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["date_preset"] == "last_30d"
+    assert calls[0]["since"] is None
+    assert calls[0]["until"] is None
+    assert result["current_window"] == {"date_preset": "last_30d", "since": None, "until": None}
+
+
 def test_account_snapshot_supports_explicit_since_until(monkeypatch) -> None:
     entity_calls: list[dict[str, object]] = []
     child_calls: list[dict[str, object]] = []

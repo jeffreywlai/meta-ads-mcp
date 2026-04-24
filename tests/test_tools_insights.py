@@ -338,6 +338,26 @@ def test_summarize_actions_can_include_all_totals(monkeypatch) -> None:
     assert result["all_action_totals_included"] is True
 
 
+def test_summarize_actions_treats_blank_dates_as_default_window(monkeypatch) -> None:
+    class BlankDateActionClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["date_preset"] == "last_30d"
+            assert "time_range" not in params
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: BlankDateActionClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            since=" ",
+            until=" ",
+        )
+    )
+
+    assert result["window"] == {"date_preset": "last_30d", "since": None, "until": None}
+
+
 def test_summarize_actions_reports_explicit_window_without_default_preset(monkeypatch) -> None:
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
     result = asyncio.run(

@@ -203,7 +203,7 @@ def _coerce_time_range(
 ) -> tuple[str | None, str | None]:
     """Accept the older get_insights time_range shape without changing the core API."""
     if time_range is None:
-        return since, until
+        return blank_to_none(since), blank_to_none(until)
     if since or until:
         raise ValidationError("Use either time_range or since/until, not both.")
     range_since = blank_to_none(time_range.get("since"))

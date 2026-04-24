@@ -508,6 +508,8 @@ async def get_account_health_snapshot(
 ) -> dict[str, Any]:
     """Use this for one-call account totals with optional previous-window and year-over-year comparisons."""
     resolved_account_id = normalize_account_id(account_id)
+    since = blank_to_none(since)
+    until = blank_to_none(until)
     window = _window_kwargs(date_preset=date_preset, since=since, until=until)
     current = await get_entity_insights(
         level="account",
