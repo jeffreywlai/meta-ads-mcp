@@ -356,6 +356,21 @@ def _platform_rows(rows: list[dict[str, Any]], *, min_spend: float) -> list[dict
     return platform_rows
 
 
+def _unique_campaign_refs(campaigns: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    """Return unique campaign refs by id while preserving input order."""
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for campaign in campaigns:
+        campaign_id = str(campaign.get("id") or "").strip()
+        if not campaign_id or campaign_id in seen:
+            continue
+        seen.add(campaign_id)
+        selected.append(campaign)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def _group_overlap_platforms(campaigns: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Group platform rows shared by more than one campaign."""
     platform_to_campaigns: dict[str, list[dict[str, Any]]] = {}
@@ -568,7 +583,10 @@ async def detect_auction_overlap(
     """Use this for a compact cannibalization or platform-overlap screen across selected campaign ids."""
     resolved_account_id = normalize_account_id(account_id)
     if campaign_ids:
-        selected_campaigns = [{"id": campaign_id, "name": campaign_id} for campaign_id in campaign_ids[:max_campaigns]]
+        selected_campaigns = _unique_campaign_refs(
+            [{"id": campaign_id, "name": campaign_id} for campaign_id in campaign_ids],
+            limit=max_campaigns,
+        )
     else:
         client = get_graph_api_client()
         payload = await client.list_objects(
@@ -577,7 +595,7 @@ async def detect_auction_overlap(
             fields=["id", "name", "effective_status"],
             params={"limit": max_campaigns, "effective_status": ["ACTIVE"]},
         )
-        selected_campaigns = payload.get("data", [])[:max_campaigns]
+        selected_campaigns = _unique_campaign_refs(payload.get("data", []), limit=max_campaigns)
 
     window = _window_kwargs(date_preset=date_preset, since=since, until=until)
 

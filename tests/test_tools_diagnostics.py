@@ -550,3 +550,29 @@ def test_detect_auction_overlap_flags_shared_platform(monkeypatch) -> None:
     assert insight_calls[0]["date_preset"] is None
     assert "actions" not in insight_calls[0]["fields"]
     assert "cost_per_action_type" not in insight_calls[0]["fields"]
+
+
+def test_detect_auction_overlap_deduplicates_campaign_ids(monkeypatch) -> None:
+    insight_object_ids: list[str] = []
+
+    async def fake_get_entity_insights(*, object_id: str, **kwargs):
+        insight_object_ids.append(object_id)
+        return {
+            "items": [
+                {
+                    "publisher_platform": "facebook",
+                    "reach": 1000,
+                    "metrics": {"spend": 50.0, "frequency": 1.5, "cpm": 10.0},
+                }
+            ],
+            "summary": {"metrics": {"spend": 50.0}},
+        }
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.detect_auction_overlap(account_id="123", campaign_ids=["cmp_1", "cmp_1"])
+    )
+    assert insight_object_ids == ["cmp_1"]
+    assert result["campaign_count"] == 1
+    assert result["findings"][0]["type"] == "no_platform_overlap_detected"
+    assert result["overlap_platforms"] == {}
