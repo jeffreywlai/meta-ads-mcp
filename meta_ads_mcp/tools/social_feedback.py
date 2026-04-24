@@ -52,6 +52,14 @@ def _validate_limit(name: str, value: int, *, minimum: int = 1, maximum: int = 1
         raise ValidationError(f"{name} must be between {minimum} and {maximum}.")
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    """Treat blank optional ids as omitted."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _truncate_text(value: Any, max_chars: int) -> tuple[str | None, bool]:
     """Return text bounded for LLM-friendly output."""
     if value is None:
@@ -326,6 +334,9 @@ async def list_ad_comments(
     order: str | None = "reverse_chronological",
 ) -> dict[str, Any]:
     """Use this first for raw Facebook ad comments or Instagram ad comments from an ad id, Page post id, or IG media id."""
+    ad_id = _blank_to_none(ad_id)
+    object_story_id = _blank_to_none(object_story_id)
+    instagram_media_id = _blank_to_none(instagram_media_id)
     provided_ids = [value for value in (ad_id, object_story_id, instagram_media_id) if value]
     if len(provided_ids) != 1:
         raise ValidationError("Provide exactly one of ad_id, object_story_id, or instagram_media_id.")

@@ -195,6 +195,14 @@ def _normalize_date_preset(date_preset: str | None) -> str | None:
     return normalized
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    """Treat blank optional strings as omitted."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _coerce_time_range(
     time_range: dict[str, str] | None,
     *,
@@ -206,11 +214,11 @@ def _coerce_time_range(
         return since, until
     if since or until:
         raise ValidationError("Use either time_range or since/until, not both.")
-    range_since = time_range.get("since")
-    range_until = time_range.get("until")
+    range_since = _blank_to_none(time_range.get("since"))
+    range_until = _blank_to_none(time_range.get("until"))
     if not range_since or not range_until:
         raise ValidationError("time_range must include since and until.")
-    return str(range_since), str(range_until)
+    return range_since, range_until
 
 
 def _action_patterns(action_types: list[str] | None) -> list[str]:

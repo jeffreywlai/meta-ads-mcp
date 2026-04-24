@@ -262,9 +262,13 @@ async def _child_insights(
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     limit: int = 250,
+    max_rows: int = 1000,
 ) -> list[dict[str, Any]]:
     """Fetch child-entity insights rows."""
+    if limit < 1 or max_rows < 1:
+        raise ValidationError("limit and max_rows must be positive.")
     client = get_graph_api_client()
+    page_limit = min(limit, max_rows)
     base_params = _insights_params(
         level=level,
         date_preset=date_preset,
@@ -272,7 +276,7 @@ async def _child_insights(
         until=until,
         breakdowns=breakdowns,
         action_breakdowns=action_breakdowns,
-        limit=limit,
+        limit=page_limit,
     )
     rows: list[dict[str, Any]] = []
     after: str | None = None
@@ -287,6 +291,8 @@ async def _child_insights(
             params=params,
         )
         rows.extend(_normalize_rows(payload))
+        if len(rows) >= max_rows:
+            return rows[:max_rows]
         paging = extract_paging(payload)
         next_after = paging.get("after") if paging.get("next") else None
         if not next_after or next_after in seen_after:

@@ -33,6 +33,25 @@ def test_child_insights_paginates_before_returning_rows(monkeypatch) -> None:
     assert len(calls) == 2
 
 
+def test_child_insights_respects_max_rows_cap(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class PagingInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            calls.append(dict(params))
+            return {
+                "data": [{"campaign_id": f"cmp_{len(calls)}", "spend": "100"}],
+                "paging": {"cursors": {"after": f"cursor_{len(calls) + 1}"}, "next": "next"},
+            }
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: PagingInsightsClient())
+    rows = asyncio.run(diagnostics._child_insights("act_123", level="campaign", limit=2, max_rows=2))
+
+    assert [row["campaign_id"] for row in rows] == ["cmp_1", "cmp_2"]
+    assert [call["limit"] for call in calls] == [2, 2]
+    assert len(calls) == 2
+
+
 def test_account_snapshot_ranks_children(monkeypatch) -> None:
     async def fake_get_entity_insights(**kwargs):
         return {

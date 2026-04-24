@@ -200,6 +200,22 @@ def test_get_insights_alias_accepts_time_range(monkeypatch) -> None:
     assert result["summary"]["metrics"]["spend"] == 100.0
 
 
+def test_get_insights_alias_rejects_blank_time_range_values(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            raise AssertionError("time_range validation should happen before the API call")
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="time_range must include since and until"):
+        asyncio.run(
+            insights.get_insights(
+                level="account",
+                object_id="act_123",
+                time_range={"since": " ", "until": "2026-03-07"},
+            )
+        )
+
+
 def test_summarize_actions_filters_requested_action_types(monkeypatch) -> None:
     class ActionClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):
