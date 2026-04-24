@@ -200,6 +200,25 @@ def test_get_insights_alias_accepts_time_range(monkeypatch) -> None:
     assert result["summary"]["metrics"]["spend"] == 100.0
 
 
+def test_get_insights_alias_ignores_blank_direct_dates_with_time_range(monkeypatch) -> None:
+    class TimeRangeClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["time_range"] == '{"since": "2026-03-01", "until": "2026-03-07"}'
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: TimeRangeClient())
+    result = asyncio.run(
+        insights.get_insights(
+            level="account",
+            object_id="act_123",
+            since=" ",
+            until=" ",
+            time_range={"since": "2026-03-01", "until": "2026-03-07"},
+        )
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
 def test_get_insights_alias_rejects_blank_time_range_values(monkeypatch) -> None:
     class FailIfCalledClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):

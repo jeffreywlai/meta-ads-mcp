@@ -355,6 +355,12 @@ def test_get_ad_feedback_signals_returns_guidance_without_scope() -> None:
     assert "list_ad_comments" in result["recommended_tools"][0]
 
 
+def test_get_ad_feedback_signals_treats_blank_scope_args_as_omitted() -> None:
+    result = asyncio.run(diagnostics.get_ad_feedback_signals(level=" ", account_id=" ", adset_id=" "))
+    assert result["scope"] == {"level": None, "object_id": None}
+    assert result["recommended_tools"]
+
+
 def test_get_ad_feedback_signals_flags_weak_quality(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
 

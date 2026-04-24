@@ -758,6 +758,11 @@ async def get_ad_feedback_signals(
     top_n: int = 10,
 ) -> dict[str, Any]:
     """Use this when the user asks for ad comments, reviews, testimonials, customer feedback, negative feedback, or quality rankings."""
+    level = blank_to_none(level)
+    object_id = blank_to_none(object_id)
+    account_id = blank_to_none(account_id)
+    campaign_id = blank_to_none(campaign_id)
+    adset_id = blank_to_none(adset_id)
     ad_id = blank_to_none(ad_id)
     if not any([level, object_id, account_id, campaign_id, adset_id, ad_id]):
         available_signals = [
