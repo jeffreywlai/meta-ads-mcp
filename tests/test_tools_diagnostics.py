@@ -272,6 +272,8 @@ def test_creative_performance_report_accepts_level_and_object_id(monkeypatch) ->
     assert calls[0]["object_id"] == "cmp_123"
     assert calls[0]["level"] == "ad"
     assert "quality_ranking" in calls[0]["fields"]
+    assert "actions" in calls[0]["fields"]
+    assert "action_values" in calls[0]["fields"]
     assert result["scope"]["object_id"] == "cmp_123"
 
 

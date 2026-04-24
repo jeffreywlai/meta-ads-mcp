@@ -138,6 +138,21 @@ def test_list_ad_comments_direct_story_id_compacts_and_truncates(monkeypatch) ->
     }
 
 
+def test_reply_author_fields_are_requested_when_author_enabled() -> None:
+    facebook_fields = social_feedback._facebook_comment_fields(
+        include_replies=True,
+        reply_limit=3,
+        include_author=True,
+    )
+    instagram_fields = social_feedback._instagram_comment_fields(
+        include_replies=True,
+        reply_limit=3,
+        include_author=True,
+    )
+    assert "comments.limit(3){id,message,created_time,like_count,comment_count,from{name}}" in facebook_fields
+    assert "replies.limit(3){id,text,timestamp,like_count,username}" in instagram_fields
+
+
 def test_list_ad_comments_can_fetch_all_available_ad_surfaces(monkeypatch) -> None:
     client = FakeSocialClient()
     monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)

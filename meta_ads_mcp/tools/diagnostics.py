@@ -65,11 +65,7 @@ QUALITY_RANKING_FIELDS = (
     "conversion_rate_ranking",
 )
 
-AD_QUALITY_FIELDS = [
-    *"ad_id ad_name campaign_id campaign_name adset_id adset_name date_start date_stop".split(),
-    *"spend impressions reach frequency clicks ctr cpc cpm".split(),
-    *QUALITY_RANKING_FIELDS,
-]
+AD_QUALITY_FIELDS = [*DEFAULT_INSIGHTS_FIELDS, *QUALITY_RANKING_FIELDS]
 
 OVERLAP_INSIGHTS_FIELDS = (
     "campaign_id campaign_name publisher_platform spend impressions reach "

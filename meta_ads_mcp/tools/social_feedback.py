@@ -170,7 +170,10 @@ def _facebook_comment_fields(include_replies: bool, reply_limit: int, include_au
     if include_author:
         fields.append("from{name}")
     if include_replies and reply_limit:
-        fields.append(f"comments.limit({reply_limit}){{id,message,created_time,like_count,comment_count}}")
+        reply_fields = ["id", "message", "created_time", "like_count", "comment_count"]
+        if include_author:
+            reply_fields.append("from{name}")
+        fields.append(f"comments.limit({reply_limit}){{{','.join(reply_fields)}}}")
     return fields
 
 
@@ -180,7 +183,10 @@ def _instagram_comment_fields(include_replies: bool, reply_limit: int, include_a
     if include_author:
         fields.append("username")
     if include_replies and reply_limit:
-        fields.append(f"replies.limit({reply_limit}){{id,text,timestamp,like_count}}")
+        reply_fields = ["id", "text", "timestamp", "like_count"]
+        if include_author:
+            reply_fields.append("username")
+        fields.append(f"replies.limit({reply_limit}){{{','.join(reply_fields)}}}")
     return fields
 
 

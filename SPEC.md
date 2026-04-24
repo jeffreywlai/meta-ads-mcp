@@ -607,7 +607,7 @@ Inputs:
 Output:
 
 - compact action totals
-- matched action types
+- matched action types and whether the action filter is `all` or `filtered`
 - summary metrics
 - Meta attribution notice for conversion-source caveats
 

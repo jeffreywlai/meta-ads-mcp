@@ -46,6 +46,10 @@ def test_list_campaigns_uses_account_scope(monkeypatch) -> None:
         "tool": "get_campaign_optimization_snapshot",
         "arguments": {"campaign_id": "cmp_1"},
     }
+    assert result["suggested_next_tools"]["whole_account_health"] == {
+        "tool": "get_account_optimization_snapshot",
+        "arguments": {"account_id": "act_123"},
+    }
     assert result["suggested_next_tools"]["writes_catalog"] == {
         "tool": "list_mutation_tools",
         "arguments": {},

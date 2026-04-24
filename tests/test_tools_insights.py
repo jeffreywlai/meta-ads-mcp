@@ -192,6 +192,8 @@ def test_summarize_actions_filters_requested_action_types(monkeypatch) -> None:
         }
     ]
     assert result["window"]["date_preset"] == "last_7d"
+    assert result["requested_action_types"] == ["appointment"]
+    assert result["action_filter_mode"] == "filtered"
     assert "Snowplow" in result["meta_attribution_notice"]
 
 
@@ -210,6 +212,8 @@ def test_summarize_actions_reports_explicit_window_without_default_preset(monkey
         "since": "2026-03-01",
         "until": "2026-03-07",
     }
+    assert result["requested_action_types"] == []
+    assert result["action_filter_mode"] == "all"
 
 
 def test_compare_performance_ranks_multiple_objects(monkeypatch) -> None:

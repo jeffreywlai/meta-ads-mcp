@@ -114,7 +114,7 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
     return params
 
 
-def _campaign_suggested_next_tools(items: list[dict[str, Any]]) -> dict[str, Any]:
+def _campaign_suggested_next_tools(items: list[dict[str, Any]], account_id: str) -> dict[str, Any]:
     """Return compact routing hints after campaign discovery."""
     campaign_ids = [str(item.get("id")) for item in items[:5] if item.get("id")]
     if not campaign_ids:
@@ -131,7 +131,7 @@ def _campaign_suggested_next_tools(items: list[dict[str, Any]]) -> dict[str, Any
         },
         "whole_account_health": {
             "tool": "get_account_optimization_snapshot",
-            "arguments": {"account_id": "..."},
+            "arguments": {"account_id": account_id},
         },
         "writes_catalog": {"tool": "list_mutation_tools", "arguments": {}},
     }
@@ -167,18 +167,19 @@ async def list_campaigns(
 ) -> dict[str, Any]:
     """Use this to list campaign names and ids so callers can find campaigns by scanning returned names, with optional status filtering."""
     client = get_graph_api_client()
+    resolved_account_id = _resolve_account_id(account_id)
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
     if after:
         params["after"] = after
     payload = await client.list_objects(
-        _resolve_account_id(account_id),
+        resolved_account_id,
         "campaigns",
         fields=CAMPAIGN_FIELDS,
         params=params,
     )
     normalized = normalize_collection(payload)
     normalized["items"] = _normalize_budgets(normalized["items"])
-    suggestions = _campaign_suggested_next_tools(normalized["items"])
+    suggestions = _campaign_suggested_next_tools(normalized["items"], resolved_account_id)
     if suggestions:
         normalized["suggested_next_tools"] = suggestions
     return normalized
