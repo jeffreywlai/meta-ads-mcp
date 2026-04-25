@@ -670,6 +670,16 @@ def test_detect_auction_overlap_deduplicates_campaign_ids(monkeypatch) -> None:
     assert result["overlap_platforms"] == {}
 
 
+def test_detect_auction_overlap_rejects_non_positive_max_campaigns(monkeypatch) -> None:
+    class FailIfCalledClient:
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            raise AssertionError("max_campaigns validation should happen before discovery")
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(diagnostics.ValidationError, match="max_campaigns must be at least 1"):
+        asyncio.run(diagnostics.detect_auction_overlap(account_id="123", max_campaigns=0))
+
+
 def test_detect_auction_overlap_ignores_blank_dates_for_default_window(monkeypatch) -> None:
     insight_calls: list[dict[str, object]] = []
 

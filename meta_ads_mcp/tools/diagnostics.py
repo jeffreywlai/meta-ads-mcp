@@ -386,6 +386,8 @@ def _platform_rows(rows: list[dict[str, Any]], *, min_spend: float) -> list[dict
 
 def _unique_campaign_refs(campaigns: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
     """Return unique campaign refs by id while preserving input order."""
+    if limit < 1:
+        return []
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
     for campaign in campaigns:
@@ -611,6 +613,8 @@ async def detect_auction_overlap(
     min_platform_spend: float = 1.0,
 ) -> dict[str, Any]:
     """Use this for a compact cannibalization or platform-overlap screen across selected campaign ids."""
+    if max_campaigns < 1:
+        raise ValidationError("max_campaigns must be at least 1.")
     resolved_account_id = normalize_account_id(account_id)
     if campaign_ids:
         selected_campaigns = _unique_campaign_refs(

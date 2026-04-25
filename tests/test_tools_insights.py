@@ -377,6 +377,24 @@ def test_summarize_actions_treats_blank_dates_as_default_window(monkeypatch) -> 
     assert result["window"] == {"date_preset": "last_30d", "since": None, "until": None}
 
 
+def test_summarize_actions_rejects_mixed_date_preset_and_dates(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            raise AssertionError("date filter validation should happen before the API call")
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="Use date_preset or since/until"):
+        asyncio.run(
+            insights.summarize_actions(
+                level="account",
+                object_id="act_123",
+                date_preset="last_30d",
+                since="2026-03-01",
+                until="2026-03-07",
+            )
+        )
+
+
 def test_summarize_actions_reports_explicit_window_without_default_preset(monkeypatch) -> None:
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
     result = asyncio.run(
@@ -463,6 +481,39 @@ def test_compare_performance_handles_mixed_success(monkeypatch) -> None:
     assert result["summary"]["successful"] == 1
     assert result["summary"]["failed"] == 1
     assert any(item["object_id"] == "cmp_bad" and "error" in item for item in result["items"])
+
+
+def test_compare_performance_reports_effective_window(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(*, object_id: str, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {
+            "items": [{"campaign_id": object_id, "campaign_name": f"Campaign {object_id}"}],
+            "summary": {"count": 1, "metrics": {"spend": 100.0, "roas": 2.0}},
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    monkeypatch.setattr(insights, "_object_name", lambda object_id: object_id)
+    result = asyncio.run(
+        insights.compare_performance(
+            level="campaign",
+            object_ids=["cmp_1"],
+            date_preset="last_30_days",
+            since=" ",
+            until=" ",
+        )
+    )
+
+    assert calls[0]["date_preset"] == "last_30d"
+    assert calls[0]["since"] is None
+    assert calls[0]["until"] is None
+    assert result["summary"]["window"] == {
+        "date_preset": "last_30d",
+        "since": None,
+        "until": None,
+        "action_types": None,
+    }
 
 
 def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:

@@ -215,6 +215,26 @@ def _coerce_time_range(
     return range_since, range_until
 
 
+def _effective_date_window(
+    date_preset: str | None,
+    since: str | None,
+    until: str | None,
+    *,
+    default_date_preset: str,
+) -> dict[str, str | None]:
+    """Return normalized caller-facing date window metadata."""
+    normalized_date_preset = _normalize_date_preset(date_preset)
+    normalized_since = blank_to_none(since)
+    normalized_until = blank_to_none(until)
+    if normalized_date_preset and (normalized_since or normalized_until):
+        raise ValidationError("Use date_preset or since/until, not both.")
+    return {
+        "date_preset": normalized_date_preset or (default_date_preset if not (normalized_since or normalized_until) else None),
+        "since": normalized_since,
+        "until": normalized_until,
+    }
+
+
 def _action_patterns(action_types: list[str] | None) -> list[str]:
     """Normalize requested action types and expand common aliases."""
     return list(
@@ -642,9 +662,12 @@ async def summarize_actions(
     if max_action_types < 1 or max_action_types > 100:
         raise ValidationError("max_action_types must be between 1 and 100.")
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
-    effective_date_preset = None
-    if not (resolved_since and resolved_until):
-        effective_date_preset = _normalize_date_preset(date_preset) or _normalize_date_preset("last_30d")
+    effective_window = _effective_date_window(
+        date_preset,
+        resolved_since,
+        resolved_until,
+        default_date_preset="last_30d",
+    )
     fields = [
         ID_FIELD_BY_LEVEL.get(level, "campaign_id"),
         NAME_FIELD_BY_LEVEL.get(level, "campaign_name"),
@@ -659,9 +682,9 @@ async def summarize_actions(
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
-        date_preset=effective_date_preset,
-        since=resolved_since,
-        until=resolved_until,
+        date_preset=effective_window["date_preset"],
+        since=effective_window["since"],
+        until=effective_window["until"],
         fields=[field for field in fields if field],
         action_types=action_types,
         breakdowns=breakdowns,
@@ -673,11 +696,7 @@ async def summarize_actions(
     totals = all_totals if include_all_action_totals else all_totals[:max_action_types]
     response: dict[str, Any] = {
         "scope": {"level": level, "object_id": object_id},
-        "window": {
-            "date_preset": effective_date_preset,
-            "since": resolved_since,
-            "until": resolved_until,
-        },
+        "window": effective_window,
         "requested_action_types": action_types or [],
         "action_filter_mode": "filtered" if action_types else "all",
         "action_totals": totals,
@@ -800,14 +819,20 @@ async def compare_performance(
     """Use this when the user wants the same metrics compared across multiple campaigns, ad sets, ads, or accounts."""
     if not object_ids:
         raise ValidationError("Provide at least one object_id.")
+    effective_window = _effective_date_window(
+        date_preset,
+        since,
+        until,
+        default_date_preset="last_7d",
+    )
     comparisons = await asyncio.gather(
         *[
             _comparison_row(
                 level=level,
                 object_id=object_id,
-                date_preset=date_preset,
-                since=since,
-                until=until,
+                date_preset=effective_window["date_preset"],
+                since=effective_window["since"],
+                until=effective_window["until"],
                 fields=fields,
                 breakdowns=breakdowns,
                 action_breakdowns=action_breakdowns,
@@ -831,9 +856,9 @@ async def compare_performance(
             "metrics_compared": metrics_to_rank,
             "rankings": rankings,
             "window": {
-                "date_preset": date_preset,
-                "since": since,
-                "until": until,
+                "date_preset": effective_window["date_preset"],
+                "since": effective_window["since"],
+                "until": effective_window["until"],
                 "action_types": action_types,
             },
         },
