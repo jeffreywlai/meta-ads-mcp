@@ -171,25 +171,33 @@ def _window_kwargs(
     date_preset: str | None = "last_7d",
     since: str | None = None,
     until: str | None = None,
+    default_date_preset: str | None = "last_7d",
 ) -> dict[str, Any]:
     """Build shared date-window kwargs for diagnostics reads."""
     date_preset = blank_to_none(date_preset)
     since = blank_to_none(since)
     until = blank_to_none(until)
+    default_date_preset = blank_to_none(default_date_preset)
     return {
-        "date_preset": None if (since or until) else date_preset,
+        "date_preset": None if (since or until) else date_preset or default_date_preset,
         "since": since,
         "until": until,
     }
 
 
-def _window_descriptor(date_preset: str | None, since: str | None, until: str | None) -> dict[str, Any]:
-    """Return the caller-facing window shape used in analysis extras."""
+def _window_descriptor(
+    date_preset: str | None,
+    since: str | None,
+    until: str | None,
+    default_date_preset: str | None = "last_7d",
+) -> dict[str, Any]:
+    """Return the effective caller-facing window shape used in analysis extras."""
     date_preset = blank_to_none(date_preset)
     since = blank_to_none(since)
     until = blank_to_none(until)
+    default_date_preset = blank_to_none(default_date_preset)
     return {
-        "date_preset": None if (since or until) else date_preset,
+        "date_preset": None if (since or until) else date_preset or default_date_preset,
         "since": since,
         "until": until,
     }

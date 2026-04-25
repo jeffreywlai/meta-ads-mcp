@@ -386,6 +386,20 @@ def test_get_ad_feedback_signals_flags_weak_quality(monkeypatch) -> None:
     assert result["missing_signals"]
 
 
+def test_get_ad_feedback_signals_reports_effective_default_window(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_child_insights(*args, **kwargs):
+        calls.append(kwargs)
+        return [{"ad_id": "ad1", "metrics": {"spend": 100.0}}]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123", date_preset=None))
+
+    assert calls[0]["date_preset"] == "last_7d"
+    assert result["window"] == {"date_preset": "last_7d", "since": None, "until": None}
+
+
 def test_get_ad_feedback_signals_rejects_conflicting_ad_scope_inputs() -> None:
     with pytest.raises(diagnostics.ValidationError):
         asyncio.run(diagnostics.get_ad_feedback_signals(ad_id="ad_1", campaign_id="cmp_123"))
