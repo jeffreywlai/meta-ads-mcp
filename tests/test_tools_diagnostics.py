@@ -151,7 +151,8 @@ def test_account_health_snapshot_uses_equal_length_previous_window_for_multi_mon
     assert calls[1] == ("2025-10-03", "2025-12-31")
 
 
-def test_account_health_snapshot_treats_blank_dates_as_default_window(monkeypatch) -> None:
+@pytest.mark.parametrize("date_preset", [None, " "])
+def test_account_health_snapshot_treats_blank_inputs_as_default_window(monkeypatch, date_preset) -> None:
     calls: list[dict[str, object]] = []
 
     async def fake_get_entity_insights(**kwargs):
@@ -162,6 +163,7 @@ def test_account_health_snapshot_treats_blank_dates_as_default_window(monkeypatc
     result = asyncio.run(
         diagnostics.get_account_health_snapshot(
             account_id="123",
+            date_preset=date_preset,
             since=" ",
             until=" ",
         )
@@ -386,7 +388,8 @@ def test_get_ad_feedback_signals_flags_weak_quality(monkeypatch) -> None:
     assert result["missing_signals"]
 
 
-def test_get_ad_feedback_signals_reports_effective_default_window(monkeypatch) -> None:
+@pytest.mark.parametrize("date_preset", [None, " "])
+def test_get_ad_feedback_signals_reports_effective_default_window(monkeypatch, date_preset) -> None:
     calls: list[dict[str, object]] = []
 
     async def fake_child_insights(*args, **kwargs):
@@ -394,10 +397,10 @@ def test_get_ad_feedback_signals_reports_effective_default_window(monkeypatch) -
         return [{"ad_id": "ad1", "metrics": {"spend": 100.0}}]
 
     monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
-    result = asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123", date_preset=None))
+    result = asyncio.run(diagnostics.get_ad_feedback_signals(campaign_id="cmp_123", date_preset=date_preset))
 
-    assert calls[0]["date_preset"] == "last_7d"
-    assert result["window"] == {"date_preset": "last_7d", "since": None, "until": None}
+    assert calls[0]["date_preset"] == "last_30d"
+    assert result["window"] == {"date_preset": "last_30d", "since": None, "until": None}
 
 
 def test_get_ad_feedback_signals_rejects_conflicting_ad_scope_inputs() -> None:
@@ -694,7 +697,8 @@ def test_detect_auction_overlap_rejects_non_positive_max_campaigns(monkeypatch) 
         asyncio.run(diagnostics.detect_auction_overlap(account_id="123", max_campaigns=0))
 
 
-def test_detect_auction_overlap_ignores_blank_dates_for_default_window(monkeypatch) -> None:
+@pytest.mark.parametrize("date_preset", [None, " "])
+def test_detect_auction_overlap_ignores_blank_inputs_for_default_window(monkeypatch, date_preset) -> None:
     insight_calls: list[dict[str, object]] = []
 
     async def fake_get_entity_insights(*, object_id: str, **kwargs):
@@ -703,7 +707,13 @@ def test_detect_auction_overlap_ignores_blank_dates_for_default_window(monkeypat
 
     monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
     result = asyncio.run(
-        diagnostics.detect_auction_overlap(account_id="123", campaign_ids=["cmp_1"], since=" ", until=" ")
+        diagnostics.detect_auction_overlap(
+            account_id="123",
+            campaign_ids=["cmp_1"],
+            date_preset=date_preset,
+            since=" ",
+            until=" ",
+        )
     )
     assert insight_calls[0]["date_preset"] == "last_30d"
     assert insight_calls[0]["since"] is None

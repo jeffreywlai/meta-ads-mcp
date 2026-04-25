@@ -520,14 +520,26 @@ async def get_account_health_snapshot(
     resolved_account_id = normalize_account_id(account_id)
     since = blank_to_none(since)
     until = blank_to_none(until)
-    window = _window_kwargs(date_preset=date_preset, since=since, until=until)
+    window = _window_kwargs(
+        date_preset=date_preset,
+        since=since,
+        until=until,
+        default_date_preset="last_30d",
+    )
     current = await get_entity_insights(
         level="account",
         object_id=resolved_account_id,
         **window,
     )
     current_metrics = current["summary"]["metrics"]
-    extra: dict[str, Any] = {"current_window": _window_descriptor(date_preset, since, until)}
+    extra: dict[str, Any] = {
+        "current_window": _window_descriptor(
+            date_preset,
+            since,
+            until,
+            default_date_preset="last_30d",
+        )
+    }
 
     if since and until and (include_previous or include_year_over_year):
         since_date = _parse_required_date(since, field="since")
@@ -639,7 +651,12 @@ async def detect_auction_overlap(
         )
         selected_campaigns = _unique_campaign_refs(payload.get("data", []), limit=max_campaigns)
 
-    window = _window_kwargs(date_preset=date_preset, since=since, until=until)
+    window = _window_kwargs(
+        date_preset=date_preset,
+        since=since,
+        until=until,
+        default_date_preset="last_30d",
+    )
 
     async def campaign_summary(campaign: dict[str, Any]) -> dict[str, Any]:
         campaign_id = str(campaign.get("id"))
@@ -675,7 +692,12 @@ async def detect_auction_overlap(
             "campaign_count": len(campaign_summaries),
             "overlap_platforms": overlap_platforms,
             "campaigns": campaign_summaries,
-            "window": _window_descriptor(date_preset, since, until),
+            "window": _window_descriptor(
+                date_preset,
+                since,
+                until,
+                default_date_preset="last_30d",
+            ),
         },
     )
 
@@ -820,7 +842,12 @@ async def get_ad_feedback_signals(
     rows = await _child_insights(
         resolved_object_id,
         level="ad",
-        **_window_kwargs(date_preset=date_preset, since=since, until=until),
+        **_window_kwargs(
+            date_preset=date_preset,
+            since=since,
+            until=until,
+            default_date_preset="last_30d",
+        ),
         fields=AD_QUALITY_FIELDS,
     )
     ranked_by_spend = rank_rows(rows, "spend")[:top_n]
@@ -834,7 +861,12 @@ async def get_ad_feedback_signals(
             "ads_by_spend": ranked_by_spend,
             "weak_quality_ads": weak_rows,
             "quality_fields": list(QUALITY_RANKING_FIELDS),
-            "window": _window_descriptor(date_preset, since, until),
+            "window": _window_descriptor(
+                date_preset,
+                since,
+                until,
+                default_date_preset="last_30d",
+            ),
         },
     )
 
