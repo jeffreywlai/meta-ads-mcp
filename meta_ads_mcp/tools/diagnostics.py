@@ -25,6 +25,7 @@ from meta_ads_mcp.tools.insights import (
     DEFAULT_INSIGHTS_FIELDS,
     _aggregate_metrics,
     _insights_params,
+    _normalize_date_preset,
     _normalize_rows,
     get_entity_insights,
 )
@@ -342,6 +343,27 @@ def _previous_comparable_window(since: date, until: date) -> tuple[date, date]:
     return previous_window(since, until)
 
 
+def _fixed_preset_window(date_preset: str | None) -> tuple[date, date] | None:
+    """Resolve fixed trailing date presets to explicit comparable windows."""
+    preset = blank_to_none(date_preset)
+    if not preset:
+        return None
+    preset = _normalize_date_preset(preset)
+    trailing_days = {
+        "last_3d": 3,
+        "last_7d": 7,
+        "last_14d": 14,
+        "last_28d": 28,
+        "last_30d": 30,
+        "last_90d": 90,
+    }.get(preset)
+    if trailing_days is None:
+        return None
+    current_until = date.today() - timedelta(days=1)
+    current_since = current_until - timedelta(days=trailing_days - 1)
+    return current_since, current_until
+
+
 def _weak_quality_rows(rows: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
     """Return rows with below-average Meta quality ranking fields."""
     return [
@@ -542,20 +564,29 @@ async def get_account_health_snapshot(
         **window,
     )
     current_metrics = current["summary"]["metrics"]
+    current_window = _window_descriptor(
+        date_preset,
+        since,
+        until,
+        default_date_preset="last_30d",
+    )
     extra: dict[str, Any] = {
-        "current_window": _window_descriptor(
-            date_preset,
-            since,
-            until,
-            default_date_preset="last_30d",
-        )
+        "current_window": current_window,
     }
 
-    if since and until and (include_previous or include_year_over_year):
-        since_date = _parse_required_date(since, field="since")
-        until_date = _parse_required_date(until, field="until")
-        if until_date < since_date:
-            raise ValidationError("until must be on or after since.")
+    comparison_window: tuple[date, date] | None = None
+    if include_previous or include_year_over_year:
+        if since and until:
+            since_date = _parse_required_date(since, field="since")
+            until_date = _parse_required_date(until, field="until")
+            if until_date < since_date:
+                raise ValidationError("until must be on or after since.")
+            comparison_window = since_date, until_date
+        else:
+            comparison_window = _fixed_preset_window(current_window["date_preset"])
+
+    if comparison_window:
+        since_date, until_date = comparison_window
         windows: list[tuple[str, date, date]] = []
         if include_previous:
             previous_since, previous_until = _previous_comparable_window(since_date, until_date)
@@ -589,7 +620,7 @@ async def get_account_health_snapshot(
             for (label, _, _), payload in zip(windows, comparison_payloads, strict=True)
         }
     elif include_previous or include_year_over_year:
-        extra["comparison_hint"] = "Provide explicit since and until to include previous-window or year-over-year comparisons."
+        extra["comparison_hint"] = "Use a fixed trailing date_preset or explicit since/until to include previous-window or year-over-year comparisons."
 
     return _snapshot_analysis(
         scope={"level": "account", "object_id": resolved_account_id},

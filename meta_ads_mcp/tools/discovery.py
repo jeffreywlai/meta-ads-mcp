@@ -202,7 +202,7 @@ async def list_adsets(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover ad sets under one account or one campaign."""
+    """Use this to discover ad sets under one account, one campaign, or the default account when omitted."""
     account_id = blank_to_none(account_id)
     campaign_id = blank_to_none(campaign_id)
     if account_id and campaign_id:

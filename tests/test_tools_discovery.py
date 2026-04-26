@@ -182,6 +182,10 @@ def test_list_adsets_uses_default_account_id(monkeypatch) -> None:
     assert result["summary"]["count"] == 1
 
 
+def test_list_adsets_docstring_mentions_default_account() -> None:
+    assert "default account" in (discovery.list_adsets.__doc__ or "")
+
+
 def test_list_ads_uses_default_account_id(monkeypatch) -> None:
     class DefaultAccountClient(FakeDiscoveryClient):
         async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):

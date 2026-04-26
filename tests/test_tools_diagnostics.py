@@ -159,7 +159,13 @@ def test_account_health_snapshot_treats_blank_inputs_as_default_window(monkeypat
         calls.append(kwargs)
         return {"summary": {"metrics": {"spend": 300.0, "clicks": 10, "impressions": 1000}}}
 
+    class FixedDate(diagnostics.date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 4, 1)
+
     monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    monkeypatch.setattr(diagnostics, "date", FixedDate)
     result = asyncio.run(
         diagnostics.get_account_health_snapshot(
             account_id="123",
@@ -169,11 +175,42 @@ def test_account_health_snapshot_treats_blank_inputs_as_default_window(monkeypat
         )
     )
 
-    assert len(calls) == 1
+    assert len(calls) == 3
     assert calls[0]["date_preset"] == "last_30d"
     assert calls[0]["since"] is None
     assert calls[0]["until"] is None
+    assert calls[1]["date_preset"] is None
+    assert calls[1]["since"] == "2026-01-31"
+    assert calls[1]["until"] == "2026-03-01"
+    assert calls[2]["date_preset"] is None
+    assert calls[2]["since"] == "2025-03-02"
+    assert calls[2]["until"] == "2025-03-31"
     assert result["current_window"] == {"date_preset": "last_30d", "since": None, "until": None}
+    assert result["previous_window"] == {"since": "2026-01-31", "until": "2026-03-01"}
+    assert result["year_over_year_window"] == {"since": "2025-03-02", "until": "2025-03-31"}
+    assert "comparisons" in result
+
+
+def test_account_health_snapshot_can_skip_default_comparisons(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs):
+        calls.append(kwargs)
+        return {"summary": {"metrics": {"spend": 300.0, "clicks": 10, "impressions": 1000}}}
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.get_account_health_snapshot(
+            account_id="123",
+            include_previous=False,
+            include_year_over_year=False,
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["date_preset"] == "last_30d"
+    assert result["current_window"] == {"date_preset": "last_30d", "since": None, "until": None}
+    assert "comparisons" not in result
 
 
 def test_account_snapshot_supports_explicit_since_until(monkeypatch) -> None:
