@@ -784,7 +784,7 @@ async def get_creative_performance_report(
     include_quality_rankings: bool = True,
 ) -> dict[str, Any]:
     """Use this when the user wants top and worst ad-level creative performers, including quality rankings when available."""
-    _scope_level, resolved_object_id = _resolve_scope(
+    scope_level, resolved_object_id = _resolve_scope(
         allowed_levels=("account", "campaign", "adset"),
         level=level,
         object_id=object_id,
@@ -802,10 +802,11 @@ async def get_creative_performance_report(
     ranked = rank_rows(rows, "roas")
     summary_metrics = _aggregate_metrics(rows)
     return _snapshot_analysis(
-        scope={"level": "ad", "object_id": resolved_object_id},
+        scope={"level": scope_level, "object_id": resolved_object_id},
         metrics=summary_metrics,
         child_rows=rows,
         extra={
+            "analyzed_level": "ad",
             "top_creatives": ranked[:top_n],
             "worst_creatives": list(reversed(ranked[-top_n:])) if ranked else [],
             "quality_rankings_requested": include_quality_rankings,
@@ -920,7 +921,7 @@ async def get_creative_fatigue_report(
     previous_window_days: int = 7,
 ) -> dict[str, Any]:
     """Use this when the user asks whether ads are fatiguing between a current and previous window. Prefer level/object_id for consistency."""
-    _scope_level, resolved_object_id = _resolve_scope(
+    scope_level, resolved_object_id = _resolve_scope(
         allowed_levels=("campaign", "adset"),
         level=level,
         object_id=object_id,
@@ -999,7 +1000,7 @@ async def get_creative_fatigue_report(
                 )
             )
     return analysis_response(
-        scope={"level": "ad", "object_id": resolved_object_id},
+        scope={"level": scope_level, "object_id": resolved_object_id},
         metrics={},
         findings=findings or [
             build_finding(
@@ -1010,6 +1011,7 @@ async def get_creative_fatigue_report(
             )
         ],
         extra={
+            "analyzed_level": "ad",
             "current_window": current_window,
             "previous_window": previous_window_range,
         },
