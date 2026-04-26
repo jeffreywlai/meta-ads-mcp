@@ -165,7 +165,7 @@ async def list_campaigns(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this first to find campaign by name: list campaigns with names and ids, with optional status filtering."""
+    """Discover campaign names and ids for client-side name lookup by listing campaigns, with optional status filtering."""
     client = get_graph_api_client()
     account_id = blank_to_none(account_id)
     resolved_account_id = _resolve_account_id(account_id)

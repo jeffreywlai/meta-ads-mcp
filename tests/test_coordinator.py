@@ -92,6 +92,8 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
     assert page_reviews.splitlines()[1].startswith("- `list_page_recommendations`")
     assert actions.splitlines()[1].startswith("- `summarize_actions`")
     assert campaign_lookup.splitlines()[1].startswith("- `list_campaigns`")
+    assert "client-side name lookup" in campaign_lookup.splitlines()[1]
+    assert "find campaign by name" not in campaign_lookup.splitlines()[1]
     assert terse_campaigns.splitlines()[1].startswith("- `list_campaigns`")
     assert terse_actions.splitlines()[1].startswith("- `summarize_actions`")
     assert terse_pause.splitlines()[1].startswith("- `set_adset_status`")
