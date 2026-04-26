@@ -687,6 +687,67 @@ def test_detect_auction_overlap_deduplicates_campaign_ids(monkeypatch) -> None:
     assert result["overlap_platforms"] == {}
 
 
+def test_detect_auction_overlap_normalizes_campaign_ids(monkeypatch) -> None:
+    insight_object_ids: list[str] = []
+
+    async def fake_get_entity_insights(*, object_id: str, **kwargs):
+        insight_object_ids.append(object_id)
+        return {
+            "items": [
+                {
+                    "publisher_platform": "facebook",
+                    "reach": 1000,
+                    "metrics": {"spend": 50.0, "frequency": 1.5, "cpm": 10.0},
+                }
+            ],
+            "summary": {"metrics": {"spend": 50.0}},
+        }
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        diagnostics.detect_auction_overlap(account_id="123", campaign_ids=[" cmp_1 ", "cmp_1"])
+    )
+    assert insight_object_ids == ["cmp_1"]
+    assert result["campaigns"][0]["campaign_id"] == "cmp_1"
+    assert result["campaigns"][0]["campaign_name"] == "cmp_1"
+
+
+def test_detect_auction_overlap_returns_insufficient_data_for_empty_campaign_selection(monkeypatch) -> None:
+    class FailIfCalledClient:
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            raise AssertionError("discovery should not run for an explicit empty campaign selection")
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("insights should not be fetched without valid campaigns")
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: FailIfCalledClient())
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fail_if_called)
+    for campaign_ids in ([], [" ", ""]):
+        result = asyncio.run(diagnostics.detect_auction_overlap(account_id="123", campaign_ids=campaign_ids))
+
+        assert result["campaign_count"] == 0
+        assert result["campaigns"] == []
+        assert result["overlap_platforms"] == {}
+        assert result["findings"][0]["type"] == "insufficient_data"
+        assert "no_platform_overlap_detected" not in {finding["type"] for finding in result["findings"]}
+
+
+def test_detect_auction_overlap_returns_insufficient_data_when_discovery_is_empty(monkeypatch) -> None:
+    class EmptyClient:
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            return {"data": []}
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("insights should not be fetched without discovered campaigns")
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: EmptyClient())
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fail_if_called)
+    result = asyncio.run(diagnostics.detect_auction_overlap(account_id="123"))
+
+    assert result["campaign_count"] == 0
+    assert result["findings"][0]["type"] == "insufficient_data"
+
+
 def test_detect_auction_overlap_rejects_non_positive_max_campaigns(monkeypatch) -> None:
     class FailIfCalledClient:
         async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):

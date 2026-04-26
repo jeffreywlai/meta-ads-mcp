@@ -72,6 +72,10 @@ OVERLAP_INSIGHTS_FIELDS = (
     "campaign_id campaign_name spend impressions reach "
     "frequency cpm"
 ).split()
+OVERLAP_MISSING_SIGNALS = [
+    "Publisher-platform overlap is directional; it is not person-level auction overlap.",
+    "Audience overlap requires inspecting targeting and reach context outside this aggregate insights response.",
+]
 
 WEAK_RANKINGS = {"BELOW_AVERAGE_10", "BELOW_AVERAGE_20", "BELOW_AVERAGE_35"}
 FEEDBACK_UNAVAILABLE_SIGNALS = [
@@ -403,7 +407,13 @@ def _unique_campaign_refs(campaigns: list[dict[str, Any]], *, limit: int) -> lis
         if not campaign_id or campaign_id in seen:
             continue
         seen.add(campaign_id)
-        selected.append(campaign)
+        selected.append(
+            {
+                **campaign,
+                "id": campaign_id,
+                "name": blank_to_none(campaign.get("name")) or campaign_id,
+            }
+        )
         if len(selected) >= limit:
             break
     return selected
@@ -636,7 +646,7 @@ async def detect_auction_overlap(
     if max_campaigns < 1:
         raise ValidationError("max_campaigns must be at least 1.")
     resolved_account_id = normalize_account_id(account_id)
-    if campaign_ids:
+    if campaign_ids is not None:
         selected_campaigns = _unique_campaign_refs(
             [{"id": campaign_id, "name": campaign_id} for campaign_id in campaign_ids],
             limit=max_campaigns,
@@ -657,6 +667,34 @@ async def detect_auction_overlap(
         until=until,
         default_date_preset="last_30d",
     )
+    if not selected_campaigns:
+        return analysis_response(
+            scope={"level": "account", "object_id": resolved_account_id},
+            metrics={},
+            findings=[
+                build_finding(
+                    "insufficient_data",
+                    "No valid campaigns were available to analyze for overlap.",
+                    severity="low",
+                    confidence=0.4,
+                    next_actions=[
+                        "Provide at least one valid campaign_id or ensure the account has active campaigns.",
+                    ],
+                )
+            ],
+            missing_signals=OVERLAP_MISSING_SIGNALS,
+            extra={
+                "campaign_count": 0,
+                "overlap_platforms": {},
+                "campaigns": [],
+                "window": _window_descriptor(
+                    date_preset,
+                    since,
+                    until,
+                    default_date_preset="last_30d",
+                ),
+            },
+        )
 
     async def campaign_summary(campaign: dict[str, Any]) -> dict[str, Any]:
         campaign_id = str(campaign.get("id"))
@@ -684,10 +722,7 @@ async def detect_auction_overlap(
         scope={"level": "account", "object_id": resolved_account_id},
         metrics={},
         findings=_overlap_findings(overlap_platforms),
-        missing_signals=[
-            "Publisher-platform overlap is directional; it is not person-level auction overlap.",
-            "Audience overlap requires inspecting targeting and reach context outside this aggregate insights response.",
-        ],
+        missing_signals=OVERLAP_MISSING_SIGNALS,
         extra={
             "campaign_count": len(campaign_summaries),
             "overlap_platforms": overlap_platforms,
