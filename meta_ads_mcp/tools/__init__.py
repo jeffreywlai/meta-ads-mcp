@@ -15,6 +15,7 @@ from . import (
     insights,
     recommendations,
     research,
+    social_feedback,
     targeting,
     utility,
 )
@@ -32,6 +33,7 @@ TOOL_MODULES = (
     insights,
     recommendations,
     research,
+    social_feedback,
     targeting,
     utility,
 )
@@ -50,6 +52,7 @@ __all__ = [
     "insights",
     "recommendations",
     "research",
+    "social_feedback",
     "targeting",
     "utility",
 ]

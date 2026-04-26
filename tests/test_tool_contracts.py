@@ -25,6 +25,7 @@ from meta_ads_mcp.tools import (
     insights,
     recommendations,
     research,
+    social_feedback,
     targeting,
     utility,
 )
@@ -128,6 +129,8 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "create_async_insights_report": {"fields": ["spend", "impressions"]},
     "get_async_insights_report": {"fields": ["spend", "impressions"]},
     "search_ads_archive": {"ad_reached_countries": ["US"]},
+    "list_ad_comments": {"object_story_id": "page_123_post_123"},
+    "list_page_recommendations": {"page_id": "page_123"},
 }
 
 
@@ -244,6 +247,29 @@ class UniversalFakeClient:
             return {"data": [{"id": "rf_123", "status": 1, "daily_impression_curve": []}]}
         if edge == "recommendations":
             return {"data": [{"id": "rec_123", "message": "Increase budget"}]}
+        if edge == "comments":
+            return {
+                "data": [
+                    {
+                        "id": "comment_123",
+                        "message": "Useful comment",
+                        "text": "Useful comment",
+                        "created_time": "2026-03-01T00:00:00+0000",
+                        "timestamp": "2026-03-01T00:00:00+0000",
+                        "like_count": 1,
+                    }
+                ]
+            }
+        if edge == "ratings":
+            return {
+                "data": [
+                    {
+                        "created_time": "2026-03-01T00:00:00+0000",
+                        "review_text": "Useful recommendation",
+                        "recommendation_type": "positive",
+                    }
+                ]
+            }
         if edge == "insights":
             return {"data": [SAMPLE_INSIGHTS_ROW]}
         return {"data": [{"id": f"{edge}_123", "name": f"{edge} item"}]}
@@ -455,6 +481,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         insights,
         recommendations,
         research,
+        social_feedback,
         targeting,
         utility,
     ]:
@@ -575,6 +602,7 @@ def _required_value(param_name: str) -> Any:
         "system_user_id": "sys_123",
         "report_run_id": "rpt_123",
         "owner_id": "act_123",
+        "page_id": "page_123",
         "object_id": "cmp_123",
         "object_ids": ["cmp_123", "cmp_456"],
         "level": "campaign",

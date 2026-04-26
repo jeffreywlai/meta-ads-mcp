@@ -5,7 +5,7 @@
 [![FastMCP 3.1](https://img.shields.io/badge/FastMCP-3.1-green.svg)](https://github.com/jlowin/fastmcp)
 [![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
-**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 79 tools for querying, managing, and optimizing your ad accounts through natural language.**
+**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 88 tools for querying, managing, and optimizing your ad accounts through natural language.**
 
 > Ask Claude or Gemini to "show me which creatives are fatiguing" or "give me an optimization snapshot for this account" — and it just works.
 
@@ -13,16 +13,16 @@
 
 ## ✨ Features
 
-- 📊 **79 Tools** — Discovery, reporting, diagnostics, targeting, research, auth helpers, and controlled writes
+- 📊 **88 Tools** — Discovery, reporting, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, and v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 79 up front
+- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 88 up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (79)
+## 📋 Available Tools (88)
 
 ### 🔍 Discovery
 
@@ -45,8 +45,10 @@
 
 | Tool | Description |
 |------|-------------|
+| `get_insights` | Backward-compatible alias for older insights calls |
 | `get_entity_insights` | Get performance insights for any entity |
 | `get_performance_breakdown` | Break down performance by dimension |
+| `summarize_actions` | Count selected actions without returning full action arrays |
 | `compare_time_ranges` | Compare metrics across two time ranges |
 | `compare_performance` | Compare metrics across multiple entities |
 | `export_insights` | Export insights as CSV or structured data |
@@ -59,6 +61,9 @@
 |------|-------------|
 | `get_account_optimization_snapshot` | Full account health and optimization summary |
 | `get_campaign_optimization_snapshot` | Campaign-level optimization summary |
+| `get_account_health_snapshot` | Account totals with previous-window and YoY comparisons |
+| `detect_auction_overlap` | Directional cannibalization screen across campaigns |
+| `get_ad_feedback_signals` | Feedback availability and quality-ranking signals |
 | `get_budget_pacing_report` | Budget pacing and spend trajectory |
 | `get_creative_performance_report` | Creative performance analysis |
 | `get_creative_fatigue_report` | Detect creative fatigue signals |
@@ -71,6 +76,14 @@
 | `get_audience_opportunities` | Audience and targeting opportunities |
 | `get_delivery_opportunities` | Delivery and reach opportunities |
 | `get_bidding_opportunities` | Bid strategy opportunities |
+
+### 💬 Social Feedback
+
+| Tool | Description |
+|------|-------------|
+| `get_ad_social_context` | Resolve Facebook post and Instagram media ids behind an ad |
+| `list_ad_comments` | Read compact raw Facebook or Instagram comments for an ad or social object |
+| `list_page_recommendations` | Read compact Facebook Page recommendations, reviews, or testimonials |
 
 ### 🎯 Planning & Targeting
 
@@ -147,6 +160,7 @@
 | `get_optimization_playbook` | Optimization best practices playbook |
 | `health_check` | Server health check |
 | `get_capabilities` | List server capabilities |
+| `list_mutation_tools` | List write tools and safety notes |
 
 FastMCP 3.1 also exposes dynamic search tools at runtime:
 
@@ -174,6 +188,7 @@ These let the LLM discover the right tool on demand instead of loading the full 
 - Python 3.12+
 - [`uv`](https://github.com/astral-sh/uv) (recommended) or `pipx`
 - A Meta access token with the scopes needed for the tools you want to use
+- Social feedback tools also need Page or Instagram permissions, such as `pages_read_user_content` for Page comments/recommendations and the relevant Instagram comment permissions for IG media comments
 
 ### 1. Get Your Credentials
 
@@ -335,6 +350,7 @@ meta-ads-mcp/
 │   │   ├── insights.py        # Reporting & analysis
 │   │   ├── recommendations.py # AI recommendations
 │   │   ├── research.py        # Ad Library research
+│   │   ├── social_feedback.py # Comments & Page recommendations
 │   │   ├── targeting.py       # Targeting & planning
 │   │   └── utility.py         # Health check & capabilities
 │   └── context/               # Embedded docs & playbooks

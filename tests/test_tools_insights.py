@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import insights
 
 
@@ -82,6 +81,23 @@ def test_get_entity_insights_rejects_invalid_date_combinations(monkeypatch) -> N
         )
 
 
+def test_get_entity_insights_rejects_reversed_date_window_before_api(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            raise AssertionError("date window validation should happen before the API call")
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="until must be on or after since"):
+        asyncio.run(
+            insights.get_entity_insights(
+                level="account",
+                object_id="act_123",
+                since="2026-03-07",
+                until="2026-03-01",
+            )
+        )
+
+
 def test_get_entity_insights_accepts_since_until_without_explicit_date_preset(monkeypatch) -> None:
     class DateRangeClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):
@@ -99,6 +115,24 @@ def test_get_entity_insights_accepts_since_until_without_explicit_date_preset(mo
         )
     )
     assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_entity_insights_action_filter_adds_required_fields(monkeypatch) -> None:
+    class ActionFieldClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert fields == ["campaign_id", "spend", "impressions", "clicks", "actions", "action_values"]
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ActionFieldClient())
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            fields=["campaign_id"],
+            action_types=["purchase"],
+        )
+    )
+    assert result["summary"]["action_filter"]["matched"] == ["purchase"]
 
 
 def test_get_entity_insights_treats_blank_date_inputs_as_missing(monkeypatch) -> None:
@@ -120,13 +154,13 @@ def test_get_entity_insights_treats_blank_date_inputs_as_missing(monkeypatch) ->
     assert result["summary"]["metrics"]["spend"] == 100.0
 
 
-def test_get_entity_insights_surfaces_meta_validation_errors(monkeypatch) -> None:
-    class InvalidPresetClient(FakeInsightsClient):
+def test_get_entity_insights_rejects_unknown_date_preset_before_api(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):
-            raise MetaApiError(message="Invalid date_preset value.", status_code=400, code=100)
+            raise AssertionError("date preset validation should happen before the API call")
 
-    monkeypatch.setattr(insights, "get_graph_api_client", lambda: InvalidPresetClient())
-    with pytest.raises(MetaApiError, match="Invalid date_preset value"):
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="Supported values"):
         asyncio.run(
             insights.get_entity_insights(
                 level="account",
@@ -134,6 +168,250 @@ def test_get_entity_insights_surfaces_meta_validation_errors(monkeypatch) -> Non
                 date_preset="this_week_mon_sun",
             )
         )
+
+
+def test_get_entity_insights_translates_lifetime_date_alias(monkeypatch) -> None:
+    class LifetimeAliasClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["date_preset"] == "maximum"
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: LifetimeAliasClient())
+    result = asyncio.run(
+        insights.get_entity_insights(level="account", object_id="act_123", date_preset="lifetime")
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_insights_alias_accepts_time_range(monkeypatch) -> None:
+    class TimeRangeClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["time_range"] == '{"since": "2026-03-01", "until": "2026-03-07"}'
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: TimeRangeClient())
+    result = asyncio.run(
+        insights.get_insights(
+            level="account",
+            object_id="act_123",
+            time_range={"since": "2026-03-01", "until": "2026-03-07"},
+        )
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_insights_alias_ignores_blank_direct_dates_with_time_range(monkeypatch) -> None:
+    class TimeRangeClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["time_range"] == '{"since": "2026-03-01", "until": "2026-03-07"}'
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: TimeRangeClient())
+    result = asyncio.run(
+        insights.get_insights(
+            level="account",
+            object_id="act_123",
+            since=" ",
+            until=" ",
+            time_range={"since": "2026-03-01", "until": "2026-03-07"},
+        )
+    )
+    assert result["summary"]["metrics"]["spend"] == 100.0
+
+
+def test_get_insights_alias_rejects_blank_time_range_values(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            raise AssertionError("time_range validation should happen before the API call")
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="time_range must include since and until"):
+        asyncio.run(
+            insights.get_insights(
+                level="account",
+                object_id="act_123",
+                time_range={"since": " ", "until": "2026-03-07"},
+            )
+        )
+
+
+def test_summarize_actions_filters_requested_action_types(monkeypatch) -> None:
+    class ActionClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["date_preset"] == "last_30d"
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"].append({"action_type": "onsite_conversion.schedule_appointment", "value": "3"})
+            payload["data"][0]["action_values"].append(
+                {"action_type": "onsite_conversion.schedule_appointment", "value": "0"}
+            )
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ActionClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            action_types=["appointment"],
+        )
+    )
+    assert result["action_totals"] == [
+        {
+            "action_type": "onsite_conversion.schedule_appointment",
+            "count": 3.0,
+            "value": 0.0,
+            "cost_per_action": 100.0 / 3.0,
+        }
+    ]
+    assert result["window"]["date_preset"] == "last_30d"
+    assert result["requested_action_types"] == ["appointment"]
+    assert result["action_filter_mode"] == "filtered"
+    assert "Snowplow" in result["meta_attribution_notice"]
+
+
+def test_summarize_actions_matches_pixel_purchase_alias(monkeypatch) -> None:
+    class PixelPurchaseClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"] = [{"action_type": "offsite_conversion.fb_pixel_purchase", "value": "2"}]
+            payload["data"][0]["action_values"] = [
+                {"action_type": "offsite_conversion.fb_pixel_purchase", "value": "250"}
+            ]
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PixelPurchaseClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            action_types=["purchase"],
+        )
+    )
+
+    assert result["action_totals"] == [
+        {
+            "action_type": "offsite_conversion.fb_pixel_purchase",
+            "count": 2.0,
+            "value": 250.0,
+            "cost_per_action": 50.0,
+        }
+    ]
+    assert result["summary_metrics"]["roas"] == 2.5
+
+
+def test_summarize_actions_caps_totals_by_default(monkeypatch) -> None:
+    class ManyActionsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"] = [
+                {"action_type": f"custom_{idx}", "value": str(30 - idx)}
+                for idx in range(30)
+            ]
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ManyActionsClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            max_action_types=5,
+        )
+    )
+
+    assert [item["action_type"] for item in result["action_totals"]] == [
+        "custom_0",
+        "custom_1",
+        "custom_2",
+        "custom_3",
+        "custom_4",
+    ]
+    assert result["action_totals_summary"] == {
+        "returned": 5,
+        "total_action_types": 30,
+        "truncated": True,
+        "max_action_types": 5,
+    }
+
+
+def test_summarize_actions_can_include_all_totals(monkeypatch) -> None:
+    class ManyActionsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["actions"] = [
+                {"action_type": f"custom_{idx}", "value": "1"}
+                for idx in range(30)
+            ]
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ManyActionsClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            max_action_types=5,
+            include_all_action_totals=True,
+        )
+    )
+
+    assert len(result["action_totals"]) == 30
+    assert result["action_totals_summary"]["truncated"] is False
+    assert result["all_action_totals_included"] is True
+
+
+def test_summarize_actions_treats_blank_dates_as_default_window(monkeypatch) -> None:
+    class BlankDateActionClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["date_preset"] == "last_30d"
+            assert "time_range" not in params
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: BlankDateActionClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            since=" ",
+            until=" ",
+        )
+    )
+
+    assert result["window"] == {"date_preset": "last_30d", "since": None, "until": None}
+
+
+def test_summarize_actions_rejects_mixed_date_preset_and_dates(monkeypatch) -> None:
+    class FailIfCalledClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            raise AssertionError("date filter validation should happen before the API call")
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+    with pytest.raises(insights.ValidationError, match="Use date_preset or since/until"):
+        asyncio.run(
+            insights.summarize_actions(
+                level="account",
+                object_id="act_123",
+                date_preset="last_30d",
+                since="2026-03-01",
+                until="2026-03-07",
+            )
+        )
+
+
+def test_summarize_actions_reports_explicit_window_without_default_preset(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            since="2026-03-01",
+            until="2026-03-07",
+        )
+    )
+    assert result["window"] == {
+        "date_preset": None,
+        "since": "2026-03-01",
+        "until": "2026-03-07",
+    }
+    assert result["requested_action_types"] == []
+    assert result["action_filter_mode"] == "all"
 
 
 def test_compare_performance_ranks_multiple_objects(monkeypatch) -> None:
@@ -203,6 +481,39 @@ def test_compare_performance_handles_mixed_success(monkeypatch) -> None:
     assert result["summary"]["successful"] == 1
     assert result["summary"]["failed"] == 1
     assert any(item["object_id"] == "cmp_bad" and "error" in item for item in result["items"])
+
+
+def test_compare_performance_reports_effective_window(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(*, object_id: str, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {
+            "items": [{"campaign_id": object_id, "campaign_name": f"Campaign {object_id}"}],
+            "summary": {"count": 1, "metrics": {"spend": 100.0, "roas": 2.0}},
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    monkeypatch.setattr(insights, "_object_name", lambda object_id: object_id)
+    result = asyncio.run(
+        insights.compare_performance(
+            level="campaign",
+            object_ids=["cmp_1"],
+            date_preset="last_30_days",
+            since=" ",
+            until=" ",
+        )
+    )
+
+    assert calls[0]["date_preset"] == "last_30d"
+    assert calls[0]["since"] is None
+    assert calls[0]["until"] is None
+    assert result["summary"]["window"] == {
+        "date_preset": "last_30d",
+        "since": None,
+        "until": None,
+        "action_types": None,
+    }
 
 
 def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:
@@ -347,6 +658,40 @@ def test_export_insights_supports_json_and_csv(monkeypatch) -> None:
     assert "campaign_id" in csv_result["data"]
 
 
+def test_export_insights_reports_effective_window(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"items": [], "summary": {"count": 0, "metrics": {}}}
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        insights.export_insights(
+            level="campaign",
+            object_id="cmp_1",
+            date_preset="last_30_days",
+            since=" ",
+            until=" ",
+        )
+    )
+
+    assert calls[0]["date_preset"] == "last_30d"
+    assert calls[0]["since"] is None
+    assert calls[0]["until"] is None
+    assert result["query"]["date_preset"] == "last_30d"
+    assert result["query"]["requested_window"] == {
+        "date_preset": "last_30_days",
+        "since": " ",
+        "until": " ",
+    }
+    assert result["query"]["effective_window"] == {
+        "date_preset": "last_30d",
+        "since": None,
+        "until": None,
+    }
+
+
 def test_export_insights_truncates_large_inline_payloads_by_default(monkeypatch) -> None:
     async def fake_get_entity_insights(**_: object) -> dict[str, object]:
         items = [{"campaign_id": f"cmp_{index}", "metrics": {"spend": float(index)}} for index in range(150)]
@@ -486,6 +831,23 @@ def test_create_async_insights_report_accepts_since_until_without_explicit_date_
         )
     )
     assert result["report_run_id"] == "rpt_created"
+
+
+def test_create_async_insights_report_rejects_reversed_date_window(monkeypatch) -> None:
+    monkeypatch.setattr(
+        insights,
+        "get_graph_api_client",
+        lambda: FakeAsyncInsightsClient({"report_run_id": "rpt_created", "async_status": "Job Running"}),
+    )
+    with pytest.raises(insights.ValidationError, match="until must be on or after since"):
+        asyncio.run(
+            insights.create_async_insights_report(
+                level="campaign",
+                object_id="cmp_1",
+                since="2026-03-07",
+                until="2026-03-01",
+            )
+        )
 
 
 def test_get_async_insights_report_handles_in_progress_state(monkeypatch) -> None:

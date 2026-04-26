@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
+
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import ALWAYS_VISIBLE_TOOLS
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 
 TOOL_GROUPS = {
@@ -24,8 +25,10 @@ TOOL_GROUPS = {
         "list_creatives",
     ],
     "analysis": [
+        "get_insights",
         "get_entity_insights",
         "get_performance_breakdown",
+        "summarize_actions",
         "compare_time_ranges",
         "compare_performance",
         "export_insights",
@@ -35,6 +38,9 @@ TOOL_GROUPS = {
     "optimization": [
         "get_account_optimization_snapshot",
         "get_campaign_optimization_snapshot",
+        "get_account_health_snapshot",
+        "detect_auction_overlap",
+        "get_ad_feedback_signals",
         "get_budget_pacing_report",
         "get_creative_performance_report",
         "get_creative_fatigue_report",
@@ -47,6 +53,11 @@ TOOL_GROUPS = {
         "get_audience_opportunities",
         "get_delivery_opportunities",
         "get_bidding_opportunities",
+    ],
+    "social_feedback": [
+        "get_ad_social_context",
+        "list_ad_comments",
+        "list_page_recommendations",
     ],
     "planning": [
         "search_interests",
@@ -107,6 +118,7 @@ TOOL_GROUPS = {
     "utility": [
         "health_check",
         "get_capabilities",
+        "list_mutation_tools",
     ],
 }
 
@@ -140,9 +152,12 @@ INTENT_GUIDE = {
     },
     "inspect_single_entity_performance": {
         "description": "Inspect performance for one account, campaign, ad set, or ad.",
-        "recommended_order": ["get_entity_insights", "get_performance_breakdown"],
+        "recommended_order": ["get_entity_insights", "get_performance_breakdown", "summarize_actions"],
         "avoid_unless_needed": ["export_insights"],
-        "notes": ["Use export_insights only when the user explicitly wants raw rows or CSV output."],
+        "notes": [
+            "Use summarize_actions for appointments, purchases, leads, or other action counts.",
+            "Use export_insights only when the user explicitly wants raw rows or CSV output.",
+        ],
     },
     "compare_multiple_entities": {
         "description": "Rank multiple campaigns, ad sets, or ads across the same window.",
@@ -167,6 +182,8 @@ INTENT_GUIDE = {
         "recommended_order": [
             "get_account_optimization_snapshot",
             "get_campaign_optimization_snapshot",
+            "get_account_health_snapshot",
+            "detect_auction_overlap",
             "get_recommendations",
             "get_budget_pacing_report",
             "get_creative_fatigue_report",
@@ -182,6 +199,27 @@ INTENT_GUIDE = {
         "notes": [
             "Call get_recommendations once for a broad Meta-native opportunity scan.",
             "Use typed opportunity tools only when the user asks for one category specifically.",
+        ],
+    },
+    "read_ad_comments_or_quality_signals": {
+        "description": (
+            "Handle asks for ad comments, reviews, testimonials, customer feedback, negative feedback, "
+            "or quality rankings."
+        ),
+        "recommended_order": [
+            "list_ad_comments",
+            "list_page_recommendations",
+            "get_ad_social_context",
+            "get_ad_feedback_signals",
+            "get_creative_performance_report",
+            "get_creative_fatigue_report",
+        ],
+        "avoid_unless_needed": ["get_entity_insights"],
+        "notes": [
+            "Use list_ad_comments when the user provides an ad id, object_story_id, or Instagram media id.",
+            "Use list_page_recommendations for Facebook Page reviews or testimonials.",
+            "Customer feedback score and negative-feedback counts are still not exposed as stable public Marketing API fields.",
+            "Use get_ad_feedback_signals for Meta ad-quality ranking fields when comments are not enough.",
         ],
     },
     "plan_targeting_or_audiences": {
@@ -245,6 +283,103 @@ ROUTING_HINTS = {
     intent: list(route["recommended_order"]) + list(route["avoid_unless_needed"])
     for intent, route in INTENT_GUIDE.items()
 }
+
+INTENT_SEARCH_SYNONYMS = {
+    "comments": "feedback reviews testimonials quality ranking negative feedback",
+    "comment": "feedback reviews testimonials quality ranking negative feedback",
+    "review": "feedback comments testimonials quality ranking negative feedback",
+    "reviews": "feedback comments testimonials quality ranking negative feedback",
+    "testimonial": "feedback comments reviews quality ranking",
+    "testimonials": "feedback comments reviews quality ranking",
+    "customer": "feedback score reviews comments quality ranking",
+    "score": "customer feedback quality ranking",
+    "appointment": "actions conversions summarize_actions",
+    "appointments": "actions conversions summarize_actions",
+    "pause": "writes status mutation set_status",
+    "budget": "writes budget mutation",
+    "create": "writes mutation create",
+}
+
+
+def _search_tokens(text: str) -> set[str]:
+    """Tokenize routing text for tiny local fuzzy matching."""
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9_]+", text.lower()):
+        tokens.add(token)
+        tokens.update(part for part in token.split("_") if part)
+        if token.endswith("s") and len(token) > 3:
+            tokens.add(token[:-1])
+        if token in {"adset", "adsets"}:
+            tokens.update({"ad", "set", "ad_set"})
+    return tokens
+
+
+def _closest_intents(query: str, limit: int = 3) -> list[dict[str, object]]:
+    """Return best-effort intent matches instead of failing on free text."""
+    expanded_query = " ".join([query, *(INTENT_SEARCH_SYNONYMS.get(token, "") for token in _search_tokens(query))])
+    query_tokens = _search_tokens(expanded_query)
+    matches: list[tuple[float, str, dict[str, object]]] = []
+    for intent, route in INTENT_GUIDE.items():
+        route_parts = [
+            intent,
+            route.get("description", ""),
+            *route.get("recommended_order", []),
+            *route.get("avoid_unless_needed", []),
+            *route.get("notes", []),
+        ]
+        route_text = " ".join(map(str, route_parts))
+        route_tokens = _search_tokens(route_text)
+        overlap = query_tokens & route_tokens
+        score = float(len(overlap))
+        if intent == "discover_accounts_or_ids" and query_tokens & {
+            "account",
+            "accounts",
+            "campaign",
+            "campaigns",
+            "adset",
+            "adsets",
+            "ad",
+            "ads",
+        }:
+            score += 2.0
+        if intent == "writes_after_confirmation" and query_tokens & {
+            "pause",
+            "resume",
+            "enable",
+            "disable",
+            "status",
+            "budget",
+            "bid",
+            "create",
+            "update",
+            "delete",
+        }:
+            score += 3.0
+        if intent == "inspect_single_entity_performance" and query_tokens & {
+            "appointment",
+            "appointments",
+            "purchase",
+            "purchases",
+            "lead",
+            "leads",
+            "conversion",
+            "conversions",
+        }:
+            score += 2.0
+        if query.lower() in route_text.lower():
+            score += 3.0
+        if score > 0:
+            matches.append((score, intent, route))
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "intent": intent,
+            "score": score,
+            "description": route["description"],
+            "recommended_order": route["recommended_order"],
+        }
+        for score, intent, route in matches[:limit]
+    ]
 
 
 def tool_routing_markdown() -> str:
@@ -344,9 +479,19 @@ async def get_capabilities(
     if intent is not None:
         route = INTENT_GUIDE.get(intent)
         if route is None:
-            raise ValidationError(
-                f"Unknown intent '{intent}'. Valid intents: {', '.join(sorted(INTENT_GUIDE))}."
-            )
+            closest = _closest_intents(intent)
+            return {
+                "server": _server_metadata(),
+                "unmatched_intent": intent,
+                "closest_intents": closest,
+                "suggested_search": {"tool": "search_tools", "arguments": {"query": intent}},
+                "resources": RESOURCE_URIS,
+                "valid_intents": sorted(INTENT_GUIDE),
+                "notes": [
+                    "No exact intent key matched, so this response returns fuzzy routing candidates.",
+                    "Use the top closest_intents entry when it fits, or search_tools with the original query.",
+                ],
+            }
         return {
             "server": _server_metadata(),
             "selected_intent": {
@@ -380,6 +525,9 @@ async def get_capabilities(
         "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
         "Use list_instagram_accounts when creative setup requires an Instagram identity rather than a Facebook Page.",
         "Use get_recommendations once for a broad Meta-native opportunity scan, and use typed opportunity tools only for category-specific follow-up.",
+        "Use summarize_actions for appointment, lead, purchase, or custom action counts instead of returning full actions arrays.",
+        "Use list_ad_comments for raw ad comments and list_page_recommendations for Page reviews; customer feedback score is not exposed as a stable public Marketing API field.",
+        "Use list_mutation_tools when the user asks what the MCP can change.",
         "search_ads_archive is public research data and does not depend on an ad account id, but the app still needs Ads Library API access.",
         "Write operations still depend on the token having ads_management-level permissions.",
     ]
@@ -407,4 +555,26 @@ async def get_capabilities(
         },
         "resources": RESOURCE_URIS,
         "notes": notes,
+    }
+
+
+@mcp_server.tool()
+async def list_mutation_tools() -> dict[str, object]:
+    """Use this when the user asks what Meta Ads state this MCP can create, pause, update, or delete."""
+    return {
+        "tool_group": "writes",
+        "count": len(TOOL_GROUPS["writes"]),
+        "tools": TOOL_GROUPS["writes"],
+        "common_paths": {
+            "pause_or_enable": ["set_campaign_status", "set_adset_status", "set_ad_status"],
+            "budget_changes": ["update_campaign_budget", "update_adset_budget"],
+            "bid_changes": ["update_campaign_bid_strategy", "update_adset_bid_strategy", "update_adset_bid_amount"],
+            "creation": ["create_campaign", "create_ad_set", "create_ad", "create_ad_creative"],
+            "audiences": ["create_custom_audience", "create_lookalike_audience", "update_custom_audience", "delete_audience"],
+        },
+        "safety_notes": [
+            "Ask for explicit confirmation before spend-affecting changes.",
+            "Read current state first with discovery or diagnostics tools.",
+            "Token must have ads_management-level permissions.",
+        ],
     }
