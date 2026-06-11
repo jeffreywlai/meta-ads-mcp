@@ -14,6 +14,7 @@ from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.tools import (
+    activity,
     ads,
     audiences,
     auth_tools,
@@ -131,6 +132,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "search_ads_archive": {"ad_reached_countries": ["US"]},
     "list_ad_comments": {"object_story_id": "page_123_post_123"},
     "list_page_recommendations": {"page_id": "page_123"},
+    "list_change_history": {"account_id": "123"},
 }
 
 
@@ -257,6 +259,22 @@ class UniversalFakeClient:
                         "created_time": "2026-03-01T00:00:00+0000",
                         "timestamp": "2026-03-01T00:00:00+0000",
                         "like_count": 1,
+                    }
+                ]
+            }
+        if edge == "activities":
+            return {
+                "data": [
+                    {
+                        "actor_name": "Test User",
+                        "application_name": "Meta Ads Manager",
+                        "event_time": "1770000000",
+                        "event_type": "update_campaign_budget",
+                        "extra_data": '{"old_value":"50","new_value":"75"}',
+                        "object_id": parent_id,
+                        "object_name": "Object 123",
+                        "object_type": "campaign",
+                        "translated_event_type": "Updated campaign budget",
                     }
                 ]
             }
@@ -470,6 +488,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
     """Patch all client factories to return a single fake client."""
     client = UniversalFakeClient()
     for module in [
+        activity,
         ads,
         audiences,
         auth_tools,

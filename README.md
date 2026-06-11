@@ -5,7 +5,7 @@
 [![FastMCP 3.1](https://img.shields.io/badge/FastMCP-3.1-green.svg)](https://github.com/jlowin/fastmcp)
 [![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
-**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 88 tools for querying, managing, and optimizing your ad accounts through natural language.**
+**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 89 tools for querying, managing, and optimizing your ad accounts through natural language.**
 
 > Ask Claude or Gemini to "show me which creatives are fatiguing" or "give me an optimization snapshot for this account" — and it just works.
 
@@ -13,16 +13,16 @@
 
 ## ✨ Features
 
-- 📊 **88 Tools** — Discovery, reporting, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **89 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, and v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 88 up front
+- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 89 up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (88)
+## 📋 Available Tools (89)
 
 ### 🔍 Discovery
 
@@ -84,6 +84,12 @@
 | `get_ad_social_context` | Resolve Facebook post and Instagram media ids behind an ad |
 | `list_ad_comments` | Read compact raw Facebook or Instagram comments for an ad or social object |
 | `list_page_recommendations` | Read compact Facebook Page recommendations, reviews, or testimonials |
+
+### 🧾 Activity History
+
+| Tool | Description |
+|------|-------------|
+| `list_change_history` | Read Meta Ads activity logs for account, campaign, ad set, or ad changes with documented time, category, business, and actor filters |
 
 ### 🎯 Planning & Targeting
 
@@ -339,6 +345,7 @@ meta-ads-mcp/
 │   ├── schemas.py             # Pydantic schemas
 │   ├── tools/
 │   │   ├── ads.py             # Ad management
+│   │   ├── activity.py        # Activity and change-history reads
 │   │   ├── audiences.py       # Audience management
 │   │   ├── auth_tools.py      # Auth helper tools
 │   │   ├── campaigns.py       # Campaign & ad set management

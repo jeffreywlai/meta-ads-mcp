@@ -392,14 +392,18 @@ These are the core v1 tools.
 - `list_page_recommendations`
 - `get_ad_feedback_signals`
 
-### Group D: Audience and Planning
+### Group D: Activity History
+
+- `list_change_history`
+
+### Group E: Audience and Planning
 
 - `search_interests`
 - `search_geo_locations`
 - `estimate_audience_size`
 - `get_reach_frequency_predictions`
 
-### Group E: Recommendations and Docs
+### Group F: Recommendations and Docs
 
 - `get_recommendations`
 - `get_metrics_reference`
@@ -407,7 +411,7 @@ These are the core v1 tools.
 - `get_v25_notes`
 - `get_optimization_playbook`
 
-### Group F: Controlled Execution
+### Group G: Controlled Execution
 
 These are deliberately narrow and should be secondary to analysis tools.
 
@@ -540,6 +544,35 @@ Inputs:
 
 - `ad_id`
 - `include_creative_summary`
+
+## Activity History Tools
+
+### `list_change_history`
+
+Purpose:
+Read Meta Ads activity logs / changelog rows for an account, campaign, ad set,
+or ad.
+
+Inputs:
+
+- `level`: optional generic scope of `account`, `campaign`, `adset`, or `ad`
+- `object_id`: optional generic object id when `level` is provided
+- `account_id`, `campaign_id`, `adset_id`, or `ad_id`
+- `since` and `until`: optional datetime filters; Meta defaults to the prior
+  7 days through now when omitted
+- `category`
+- `business_id`
+- `uid`: optional actor/user id filter
+- `fields`
+- `limit`
+- `after`
+
+Output:
+
+- activity rows from the Meta `activities` edge
+- parsed `extra_data_parsed` when `extra_data` is JSON encoded
+- paging cursors
+- scope, date-window, and filter summary
 
 ## Core Analysis Tools
 

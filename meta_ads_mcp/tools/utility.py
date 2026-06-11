@@ -35,6 +35,9 @@ TOOL_GROUPS = {
         "create_async_insights_report",
         "get_async_insights_report",
     ],
+    "activity": [
+        "list_change_history",
+    ],
     "optimization": [
         "get_account_optimization_snapshot",
         "get_campaign_optimization_snapshot",
@@ -171,6 +174,17 @@ INTENT_GUIDE = {
         "avoid_unless_needed": ["export_insights"],
         "notes": ["Use this before asking for diagnostics when the question is purely time-window comparison."],
     },
+    "read_change_history": {
+        "description": "Read account, campaign, ad set, or ad activity logs, changelogs, audit logs, and change history.",
+        "recommended_order": ["list_change_history"],
+        "avoid_unless_needed": ["get_insights"],
+        "notes": [
+            "Use this when the user asks who changed budgets, statuses, bids, names, targeting, or other settings.",
+            "Meta returns one week of activity by default when since/until are omitted.",
+            "Pass business_id when Meta requires it for ad accounts connected to a Business Manager.",
+            "Use uid to filter to changes made by a specific Meta user.",
+        ],
+    },
     "export_reporting_data": {
         "description": "Return raw or file-like reporting output instead of summary analysis.",
         "recommended_order": ["export_insights", "create_async_insights_report", "get_async_insights_report"],
@@ -298,6 +312,13 @@ INTENT_SEARCH_SYNONYMS = {
     "pause": "writes status mutation set_status",
     "budget": "writes budget mutation",
     "create": "writes mutation create",
+    "change": "activity changelog audit log history",
+    "changes": "activity changelog audit log history",
+    "changed": "activity changelog audit log history",
+    "changelog": "activity changes audit log history",
+    "history": "activity changes changelog audit log",
+    "audit": "activity changes changelog history",
+    "log": "activity changes changelog history",
 }
 
 
@@ -527,6 +548,7 @@ async def get_capabilities(
         "Use get_recommendations once for a broad Meta-native opportunity scan, and use typed opportunity tools only for category-specific follow-up.",
         "Use summarize_actions for appointment, lead, purchase, or custom action counts instead of returning full actions arrays.",
         "Use list_ad_comments for raw ad comments and list_page_recommendations for Page reviews; customer feedback score is not exposed as a stable public Marketing API field.",
+        "Use list_change_history for Meta Ads activity logs, changelogs, or audits of campaign, ad set, and ad changes.",
         "Use list_mutation_tools when the user asks what the MCP can change.",
         "search_ads_archive is public research data and does not depend on an ad account id, but the app still needs Ads Library API access.",
         "Write operations still depend on the token having ads_management-level permissions.",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import (
+    activity,
     ads,
     audiences,
     auth_tools,
@@ -21,6 +22,7 @@ from . import (
 )
 
 TOOL_MODULES = (
+    activity,
     ads,
     audiences,
     auth_tools,
@@ -40,6 +42,7 @@ TOOL_MODULES = (
 
 __all__ = [
     "TOOL_MODULES",
+    "activity",
     "ads",
     "audiences",
     "auth_tools",
