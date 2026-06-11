@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 
 from meta_ads_mcp import stdio  # noqa: F401 - ensures tools are registered
+from meta_ads_mcp.config import Settings
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
     mcp_server,
     serialize_search_results_compact,
 )
+from meta_ads_mcp.tools import discovery, insights, utility
 
 
 def test_fastmcp_31_search_transform_is_configured() -> None:
@@ -31,6 +33,106 @@ def test_list_tools_exposes_compact_search_surface() -> None:
         "search_tools",
         "call_tool",
     ]
+
+
+def test_historical_missing_tools_remain_visible_on_compact_surface() -> None:
+    names = {tool.name for tool in asyncio.run(mcp_server.list_tools())}
+    assert {"health_check", "list_ad_accounts"} <= names
+
+
+def test_historical_missing_tools_respond_through_tool_layer(monkeypatch) -> None:
+    class FakeDiscoveryClient:
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            assert parent_id == "me"
+            assert edge == "adaccounts"
+            return {"data": [{"id": "act_123", "name": "Test Account", "account_status": 1}]}
+
+    monkeypatch.setattr(
+        utility,
+        "get_settings",
+        lambda: Settings(
+            access_token=None,
+            api_version="v25.0",
+            default_account_id=None,
+            app_id=None,
+            app_secret=None,
+            redirect_uri=None,
+            log_level="INFO",
+            host="127.0.0.1",
+            port=8000,
+            request_timeout=30.0,
+            max_retries=2,
+        ),
+    )
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+
+    health = asyncio.run(mcp_server.call_tool("health_check", {}))
+    accounts = asyncio.run(mcp_server.call_tool("list_ad_accounts", {"limit": 1}))
+
+    assert health.structured_content["status"] == "unhealthy"
+    assert accounts.structured_content["items"][0]["id"] == "act_123"
+
+
+def test_search_routes_feedback_and_action_count_workflows() -> None:
+    async def search(query: str) -> str:
+        result = await mcp_server.call_tool("search_tools", {"query": query})
+        return result.structured_content["result"]
+
+    feedback = asyncio.run(search("feedback reviews testimonials"))
+    raw_comments = asyncio.run(search("facebook ad comments"))
+    page_reviews = asyncio.run(search("page reviews testimonials"))
+    actions = asyncio.run(search("how many appointments campaign trailing 30 days"))
+    campaign_lookup = asyncio.run(search("find campaign by name"))
+    terse_campaigns = asyncio.run(search("campaigns"))
+    terse_actions = asyncio.run(search("appointments last 30 days"))
+    terse_pause = asyncio.run(search("pause ad set"))
+
+    assert feedback.splitlines()[1].startswith("- `get_ad_feedback_signals`")
+    assert raw_comments.splitlines()[1].startswith("- `list_ad_comments`")
+    assert page_reviews.splitlines()[1].startswith("- `list_page_recommendations`")
+    assert actions.splitlines()[1].startswith("- `summarize_actions`")
+    assert campaign_lookup.splitlines()[1].startswith("- `list_campaigns`")
+    assert "client-side name lookup" in campaign_lookup.splitlines()[1]
+    assert "find campaign by name" not in campaign_lookup.splitlines()[1]
+    assert terse_campaigns.splitlines()[1].startswith("- `list_campaigns`")
+    assert terse_actions.splitlines()[1].startswith("- `summarize_actions`")
+    assert terse_pause.splitlines()[1].startswith("- `set_adset_status`")
+
+
+def test_compare_performance_responds_through_tool_layer(monkeypatch) -> None:
+    class FakeInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert object_id == "act_123"
+            assert params["level"] == "campaign"
+            return {
+                "data": [
+                    {
+                        "campaign_id": "cmp_1",
+                        "campaign_name": "Campaign One",
+                        "spend": "100",
+                        "impressions": "1000",
+                        "clicks": "50",
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+
+    result = asyncio.run(
+        mcp_server.call_tool(
+            "compare_performance",
+            {
+                "level": "campaign",
+                "object_ids": ["act_123"],
+                "date_preset": "last_30d",
+                "metrics": ["spend", "clicks"],
+            },
+        )
+    )
+
+    summary = result.structured_content["summary"]
+    assert summary["successful"] == 1
+    assert summary["failed"] == 0
 
 
 def test_compact_search_serializer_returns_minimal_markdown() -> None:

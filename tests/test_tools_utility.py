@@ -58,6 +58,11 @@ def test_get_capabilities_returns_compact_summary_by_default() -> None:
 def test_get_capabilities_can_return_full_manifest() -> None:
     result = asyncio.run(utility.get_capabilities(include_full_manifest=True))
     assert "health_check" in result["tool_groups"]["utility"]
+    assert "list_mutation_tools" in result["tool_groups"]["utility"]
+    assert "summarize_actions" in result["tool_groups"]["analysis"]
+    assert "get_ad_feedback_signals" in result["tool_groups"]["optimization"]
+    assert "list_ad_comments" in result["tool_groups"]["social_feedback"]
+    assert "list_page_recommendations" in result["tool_groups"]["social_feedback"]
     assert "compare_performance" in result["tool_groups"]["analysis"]
     assert "export_insights" in result["tool_groups"]["analysis"]
     assert "get_account_pages" in result["tool_groups"]["discovery"]
@@ -79,10 +84,34 @@ def test_get_capabilities_can_return_compact_intent_guide() -> None:
     assert "meta://docs/tool-routing" in result["resources"]
 
 
-def test_get_capabilities_rejects_unknown_intent() -> None:
-    try:
-        asyncio.run(utility.get_capabilities(intent="not_real"))
-    except utility.ValidationError as exc:
-        assert "Valid intents" in str(exc)
-    else:  # pragma: no cover - defensive
-        raise AssertionError("Expected ValidationError for unknown intent")
+def test_get_capabilities_falls_forward_on_unknown_intent() -> None:
+    result = asyncio.run(utility.get_capabilities(intent="customer feedback product reviews testimonials"))
+    assert result["unmatched_intent"] == "customer feedback product reviews testimonials"
+    assert result["closest_intents"][0]["intent"] == "read_ad_comments_or_quality_signals"
+    assert result["suggested_search"] == {
+        "tool": "search_tools",
+        "arguments": {"query": "customer feedback product reviews testimonials"},
+    }
+
+
+def test_get_capabilities_routes_terse_intents() -> None:
+    pause = asyncio.run(utility.get_capabilities(intent="pause ad set"))
+    campaigns = asyncio.run(utility.get_capabilities(intent="campaigns"))
+    appointments = asyncio.run(utility.get_capabilities(intent="appointments last 30 days"))
+
+    assert pause["closest_intents"][0]["intent"] == "writes_after_confirmation"
+    assert campaigns["closest_intents"][0]["intent"] == "discover_accounts_or_ids"
+    assert appointments["closest_intents"][0]["intent"] == "inspect_single_entity_performance"
+
+
+def test_get_capabilities_has_feedback_intent() -> None:
+    result = asyncio.run(utility.get_capabilities(intent="read_ad_comments_or_quality_signals"))
+    assert result["selected_intent"]["recommended_order"][0] == "list_ad_comments"
+    assert any("comments" in note for note in result["selected_intent"]["notes"])
+
+
+def test_list_mutation_tools_returns_write_catalog() -> None:
+    result = asyncio.run(utility.list_mutation_tools())
+    assert result["count"] == len(utility.TOOL_GROUPS["writes"])
+    assert "set_campaign_status" in result["common_paths"]["pause_or_enable"]
+    assert result["safety_notes"]

@@ -8,7 +8,7 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import normalize_budget_value, normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_budget_value, normalize_collection
 from meta_ads_mcp.schemas import collection_response
 
 ACCOUNT_FIELDS = [
@@ -114,6 +114,29 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
     return params
 
 
+def _campaign_suggested_next_tools(items: list[dict[str, Any]], account_id: str) -> dict[str, Any]:
+    """Return compact routing hints after campaign discovery."""
+    campaign_ids = [str(item.get("id")) for item in items[:5] if item.get("id")]
+    if not campaign_ids:
+        return {}
+    first_campaign_id = campaign_ids[0]
+    return {
+        "campaign_health": {
+            "tool": "get_campaign_optimization_snapshot",
+            "arguments": {"campaign_id": first_campaign_id},
+        },
+        "compare_visible_campaigns": {
+            "tool": "compare_performance",
+            "arguments": {"level": "campaign", "object_ids": campaign_ids},
+        },
+        "whole_account_health": {
+            "tool": "get_account_optimization_snapshot",
+            "arguments": {"account_id": account_id},
+        },
+        "writes_catalog": {"tool": "list_mutation_tools", "arguments": {}},
+    }
+
+
 @mcp_server.tool()
 async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[str, Any]:
     """Use this first when the user needs to discover which ad accounts are available."""
@@ -142,19 +165,24 @@ async def list_campaigns(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover campaign ids and high-level campaign metadata inside one ad account."""
+    """Discover campaign names and ids for client-side name lookup by listing campaigns, with optional status filtering."""
     client = get_graph_api_client()
+    account_id = blank_to_none(account_id)
+    resolved_account_id = _resolve_account_id(account_id)
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
     if after:
         params["after"] = after
     payload = await client.list_objects(
-        _resolve_account_id(account_id),
+        resolved_account_id,
         "campaigns",
         fields=CAMPAIGN_FIELDS,
         params=params,
     )
     normalized = normalize_collection(payload)
     normalized["items"] = _normalize_budgets(normalized["items"])
+    suggestions = _campaign_suggested_next_tools(normalized["items"], resolved_account_id)
+    if suggestions:
+        normalized["suggested_next_tools"] = suggestions
     return normalized
 
 
@@ -174,9 +202,11 @@ async def list_adsets(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover ad sets under one account or one campaign."""
-    if not account_id and not campaign_id:
-        raise ValidationError("Provide account_id or campaign_id.")
+    """Use this to discover ad sets under one account, one campaign, or the default account when omitted."""
+    account_id = blank_to_none(account_id)
+    campaign_id = blank_to_none(campaign_id)
+    if account_id and campaign_id:
+        raise ValidationError("Provide only one of account_id or campaign_id.")
     parent_id = campaign_id or _resolve_account_id(account_id)
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
@@ -205,10 +235,13 @@ async def list_ads(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover ads under exactly one scope: one account, one campaign, or one ad set."""
+    """Use this to discover ads under at most one scope; if none is provided, META_DEFAULT_ACCOUNT_ID is used."""
+    account_id = blank_to_none(account_id)
+    campaign_id = blank_to_none(campaign_id)
+    adset_id = blank_to_none(adset_id)
     scope_count = sum(value is not None for value in (account_id, campaign_id, adset_id))
-    if scope_count != 1:
-        raise ValidationError("Provide exactly one of account_id, campaign_id, or adset_id.")
+    if scope_count > 1:
+        raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")
     parent_id = adset_id or campaign_id or _resolve_account_id(account_id)
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
@@ -224,7 +257,10 @@ async def get_ad(ad_id: str, include_creative_summary: bool = False) -> dict[str
     client = get_graph_api_client()
     fields = list(AD_FIELDS)
     if include_creative_summary:
-        fields[-1] = "creative{id,name,title,body,object_story_spec}"
+        fields[-1] = (
+            "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+            "effective_instagram_media_id,effective_instagram_story_id,object_story_spec}"
+        )
     ad = await client.get_object(ad_id, fields=fields)
     return {"item": ad, "summary": {"count": 1}}
 
@@ -257,6 +293,7 @@ async def list_instagram_accounts(
 ) -> dict[str, Any]:
     """Use this before creative creation when the user needs Instagram identities linked to the account."""
     client = get_graph_api_client()
+    account_id = blank_to_none(account_id)
     params = _page_params(limit, after)
     source_attempts = ["instagram_accounts"]
     try:
@@ -273,7 +310,7 @@ async def list_instagram_accounts(
         source_attempts.append("accounts.instagram_business_account")
 
     pages = await get_account_pages(
-        account_id=account_id,
+        account_id=account_id or "me",
         limit=limit,
         after=after,
         fields=["id", "name", "instagram_business_account"],
