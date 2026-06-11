@@ -345,6 +345,7 @@ async def list_ad_comments(
     _validate_limit("limit", limit)
     _validate_limit("reply_limit", reply_limit, minimum=0, maximum=25)
     _validate_limit("max_message_chars", max_message_chars, minimum=0, maximum=5000)
+    after = blank_to_none(after)
     if after and surface not in {"facebook", "instagram"}:
         raise ValidationError("after is supported only when fetching one concrete surface.")
 

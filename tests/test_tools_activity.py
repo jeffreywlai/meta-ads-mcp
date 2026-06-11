@@ -61,17 +61,20 @@ def test_list_change_history_defaults_to_configured_account(monkeypatch: pytest.
             "params": {"limit": 25},
         }
     ]
-    assert result["scope"] == {"level": "account", "object_id": "act_123"}
+    assert result["scope"] == {"level": "account", "object_id": "act_123", "account_id": "act_123"}
     assert result["items"][0]["extra_data_parsed"] == {"old_value": "50", "new_value": "75"}
     assert result["summary"]["default_window"].startswith("Meta returns one week")
 
 
-def test_list_change_history_supports_campaign_filters_and_custom_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_list_change_history_routes_campaign_scope_through_account_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = FakeActivityClient()
     monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
 
     result = asyncio.run(
         activity.list_change_history(
+            account_id="123",
             campaign_id="cmp_123",
             since="2026-06-01",
             until="2026-06-07",
@@ -84,7 +87,7 @@ def test_list_change_history_supports_campaign_filters_and_custom_fields(monkeyp
     )
 
     assert client.calls[0] == {
-        "parent_id": "cmp_123",
+        "parent_id": "act_123",
         "edge": "activities",
         "fields": ["event_time", "event_type", "object_id"],
         "params": {
@@ -95,11 +98,28 @@ def test_list_change_history_supports_campaign_filters_and_custom_fields(monkeyp
             "category": "AD_SET",
             "business_id": "biz_123",
             "uid": 987654321,
+            "oid": "cmp_123",
         },
     }
-    assert result["scope"] == {"level": "campaign", "object_id": "cmp_123"}
+    assert result["scope"] == {"level": "campaign", "object_id": "cmp_123", "account_id": "act_123"}
     assert result["summary"]["date_window"] == {"since": "2026-06-01", "until": "2026-06-07"}
     assert result["summary"]["uid"] == 987654321
+    assert result["summary"]["object_filter_id"] == "cmp_123"
+
+
+def test_list_change_history_uses_default_account_for_scoped_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "456")
+    reload_settings()
+    client = FakeActivityClient()
+    monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(activity.list_change_history(level="adset", object_id="adset_123"))
+
+    assert client.calls[0]["parent_id"] == "act_456"
+    assert client.calls[0]["params"] == {"limit": 50, "oid": "adset_123"}
+    assert result["scope"] == {"level": "adset", "object_id": "adset_123", "account_id": "act_456"}
 
 
 def test_list_change_history_rejects_conflicting_scopes() -> None:

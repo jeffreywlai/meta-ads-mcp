@@ -259,6 +259,20 @@ def test_list_ad_comments_rejects_auto_pagination_cursor() -> None:
         asyncio.run(social_feedback.list_ad_comments(ad_id="ad_full", after="after_fb"))
 
 
+def test_list_ad_comments_normalizes_blank_pagination_cursor(monkeypatch) -> None:
+    client = FakeSocialClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(social_feedback.list_ad_comments(ad_id="ad_full", after=" "))
+
+    assert result["summary"]["surfaces"] == ["facebook"]
+    assert client.list_calls[0][3] == {
+        "limit": 25,
+        "filter": "stream",
+        "order": "reverse_chronological",
+    }
+
+
 def test_list_ad_comments_ignores_blank_optional_ids(monkeypatch) -> None:
     client = FakeSocialClient()
     monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)

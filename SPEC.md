@@ -557,7 +557,10 @@ Inputs:
 
 - `level`: optional generic scope of `account`, `campaign`, `adset`, or `ad`
 - `object_id`: optional generic object id when `level` is provided
-- `account_id`, `campaign_id`, `adset_id`, or `ad_id`
+- `account_id`: ad account to read from; required for object-scoped history
+  unless `META_DEFAULT_ACCOUNT_ID` is configured
+- `campaign_id`, `adset_id`, or `ad_id`: optional object scope routed through
+  the ad-account activities edge with object filtering
 - `since` and `until`: optional datetime filters; Meta defaults to the prior
   7 days through now when omitted
 - `category`
@@ -572,7 +575,7 @@ Output:
 - activity rows from the Meta `activities` edge
 - parsed `extra_data_parsed` when `extra_data` is JSON encoded
 - paging cursors
-- scope, date-window, and filter summary
+- scope, account parent, date-window, and filter summary
 
 ## Core Analysis Tools
 
