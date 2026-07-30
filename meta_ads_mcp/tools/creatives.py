@@ -80,7 +80,7 @@ async def get_creative(
     creative_id: str,
     fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """Read one creative by id, including url_tags, asset_feed_spec, object_story_spec, or degrees_of_freedom_spec."""
+    """Get, fetch, look up, show, or inspect what is in one creative by id, including full details for url_tags, asset_feed_spec, object_story_spec, and degrees_of_freedom_spec."""
     client = get_graph_api_client()
     creative = await client.get_object(creative_id, fields=fields or CREATIVE_FIELDS)
     return {"item": creative, "summary": {"count": 1}}

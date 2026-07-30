@@ -10,6 +10,22 @@ try:
     from fastmcp import FastMCP
     from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
     from fastmcp.server.transforms.search import BM25SearchTransform
+    from fastmcp.tools.tool import ToolResult
+    from mcp.types import TextContent
+
+    class SerializedResponseLimitingMiddleware(ResponseLimitingMiddleware):
+        """Replace oversized results with a compact response that stays under the wire cap."""
+
+        def _truncate_to_result(self, text: str) -> ToolResult:
+            _ = text
+            return ToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=self.truncation_suffix.strip(),
+                    )
+                ]
+            )
 except ImportError:  # pragma: no cover - fallback for tests without the package
     class ResponseLimitingMiddleware:  # type: ignore[override]
         """Minimal local fallback for tests without FastMCP."""
@@ -22,6 +38,9 @@ except ImportError:  # pragma: no cover - fallback for tests without the package
         ) -> None:
             self.max_size = max_size
             self.truncation_suffix = truncation_suffix
+
+    class SerializedResponseLimitingMiddleware(ResponseLimitingMiddleware):
+        """Minimal local fallback for tests without FastMCP."""
 
     class BM25SearchTransform:  # type: ignore[override]
         """Minimal local fallback for the FastMCP 3.1 search transform."""
@@ -216,7 +235,7 @@ mcp_server = FastMCP(
     mask_error_details=False,
 )
 mcp_server.add_middleware(
-    ResponseLimitingMiddleware(
+    SerializedResponseLimitingMiddleware(
         max_size=MAX_TOOL_RESPONSE_BYTES,
         truncation_suffix=RESPONSE_LIMIT_HINT,
     )

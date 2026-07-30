@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import pydantic_core
 import pytest
 
 from meta_ads_mcp.coordinator import MAX_TOOL_RESPONSE_BYTES, RESPONSE_LIMIT_HINT, mcp_server
@@ -924,7 +925,7 @@ def test_mcp_response_guard_caps_oversized_insights_with_hint(monkeypatch) -> No
                 "data": [
                     {
                         "ad_id": "ad_1",
-                        "ad_name": "oversized-" + ("x" * 100_000),
+                        "ad_name": "oversized-" + ('\\"' * 100_000),
                         "spend": "1",
                         "impressions": "10",
                         "clicks": "1",
@@ -943,4 +944,4 @@ def test_mcp_response_guard_caps_oversized_insights_with_hint(monkeypatch) -> No
 
     assert result.structured_content is None
     assert RESPONSE_LIMIT_HINT.strip() in result.content[0].text
-    assert len(result.content[0].text.encode("utf-8")) < MAX_TOOL_RESPONSE_BYTES
+    assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES

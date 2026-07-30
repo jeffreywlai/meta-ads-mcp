@@ -27,7 +27,7 @@ def test_fastmcp_31_search_transform_is_configured() -> None:
 
 def test_response_size_guard_is_configured() -> None:
     middleware = mcp_server.middleware[-1]
-    assert type(middleware).__name__ == "ResponseLimitingMiddleware"
+    assert type(middleware).__name__ == "SerializedResponseLimitingMiddleware"
     assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
     assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
 
@@ -98,6 +98,11 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
     creative_read = asyncio.run(
         search("full creative spec by id including url_tags asset_feed_spec degrees_of_freedom")
     )
+    terse_creative_reads = [
+        asyncio.run(search("fetch creative 123")),
+        asyncio.run(search("creative 123 details")),
+        asyncio.run(search("what is creative 123")),
+    ]
 
     assert feedback.splitlines()[1].startswith("- `get_ad_feedback_signals`")
     assert raw_comments.splitlines()[1].startswith("- `list_ad_comments`")
@@ -110,6 +115,7 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
     assert terse_actions.splitlines()[1].startswith("- `summarize_actions`")
     assert terse_pause.splitlines()[1].startswith("- `set_adset_status`")
     assert creative_read.splitlines()[1].startswith("- `get_creative`")
+    assert all(result.splitlines()[1].startswith("- `get_creative`") for result in terse_creative_reads)
 
 
 def test_compare_performance_responds_through_tool_layer(monkeypatch) -> None:
