@@ -8,7 +8,7 @@ from typing import Any
 
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaAdsError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.tool_types import FieldList
@@ -75,17 +75,33 @@ async def _resolve_object_account_id(
     account_id: str | None,
     client: Any,
 ) -> str:
-    """Resolve an object's owning account when no account context was provided."""
-    if resolved_account_id := _configured_account_id(account_id):
-        return resolved_account_id
-    payload = await client.get_object(object_id, fields=["account_id"])
+    """Resolve and verify an object's owning account."""
+    configured_account_id = _configured_account_id(account_id)
+    try:
+        payload = await client.get_object(object_id, fields=["account_id"])
+    except MetaAdsError:
+        if configured_account_id is not None:
+            return configured_account_id
+        raise
     derived_account_id = payload.get("account_id")
     if derived_account_id is None or not str(derived_account_id).strip():
+        if configured_account_id is not None:
+            return configured_account_id
         raise ValidationError(
             f"account_id could not be derived from object '{object_id}'. "
             "Pass account_id explicitly or set META_DEFAULT_ACCOUNT_ID."
         )
-    return normalize_account_id(str(derived_account_id).strip())
+    normalized_derived_account_id = normalize_account_id(str(derived_account_id).strip())
+    if (
+        configured_account_id is not None
+        and configured_account_id != normalized_derived_account_id
+    ):
+        raise ValidationError(
+            f"Object '{object_id}' belongs to account "
+            f"'{normalized_derived_account_id}', but the supplied or default "
+            f"account resolves to '{configured_account_id}'."
+        )
+    return normalized_derived_account_id
 
 
 def _normalize_level(level: str | None) -> str | None:

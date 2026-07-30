@@ -606,6 +606,20 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
     monkeypatch.setenv("META_APP_SECRET", "secret_123")
     monkeypatch.setenv("META_REDIRECT_URI", "https://example.com/callback")
     reload_settings()
+    monkeypatch.setattr(
+        utility.OVERFLOW_ARTIFACT_STORE,
+        "read",
+        lambda export_id, **_: {
+            "export_id": export_id,
+            "data": "{}",
+            "complete": True,
+        },
+    )
+    monkeypatch.setattr(
+        utility.OVERFLOW_ARTIFACT_STORE,
+        "delete",
+        lambda export_id: {"ok": True, "export_id": export_id, "deleted": True},
+    )
     return client
 
 
@@ -623,6 +637,7 @@ def _required_value(param_name: str) -> Any:
         "ad_reached_countries": ["US"],
         "system_user_id": "sys_123",
         "report_run_id": "rpt_123",
+        "export_id": "A" * 32,
         "owner_id": "act_123",
         "page_id": "page_123",
         "object_id": "cmp_123",

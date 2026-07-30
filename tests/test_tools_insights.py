@@ -743,6 +743,41 @@ def test_export_insights_can_allow_large_output(monkeypatch) -> None:
     assert len(result["rows"]) == 120
 
 
+def test_export_insights_preserves_meta_paging_and_next_cursor(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        items = [{"campaign_id": f"cmp_{index}"} for index in range(100)]
+        return {
+            "items": items,
+            "summary": {"count": len(items)},
+            "paging": {
+                "before": None,
+                "after": "NEXT_PAGE",
+                "next": "https://graph.example/next",
+            },
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        insights.export_insights(
+            level="campaign",
+            object_id="act_123",
+            allow_large_output=True,
+            after="CURRENT_PAGE",
+        )
+    )
+
+    assert calls[0]["after"] == "CURRENT_PAGE"
+    assert result["record_count"] == 100
+    assert result["returned_count"] == 100
+    assert result["truncated"] is True
+    assert result["complete"] is False
+    assert result["paging"]["after"] == "NEXT_PAGE"
+    assert "after='NEXT_PAGE'" in result["next_step"]
+
+
 def test_export_insights_handles_empty_results(monkeypatch) -> None:
     async def fake_get_entity_insights(**_: object) -> dict[str, object]:
         return {"items": [], "summary": {"count": 0, "metrics": {}}, "paging": {}}
@@ -944,7 +979,8 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
 
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
     middleware = mcp_server.middleware[-1]
-    monkeypatch.setattr(middleware, "export_directory", tmp_path)
+    artifact_store = middleware.artifact_store
+    monkeypatch.setattr(artifact_store, "export_directory", tmp_path)
 
     result = asyncio.run(
         mcp_server.call_tool(
@@ -956,13 +992,51 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
     assert result.structured_content is None
     overflow = result.meta["overflow"]
     assert overflow["archived"] is True
-    artifact_path = Path(overflow["artifact_path"])
-    assert str(artifact_path) in result.content[0].text
-    archived = json.loads(artifact_path.read_text())
-    assert archived["items"][0]["ad_name"] == oversized_name
+    export_id = overflow["export_id"]
+    assert export_id in result.content[0].text
+    assert str(tmp_path) not in result.content[0].text
+
+    chunks: list[str] = []
+    offset = 0
+    while True:
+        chunk_result = asyncio.run(
+            mcp_server.call_tool(
+                "call_tool",
+                {
+                    "name": "read_overflow_artifact",
+                    "arguments": {"export_id": export_id, "offset": offset},
+                },
+            )
+        )
+        assert len(pydantic_core.to_json(chunk_result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES
+        chunk = chunk_result.structured_content
+        chunks.append(chunk["data"])
+        if chunk["complete"]:
+            break
+        offset = chunk["next_offset"]
+
+    archived = json.loads("".join(chunks))
+    archived_result = archived["tool_result"]
+    assert archived_result["structured_content"]["items"][0]["ad_name"] == oversized_name
+    assert archived_result["content"]
+    assert "meta" in archived_result
+    artifact_path = artifact_store._artifact_path(export_id)
     assert overflow["artifact_bytes"] == artifact_path.stat().st_size
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
     assert stat.S_IMODE(artifact_path.stat().st_mode) == 0o600
     assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES
+
+    deleted = asyncio.run(
+        mcp_server.call_tool(
+            "call_tool",
+            {
+                "name": "delete_overflow_artifact",
+                "arguments": {"export_id": export_id},
+            },
+        )
+    )
+    assert deleted.structured_content["deleted"] is True
+    assert not artifact_path.exists()
 
 
 def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
@@ -976,7 +1050,7 @@ def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
     blocked_directory = tmp_path / "not-a-directory"
     blocked_directory.write_text("blocked")
     middleware = mcp_server.middleware[-1]
-    monkeypatch.setattr(middleware, "export_directory", blocked_directory)
+    monkeypatch.setattr(middleware.artifact_store, "export_directory", blocked_directory)
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
 
     result = asyncio.run(

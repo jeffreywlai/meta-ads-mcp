@@ -20,7 +20,7 @@ def test_fastmcp_31_search_transform_is_configured() -> None:
     transforms = getattr(mcp_server, "transforms", [])
     assert transforms
     transform = transforms[0]
-    assert type(transform).__name__ == "BM25SearchTransform"
+    assert type(transform).__name__ == "IntentAwareBM25SearchTransform"
     assert sorted(getattr(transform, "_always_visible", set())) == sorted(ALWAYS_VISIBLE_TOOLS)
     assert getattr(transform, "_search_result_serializer", None) is serialize_search_results_compact
 
@@ -102,7 +102,30 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
         asyncio.run(search("fetch creative 123")),
         asyncio.run(search("creative 123 details")),
         asyncio.run(search("what is creative 123")),
+        asyncio.run(search("read creative 123 do not change it")),
+        asyncio.run(search("do not delete creative 123 just read it")),
+        asyncio.run(search("read-only creative 123")),
+        asyncio.run(search("creative details, not delete")),
+        asyncio.run(search("do not rename creative 123, just inspect it")),
+        asyncio.run(search("do not upload creative 123, show details")),
+        asyncio.run(search("never create a creative, just inspect existing creative 123")),
     ]
+    delete_creative = asyncio.run(search("remove creative 123"))
+    update_creative = asyncio.run(search("update creative 123"))
+    performance_report = asyncio.run(search("get creative performance report"))
+    mixed_intent = asyncio.run(search("do not delete creative; update its name instead"))
+    creative_list = asyncio.run(search("show creatives in account 123"))
+    creative_comments = asyncio.run(search("read creative comments"))
+    creative_image = asyncio.run(search("get creative image for ad 123"))
+    narrow_remove = asyncio.run(search("remove image from creative 123"))
+    detach_creative = asyncio.run(search("remove creative from ad 123"))
+    overflow_read = asyncio.run(search("get full oversized MCP response"))
+    overflow_download = asyncio.run(search("download oversized response"))
+    plural_delete = asyncio.run(search("delete creatives 123 and 456"))
+    plural_comments = asyncio.run(search("show comments on creatives"))
+    mixed_results = asyncio.run(
+        search("do not delete creative; update its name instead")
+    )
 
     assert feedback.splitlines()[1].startswith("- `get_ad_feedback_signals`")
     assert raw_comments.splitlines()[1].startswith("- `list_ad_comments`")
@@ -116,6 +139,32 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
     assert terse_pause.splitlines()[1].startswith("- `set_adset_status`")
     assert creative_read.splitlines()[1].startswith("- `get_creative`")
     assert all(result.splitlines()[1].startswith("- `get_creative`") for result in terse_creative_reads)
+    assert all(
+        not any(
+            f"`{prefix}" in result
+            for prefix in ("`create_", "`update_", "`delete_", "`set_", "`upload_")
+        )
+        for result in terse_creative_reads
+    )
+    assert all("`setup_ab_test`" not in result for result in terse_creative_reads)
+    assert delete_creative.splitlines()[1].startswith("- `delete_creative`")
+    assert update_creative.splitlines()[1].startswith("- `update_creative`")
+    assert performance_report.splitlines()[1].startswith(
+        "- `get_creative_performance_report`"
+    )
+    assert mixed_intent.splitlines()[1].startswith("- `update_creative`")
+    assert creative_list.splitlines()[1].startswith("- `list_creatives`")
+    assert creative_comments.splitlines()[1].startswith("- `list_ad_comments`")
+    assert creative_image.splitlines()[1].startswith("- `get_ad_image`")
+    assert not narrow_remove.splitlines()[1].startswith("- `delete_creative`")
+    assert not detach_creative.splitlines()[1].startswith("- `delete_creative`")
+    assert overflow_read.splitlines()[1].startswith("- `read_overflow_artifact`")
+    assert "`delete_overflow_artifact`" not in overflow_read
+    assert overflow_download.splitlines()[1].startswith("- `read_overflow_artifact`")
+    assert plural_delete.splitlines()[1].startswith("- `delete_creative`")
+    assert plural_comments.splitlines()[1].startswith("- `list_ad_comments`")
+    assert mixed_results.splitlines()[1].startswith("- `update_creative`")
+    assert "`delete_creative`" not in mixed_results
 
 
 def test_compare_performance_responds_through_tool_layer(monkeypatch) -> None:

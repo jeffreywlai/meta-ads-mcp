@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 
 from meta_ads_mcp.config import get_settings
-from meta_ads_mcp.coordinator import ALWAYS_VISIBLE_TOOLS
-from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.coordinator import (
+    ALWAYS_VISIBLE_TOOLS,
+    OVERFLOW_ARTIFACT_STORE,
+    mcp_server,
+)
 from meta_ads_mcp.graph_api import get_graph_api_client
 
 TOOL_GROUPS = {
@@ -123,6 +126,8 @@ TOOL_GROUPS = {
         "health_check",
         "get_capabilities",
         "list_mutation_tools",
+        "read_overflow_artifact",
+        "delete_overflow_artifact",
     ],
 }
 
@@ -541,6 +546,9 @@ async def get_capabilities(
             "META_APP_SECRET",
             "META_REDIRECT_URI",
             "META_EXPORT_DIR",
+            "META_EXPORT_TTL_SECONDS",
+            "META_EXPORT_MAX_FILES",
+            "META_EXPORT_MAX_BYTES",
         ],
     }
     notes = [
@@ -548,7 +556,7 @@ async def get_capabilities(
         "FastMCP 3.1 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
         "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
         "export_insights is a convenience wrapper over the core insights surface.",
-        "Oversized tool responses are saved as complete JSON files under META_EXPORT_DIR or the operating system temp directory.",
+        "Oversized tool responses return an opaque export_id; use call_tool to invoke read_overflow_artifact for bounded JSON chunks and delete_overflow_artifact when finished.",
         "Pass intent to get_capabilities for a compact routing response instead of the full manifest.",
         "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
         "Use list_instagram_accounts when creative setup requires an Instagram identity rather than a Facebook Page.",
@@ -607,3 +615,23 @@ async def list_mutation_tools() -> dict[str, object]:
             "Token must have ads_management-level permissions.",
         ],
     }
+
+
+@mcp_server.tool()
+async def read_overflow_artifact(
+    export_id: str,
+    offset: int = 0,
+    max_bytes: int = 8_000,
+) -> dict[str, object]:
+    """Read one bounded JSON chunk from a complete oversized tool response using its opaque export id."""
+    return OVERFLOW_ARTIFACT_STORE.read(
+        export_id,
+        offset=offset,
+        max_bytes=max_bytes,
+    )
+
+
+@mcp_server.tool()
+async def delete_overflow_artifact(export_id: str) -> dict[str, object]:
+    """Delete an oversized response artifact after the caller has finished retrieving it."""
+    return OVERFLOW_ARTIFACT_STORE.delete(export_id)

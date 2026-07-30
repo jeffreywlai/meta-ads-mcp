@@ -5,7 +5,7 @@
 [![FastMCP 3.1](https://img.shields.io/badge/FastMCP-3.1-green.svg)](https://github.com/jlowin/fastmcp)
 [![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
-**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 89 tools for querying, managing, and optimizing your ad accounts through natural language.**
+**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 92 tools for querying, managing, and optimizing your ad accounts through natural language.**
 
 > Ask Claude or Gemini to "show me which creatives are fatiguing" or "give me an optimization snapshot for this account" — and it just works.
 
@@ -13,16 +13,16 @@
 
 ## ✨ Features
 
-- 📊 **90 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **92 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, and v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 90 up front
+- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 92 up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (90)
+## 📋 Available Tools (92)
 
 ### 🔍 Discovery
 
@@ -168,6 +168,8 @@
 | `health_check` | Server health check |
 | `get_capabilities` | List server capabilities |
 | `list_mutation_tools` | List write tools and safety notes |
+| `read_overflow_artifact` | Retrieve one bounded JSON chunk from an oversized response |
+| `delete_overflow_artifact` | Delete an oversized response artifact after retrieval |
 
 FastMCP 3.1 also exposes dynamic search tools at runtime:
 
@@ -214,13 +216,24 @@ export META_APP_ID='YOUR_APP_ID'
 export META_APP_SECRET='YOUR_APP_SECRET'
 export META_REDIRECT_URI='https://example.com/callback'
 export META_EXPORT_DIR='/path/to/meta-ads-exports'
+export META_EXPORT_TTL_SECONDS='86400'
+export META_EXPORT_MAX_FILES='100'
+export META_EXPORT_MAX_BYTES='1000000000'
 ```
 
 You can also place these in a `.env` file at the repo root.
 
-`META_EXPORT_DIR` is optional. Oversized MCP responses are saved there as
-complete private JSON files; when omitted, the server uses the operating
-system's temporary `meta-ads-mcp-exports` directory.
+Overflow settings are optional. Oversized MCP responses are saved as complete,
+owner-only JSON artifacts and replaced inline by an opaque `export_id`. Use the
+visible `call_tool` proxy with `name="read_overflow_artifact"` and the returned
+`export_id`, repeating with `next_offset` to retrieve the complete response
+from local or remote MCP transports. Then use `call_tool` with
+`name="delete_overflow_artifact"`. When `META_EXPORT_DIR` is omitted, the
+server uses the operating system's temporary `meta-ads-mcp-exports` directory.
+Artifacts expire after 24 hours by default, and the store retains at most 100
+files and 1 GB; the three retention variables above override those defaults.
+If the host lacks secure directory-relative file operations and process locks,
+archival fails closed and the tool returns guidance to narrow the request.
 
 Don't have a token? Use the built-in auth helper tools (`generate_auth_url` → `exchange_code_for_token` → `refresh_to_long_lived_token`) to create one interactively.
 

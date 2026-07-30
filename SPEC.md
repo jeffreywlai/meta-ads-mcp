@@ -267,10 +267,13 @@ The FastMCP server instructions should tell the LLM:
 - Any derived metric must include the raw components used to compute it.
 - If a metric is not available, omit it and record why in `missing_signals`.
 - LLM-facing `fields` inputs accept either JSON string arrays or
-  comma-separated strings.
+  comma-separated strings; commas nested inside Graph field expressions are
+  preserved.
 - The MCP transport caps inline tool responses. Oversized results are preserved
-  as complete private JSON artifacts and replaced inline with the artifact path
-  plus guidance to narrow fields or lower limits.
+  as complete private JSON artifacts and replaced inline with an opaque
+  `export_id`. Callers retrieve bounded chunks with `read_overflow_artifact`
+  and can delete the artifact explicitly; automatic TTL, file-count, and
+  byte-count limits bound retention.
 
 ## Response Contracts
 

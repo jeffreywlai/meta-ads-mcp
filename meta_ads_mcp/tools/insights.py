@@ -16,7 +16,7 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, normalize_insights_row
 from meta_ads_mcp.schemas import analysis_response, collection_response
-from meta_ads_mcp.tool_types import FieldList
+from meta_ads_mcp.tool_types import FieldList, normalize_field_list
 
 DEFAULT_INSIGHTS_FIELDS = [
     "campaign_id",
@@ -282,7 +282,7 @@ def _filter_action_arrays(row: dict[str, Any], patterns: list[str]) -> dict[str,
 
 def _insights_fields(fields: FieldList | None, *, action_types: list[str] | None = None) -> list[str]:
     """Return requested fields with action-filter dependencies when needed."""
-    requested = list(fields or DEFAULT_INSIGHTS_FIELDS)
+    requested = list(normalize_field_list(fields) or DEFAULT_INSIGHTS_FIELDS)
     if not action_types:
         return requested
     for field in ACTION_FILTER_REQUIRED_FIELDS:
@@ -304,6 +304,7 @@ def _insights_params(
     use_unified_attribution_setting: bool = True,
     action_attribution_windows: list[str] | None = None,
     limit: int = 100,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Build insights params."""
     params: dict[str, Any] = {
@@ -325,6 +326,8 @@ def _insights_params(
         params["time_increment"] = time_increment
     if action_attribution_windows:
         params["action_attribution_windows"] = ",".join(action_attribution_windows)
+    if after:
+        params["after"] = after
     return params
 
 
@@ -420,11 +423,12 @@ async def _object_name(object_id: str) -> str | None:
 
 def _comparison_fields(level: str, fields: FieldList | None) -> list[str] | None:
     """Ensure comparison requests can resolve names without extra lookups when possible."""
-    if fields is None:
+    normalized_fields = normalize_field_list(fields)
+    if normalized_fields is None:
         return None
     required_fields = [field for field in (NAME_FIELD_BY_LEVEL.get(level), ID_FIELD_BY_LEVEL.get(level)) if field]
     combined: list[str] = []
-    for field in [*fields, *required_fields]:
+    for field in [*normalized_fields, *required_fields]:
         if field not in combined:
             combined.append(field)
     return combined
@@ -574,6 +578,7 @@ async def get_entity_insights(
     use_unified_attribution_setting: bool = True,
     action_attribution_windows: list[str] | None = None,
     limit: int = 100,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this for primary reporting reads. For action counts, use summarize_actions; for campaign health, use get_campaign_optimization_snapshot."""
     client = get_graph_api_client()
@@ -593,6 +598,7 @@ async def get_entity_insights(
             use_unified_attribution_setting=use_unified_attribution_setting,
             action_attribution_windows=action_attribution_windows,
             limit=limit,
+            after=after,
         ),
     )
     rows = _normalize_rows(payload, action_types=action_types)
@@ -623,6 +629,7 @@ async def get_insights(
     use_unified_attribution_setting: bool = True,
     action_attribution_windows: list[str] | None = None,
     limit: int = 100,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Compatibility alias for older Claude calls; prefer get_entity_insights for new reporting reads."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
@@ -640,6 +647,7 @@ async def get_insights(
         use_unified_attribution_setting=use_unified_attribution_setting,
         action_attribution_windows=action_attribution_windows,
         limit=limit,
+        after=after,
     )
 
 
@@ -882,6 +890,7 @@ async def export_insights(
     limit: int = DEFAULT_EXPORT_LIMIT,
     inline_limit: int = DEFAULT_INLINE_EXPORT_ROWS,
     allow_large_output: bool = False,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user explicitly wants export-style output; JSON returns structured rows, CSV returns serialized text."""
     export_format = format.lower()
@@ -913,16 +922,26 @@ async def export_insights(
         action_breakdowns=action_breakdowns,
         time_increment=time_increment,
         limit=limit,
+        after=after,
     )
     rows = payload["items"]
     returned_rows = rows if allow_large_output else rows[:inline_limit]
-    truncated = len(returned_rows) < len(rows)
+    paging = payload.get("paging") or {
+        "before": None,
+        "after": None,
+        "next": None,
+    }
+    inline_truncated = len(returned_rows) < len(rows)
+    has_more_pages = bool(paging.get("after") or paging.get("next"))
+    truncated = inline_truncated or has_more_pages
     response = {
         "format": export_format,
         "mime_type": "application/json" if export_format == "json" else "text/csv",
         "record_count": len(rows),
         "returned_count": len(returned_rows),
         "truncated": truncated,
+        "complete": not truncated,
+        "paging": paging,
         "summary": payload["summary"],
         "scope": {"level": level, "object_id": object_id},
         "query": {
@@ -939,17 +958,33 @@ async def export_insights(
             "limit": limit,
             "inline_limit": inline_limit,
             "allow_large_output": allow_large_output,
+            "after": after,
         },
     }
     if export_format == "json":
         response["rows"] = returned_rows
     else:
         response["data"] = _rows_to_csv(returned_rows)
-    if truncated:
-        response["next_step"] = (
-            "Rerun export_insights with allow_large_output=true for the full inline payload, "
-            "or use create_async_insights_report for larger exports."
+    next_steps: list[str] = []
+    if inline_truncated:
+        next_steps.append(
+            "Rerun export_insights with allow_large_output=true. If the complete "
+            "response exceeds the inline limit, retrieve the returned export_id "
+            "with read_overflow_artifact."
         )
+    if has_more_pages:
+        if paging.get("after"):
+            next_steps.append(
+                "Fetch the next Meta page by rerunning export_insights with "
+                f"after='{paging['after']}'."
+            )
+        else:
+            next_steps.append(
+                "Meta returned another page without a reusable cursor; use "
+                "create_async_insights_report for a complete larger export."
+            )
+    if next_steps:
+        response["next_step"] = " ".join(next_steps)
     return response
 
 

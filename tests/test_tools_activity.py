@@ -7,20 +7,21 @@ import asyncio
 import pytest
 
 from meta_ads_mcp.config import reload_settings
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import NotFoundError, ValidationError
 from meta_ads_mcp.tools import activity
 
 
 class FakeActivityClient:
     """Simple fake API client for activity tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, object_account_id: str = "20141913") -> None:
         self.calls: list[dict[str, object]] = []
         self.object_calls: list[dict[str, object]] = []
+        self.object_account_id = object_account_id
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
         self.object_calls.append({"object_id": object_id, "fields": fields, "params": params})
-        return {"id": object_id, "account_id": "20141913"}
+        return {"id": object_id, "account_id": self.object_account_id}
 
     async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
         self.calls.append(
@@ -53,7 +54,7 @@ class FakeActivityClient:
 def test_list_change_history_defaults_to_configured_account(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "123")
     reload_settings()
-    client = FakeActivityClient()
+    client = FakeActivityClient(object_account_id="123")
     monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
 
     result = asyncio.run(activity.list_change_history(limit=25))
@@ -74,7 +75,7 @@ def test_list_change_history_defaults_to_configured_account(monkeypatch: pytest.
 def test_list_change_history_routes_campaign_scope_through_account_edge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = FakeActivityClient()
+    client = FakeActivityClient(object_account_id="123")
     monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
 
     result = asyncio.run(
@@ -106,6 +107,9 @@ def test_list_change_history_routes_campaign_scope_through_account_edge(
             "oid": "cmp_123",
         },
     }
+    assert client.object_calls == [
+        {"object_id": "cmp_123", "fields": ["account_id"], "params": None}
+    ]
     assert result["scope"] == {"level": "campaign", "object_id": "cmp_123", "account_id": "act_123"}
     assert result["summary"]["date_window"] == {"since": "2026-06-01", "until": "2026-06-07"}
     assert result["summary"]["uid"] == 987654321
@@ -117,7 +121,7 @@ def test_list_change_history_uses_default_account_for_scoped_object(
 ) -> None:
     monkeypatch.setenv("META_DEFAULT_ACCOUNT_ID", "456")
     reload_settings()
-    client = FakeActivityClient()
+    client = FakeActivityClient(object_account_id="456")
     monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
 
     result = asyncio.run(activity.list_change_history(level="adset", object_id="adset_123"))
@@ -125,6 +129,9 @@ def test_list_change_history_uses_default_account_for_scoped_object(
     assert client.calls[0]["parent_id"] == "act_456"
     assert client.calls[0]["params"] == {"limit": 50, "oid": "adset_123"}
     assert result["scope"] == {"level": "adset", "object_id": "adset_123", "account_id": "act_456"}
+    assert client.object_calls == [
+        {"object_id": "adset_123", "fields": ["account_id"], "params": None}
+    ]
 
 
 def test_list_change_history_derives_account_from_scoped_object(
@@ -163,6 +170,58 @@ def test_list_change_history_explains_failed_account_derivation(
 
     with pytest.raises(ValidationError, match="could not be derived"):
         asyncio.run(activity.list_change_history(ad_id="ad_123"))
+
+
+def test_list_change_history_rejects_mismatched_object_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeActivityClient(object_account_id="222")
+    monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
+
+    with pytest.raises(ValidationError, match="belongs to account 'act_222'"):
+        asyncio.run(
+            activity.list_change_history(
+                account_id="111",
+                campaign_id="cmp_123",
+            )
+        )
+
+    assert client.object_calls == [
+        {"object_id": "cmp_123", "fields": ["account_id"], "params": None}
+    ]
+
+
+def test_list_change_history_uses_supplied_account_when_ownership_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnavailableOwnershipClient(FakeActivityClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            self.object_calls.append(
+                {"object_id": object_id, "fields": fields, "params": params}
+            )
+            if object_id == "missing_account_field":
+                return {"id": object_id}
+            raise NotFoundError("object is unavailable")
+
+    client = UnavailableOwnershipClient()
+    monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
+
+    missing_field = asyncio.run(
+        activity.list_change_history(
+            account_id="111",
+            campaign_id="missing_account_field",
+        )
+    )
+    inaccessible = asyncio.run(
+        activity.list_change_history(
+            account_id="111",
+            campaign_id="inaccessible",
+        )
+    )
+
+    assert missing_field["scope"]["account_id"] == "act_111"
+    assert inaccessible["scope"]["account_id"] == "act_111"
+    assert [call["parent_id"] for call in client.calls] == ["act_111", "act_111"]
 
 
 def test_list_change_history_rejects_conflicting_scopes() -> None:
