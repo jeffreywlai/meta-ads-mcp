@@ -57,6 +57,16 @@ def test_get_creative_reads_full_default_spec(monkeypatch) -> None:
     assert "degrees_of_freedom_spec" in creatives.CREATIVE_FIELDS
 
 
+def test_get_creative_normalizes_and_validates_id(monkeypatch) -> None:
+    client = FakeCreativeClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+
+    asyncio.run(creatives.get_creative(creative_id=" crt_123 "))
+    assert client.get_calls[0]["object_id"] == "crt_123"
+    with pytest.raises(creatives.ValidationError, match="creative_id is required"):
+        asyncio.run(creatives.get_creative(creative_id=" "))
+
+
 def test_preview_ad_supports_creative_payload(monkeypatch) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: FakeCreativeClient())
     result = asyncio.run(

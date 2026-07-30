@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 
 from meta_ads_mcp.config import reload_settings
@@ -222,6 +223,27 @@ def test_list_change_history_uses_supplied_account_when_ownership_is_unavailable
     assert missing_field["scope"]["account_id"] == "act_111"
     assert inaccessible["scope"]["account_id"] == "act_111"
     assert [call["parent_id"] for call in client.calls] == ["act_111", "act_111"]
+
+
+def test_list_change_history_uses_supplied_account_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutOwnershipClient(FakeActivityClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            raise httpx.ReadTimeout("ownership lookup timed out")
+
+    client = TimedOutOwnershipClient()
+    monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(
+        activity.list_change_history(
+            account_id="111",
+            campaign_id="cmp_123",
+        )
+    )
+
+    assert result["scope"]["account_id"] == "act_111"
+    assert client.calls[0]["parent_id"] == "act_111"
 
 
 def test_list_change_history_rejects_conflicting_scopes() -> None:

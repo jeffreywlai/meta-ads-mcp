@@ -13,6 +13,7 @@ class FakeAudienceClient:
 
     def __init__(self) -> None:
         self.list_calls: list[dict[str, object]] = []
+        self.get_calls: list[dict[str, object]] = []
 
     async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
         self.list_calls.append(
@@ -24,6 +25,9 @@ class FakeAudienceClient:
         return {"id": "aud_created", "payload": data}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.get_calls.append(
+            {"object_id": object_id, "fields": fields, "params": params}
+        )
         return {
             "id": object_id,
             "name": "Existing Audience",
@@ -73,6 +77,31 @@ def test_list_audiences_supports_empty_collection(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: EmptyAudienceClient())
     result = asyncio.run(audiences.list_audiences(account_id="123"))
     assert result["items"] == []
+
+
+def test_get_audience_returns_detailed_single_object(monkeypatch) -> None:
+    client = FakeAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(
+        audiences.get_audience(
+            audience_id="aud_1",
+            fields="id,name,lookalike_spec",
+        )
+    )
+
+    assert result["item"]["id"] == "aud_1"
+    assert result["summary"]["count"] == 1
+
+
+def test_get_audience_normalizes_and_validates_id(monkeypatch) -> None:
+    client = FakeAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+
+    asyncio.run(audiences.get_audience(audience_id=" aud_1 "))
+    assert client.get_calls[0]["object_id"] == "aud_1"
+    with pytest.raises(audiences.ValidationError, match="audience_id is required"):
+        asyncio.run(audiences.get_audience(audience_id=" "))
 
 
 def test_create_custom_audience_returns_created_payload(monkeypatch) -> None:

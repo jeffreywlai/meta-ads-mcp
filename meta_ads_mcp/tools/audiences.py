@@ -7,7 +7,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList
 
@@ -77,6 +77,22 @@ async def list_audiences(
         params=params,
     )
     return normalize_collection(payload)
+
+
+@mcp_server.tool()
+async def get_audience(
+    audience_id: str,
+    fields: FieldList | None = None,
+) -> dict[str, Any]:
+    """Get, fetch, show, or inspect one custom or lookalike audience by id with selectable detail fields."""
+    audience_id = blank_to_none(audience_id)
+    if audience_id is None:
+        raise ValidationError("audience_id is required.")
+    audience = await get_graph_api_client().get_object(
+        audience_id,
+        fields=fields or AUDIENCE_FIELDS,
+    )
+    return {"item": audience, "summary": {"count": 1}}
 
 
 @mcp_server.tool()

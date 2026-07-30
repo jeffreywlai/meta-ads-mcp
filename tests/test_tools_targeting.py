@@ -107,3 +107,109 @@ def test_get_interest_suggestions_rejects_empty_interest_list() -> None:
 def test_get_targeting_categories_requires_class() -> None:
     with pytest.raises(targeting.ValidationError):
         asyncio.run(targeting.get_targeting_categories(category_class=""))
+
+
+def test_paginated_targeting_tools_forward_after_and_preserve_cursor(
+    monkeypatch,
+) -> None:
+    class PagingTargetingClient:
+        def __init__(self) -> None:
+            self.after_values: list[str | None] = []
+
+        def payload(self):
+            return {
+                "data": [{"id": "page_item"}],
+                "paging": {"cursors": {"after": "NEXT_PAGE"}, "next": "next"},
+            }
+
+        async def search_interests(self, *, query, limit=25, after=None):
+            self.after_values.append(after)
+            return self.payload()
+
+        async def get_interest_suggestions(
+            self,
+            *,
+            interest_list,
+            limit=25,
+            after=None,
+        ):
+            self.after_values.append(after)
+            return self.payload()
+
+        async def validate_interests(
+            self,
+            *,
+            interest_list=None,
+            interest_ids=None,
+            after=None,
+        ):
+            self.after_values.append(after)
+            return self.payload()
+
+        async def search_geo_locations(
+            self,
+            *,
+            query,
+            location_types=None,
+            limit=25,
+            after=None,
+        ):
+            self.after_values.append(after)
+            return self.payload()
+
+        async def search_targeting_categories(
+            self,
+            *,
+            account_id,
+            category_class,
+            query=None,
+            limit=25,
+            after=None,
+        ):
+            self.after_values.append(after)
+            return self.payload()
+
+        async def get_reach_frequency_predictions(
+            self,
+            account_id,
+            *,
+            limit=25,
+            after=None,
+        ):
+            self.after_values.append(after)
+            return self.payload()
+
+    client = PagingTargetingClient()
+    monkeypatch.setattr(targeting, "get_graph_api_client", lambda: client)
+    calls = [
+        targeting.search_interests(query="running", after="CURSOR"),
+        targeting.get_interest_suggestions(
+            interest_list=["running"],
+            after="CURSOR",
+        ),
+        targeting.validate_interests(
+            interest_ids=["6003139266461"],
+            after="CURSOR",
+        ),
+        targeting.search_geo_locations(query="New York", after="CURSOR"),
+        targeting.search_behaviors(account_id="123", after="CURSOR"),
+        targeting.get_targeting_categories(
+            category_class="life_events",
+            account_id="123",
+            after="CURSOR",
+        ),
+        targeting.search_demographics(account_id="123", after="CURSOR"),
+        targeting.get_reach_frequency_predictions(
+            account_id="123",
+            after="CURSOR",
+        ),
+    ]
+
+    results = [asyncio.run(call) for call in calls]
+    blank_result = asyncio.run(
+        targeting.search_interests(query="running", after=" ")
+    )
+
+    assert client.after_values == ["CURSOR"] * 8 + [None]
+    assert all(result["paging"]["after"] == "NEXT_PAGE" for result in results)
+    assert blank_result["paging"]["after"] == "NEXT_PAGE"

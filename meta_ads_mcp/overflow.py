@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,7 @@ import mcp.types as mt
 import pydantic_core
 from fastmcp.server.middleware.middleware import CallNext, MiddlewareContext
 from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
+from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 
@@ -37,11 +39,33 @@ DEFAULT_ARTIFACT_MAX_BYTES = 1_000_000_000
 DEFAULT_ARTIFACT_CHUNK_BYTES = 8_000
 MAX_ARTIFACT_CHUNK_BYTES = 8_000
 EXPORT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32}$")
+ARTIFACT_PREFIX = "overflow-"
+ARTIFACT_FILE_PATTERN = re.compile(
+    rf"^{ARTIFACT_PREFIX}([A-Za-z0-9_-]{{32}})\.json$"
+)
+MANIFEST_SUFFIX = ".meta"
+MANIFEST_FILE_PATTERN = re.compile(
+    rf"^{ARTIFACT_PREFIX}([A-Za-z0-9_-]{{32}})"
+    rf"{re.escape(MANIFEST_SUFFIX)}$"
+)
+MAX_MANIFEST_BYTES = 4_096
 LOCK_FILE_NAME = ".overflow.lock"
 DIRECTORY_FD_SUPPORTED = all(
     function in os.supports_dir_fd
     for function in (os.open, os.stat, os.unlink)
 )
+
+
+@contextmanager
+def _owned_fdopen(descriptor: int, mode: str) -> Iterator[Any]:
+    """Transfer an fd to a file object without leaking when fdopen fails."""
+    try:
+        file_object = os.fdopen(descriptor, mode)
+    except Exception:
+        os.close(descriptor)
+        raise
+    with file_object:
+        yield file_object
 
 
 class OverflowArtifactStore:
@@ -68,13 +92,10 @@ class OverflowArtifactStore:
         self._thread_lock = threading.RLock()
 
     def _ensure_directory(self) -> None:
-        """Create or tighten the artifact directory to owner-only access."""
+        """Create the artifact directory without following a final-component link."""
         if self.export_directory.is_symlink():
             raise OSError("META_EXPORT_DIR must not be a symbolic link.")
         self.export_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if not self.export_directory.is_dir():
-            raise OSError("META_EXPORT_DIR must be a directory.")
-        self.export_directory.chmod(0o700)
 
     @staticmethod
     def _validate_export_id(export_id: str) -> str:
@@ -88,12 +109,19 @@ class OverflowArtifactStore:
 
     def _artifact_path(self, export_id: str) -> Path:
         """Resolve a validated opaque id inside the configured directory."""
-        return self.export_directory / f"{self._validate_export_id(export_id)}.json"
+        return self.export_directory / self._artifact_name(
+            self._validate_export_id(export_id)
+        )
 
     @staticmethod
     def _artifact_name(export_id: str) -> str:
         """Return the artifact filename for an already validated id."""
-        return f"{export_id}.json"
+        return f"{ARTIFACT_PREFIX}{export_id}.json"
+
+    @staticmethod
+    def _manifest_name(export_id: str) -> str:
+        """Return the integrity-manifest filename for an opaque artifact id."""
+        return f"{ARTIFACT_PREFIX}{export_id}{MANIFEST_SUFFIX}"
 
     @contextmanager
     def _locked_directory(self) -> Iterator[int]:
@@ -115,21 +143,36 @@ class OverflowArtifactStore:
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
                 )
                 directory_fd = os.open(self.export_directory, directory_flags)
+                directory_stat = os.fstat(directory_fd)
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise OSError("META_EXPORT_DIR must be a directory.")
+                os.fchmod(directory_fd, 0o700)
                 lock_fd = os.open(
                     LOCK_FILE_NAME,
-                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_NONBLOCK", 0),
                     0o600,
                     dir_fd=directory_fd,
                 )
+                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                    raise OSError("Overflow artifact lock must be a regular file.")
                 os.fchmod(lock_fd, 0o600)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 yield directory_fd
             finally:
-                if lock_fd is not None:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    os.close(lock_fd)
-                if directory_fd is not None:
-                    os.close(directory_fd)
+                try:
+                    if lock_fd is not None:
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+                        finally:
+                            os.close(lock_fd)
+                finally:
+                    if directory_fd is not None:
+                        os.close(directory_fd)
 
     def _stat_name(self, name: str, directory_fd: int) -> os.stat_result:
         """Stat a directory-relative name without following symlinks."""
@@ -157,7 +200,7 @@ class OverflowArtifactStore:
         entries = os.listdir(directory_fd)
         artifacts: list[tuple[float, int, str]] = []
         for name in entries:
-            if not name.endswith(".json") or not EXPORT_ID_PATTERN.fullmatch(name[:-5]):
+            if not ARTIFACT_FILE_PATTERN.fullmatch(name):
                 continue
             try:
                 file_stat = self._stat_name(name, directory_fd)
@@ -166,6 +209,63 @@ class OverflowArtifactStore:
             if stat.S_ISREG(file_stat.st_mode):
                 artifacts.append((file_stat.st_mtime, file_stat.st_size, name))
         return artifacts
+
+    def _unlink_artifact_files(self, name: str, directory_fd: int) -> None:
+        """Remove an artifact and its integrity manifest when present."""
+        names = [name]
+        if artifact_match := ARTIFACT_FILE_PATTERN.fullmatch(name):
+            names.append(self._manifest_name(artifact_match.group(1)))
+        for candidate in names:
+            try:
+                candidate_stat = self._stat_name(candidate, directory_fd)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(candidate_stat.st_mode):
+                continue
+            try:
+                self._unlink_name(candidate, directory_fd)
+            except FileNotFoundError:
+                pass
+
+    def _cleanup_orphans_unlocked(
+        self,
+        directory_fd: int,
+    ) -> tuple[int, int]:
+        """Remove reserved-name manifests without a regular paired artifact."""
+        removed_files = 0
+        removed_bytes = 0
+        entries = os.listdir(directory_fd)
+        for name in entries:
+            manifest_match = MANIFEST_FILE_PATTERN.fullmatch(name)
+            if manifest_match is None:
+                continue
+            artifact_name = self._artifact_name(manifest_match.group(1))
+            try:
+                artifact_stat = self._stat_name(artifact_name, directory_fd)
+            except FileNotFoundError:
+                artifact_stat = None
+            if artifact_stat is not None and stat.S_ISREG(artifact_stat.st_mode):
+                continue
+            try:
+                manifest_stat = self._stat_name(name, directory_fd)
+                self._unlink_name(name, directory_fd)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                manifest_stat = None
+            if manifest_stat is not None:
+                removed_files += 1
+                removed_bytes += (
+                    manifest_stat.st_size
+                    if stat.S_ISREG(manifest_stat.st_mode)
+                    else 0
+                )
+            if artifact_stat is not None:
+                try:
+                    self._unlink_name(artifact_name, directory_fd)
+                except OSError:
+                    pass
+        return removed_files, removed_bytes
 
     def _cleanup_unlocked(
         self,
@@ -176,17 +276,15 @@ class OverflowArtifactStore:
     ) -> dict[str, int]:
         """Apply retention limits while the directory lock is held."""
         current_time = time.time() if now is None else now
-        removed_files = 0
-        removed_bytes = 0
+        removed_files, removed_bytes = self._cleanup_orphans_unlocked(
+            directory_fd
+        )
         for modified_at, file_size, name in self._artifact_records(directory_fd):
             if (
                 name != protect_name
                 and current_time - modified_at > self.ttl_seconds
             ):
-                try:
-                    self._unlink_name(name, directory_fd)
-                except FileNotFoundError:
-                    continue
+                self._unlink_artifact_files(name, directory_fd)
                 removed_files += 1
                 removed_bytes += file_size
 
@@ -207,10 +305,7 @@ class OverflowArtifactStore:
                 kept_files += 1
                 kept_bytes += file_size
                 continue
-            try:
-                self._unlink_name(name, directory_fd)
-            except FileNotFoundError:
-                continue
+            self._unlink_artifact_files(name, directory_fd)
             removed_files += 1
             removed_bytes += file_size
 
@@ -239,6 +334,15 @@ class OverflowArtifactStore:
             indent=2,
             default=str,
         ).encode("utf-8")
+        manifest_bytes = json.dumps(
+            {
+                "schema_version": 1,
+                "size": len(artifact_bytes),
+                "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
         if len(artifact_bytes) > self.max_total_bytes:
             raise ValueError("The overflow artifact exceeds META_EXPORT_MAX_BYTES.")
         with self._locked_directory() as directory_fd:
@@ -256,21 +360,78 @@ class OverflowArtifactStore:
                     continue
                 break
 
+            manifest_name = self._manifest_name(export_id)
             try:
-                with os.fdopen(descriptor, "wb") as artifact_file:
+                with _owned_fdopen(descriptor, "wb") as artifact_file:
                     os.fchmod(artifact_file.fileno(), 0o600)
                     artifact_file.write(artifact_bytes)
+                manifest_descriptor = self._open_name(
+                    manifest_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    directory_fd,
+                )
+                with _owned_fdopen(manifest_descriptor, "wb") as manifest_file:
+                    os.fchmod(manifest_file.fileno(), 0o600)
+                    manifest_file.write(manifest_bytes)
                 self._cleanup_unlocked(
                     directory_fd=directory_fd,
                     protect_name=artifact_name,
                 )
             except Exception:
-                try:
-                    self._unlink_name(artifact_name, directory_fd)
-                except FileNotFoundError:
-                    pass
+                self._unlink_artifact_files(artifact_name, directory_fd)
                 raise
             return export_id, len(artifact_bytes)
+
+    def _read_manifest(
+        self,
+        *,
+        export_id: str,
+        directory_fd: int,
+    ) -> tuple[int, str]:
+        """Read and validate a bounded integrity manifest without following links."""
+        try:
+            descriptor = self._open_name(
+                self._manifest_name(export_id),
+                os.O_RDONLY | getattr(os, "O_NONBLOCK", 0),
+                directory_fd,
+            )
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ELOOP, errno.EISDIR, errno.ENXIO}:
+                raise ValidationError(
+                    "Overflow artifact failed integrity validation."
+                ) from exc
+            raise
+        try:
+            manifest_stat = os.fstat(descriptor)
+        except Exception:
+            os.close(descriptor)
+            raise
+        if not stat.S_ISREG(manifest_stat.st_mode):
+            os.close(descriptor)
+            raise ValidationError(
+                "Overflow artifact failed integrity validation."
+            )
+        with _owned_fdopen(descriptor, "rb") as manifest_file:
+            manifest_bytes = manifest_file.read(MAX_MANIFEST_BYTES + 1)
+        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise ValidationError("Overflow artifact failed integrity validation.")
+        try:
+            manifest = json.loads(manifest_bytes)
+            expected_size = manifest["size"]
+            expected_digest = manifest["sha256"]
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise ValidationError(
+                "Overflow artifact failed integrity validation."
+            ) from exc
+        if (
+            manifest.get("schema_version") != 1
+            or not isinstance(expected_size, int)
+            or expected_size < 0
+            or not isinstance(expected_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+        ):
+            raise ValidationError("Overflow artifact failed integrity validation.")
+        return expected_size, expected_digest
 
     def read(
         self,
@@ -291,29 +452,76 @@ class OverflowArtifactStore:
         with self._locked_directory() as directory_fd:
             self._cleanup_unlocked(directory_fd=directory_fd)
             try:
+                path_stat = self._stat_name(artifact_name, directory_fd)
+            except FileNotFoundError as exc:
+                raise NotFoundError(
+                    "Overflow artifact was not found or has expired."
+                ) from exc
+            if not stat.S_ISREG(path_stat.st_mode):
+                raise NotFoundError(
+                    "Overflow artifact was not found or has expired."
+                )
+            expected_size, expected_digest = self._read_manifest(
+                export_id=normalized_export_id,
+                directory_fd=directory_fd,
+            )
+            try:
                 descriptor = self._open_name(
                     artifact_name,
-                    os.O_RDONLY,
+                    os.O_RDONLY | getattr(os, "O_NONBLOCK", 0),
                     directory_fd,
                 )
             except OSError as exc:
-                if exc.errno in {errno.ENOENT, errno.ELOOP, errno.EISDIR}:
+                if exc.errno in {
+                    errno.ENOENT,
+                    errno.ELOOP,
+                    errno.EISDIR,
+                    errno.ENXIO,
+                }:
                     raise NotFoundError(
                         "Overflow artifact was not found or has expired."
                     ) from exc
                 raise
-            with os.fdopen(descriptor, "rb") as artifact_file:
-                file_stat = os.fstat(artifact_file.fileno())
-                if not stat.S_ISREG(file_stat.st_mode):
-                    raise NotFoundError(
-                        "Overflow artifact was not found or has expired."
-                    )
+            try:
+                file_stat = os.fstat(descriptor)
+            except Exception:
+                os.close(descriptor)
+                raise
+            if not stat.S_ISREG(file_stat.st_mode):
+                os.close(descriptor)
+                raise NotFoundError(
+                    "Overflow artifact was not found or has expired."
+                )
+            with _owned_fdopen(descriptor, "rb") as artifact_file:
                 total_bytes = file_stat.st_size
+                if total_bytes != expected_size:
+                    raise ValidationError(
+                        "Overflow artifact failed integrity validation."
+                    )
                 if offset > total_bytes:
                     raise ValidationError("offset exceeds the artifact size.")
                 artifact_file.seek(offset)
                 chunk_bytes = artifact_file.read(max_bytes)
-        next_offset = offset + len(chunk_bytes)
+                next_offset = offset + len(chunk_bytes)
+                if next_offset >= total_bytes:
+                    artifact_file.seek(0)
+                    digest = hashlib.sha256()
+                    while digest_chunk := artifact_file.read(64 * 1024):
+                        digest.update(digest_chunk)
+                    if not secrets.compare_digest(
+                        digest.hexdigest(),
+                        expected_digest,
+                    ):
+                        raise ValidationError(
+                            "Overflow artifact failed integrity validation."
+                        )
+                try:
+                    chunk_data = chunk_bytes.decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise ValidationError(
+                        "Overflow artifact failed integrity validation."
+                    ) from exc
+                os.utime(artifact_file.fileno(), None)
         return {
             "export_id": normalized_export_id,
             "format": "application/json",
@@ -322,7 +530,7 @@ class OverflowArtifactStore:
             "next_offset": next_offset,
             "total_bytes": total_bytes,
             "complete": next_offset >= total_bytes,
-            "data": chunk_bytes.decode("ascii"),
+            "data": chunk_data,
         }
 
     def delete(self, export_id: str) -> dict[str, Any]:
@@ -336,7 +544,7 @@ class OverflowArtifactStore:
                     raise NotFoundError(
                         "Overflow artifact was not found or has expired."
                     )
-                self._unlink_name(artifact_name, directory_fd)
+                self._unlink_artifact_files(artifact_name, directory_fd)
             except FileNotFoundError as exc:
                 raise NotFoundError(
                     "Overflow artifact was not found or has expired."
@@ -360,15 +568,62 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         )
         self.artifact_store = artifact_store
 
+    @staticmethod
+    def _retrieval_message(
+        *,
+        max_size: int,
+        export_id: str,
+        response_kind: str = "response",
+    ) -> str:
+        """Return compact remote-retrieval guidance for an archived payload."""
+        return (
+            f"[{response_kind.capitalize()} exceeded the {max_size:,}-byte "
+            f"inline limit. The complete JSON is available as export_id "
+            f"'{export_id}'. Use call_tool with name='read_overflow_artifact' "
+            f'and arguments={{"export_id": "{export_id}", "offset": 0}} '
+            "repeatedly using next_offset. When done, use call_tool with "
+            "name='delete_overflow_artifact' and that export_id.]"
+        )
+
     async def on_call_tool(
         self,
         context: MiddlewareContext[mt.CallToolRequestParams],
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         """Archive responses whose complete serialized MCP result exceeds the cap."""
-        result = await call_next(context)
         if self.tools is not None and context.message.name not in self.tools:
-            return result
+            return await call_next(context)
+        try:
+            result = await call_next(context)
+        except Exception as exc:
+            error_text = str(exc)
+            error_bytes = len(error_text.encode("utf-8", errors="replace"))
+            error_result = ToolResult(
+                content=[TextContent(type="text", text=error_text)],
+                meta={
+                    "overflow_exception": {
+                        "type": type(exc).__name__,
+                        "message_bytes": error_bytes,
+                    }
+                },
+            )
+            serialized_error = pydantic_core.to_json(error_result, fallback=str)
+            if len(serialized_error) <= self.max_size:
+                raise
+            try:
+                export_id, _artifact_size = self.artifact_store.create(
+                    error_result,
+                    tool_name=context.message.name,
+                )
+            except (OSError, TypeError, ValueError):
+                raise ToolError(self.truncation_suffix.strip()) from None
+            raise ToolError(
+                self._retrieval_message(
+                    max_size=self.max_size,
+                    export_id=export_id,
+                    response_kind="error",
+                )
+            ) from None
 
         serialized = pydantic_core.to_json(result, fallback=str)
         if len(serialized) <= self.max_size:
@@ -396,13 +651,9 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                 },
             )
 
-        message = (
-            f"[Response exceeded the {self.max_size:,}-byte inline limit. "
-            f"The complete JSON response is available as export_id '{export_id}'. "
-            "Use call_tool with name='read_overflow_artifact' and arguments="
-            f'{{"export_id": "{export_id}", "offset": 0}} repeatedly using '
-            "next_offset. When done, use call_tool with "
-            "name='delete_overflow_artifact' and that export_id.]"
+        message = self._retrieval_message(
+            max_size=self.max_size,
+            export_id=export_id,
         )
         return ToolResult(
             content=[TextContent(type="text", text=message)],

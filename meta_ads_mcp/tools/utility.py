@@ -25,6 +25,7 @@ TOOL_GROUPS = {
         "list_ads",
         "get_ad",
         "list_audiences",
+        "get_audience",
         "list_creatives",
         "get_creative",
     ],
@@ -64,6 +65,7 @@ TOOL_GROUPS = {
     "social_feedback": [
         "get_ad_social_context",
         "list_ad_comments",
+        "list_comment_replies",
         "list_page_recommendations",
     ],
     "planning": [
@@ -153,6 +155,7 @@ INTENT_GUIDE = {
             "list_campaigns",
             "list_adsets",
             "list_ads",
+            "list_audiences",
             "get_account_pages",
             "list_instagram_accounts",
         ],

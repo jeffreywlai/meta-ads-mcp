@@ -191,7 +191,8 @@ def _normalize_date_preset(date_preset: str | None) -> str | None:
         supported = ", ".join(sorted(META_DATE_PRESETS))
         aliases = "lifetime->maximum, all_time->maximum, ytd->this_year, last_30_days->last_30d"
         raise ValidationError(
-            f"Unsupported date_preset '{date_preset}'. Supported values: {supported}. Common aliases: {aliases}."
+            f"Unsupported date_preset. Supported values: {supported}. "
+            f"Common aliases: {aliases}."
         )
     return normalized
 
@@ -326,8 +327,8 @@ def _insights_params(
         params["time_increment"] = time_increment
     if action_attribution_windows:
         params["action_attribution_windows"] = ",".join(action_attribution_windows)
-    if after:
-        params["after"] = after
+    if normalized_after := blank_to_none(after):
+        params["after"] = normalized_after
     return params
 
 
@@ -666,8 +667,10 @@ async def summarize_actions(
     max_action_types: int = 25,
     include_all_action_totals: bool = False,
     limit: int = 100,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this for appointment, purchase, lead, or custom action counts over last 30 days or any trailing window."""
+    after = blank_to_none(after)
     if max_action_types < 1 or max_action_types > 100:
         raise ValidationError("max_action_types must be between 1 and 100.")
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
@@ -699,8 +702,14 @@ async def summarize_actions(
         breakdowns=breakdowns,
         time_increment=time_increment,
         limit=limit,
+        after=after,
     )
     rows = payload["items"]
+    paging = payload.get(
+        "paging",
+        {"before": None, "after": None, "next": None},
+    )
+    complete = not bool(paging.get("next"))
     all_totals = _action_totals(rows)
     totals = all_totals if include_all_action_totals else all_totals[:max_action_types]
     response: dict[str, Any] = {
@@ -709,6 +718,8 @@ async def summarize_actions(
         "requested_action_types": action_types or [],
         "action_filter_mode": "filtered" if action_types else "all",
         "action_totals": totals,
+        "paging": paging,
+        "complete": complete,
         "action_totals_summary": {
             "returned": len(totals),
             "total_action_types": len(all_totals),
@@ -723,6 +734,17 @@ async def summarize_actions(
         response["all_action_totals_included"] = True
     if include_rows:
         response["rows"] = _compact_action_rows(rows)
+    if not complete:
+        if paging.get("next") and paging.get("after"):
+            response["next_step"] = (
+                "These totals cover one Meta page. Rerun summarize_actions with "
+                f"after='{paging['after']}' and combine page totals."
+            )
+        else:
+            response["next_step"] = (
+                "These totals cover one Meta page; use a narrower query or an "
+                "async insights report to obtain a complete result."
+            )
     return response
 
 
@@ -736,8 +758,10 @@ async def get_performance_breakdown(
     until: str | None = None,
     fields: FieldList | None = None,
     sort_by: str = "spend",
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants ranked segment performance, such as by country, device, or age."""
+    after = blank_to_none(after)
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -747,6 +771,7 @@ async def get_performance_breakdown(
         fields=fields,
         breakdowns=[breakdown],
         limit=500,
+        after=after,
     )
     ranked = sorted(
         payload["items"],
@@ -762,6 +787,7 @@ async def get_performance_breakdown(
             "metrics": payload["summary"]["metrics"],
             "top_segments": ranked[:5],
             "bottom_segments": ranked[-5:] if ranked else [],
+            "complete": not bool(payload["paging"].get("next")),
         },
     )
 
@@ -893,6 +919,7 @@ async def export_insights(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user explicitly wants export-style output; JSON returns structured rows, CSV returns serialized text."""
+    after = blank_to_none(after)
     export_format = format.lower()
     if export_format not in {"json", "csv"}:
         raise ValidationError("format must be 'json' or 'csv'.")
@@ -932,7 +959,7 @@ async def export_insights(
         "next": None,
     }
     inline_truncated = len(returned_rows) < len(rows)
-    has_more_pages = bool(paging.get("after") or paging.get("next"))
+    has_more_pages = bool(paging.get("next"))
     truncated = inline_truncated or has_more_pages
     response = {
         "format": export_format,
@@ -1003,7 +1030,7 @@ async def create_async_insights_report(
 ) -> dict[str, Any]:
     """Use this when the reporting query is large enough that a synchronous insights call would be too heavy."""
     client = get_graph_api_client()
-    requested_fields = fields or DEFAULT_INSIGHTS_FIELDS
+    requested_fields = normalize_field_list(fields) or DEFAULT_INSIGHTS_FIELDS
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
     payload = await client.create_async_insights_report(
         resolved_object_id,
@@ -1036,6 +1063,7 @@ async def get_async_insights_report(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this after create_async_insights_report to poll status and fetch rows when the job is ready."""
+    after = blank_to_none(after)
     client = get_graph_api_client()
     payload = await client.get_async_report(
         report_run_id,

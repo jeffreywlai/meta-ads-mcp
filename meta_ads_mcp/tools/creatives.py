@@ -7,7 +7,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList
 
@@ -81,6 +81,9 @@ async def get_creative(
     fields: FieldList | None = None,
 ) -> dict[str, Any]:
     """Get, fetch, look up, show, or inspect what is in one creative by id, including full details for url_tags, asset_feed_spec, object_story_spec, and degrees_of_freedom_spec."""
+    creative_id = blank_to_none(creative_id)
+    if creative_id is None:
+        raise ValidationError("creative_id is required.")
     client = get_graph_api_client()
     creative = await client.get_object(creative_id, fields=fields or CREATIVE_FIELDS)
     return {"item": creative, "summary": {"count": 1}}

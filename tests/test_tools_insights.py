@@ -176,6 +176,29 @@ def test_get_entity_insights_rejects_unknown_date_preset_before_api(monkeypatch)
         )
 
 
+def test_tool_layer_bounds_invalid_date_preset_in_errors_and_logs(capsys) -> None:
+    oversized_value = "sensitive-invalid-value-" * 3_000
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(
+            mcp_server.call_tool(
+                "get_insights",
+                {
+                    "level": "account",
+                    "object_id": "act_123",
+                    "date_preset": oversized_value,
+                },
+            )
+        )
+    captured = capsys.readouterr()
+    emitted = captured.out + captured.err
+
+    assert "Unsupported date_preset" in str(exc_info.value)
+    assert oversized_value not in str(exc_info.value)
+    assert oversized_value not in emitted
+    assert len(emitted.encode("utf-8")) < MAX_TOOL_RESPONSE_BYTES
+
+
 def test_get_entity_insights_translates_lifetime_date_alias(monkeypatch) -> None:
     class LifetimeAliasClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):
@@ -420,6 +443,106 @@ def test_summarize_actions_reports_explicit_window_without_default_preset(monkey
     assert result["action_filter_mode"] == "all"
 
 
+def test_summarize_actions_exposes_partial_page_and_continuation(monkeypatch) -> None:
+    class PagingActionClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["after"] == "CURRENT_PAGE"
+            payload = await super().get_insights(
+                object_id,
+                fields=fields,
+                params=params,
+            )
+            payload["paging"] = {
+                "cursors": {"after": "NEXT_PAGE"},
+                "next": "next",
+            }
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PagingActionClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            after="CURRENT_PAGE",
+        )
+    )
+
+    assert result["complete"] is False
+    assert result["paging"]["after"] == "NEXT_PAGE"
+    assert "after='NEXT_PAGE'" in result["next_step"]
+
+
+def test_composite_insights_tools_normalize_blank_after(monkeypatch) -> None:
+    calls: list[object] = []
+
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs["after"])
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {"count": 0, "metrics": {}},
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            after=" ",
+        )
+    )
+    asyncio.run(
+        insights.get_performance_breakdown(
+            level="campaign",
+            object_id="cmp_1",
+            breakdown="country",
+            after=" ",
+        )
+    )
+
+    assert calls == [None, None]
+
+
+def test_terminal_after_cursor_without_next_is_complete(monkeypatch) -> None:
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        return {
+            "items": [],
+            "paging": {
+                "before": None,
+                "after": "END_CURSOR",
+                "next": None,
+            },
+            "summary": {"count": 0, "metrics": {}},
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    actions = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+        )
+    )
+    breakdown = asyncio.run(
+        insights.get_performance_breakdown(
+            level="campaign",
+            object_id="cmp_1",
+            breakdown="country",
+        )
+    )
+    exported = asyncio.run(
+        insights.export_insights(
+            level="campaign",
+            object_id="cmp_1",
+        )
+    )
+
+    assert actions["complete"] is True
+    assert "next_step" not in actions
+    assert breakdown["summary"]["complete"] is True
+    assert exported["complete"] is True
+    assert exported["truncated"] is False
+
+
 def test_compare_performance_ranks_multiple_objects(monkeypatch) -> None:
     async def fake_get_entity_insights(*, object_id: str, **_: object) -> dict[str, object]:
         metrics = {
@@ -523,7 +646,8 @@ def test_compare_performance_reports_effective_window(monkeypatch) -> None:
 
 
 def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:
-    async def fake_get_entity_insights(**_: object) -> dict[str, object]:
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        assert kwargs["after"] == "CURRENT_PAGE"
         return {
             "items": [
                 {"country": "US", "metrics": {"spend": 100.0, "roas": 1.0}},
@@ -536,10 +660,16 @@ def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:
 
     monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
     result = asyncio.run(
-        insights.get_performance_breakdown(level="campaign", object_id="cmp_1", breakdown="country")
+        insights.get_performance_breakdown(
+            level="campaign",
+            object_id="cmp_1",
+            breakdown="country",
+            after="CURRENT_PAGE",
+        )
     )
     assert result["items"][0]["country"] == "CA"
     assert result["summary"]["top_segments"][0]["country"] == "CA"
+    assert result["summary"]["complete"] is False
     assert result["paging"]["after"] == "after_1"
 
 

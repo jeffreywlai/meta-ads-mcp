@@ -397,6 +397,7 @@ These are the core v1 tools.
 
 - `get_ad_social_context`
 - `list_ad_comments`
+- `list_comment_replies`
 - `list_page_recommendations`
 - `get_ad_feedback_signals`
 
@@ -632,8 +633,9 @@ Return a normalized insights report for an account, campaign, ad set, or ad.
 
 Underlying API surface:
 
-- Meta insights edge
-- sync or async depending on payload size
+- synchronous Meta insights edge
+- use `create_async_insights_report` explicitly for queries too large for a
+  synchronous request
 
 Inputs:
 
@@ -648,6 +650,7 @@ Inputs:
 - `use_unified_attribution_setting`
 - `action_attribution_windows`
 - `limit`
+- `after`
 
 Output:
 
@@ -676,6 +679,7 @@ Output:
 - compact action totals
 - matched action types and whether the action filter is `all` or `filtered`
 - summary metrics
+- paging, completeness, and a continuation hint when totals cover only one page
 - Meta attribution notice for conversion-source caveats
 
 ### `get_performance_breakdown`
@@ -701,6 +705,7 @@ Inputs:
 - `date_preset` or `since` and `until`
 - `fields`
 - `sort_by`
+- `after`
 
 Output:
 
@@ -708,6 +713,30 @@ Output:
 - summary totals
 - derived KPIs by segment
 - top and bottom performers
+- paging and completeness
+
+### `export_insights`
+
+Purpose:
+Return export-style JSON rows or CSV text while keeping large results
+retrievable through the server overflow-artifact flow.
+
+Inputs:
+
+- the core `get_entity_insights` filters
+- `format`: `json` or `csv`
+- `limit` and optional `after`
+- `inline_limit`
+- `allow_large_output`
+
+Output:
+
+- structured rows or CSV text
+- the effective reporting window
+- Meta paging and the next cursor
+- truncation guidance when `inline_limit` is reached
+- for responses above the MCP inline cap, an overflow `export_id` that can be
+  read in bounded chunks and deleted after retrieval
 
 ### `compare_time_ranges`
 
@@ -875,6 +904,26 @@ Output:
 - paging cursor for one surface, or per-surface paging when `surface="all"`
 - API-call count and parent ids used
 - structured unavailable output for permission-gated Page/Instagram surfaces
+
+### `list_comment_replies`
+
+Purpose:
+Continue the paginated replies for one Facebook or Instagram comment.
+
+Inputs:
+
+- `comment_id`
+- `surface`: `facebook` or `instagram`
+- `limit` and optional `after`
+- `include_author`
+- `max_message_chars`
+
+Output:
+
+- compact normalized replies
+- paging cursor for the next reply page
+- API-call and edge metadata
+- structured unavailable output for permission-gated surfaces
 
 ### `list_page_recommendations`
 

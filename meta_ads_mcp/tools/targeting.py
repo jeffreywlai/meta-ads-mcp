@@ -8,7 +8,7 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 
 
 def _resolve_account_id(account_id: str | None) -> str:
@@ -20,15 +20,26 @@ def _resolve_account_id(account_id: str | None) -> str:
     raise ValidationError("account_id is required when META_DEFAULT_ACCOUNT_ID is not set.")
 
 
+def _cursor_options(after: str | None) -> dict[str, str]:
+    """Return a Graph cursor argument only when it is nonblank."""
+    cursor = blank_to_none(after)
+    return {"after": cursor} if cursor else {}
+
+
 @mcp_server.tool()
 async def search_interests(
     query: str,
     account_id: str | None = None,
     limit: int = 25,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants to find interest targeting options from a free-text query."""
     client = get_graph_api_client()
-    payload = await client.search_interests(query=query, limit=limit)
+    payload = await client.search_interests(
+        query=query,
+        limit=limit,
+        **_cursor_options(after),
+    )
     return normalize_collection(payload)
 
 
@@ -36,12 +47,17 @@ async def search_interests(
 async def get_interest_suggestions(
     interest_list: list[str],
     limit: int = 25,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user already has seed interests and wants closely related targeting ideas."""
     if not interest_list:
         raise ValidationError("interest_list must contain at least one interest.")
     client = get_graph_api_client()
-    payload = await client.get_interest_suggestions(interest_list=interest_list, limit=limit)
+    payload = await client.get_interest_suggestions(
+        interest_list=interest_list,
+        limit=limit,
+        **_cursor_options(after),
+    )
     return normalize_collection(payload)
 
 
@@ -49,12 +65,17 @@ async def get_interest_suggestions(
 async def validate_interests(
     interest_list: list[str] | None = None,
     interest_ids: list[str] | None = None,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants to confirm that proposed interests still resolve in Meta's targeting catalog."""
     if not interest_list and not interest_ids:
         raise ValidationError("Provide interest_list or interest_ids.")
     client = get_graph_api_client()
-    payload = await client.validate_interests(interest_list=interest_list, interest_ids=interest_ids)
+    payload = await client.validate_interests(
+        interest_list=interest_list,
+        interest_ids=interest_ids,
+        **_cursor_options(after),
+    )
     return normalize_collection(payload)
 
 
@@ -63,10 +84,16 @@ async def search_geo_locations(
     query: str,
     location_types: list[str] | None = None,
     limit: int = 25,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants countries, regions, cities, or other geo targeting matches from text."""
     client = get_graph_api_client()
-    payload = await client.search_geo_locations(query=query, location_types=location_types, limit=limit)
+    payload = await client.search_geo_locations(
+        query=query,
+        location_types=location_types,
+        limit=limit,
+        **_cursor_options(after),
+    )
     return normalize_collection(payload)
 
 
@@ -75,6 +102,7 @@ async def search_behaviors(
     query: str | None = None,
     account_id: str | None = None,
     limit: int = 25,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants behavior-based targeting options rather than interests or demographics."""
     client = get_graph_api_client()
@@ -83,6 +111,7 @@ async def search_behaviors(
         category_class="behaviors",
         query=query,
         limit=limit,
+        **_cursor_options(after),
     )
     return normalize_collection(payload)
 
@@ -93,6 +122,7 @@ async def get_targeting_categories(
     query: str | None = None,
     account_id: str | None = None,
     limit: int = 25,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user knows the targeting category class they want and needs matching options."""
     if not category_class:
@@ -103,6 +133,7 @@ async def get_targeting_categories(
         category_class=category_class,
         query=query,
         limit=limit,
+        **_cursor_options(after),
     )
     return normalize_collection(payload)
 
@@ -113,6 +144,7 @@ async def search_demographics(
     query: str | None = None,
     account_id: str | None = None,
     limit: int = 25,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants demographic targeting options such as age, education, or life-stage categories."""
     if not demographic_class:
@@ -123,6 +155,7 @@ async def search_demographics(
         category_class=demographic_class,
         query=query,
         limit=limit,
+        **_cursor_options(after),
     )
     return normalize_collection(payload)
 
@@ -147,8 +180,13 @@ async def estimate_audience_size(
 async def get_reach_frequency_predictions(
     account_id: str | None = None,
     limit: int = 25,
+    after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants existing reach-and-frequency prediction objects for an account."""
     client = get_graph_api_client()
-    payload = await client.get_reach_frequency_predictions(_resolve_account_id(account_id), limit=limit)
+    payload = await client.get_reach_frequency_predictions(
+        _resolve_account_id(account_id),
+        limit=limit,
+        **_cursor_options(after),
+    )
     return normalize_collection(payload)

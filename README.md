@@ -5,7 +5,7 @@
 [![FastMCP 3.1](https://img.shields.io/badge/FastMCP-3.1-green.svg)](https://github.com/jlowin/fastmcp)
 [![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
-**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 92 tools for querying, managing, and optimizing your ad accounts through natural language.**
+**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 94 tools for querying, managing, and optimizing your ad accounts through natural language.**
 
 > Ask Claude or Gemini to "show me which creatives are fatiguing" or "give me an optimization snapshot for this account" — and it just works.
 
@@ -13,16 +13,16 @@
 
 ## ✨ Features
 
-- 📊 **92 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **94 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, and v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 92 up front
+- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 94 up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (92)
+## 📋 Available Tools (94)
 
 ### 🔍 Discovery
 
@@ -39,6 +39,7 @@
 | `list_ads` | List ads in an ad set or account |
 | `get_ad` | Get details for a specific ad |
 | `list_audiences` | List custom and lookalike audiences |
+| `get_audience` | Read one custom or lookalike audience by ID |
 | `list_creatives` | List ad creatives in an account |
 | `get_creative` | Read one ad creative by ID with selectable fields |
 
@@ -84,6 +85,7 @@
 |------|-------------|
 | `get_ad_social_context` | Resolve Facebook post and Instagram media ids behind an ad |
 | `list_ad_comments` | Read compact raw Facebook or Instagram comments for an ad or social object |
+| `list_comment_replies` | Continue paginated replies for one Facebook or Instagram comment |
 | `list_page_recommendations` | Read compact Facebook Page recommendations, reviews, or testimonials |
 
 ### 🧾 Activity History
@@ -231,7 +233,9 @@ from local or remote MCP transports. Then use `call_tool` with
 `name="delete_overflow_artifact"`. When `META_EXPORT_DIR` is omitted, the
 server uses the operating system's temporary `meta-ads-mcp-exports` directory.
 Artifacts expire after 24 hours by default, and the store retains at most 100
-files and 1 GB; the three retention variables above override those defaults.
+response artifacts totaling 1 GB of JSON payload data; small private integrity
+manifests are stored alongside those payloads. The three retention variables
+above override those defaults.
 If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
 

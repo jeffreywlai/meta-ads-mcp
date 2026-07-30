@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
+import httpx
+
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, ValidationError
@@ -79,7 +81,7 @@ async def _resolve_object_account_id(
     configured_account_id = _configured_account_id(account_id)
     try:
         payload = await client.get_object(object_id, fields=["account_id"])
-    except MetaAdsError:
+    except (MetaAdsError, httpx.HTTPError):
         if configured_account_id is not None:
             return configured_account_id
         raise
