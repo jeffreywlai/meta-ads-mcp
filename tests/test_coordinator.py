@@ -27,7 +27,7 @@ def test_fastmcp_31_search_transform_is_configured() -> None:
 
 def test_response_size_guard_is_configured() -> None:
     middleware = mcp_server.middleware[-1]
-    assert type(middleware).__name__ == "SerializedResponseLimitingMiddleware"
+    assert type(middleware).__name__ == "ArchivedResponseLimitingMiddleware"
     assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
     assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
 

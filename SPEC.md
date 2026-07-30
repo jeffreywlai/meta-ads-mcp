@@ -268,8 +268,9 @@ The FastMCP server instructions should tell the LLM:
 - If a metric is not available, omit it and record why in `missing_signals`.
 - LLM-facing `fields` inputs accept either JSON string arrays or
   comma-separated strings.
-- The MCP transport caps oversized tool responses and appends recovery guidance
-  to narrow fields, lower limits, or use the reporting export path.
+- The MCP transport caps inline tool responses. Oversized results are preserved
+  as complete private JSON artifacts and replaced inline with the artifact path
+  plus guidance to narrow fields or lower limits.
 
 ## Response Contracts
 

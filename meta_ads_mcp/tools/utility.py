@@ -540,6 +540,7 @@ async def get_capabilities(
             "META_APP_ID",
             "META_APP_SECRET",
             "META_REDIRECT_URI",
+            "META_EXPORT_DIR",
         ],
     }
     notes = [
@@ -547,6 +548,7 @@ async def get_capabilities(
         "FastMCP 3.1 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
         "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
         "export_insights is a convenience wrapper over the core insights surface.",
+        "Oversized tool responses are saved as complete JSON files under META_EXPORT_DIR or the operating system temp directory.",
         "Pass intent to get_capabilities for a compact routing response instead of the full manifest.",
         "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
         "Use list_instagram_accounts when creative setup requires an Instagram identity rather than a Facebook Page.",

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
+import stat
+
 import pydantic_core
 import pytest
 
@@ -918,14 +922,19 @@ def test_get_async_insights_report_preserves_error_fields(monkeypatch) -> None:
     assert result["rows"]["summary"]["count"] == 0
 
 
-def test_mcp_response_guard_caps_oversized_insights_with_hint(monkeypatch) -> None:
+def test_mcp_response_guard_archives_complete_oversized_insights(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    oversized_name = "oversized-" + ('\\"' * 100_000)
+
     class OversizedInsightsClient:
         async def get_insights(self, object_id: str, *, fields, params):
             return {
                 "data": [
                     {
                         "ad_id": "ad_1",
-                        "ad_name": "oversized-" + ('\\"' * 100_000),
+                        "ad_name": oversized_name,
                         "spend": "1",
                         "impressions": "10",
                         "clicks": "1",
@@ -933,6 +942,41 @@ def test_mcp_response_guard_caps_oversized_insights_with_hint(monkeypatch) -> No
                 ]
             }
 
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
+    middleware = mcp_server.middleware[-1]
+    monkeypatch.setattr(middleware, "export_directory", tmp_path)
+
+    result = asyncio.run(
+        mcp_server.call_tool(
+            "get_insights",
+            {"level": "ad", "object_id": "ad_1", "time_increment": 1},
+        )
+    )
+
+    assert result.structured_content is None
+    overflow = result.meta["overflow"]
+    assert overflow["archived"] is True
+    artifact_path = Path(overflow["artifact_path"])
+    assert str(artifact_path) in result.content[0].text
+    archived = json.loads(artifact_path.read_text())
+    assert archived["items"][0]["ad_name"] == oversized_name
+    assert overflow["artifact_bytes"] == artifact_path.stat().st_size
+    assert stat.S_IMODE(artifact_path.stat().st_mode) == 0o600
+    assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES
+
+
+def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class OversizedInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            return {"data": [{"ad_id": "ad_1", "ad_name": "x" * 100_000}]}
+
+    blocked_directory = tmp_path / "not-a-directory"
+    blocked_directory.write_text("blocked")
+    middleware = mcp_server.middleware[-1]
+    monkeypatch.setattr(middleware, "export_directory", blocked_directory)
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
 
     result = asyncio.run(
@@ -943,5 +987,6 @@ def test_mcp_response_guard_caps_oversized_insights_with_hint(monkeypatch) -> No
     )
 
     assert result.structured_content is None
+    assert result.meta["overflow"]["archived"] is False
     assert RESPONSE_LIMIT_HINT.strip() in result.content[0].text
     assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES

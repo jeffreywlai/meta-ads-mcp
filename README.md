@@ -213,9 +213,14 @@ export META_API_VERSION='v25.0'
 export META_APP_ID='YOUR_APP_ID'
 export META_APP_SECRET='YOUR_APP_SECRET'
 export META_REDIRECT_URI='https://example.com/callback'
+export META_EXPORT_DIR='/path/to/meta-ads-exports'
 ```
 
 You can also place these in a `.env` file at the repo root.
+
+`META_EXPORT_DIR` is optional. Oversized MCP responses are saved there as
+complete private JSON files; when omitted, the server uses the operating
+system's temporary `meta-ads-mcp-exports` directory.
 
 Don't have a token? Use the built-in auth helper tools (`generate_auth_url` → `exchange_code_for_token` → `refresh_to_long_lived_token`) to create one interactively.
 
