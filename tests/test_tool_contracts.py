@@ -52,6 +52,9 @@ def _registered_tools() -> dict[str, Any]:
 
 
 REGISTERED_TOOLS = _registered_tools()
+FIELD_TOOL_NAMES = sorted(
+    name for name, fn in REGISTERED_TOOLS.items() if "fields" in inspect.signature(fn).parameters
+)
 SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 SAMPLE_TARGETING = {
@@ -685,6 +688,22 @@ def test_capabilities_manifest_matches_registered_tools() -> None:
     """The capability tool should stay in sync with the actual registry."""
     declared = {tool for tools in utility.TOOL_GROUPS.values() for tool in tools}
     assert declared == set(REGISTERED_TOOLS)
+
+
+@pytest.mark.parametrize("tool_name", FIELD_TOOL_NAMES)
+def test_every_fields_parameter_accepts_csv_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """LLM-style comma-separated field lists should pass MCP validation everywhere."""
+    _patch_clients(monkeypatch)
+    fn = REGISTERED_TOOLS[tool_name]
+    kwargs = _tool_kwargs(tool_name, fn)
+    kwargs["fields"] = "id, name, url_tags"
+
+    result = asyncio.run(mcp_server.call_tool(tool_name, kwargs))
+
+    assert result.structured_content is not None
 
 
 @pytest.mark.parametrize("tool_name", sorted(REGISTERED_TOOLS))

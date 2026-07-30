@@ -9,19 +9,24 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import normalize_collection
 from meta_ads_mcp.schemas import mutation_response
+from meta_ads_mcp.tool_types import FieldList
 
 
-AUDIENCE_FIELDS = [
+AUDIENCE_SUMMARY_FIELDS = [
     "id",
     "name",
     "subtype",
-    "description",
-    "customer_file_source",
     "approximate_count_lower_bound",
     "approximate_count_upper_bound",
-    "retention_days",
     "time_updated",
     "operation_status",
+]
+
+AUDIENCE_FIELDS = [
+    *AUDIENCE_SUMMARY_FIELDS,
+    "description",
+    "customer_file_source",
+    "retention_days",
     "lookalike_spec",
 ]
 
@@ -56,6 +61,7 @@ async def list_audiences(
     subtype: str | None = None,
     limit: int = 50,
     after: str | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
     """Use this when the user needs audience ids, sizes, or subtype metadata for one ad account."""
     client = get_graph_api_client()
@@ -67,7 +73,7 @@ async def list_audiences(
     payload = await client.list_objects(
         normalize_account_id(account_id),
         "customaudiences",
-        fields=AUDIENCE_FIELDS,
+        fields=fields or AUDIENCE_SUMMARY_FIELDS,
         params=params,
     )
     return normalize_collection(payload)

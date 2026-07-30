@@ -8,8 +8,21 @@ from typing import Any, Callable
 
 try:
     from fastmcp import FastMCP
+    from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
     from fastmcp.server.transforms.search import BM25SearchTransform
 except ImportError:  # pragma: no cover - fallback for tests without the package
+    class ResponseLimitingMiddleware:  # type: ignore[override]
+        """Minimal local fallback for tests without FastMCP."""
+
+        def __init__(
+            self,
+            *,
+            max_size: int,
+            truncation_suffix: str,
+        ) -> None:
+            self.max_size = max_size
+            self.truncation_suffix = truncation_suffix
+
     class BM25SearchTransform:  # type: ignore[override]
         """Minimal local fallback for the FastMCP 3.1 search transform."""
 
@@ -66,6 +79,9 @@ except ImportError:  # pragma: no cover - fallback for tests without the package
         def add_transform(self, transform: Any) -> None:
             self.transforms.append(transform)
             self._transforms.append(transform)
+
+        def add_middleware(self, middleware: Any) -> None:
+            self.middleware = [*getattr(self, "middleware", []), middleware]
 
         async def list_tools(self, *, run_middleware: bool = True) -> list[Any]:
             _ = run_middleware
@@ -156,6 +172,11 @@ TOOL_SEARCH_TRANSFORM = BM25SearchTransform(
     search_result_serializer=serialize_search_results_compact,
 )
 
+MAX_TOOL_RESPONSE_BYTES = 64_000
+RESPONSE_LIMIT_HINT = (
+    "\n\n[Response exceeded the safe inline size. Narrow fields, lower limit, "
+    "or use export_insights for large reporting datasets.]"
+)
 
 mcp_server = FastMCP(
     name="Meta Ads FastMCP",
@@ -170,7 +191,9 @@ mcp_server = FastMCP(
         "use list_ad_accounts and discovery tools to find ids. Use "
         "get_account_pages before creative creation when a Page-linked asset "
         "is needed and list_instagram_accounts when an Instagram identity is "
-        "needed. For detailed reporting use get_entity_insights. For "
+        "needed. Use get_creative when a creative id is already known and "
+        "full creative fields are needed. For detailed reporting use "
+        "get_entity_insights. For "
         "action counts like appointments use summarize_actions. For "
         "multi-entity comparisons use compare_performance. For explicit account "
         "period comparisons use get_account_health_snapshot. For cannibalization "
@@ -191,4 +214,10 @@ mcp_server = FastMCP(
     ),
     transforms=[TOOL_SEARCH_TRANSFORM],
     mask_error_details=False,
+)
+mcp_server.add_middleware(
+    ResponseLimitingMiddleware(
+        max_size=MAX_TOOL_RESPONSE_BYTES,
+        truncation_suffix=RESPONSE_LIMIT_HINT,
+    )
 )

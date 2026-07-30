@@ -23,6 +23,7 @@ TOOL_GROUPS = {
         "get_ad",
         "list_audiences",
         "list_creatives",
+        "get_creative",
     ],
     "analysis": [
         "get_insights",
@@ -257,6 +258,7 @@ INTENT_GUIDE = {
             "get_account_pages",
             "list_instagram_accounts",
             "list_creatives",
+            "get_creative",
             "get_ad_image",
             "preview_ad",
             "upload_creative_asset",
@@ -264,7 +266,10 @@ INTENT_GUIDE = {
             "create_ad",
         ],
         "avoid_unless_needed": [],
-        "notes": ["Use get_account_pages and list_instagram_accounts before creative creation when an identity is required."],
+        "notes": [
+            "Use get_creative when a creative id is already known and full creative fields are needed.",
+            "Use get_account_pages and list_instagram_accounts before creative creation when an identity is required.",
+        ],
     },
     "research_competitor_ads": {
         "description": "Search public Ads Library data for competitor or market research.",

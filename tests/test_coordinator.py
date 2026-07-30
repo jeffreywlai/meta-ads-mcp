@@ -8,6 +8,8 @@ from meta_ads_mcp import stdio  # noqa: F401 - ensures tools are registered
 from meta_ads_mcp.config import Settings
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
+    MAX_TOOL_RESPONSE_BYTES,
+    RESPONSE_LIMIT_HINT,
     mcp_server,
     serialize_search_results_compact,
 )
@@ -21,6 +23,13 @@ def test_fastmcp_31_search_transform_is_configured() -> None:
     assert type(transform).__name__ == "BM25SearchTransform"
     assert sorted(getattr(transform, "_always_visible", set())) == sorted(ALWAYS_VISIBLE_TOOLS)
     assert getattr(transform, "_search_result_serializer", None) is serialize_search_results_compact
+
+
+def test_response_size_guard_is_configured() -> None:
+    middleware = mcp_server.middleware[-1]
+    assert type(middleware).__name__ == "ResponseLimitingMiddleware"
+    assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
+    assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
 
 
 def test_list_tools_exposes_compact_search_surface() -> None:
@@ -86,6 +95,9 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
     terse_campaigns = asyncio.run(search("campaigns"))
     terse_actions = asyncio.run(search("appointments last 30 days"))
     terse_pause = asyncio.run(search("pause ad set"))
+    creative_read = asyncio.run(
+        search("full creative spec by id including url_tags asset_feed_spec degrees_of_freedom")
+    )
 
     assert feedback.splitlines()[1].startswith("- `get_ad_feedback_signals`")
     assert raw_comments.splitlines()[1].startswith("- `list_ad_comments`")
@@ -97,6 +109,7 @@ def test_search_routes_feedback_and_action_count_workflows() -> None:
     assert terse_campaigns.splitlines()[1].startswith("- `list_campaigns`")
     assert terse_actions.splitlines()[1].startswith("- `summarize_actions`")
     assert terse_pause.splitlines()[1].startswith("- `set_adset_status`")
+    assert creative_read.splitlines()[1].startswith("- `get_creative`")
 
 
 def test_compare_performance_responds_through_tool_layer(monkeypatch) -> None:

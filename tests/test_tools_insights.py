@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 
+from meta_ads_mcp.coordinator import MAX_TOOL_RESPONSE_BYTES, RESPONSE_LIMIT_HINT, mcp_server
 from meta_ads_mcp.tools import insights
 
 
@@ -914,3 +915,32 @@ def test_get_async_insights_report_preserves_error_fields(monkeypatch) -> None:
     result = asyncio.run(insights.get_async_insights_report(report_run_id="rpt_123"))
     assert result["status"]["error_message"] == "bad report"
     assert result["rows"]["summary"]["count"] == 0
+
+
+def test_mcp_response_guard_caps_oversized_insights_with_hint(monkeypatch) -> None:
+    class OversizedInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            return {
+                "data": [
+                    {
+                        "ad_id": "ad_1",
+                        "ad_name": "oversized-" + ("x" * 100_000),
+                        "spend": "1",
+                        "impressions": "10",
+                        "clicks": "1",
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
+
+    result = asyncio.run(
+        mcp_server.call_tool(
+            "get_insights",
+            {"level": "ad", "object_id": "ad_1", "time_increment": 1},
+        )
+    )
+
+    assert result.structured_content is None
+    assert RESPONSE_LIMIT_HINT.strip() in result.content[0].text
+    assert len(result.content[0].text.encode("utf-8")) < MAX_TOOL_RESPONSE_BYTES

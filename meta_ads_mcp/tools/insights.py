@@ -16,6 +16,7 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, normalize_insights_row
 from meta_ads_mcp.schemas import analysis_response, collection_response
+from meta_ads_mcp.tool_types import FieldList
 
 DEFAULT_INSIGHTS_FIELDS = [
     "campaign_id",
@@ -279,7 +280,7 @@ def _filter_action_arrays(row: dict[str, Any], patterns: list[str]) -> dict[str,
     return filtered
 
 
-def _insights_fields(fields: list[str] | None, *, action_types: list[str] | None = None) -> list[str]:
+def _insights_fields(fields: FieldList | None, *, action_types: list[str] | None = None) -> list[str]:
     """Return requested fields with action-filter dependencies when needed."""
     requested = list(fields or DEFAULT_INSIGHTS_FIELDS)
     if not action_types:
@@ -417,7 +418,7 @@ async def _object_name(object_id: str) -> str | None:
     return str(name) if name is not None else None
 
 
-def _comparison_fields(level: str, fields: list[str] | None) -> list[str] | None:
+def _comparison_fields(level: str, fields: FieldList | None) -> list[str] | None:
     """Ensure comparison requests can resolve names without extra lookups when possible."""
     if fields is None:
         return None
@@ -455,7 +456,7 @@ async def _comparison_row(
     date_preset: str | None,
     since: str | None,
     until: str | None,
-    fields: list[str] | None,
+    fields: FieldList | None,
     breakdowns: list[str] | None,
     action_breakdowns: list[str] | None,
     time_increment: int | str | None,
@@ -565,7 +566,7 @@ async def get_entity_insights(
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     action_types: list[str] | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
@@ -614,7 +615,7 @@ async def get_insights(
     since: str | None = None,
     until: str | None = None,
     time_range: dict[str, str] | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     action_types: list[str] | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
@@ -725,7 +726,7 @@ async def get_performance_breakdown(
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     sort_by: str = "spend",
 ) -> dict[str, Any]:
     """Use this when the user wants ranked segment performance, such as by country, device, or age."""
@@ -765,7 +766,7 @@ async def compare_time_ranges(
     current_until: str,
     previous_since: str,
     previous_until: str,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
     """Use this when the user asks what changed between two explicit time windows for one entity."""
     current_payload = await get_entity_insights(
@@ -808,7 +809,7 @@ async def compare_performance(
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
@@ -873,7 +874,7 @@ async def export_insights(
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     action_types: list[str] | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
@@ -959,7 +960,7 @@ async def create_async_insights_report(
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     time_increment: int | str | None = None,
@@ -995,7 +996,7 @@ async def create_async_insights_report(
 @mcp_server.tool()
 async def get_async_insights_report(
     report_run_id: str,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     limit: int = 100,
     after: str | None = None,
 ) -> dict[str, Any]:

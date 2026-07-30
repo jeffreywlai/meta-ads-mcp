@@ -10,6 +10,7 @@ from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, normalize_budget_value, normalize_collection
 from meta_ads_mcp.schemas import collection_response
+from meta_ads_mcp.tool_types import FieldList
 
 ACCOUNT_FIELDS = [
     "id",
@@ -270,7 +271,7 @@ async def get_account_pages(
     account_id: str = "me",
     limit: int = 50,
     after: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
     """Use this before creative creation when the user needs Facebook Pages available to the account."""
     client = get_graph_api_client()
@@ -289,7 +290,7 @@ async def list_instagram_accounts(
     account_id: str | None = None,
     limit: int = 50,
     after: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
     """Use this before creative creation when the user needs Instagram identities linked to the account."""
     client = get_graph_api_client()

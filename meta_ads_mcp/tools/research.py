@@ -8,6 +8,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.normalize import normalize_collection
+from meta_ads_mcp.tool_types import FieldList
 
 
 ADS_ARCHIVE_FIELDS = [
@@ -25,7 +26,7 @@ async def search_ads_archive(
     ad_reached_countries: list[str],
     ad_type: str = "ALL",
     limit: int = 25,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants competitor or market research from the public Meta Ads Library."""
     if not ad_reached_countries:

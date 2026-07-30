@@ -266,6 +266,10 @@ The FastMCP server instructions should tell the LLM:
 - Errors raise typed exceptions, not free-form error text.
 - Any derived metric must include the raw components used to compute it.
 - If a metric is not available, omit it and record why in `missing_signals`.
+- LLM-facing `fields` inputs accept either JSON string arrays or
+  comma-separated strings.
+- The MCP transport caps oversized tool responses and appends recovery guidance
+  to narrow fields, lower limits, or use the reporting export path.
 
 ## Response Contracts
 
@@ -545,6 +549,29 @@ Inputs:
 - `ad_id`
 - `include_creative_summary`
 
+### `list_creatives`
+
+Purpose:
+List lightweight creative metadata for an ad account.
+
+Inputs:
+
+- `account_id`
+- `limit`
+- `after`
+- optional `fields`
+
+### `get_creative`
+
+Purpose:
+Read one creative by id, including full creative fields such as `url_tags`,
+`asset_feed_spec`, `object_story_spec`, and `degrees_of_freedom_spec`.
+
+Inputs:
+
+- `creative_id`
+- optional `fields`
+
 ## Activity History Tools
 
 ### `list_change_history`
@@ -557,8 +584,8 @@ Inputs:
 
 - `level`: optional generic scope of `account`, `campaign`, `adset`, or `ad`
 - `object_id`: optional generic object id when `level` is provided
-- `account_id`: ad account to read from; required for object-scoped history
-  unless `META_DEFAULT_ACCOUNT_ID` is configured
+- `account_id`: optional ad account context; object-scoped history derives it
+  from the object when neither this nor `META_DEFAULT_ACCOUNT_ID` is configured
 - `campaign_id`, `adset_id`, or `ad_id`: optional object scope routed through
   the ad-account activities edge with object filtering
 - `since` and `until`: optional datetime filters; Meta defaults to the prior

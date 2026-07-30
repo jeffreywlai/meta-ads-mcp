@@ -19,6 +19,7 @@ from .errors import (
     RateLimitError,
     UnsupportedFeatureError,
 )
+from .tool_types import FieldList, coerce_csv_string_list
 
 USER_AGENT = "meta-ads-fastmcp/0.1.0"
 _CLIENT_POOL: dict[tuple[asyncio.AbstractEventLoop, str, str | None, float], httpx.AsyncClient] = {}
@@ -27,6 +28,14 @@ _CLIENT_POOL: dict[tuple[asyncio.AbstractEventLoop, str, str | None, float], htt
 def normalize_account_id(account_id: str) -> str:
     """Ensure account ids use the Graph API act_ prefix."""
     return account_id if account_id.startswith("act_") else f"act_{account_id}"
+
+
+def _serialize_fields(fields: FieldList | None) -> str | None:
+    """Serialize either validated field arrays or direct CSV client input."""
+    normalized_fields = coerce_csv_string_list(fields)
+    if not normalized_fields:
+        return None
+    return ",".join(normalized_fields)
 
 
 def _is_unsupported_surface_error(error: MetaApiError) -> bool:
@@ -179,13 +188,13 @@ class GraphAPIClient:
         self,
         object_id: str,
         *,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch a single object."""
         query = dict(params or {})
-        if fields:
-            query["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            query["fields"] = serialized_fields
         return await self.request("GET", object_id, params=query)
 
     async def list_objects(
@@ -193,13 +202,13 @@ class GraphAPIClient:
         parent_id: str,
         edge: str,
         *,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch an edge collection."""
         query = dict(params or {})
-        if fields:
-            query["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            query["fields"] = serialized_fields
         return await self.request("GET", f"{parent_id}/{edge}", params=query)
 
     async def update_object(
@@ -230,24 +239,24 @@ class GraphAPIClient:
         self,
         object_id: str,
         *,
-        fields: list[str],
+        fields: FieldList,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch insights for an object."""
         query = dict(params or {})
-        query["fields"] = ",".join(fields)
+        query["fields"] = _serialize_fields(fields) or ""
         return await self.request("GET", f"{object_id}/insights", params=query)
 
     async def create_async_insights_report(
         self,
         object_id: str,
         *,
-        fields: list[str],
+        fields: FieldList,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Start an async insights report."""
         query = dict(params or {})
-        query["fields"] = ",".join(fields)
+        query["fields"] = _serialize_fields(fields) or ""
         query["async"] = "true"
         return await self.request("POST", f"{object_id}/insights", data=query)
 
@@ -255,7 +264,7 @@ class GraphAPIClient:
         self,
         report_run_id: str,
         *,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
         limit: int = 100,
         after: str | None = None,
     ) -> dict[str, Any]:
@@ -504,12 +513,12 @@ class GraphAPIClient:
         account_id: str,
         *,
         hashes: list[str],
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
     ) -> dict[str, Any]:
         """Resolve ad image hashes into hosted image metadata."""
         params: dict[str, Any] = {"hashes": hashes}
-        if fields:
-            params["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            params["fields"] = serialized_fields
         return await self.request(
             "GET",
             f"{normalize_account_id(account_id)}/adimages",
@@ -523,7 +532,7 @@ class GraphAPIClient:
         ad_reached_countries: list[str],
         ad_type: str = "ALL",
         limit: int = 25,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
     ) -> dict[str, Any]:
         """Search the public Ads Library / archive endpoint."""
         params: dict[str, Any] = {
@@ -532,8 +541,8 @@ class GraphAPIClient:
             "ad_type": ad_type,
             "limit": limit,
         }
-        if fields:
-            params["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            params["fields"] = serialized_fields
         return await self.request("GET", "ads_archive", params=params)
 
 

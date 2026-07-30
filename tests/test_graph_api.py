@@ -128,6 +128,29 @@ def test_request_keeps_invalid_async_fields_as_meta_api_errors(monkeypatch: pyte
     assert "fields param" in exc_info.value.message
 
 
+def test_graph_client_accepts_csv_fields_for_direct_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_request(self, method: str, endpoint: str, **kwargs):
+        calls.append({"method": method, "endpoint": endpoint, **kwargs})
+        return {"id": endpoint}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+
+    result = asyncio.run(_client().get_object("crt_123", fields="id, name, url_tags"))  # type: ignore[arg-type]
+
+    assert result == {"id": "crt_123"}
+    assert calls == [
+        {
+            "method": "GET",
+            "endpoint": "crt_123",
+            "params": {"fields": "id,name,url_tags"},
+        }
+    ]
+
+
 def test_request_retries_payload_rate_limit_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeAsyncClient.responses = deque(
         [

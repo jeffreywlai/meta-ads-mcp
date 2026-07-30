@@ -11,6 +11,9 @@ from meta_ads_mcp.tools import creatives
 class FakeCreativeClient:
     """Fake creative client."""
 
+    def __init__(self) -> None:
+        self.get_calls: list[dict[str, object]] = []
+
     async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
         return {"data": [{"id": "crt_1", "name": "Creative One"}]}
 
@@ -24,6 +27,7 @@ class FakeCreativeClient:
         return {"images": {"test.png": {"hash": "abc123"}}, "account_id": account_id}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.get_calls.append({"object_id": object_id, "fields": fields, "params": params})
         return {"id": object_id, "name": "Old", "title": "Old title", "body": "Old body", "status": "ACTIVE"}
 
     async def update_object(self, object_id: str, *, data):
@@ -37,6 +41,20 @@ def test_preview_ad_supports_existing_ad(monkeypatch) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: FakeCreativeClient())
     result = asyncio.run(creatives.preview_ad(ad_id="ad_123"))
     assert result["item"]["request"]["ad_id"] == "ad_123"
+
+
+def test_get_creative_reads_full_default_spec(monkeypatch) -> None:
+    client = FakeCreativeClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(creatives.get_creative(creative_id="crt_123"))
+
+    assert result["item"]["id"] == "crt_123"
+    assert client.get_calls == [
+        {"object_id": "crt_123", "fields": creatives.CREATIVE_FIELDS, "params": None}
+    ]
+    assert "url_tags" in creatives.CREATIVE_FIELDS
+    assert "degrees_of_freedom_spec" in creatives.CREATIVE_FIELDS
 
 
 def test_preview_ad_supports_creative_payload(monkeypatch) -> None:

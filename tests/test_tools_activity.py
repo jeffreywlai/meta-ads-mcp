@@ -16,6 +16,11 @@ class FakeActivityClient:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.object_calls: list[dict[str, object]] = []
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.object_calls.append({"object_id": object_id, "fields": fields, "params": params})
+        return {"id": object_id, "account_id": "20141913"}
 
     async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
         self.calls.append(
@@ -120,6 +125,44 @@ def test_list_change_history_uses_default_account_for_scoped_object(
     assert client.calls[0]["parent_id"] == "act_456"
     assert client.calls[0]["params"] == {"limit": 50, "oid": "adset_123"}
     assert result["scope"] == {"level": "adset", "object_id": "adset_123", "account_id": "act_456"}
+
+
+def test_list_change_history_derives_account_from_scoped_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("META_DEFAULT_ACCOUNT_ID", raising=False)
+    reload_settings()
+    client = FakeActivityClient()
+    monkeypatch.setattr(activity, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(activity.list_change_history(level="campaign", object_id="cmp_123"))
+
+    assert client.object_calls == [
+        {"object_id": "cmp_123", "fields": ["account_id"], "params": None}
+    ]
+    assert client.calls[0]["parent_id"] == "act_20141913"
+    assert client.calls[0]["params"] == {"limit": 50, "oid": "cmp_123"}
+    assert result["scope"] == {
+        "level": "campaign",
+        "object_id": "cmp_123",
+        "account_id": "act_20141913",
+    }
+
+
+def test_list_change_history_explains_failed_account_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("META_DEFAULT_ACCOUNT_ID", raising=False)
+    reload_settings()
+
+    class MissingAccountClient(FakeActivityClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            return {"id": object_id}
+
+    monkeypatch.setattr(activity, "get_graph_api_client", lambda: MissingAccountClient())
+
+    with pytest.raises(ValidationError, match="could not be derived"):
+        asyncio.run(activity.list_change_history(ad_id="ad_123"))
 
 
 def test_list_change_history_rejects_conflicting_scopes() -> None:

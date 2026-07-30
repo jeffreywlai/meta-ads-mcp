@@ -11,7 +11,13 @@ from meta_ads_mcp.tools import audiences
 class FakeAudienceClient:
     """Fake audience client."""
 
+    def __init__(self) -> None:
+        self.list_calls: list[dict[str, object]] = []
+
     async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+        self.list_calls.append(
+            {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}
+        )
         return {"data": [{"id": "aud_1", "name": "Audience One"}]}
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
@@ -51,9 +57,12 @@ def test_create_lookalike_audience_builds_lookalike_spec(monkeypatch) -> None:
 
 
 def test_list_audiences_returns_collection(monkeypatch) -> None:
-    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: FakeAudienceClient())
+    client = FakeAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(audiences.list_audiences(account_id="123"))
     assert result["summary"]["count"] == 1
+    assert client.list_calls[0]["fields"] == audiences.AUDIENCE_SUMMARY_FIELDS
+    assert "lookalike_spec" not in audiences.AUDIENCE_SUMMARY_FIELDS
 
 
 def test_list_audiences_supports_empty_collection(monkeypatch) -> None:
