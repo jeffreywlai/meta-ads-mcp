@@ -87,7 +87,7 @@ SAMPLE_INSIGHTS_ROW = {
 
 TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "create_campaign": {"daily_budget": 50.0},
-    "create_ad": {"bid_amount": 12.34},
+    "create_ad": {"creative_id": "crt_123", "bid_amount": 12.34},
     "create_ad_set": {"daily_budget": 25.0},
     "create_custom_audience": {"customer_file_source": "USER_PROVIDED_ONLY"},
     "create_lookalike_audience": {"country": "US", "ratio": 0.02},
@@ -131,6 +131,10 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "compare_performance": {"metrics": ["roas", "cpa", "ctr"]},
     "export_insights": {"format": "json"},
     "create_async_insights_report": {"fields": ["spend", "impressions"]},
+    "create_async_insights_report_batch": {
+        "breakdown_sets": [["country"], ["device_platform"]],
+        "fields": ["spend", "impressions"],
+    },
     "get_async_insights_report": {"fields": ["spend", "impressions"]},
     "search_ads_archive": {"ad_reached_countries": ["US"]},
     "list_ad_comments": {"object_story_id": "page_123_post_123"},
@@ -654,9 +658,10 @@ def _required_value(param_name: str) -> Any:
         "search_terms": "shirts",
         "code": "oauth_code",
         "scope": ["ads_management"],
-            "status": "PAUSED",
-            "surface": "facebook",
+        "status": "PAUSED",
+        "surface": "facebook",
         "breakdown": "country",
+        "breakdown_sets": [["country"]],
         "current_since": "2026-03-01",
         "current_until": "2026-03-07",
         "previous_since": "2026-02-22",
@@ -699,6 +704,25 @@ def test_registered_tools_have_claude_friendly_contracts() -> None:
             if not SNAKE_CASE.match(param.name):
                 problems.append(f"{name}: parameter {param.name} must be snake_case")
     assert not problems, "\n".join(problems)
+
+
+def test_every_string_list_contract_accepts_csv_at_the_mcp_boundary() -> None:
+    """List-shaped LLM inputs should share one forgiving boundary contract."""
+    provider = mcp_server.local_provider
+    problems: list[str] = []
+    for component in provider._components.values():
+        name = getattr(component, "name", None)
+        parameters = getattr(component, "parameters", {}) or {}
+        for param_name, schema in (parameters.get("properties", {}) or {}).items():
+            choices = schema.get("anyOf", [schema])
+            has_string_array = any(
+                choice.get("type") == "array"
+                and (choice.get("items") or {}).get("type") == "string"
+                for choice in choices
+            )
+            if has_string_array and not any(choice.get("type") == "string" for choice in choices):
+                problems.append(f"{name}.{param_name}")
+    assert not problems, "String-list parameters missing CSV input support: " + ", ".join(problems)
 
 
 def test_capabilities_manifest_matches_registered_tools() -> None:

@@ -8,9 +8,13 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import blank_to_none, normalize_budget_value, normalize_collection
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    normalize_budget_value,
+    normalize_collection,
+)
 from meta_ads_mcp.schemas import collection_response
-from meta_ads_mcp.tool_types import FieldList
+from meta_ads_mcp.tool_types import FieldList, StringList
 
 ACCOUNT_FIELDS = [
     "id",
@@ -45,12 +49,15 @@ ADSET_FIELDS = [
     "campaign_id",
     "optimization_goal",
     "billing_event",
+    "bid_amount",
     "bid_strategy",
+    "bid_constraints",
     "daily_budget",
     "lifetime_budget",
     "start_time",
     "end_time",
     "targeting",
+    "promoted_object",
 ]
 
 AD_FIELDS = [
@@ -105,6 +112,22 @@ def _status_filter(effective_status: list[str] | None) -> dict[str, Any]:
     if not effective_status:
         return {}
     return {"effective_status": effective_status}
+
+
+def _name_filter(name_contains: str | None) -> dict[str, Any]:
+    """Build one Graph-native name containment filter."""
+    normalized = blank_to_none(name_contains)
+    if normalized is None:
+        return {}
+    return {
+        "filtering": [
+            {
+                "field": "name",
+                "operator": "CONTAIN",
+                "value": normalized,
+            }
+        ]
+    }
 
 
 def _page_params(limit: int, after: str | None) -> dict[str, Any]:
@@ -162,15 +185,20 @@ async def get_ad_account(account_id: str) -> dict[str, Any]:
 @mcp_server.tool()
 async def list_campaigns(
     account_id: str | None = None,
-    effective_status: list[str] | None = None,
+    effective_status: StringList | None = None,
+    name_contains: str | None = None,
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Discover campaign names and ids for client-side name lookup by listing campaigns, with optional status filtering."""
+    """Discover campaign names and ids, with server-side name containment and status filters."""
     client = get_graph_api_client()
     account_id = blank_to_none(account_id)
     resolved_account_id = _resolve_account_id(account_id)
-    params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
+    params: dict[str, Any] = {
+        "limit": limit,
+        **_status_filter(effective_status),
+        **_name_filter(name_contains),
+    }
     if after:
         params["after"] = after
     payload = await client.list_objects(
@@ -199,18 +227,23 @@ async def get_campaign(campaign_id: str) -> dict[str, Any]:
 async def list_adsets(
     account_id: str | None = None,
     campaign_id: str | None = None,
-    effective_status: list[str] | None = None,
+    effective_status: StringList | None = None,
+    name_contains: str | None = None,
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover ad sets under one account, one campaign, or the default account when omitted."""
+    """Discover ad sets under one scope or the default account, with server-side name and status filters."""
     account_id = blank_to_none(account_id)
     campaign_id = blank_to_none(campaign_id)
     if account_id and campaign_id:
         raise ValidationError("Provide only one of account_id or campaign_id.")
     parent_id = campaign_id or _resolve_account_id(account_id)
     client = get_graph_api_client()
-    params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
+    params: dict[str, Any] = {
+        "limit": limit,
+        **_status_filter(effective_status),
+        **_name_filter(name_contains),
+    }
     if after:
         params["after"] = after
     payload = await client.list_objects(parent_id, "adsets", fields=ADSET_FIELDS, params=params)
@@ -232,11 +265,12 @@ async def list_ads(
     account_id: str | None = None,
     campaign_id: str | None = None,
     adset_id: str | None = None,
-    effective_status: list[str] | None = None,
+    effective_status: StringList | None = None,
+    name_contains: str | None = None,
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this to discover ads under at most one scope; if none is provided, META_DEFAULT_ACCOUNT_ID is used."""
+    """Discover ads under one scope, optionally filtering names and statuses server-side."""
     account_id = blank_to_none(account_id)
     campaign_id = blank_to_none(campaign_id)
     adset_id = blank_to_none(adset_id)
@@ -245,7 +279,11 @@ async def list_ads(
         raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")
     parent_id = adset_id or campaign_id or _resolve_account_id(account_id)
     client = get_graph_api_client()
-    params: dict[str, Any] = {"limit": limit, **_status_filter(effective_status)}
+    params: dict[str, Any] = {
+        "limit": limit,
+        **_status_filter(effective_status),
+        **_name_filter(name_contains),
+    }
     if after:
         params["after"] = after
     payload = await client.list_objects(parent_id, "ads", fields=AD_FIELDS, params=params)

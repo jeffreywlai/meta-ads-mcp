@@ -7,8 +7,10 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.graph_payload import add_validate_only, merge_graph_payload
 from meta_ads_mcp.normalize import ZERO_DECIMAL_CURRENCIES, normalize_budget_value
-from meta_ads_mcp.schemas import mutation_response
+from meta_ads_mcp.schemas import creation_response, mutation_response
+from meta_ads_mcp.tool_types import StringList
 
 
 def _budget_minor_units(value: float, currency: str | None = None) -> int:
@@ -30,25 +32,18 @@ def _encode_budget_field(
         payload[field_name] = _budget_minor_units(value, currency)
 
 
-def _merge_params(base: dict[str, Any], extra: dict[str, Any] | None) -> dict[str, Any]:
-    """Merge optional params into a request payload."""
-    merged = dict(base)
-    if extra:
-        merged.update(extra)
-    return merged
-
-
 @mcp_server.tool()
 async def create_campaign(
     account_id: str,
     name: str,
     objective: str,
     status: str = "PAUSED",
-    special_ad_categories: list[str] | None = None,
+    special_ad_categories: StringList | None = None,
     daily_budget: float | None = None,
     lifetime_budget: float | None = None,
     buying_type: str | None = None,
     bid_strategy: str | None = None,
+    validate_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants to create a new campaign shell before adding ad sets or ads."""
@@ -66,18 +61,20 @@ async def create_campaign(
         payload["buying_type"] = buying_type
     if bid_strategy:
         payload["bid_strategy"] = bid_strategy
+    add_validate_only(payload, validate_only=validate_only)
     client = get_graph_api_client()
+    account_id = normalize_account_id(account_id)
     result = await client.create_edge_object(
-        normalize_account_id(account_id),
+        account_id,
         "campaigns",
-        data=_merge_params(payload, params),
+        data=merge_graph_payload(payload, params),
     )
-    return {
-        "ok": True,
-        "action": "create_campaign",
-        "target": {"account_id": normalize_account_id(account_id)},
-        "created": result,
-    }
+    return creation_response(
+        action="create_campaign",
+        target={"account_id": account_id},
+        result=result,
+        validate_only=validate_only,
+    )
 
 
 @mcp_server.tool()
@@ -116,7 +113,7 @@ async def update_campaign(
         current["daily_budget"] = daily_budget
     if lifetime_budget is not None:
         current["lifetime_budget"] = lifetime_budget
-    payload = _merge_params(payload, params)
+    payload = merge_graph_payload(payload, params)
     if params:
         current.update(params)
     if not payload:
@@ -159,14 +156,17 @@ async def create_ad_set(
     targeting: dict[str, Any],
     status: str = "PAUSED",
     bid_amount: float | None = None,
+    bid_strategy: str | None = None,
+    bid_constraints: dict[str, Any] | None = None,
     daily_budget: float | None = None,
     lifetime_budget: float | None = None,
     promoted_object: dict[str, Any] | None = None,
     start_time: str | None = None,
     end_time: str | None = None,
+    validate_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to attach targeting and budget delivery settings under an existing campaign."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints."""
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     payload: dict[str, Any] = {
@@ -179,6 +179,12 @@ async def create_ad_set(
     }
     if bid_amount is not None:
         payload["bid_amount"] = int(bid_amount * 100)
+    if bid_strategy:
+        payload["bid_strategy"] = bid_strategy
+    if bid_constraints:
+        if not bid_strategy:
+            raise ValidationError("bid_strategy is required when bid_constraints is provided.")
+        payload["bid_constraints"] = bid_constraints
     _encode_budget_field(payload, "daily_budget", daily_budget)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget)
     if promoted_object:
@@ -187,15 +193,17 @@ async def create_ad_set(
         payload["start_time"] = start_time
     if end_time:
         payload["end_time"] = end_time
+    add_validate_only(payload, validate_only=validate_only)
     client = get_graph_api_client()
+    account_id = normalize_account_id(account_id)
     result = await client.create_edge_object(
-        normalize_account_id(account_id),
+        account_id,
         "adsets",
-        data=_merge_params(payload, params),
+        data=merge_graph_payload(payload, params),
     )
-    return {
-        "ok": True,
-        "action": "create_ad_set",
-        "target": {"account_id": normalize_account_id(account_id), "campaign_id": campaign_id},
-        "created": result,
-    }
+    return creation_response(
+        action="create_ad_set",
+        target={"account_id": account_id, "campaign_id": campaign_id},
+        result=result,
+        validate_only=validate_only,
+    )

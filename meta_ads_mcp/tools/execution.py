@@ -62,6 +62,29 @@ async def set_ad_status(ad_id: str, status: str) -> dict[str, object]:
     return await _set_status(ad_id, "ad", status)
 
 
+async def _delete_object(object_id: str, object_type: str) -> dict[str, object]:
+    """Delete one object through an explicitly destructive tool."""
+    result = await get_graph_api_client().delete_object(object_id)
+    return {
+        "ok": True,
+        "action": f"delete_{object_type}",
+        "target": {f"{object_type}_id": object_id},
+        "result": result,
+    }
+
+
+@mcp_server.tool()
+async def delete_adset(adset_id: str) -> dict[str, object]:
+    """Use this only when the user explicitly wants to delete an ad set rather than pause it."""
+    return await _delete_object(adset_id, "adset")
+
+
+@mcp_server.tool()
+async def delete_ad(ad_id: str) -> dict[str, object]:
+    """Use this only when the user explicitly wants to delete an ad rather than pause it."""
+    return await _delete_object(ad_id, "ad")
+
+
 async def _update_budget(
     object_id: str,
     object_type: str,
@@ -143,6 +166,7 @@ async def _update_bid_strategy(
     *,
     bid_strategy: str,
     bid_amount: float | None = None,
+    bid_constraints: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Update bid strategy and optionally a supporting bid amount."""
     validated_bid_strategy = _validate_bid_strategy(bid_strategy)
@@ -152,13 +176,16 @@ async def _update_bid_strategy(
     client = get_graph_api_client()
     previous = await client.get_object(
         object_id,
-        fields=["id", "bid_strategy", "bid_amount", "currency"],
+        fields=["id", "bid_strategy", "bid_amount", "bid_constraints", "currency"],
     )
     payload: dict[str, object] = {"bid_strategy": validated_bid_strategy}
     current: dict[str, object] = {"bid_strategy": validated_bid_strategy}
     if bid_amount is not None:
         payload["bid_amount"] = _bid_minor_units(bid_amount, previous.get("currency"))
         current["bid_amount"] = bid_amount
+    if bid_constraints is not None:
+        payload["bid_constraints"] = bid_constraints
+        current["bid_constraints"] = bid_constraints
 
     await client.update_object(object_id, data=payload)
     return mutation_response(
@@ -167,6 +194,7 @@ async def _update_bid_strategy(
         previous={
             "bid_strategy": previous.get("bid_strategy"),
             "bid_amount": normalize_budget_value(previous.get("bid_amount"), previous.get("currency")),
+            "bid_constraints": previous.get("bid_constraints"),
         },
         current=current,
     )
@@ -228,6 +256,7 @@ async def update_adset_bid_strategy(
     adset_id: str,
     bid_strategy: str,
     bid_amount: float | None = None,
+    bid_constraints: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Use this when the user wants to adjust ad set bidding strategy with an optional bid amount override."""
     return await _update_bid_strategy(
@@ -235,4 +264,5 @@ async def update_adset_bid_strategy(
         "adset",
         bid_strategy=bid_strategy,
         bid_amount=bid_amount,
+        bid_constraints=bid_constraints,
     )

@@ -7,10 +7,10 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.graph_payload import merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
-from meta_ads_mcp.tool_types import FieldList
-
+from meta_ads_mcp.tool_types import FieldList, StringList
 
 CREATIVE_FIELDS = [
     "id",
@@ -25,14 +25,6 @@ CREATIVE_FIELDS = [
     "image_hash",
     "thumbnail_url",
 ]
-
-
-def _merge_params(base: dict[str, Any], extra: dict[str, Any] | None) -> dict[str, Any]:
-    """Merge optional params."""
-    merged = dict(base)
-    if extra:
-        merged.update(extra)
-    return merged
 
 
 def _ensure_v25_creative_payload(payload: Any) -> None:
@@ -123,7 +115,7 @@ async def create_ad_creative(
     created = await client.create_edge_object(
         normalize_account_id(account_id),
         "adcreatives",
-        data=_merge_params(payload, params),
+        data=merge_graph_payload(payload, params),
     )
     return {
         "ok": True,
@@ -190,7 +182,7 @@ async def setup_ab_test(
     name: str,
     description: str | None = None,
     ad_study_type: str = "SPLIT_TEST_V2",
-    cell_ids: list[str] | None = None,
+    cell_ids: StringList | None = None,
     start_time: str | None = None,
     end_time: str | None = None,
     observation_type: str | None = None,
@@ -215,7 +207,11 @@ async def setup_ab_test(
     if hypothesis:
         payload["hypothesis"] = hypothesis
     client = get_graph_api_client()
-    created = await client.create_edge_object(owner_id, "ad_studies", data=_merge_params(payload, params))
+    created = await client.create_edge_object(
+        owner_id,
+        "ad_studies",
+        data=merge_graph_payload(payload, params),
+    )
     return {
         "ok": True,
         "action": "setup_ab_test",
@@ -253,8 +249,7 @@ async def update_creative(
         payload["object_story_spec"] = object_story_spec
     if asset_feed_spec is not None:
         payload["asset_feed_spec"] = asset_feed_spec
-    if params:
-        payload.update(params)
+    payload = merge_graph_payload(payload, params)
     if not payload:
         raise ValidationError("At least one field must be provided for update_creative.")
     client = get_graph_api_client()

@@ -32,6 +32,9 @@ class FakeExecutionClient:
         self.updated_payloads.append((object_id, data))
         return {"success": True}
 
+    async def delete_object(self, object_id: str):
+        return {"success": True, "id": object_id}
+
 
 def test_set_campaign_status_returns_previous_and_current(monkeypatch) -> None:
     client = FakeExecutionClient()
@@ -58,6 +61,15 @@ def test_set_ad_status_rejects_invalid_status(monkeypatch) -> None:
     monkeypatch.setattr(execution, "get_graph_api_client", lambda: FakeExecutionClient())
     with pytest.raises(execution.ValidationError):
         asyncio.run(execution.set_ad_status(ad_id="ad_123", status="DELETED"))
+
+
+def test_delete_ad_and_adset_use_explicit_destructive_tools(monkeypatch) -> None:
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: FakeExecutionClient())
+    ad = asyncio.run(execution.delete_ad(ad_id="ad_123"))
+    adset = asyncio.run(execution.delete_adset(adset_id="adset_123"))
+    assert ad["action"] == "delete_ad"
+    assert ad["result"]["success"] is True
+    assert adset["action"] == "delete_adset"
 
 
 def test_update_campaign_budget_normalizes_previous_zero_decimal_currency(monkeypatch) -> None:
@@ -109,3 +121,20 @@ def test_update_adset_bid_strategy_rejects_invalid_inputs(monkeypatch) -> None:
         asyncio.run(execution.update_adset_bid_strategy(adset_id="adset_123", bid_strategy=""))
     with pytest.raises(execution.ValidationError):
         asyncio.run(execution.update_adset_bid_strategy(adset_id="adset_123", bid_strategy="COST_CAP", bid_amount=0))
+
+
+def test_update_adset_bid_strategy_supports_bid_constraints(monkeypatch) -> None:
+    client = FakeExecutionClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        execution.update_adset_bid_strategy(
+            adset_id="adset_123",
+            bid_strategy="LOWEST_COST_WITH_MIN_ROAS",
+            bid_constraints={"roas_average_floor": 30000},
+        )
+    )
+    assert client.updated_payloads[0][1] == {
+        "bid_strategy": "LOWEST_COST_WITH_MIN_ROAS",
+        "bid_constraints": {"roas_average_floor": 30000},
+    }
+    assert result["current"]["bid_constraints"] == {"roas_average_floor": 30000}

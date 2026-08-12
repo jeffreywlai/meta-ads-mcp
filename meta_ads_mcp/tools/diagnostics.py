@@ -17,11 +17,12 @@ from meta_ads_mcp.diagnostics import (
     rank_rows,
     summary_metric_evidence,
 )
+from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, to_float
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
-from meta_ads_mcp.tool_types import FieldList
+from meta_ads_mcp.tool_types import FieldList, StringList
 from meta_ads_mcp.tools.insights import (
     DEFAULT_INSIGHTS_FIELDS,
     _aggregate_metrics,
@@ -30,7 +31,6 @@ from meta_ads_mcp.tools.insights import (
     _normalize_rows,
     get_entity_insights,
 )
-from meta_ads_mcp.errors import ValidationError
 
 LEARNING_PHASE_FIELDS_BY_LEVEL = {
     "campaign": [
@@ -667,7 +667,7 @@ async def get_campaign_optimization_snapshot(
 @mcp_server.tool()
 async def detect_auction_overlap(
     account_id: str,
-    campaign_ids: list[str] | None = None,
+    campaign_ids: StringList | None = None,
     date_preset: str | None = "last_30d",
     since: str | None = None,
     until: str | None = None,

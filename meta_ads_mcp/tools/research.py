@@ -8,8 +8,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
-from meta_ads_mcp.tool_types import FieldList
-
+from meta_ads_mcp.tool_types import FieldList, StringList
 
 ADS_ARCHIVE_FIELDS = [
     "id",
@@ -23,7 +22,7 @@ ADS_ARCHIVE_FIELDS = [
 @mcp_server.tool()
 async def search_ads_archive(
     search_terms: str,
-    ad_reached_countries: list[str],
+    ad_reached_countries: StringList,
     ad_type: str = "ALL",
     limit: int = 25,
     fields: FieldList | None = None,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from meta_ads_mcp.tools import ads
 
 
@@ -61,6 +63,50 @@ def test_create_ad_wraps_creative_id(monkeypatch) -> None:
     assert client.created_payload["parent_id"] == "act_123"
     assert client.created_payload["data"]["creative"] == {"creative_id": "crt_123"}
     assert client.created_payload["data"]["bid_amount"] == 1234
+
+
+def test_create_ad_accepts_nested_graph_creative_shape(monkeypatch) -> None:
+    client = FakeAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        ads.create_ad(
+            account_id="123",
+            name="Nested creative",
+            adset_id="adset_123",
+            creative={"creative_id": "crt_123"},
+            validate_only=True,
+        )
+    )
+    assert client.created_payload["data"]["creative"] == {"creative_id": "crt_123"}
+    assert client.created_payload["data"]["execution_options"] == ["validate_only"]
+    assert result["validation_only"] is True
+
+
+def test_create_ad_rejects_conflicting_creative_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
+    with pytest.raises(ads.ValidationError, match="must match"):
+        asyncio.run(
+            ads.create_ad(
+                account_id="123",
+                name="Conflict",
+                adset_id="adset_123",
+                creative_id="crt_1",
+                creative={"creative_id": "crt_2"},
+            )
+        )
+
+
+def test_create_ad_rejects_ignored_nested_creative_fields(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
+    with pytest.raises(ads.ValidationError, match="unexpected fields"):
+        asyncio.run(
+            ads.create_ad(
+                account_id="123",
+                name="Unsupported creative body",
+                adset_id="adset_123",
+                creative={"creative_id": "crt_1", "name": "would be ignored"},
+            )
+        )
 
 
 def test_get_ad_image_resolves_candidates(monkeypatch) -> None:

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+
 import pytest
 
-from meta_ads_mcp.tools import discovery
 from meta_ads_mcp.errors import UnsupportedFeatureError
+from meta_ads_mcp.tools import discovery
 
 
 class FakeDiscoveryClient:
@@ -54,6 +55,35 @@ def test_list_campaigns_uses_account_scope(monkeypatch) -> None:
         "tool": "list_mutation_tools",
         "arguments": {},
     }
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "edge"),
+    [
+        (discovery.list_campaigns, {"account_id": "123"}, "campaigns"),
+        (discovery.list_adsets, {"campaign_id": "cmp_1"}, "adsets"),
+        (discovery.list_ads, {"adset_id": "adset_1"}, "ads"),
+    ],
+)
+def test_entity_list_name_filter_uses_graph_native_filtering(
+    monkeypatch,
+    tool,
+    kwargs,
+    edge,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class CapturingClient(FakeDiscoveryClient):
+        async def list_objects(self, parent_id: str, actual_edge: str, *, fields=None, params=None):
+            calls.append({"parent_id": parent_id, "edge": actual_edge, "params": params})
+            return await super().list_objects(parent_id, actual_edge, fields=fields, params=params)
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: CapturingClient())
+    asyncio.run(tool(name_contains="Experiment", **kwargs))
+    assert calls[0]["edge"] == edge
+    assert calls[0]["params"]["filtering"] == [
+        {"field": "name", "operator": "CONTAIN", "value": "Experiment"}
+    ]
 
 
 def test_get_account_pages_uses_assigned_pages_for_account_scope(monkeypatch) -> None:

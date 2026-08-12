@@ -43,13 +43,16 @@ def coerce_csv_string_list(value: Any) -> Any:
     return items
 
 
-FieldList: TypeAlias = Annotated[
+StringList: TypeAlias = Annotated[
     list[str],
     BeforeValidator(
         coerce_csv_string_list,
         json_schema_input_type=str | list[str],
     ),
 ]
+
+# Graph fields use the same top-level CSV grammar, including nested field expressions.
+FieldList: TypeAlias = StringList
 
 
 def normalize_field_list(value: FieldList | str | None) -> list[str] | None:

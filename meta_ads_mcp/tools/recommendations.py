@@ -10,6 +10,7 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.input_compat import resolve_identifier_alias
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 
 _RECOMMENDATION_CACHE_TTL_SECONDS = 15.0
@@ -307,12 +308,19 @@ async def _typed_opportunities(
 @mcp_server.tool()
 async def get_recommendations(
     account_id: str | None = None,
+    object_id: str | None = None,
     campaign_id: str | None = None,
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
 ) -> dict[str, object]:
     """Use this for a broad Meta-native opportunity scan. Prefer this once before category-specific opportunity tools."""
+    account_id = resolve_identifier_alias(
+        account_id,
+        object_id,
+        primary_name="account_id",
+        alias_name="object_id",
+    )
     return await _recommendation_collection(
         account_id=account_id,
         campaign_id=campaign_id,

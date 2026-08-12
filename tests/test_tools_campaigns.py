@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+
 import pytest
 
 from meta_ads_mcp.tools import campaigns
@@ -112,6 +113,62 @@ def test_create_ad_set_rejects_both_budgets(monkeypatch) -> None:
                 targeting={"geo_locations": {"countries": ["US"]}},
                 daily_budget=10.0,
                 lifetime_budget=20.0,
+            )
+        )
+
+
+def test_create_ad_set_supports_typed_bidding_and_validate_only(monkeypatch) -> None:
+    client = FakeCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        campaigns.create_ad_set(
+            account_id="123",
+            campaign_id="cmp_123",
+            name="Target ROAS",
+            billing_event="IMPRESSIONS",
+            optimization_goal="VALUE",
+            targeting={"geo_locations": {"countries": ["US"]}},
+            bid_strategy="LOWEST_COST_WITH_MIN_ROAS",
+            bid_constraints={"roas_average_floor": 30000},
+            validate_only=True,
+        )
+    )
+    assert client.created_payload["data"]["bid_strategy"] == "LOWEST_COST_WITH_MIN_ROAS"
+    assert client.created_payload["data"]["bid_constraints"] == {"roas_average_floor": 30000}
+    assert client.created_payload["data"]["execution_options"] == ["validate_only"]
+    assert result["validation_only"] is True
+    assert result["created"] is None
+    assert result["validation"] == {"id": "cmp_123"}
+
+
+def test_create_ad_set_rejects_params_overriding_typed_fields(monkeypatch) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
+    with pytest.raises(campaigns.ValidationError, match="cannot override typed fields"):
+        asyncio.run(
+            campaigns.create_ad_set(
+                account_id="123",
+                campaign_id="cmp_123",
+                name="Safe name",
+                billing_event="IMPRESSIONS",
+                optimization_goal="VALUE",
+                targeting={"geo_locations": {"countries": ["US"]}},
+                params={"name": "Hidden override"},
+            )
+        )
+
+
+def test_create_ad_set_requires_strategy_for_bid_constraints(monkeypatch) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
+    with pytest.raises(campaigns.ValidationError, match="bid_strategy is required"):
+        asyncio.run(
+            campaigns.create_ad_set(
+                account_id="123",
+                campaign_id="cmp_123",
+                name="Missing strategy",
+                billing_event="IMPRESSIONS",
+                optimization_goal="VALUE",
+                targeting={"geo_locations": {"countries": ["US"]}},
+                bid_constraints={"roas_average_floor": 30000},
             )
         )
 

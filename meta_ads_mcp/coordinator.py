@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Annotated, Any
 
 from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.input_compat import (
+    canonical_tool_name,
+    normalize_tool_arguments,
+    resolve_tool_name,
+)
 from meta_ads_mcp.intent_routing import (
     RouteDecision,
     StructuredIntentRouter,
@@ -14,18 +19,23 @@ from meta_ads_mcp.intent_routing import (
 )
 from meta_ads_mcp.tool_contracts import ToolContract, build_tool_contracts
 
-
 try:
-    from fastmcp import FastMCP
+    from fastmcp import Context, FastMCP
     from fastmcp.server.transforms.search import BM25SearchTransform
-    from fastmcp.tools.tool import Tool
+    from fastmcp.tools.tool import Tool, ToolResult
 
+    from meta_ads_mcp.error_middleware import StructuredMetaErrorMiddleware
     from meta_ads_mcp.overflow import (
         ArchivedResponseLimitingMiddleware,
         OverflowArtifactStore,
     )
 except ImportError:  # pragma: no cover - fallback for tests without the package
+    Context = Any
     Tool = Any
+    ToolResult = Any
+
+    class StructuredMetaErrorMiddleware:  # type: ignore[override]
+        """Minimal local fallback for tests without FastMCP."""
 
     class OverflowArtifactStore:  # type: ignore[override]
         """Minimal local fallback for tests without FastMCP."""
@@ -190,8 +200,45 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
         ranked = [*selected_tools, *ranked]
         return ranked[: self._max_results]
 
+    def _make_call_tool(self) -> Tool:
+        """Create a forgiving proxy while preserving one canonical tool catalog."""
+        transform = self
 
+        async def call_tool(
+            name: Annotated[str | None, "Canonical tool name"] = None,
+            arguments: Annotated[
+                dict[str, Any] | str | None,
+                "Tool arguments as an object or object-valued JSON string",
+            ] = None,
+            tool_name: Annotated[
+                str | None,
+                "Compatibility alias for name",
+            ] = None,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> ToolResult:
+            """Call a discovered tool by canonical name or a supported compatibility alias."""
+            resolved_name = resolve_tool_name(name, tool_name)
+            if resolved_name in {
+                transform._call_tool_name,
+                transform._search_tool_name,
+            }:
+                raise ValueError(
+                    f"'{resolved_name}' is a synthetic search tool and cannot be called via the call_tool proxy"
+                )
+            return await ctx.fastmcp.call_tool(
+                resolved_name,
+                normalize_tool_arguments(arguments),
+            )
 
+        return Tool.from_function(fn=call_tool, name=self._call_tool_name)
+
+    async def get_tool(self, name: str, call_next: Any, *, version: Any = None) -> Tool | None:
+        """Resolve compatibility aliases even for clients that bypass call_tool."""
+        return await super().get_tool(
+            canonical_tool_name(name),
+            call_next,
+            version=version,
+        )
 
 ALWAYS_VISIBLE_TOOLS = [
     "health_check",
@@ -328,10 +375,10 @@ mcp_server = FastMCP(
     transforms=[TOOL_SEARCH_TRANSFORM],
     mask_error_details=False,
 )
-mcp_server.add_middleware(
-    ArchivedResponseLimitingMiddleware(
-        max_size=MAX_TOOL_RESPONSE_BYTES,
-        truncation_suffix=RESPONSE_LIMIT_HINT,
-        artifact_store=OVERFLOW_ARTIFACT_STORE,
-    )
+RESPONSE_LIMITING_MIDDLEWARE = ArchivedResponseLimitingMiddleware(
+    max_size=MAX_TOOL_RESPONSE_BYTES,
+    truncation_suffix=RESPONSE_LIMIT_HINT,
+    artifact_store=OVERFLOW_ARTIFACT_STORE,
 )
+mcp_server.add_middleware(RESPONSE_LIMITING_MIDDLEWARE)
+mcp_server.add_middleware(StructuredMetaErrorMiddleware())

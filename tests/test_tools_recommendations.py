@@ -36,6 +36,15 @@ def test_get_recommendations_returns_supported_collection(monkeypatch) -> None:
     assert "opportunity_categories" in result["items"][0]
 
 
+def test_get_recommendations_accepts_account_object_id_alias(monkeypatch) -> None:
+    recommendations._RECOMMENDATION_CACHE.clear()
+    client = FakeRecommendationsClient()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: client)
+    result = asyncio.run(recommendations.get_recommendations(object_id="act_123"))
+    assert result["supported"] is True
+    assert client.calls == 1
+
+
 def test_typed_opportunity_tools_filter_by_category(monkeypatch) -> None:
     recommendations._RECOMMENDATION_CACHE.clear()
     monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: FakeRecommendationsClient())

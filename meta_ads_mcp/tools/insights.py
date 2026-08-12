@@ -4,19 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 from datetime import date
 from io import StringIO
-import json
-from typing import Any
+from typing import Any, Literal
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.diagnostics import compare_metric_sets, derive_core_metrics
-from meta_ads_mcp.diagnostics import summary_metric_evidence
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.diagnostics import (
+    compare_metric_sets,
+    derive_core_metrics,
+    summary_metric_evidence,
+)
+from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, normalize_insights_row
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    first_present,
+    normalize_collection,
+    normalize_insights_row,
+)
 from meta_ads_mcp.schemas import analysis_response, collection_response
-from meta_ads_mcp.tool_types import FieldList, normalize_field_list
+from meta_ads_mcp.tool_types import FieldList, StringList, normalize_field_list
 
 DEFAULT_INSIGHTS_FIELDS = [
     "campaign_id",
@@ -38,6 +46,29 @@ DEFAULT_INSIGHTS_FIELDS = [
     "actions",
     "action_values",
 ]
+
+ASYNC_ID_FIELDS_BY_LEVEL = {
+    "account": ["account_id", "account_name"],
+    "campaign": ["campaign_id", "campaign_name"],
+    "adset": ["campaign_id", "campaign_name", "adset_id", "adset_name"],
+    "ad": [
+        "campaign_id",
+        "campaign_name",
+        "adset_id",
+        "adset_name",
+        "ad_id",
+        "ad_name",
+    ],
+}
+ASYNC_LEAN_METRIC_FIELDS = [
+    "date_start",
+    "date_stop",
+    "spend",
+    "impressions",
+    "clicks",
+]
+MAX_ASYNC_BATCH_JOBS = 10
+MAX_ASYNC_WAIT_SECONDS = 60.0
 
 DEFAULT_COMPARE_METRICS = [
     "spend",
@@ -281,15 +312,71 @@ def _filter_action_arrays(row: dict[str, Any], patterns: list[str]) -> dict[str,
     return filtered
 
 
-def _insights_fields(fields: FieldList | None, *, action_types: list[str] | None = None) -> list[str]:
+def _insights_fields(
+    fields: FieldList | None,
+    *,
+    action_types: list[str] | None = None,
+    flatten_actions: list[str] | None = None,
+) -> list[str]:
     """Return requested fields with action-filter dependencies when needed."""
     requested = list(normalize_field_list(fields) or DEFAULT_INSIGHTS_FIELDS)
-    if not action_types:
-        return requested
-    for field in ACTION_FILTER_REQUIRED_FIELDS:
+    for field in _action_dependency_fields(
+        action_types=action_types,
+        flatten_actions=flatten_actions,
+    ):
         if field not in requested:
             requested.append(field)
     return requested
+
+
+def _normalize_flatten_actions(
+    flatten_actions: list[str] | None,
+) -> list[str]:
+    """Normalize and validate scalar action projections before Graph calls."""
+    normalized: list[str] = []
+    for raw_label in flatten_actions or []:
+        label = _normalize_key(raw_label)
+        if not label:
+            raise ValidationError("flatten_actions values must not be blank.")
+        if label not in normalized:
+            normalized.append(label)
+    return normalized
+
+
+def _action_dependency_fields(
+    *,
+    action_types: list[str] | None,
+    flatten_actions: list[str] | None,
+) -> list[str]:
+    """Return only the verbose Meta fields needed for the requested projection."""
+    if action_types:
+        return list(ACTION_FILTER_REQUIRED_FIELDS)
+    dependencies: list[str] = []
+    for label in flatten_actions or []:
+        field = "action_values" if label.endswith("_value") else "actions"
+        if field not in dependencies:
+            dependencies.append(field)
+    return dependencies
+
+
+def _flatten_action_columns(
+    row: dict[str, Any],
+    flatten_actions: list[str] | None,
+) -> dict[str, Any]:
+    """Promote requested action counts or values into stable scalar columns."""
+    columns: dict[str, Any] = {}
+    for label in flatten_actions or []:
+        wants_value = label.endswith("_value")
+        action_label = label.removesuffix("_value") if wants_value else label
+        patterns = _action_patterns([action_label])
+        source = row.get("action_values_map" if wants_value else "actions_map") or {}
+        value = first_present(source, patterns)
+        if label in row:
+            raise ValidationError(
+                f"flatten_actions column '{label}' conflicts with an existing insight field."
+            )
+        columns[label] = value
+    return columns
 
 
 def _insights_params(
@@ -339,13 +426,57 @@ def _normalize_reporting_object_id(level: str, object_id: str) -> str:
     return object_id
 
 
-def _normalize_rows(payload: dict[str, Any], action_types: list[str] | None = None) -> list[dict[str, Any]]:
+def _normalize_rows(
+    payload: dict[str, Any],
+    action_types: list[str] | None = None,
+    *,
+    include_raw_actions: bool = True,
+    flatten_actions: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Normalize insights rows and attach derived metrics."""
     action_patterns = _action_patterns(action_types)
     rows = [normalize_insights_row(_filter_action_arrays(row, action_patterns)) for row in payload.get("data", [])]
     for row in rows:
         row["metrics"] = derive_core_metrics(row)
+        row.update(_flatten_action_columns(row, flatten_actions))
+        if not include_raw_actions:
+            for field in ACTION_FILTER_REQUIRED_FIELDS:
+                row.pop(field, None)
+            row.pop("actions_map", None)
+            row.pop("action_values_map", None)
     return rows
+
+
+def _default_async_fields(level: str, field_preset: str) -> list[str]:
+    """Return a bounded async default while preserving an explicit full preset."""
+    if field_preset == "full":
+        return list(DEFAULT_INSIGHTS_FIELDS)
+    if field_preset != "lean":
+        raise ValidationError("field_preset must be 'lean' or 'full'.")
+    level_fields = ASYNC_ID_FIELDS_BY_LEVEL.get(level)
+    if level_fields is None:
+        raise ValidationError("level must be account, campaign, adset, or ad.")
+    return [*level_fields, *ASYNC_LEAN_METRIC_FIELDS]
+
+
+def _async_job_state(
+    status: dict[str, Any],
+    *,
+    poll_interval_seconds: float,
+) -> dict[str, Any]:
+    """Normalize Meta's asynchronous status into explicit polling semantics."""
+    raw_status = str(status.get("async_status") or "unknown")
+    normalized = " ".join(raw_status.replace("_", " ").lower().split())
+    ready = normalized in {"job completed", "completed"}
+    failed = normalized in {"job failed", "failed", "job cancelled", "cancelled", "canceled"}
+    terminal = ready or failed
+    return {
+        "state": raw_status,
+        "progress_percent": status.get("async_percent_completion"),
+        "ready": ready,
+        "terminal": terminal,
+        "poll_after_seconds": None if terminal else poll_interval_seconds,
+    }
 
 
 def _action_totals(rows: list[dict[str, Any]], action_types: list[str] | None = None) -> list[dict[str, Any]]:
@@ -572,21 +703,27 @@ async def get_entity_insights(
     since: str | None = None,
     until: str | None = None,
     fields: FieldList | None = None,
-    action_types: list[str] | None = None,
-    breakdowns: list[str] | None = None,
-    action_breakdowns: list[str] | None = None,
+    action_types: StringList | None = None,
+    flatten_actions: StringList | None = None,
+    breakdowns: StringList | None = None,
+    action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     use_unified_attribution_setting: bool = True,
-    action_attribution_windows: list[str] | None = None,
+    action_attribution_windows: StringList | None = None,
     limit: int = 100,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this for primary reporting reads. For action counts, use summarize_actions; for campaign health, use get_campaign_optimization_snapshot."""
+    """Return paginated insights rows with optional flattened purchase, purchase-value, or other action columns; use summarize_actions for totals."""
+    flatten_actions = _normalize_flatten_actions(flatten_actions)
     client = get_graph_api_client()
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
     payload = await client.get_insights(
         resolved_object_id,
-        fields=_insights_fields(fields, action_types=action_types),
+        fields=_insights_fields(
+            fields,
+            action_types=action_types,
+            flatten_actions=flatten_actions,
+        ),
         params=_insights_params(
             level=level,
             date_preset=date_preset,
@@ -602,7 +739,11 @@ async def get_entity_insights(
             after=after,
         ),
     )
-    rows = _normalize_rows(payload, action_types=action_types)
+    rows = _normalize_rows(
+        payload,
+        action_types=action_types,
+        flatten_actions=flatten_actions,
+    )
     response = normalize_collection(payload)
     response["items"] = rows
     response["summary"]["metrics"] = _aggregate_metrics(rows)
@@ -611,6 +752,10 @@ async def get_entity_insights(
             "requested": action_types,
             "matched": [item["action_type"] for item in _action_totals(rows)],
         }
+    if flatten_actions:
+        response["summary"]["flattened_action_columns"] = [
+            _normalize_key(label) for label in flatten_actions
+        ]
     return response
 
 
@@ -623,12 +768,13 @@ async def get_insights(
     until: str | None = None,
     time_range: dict[str, str] | None = None,
     fields: FieldList | None = None,
-    action_types: list[str] | None = None,
-    breakdowns: list[str] | None = None,
-    action_breakdowns: list[str] | None = None,
+    action_types: StringList | None = None,
+    flatten_actions: StringList | None = None,
+    breakdowns: StringList | None = None,
+    action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     use_unified_attribution_setting: bool = True,
-    action_attribution_windows: list[str] | None = None,
+    action_attribution_windows: StringList | None = None,
     limit: int = 100,
     after: str | None = None,
 ) -> dict[str, Any]:
@@ -642,6 +788,7 @@ async def get_insights(
         until=resolved_until,
         fields=fields,
         action_types=action_types,
+        flatten_actions=flatten_actions,
         breakdowns=breakdowns,
         action_breakdowns=action_breakdowns,
         time_increment=time_increment,
@@ -656,12 +803,12 @@ async def get_insights(
 async def summarize_actions(
     level: str,
     object_id: str,
-    action_types: list[str] | None = None,
+    action_types: StringList | None = None,
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
     time_range: dict[str, str] | None = None,
-    breakdowns: list[str] | None = None,
+    breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     include_rows: bool = False,
     max_action_types: int = 25,
@@ -839,17 +986,17 @@ async def compare_time_ranges(
 @mcp_server.tool()
 async def compare_performance(
     level: str,
-    object_ids: list[str],
+    object_ids: StringList,
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
     fields: FieldList | None = None,
-    breakdowns: list[str] | None = None,
-    action_breakdowns: list[str] | None = None,
+    breakdowns: StringList | None = None,
+    action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
-    action_types: list[str] | None = None,
+    action_types: StringList | None = None,
     limit: int = 100,
-    metrics: list[str] | None = None,
+    metrics: StringList | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants the same metrics compared across multiple campaigns, ad sets, ads, or accounts."""
     if not object_ids:
@@ -909,9 +1056,10 @@ async def export_insights(
     since: str | None = None,
     until: str | None = None,
     fields: FieldList | None = None,
-    action_types: list[str] | None = None,
-    breakdowns: list[str] | None = None,
-    action_breakdowns: list[str] | None = None,
+    action_types: StringList | None = None,
+    flatten_actions: StringList | None = None,
+    breakdowns: StringList | None = None,
+    action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     limit: int = DEFAULT_EXPORT_LIMIT,
     inline_limit: int = DEFAULT_INLINE_EXPORT_ROWS,
@@ -920,6 +1068,7 @@ async def export_insights(
 ) -> dict[str, Any]:
     """Use this when the user explicitly wants export-style output; JSON returns structured rows, CSV returns serialized text."""
     after = blank_to_none(after)
+    flatten_actions = _normalize_flatten_actions(flatten_actions)
     export_format = format.lower()
     if export_format not in {"json", "csv"}:
         raise ValidationError("format must be 'json' or 'csv'.")
@@ -945,6 +1094,7 @@ async def export_insights(
         until=normalized_until,
         fields=fields,
         action_types=action_types,
+        flatten_actions=flatten_actions,
         breakdowns=breakdowns,
         action_breakdowns=action_breakdowns,
         time_increment=time_increment,
@@ -982,6 +1132,7 @@ async def export_insights(
             "breakdowns": breakdowns or [],
             "action_breakdowns": action_breakdowns or [],
             "action_types": action_types or [],
+            "flatten_actions": flatten_actions or [],
             "limit": limit,
             "inline_limit": inline_limit,
             "allow_large_output": allow_large_output,
@@ -1015,7 +1166,7 @@ async def export_insights(
     return response
 
 
-@mcp_server.tool()
+@mcp_server.tool(tags={"read-only"})
 async def create_async_insights_report(
     level: str,
     object_id: str,
@@ -1023,14 +1174,25 @@ async def create_async_insights_report(
     since: str | None = None,
     until: str | None = None,
     fields: FieldList | None = None,
-    breakdowns: list[str] | None = None,
-    action_breakdowns: list[str] | None = None,
+    field_preset: Literal["lean", "full"] = "lean",
+    flatten_actions: StringList | None = None,
+    breakdowns: StringList | None = None,
+    action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Use this when the reporting query is large enough that a synchronous insights call would be too heavy."""
+    """Create a large report using lean fields by default and optional scalar action projections."""
+    flatten_actions = _normalize_flatten_actions(flatten_actions)
     client = get_graph_api_client()
-    requested_fields = normalize_field_list(fields) or DEFAULT_INSIGHTS_FIELDS
+    requested_fields = normalize_field_list(fields)
+    effective_field_preset = "custom" if requested_fields else field_preset
+    requested_fields = requested_fields or _default_async_fields(level, field_preset)
+    for dependency in _action_dependency_fields(
+        action_types=None,
+        flatten_actions=flatten_actions,
+    ):
+        if dependency not in requested_fields:
+            requested_fields.append(dependency)
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
     payload = await client.create_async_insights_report(
         resolved_object_id,
@@ -1051,38 +1213,181 @@ async def create_async_insights_report(
         "report_run_id": payload.get("report_run_id") or payload.get("id"),
         "status": payload,
         "requested_fields": requested_fields,
+        "field_preset": effective_field_preset,
+        "flatten_actions": flatten_actions,
         "poll_hint": "Use get_async_insights_report with the returned report_run_id.",
     }
+
+
+@mcp_server.tool(tags={"read-only"})
+async def create_async_insights_report_batch(
+    level: str,
+    object_id: str,
+    breakdown_sets: list[list[str]],
+    date_preset: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    fields: FieldList | None = None,
+    field_preset: Literal["lean", "full"] = "lean",
+    flatten_actions: StringList | None = None,
+    action_breakdowns: StringList | None = None,
+    time_increment: int | str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Submit a bounded sequence of async reports for several independent breakdown sets."""
+    if not breakdown_sets:
+        raise ValidationError("breakdown_sets must contain at least one breakdown set.")
+    if len(breakdown_sets) > MAX_ASYNC_BATCH_JOBS:
+        raise ValidationError(
+            f"breakdown_sets supports at most {MAX_ASYNC_BATCH_JOBS} jobs per call."
+        )
+    if any(not breakdown_set for breakdown_set in breakdown_sets):
+        raise ValidationError("Each breakdown set must contain at least one breakdown.")
+
+    items: list[dict[str, Any]] = []
+    stopped_early = False
+    for index, breakdown_set in enumerate(breakdown_sets):
+        try:
+            report = await create_async_insights_report(
+                level=level,
+                object_id=object_id,
+                date_preset=date_preset,
+                since=since,
+                until=until,
+                fields=fields,
+                field_preset=field_preset,
+                flatten_actions=flatten_actions,
+                breakdowns=breakdown_set,
+                action_breakdowns=action_breakdowns,
+                time_increment=time_increment,
+                limit=limit,
+            )
+            items.append(
+                {
+                    "index": index,
+                    "breakdowns": breakdown_set,
+                    "ok": True,
+                    **report,
+                }
+            )
+        except RateLimitError as exc:
+            items.append(
+                {
+                    "index": index,
+                    "breakdowns": breakdown_set,
+                    "ok": False,
+                    "error": exc.to_public_dict(),
+                }
+            )
+            stopped_early = True
+            break
+        except MetaApiError as exc:
+            items.append(
+                {
+                    "index": index,
+                    "breakdowns": breakdown_set,
+                    "ok": False,
+                    "error": exc.to_public_dict(),
+                }
+            )
+            if exc.is_transient or exc.mutation_outcome_unknown:
+                stopped_early = True
+                break
+
+    succeeded = sum(1 for item in items if item["ok"])
+    return collection_response(
+        items,
+        summary={
+            "count": len(items),
+            "requested": len(breakdown_sets),
+            "succeeded": succeeded,
+            "failed": len(items) - succeeded,
+            "stopped_early": stopped_early,
+            "remaining_unsubmitted": len(breakdown_sets) - len(items),
+        },
+    )
 
 
 @mcp_server.tool()
 async def get_async_insights_report(
     report_run_id: str,
     fields: FieldList | None = None,
+    action_types: StringList | None = None,
+    flatten_actions: StringList | None = None,
+    include_raw_actions: bool = False,
     limit: int = 100,
     after: str | None = None,
+    wait: bool = False,
+    wait_timeout_seconds: float = 30.0,
+    poll_interval_seconds: float = 2.0,
 ) -> dict[str, Any]:
-    """Use this after create_async_insights_report to poll status and fetch rows when the job is ready."""
+    """Poll or bounded-wait for an async report and return compact, field-selectable rows when ready."""
     after = blank_to_none(after)
+    if wait_timeout_seconds < 0 or wait_timeout_seconds > MAX_ASYNC_WAIT_SECONDS:
+        raise ValidationError(
+            f"wait_timeout_seconds must be between 0 and {MAX_ASYNC_WAIT_SECONDS:g}."
+        )
+    if poll_interval_seconds <= 0 or poll_interval_seconds > 10:
+        raise ValidationError("poll_interval_seconds must be greater than 0 and at most 10.")
+    flatten_actions = _normalize_flatten_actions(flatten_actions)
+    requested_fields = normalize_field_list(fields)
+    if requested_fields is not None:
+        for required_field in _action_dependency_fields(
+            action_types=action_types,
+            flatten_actions=flatten_actions,
+        ):
+            if required_field not in requested_fields:
+                requested_fields.append(required_field)
     client = get_graph_api_client()
-    payload = await client.get_async_report(
-        report_run_id,
-        fields=fields,
-        limit=limit,
-        after=after,
-    )
+    deadline = asyncio.get_running_loop().time() + wait_timeout_seconds
+    wait_timed_out = False
+    while True:
+        payload = await client.get_async_report(
+            report_run_id,
+            fields=requested_fields,
+            limit=limit,
+            after=after,
+        )
+        job = _async_job_state(
+            payload["status"],
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        if job["terminal"] or not wait:
+            break
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining < poll_interval_seconds:
+            wait_timed_out = True
+            break
+        await asyncio.sleep(poll_interval_seconds)
+
+    job["wait_timed_out"] = wait_timed_out
     rows_payload = payload.get("rows", {})
     if isinstance(rows_payload, dict) and rows_payload:
-        rows = _normalize_rows(rows_payload)
+        rows = _normalize_rows(
+            rows_payload,
+            action_types=action_types,
+            include_raw_actions=include_raw_actions,
+            flatten_actions=flatten_actions,
+        )
+        row_summary: dict[str, Any] = {
+            "count": len(rows),
+            "metrics": _aggregate_metrics(rows),
+        }
+        if flatten_actions:
+            row_summary["flattened_action_columns"] = [
+                _normalize_key(label) for label in flatten_actions
+            ]
         return {
             "status": payload["status"],
+            "job": job,
             "rows": collection_response(
                 rows,
                 paging=normalize_collection(rows_payload)["paging"],
-                summary={"count": len(rows), "metrics": _aggregate_metrics(rows)},
+                summary=row_summary,
             ),
         }
     return {
         "status": payload["status"],
+        "job": job,
         "rows": collection_response([], summary={"count": 0}),
     }
