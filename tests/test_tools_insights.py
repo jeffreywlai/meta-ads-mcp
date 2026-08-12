@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
+import stat
+
+import pydantic_core
 import pytest
 
+from meta_ads_mcp.coordinator import MAX_TOOL_RESPONSE_BYTES, RESPONSE_LIMIT_HINT, mcp_server
 from meta_ads_mcp.tools import insights
 
 
@@ -168,6 +174,29 @@ def test_get_entity_insights_rejects_unknown_date_preset_before_api(monkeypatch)
                 date_preset="this_week_mon_sun",
             )
         )
+
+
+def test_tool_layer_bounds_invalid_date_preset_in_errors_and_logs(capsys) -> None:
+    oversized_value = "sensitive-invalid-value-" * 3_000
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(
+            mcp_server.call_tool(
+                "get_insights",
+                {
+                    "level": "account",
+                    "object_id": "act_123",
+                    "date_preset": oversized_value,
+                },
+            )
+        )
+    captured = capsys.readouterr()
+    emitted = captured.out + captured.err
+
+    assert "Unsupported date_preset" in str(exc_info.value)
+    assert oversized_value not in str(exc_info.value)
+    assert oversized_value not in emitted
+    assert len(emitted.encode("utf-8")) < MAX_TOOL_RESPONSE_BYTES
 
 
 def test_get_entity_insights_translates_lifetime_date_alias(monkeypatch) -> None:
@@ -414,6 +443,106 @@ def test_summarize_actions_reports_explicit_window_without_default_preset(monkey
     assert result["action_filter_mode"] == "all"
 
 
+def test_summarize_actions_exposes_partial_page_and_continuation(monkeypatch) -> None:
+    class PagingActionClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert params["after"] == "CURRENT_PAGE"
+            payload = await super().get_insights(
+                object_id,
+                fields=fields,
+                params=params,
+            )
+            payload["paging"] = {
+                "cursors": {"after": "NEXT_PAGE"},
+                "next": "next",
+            }
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PagingActionClient())
+    result = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            after="CURRENT_PAGE",
+        )
+    )
+
+    assert result["complete"] is False
+    assert result["paging"]["after"] == "NEXT_PAGE"
+    assert "after='NEXT_PAGE'" in result["next_step"]
+
+
+def test_composite_insights_tools_normalize_blank_after(monkeypatch) -> None:
+    calls: list[object] = []
+
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs["after"])
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {"count": 0, "metrics": {}},
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+            after=" ",
+        )
+    )
+    asyncio.run(
+        insights.get_performance_breakdown(
+            level="campaign",
+            object_id="cmp_1",
+            breakdown="country",
+            after=" ",
+        )
+    )
+
+    assert calls == [None, None]
+
+
+def test_terminal_after_cursor_without_next_is_complete(monkeypatch) -> None:
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        return {
+            "items": [],
+            "paging": {
+                "before": None,
+                "after": "END_CURSOR",
+                "next": None,
+            },
+            "summary": {"count": 0, "metrics": {}},
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    actions = asyncio.run(
+        insights.summarize_actions(
+            level="account",
+            object_id="act_123",
+        )
+    )
+    breakdown = asyncio.run(
+        insights.get_performance_breakdown(
+            level="campaign",
+            object_id="cmp_1",
+            breakdown="country",
+        )
+    )
+    exported = asyncio.run(
+        insights.export_insights(
+            level="campaign",
+            object_id="cmp_1",
+        )
+    )
+
+    assert actions["complete"] is True
+    assert "next_step" not in actions
+    assert breakdown["summary"]["complete"] is True
+    assert exported["complete"] is True
+    assert exported["truncated"] is False
+
+
 def test_compare_performance_ranks_multiple_objects(monkeypatch) -> None:
     async def fake_get_entity_insights(*, object_id: str, **_: object) -> dict[str, object]:
         metrics = {
@@ -517,7 +646,8 @@ def test_compare_performance_reports_effective_window(monkeypatch) -> None:
 
 
 def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:
-    async def fake_get_entity_insights(**_: object) -> dict[str, object]:
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        assert kwargs["after"] == "CURRENT_PAGE"
         return {
             "items": [
                 {"country": "US", "metrics": {"spend": 100.0, "roas": 1.0}},
@@ -530,10 +660,16 @@ def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:
 
     monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
     result = asyncio.run(
-        insights.get_performance_breakdown(level="campaign", object_id="cmp_1", breakdown="country")
+        insights.get_performance_breakdown(
+            level="campaign",
+            object_id="cmp_1",
+            breakdown="country",
+            after="CURRENT_PAGE",
+        )
     )
     assert result["items"][0]["country"] == "CA"
     assert result["summary"]["top_segments"][0]["country"] == "CA"
+    assert result["summary"]["complete"] is False
     assert result["paging"]["after"] == "after_1"
 
 
@@ -737,6 +873,41 @@ def test_export_insights_can_allow_large_output(monkeypatch) -> None:
     assert len(result["rows"]) == 120
 
 
+def test_export_insights_preserves_meta_paging_and_next_cursor(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_entity_insights(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        items = [{"campaign_id": f"cmp_{index}"} for index in range(100)]
+        return {
+            "items": items,
+            "summary": {"count": len(items)},
+            "paging": {
+                "before": None,
+                "after": "NEXT_PAGE",
+                "next": "https://graph.example/next",
+            },
+        }
+
+    monkeypatch.setattr(insights, "get_entity_insights", fake_get_entity_insights)
+    result = asyncio.run(
+        insights.export_insights(
+            level="campaign",
+            object_id="act_123",
+            allow_large_output=True,
+            after="CURRENT_PAGE",
+        )
+    )
+
+    assert calls[0]["after"] == "CURRENT_PAGE"
+    assert result["record_count"] == 100
+    assert result["returned_count"] == 100
+    assert result["truncated"] is True
+    assert result["complete"] is False
+    assert result["paging"]["after"] == "NEXT_PAGE"
+    assert "after='NEXT_PAGE'" in result["next_step"]
+
+
 def test_export_insights_handles_empty_results(monkeypatch) -> None:
     async def fake_get_entity_insights(**_: object) -> dict[str, object]:
         return {"items": [], "summary": {"count": 0, "metrics": {}}, "paging": {}}
@@ -914,3 +1085,119 @@ def test_get_async_insights_report_preserves_error_fields(monkeypatch) -> None:
     result = asyncio.run(insights.get_async_insights_report(report_run_id="rpt_123"))
     assert result["status"]["error_message"] == "bad report"
     assert result["rows"]["summary"]["count"] == 0
+
+
+def test_mcp_response_guard_archives_complete_oversized_insights(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    oversized_name = "oversized-" + ('\\"' * 100_000)
+
+    class OversizedInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            return {
+                "data": [
+                    {
+                        "ad_id": "ad_1",
+                        "ad_name": oversized_name,
+                        "spend": "1",
+                        "impressions": "10",
+                        "clicks": "1",
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
+    middleware = mcp_server.middleware[-1]
+    artifact_store = middleware.artifact_store
+    monkeypatch.setattr(artifact_store, "export_directory", tmp_path)
+
+    result = asyncio.run(
+        mcp_server.call_tool(
+            "get_insights",
+            {"level": "ad", "object_id": "ad_1", "time_increment": 1},
+        )
+    )
+
+    assert result.structured_content is None
+    overflow = result.meta["overflow"]
+    assert overflow["archived"] is True
+    export_id = overflow["export_id"]
+    assert export_id in result.content[0].text
+    assert str(tmp_path) not in result.content[0].text
+
+    chunks: list[str] = []
+    offset = 0
+    chunk_calls = 0
+    while True:
+        chunk_calls += 1
+        chunk_result = asyncio.run(
+            mcp_server.call_tool(
+                "call_tool",
+                {
+                    "name": "read_overflow_artifact",
+                    "arguments": {"export_id": export_id, "offset": offset},
+                },
+            )
+        )
+        assert len(pydantic_core.to_json(chunk_result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES
+        chunk = chunk_result.structured_content
+        assert json.loads(chunk_result.content[0].text) == chunk
+        chunks.append(chunk["data"])
+        if chunk["complete"]:
+            break
+        offset = chunk["next_offset"]
+    legacy_chunk_calls = (
+        chunk["total_bytes"] + 8_000 - 1
+    ) // 8_000
+    assert chunk_calls < legacy_chunk_calls
+
+    archived = json.loads("".join(chunks))
+    archived_result = archived["tool_result"]
+    assert archived_result["structured_content"]["items"][0]["ad_name"] == oversized_name
+    assert archived_result["content"]
+    assert "meta" in archived_result
+    artifact_path = artifact_store._artifact_path(export_id)
+    assert overflow["artifact_bytes"] == artifact_path.stat().st_size
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE(artifact_path.stat().st_mode) == 0o600
+    assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES
+
+    deleted = asyncio.run(
+        mcp_server.call_tool(
+            "call_tool",
+            {
+                "name": "delete_overflow_artifact",
+                "arguments": {"export_id": export_id},
+            },
+        )
+    )
+    assert deleted.structured_content["deleted"] is True
+    assert not artifact_path.exists()
+
+
+def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class OversizedInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            return {"data": [{"ad_id": "ad_1", "ad_name": "x" * 100_000}]}
+
+    blocked_directory = tmp_path / "not-a-directory"
+    blocked_directory.write_text("blocked")
+    middleware = mcp_server.middleware[-1]
+    monkeypatch.setattr(middleware.artifact_store, "export_directory", blocked_directory)
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
+
+    result = asyncio.run(
+        mcp_server.call_tool(
+            "get_insights",
+            {"level": "ad", "object_id": "ad_1", "time_increment": 1},
+        )
+    )
+
+    assert result.structured_content is None
+    assert result.meta["overflow"]["archived"] is False
+    assert RESPONSE_LIMIT_HINT.strip() in result.content[0].text
+    assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES

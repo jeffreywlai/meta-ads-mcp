@@ -166,3 +166,117 @@ def test_recommendation_refresh_bypasses_cache(monkeypatch) -> None:
     asyncio.run(recommendations.get_budget_opportunities(account_id="123", refresh=True))
 
     assert client.calls == 2
+
+
+def test_recommendation_paging_is_usable_and_cache_is_cursor_scoped(
+    monkeypatch,
+) -> None:
+    class PagingRecommendationsClient(FakeRecommendationsClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requests: list[tuple[int, str | None]] = []
+
+        async def get_recommendations(
+            self,
+            account_id: str,
+            *,
+            campaign_id=None,
+            limit=25,
+            after=None,
+        ):
+            self.calls += 1
+            self.requests.append((limit, after))
+            suffix = after or "first"
+            return {
+                "data": [
+                    {
+                        "id": f"rec_{suffix}",
+                        "message": "Increase budget on strong ad sets",
+                    }
+                ],
+                "paging": {
+                    "cursors": {"after": f"next_{suffix}"},
+                    "next": "next",
+                },
+            }
+
+    recommendations._RECOMMENDATION_CACHE.clear()
+    client = PagingRecommendationsClient()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: client)
+
+    first = asyncio.run(
+        recommendations.get_recommendations(account_id="123", limit=10)
+    )
+    first_again = asyncio.run(
+        recommendations.get_recommendations(account_id="123", limit=10)
+    )
+    first_with_blank_cursor = asyncio.run(
+        recommendations.get_recommendations(
+            account_id="123",
+            limit=10,
+            after=" ",
+        )
+    )
+    second = asyncio.run(
+        recommendations.get_budget_opportunities(
+            account_id="123",
+            limit=10,
+            after="next_first",
+        )
+    )
+
+    assert first["paging"]["after"] == "next_first"
+    assert first["complete"] is False
+    assert first_again["items"][0]["id"] == "rec_first"
+    assert first_with_blank_cursor["items"][0]["id"] == "rec_first"
+    assert second["paging"]["after"] == "next_next_first"
+    assert second["complete"] is False
+    assert client.requests == [(10, None), (10, "next_first")]
+
+
+def test_recommendation_terminal_after_cursor_is_complete(monkeypatch) -> None:
+    class TerminalRecommendationsClient(FakeRecommendationsClient):
+        async def get_recommendations(self, account_id: str, **kwargs):
+            return {
+                "data": [{"id": "rec_terminal", "message": "Increase budget"}],
+                "paging": {"cursors": {"after": "END_CURSOR"}},
+            }
+
+    recommendations._RECOMMENDATION_CACHE.clear()
+    monkeypatch.setattr(
+        recommendations,
+        "get_graph_api_client",
+        lambda: TerminalRecommendationsClient(),
+    )
+    result = asyncio.run(recommendations.get_recommendations(account_id="123"))
+
+    assert result["paging"]["after"] == "END_CURSOR"
+    assert result["complete"] is True
+
+
+def test_recommendation_cache_prunes_expired_and_caps_live_entries(
+    monkeypatch,
+) -> None:
+    now = 1_000.0
+    monkeypatch.setattr(recommendations, "monotonic", lambda: now)
+    recommendations._RECOMMENDATION_CACHE.clear()
+    payload = {"supported": True, "items": [], "summary": {"count": 0}}
+
+    for index in range(recommendations._RECOMMENDATION_CACHE_MAX_ENTRIES + 20):
+        recommendations._store_cached_recommendations(
+            ("token", "act_123", "", 25, f"cursor_{index}"),
+            payload,
+        )
+
+    assert (
+        len(recommendations._RECOMMENDATION_CACHE)
+        == recommendations._RECOMMENDATION_CACHE_MAX_ENTRIES
+    )
+    now += recommendations._RECOMMENDATION_CACHE_TTL_SECONDS + 1
+    recommendations._store_cached_recommendations(
+        ("token", "act_123", "", 25, "fresh"),
+        payload,
+    )
+    assert list(recommendations._RECOMMENDATION_CACHE) == [
+        ("token", "act_123", "", 25, "fresh")
+    ]

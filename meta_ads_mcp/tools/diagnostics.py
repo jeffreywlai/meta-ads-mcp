@@ -21,6 +21,7 @@ from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, to_float
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
+from meta_ads_mcp.tool_types import FieldList
 from meta_ads_mcp.tools.insights import (
     DEFAULT_INSIGHTS_FIELDS,
     _aggregate_metrics,
@@ -269,7 +270,7 @@ async def _child_insights(
     date_preset: str | None = "last_7d",
     since: str | None = None,
     until: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     breakdowns: list[str] | None = None,
     action_breakdowns: list[str] | None = None,
     limit: int = 250,

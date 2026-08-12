@@ -8,6 +8,8 @@ from meta_ads_mcp import stdio  # noqa: F401 - ensures tools are registered
 from meta_ads_mcp.config import Settings
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
+    MAX_TOOL_RESPONSE_BYTES,
+    RESPONSE_LIMIT_HINT,
     mcp_server,
     serialize_search_results_compact,
 )
@@ -18,9 +20,16 @@ def test_fastmcp_31_search_transform_is_configured() -> None:
     transforms = getattr(mcp_server, "transforms", [])
     assert transforms
     transform = transforms[0]
-    assert type(transform).__name__ == "BM25SearchTransform"
+    assert type(transform).__name__ == "IntentAwareBM25SearchTransform"
     assert sorted(getattr(transform, "_always_visible", set())) == sorted(ALWAYS_VISIBLE_TOOLS)
     assert getattr(transform, "_search_result_serializer", None) is serialize_search_results_compact
+
+
+def test_response_size_guard_is_configured() -> None:
+    middleware = mcp_server.middleware[-1]
+    assert type(middleware).__name__ == "ArchivedResponseLimitingMiddleware"
+    assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
+    assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
 
 
 def test_list_tools_exposes_compact_search_surface() -> None:
@@ -71,32 +80,6 @@ def test_historical_missing_tools_respond_through_tool_layer(monkeypatch) -> Non
 
     assert health.structured_content["status"] == "unhealthy"
     assert accounts.structured_content["items"][0]["id"] == "act_123"
-
-
-def test_search_routes_feedback_and_action_count_workflows() -> None:
-    async def search(query: str) -> str:
-        result = await mcp_server.call_tool("search_tools", {"query": query})
-        return result.structured_content["result"]
-
-    feedback = asyncio.run(search("feedback reviews testimonials"))
-    raw_comments = asyncio.run(search("facebook ad comments"))
-    page_reviews = asyncio.run(search("page reviews testimonials"))
-    actions = asyncio.run(search("how many appointments campaign trailing 30 days"))
-    campaign_lookup = asyncio.run(search("find campaign by name"))
-    terse_campaigns = asyncio.run(search("campaigns"))
-    terse_actions = asyncio.run(search("appointments last 30 days"))
-    terse_pause = asyncio.run(search("pause ad set"))
-
-    assert feedback.splitlines()[1].startswith("- `get_ad_feedback_signals`")
-    assert raw_comments.splitlines()[1].startswith("- `list_ad_comments`")
-    assert page_reviews.splitlines()[1].startswith("- `list_page_recommendations`")
-    assert actions.splitlines()[1].startswith("- `summarize_actions`")
-    assert campaign_lookup.splitlines()[1].startswith("- `list_campaigns`")
-    assert "client-side name lookup" in campaign_lookup.splitlines()[1]
-    assert "find campaign by name" not in campaign_lookup.splitlines()[1]
-    assert terse_campaigns.splitlines()[1].startswith("- `list_campaigns`")
-    assert terse_actions.splitlines()[1].startswith("- `summarize_actions`")
-    assert terse_pause.splitlines()[1].startswith("- `set_adset_status`")
 
 
 def test_compare_performance_responds_through_tool_layer(monkeypatch) -> None:

@@ -6,11 +6,15 @@ from dataclasses import dataclass
 import json
 from typing import Any
 
+import httpx
+
+from meta_ads_mcp.activity_scope import validate_activity_scope_arguments
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaAdsError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.tool_types import FieldList
 
 DEFAULT_ACTIVITY_FIELDS = [
     "actor_id",
@@ -26,17 +30,6 @@ DEFAULT_ACTIVITY_FIELDS = [
     "object_type",
     "translated_event_type",
 ]
-
-LEVEL_ALIASES = {
-    "account": "account",
-    "campaign": "campaign",
-    "adset": "adset",
-    "ad_set": "adset",
-    "adgroup": "adset",
-    "ad_group": "adset",
-    "ad": "ad",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class ActivityScope:
@@ -59,18 +52,55 @@ def _resolve_account_id(account_id: str | None) -> str:
     raise ValidationError("account_id is required when META_DEFAULT_ACCOUNT_ID is not set.")
 
 
-def _normalize_level(level: str | None) -> str | None:
-    """Normalize level aliases while preserving omitted levels."""
-    level = blank_to_none(level)
-    if level is None:
-        return None
-    normalized = LEVEL_ALIASES.get(level.lower())
-    if normalized is None:
-        raise ValidationError(f"level must be one of {sorted(set(LEVEL_ALIASES.values()))}.")
-    return normalized
+def _configured_account_id(account_id: str | None) -> str | None:
+    """Resolve an explicit or configured account id without requiring one."""
+    if account_id := blank_to_none(account_id):
+        return normalize_account_id(account_id)
+    if default_account_id := blank_to_none(get_settings().default_account_id):
+        return normalize_account_id(default_account_id)
+    return None
 
 
-def _resolve_scope(
+async def _resolve_object_account_id(
+    *,
+    object_id: str,
+    account_id: str | None,
+    client: Any,
+) -> str:
+    """Resolve and verify an object's owning account."""
+    configured_account_id = _configured_account_id(account_id)
+    try:
+        payload = await client.get_object(object_id, fields=["account_id"])
+    except (MetaAdsError, httpx.HTTPError) as exc:
+        if configured_account_id is not None:
+            return configured_account_id
+        raise ValidationError(
+            f"account_id could not be derived from object '{object_id}'. "
+            "Pass account_id explicitly or set META_DEFAULT_ACCOUNT_ID. "
+            f"Ownership lookup failed: {exc}"
+        ) from exc
+    derived_account_id = payload.get("account_id")
+    if derived_account_id is None or not str(derived_account_id).strip():
+        if configured_account_id is not None:
+            return configured_account_id
+        raise ValidationError(
+            f"account_id could not be derived from object '{object_id}'. "
+            "Pass account_id explicitly or set META_DEFAULT_ACCOUNT_ID."
+        )
+    normalized_derived_account_id = normalize_account_id(str(derived_account_id).strip())
+    if (
+        configured_account_id is not None
+        and configured_account_id != normalized_derived_account_id
+    ):
+        raise ValidationError(
+            f"Object '{object_id}' belongs to account "
+            f"'{normalized_derived_account_id}', but the supplied or default "
+            f"account resolves to '{configured_account_id}'."
+        )
+    return normalized_derived_account_id
+
+
+async def _resolve_scope(
     *,
     level: str | None,
     object_id: str | None,
@@ -78,33 +108,32 @@ def _resolve_scope(
     campaign_id: str | None,
     adset_id: str | None,
     ad_id: str | None,
+    client: Any,
 ) -> ActivityScope:
     """Resolve user scope into the ad-account activities edge plus optional object filter."""
-    normalized_level = _normalize_level(level)
-    normalized_object_id = blank_to_none(object_id)
-    normalized_account_id = blank_to_none(account_id)
-    object_alias_candidates = [
-        ("campaign", blank_to_none(campaign_id)),
-        ("adset", blank_to_none(adset_id)),
-        ("ad", blank_to_none(ad_id)),
-    ]
-    provided_object_aliases = [
-        (candidate_level, candidate_id) for candidate_level, candidate_id in object_alias_candidates if candidate_id
-    ]
-    if len(provided_object_aliases) > 1:
-        raise ValidationError("Provide only one of campaign_id, adset_id, or ad_id.")
+    try:
+        validated = validate_activity_scope_arguments(
+            level=level,
+            object_id=object_id,
+            account_id=account_id,
+            campaign_id=campaign_id,
+            adset_id=adset_id,
+            ad_id=ad_id,
+        )
+    except ValueError as error:
+        raise ValidationError(str(error)) from error
+    normalized_level = validated.level
+    normalized_object_id = validated.object_id
+    normalized_account_id = validated.account_id
+    provided_object_aliases = (
+        [validated.object_alias]
+        if validated.object_alias is not None
+        else []
+    )
 
     if normalized_object_id is not None:
-        if normalized_level is None:
-            raise ValidationError("Provide level when using object_id.")
-        if provided_object_aliases:
-            alias_level, alias_object_id = provided_object_aliases[0]
-            if alias_level != normalized_level or alias_object_id != normalized_object_id:
-                raise ValidationError("Conflicting scope arguments. Use either level/object_id or one entity-specific id.")
         if normalized_level == "account":
             resolved_account_id = _resolve_account_id(normalized_object_id)
-            if normalized_account_id and _resolve_account_id(normalized_account_id) != resolved_account_id:
-                raise ValidationError("Conflicting account scope arguments.")
             return ActivityScope(
                 level="account",
                 object_id=resolved_account_id,
@@ -112,7 +141,11 @@ def _resolve_scope(
                 parent_id=resolved_account_id,
                 object_filter_id=None,
             )
-        resolved_account_id = _resolve_account_id(normalized_account_id)
+        resolved_account_id = await _resolve_object_account_id(
+            object_id=normalized_object_id,
+            account_id=normalized_account_id,
+            client=client,
+        )
         return ActivityScope(
             level=normalized_level,
             object_id=normalized_object_id,
@@ -123,9 +156,11 @@ def _resolve_scope(
 
     if provided_object_aliases:
         alias_level, alias_object_id = provided_object_aliases[0]
-        if normalized_level is not None and normalized_level != alias_level:
-            raise ValidationError("Conflicting scope arguments. Use either level/object_id or one entity-specific id.")
-        resolved_account_id = _resolve_account_id(normalized_account_id)
+        resolved_account_id = await _resolve_object_account_id(
+            object_id=alias_object_id,
+            account_id=normalized_account_id,
+            client=client,
+        )
         return ActivityScope(
             level=alias_level,
             object_id=alias_object_id,
@@ -143,7 +178,7 @@ def _resolve_scope(
             parent_id=resolved_account_id,
             object_filter_id=None,
         )
-    raise ValidationError("Provide object_id or the matching entity-specific id for non-account levels.")
+    raise AssertionError("validated activity scope was not resolvable")
 
 
 def _activity_params(
@@ -208,18 +243,20 @@ async def list_change_history(
     category: str | None = None,
     business_id: str | None = None,
     uid: str | int | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
     """Read Meta Ads activity/change history for an account, campaign, ad set, or ad."""
-    scope = _resolve_scope(
+    client = get_graph_api_client()
+    scope = await _resolve_scope(
         level=level,
         object_id=object_id,
         account_id=account_id,
         campaign_id=campaign_id,
         adset_id=adset_id,
         ad_id=ad_id,
+        client=client,
     )
     requested_fields = fields or DEFAULT_ACTIVITY_FIELDS
     params = _activity_params(
@@ -232,7 +269,6 @@ async def list_change_history(
         uid=uid,
         object_filter_id=scope.object_filter_id,
     )
-    client = get_graph_api_client()
     payload = await client.list_objects(scope.parent_id, "activities", fields=requested_fields, params=params)
     response = normalize_collection(payload)
     normalized_uid = blank_to_none(uid) if isinstance(uid, str) else uid

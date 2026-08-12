@@ -205,6 +205,165 @@ def test_reply_author_fields_are_requested_when_author_enabled() -> None:
     assert "replies.limit(3){id,text,timestamp,like_count,username}" in instagram_fields
 
 
+def test_compact_comment_preserves_nested_reply_paging() -> None:
+    result = social_feedback._compact_comment(
+        {
+            "id": "comment_1",
+            "message": "Parent",
+            "comment_count": 5,
+            "comments": {
+                "data": [{"id": "reply_1", "message": "Reply"}],
+                "paging": {
+                    "cursors": {"after": "REPLY_NEXT"},
+                    "next": "https://graph.example/replies",
+                },
+            },
+        },
+        surface="facebook",
+        max_message_chars=1_000,
+        include_author=False,
+    )
+
+    assert result["replies_returned"] == 1
+    assert result["replies_complete"] is False
+    assert result["reply_paging"]["after"] == "REPLY_NEXT"
+    assert result["reply_next_step"] == {
+        "tool": "list_comment_replies",
+        "arguments": {
+            "comment_id": "comment_1",
+            "surface": "facebook",
+            "include_author": False,
+            "max_message_chars": 1_000,
+            "after": "REPLY_NEXT",
+        },
+    }
+
+
+def test_compact_comment_treats_terminal_after_cursor_as_complete() -> None:
+    result = social_feedback._compact_comment(
+        {
+            "id": "comment_1",
+            "message": "Parent",
+            "comment_count": 1,
+            "comments": {
+                "data": [{"id": "reply_1", "message": "Reply"}],
+                "paging": {"cursors": {"after": "END_CURSOR"}},
+            },
+        },
+        surface="facebook",
+        max_message_chars=1_000,
+        include_author=True,
+    )
+
+    assert result["reply_paging"]["after"] == "END_CURSOR"
+    assert result["replies_complete"] is True
+    assert "reply_next_step" not in result
+
+
+def test_reply_next_step_preserves_output_controls() -> None:
+    result = social_feedback._compact_comment(
+        {
+            "id": "comment_1",
+            "message": "Parent",
+            "comment_count": 2,
+            "comments": {
+                "data": [{"id": "reply_1", "message": "Reply"}],
+                "paging": {
+                    "cursors": {"after": "REPLY_NEXT"},
+                    "next": "next",
+                },
+            },
+        },
+        surface="facebook",
+        max_message_chars=1_234,
+        include_author=True,
+        reply_limit=7,
+    )
+
+    assert result["reply_next_step"]["arguments"] == {
+        "comment_id": "comment_1",
+        "surface": "facebook",
+        "include_author": True,
+        "max_message_chars": 1_234,
+        "limit": 7,
+        "after": "REPLY_NEXT",
+    }
+
+
+@pytest.mark.parametrize(
+    ("surface", "expected_edge"),
+    [("facebook", "comments"), ("instagram", "replies")],
+)
+def test_list_comment_replies_continues_surface_specific_edge(
+    monkeypatch,
+    surface: str,
+    expected_edge: str,
+) -> None:
+    class ReplyClient(FakeSocialClient):
+        async def list_objects(
+            self,
+            parent_id: str,
+            edge: str,
+            *,
+            fields=None,
+            params=None,
+        ):
+            self.list_calls.append((parent_id, edge, fields, params))
+            text_key = "message" if surface == "facebook" else "text"
+            time_key = "created_time" if surface == "facebook" else "timestamp"
+            return {
+                "data": [
+                    {
+                        "id": "reply_2",
+                        text_key: "Continued reply",
+                        time_key: "2026-04-01T00:00:00+0000",
+                    }
+                ],
+                "paging": {"cursors": {"after": "REPLY_NEXT_2"}},
+            }
+
+    client = ReplyClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        social_feedback.list_comment_replies(
+            comment_id="comment_1",
+            surface=surface,
+            after="REPLY_NEXT",
+        )
+    )
+
+    assert client.list_calls[0][0:2] == ("comment_1", expected_edge)
+    assert client.list_calls[0][3]["after"] == "REPLY_NEXT"
+    assert result["items"][0]["message"] == "Continued reply"
+    assert result["paging"]["after"] == "REPLY_NEXT_2"
+
+
+def test_list_comment_replies_normalizes_blank_cursor(monkeypatch) -> None:
+    class BlankCursorReplyClient(FakeSocialClient):
+        async def list_objects(
+            self,
+            parent_id: str,
+            edge: str,
+            *,
+            fields=None,
+            params=None,
+        ):
+            self.list_calls.append((parent_id, edge, fields, params))
+            return {"data": []}
+
+    client = BlankCursorReplyClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+    asyncio.run(
+        social_feedback.list_comment_replies(
+            comment_id="comment_1",
+            surface="facebook",
+            after=" ",
+        )
+    )
+
+    assert client.list_calls[0][3] == {"limit": 25}
+
+
 def test_list_ad_comments_can_fetch_all_available_ad_surfaces(monkeypatch) -> None:
     client = FakeSocialClient()
     monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)

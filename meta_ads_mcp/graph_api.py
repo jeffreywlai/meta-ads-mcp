@@ -19,6 +19,7 @@ from .errors import (
     RateLimitError,
     UnsupportedFeatureError,
 )
+from .tool_types import FieldList, coerce_csv_string_list
 
 USER_AGENT = "meta-ads-fastmcp/0.1.0"
 _CLIENT_POOL: dict[tuple[asyncio.AbstractEventLoop, str, str | None, float], httpx.AsyncClient] = {}
@@ -27,6 +28,21 @@ _CLIENT_POOL: dict[tuple[asyncio.AbstractEventLoop, str, str | None, float], htt
 def normalize_account_id(account_id: str) -> str:
     """Ensure account ids use the Graph API act_ prefix."""
     return account_id if account_id.startswith("act_") else f"act_{account_id}"
+
+
+def _serialize_fields(fields: FieldList | None) -> str | None:
+    """Serialize either validated field arrays or direct CSV client input."""
+    normalized_fields = coerce_csv_string_list(fields)
+    if not normalized_fields:
+        return None
+    return ",".join(normalized_fields)
+
+
+def _normalize_cursor(after: str | None) -> str | None:
+    """Treat blank model-supplied cursors as omitted."""
+    if after is None:
+        return None
+    return after.strip() or None
 
 
 def _is_unsupported_surface_error(error: MetaApiError) -> bool:
@@ -179,13 +195,13 @@ class GraphAPIClient:
         self,
         object_id: str,
         *,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch a single object."""
         query = dict(params or {})
-        if fields:
-            query["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            query["fields"] = serialized_fields
         return await self.request("GET", object_id, params=query)
 
     async def list_objects(
@@ -193,13 +209,13 @@ class GraphAPIClient:
         parent_id: str,
         edge: str,
         *,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch an edge collection."""
         query = dict(params or {})
-        if fields:
-            query["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            query["fields"] = serialized_fields
         return await self.request("GET", f"{parent_id}/{edge}", params=query)
 
     async def update_object(
@@ -230,24 +246,24 @@ class GraphAPIClient:
         self,
         object_id: str,
         *,
-        fields: list[str],
+        fields: FieldList,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch insights for an object."""
         query = dict(params or {})
-        query["fields"] = ",".join(fields)
+        query["fields"] = _serialize_fields(fields) or ""
         return await self.request("GET", f"{object_id}/insights", params=query)
 
     async def create_async_insights_report(
         self,
         object_id: str,
         *,
-        fields: list[str],
+        fields: FieldList,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Start an async insights report."""
         query = dict(params or {})
-        query["fields"] = ",".join(fields)
+        query["fields"] = _serialize_fields(fields) or ""
         query["async"] = "true"
         return await self.request("POST", f"{object_id}/insights", data=query)
 
@@ -255,11 +271,12 @@ class GraphAPIClient:
         self,
         report_run_id: str,
         *,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
         limit: int = 100,
         after: str | None = None,
     ) -> dict[str, Any]:
         """Poll report status and fetch results when complete."""
+        cursor = _normalize_cursor(after)
         status = await self.get_object(
             report_run_id,
             fields=[
@@ -280,7 +297,7 @@ class GraphAPIClient:
             report_run_id,
             "insights",
             fields=fields,
-            params={"limit": limit, "after": after} if after else {"limit": limit},
+            params={"limit": limit, "after": cursor} if cursor else {"limit": limit},
         )
         return {"status": status, "rows": rows}
 
@@ -289,12 +306,19 @@ class GraphAPIClient:
         *,
         query: str,
         limit: int = 25,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Search targeting interests."""
+        cursor = _normalize_cursor(after)
         return await self.request(
             "GET",
             "search",
-            params={"q": query, "type": "adinterest", "limit": limit},
+            params={
+                "q": query,
+                "type": "adinterest",
+                "limit": limit,
+                **({"after": cursor} if cursor else {}),
+            },
         )
 
     async def get_interest_suggestions(
@@ -302,8 +326,10 @@ class GraphAPIClient:
         *,
         interest_list: list[str],
         limit: int = 25,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Fetch interest suggestions related to seed interests."""
+        cursor = _normalize_cursor(after)
         return await self.request(
             "GET",
             "search",
@@ -311,6 +337,7 @@ class GraphAPIClient:
                 "type": "adinterestsuggestion",
                 "interest_list": interest_list,
                 "limit": limit,
+                **({"after": cursor} if cursor else {}),
             },
         )
 
@@ -319,13 +346,17 @@ class GraphAPIClient:
         *,
         interest_list: list[str] | None = None,
         interest_ids: list[str] | None = None,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Validate interest names or ids against Meta's targeting search."""
+        cursor = _normalize_cursor(after)
         params: dict[str, Any] = {"type": "adinterestvalid"}
         if interest_list:
             params["interest_list"] = interest_list
         if interest_ids:
             params["interest_fbid_list"] = interest_ids
+        if cursor:
+            params["after"] = cursor
         return await self.request("GET", "search", params=params)
 
     async def search_geo_locations(
@@ -334,8 +365,10 @@ class GraphAPIClient:
         query: str,
         location_types: list[str] | None = None,
         limit: int = 25,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Search geo locations."""
+        cursor = _normalize_cursor(after)
         params: dict[str, Any] = {
             "type": "adgeolocation",
             "q": query,
@@ -343,6 +376,8 @@ class GraphAPIClient:
         }
         if location_types:
             params["location_types"] = ",".join(location_types)
+        if cursor:
+            params["after"] = cursor
         return await self.request("GET", "search", params=params)
 
     async def search_targeting_categories(
@@ -352,14 +387,18 @@ class GraphAPIClient:
         category_class: str,
         query: str | None = None,
         limit: int = 25,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Search targeting categories such as behaviors or demographics."""
+        cursor = _normalize_cursor(after)
         params: dict[str, Any] = {
             "class": category_class,
             "limit": limit,
         }
         if query:
             params["query"] = query
+        if cursor:
+            params["after"] = cursor
         return await self.request(
             "GET",
             f"{normalize_account_id(account_id)}/broadtargetingcategories",
@@ -388,12 +427,17 @@ class GraphAPIClient:
         account_id: str,
         *,
         limit: int = 25,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """List reach frequency predictions."""
+        cursor = _normalize_cursor(after)
         return await self.list_objects(
             normalize_account_id(account_id),
             "reachfrequencypredictions",
-            params={"limit": limit},
+            params={
+                "limit": limit,
+                **({"after": cursor} if cursor else {}),
+            },
         )
 
     async def get_recommendations(
@@ -401,9 +445,16 @@ class GraphAPIClient:
         account_id: str,
         *,
         campaign_id: str | None = None,
+        limit: int = 25,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Fetch recommendation surfaces when available."""
-        params = {"campaign_id": campaign_id} if campaign_id else None
+        cursor = _normalize_cursor(after)
+        params: dict[str, Any] = {"limit": limit}
+        if campaign_id:
+            params["campaign_id"] = campaign_id
+        if cursor:
+            params["after"] = cursor
         return await self.list_objects(
             normalize_account_id(account_id),
             "recommendations",
@@ -504,12 +555,12 @@ class GraphAPIClient:
         account_id: str,
         *,
         hashes: list[str],
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
     ) -> dict[str, Any]:
         """Resolve ad image hashes into hosted image metadata."""
         params: dict[str, Any] = {"hashes": hashes}
-        if fields:
-            params["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            params["fields"] = serialized_fields
         return await self.request(
             "GET",
             f"{normalize_account_id(account_id)}/adimages",
@@ -523,17 +574,21 @@ class GraphAPIClient:
         ad_reached_countries: list[str],
         ad_type: str = "ALL",
         limit: int = 25,
-        fields: list[str] | None = None,
+        fields: FieldList | None = None,
+        after: str | None = None,
     ) -> dict[str, Any]:
         """Search the public Ads Library / archive endpoint."""
+        cursor = _normalize_cursor(after)
         params: dict[str, Any] = {
             "search_terms": search_terms,
             "ad_reached_countries": ad_reached_countries,
             "ad_type": ad_type,
             "limit": limit,
         }
-        if fields:
-            params["fields"] = ",".join(fields)
+        if serialized_fields := _serialize_fields(fields):
+            params["fields"] = serialized_fields
+        if cursor:
+            params["after"] = cursor
         return await self.request("GET", "ads_archive", params=params)
 
 

@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import re
 
+import pydantic_core
+
 from meta_ads_mcp.config import get_settings
-from meta_ads_mcp.coordinator import ALWAYS_VISIBLE_TOOLS
-from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.coordinator import (
+    ALWAYS_VISIBLE_TOOLS,
+    OVERFLOW_ARTIFACT_STORE,
+    mcp_server,
+)
 from meta_ads_mcp.graph_api import get_graph_api_client
+from meta_ads_mcp.overflow import (
+    DEFAULT_ARTIFACT_CHUNK_BYTES,
+    compact_overflow_chunk_result,
+)
+
+
+MAX_INLINE_ARTIFACT_RESULT_BYTES = 63_000
 
 TOOL_GROUPS = {
     "discovery": [
@@ -22,7 +34,9 @@ TOOL_GROUPS = {
         "list_ads",
         "get_ad",
         "list_audiences",
+        "get_audience",
         "list_creatives",
+        "get_creative",
     ],
     "analysis": [
         "get_insights",
@@ -60,6 +74,7 @@ TOOL_GROUPS = {
     "social_feedback": [
         "get_ad_social_context",
         "list_ad_comments",
+        "list_comment_replies",
         "list_page_recommendations",
     ],
     "planning": [
@@ -122,6 +137,8 @@ TOOL_GROUPS = {
         "health_check",
         "get_capabilities",
         "list_mutation_tools",
+        "read_overflow_artifact",
+        "delete_overflow_artifact",
     ],
 }
 
@@ -147,6 +164,7 @@ INTENT_GUIDE = {
             "list_campaigns",
             "list_adsets",
             "list_ads",
+            "list_audiences",
             "get_account_pages",
             "list_instagram_accounts",
         ],
@@ -190,6 +208,18 @@ INTENT_GUIDE = {
         "recommended_order": ["export_insights", "create_async_insights_report", "get_async_insights_report"],
         "avoid_unless_needed": [],
         "notes": ["Prefer summary tools first; exports are the heaviest reporting path."],
+    },
+    "retrieve_oversized_response": {
+        "description": "Retrieve or download the complete oversized response behind an overflow export id.",
+        "recommended_order": [
+            "read_overflow_artifact",
+            "delete_overflow_artifact",
+        ],
+        "avoid_unless_needed": [],
+        "notes": [
+            "Read repeatedly with next_offset until complete is true.",
+            "Delete the overflow artifact only after all chunks have been retrieved.",
+        ],
     },
     "find_optimization_opportunities": {
         "description": "Find optimization opportunities, risks, pacing issues, or fatigue.",
@@ -257,6 +287,7 @@ INTENT_GUIDE = {
             "get_account_pages",
             "list_instagram_accounts",
             "list_creatives",
+            "get_creative",
             "get_ad_image",
             "preview_ad",
             "upload_creative_asset",
@@ -264,7 +295,10 @@ INTENT_GUIDE = {
             "create_ad",
         ],
         "avoid_unless_needed": [],
-        "notes": ["Use get_account_pages and list_instagram_accounts before creative creation when an identity is required."],
+        "notes": [
+            "Use get_creative when a creative id is already known and full creative fields are needed.",
+            "Use get_account_pages and list_instagram_accounts before creative creation when an identity is required.",
+        ],
     },
     "research_competitor_ads": {
         "description": "Search public Ads Library data for competitor or market research.",
@@ -326,12 +360,13 @@ def _search_tokens(text: str) -> set[str]:
     """Tokenize routing text for tiny local fuzzy matching."""
     tokens: set[str] = set()
     for token in re.findall(r"[a-z0-9_]+", text.lower()):
-        tokens.add(token)
-        tokens.update(part for part in token.split("_") if part)
-        if token.endswith("s") and len(token) > 3:
-            tokens.add(token[:-1])
-        if token in {"adset", "adsets"}:
-            tokens.update({"ad", "set", "ad_set"})
+        components = {token, *(part for part in token.split("_") if part)}
+        for component in components:
+            tokens.add(component)
+            if component.endswith("s") and len(component) > 3:
+                tokens.add(component[:-1])
+            if component in {"adset", "adsets"}:
+                tokens.update({"ad", "set", "ad_set"})
     return tokens
 
 
@@ -535,6 +570,10 @@ async def get_capabilities(
             "META_APP_ID",
             "META_APP_SECRET",
             "META_REDIRECT_URI",
+            "META_EXPORT_DIR",
+            "META_EXPORT_TTL_SECONDS",
+            "META_EXPORT_MAX_FILES",
+            "META_EXPORT_MAX_BYTES",
         ],
     }
     notes = [
@@ -542,6 +581,7 @@ async def get_capabilities(
         "FastMCP 3.1 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
         "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
         "export_insights is a convenience wrapper over the core insights surface.",
+        "Oversized tool responses return an opaque export_id; use call_tool to invoke read_overflow_artifact for bounded JSON chunks and delete_overflow_artifact when finished.",
         "Pass intent to get_capabilities for a compact routing response instead of the full manifest.",
         "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
         "Use list_instagram_accounts when creative setup requires an Instagram identity rather than a Facebook Page.",
@@ -600,3 +640,42 @@ async def list_mutation_tools() -> dict[str, object]:
             "Token must have ads_management-level permissions.",
         ],
     }
+
+
+@mcp_server.tool()
+async def read_overflow_artifact(
+    export_id: str,
+    offset: int = 0,
+    max_bytes: int = DEFAULT_ARTIFACT_CHUNK_BYTES,
+) -> dict[str, object]:
+    """Read the largest safe JSON chunk from a complete oversized response."""
+    requested_bytes = max_bytes
+    while True:
+        chunk = OVERFLOW_ARTIFACT_STORE.read(
+            export_id,
+            offset=offset,
+            max_bytes=requested_bytes,
+        )
+        result = compact_overflow_chunk_result(chunk)
+        serialized_size = len(
+            pydantic_core.to_json(result, fallback=str)
+        )
+        if serialized_size <= MAX_INLINE_ARTIFACT_RESULT_BYTES:
+            return chunk
+        if requested_bytes == 1:
+            return chunk
+        requested_bytes = max(
+            1,
+            int(
+                requested_bytes
+                * MAX_INLINE_ARTIFACT_RESULT_BYTES
+                / serialized_size
+                * 0.95
+            ),
+        )
+
+
+@mcp_server.tool()
+async def delete_overflow_artifact(export_id: str) -> dict[str, object]:
+    """Delete an oversized response artifact after the caller has finished retrieving it."""
+    return OVERFLOW_ARTIFACT_STORE.delete(export_id)

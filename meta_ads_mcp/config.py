@@ -31,6 +31,10 @@ class Settings:
     port: int
     request_timeout: float
     max_retries: int
+    export_directory: str | None = None
+    export_ttl_seconds: int = 86_400
+    export_max_files: int = 100
+    export_max_bytes: int = 1_000_000_000
 
 
 @lru_cache(maxsize=1)
@@ -48,6 +52,10 @@ def get_settings() -> Settings:
         port=int(os.getenv("FASTMCP_PORT", "8000")),
         request_timeout=float(os.getenv("META_REQUEST_TIMEOUT", "30")),
         max_retries=int(os.getenv("META_MAX_RETRIES", "2")),
+        export_directory=os.getenv("META_EXPORT_DIR"),
+        export_ttl_seconds=int(os.getenv("META_EXPORT_TTL_SECONDS", "86400")),
+        export_max_files=int(os.getenv("META_EXPORT_MAX_FILES", "100")),
+        export_max_bytes=int(os.getenv("META_EXPORT_MAX_BYTES", "1000000000")),
     )
 
 

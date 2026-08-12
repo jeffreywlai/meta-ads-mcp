@@ -73,3 +73,49 @@ def test_search_ads_archive_handles_empty_results(monkeypatch) -> None:
     monkeypatch.setattr(research, "get_graph_api_client", lambda: EmptyResearchClient())
     result = asyncio.run(research.search_ads_archive(search_terms="shirts", ad_reached_countries=["US"]))
     assert result["items"] == []
+
+
+def test_search_ads_archive_forwards_after_and_preserves_cursor(monkeypatch) -> None:
+    class PagingResearchClient(FakeResearchClient):
+        async def search_ads_archive(self, *, after=None, **kwargs):
+            assert after == "CURSOR"
+            return {
+                "data": [{"id": "archive_2"}],
+                "paging": {
+                    "cursors": {"after": "NEXT_PAGE"},
+                    "next": "next",
+                },
+            }
+
+    monkeypatch.setattr(research, "get_graph_api_client", lambda: PagingResearchClient())
+    result = asyncio.run(
+        research.search_ads_archive(
+            search_terms="shirts",
+            ad_reached_countries=["US"],
+            after="CURSOR",
+        )
+    )
+
+    assert result["paging"]["after"] == "NEXT_PAGE"
+
+
+def test_search_ads_archive_normalizes_blank_after(monkeypatch) -> None:
+    class BlankCursorResearchClient(FakeResearchClient):
+        async def search_ads_archive(self, **kwargs):
+            assert "after" not in kwargs
+            return {"data": []}
+
+    monkeypatch.setattr(
+        research,
+        "get_graph_api_client",
+        lambda: BlankCursorResearchClient(),
+    )
+    result = asyncio.run(
+        research.search_ads_archive(
+            search_terms="shirts",
+            ad_reached_countries=["US"],
+            after=" ",
+        )
+    )
+
+    assert result["items"] == []

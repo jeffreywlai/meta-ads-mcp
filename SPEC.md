@@ -266,6 +266,14 @@ The FastMCP server instructions should tell the LLM:
 - Errors raise typed exceptions, not free-form error text.
 - Any derived metric must include the raw components used to compute it.
 - If a metric is not available, omit it and record why in `missing_signals`.
+- LLM-facing `fields` inputs accept either JSON string arrays or
+  comma-separated strings; commas nested inside Graph field expressions are
+  preserved.
+- The MCP transport caps inline tool responses. Oversized results are preserved
+  as complete private JSON artifacts and replaced inline with an opaque
+  `export_id`. Callers retrieve bounded chunks with `read_overflow_artifact`
+  and can delete the artifact explicitly; automatic TTL, file-count, and
+  byte-count limits bound retention.
 
 ## Response Contracts
 
@@ -389,6 +397,7 @@ These are the core v1 tools.
 
 - `get_ad_social_context`
 - `list_ad_comments`
+- `list_comment_replies`
 - `list_page_recommendations`
 - `get_ad_feedback_signals`
 
@@ -545,6 +554,29 @@ Inputs:
 - `ad_id`
 - `include_creative_summary`
 
+### `list_creatives`
+
+Purpose:
+List lightweight creative metadata for an ad account.
+
+Inputs:
+
+- `account_id`
+- `limit`
+- `after`
+- optional `fields`
+
+### `get_creative`
+
+Purpose:
+Read one creative by id, including full creative fields such as `url_tags`,
+`asset_feed_spec`, `object_story_spec`, and `degrees_of_freedom_spec`.
+
+Inputs:
+
+- `creative_id`
+- optional `fields`
+
 ## Activity History Tools
 
 ### `list_change_history`
@@ -557,8 +589,8 @@ Inputs:
 
 - `level`: optional generic scope of `account`, `campaign`, `adset`, or `ad`
 - `object_id`: optional generic object id when `level` is provided
-- `account_id`: ad account to read from; required for object-scoped history
-  unless `META_DEFAULT_ACCOUNT_ID` is configured
+- `account_id`: optional ad account context; object-scoped history derives it
+  from the object when neither this nor `META_DEFAULT_ACCOUNT_ID` is configured
 - `campaign_id`, `adset_id`, or `ad_id`: optional object scope routed through
   the ad-account activities edge with object filtering
 - `since` and `until`: optional datetime filters; Meta defaults to the prior
@@ -601,8 +633,9 @@ Return a normalized insights report for an account, campaign, ad set, or ad.
 
 Underlying API surface:
 
-- Meta insights edge
-- sync or async depending on payload size
+- synchronous Meta insights edge
+- use `create_async_insights_report` explicitly for queries too large for a
+  synchronous request
 
 Inputs:
 
@@ -617,6 +650,7 @@ Inputs:
 - `use_unified_attribution_setting`
 - `action_attribution_windows`
 - `limit`
+- `after`
 
 Output:
 
@@ -645,6 +679,7 @@ Output:
 - compact action totals
 - matched action types and whether the action filter is `all` or `filtered`
 - summary metrics
+- paging, completeness, and a continuation hint when totals cover only one page
 - Meta attribution notice for conversion-source caveats
 
 ### `get_performance_breakdown`
@@ -670,6 +705,7 @@ Inputs:
 - `date_preset` or `since` and `until`
 - `fields`
 - `sort_by`
+- `after`
 
 Output:
 
@@ -677,6 +713,30 @@ Output:
 - summary totals
 - derived KPIs by segment
 - top and bottom performers
+- paging and completeness
+
+### `export_insights`
+
+Purpose:
+Return export-style JSON rows or CSV text while keeping large results
+retrievable through the server overflow-artifact flow.
+
+Inputs:
+
+- the core `get_entity_insights` filters
+- `format`: `json` or `csv`
+- `limit` and optional `after`
+- `inline_limit`
+- `allow_large_output`
+
+Output:
+
+- structured rows or CSV text
+- the effective reporting window
+- Meta paging and the next cursor
+- truncation guidance when `inline_limit` is reached
+- for responses above the MCP inline cap, an overflow `export_id` that can be
+  read in bounded chunks and deleted after retrieval
 
 ### `compare_time_ranges`
 
@@ -844,6 +904,26 @@ Output:
 - paging cursor for one surface, or per-surface paging when `surface="all"`
 - API-call count and parent ids used
 - structured unavailable output for permission-gated Page/Instagram surfaces
+
+### `list_comment_replies`
+
+Purpose:
+Continue the paginated replies for one Facebook or Instagram comment.
+
+Inputs:
+
+- `comment_id`
+- `surface`: `facebook` or `instagram`
+- `limit` and optional `after`
+- `include_author`
+- `max_message_chars`
+
+Output:
+
+- compact normalized replies
+- paging cursor for the next reply page
+- API-call and edge metadata
+- structured unavailable output for permission-gated surfaces
 
 ### `list_page_recommendations`
 

@@ -8,6 +8,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, NotFoundError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.pagination import extract_paging
 
 SOCIAL_CREATIVE_FIELDS = [
     "id",
@@ -204,6 +205,7 @@ def _compact_comment(
     surface: str,
     max_message_chars: int,
     include_author: bool,
+    reply_limit: int | None = None,
 ) -> dict[str, Any]:
     """Normalize Facebook and Instagram comments to a shared compact shape."""
     text_key = "text" if surface == "instagram" else "message"
@@ -232,9 +234,42 @@ def _compact_comment(
         if isinstance(author, dict) and author.get("name"):
             compact["author"] = {"name": author["name"]}
     reply_rows = replies.get("data") if isinstance(replies.get("data"), list) else []
+    if replies:
+        reply_paging = extract_paging(replies)
+        expected_reply_count = compact.get("reply_count")
+        compact["reply_paging"] = reply_paging
+        compact["replies_returned"] = len(reply_rows)
+        compact["replies_complete"] = not bool(
+            reply_paging.get("next")
+            or (
+                isinstance(expected_reply_count, int)
+                and expected_reply_count > len(reply_rows)
+            )
+        )
+        if not compact["replies_complete"] and item.get("id"):
+            next_arguments: dict[str, Any] = {
+                "comment_id": str(item["id"]),
+                "surface": surface,
+                "include_author": include_author,
+                "max_message_chars": max_message_chars,
+            }
+            if reply_limit is not None:
+                next_arguments["limit"] = reply_limit
+            if reply_paging.get("after"):
+                next_arguments["after"] = reply_paging["after"]
+            compact["reply_next_step"] = {
+                "tool": "list_comment_replies",
+                "arguments": next_arguments,
+            }
     if reply_rows:
         compact["replies"] = [
-            _compact_comment(reply, surface=surface, max_message_chars=max_message_chars, include_author=include_author)
+            _compact_comment(
+                reply,
+                surface=surface,
+                max_message_chars=max_message_chars,
+                include_author=include_author,
+                reply_limit=reply_limit,
+            )
             for reply in reply_rows
         ]
     return {key: value for key, value in compact.items() if value is not None}
@@ -277,6 +312,7 @@ async def _comments_for_surface(
                 surface=surface,
                 max_message_chars=max_message_chars,
                 include_author=include_author,
+                reply_limit=reply_limit,
             )
             for item in normalized["items"]
         ],
@@ -456,6 +492,70 @@ async def list_ad_comments(
 
 
 @mcp_server.tool()
+async def list_comment_replies(
+    comment_id: str,
+    surface: str,
+    limit: int = 25,
+    after: str | None = None,
+    include_author: bool = False,
+    max_message_chars: int = 500,
+) -> dict[str, Any]:
+    """Use this to continue a Facebook or Instagram comment's paginated replies."""
+    normalized_comment_id = blank_to_none(comment_id)
+    if not normalized_comment_id:
+        raise ValidationError("comment_id is required.")
+    if surface not in {"facebook", "instagram"}:
+        raise ValidationError("surface must be 'facebook' or 'instagram'.")
+    _validate_limit("limit", limit)
+    _validate_limit("max_message_chars", max_message_chars, minimum=0, maximum=5000)
+    normalized_after = blank_to_none(after)
+    edge = "comments" if surface == "facebook" else "replies"
+    fields = (
+        _facebook_comment_fields(False, 0, include_author)
+        if surface == "facebook"
+        else _instagram_comment_fields(False, 0, include_author)
+    )
+    params: dict[str, Any] = {"limit": limit}
+    if normalized_after:
+        params["after"] = normalized_after
+    scope = {"comment_id": normalized_comment_id, "surface": surface}
+    try:
+        payload = await get_graph_api_client().list_objects(
+            normalized_comment_id,
+            edge,
+            fields=fields,
+            params=params,
+        )
+    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+        return _social_error_payload(
+            scope=scope,
+            error=exc,
+            api_calls=1,
+        )
+    normalized = normalize_collection(payload)
+    return {
+        "items": [
+            _compact_comment(
+                item,
+                surface=surface,
+                max_message_chars=max_message_chars,
+                include_author=include_author,
+            )
+            for item in normalized["items"]
+        ],
+        "paging": normalized["paging"],
+        "scope": scope,
+        "summary": {
+            "count": normalized["summary"]["count"],
+            "api_calls": 1,
+            "edge": edge,
+            "max_message_chars": max_message_chars,
+        },
+        "permission_notes": SOCIAL_PERMISSION_NOTES,
+    }
+
+
+@mcp_server.tool()
 async def list_page_recommendations(
     page_id: str,
     limit: int = 25,
@@ -469,6 +569,7 @@ async def list_page_recommendations(
         raise ValidationError("page_id is required.")
     _validate_limit("limit", limit)
     _validate_limit("max_message_chars", max_message_chars, minimum=0, maximum=5000)
+    after = blank_to_none(after)
     fields = ["created_time", "review_text", "rating", "recommendation_type", "open_graph_story{id}"]
     if include_reviewer:
         fields.append("reviewer{name}")

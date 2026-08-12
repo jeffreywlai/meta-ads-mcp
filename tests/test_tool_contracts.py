@@ -52,6 +52,9 @@ def _registered_tools() -> dict[str, Any]:
 
 
 REGISTERED_TOOLS = _registered_tools()
+FIELD_TOOL_NAMES = sorted(
+    name for name, fn in REGISTERED_TOOLS.items() if "fields" in inspect.signature(fn).parameters
+)
 SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 SAMPLE_TARGETING = {
@@ -603,6 +606,20 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
     monkeypatch.setenv("META_APP_SECRET", "secret_123")
     monkeypatch.setenv("META_REDIRECT_URI", "https://example.com/callback")
     reload_settings()
+    monkeypatch.setattr(
+        utility.OVERFLOW_ARTIFACT_STORE,
+        "read",
+        lambda export_id, **_: {
+            "export_id": export_id,
+            "data": "{}",
+            "complete": True,
+        },
+    )
+    monkeypatch.setattr(
+        utility.OVERFLOW_ARTIFACT_STORE,
+        "delete",
+        lambda export_id: {"ok": True, "export_id": export_id, "deleted": True},
+    )
     return client
 
 
@@ -613,13 +630,15 @@ def _required_value(param_name: str) -> Any:
         "campaign_id": "cmp_123",
         "adset_id": "adset_123",
         "ad_id": "ad_123",
-        "creative_id": "crt_123",
-        "audience_id": "aud_123",
+            "creative_id": "crt_123",
+            "comment_id": "comment_123",
+            "audience_id": "aud_123",
         "origin_audience_id": "aud_origin_123",
         "interest_list": ["running"],
         "ad_reached_countries": ["US"],
         "system_user_id": "sys_123",
         "report_run_id": "rpt_123",
+        "export_id": "A" * 32,
         "owner_id": "act_123",
         "page_id": "page_123",
         "object_id": "cmp_123",
@@ -635,7 +654,8 @@ def _required_value(param_name: str) -> Any:
         "search_terms": "shirts",
         "code": "oauth_code",
         "scope": ["ads_management"],
-        "status": "PAUSED",
+            "status": "PAUSED",
+            "surface": "facebook",
         "breakdown": "country",
         "current_since": "2026-03-01",
         "current_until": "2026-03-07",
@@ -685,6 +705,22 @@ def test_capabilities_manifest_matches_registered_tools() -> None:
     """The capability tool should stay in sync with the actual registry."""
     declared = {tool for tools in utility.TOOL_GROUPS.values() for tool in tools}
     assert declared == set(REGISTERED_TOOLS)
+
+
+@pytest.mark.parametrize("tool_name", FIELD_TOOL_NAMES)
+def test_every_fields_parameter_accepts_csv_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """LLM-style comma-separated field lists should pass MCP validation everywhere."""
+    _patch_clients(monkeypatch)
+    fn = REGISTERED_TOOLS[tool_name]
+    kwargs = _tool_kwargs(tool_name, fn)
+    kwargs["fields"] = "id, name, url_tags"
+
+    result = asyncio.run(mcp_server.call_tool(tool_name, kwargs))
+
+    assert result.structured_content is not None
 
 
 @pytest.mark.parametrize("tool_name", sorted(REGISTERED_TOOLS))

@@ -7,8 +7,9 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
+from meta_ads_mcp.tool_types import FieldList
 
 
 CREATIVE_FIELDS = [
@@ -19,6 +20,8 @@ CREATIVE_FIELDS = [
     "status",
     "object_story_spec",
     "asset_feed_spec",
+    "degrees_of_freedom_spec",
+    "url_tags",
     "image_hash",
     "thumbnail_url",
 ]
@@ -56,7 +59,7 @@ async def list_creatives(
     account_id: str,
     limit: int = 50,
     after: str | None = None,
-    fields: list[str] | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
     """Use this when the user needs creative ids or lightweight creative metadata before previewing or creating ads."""
     client = get_graph_api_client()
@@ -70,6 +73,20 @@ async def list_creatives(
         params=params,
     )
     return normalize_collection(payload)
+
+
+@mcp_server.tool()
+async def get_creative(
+    creative_id: str,
+    fields: FieldList | None = None,
+) -> dict[str, Any]:
+    """Get, fetch, look up, show, or inspect what is in one creative by id, including full details for url_tags, asset_feed_spec, object_story_spec, and degrees_of_freedom_spec."""
+    creative_id = blank_to_none(creative_id)
+    if creative_id is None:
+        raise ValidationError("creative_id is required.")
+    client = get_graph_api_client()
+    creative = await client.get_object(creative_id, fields=fields or CREATIVE_FIELDS)
+    return {"item": creative, "summary": {"count": 1}}
 
 
 @mcp_server.tool()
