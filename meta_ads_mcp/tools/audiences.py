@@ -7,7 +7,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.graph_payload import merge_graph_payload
+from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList
@@ -108,15 +108,15 @@ async def create_custom_audience(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants to create a first-party or rule-based custom audience."""
-    payload: dict[str, Any] = {"name": name, "subtype": subtype, "prefill": prefill}
-    if description:
-        payload["description"] = description
-    if customer_file_source:
-        payload["customer_file_source"] = customer_file_source
-    if retention_days is not None:
-        payload["retention_days"] = retention_days
-    if rule:
-        payload["rule"] = rule
+    payload: dict[str, Any] = {
+        "name": name,
+        "subtype": subtype,
+        "prefill": prefill,
+        "description": description or OMIT,
+        "customer_file_source": customer_file_source or OMIT,
+        "retention_days": OMIT if retention_days is None else retention_days,
+        "rule": rule or OMIT,
+    }
     payload = merge_graph_payload(payload, params)
     client = get_graph_api_client()
     created = await client.create_edge_object(
@@ -157,9 +157,8 @@ async def create_lookalike_audience(
             starting_ratio=starting_ratio,
             lookalike_type=lookalike_type,
         ),
+        "description": description or OMIT,
     }
-    if description:
-        payload["description"] = description
     payload = merge_graph_payload(payload, params)
     client = get_graph_api_client()
     created = await client.create_edge_object(
@@ -185,7 +184,12 @@ async def update_custom_audience(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user already has an audience id and needs to change audience metadata."""
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {
+        "name": OMIT,
+        "description": OMIT,
+        "retention_days": OMIT,
+        "customer_file_source": OMIT,
+    }
     if name is not None:
         payload["name"] = name
     if description is not None:

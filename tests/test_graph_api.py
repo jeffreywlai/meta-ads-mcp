@@ -90,13 +90,21 @@ def test_request_maps_unsupported_get_request_to_unsupported_feature(monkeypatch
         [
             FakeResponse(
                 400,
-                {"error": {"message": "Unsupported get request.", "code": 100}},
-            )
+                {
+                    "error": {
+                        "message": "Unsupported get request.",
+                        "code": 100,
+                        "is_transient": True,
+                    }
+                },
+            ),
+            FakeResponse(200, {"data": [{"id": "must_not_be_returned"}]}),
         ]
     )
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     with pytest.raises(UnsupportedFeatureError):
-        asyncio.run(_client().request("GET", "bad-edge"))
+        asyncio.run(_client(max_retries=1).request("GET", "bad-edge"))
+    assert len(FakeAsyncClient.responses) == 1
 
 
 def test_request_keeps_invalid_field_errors_as_meta_api_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -308,6 +316,7 @@ def test_transient_graph_write_error_marks_outcome_unknown_even_on_400(
         asyncio.run(_client(max_retries=2).request("POST", "act_1/ads", data={"name": "x"}))
     assert exc_info.value.is_transient is True
     assert exc_info.value.mutation_outcome_unknown is True
+    assert exc_info.value.to_public_dict()["retryable"] is False
     assert len(FakeAsyncClient.responses) == 1
 
 
@@ -326,6 +335,87 @@ def test_safe_read_retries_transient_503(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
     result = asyncio.run(_client(max_retries=1).request("GET", "act_1/campaigns"))
     assert result["data"][0]["id"] == "ok"
+
+
+def test_safe_read_retries_graph_transient_error_on_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                400,
+                {
+                    "error": {
+                        "message": "Temporary upstream failure",
+                        "code": 2,
+                        "is_transient": True,
+                    }
+                },
+            ),
+            FakeResponse(200, {"data": [{"id": "ok"}]}),
+        ]
+    )
+
+    async def fake_sleep(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    result = asyncio.run(_client(max_retries=1).request("GET", "act_1/campaigns"))
+    assert result["data"][0]["id"] == "ok"
+
+
+def test_safe_read_retries_transient_error_inside_success_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                200,
+                {
+                    "error": {
+                        "message": "Temporary upstream failure",
+                        "code": 2,
+                        "is_transient": True,
+                    }
+                },
+            ),
+            FakeResponse(200, {"data": [{"id": "ok"}]}),
+        ]
+    )
+
+    async def fake_sleep(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    result = asyncio.run(_client(max_retries=1).request("GET", "act_1/campaigns"))
+    assert result["data"][0]["id"] == "ok"
+
+
+def test_exhausted_transient_read_remains_explicitly_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                400,
+                {
+                    "error": {
+                        "message": "Temporary upstream failure",
+                        "code": 2,
+                        "is_transient": True,
+                    }
+                },
+            )
+        ]
+    )
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(MetaApiError) as exc_info:
+        asyncio.run(_client(max_retries=0).request("GET", "act_1/campaigns"))
+    public_error = exc_info.value.to_public_dict()
+    assert public_error["retryable"] is True
+    assert public_error["mutation_outcome_unknown"] is False
 
 
 def test_request_reuses_shared_async_client_within_one_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:

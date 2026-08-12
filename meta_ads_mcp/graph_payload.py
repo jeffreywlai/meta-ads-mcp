@@ -7,15 +7,20 @@ from typing import Any
 
 from meta_ads_mcp.errors import ValidationError
 
-RESERVED_GRAPH_PARAMS = {"access_token"}
+RESERVED_GRAPH_PARAMS = {"access_token", "execution_options"}
+OMIT = object()
 
 
 def merge_graph_payload(
     typed_fields: Mapping[str, Any],
     extra_fields: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Merge extension fields without allowing silent typed-field overrides."""
-    merged = dict(typed_fields)
+    """Merge extension fields without bypassing the tool's typed contract."""
+    merged = {
+        key: value
+        for key, value in typed_fields.items()
+        if value is not OMIT
+    }
     if not extra_fields:
         return merged
 
@@ -25,14 +30,10 @@ def merge_graph_payload(
             f"params cannot contain transport-managed fields: {', '.join(reserved)}."
         )
 
-    conflicts = sorted(
-        key
-        for key, value in extra_fields.items()
-        if key in merged and merged[key] != value
-    )
+    conflicts = sorted(set(typed_fields).intersection(extra_fields))
     if conflicts:
         raise ValidationError(
-            "params cannot override typed fields with different values: "
+            "params cannot override typed fields or supply omitted tool-managed fields: "
             f"{', '.join(conflicts)}. Use the named tool parameters instead."
         )
 
@@ -42,6 +43,5 @@ def merge_graph_payload(
 
 
 def add_validate_only(payload: dict[str, Any], *, validate_only: bool) -> None:
-    """Request Meta validation without creating an object."""
-    if validate_only:
-        payload["execution_options"] = ["validate_only"]
+    """Own Meta's validation control field, omitting it from ordinary calls."""
+    payload["execution_options"] = ["validate_only"] if validate_only else OMIT

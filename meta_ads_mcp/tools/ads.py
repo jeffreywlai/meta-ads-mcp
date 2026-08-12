@@ -7,7 +7,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.graph_payload import add_validate_only, merge_graph_payload
+from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
 from meta_ads_mcp.input_compat import resolve_identifier_alias
 from meta_ads_mcp.schemas import creation_response
 
@@ -158,11 +158,9 @@ async def create_ad(
         "adset_id": adset_id,
         "creative": {"creative_id": resolved_creative_id},
         "status": status,
+        "bid_amount": OMIT if bid_amount is None else int(bid_amount * 100),
+        "tracking_specs": tracking_specs or OMIT,
     }
-    if bid_amount is not None:
-        payload["bid_amount"] = int(bid_amount * 100)
-    if tracking_specs:
-        payload["tracking_specs"] = tracking_specs
     add_validate_only(payload, validate_only=validate_only)
     payload = merge_graph_payload(payload, params)
 

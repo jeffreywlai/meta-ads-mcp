@@ -255,15 +255,17 @@ Async insights use a lean scalar field set by default; pass
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating
 and retrieving a report to request only the required action dependencies and
 promote those values into scalar row columns. Async retrieval omits verbose
-action arrays and maps unless `include_raw_actions=true`. Use `wait=true` for a
-bounded server-side poll, or inspect the returned `job.ready`, `job.terminal`,
-and `job.poll_after_seconds` fields yourself.
+action arrays and maps unless `include_raw_actions=true`, while preserving
+requested scalar fields such as spend, impressions, and clicks. Use `wait=true`
+for a bounded server-side poll, or inspect the returned `job.ready`,
+`job.terminal`, and `job.poll_after_seconds` fields yourself.
 
 Graph API failures are returned as allowlisted structured error JSON with Meta
 codes, subcodes, user guidance, retry timing, and usage diagnostics when
 available. Reads may retry transient failures; create, update, and delete calls
 are not automatically retried after ambiguous failures. If
-`mutation_outcome_unknown=true`, verify current object state before retrying.
+`mutation_outcome_unknown=true`, `retryable` is false and callers must verify
+current object state before deciding whether to retry.
 
 `META_DEFAULT_ACCOUNT_ID` is an optional convenience, not a requirement for
 object-scoped activity history. When a campaign, ad set, or ad ID is supplied,

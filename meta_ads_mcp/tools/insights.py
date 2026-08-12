@@ -156,7 +156,8 @@ ACTION_TYPE_ALIASES = {
 ACTION_ATTRIBUTION_NOTICE = (
     "Action counts and values come from Meta attribution. For purchase truth, reconcile with Snowplow/Snowflake."
 )
-ACTION_FILTER_REQUIRED_FIELDS = ["spend", "impressions", "clicks", "actions", "action_values"]
+RAW_ACTION_ARRAY_FIELDS = ["actions", "action_values"]
+ACTION_FILTER_REQUIRED_FIELDS = ["spend", "impressions", "clicks", *RAW_ACTION_ARRAY_FIELDS]
 
 NAME_FIELD_BY_LEVEL = {
     "account": "account_name",
@@ -440,7 +441,7 @@ def _normalize_rows(
         row["metrics"] = derive_core_metrics(row)
         row.update(_flatten_action_columns(row, flatten_actions))
         if not include_raw_actions:
-            for field in ACTION_FILTER_REQUIRED_FIELDS:
+            for field in RAW_ACTION_ARRAY_FIELDS:
                 row.pop(field, None)
             row.pop("actions_map", None)
             row.pop("action_values_map", None)

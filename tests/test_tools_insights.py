@@ -1125,8 +1125,14 @@ def test_get_async_insights_report_handles_completed_rows_and_paging(monkeypatch
     assert result["rows"]["paging"]["after"] == "after_1"
     assert result["rows"]["items"][0]["metrics"]["roas"] == 2.5
     assert result["job"]["ready"] is True
-    assert "actions" not in result["rows"]["items"][0]
-    assert "actions_map" not in result["rows"]["items"][0]
+    row = result["rows"]["items"][0]
+    assert row["spend"] == 100.0
+    assert row["impressions"] == 1000.0
+    assert row["clicks"] == 50.0
+    assert "actions" not in row
+    assert "action_values" not in row
+    assert "actions_map" not in row
+    assert "action_values_map" not in row
 
 
 def test_get_async_insights_report_flattens_actions_and_requests_dependencies(monkeypatch) -> None:
@@ -1136,6 +1142,7 @@ def test_get_async_insights_report_flattens_actions_and_requests_dependencies(mo
             "data": [
                 {
                     "date_start": "2026-03-01",
+                    "spend": "100",
                     "actions": [{"action_type": "purchase", "value": "2"}],
                     "action_values": [{"action_type": "purchase", "value": "250"}],
                 }
@@ -1145,18 +1152,19 @@ def test_get_async_insights_report_flattens_actions_and_requests_dependencies(mo
 
     class FlattenAsyncClient(FakeAsyncInsightsClient):
         async def get_async_report(self, report_run_id: str, *, fields=None, limit=100, after=None):
-            assert fields == ["date_start", "actions", "action_values"]
+            assert fields == ["date_start", "spend", "actions", "action_values"]
             return payload
 
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FlattenAsyncClient(payload))
     result = asyncio.run(
         insights.get_async_insights_report(
             report_run_id="rpt_123",
-            fields=["date_start"],
+            fields=["date_start", "spend"],
             flatten_actions=["purchase", "purchase_value"],
         )
     )
     row = result["rows"]["items"][0]
+    assert row["spend"] == 100.0
     assert row["purchase"] == 2.0
     assert row["purchase_value"] == 250.0
     assert "actions" not in row
@@ -1166,6 +1174,35 @@ def test_get_async_insights_report_flattens_actions_and_requests_dependencies(mo
     ]
     assert "actions_map" not in row
     assert "action_values_map" not in row
+
+
+def test_normalize_rows_preserves_full_raw_action_shape_when_requested() -> None:
+    rows = insights._normalize_rows(
+        {
+            "data": [
+                {
+                    "spend": "100",
+                    "impressions": "1000",
+                    "clicks": "50",
+                    "actions": [{"action_type": "purchase", "value": "2"}],
+                    "action_values": [
+                        {"action_type": "purchase", "value": "250"}
+                    ],
+                }
+            ]
+        },
+        include_raw_actions=True,
+        flatten_actions=["purchase", "purchase_value"],
+    )
+
+    row = rows[0]
+    assert row["spend"] == 100.0
+    assert row["actions"][0]["action_type"] == "purchase"
+    assert row["action_values"][0]["action_type"] == "purchase"
+    assert row["actions_map"]["purchase"] == 2.0
+    assert row["action_values_map"]["purchase"] == 250.0
+    assert row["purchase"] == 2.0
+    assert row["purchase_value"] == 250.0
 
 
 def test_create_async_insights_report_adds_only_requested_action_dependencies(monkeypatch) -> None:

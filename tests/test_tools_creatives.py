@@ -137,3 +137,31 @@ def test_create_ad_creative_rejects_deprecated_instagram_actor_id() -> None:
                 object_story_spec={"instagram_actor_id": "123"},
             )
         )
+
+
+def test_creative_params_cannot_supply_omitted_typed_fields(monkeypatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: FakeCreativeClient())
+
+    with pytest.raises(creatives.ValidationError, match="object_story_spec"):
+        asyncio.run(
+            creatives.create_ad_creative(
+                account_id="123",
+                name="Creative",
+                params={"object_story_spec": {"instagram_actor_id": "bypass"}},
+            )
+        )
+    with pytest.raises(creatives.ValidationError, match="cell_ids"):
+        asyncio.run(
+            creatives.setup_ab_test(
+                owner_id="act_123",
+                name="Study",
+                params={"cell_ids": ["cell_1"]},
+            )
+        )
+    with pytest.raises(creatives.ValidationError, match="object_story_spec"):
+        asyncio.run(
+            creatives.update_creative(
+                creative_id="crt_123",
+                params={"object_story_spec": {"instagram_actor_id": "bypass"}},
+            )
+        )

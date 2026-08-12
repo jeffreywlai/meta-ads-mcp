@@ -238,7 +238,8 @@ types.
 ### `graph_payload.py`
 
 Builds mutation payloads without allowing generic extension parameters to
-silently override typed fields or transport-managed authentication.
+supply present or omitted typed fields, transport-managed authentication, or
+server-managed execution controls.
 
 ### `error_middleware.py`
 
@@ -298,8 +299,9 @@ The FastMCP server instructions should tell the LLM:
 - Every public string-list input accepts either a JSON string array or a
   comma-separated string; commas nested inside Graph field expressions are
   preserved.
-- Generic mutation `params` may extend typed payloads but cannot silently
-  override them or supply `access_token`.
+- Generic mutation `params` may extend typed payloads but cannot supply any
+  present or omitted tool-managed field, `access_token`, or
+  `execution_options`.
 - The MCP transport caps inline tool responses. Oversized results are preserved
   as complete private JSON artifacts and replaced inline with an opaque
   `export_id`. Callers retrieve bounded chunks with `read_overflow_artifact`
@@ -384,7 +386,8 @@ usage headers when available. `MetaApiError` carries allowlisted Graph code,
 subcode, user title/message, trace id, error data, retryability, operation, and
 `mutation_outcome_unknown`. Safe reads may retry bounded transient failures;
 writes do not retry automatically and instruct callers to verify state when the
-outcome may be ambiguous.
+outcome may be ambiguous. Ambiguous mutation outcomes expose `retryable=false`
+even when Meta marks the underlying failure as transient.
 
 ## Optimization-First Scope
 

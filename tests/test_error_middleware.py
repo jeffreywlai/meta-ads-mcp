@@ -71,6 +71,18 @@ def test_rate_limit_errors_include_retry_and_usage_guidance() -> None:
     assert payload["operation"] == "GET /act_1/campaigns"
 
 
+def test_ambiguous_mutation_errors_are_not_advertised_as_retryable() -> None:
+    payload = MetaApiError(
+        "Temporary upstream failure",
+        is_transient=True,
+        mutation_outcome_unknown=True,
+    ).to_public_dict()
+
+    assert payload["retryable"] is False
+    assert payload["mutation_outcome_unknown"] is True
+    assert "Verify the target" in payload["next_step"]
+
+
 def test_fastmcp_wrapped_meta_errors_are_recovered_from_cause() -> None:
     middleware = StructuredMetaErrorMiddleware()
     meta_error = MetaApiError("Invalid parameter", code=100)

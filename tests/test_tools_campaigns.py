@@ -157,6 +157,50 @@ def test_create_ad_set_rejects_params_overriding_typed_fields(monkeypatch) -> No
         )
 
 
+def test_campaign_params_cannot_supply_omitted_typed_or_control_fields(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
+
+    with pytest.raises(campaigns.ValidationError, match="daily_budget"):
+        asyncio.run(
+            campaigns.create_campaign(
+                account_id="123",
+                name="Campaign",
+                objective="OUTCOME_SALES",
+                params={"daily_budget": 25},
+            )
+        )
+    with pytest.raises(campaigns.ValidationError, match="execution_options"):
+        asyncio.run(
+            campaigns.create_campaign(
+                account_id="123",
+                name="Campaign",
+                objective="OUTCOME_SALES",
+                params={"execution_options": ["validate_only"]},
+            )
+        )
+    with pytest.raises(campaigns.ValidationError, match="daily_budget"):
+        asyncio.run(
+            campaigns.update_campaign(
+                campaign_id="cmp_123",
+                params={"daily_budget": 25},
+            )
+        )
+    with pytest.raises(campaigns.ValidationError, match="bid_amount"):
+        asyncio.run(
+            campaigns.create_ad_set(
+                account_id="123",
+                campaign_id="cmp_123",
+                name="Ad set",
+                billing_event="IMPRESSIONS",
+                optimization_goal="VALUE",
+                targeting={"geo_locations": {"countries": ["US"]}},
+                params={"bid_amount": 25},
+            )
+        )
+
+
 def test_create_ad_set_requires_strategy_for_bid_constraints(monkeypatch) -> None:
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
     with pytest.raises(campaigns.ValidationError, match="bid_strategy is required"):

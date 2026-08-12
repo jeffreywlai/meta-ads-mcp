@@ -7,7 +7,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.graph_payload import merge_graph_payload
+from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList
@@ -98,19 +98,15 @@ async def create_ad_creative(
         _ensure_v25_creative_payload(object_story_spec)
     if asset_feed_spec:
         _ensure_v25_creative_payload(asset_feed_spec)
-    payload: dict[str, Any] = {"name": name}
-    if object_story_spec:
-        payload["object_story_spec"] = object_story_spec
-    if asset_feed_spec:
-        payload["asset_feed_spec"] = asset_feed_spec
-    if title:
-        payload["title"] = title
-    if body:
-        payload["body"] = body
-    if image_hash:
-        payload["image_hash"] = image_hash
-    if degrees_of_freedom_spec:
-        payload["degrees_of_freedom_spec"] = degrees_of_freedom_spec
+    payload: dict[str, Any] = {
+        "name": name,
+        "object_story_spec": object_story_spec or OMIT,
+        "asset_feed_spec": asset_feed_spec or OMIT,
+        "title": title or OMIT,
+        "body": body or OMIT,
+        "image_hash": image_hash or OMIT,
+        "degrees_of_freedom_spec": degrees_of_freedom_spec or OMIT,
+    }
     client = get_graph_api_client()
     created = await client.create_edge_object(
         normalize_account_id(account_id),
@@ -191,21 +187,17 @@ async def setup_ab_test(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user explicitly wants to create a Meta split test or ad study object."""
-    payload: dict[str, Any] = {"name": name, "type": ad_study_type}
-    if description:
-        payload["description"] = description
-    if cell_ids:
-        payload["cell_ids"] = cell_ids
-    if start_time:
-        payload["start_time"] = start_time
-    if end_time:
-        payload["end_time"] = end_time
-    if observation_type:
-        payload["observation_type"] = observation_type
-    if confidence_level is not None:
-        payload["confidence_level"] = confidence_level
-    if hypothesis:
-        payload["hypothesis"] = hypothesis
+    payload: dict[str, Any] = {
+        "name": name,
+        "type": ad_study_type,
+        "description": description or OMIT,
+        "cell_ids": cell_ids or OMIT,
+        "start_time": start_time or OMIT,
+        "end_time": end_time or OMIT,
+        "observation_type": observation_type or OMIT,
+        "confidence_level": OMIT if confidence_level is None else confidence_level,
+        "hypothesis": hypothesis or OMIT,
+    }
     client = get_graph_api_client()
     created = await client.create_edge_object(
         owner_id,
@@ -236,7 +228,14 @@ async def update_creative(
         _ensure_v25_creative_payload(object_story_spec)
     if asset_feed_spec is not None:
         _ensure_v25_creative_payload(asset_feed_spec)
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {
+        "name": OMIT,
+        "title": OMIT,
+        "body": OMIT,
+        "status": OMIT,
+        "object_story_spec": OMIT,
+        "asset_feed_spec": OMIT,
+    }
     if name is not None:
         payload["name"] = name
     if title is not None:

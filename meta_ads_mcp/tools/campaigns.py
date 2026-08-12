@@ -7,7 +7,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.graph_payload import add_validate_only, merge_graph_payload
+from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
 from meta_ads_mcp.normalize import ZERO_DECIMAL_CURRENCIES, normalize_budget_value
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import StringList
@@ -28,8 +28,9 @@ def _encode_budget_field(
     currency: str | None = None,
 ) -> None:
     """Encode a budget field into minor currency units."""
-    if value is not None:
-        payload[field_name] = _budget_minor_units(value, currency)
+    payload[field_name] = (
+        OMIT if value is None else _budget_minor_units(value, currency)
+    )
 
 
 @mcp_server.tool()
@@ -54,13 +55,11 @@ async def create_campaign(
         "objective": objective,
         "status": status,
         "special_ad_categories": special_ad_categories or [],
+        "buying_type": buying_type or OMIT,
+        "bid_strategy": bid_strategy or OMIT,
     }
     _encode_budget_field(payload, "daily_budget", daily_budget)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget)
-    if buying_type:
-        payload["buying_type"] = buying_type
-    if bid_strategy:
-        payload["bid_strategy"] = bid_strategy
     add_validate_only(payload, validate_only=validate_only)
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
@@ -96,7 +95,11 @@ async def update_campaign(
         fields=["id", "name", "status", "objective", "daily_budget", "lifetime_budget", "currency"],
     )
     currency = previous.get("currency")
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {
+        "name": OMIT,
+        "status": OMIT,
+        "objective": OMIT,
+    }
     current: dict[str, Any] = {}
     if name is not None:
         payload["name"] = name
@@ -176,23 +179,18 @@ async def create_ad_set(
         "optimization_goal": optimization_goal,
         "targeting": targeting,
         "status": status,
+        "bid_amount": OMIT if bid_amount is None else int(bid_amount * 100),
+        "bid_strategy": bid_strategy or OMIT,
+        "bid_constraints": bid_constraints or OMIT,
+        "promoted_object": promoted_object or OMIT,
+        "start_time": start_time or OMIT,
+        "end_time": end_time or OMIT,
     }
-    if bid_amount is not None:
-        payload["bid_amount"] = int(bid_amount * 100)
-    if bid_strategy:
-        payload["bid_strategy"] = bid_strategy
     if bid_constraints:
         if not bid_strategy:
             raise ValidationError("bid_strategy is required when bid_constraints is provided.")
-        payload["bid_constraints"] = bid_constraints
     _encode_budget_field(payload, "daily_budget", daily_budget)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget)
-    if promoted_object:
-        payload["promoted_object"] = promoted_object
-    if start_time:
-        payload["start_time"] = start_time
-    if end_time:
-        payload["end_time"] = end_time
     add_validate_only(payload, validate_only=validate_only)
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)

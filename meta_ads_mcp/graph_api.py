@@ -279,6 +279,9 @@ class GraphAPIClient:
                     ) from error
                 if _is_unsupported_surface_error(error):
                     raise UnsupportedFeatureError(error.message) from error
+                if error.is_transient and safe_to_retry and attempt + 1 < retries:
+                    await asyncio.sleep(delay)
+                    continue
                 raise error
             return payload
 

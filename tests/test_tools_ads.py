@@ -109,6 +109,31 @@ def test_create_ad_rejects_ignored_nested_creative_fields(monkeypatch) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "params, expected_field",
+    [
+        ({"bid_amount": 25}, "bid_amount"),
+        ({"execution_options": ["validate_only"]}, "execution_options"),
+    ],
+)
+def test_create_ad_params_cannot_supply_omitted_managed_fields(
+    monkeypatch,
+    params,
+    expected_field,
+) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
+    with pytest.raises(ads.ValidationError, match=expected_field):
+        asyncio.run(
+            ads.create_ad(
+                account_id="123",
+                name="Ad",
+                adset_id="adset_123",
+                creative_id="crt_123",
+                params=params,
+            )
+        )
+
+
 def test_get_ad_image_resolves_candidates(monkeypatch) -> None:
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
     result = asyncio.run(ads.get_ad_image(ad_id="ad_123"))

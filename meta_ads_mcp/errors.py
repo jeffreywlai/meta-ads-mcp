@@ -117,7 +117,7 @@ class MetaApiError(MetaAdsError):
         payload: dict[str, Any] = {
             "type": "meta_api",
             "message": self.message,
-            "retryable": bool(self.is_transient),
+            "retryable": bool(self.is_transient) and not self.mutation_outcome_unknown,
             "mutation_outcome_unknown": self.mutation_outcome_unknown,
         }
         for key, value in (
