@@ -58,7 +58,16 @@ def test_call_tool_proxy_accepts_alias_name_and_stringified_arguments(monkeypatc
             assert parent_id == "act_123"
             assert edge == "adsets"
             assert params["limit"] == 1
-            return {"data": [{"id": "adset_1", "name": "Alias result"}]}
+            return {
+                "data": [
+                    {"id": "adset_1", "account_id": "123", "name": "Alias result"}
+                ]
+            }
+
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            assert object_id == "act_123"
+            assert fields == ["currency"]
+            return {"currency": "USD"}
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: AliasDiscoveryClient())
     result = asyncio.run(

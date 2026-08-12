@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-
+from datetime import datetime, timezone
 import pytest
 
 from meta_ads_mcp.config import Settings
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError
-from meta_ads_mcp.graph_api import _CLIENT_POOL, GraphAPIClient, close_graph_api_clients
+from meta_ads_mcp.graph_api import (
+    _CLIENT_POOL,
+    GraphAPIClient,
+    _parse_retry_after_seconds,
+    close_graph_api_clients,
+)
 
 
 class FakeResponse:
@@ -18,20 +23,23 @@ class FakeResponse:
     def __init__(
         self,
         status_code: int,
-        payload: dict[str, object],
+        payload: dict[str, object] | Exception,
         *,
         headers: dict[str, str] | None = None,
+        text: str = "",
     ) -> None:
         self.status_code = status_code
         self._payload = payload
         self.headers = {"content-type": "application/json", **(headers or {})}
-        self.text = ""
+        self.text = text
 
     @property
     def is_error(self) -> bool:
         return self.status_code >= 400
 
     def json(self) -> dict[str, object]:
+        if isinstance(self._payload, Exception):
+            raise self._payload
         return self._payload
 
 
@@ -248,6 +256,153 @@ def test_read_rate_limit_respects_retry_after_and_returns_usage_when_exhausted(
     assert exc_info.value.usage == {
         "x-ad-account-usage": {"acc_id_util_pct": 99}
     }
+
+
+def test_long_retry_after_is_preserved_without_blocking_automatic_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                429,
+                {"error": {"message": "Too many calls", "code": 17}},
+                headers={"Retry-After": "120"},
+            ),
+            FakeResponse(200, {"data": [{"id": "must_not_be_returned"}]}),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client(max_retries=1).request("GET", "act_1/campaigns"))
+
+    assert exc_info.value.retry_after_seconds == 120
+    assert sleeps == []
+    assert len(FakeAsyncClient.responses) == 1
+
+
+@pytest.mark.parametrize("retry_after", ["5", "60"])
+def test_retry_after_within_automatic_wait_budget_is_honored(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_after: str,
+) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                429,
+                {"error": {"message": "Too many calls", "code": 17}},
+                headers={"Retry-After": retry_after},
+            ),
+            FakeResponse(200, {"data": [{"id": "ok"}]}),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    result = asyncio.run(_client(max_retries=1).request("GET", "act_1/campaigns"))
+
+    assert result["data"][0]["id"] == "ok"
+    assert sleeps == [float(retry_after)]
+
+
+def test_non_json_long_retry_after_is_preserved_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                429,
+                ValueError("not json"),
+                headers={"Retry-After": "120", "Content-Type": "text/html"},
+                text="rate limited",
+            ),
+            FakeResponse(200, {"data": [{"id": "must_not_be_returned"}]}),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client(max_retries=1).request("GET", "act_1/campaigns"))
+
+    assert exc_info.value.retry_after_seconds == 120
+    assert sleeps == []
+    assert len(FakeAsyncClient.responses) == 1
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("0", 0.0),
+        (" 12.5 ", 12.5),
+        ("-1", None),
+        ("nan", None),
+        ("inf", None),
+        ("not-a-delay", None),
+    ],
+)
+def test_retry_after_numeric_validation(raw_value: str, expected: float | None) -> None:
+    assert _parse_retry_after_seconds(raw_value) == expected
+
+
+def test_retry_after_http_date_preserves_future_deadline() -> None:
+    now = datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc)
+    assert _parse_retry_after_seconds(
+        "Wed, 12 Aug 2026 21:02:00 GMT",
+        now=now,
+    ) == 120.0
+    assert _parse_retry_after_seconds(
+        "Wed, 12 Aug 2026 20:59:00 GMT",
+        now=now,
+    ) == 0.0
+
+
+def test_long_retry_after_is_exposed_on_transient_non_rate_limit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque(
+        [
+            FakeResponse(
+                503,
+                {
+                    "error": {
+                        "message": "Service unavailable",
+                        "code": 2,
+                        "is_transient": True,
+                    }
+                },
+                headers={"Retry-After": "120"},
+            ),
+            FakeResponse(200, {"data": [{"id": "must_not_be_returned"}]}),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    with pytest.raises(MetaApiError) as exc_info:
+        asyncio.run(_client(max_retries=1).request("GET", "act_1/campaigns"))
+
+    assert exc_info.value.retry_after_seconds == 120
+    assert exc_info.value.to_public_dict()["retry_after_seconds"] == 120
+    assert sleeps == []
+    assert len(FakeAsyncClient.responses) == 1
 
 
 def test_mutation_rate_limit_is_not_automatically_retried(

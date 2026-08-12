@@ -5,15 +5,13 @@ from __future__ import annotations
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
-from meta_ads_mcp.normalize import ZERO_DECIMAL_CURRENCIES, normalize_budget_value
+from meta_ads_mcp.money import (
+    from_minor_units,
+    resolve_account_currency,
+    to_minor_units,
+    validate_positive_amount,
+)
 from meta_ads_mcp.schemas import mutation_response
-
-
-def _bid_minor_units(value: float, currency: str | None = None) -> int:
-    """Encode a human bid value for the API."""
-    if currency and currency.upper() in ZERO_DECIMAL_CURRENCIES:
-        return int(value)
-    return int(value * 100)
 
 
 def _validate_status(status: str) -> str:
@@ -97,38 +95,49 @@ async def _update_budget(
         daily_budget is not None and lifetime_budget is not None
     ):
         raise ValidationError("Provide exactly one of daily_budget or lifetime_budget.")
+    field_name, amount = (
+        ("daily_budget", daily_budget)
+        if daily_budget is not None
+        else ("lifetime_budget", lifetime_budget)
+    )
+    validate_positive_amount(amount, field_name=field_name)
 
     client = get_graph_api_client()
     previous = await client.get_object(
         object_id,
-        fields=["id", "daily_budget", "lifetime_budget", "currency"],
+        fields=["id", "account_id", "daily_budget", "lifetime_budget"],
     )
-    currency = previous.get("currency")
+    currency = await resolve_account_currency(client, previous.get("account_id"))
     data: dict[str, object] = {}
     current: dict[str, object] = {}
     if daily_budget is not None:
-        data["daily_budget"] = (
-            int(daily_budget)
-            if currency and currency.upper() in ZERO_DECIMAL_CURRENCIES
-            else int(daily_budget * 100)
+        data["daily_budget"] = to_minor_units(
+            daily_budget,
+            currency,
+            field_name="daily_budget",
         )
         current["daily_budget"] = daily_budget
     if lifetime_budget is not None:
-        data["lifetime_budget"] = (
-            int(lifetime_budget)
-            if currency and currency.upper() in ZERO_DECIMAL_CURRENCIES
-            else int(lifetime_budget * 100)
+        data["lifetime_budget"] = to_minor_units(
+            lifetime_budget,
+            currency,
+            field_name="lifetime_budget",
         )
         current["lifetime_budget"] = lifetime_budget
 
+    previous_response = {
+        "daily_budget": from_minor_units(
+            previous.get("daily_budget"), currency, field_name="daily_budget"
+        ),
+        "lifetime_budget": from_minor_units(
+            previous.get("lifetime_budget"), currency, field_name="lifetime_budget"
+        ),
+    }
     await client.update_object(object_id, data=data)
     return mutation_response(
         action=f"update_{object_type}_budget",
         target={f"{object_type}_id": object_id},
-        previous={
-            "daily_budget": normalize_budget_value(previous.get("daily_budget"), previous.get("currency")),
-            "lifetime_budget": normalize_budget_value(previous.get("lifetime_budget"), previous.get("currency")),
-        },
+        previous=previous_response,
         current=current,
     )
 
@@ -140,22 +149,29 @@ async def _update_bid_amount(
     bid_amount: float,
 ) -> dict[str, object]:
     """Update a single bid amount field."""
-    if bid_amount <= 0:
-        raise ValidationError("bid_amount must be greater than 0.")
+    validate_positive_amount(bid_amount, field_name="bid_amount")
 
     client = get_graph_api_client()
     previous = await client.get_object(
         object_id,
-        fields=["id", "bid_amount", "currency"],
+        fields=["id", "account_id", "bid_amount"],
     )
-    encoded_bid_amount = _bid_minor_units(bid_amount, previous.get("currency"))
+    currency = await resolve_account_currency(client, previous.get("account_id"))
+    encoded_bid_amount = to_minor_units(
+        bid_amount,
+        currency,
+        field_name="bid_amount",
+    )
+    previous_response = {
+        "bid_amount": from_minor_units(
+            previous.get("bid_amount"), currency, field_name="bid_amount"
+        ),
+    }
     await client.update_object(object_id, data={"bid_amount": encoded_bid_amount})
     return mutation_response(
         action=f"update_{object_type}_bid_amount",
         target={f"{object_type}_id": object_id},
-        previous={
-            "bid_amount": normalize_budget_value(previous.get("bid_amount"), previous.get("currency")),
-        },
+        previous=previous_response,
         current={"bid_amount": bid_amount},
     )
 
@@ -170,32 +186,45 @@ async def _update_bid_strategy(
 ) -> dict[str, object]:
     """Update bid strategy and optionally a supporting bid amount."""
     validated_bid_strategy = _validate_bid_strategy(bid_strategy)
-    if bid_amount is not None and bid_amount <= 0:
-        raise ValidationError("bid_amount must be greater than 0 when provided.")
+    if bid_amount is not None:
+        validate_positive_amount(bid_amount, field_name="bid_amount")
 
     client = get_graph_api_client()
     previous = await client.get_object(
         object_id,
-        fields=["id", "bid_strategy", "bid_amount", "bid_constraints", "currency"],
+        fields=["id", "account_id", "bid_strategy", "bid_amount", "bid_constraints"],
+    )
+    has_bid_amount = bid_amount is not None or previous.get("bid_amount") is not None
+    currency = (
+        await resolve_account_currency(client, previous.get("account_id"))
+        if has_bid_amount
+        else None
     )
     payload: dict[str, object] = {"bid_strategy": validated_bid_strategy}
     current: dict[str, object] = {"bid_strategy": validated_bid_strategy}
     if bid_amount is not None:
-        payload["bid_amount"] = _bid_minor_units(bid_amount, previous.get("currency"))
+        payload["bid_amount"] = to_minor_units(
+            bid_amount,
+            currency,
+            field_name="bid_amount",
+        )
         current["bid_amount"] = bid_amount
     if bid_constraints is not None:
         payload["bid_constraints"] = bid_constraints
         current["bid_constraints"] = bid_constraints
 
+    previous_response = {
+        "bid_strategy": previous.get("bid_strategy"),
+        "bid_amount": from_minor_units(
+            previous.get("bid_amount"), currency, field_name="bid_amount"
+        ),
+        "bid_constraints": previous.get("bid_constraints"),
+    }
     await client.update_object(object_id, data=payload)
     return mutation_response(
         action=f"update_{object_type}_bid_strategy",
         target={f"{object_type}_id": object_id},
-        previous={
-            "bid_strategy": previous.get("bid_strategy"),
-            "bid_amount": normalize_budget_value(previous.get("bid_amount"), previous.get("currency")),
-            "bid_constraints": previous.get("bid_constraints"),
-        },
+        previous=previous_response,
         current=current,
     )
 
@@ -240,14 +269,20 @@ async def update_adset_bid_amount(adset_id: str, bid_amount: float) -> dict[str,
 async def update_campaign_bid_strategy(
     campaign_id: str,
     bid_strategy: str,
-    bid_amount: float | None = None,
 ) -> dict[str, object]:
-    """Use this when the user wants to adjust campaign bidding strategy with an optional bid amount override."""
-    return await _update_bid_strategy(
+    """Use this when the user wants to adjust the campaign-level bidding strategy."""
+    validated_bid_strategy = _validate_bid_strategy(bid_strategy)
+    client = get_graph_api_client()
+    previous = await client.get_object(campaign_id, fields=["id", "bid_strategy"])
+    await client.update_object(
         campaign_id,
-        "campaign",
-        bid_strategy=bid_strategy,
-        bid_amount=bid_amount,
+        data={"bid_strategy": validated_bid_strategy},
+    )
+    return mutation_response(
+        action="update_campaign_bid_strategy",
+        target={"campaign_id": campaign_id},
+        previous={"bid_strategy": previous.get("bid_strategy")},
+        current={"bid_strategy": validated_bid_strategy},
     )
 
 

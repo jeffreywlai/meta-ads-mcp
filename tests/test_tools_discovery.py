@@ -20,9 +20,9 @@ class FakeDiscoveryClient:
                 "data": [
                     {
                         "id": "cmp_1",
+                        "account_id": "123",
                         "name": "Campaign One",
                         "daily_budget": "5000",
-                        "currency": "USD",
                     }
                 ]
             }
@@ -32,10 +32,60 @@ class FakeDiscoveryClient:
             assert parent_id == "act_123"
             return {"data": [{"id": "ig_1", "username": "test_brand"}]}
         if edge == "adsets":
-            return {"data": [{"id": "adset_1", "campaign_id": "cmp_1", "daily_budget": "2500", "currency": "USD"}]}
+            return {
+                "data": [
+                    {
+                        "id": "adset_1",
+                        "account_id": "123",
+                        "campaign_id": "cmp_1",
+                        "daily_budget": "2500",
+                        "bid_amount": "1250",
+                    }
+                ]
+            }
         if edge == "ads":
-            return {"data": [{"id": "ad_1", "name": "Ad One"}]}
+            return {
+                "data": [
+                    {
+                        "id": "ad_1",
+                        "account_id": "123",
+                        "name": "Ad One",
+                        "bid_amount": "750",
+                    }
+                ]
+            }
         raise AssertionError(f"Unexpected edge {edge}")
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        if object_id == "act_123":
+            assert fields == ["currency"]
+            return {"id": object_id, "currency": "USD"}
+        if object_id == "cmp_1":
+            assert "account_id" in fields
+            assert "currency" not in fields
+            return {
+                "id": object_id,
+                "account_id": "123",
+                "daily_budget": "5000",
+            }
+        if object_id == "ad_1":
+            assert "account_id" in fields
+            assert "bid_amount" in fields
+            return {
+                "id": object_id,
+                "account_id": "123",
+                "bid_amount": "750",
+                "creative": {"id": "crt_1"},
+            }
+        assert object_id == "adset_1"
+        assert "account_id" in fields
+        assert "currency" not in fields
+        return {
+            "id": object_id,
+            "account_id": "123",
+            "daily_budget": "2500",
+            "bid_amount": "1250",
+        }
 
 
 def test_list_campaigns_uses_account_scope(monkeypatch) -> None:
@@ -258,6 +308,56 @@ def test_list_adsets_supports_campaign_scope(monkeypatch) -> None:
     result = asyncio.run(discovery.list_adsets(campaign_id="cmp_1"))
     assert result["summary"]["count"] == 1
     assert result["items"][0]["daily_budget"] == 25.0
+    assert result["items"][0]["bid_amount"] == 12.5
+    assert result["items"][0]["currency"] == "USD"
+    assert "account_id" in discovery.ADSET_FIELDS
+    assert "currency" not in discovery.ADSET_FIELDS
+
+
+def test_get_adset_normalizes_every_monetary_field(monkeypatch) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+
+    result = asyncio.run(discovery.get_adset(adset_id="adset_1"))
+
+    assert result["item"]["daily_budget"] == 25.0
+    assert result["item"]["bid_amount"] == 12.5
+
+
+def test_get_campaign_resolves_account_currency(monkeypatch) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+    result = asyncio.run(discovery.get_campaign(campaign_id="cmp_1"))
+    assert result["item"]["daily_budget"] == 50.0
+    assert result["item"]["account_id"] == "act_123"
+    assert result["item"]["currency"] == "USD"
+
+
+def test_ad_reads_include_and_normalize_bid_amount(monkeypatch) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeDiscoveryClient())
+    listed = asyncio.run(discovery.list_ads(adset_id="adset_1"))
+    fetched = asyncio.run(discovery.get_ad(ad_id="ad_1"))
+    assert listed["items"][0]["bid_amount"] == 7.5
+    assert fetched["item"]["bid_amount"] == 7.5
+    assert "account_id" in discovery.AD_FIELDS
+    assert "bid_amount" in discovery.AD_FIELDS
+
+
+def test_discovery_normalizes_zero_decimal_monetary_fields() -> None:
+    items = discovery._normalize_monetary_fields(
+        [
+            {
+                "daily_budget": "5000",
+                "lifetime_budget": "15000",
+                "bid_amount": "1250",
+                "currency": "JPY",
+            }
+        ]
+    )
+
+    assert items[0]["daily_budget"] == 5000.0
+    assert items[0]["lifetime_budget"] == 15000.0
+    assert items[0]["bid_amount"] == 1250.0
+    assert "account_id" in discovery.CAMPAIGN_FIELDS
+    assert "currency" not in discovery.CAMPAIGN_FIELDS
 
 
 def test_list_adsets_treats_blank_account_as_missing(monkeypatch) -> None:
@@ -279,9 +379,9 @@ def test_list_adsets_includes_schedule_fields_when_present(monkeypatch) -> None:
                     "data": [
                         {
                             "id": "adset_1",
+                            "account_id": "123",
                             "campaign_id": "cmp_1",
                             "daily_budget": "2500",
-                            "currency": "USD",
                             "start_time": "2026-03-01T00:00:00+0000",
                             "end_time": "2026-03-31T00:00:00+0000",
                         }

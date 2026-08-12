@@ -4,27 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from .money import ZERO_DECIMAL_CURRENCIES as ZERO_DECIMAL_CURRENCIES
+from .money import from_minor_units
 from .pagination import extract_paging
-
-
-ZERO_DECIMAL_CURRENCIES = {
-    "BIF",
-    "CLP",
-    "DJF",
-    "GNF",
-    "JPY",
-    "KMF",
-    "KRW",
-    "MGA",
-    "PYG",
-    "RWF",
-    "UGX",
-    "VND",
-    "VUV",
-    "XAF",
-    "XOF",
-    "XPF",
-}
 
 
 def to_float(value: Any) -> float | None:
@@ -53,12 +35,7 @@ def blank_to_none(value: str | None) -> str | None:
 
 def normalize_budget_value(value: Any, currency: str | None = None) -> float | None:
     """Convert minor-unit budgets to human-readable amounts."""
-    numeric = to_float(value)
-    if numeric is None:
-        return None
-    if currency and currency.upper() in ZERO_DECIMAL_CURRENCIES:
-        return numeric
-    return numeric / 100.0
+    return from_minor_units(value, currency, field_name="budget")
 
 
 def action_list_to_map(actions: list[dict[str, Any]] | None) -> dict[str, float]:

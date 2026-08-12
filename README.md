@@ -191,6 +191,12 @@ tool names without duplicating search results. Public string-list parameters,
 including `fields`, breakdowns, statuses, countries, scopes, and action types,
 accept either JSON string lists or comma-separated strings.
 
+Budget and bid inputs use human-readable account-currency units. The server
+resolves currency from the owning Ad Account, converts values to Meta minor
+units exactly, and rejects precision the currency cannot represent (for
+example, fractional JPY). Campaign bidding strategy and Ad Set bid amounts are
+separate operations because Meta does not expose a campaign-level `bid_amount`.
+
 ## 📚 MCP Resources
 
 | Resource | Description |
@@ -399,6 +405,7 @@ meta-ads-mcp/
 │   ├── diagnostics.py         # Derived metrics & optimization heuristics
 │   ├── errors.py              # Error handling
 │   ├── graph_api.py           # Meta Graph API client
+│   ├── money.py               # Account-currency resolution & exact conversion
 │   ├── normalize.py           # Response normalization
 │   ├── pagination.py          # Graph API pagination helpers
 │   ├── schemas.py             # Pydantic schemas

@@ -9,6 +9,11 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
 from meta_ads_mcp.input_compat import resolve_identifier_alias
+from meta_ads_mcp.money import (
+    resolve_account_currency,
+    to_minor_units,
+    validate_positive_amount,
+)
 from meta_ads_mcp.schemas import creation_response
 
 AD_IMAGE_FIELDS = [
@@ -125,6 +130,8 @@ async def create_ad(
     """Create or validate an ad from a top-level or nested creative id."""
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
+    if bid_amount is not None:
+        validate_positive_amount(bid_amount, field_name="bid_amount")
     nested_creative_id: str | None = None
     if creative is not None:
         unknown_keys = sorted(set(creative) - {"creative_id", "id"})
@@ -158,14 +165,26 @@ async def create_ad(
         "adset_id": adset_id,
         "creative": {"creative_id": resolved_creative_id},
         "status": status,
-        "bid_amount": OMIT if bid_amount is None else int(bid_amount * 100),
+        "bid_amount": OMIT,
         "tracking_specs": tracking_specs or OMIT,
     }
     add_validate_only(payload, validate_only=validate_only)
-    payload = merge_graph_payload(payload, params)
-
+    merge_graph_payload(payload, params)
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
+    currency = (
+        await resolve_account_currency(client, account_id)
+        if bid_amount is not None
+        else None
+    )
+    if bid_amount is not None:
+        payload["bid_amount"] = to_minor_units(
+            bid_amount,
+            currency,
+            field_name="bid_amount",
+        )
+    payload = merge_graph_payload(payload, params)
+
     created = await client.create_edge_object(
         account_id,
         "ads",

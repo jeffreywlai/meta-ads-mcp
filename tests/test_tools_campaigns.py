@@ -21,14 +21,17 @@ class FakeCampaignClient:
         return {"id": "cmp_123"}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
+        if object_id == "act_123":
+            assert fields == ["currency"]
+            return {"id": object_id, "currency": "USD"}
         return {
             "id": object_id,
+            "account_id": "123",
             "name": "Old name",
             "status": "PAUSED",
             "objective": "OUTCOME_SALES",
             "daily_budget": "5000",
             "lifetime_budget": None,
-            "currency": "USD",
         }
 
     async def update_object(self, object_id: str, *, data):
@@ -43,9 +46,9 @@ class FakeZeroDecimalCampaignClient(FakeCampaignClient):
     """Fake campaign client for zero-decimal currencies."""
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
-        payload = await super().get_object(object_id, fields=fields, params=params)
-        payload["currency"] = "JPY"
-        return payload
+        if object_id == "act_123":
+            return {"id": object_id, "currency": "JPY"}
+        return await super().get_object(object_id, fields=fields, params=params)
 
 
 def test_create_campaign_encodes_budget(monkeypatch) -> None:
@@ -64,6 +67,55 @@ def test_create_campaign_encodes_budget(monkeypatch) -> None:
     assert client.created_payload["data"]["daily_budget"] == 5000
 
 
+def test_create_campaign_encodes_exact_decimal_budget(monkeypatch) -> None:
+    client = FakeCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(
+        campaigns.create_campaign(
+            account_id="123",
+            name="New Campaign",
+            objective="OUTCOME_SALES",
+            daily_budget=19.99,
+        )
+    )
+    assert client.created_payload["data"]["daily_budget"] == 1999
+
+
+def test_create_campaign_encodes_zero_decimal_budget(monkeypatch) -> None:
+    client = FakeZeroDecimalCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(
+        campaigns.create_campaign(
+            account_id="123",
+            name="JPY Campaign",
+            objective="OUTCOME_SALES",
+            daily_budget=5000.0,
+        )
+    )
+    assert client.created_payload["data"]["daily_budget"] == 5000
+
+
+@pytest.mark.parametrize("daily_budget", [0, -1, float("nan")])
+def test_create_campaign_rejects_invalid_budget_before_client_lookup(
+    monkeypatch,
+    daily_budget,
+) -> None:
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+    with pytest.raises(campaigns.ValidationError, match="daily_budget"):
+        asyncio.run(
+            campaigns.create_campaign(
+                account_id="123",
+                name="Invalid Campaign",
+                objective="OUTCOME_SALES",
+                daily_budget=daily_budget,
+            )
+        )
+
+
 def test_update_campaign_returns_previous_budget(monkeypatch) -> None:
     client = FakeCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
@@ -77,7 +129,11 @@ def test_update_campaign_returns_previous_budget(monkeypatch) -> None:
 
 
 def test_update_campaign_rejects_noop_update(monkeypatch) -> None:
-    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
     with pytest.raises(campaigns.ValidationError):
         asyncio.run(campaigns.update_campaign(campaign_id="cmp_123"))
 
@@ -91,6 +147,20 @@ def test_update_campaign_rejects_both_budgets(monkeypatch) -> None:
                 daily_budget=10.0,
                 lifetime_budget=20.0,
             )
+        )
+
+
+def test_update_campaign_rejects_nonpositive_budget_before_client_lookup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+    with pytest.raises(campaigns.ValidationError, match="daily_budget"):
+        asyncio.run(
+            campaigns.update_campaign(campaign_id="cmp_123", daily_budget=-1)
         )
 
 
@@ -141,8 +211,58 @@ def test_create_ad_set_supports_typed_bidding_and_validate_only(monkeypatch) -> 
     assert result["validation"] == {"id": "cmp_123"}
 
 
+def test_create_ad_set_encodes_zero_decimal_budget_and_bid(monkeypatch) -> None:
+    client = FakeZeroDecimalCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(
+        campaigns.create_ad_set(
+            account_id="123",
+            campaign_id="cmp_123",
+            name="JPY Ad Set",
+            billing_event="IMPRESSIONS",
+            optimization_goal="OFFSITE_CONVERSIONS",
+            targeting={"geo_locations": {"countries": ["JP"]}},
+            daily_budget=5000.0,
+            bid_amount=1250.0,
+        )
+    )
+    assert client.created_payload["data"]["daily_budget"] == 5000
+    assert client.created_payload["data"]["bid_amount"] == 1250
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"daily_budget": -1}, {"bid_amount": 0}],
+)
+def test_create_ad_set_rejects_invalid_money_before_client_lookup(
+    monkeypatch,
+    kwargs,
+) -> None:
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+    with pytest.raises(campaigns.ValidationError):
+        asyncio.run(
+            campaigns.create_ad_set(
+                account_id="123",
+                campaign_id="cmp_123",
+                name="Invalid Ad Set",
+                billing_event="IMPRESSIONS",
+                optimization_goal="OFFSITE_CONVERSIONS",
+                targeting={"geo_locations": {"countries": ["US"]}},
+                **kwargs,
+            )
+        )
+
+
 def test_create_ad_set_rejects_params_overriding_typed_fields(monkeypatch) -> None:
-    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
     with pytest.raises(campaigns.ValidationError, match="cannot override typed fields"):
         asyncio.run(
             campaigns.create_ad_set(
@@ -160,7 +280,11 @@ def test_create_ad_set_rejects_params_overriding_typed_fields(monkeypatch) -> No
 def test_campaign_params_cannot_supply_omitted_typed_or_control_fields(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
 
     with pytest.raises(campaigns.ValidationError, match="daily_budget"):
         asyncio.run(
@@ -202,7 +326,11 @@ def test_campaign_params_cannot_supply_omitted_typed_or_control_fields(
 
 
 def test_create_ad_set_requires_strategy_for_bid_constraints(monkeypatch) -> None:
-    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
     with pytest.raises(campaigns.ValidationError, match="bid_strategy is required"):
         asyncio.run(
             campaigns.create_ad_set(
@@ -226,3 +354,20 @@ def test_update_campaign_encodes_zero_decimal_budget_without_cents(monkeypatch) 
     assert result["previous"]["daily_budget"] == 5000.0
     assert result["current"]["daily_budget"] == 7500.0
     assert client.updated_payload["data"]["daily_budget"] == 7500
+
+
+def test_update_campaign_decodes_previous_money_before_mutating(monkeypatch) -> None:
+    class MalformedPreviousClient(FakeCampaignClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            payload = await super().get_object(object_id, fields=fields, params=params)
+            if object_id != "act_123":
+                payload["daily_budget"] = "not-a-number"
+            return payload
+
+    client = MalformedPreviousClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="daily_budget"):
+        asyncio.run(
+            campaigns.update_campaign(campaign_id="cmp_123", daily_budget=75.0)
+        )
+    assert client.updated_payload is None

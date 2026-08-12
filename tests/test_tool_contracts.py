@@ -104,7 +104,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "upload_creative_asset": {"image_url": "https://example.com/image.png"},
     "update_campaign": {"name": "Updated Campaign"},
     "update_campaign_budget": {"daily_budget": 40.0},
-    "update_campaign_bid_strategy": {"bid_strategy": "COST_CAP", "bid_amount": 20.0},
+    "update_campaign_bid_strategy": {"bid_strategy": "COST_CAP"},
     "update_adset_budget": {"daily_budget": 35.0},
     "update_adset_bid_amount": {"bid_amount": 15.0},
     "update_adset_bid_strategy": {"bid_strategy": "LOWEST_COST_WITH_BID_CAP", "bid_amount": 12.5},
@@ -166,12 +166,12 @@ class UniversalFakeClient:
                 "data": [
                     {
                         "id": "cmp_123",
+                        "account_id": "123",
                         "name": "Campaign 123",
                         "status": "ACTIVE",
                         "effective_status": "ACTIVE",
                         "objective": "OUTCOME_SALES",
                         "daily_budget": "5000",
-                        "currency": "USD",
                     }
                 ]
             }
@@ -201,6 +201,7 @@ class UniversalFakeClient:
                 "data": [
                     {
                         "id": "adset_123",
+                        "account_id": "123",
                         "name": "Ad Set 123",
                         "status": "ACTIVE",
                         "effective_status": "ACTIVE",
@@ -217,11 +218,13 @@ class UniversalFakeClient:
                 "data": [
                     {
                         "id": "ad_123",
+                        "account_id": "123",
                         "name": "Ad 123",
                         "status": "ACTIVE",
                         "effective_status": "ACTIVE",
                         "campaign_id": "cmp_123",
                         "adset_id": "adset_123",
+                        "bid_amount": "1250",
                         "creative": {"id": "crt_123"},
                     }
                 ]
@@ -300,6 +303,8 @@ class UniversalFakeClient:
         return {"data": [{"id": f"{edge}_123", "name": f"{edge} item"}]}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
+        if object_id == "act_123":
+            return {"id": object_id, "currency": "USD"}
         if object_id == "ad_123":
             return {
                 "id": "ad_123",
@@ -318,6 +323,7 @@ class UniversalFakeClient:
             }
         payload = {
             "id": object_id,
+            "account_id": "123",
             "name": f"Object {object_id}",
             "status": "ACTIVE",
             "effective_status": "ACTIVE",
@@ -325,7 +331,6 @@ class UniversalFakeClient:
             "daily_budget": "5000",
             "lifetime_budget": "25000",
             "bid_amount": "1250",
-            "currency": "USD",
             "optimization_goal": "OFFSITE_CONVERSIONS",
             "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
             "start_time": "2026-03-01T00:00:00+0000",

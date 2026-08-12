@@ -106,6 +106,7 @@ class MetaApiError(MetaAdsError):
     trace_id: str | None = None
     error_data: dict[str, Any] | None = None
     operation: str | None = None
+    retry_after_seconds: float | None = None
     mutation_outcome_unknown: bool = False
 
     def __str__(self) -> str:
@@ -134,6 +135,7 @@ class MetaApiError(MetaAdsError):
                 else None,
             ),
             ("operation", self.operation),
+            ("retry_after_seconds", self.retry_after_seconds),
         ):
             if value is not None:
                 payload[key] = value
