@@ -38,10 +38,10 @@
 | `get_adset` | Get details for a specific ad set |
 | `list_ads` | List ads in an ad set or account |
 | `get_ad` | Get details for a specific ad |
-| `list_audiences` | List custom and lookalike audiences |
+| `list_audiences` | List custom and lookalike audiences with lightweight summary fields by default |
 | `get_audience` | Read one custom or lookalike audience by ID |
 | `list_creatives` | List ad creatives in an account |
-| `get_creative` | Read one ad creative by ID with selectable fields |
+| `get_creative` | Read one ad creative by ID, including `url_tags` and full creative-spec fields |
 
 ### 📊 Analysis
 
@@ -92,7 +92,7 @@
 
 | Tool | Description |
 |------|-------------|
-| `list_change_history` | Read Meta Ads activity logs for account, campaign, ad set, or ad changes with documented time, category, business, and actor filters |
+| `list_change_history` | Read account, campaign, ad set, or ad activity; object-scoped calls derive the owning account when `account_id` is omitted |
 
 ### 🎯 Planning & Targeting
 
@@ -181,6 +181,8 @@ FastMCP 3.1 also exposes dynamic search tools at runtime:
 | `call_tool` | Call a discovered tool by name |
 
 These let the LLM discover the right tool on demand instead of loading the full catalog into context up front.
+All public `fields` parameters accept either a JSON string list or a
+comma-separated string such as `"id,name,url_tags"`.
 
 ## 📚 MCP Resources
 
@@ -232,12 +234,19 @@ visible `call_tool` proxy with `name="read_overflow_artifact"` and the returned
 from local or remote MCP transports. Then use `call_tool` with
 `name="delete_overflow_artifact"`. When `META_EXPORT_DIR` is omitted, the
 server uses the operating system's temporary `meta-ads-mcp-exports` directory.
+The 64 KB threshold applies only to the inline MCP response: Meta's complete
+result is retained in the artifact and is not truncated or discarded.
 Artifacts expire after 24 hours by default, and the store retains at most 100
 response artifacts totaling 1 GB of JSON payload data; small private integrity
 manifests are stored alongside those payloads. The three retention variables
 above override those defaults.
 If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
+
+`META_DEFAULT_ACCOUNT_ID` is an optional convenience, not a requirement for
+object-scoped activity history. When a campaign, ad set, or ad ID is supplied,
+the server looks up its owning account and validates any explicit or default
+account against that ownership.
 
 Don't have a token? Use the built-in auth helper tools (`generate_auth_url` → `exchange_code_for_token` → `refresh_to_long_lived_token`) to create one interactively.
 
