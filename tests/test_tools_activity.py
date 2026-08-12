@@ -173,6 +173,45 @@ def test_list_change_history_explains_failed_account_derivation(
         asyncio.run(activity.list_change_history(ad_id="ad_123"))
 
 
+@pytest.mark.parametrize(
+    "lookup_error",
+    [
+        NotFoundError("object is unavailable"),
+        httpx.ReadTimeout("ownership lookup timed out"),
+    ],
+)
+def test_list_change_history_explains_account_lookup_failure_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_error: Exception,
+) -> None:
+    monkeypatch.delenv("META_DEFAULT_ACCOUNT_ID", raising=False)
+    reload_settings()
+
+    class FailedOwnershipClient(FakeActivityClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            raise lookup_error
+
+    monkeypatch.setattr(
+        activity,
+        "get_graph_api_client",
+        lambda: FailedOwnershipClient(),
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="could not be derived.*Pass account_id explicitly",
+    ) as exc_info:
+        asyncio.run(
+            activity.list_change_history(
+                level="campaign",
+                object_id="cmp_123",
+            )
+        )
+
+    assert exc_info.value.__cause__ is lookup_error
+    assert str(lookup_error) in str(exc_info.value)
+
+
 def test_list_change_history_rejects_mismatched_object_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+import pydantic_core
+
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
@@ -11,6 +13,13 @@ from meta_ads_mcp.coordinator import (
     mcp_server,
 )
 from meta_ads_mcp.graph_api import get_graph_api_client
+from meta_ads_mcp.overflow import (
+    DEFAULT_ARTIFACT_CHUNK_BYTES,
+    compact_overflow_chunk_result,
+)
+
+
+MAX_INLINE_ARTIFACT_RESULT_BYTES = 63_000
 
 TOOL_GROUPS = {
     "discovery": [
@@ -200,6 +209,18 @@ INTENT_GUIDE = {
         "avoid_unless_needed": [],
         "notes": ["Prefer summary tools first; exports are the heaviest reporting path."],
     },
+    "retrieve_oversized_response": {
+        "description": "Retrieve or download the complete oversized response behind an overflow export id.",
+        "recommended_order": [
+            "read_overflow_artifact",
+            "delete_overflow_artifact",
+        ],
+        "avoid_unless_needed": [],
+        "notes": [
+            "Read repeatedly with next_offset until complete is true.",
+            "Delete the overflow artifact only after all chunks have been retrieved.",
+        ],
+    },
     "find_optimization_opportunities": {
         "description": "Find optimization opportunities, risks, pacing issues, or fatigue.",
         "recommended_order": [
@@ -339,12 +360,13 @@ def _search_tokens(text: str) -> set[str]:
     """Tokenize routing text for tiny local fuzzy matching."""
     tokens: set[str] = set()
     for token in re.findall(r"[a-z0-9_]+", text.lower()):
-        tokens.add(token)
-        tokens.update(part for part in token.split("_") if part)
-        if token.endswith("s") and len(token) > 3:
-            tokens.add(token[:-1])
-        if token in {"adset", "adsets"}:
-            tokens.update({"ad", "set", "ad_set"})
+        components = {token, *(part for part in token.split("_") if part)}
+        for component in components:
+            tokens.add(component)
+            if component.endswith("s") and len(component) > 3:
+                tokens.add(component[:-1])
+            if component in {"adset", "adsets"}:
+                tokens.update({"ad", "set", "ad_set"})
     return tokens
 
 
@@ -624,14 +646,33 @@ async def list_mutation_tools() -> dict[str, object]:
 async def read_overflow_artifact(
     export_id: str,
     offset: int = 0,
-    max_bytes: int = 8_000,
+    max_bytes: int = DEFAULT_ARTIFACT_CHUNK_BYTES,
 ) -> dict[str, object]:
-    """Read one bounded JSON chunk from a complete oversized tool response using its opaque export id."""
-    return OVERFLOW_ARTIFACT_STORE.read(
-        export_id,
-        offset=offset,
-        max_bytes=max_bytes,
-    )
+    """Read the largest safe JSON chunk from a complete oversized response."""
+    requested_bytes = max_bytes
+    while True:
+        chunk = OVERFLOW_ARTIFACT_STORE.read(
+            export_id,
+            offset=offset,
+            max_bytes=requested_bytes,
+        )
+        result = compact_overflow_chunk_result(chunk)
+        serialized_size = len(
+            pydantic_core.to_json(result, fallback=str)
+        )
+        if serialized_size <= MAX_INLINE_ARTIFACT_RESULT_BYTES:
+            return chunk
+        if requested_bytes == 1:
+            return chunk
+        requested_bytes = max(
+            1,
+            int(
+                requested_bytes
+                * MAX_INLINE_ARTIFACT_RESULT_BYTES
+                / serialized_size
+                * 0.95
+            ),
+        )
 
 
 @mcp_server.tool()

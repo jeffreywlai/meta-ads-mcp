@@ -1128,7 +1128,9 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
 
     chunks: list[str] = []
     offset = 0
+    chunk_calls = 0
     while True:
+        chunk_calls += 1
         chunk_result = asyncio.run(
             mcp_server.call_tool(
                 "call_tool",
@@ -1140,10 +1142,15 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
         )
         assert len(pydantic_core.to_json(chunk_result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES
         chunk = chunk_result.structured_content
+        assert json.loads(chunk_result.content[0].text) == chunk
         chunks.append(chunk["data"])
         if chunk["complete"]:
             break
         offset = chunk["next_offset"]
+    legacy_chunk_calls = (
+        chunk["total_bytes"] + 8_000 - 1
+    ) // 8_000
+    assert chunk_calls < legacy_chunk_calls
 
     archived = json.loads("".join(chunks))
     archived_result = archived["tool_result"]

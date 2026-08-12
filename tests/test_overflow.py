@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -87,6 +88,7 @@ def test_cleanup_enforces_ttl_and_file_quota(tmp_path: Path) -> None:
     first_id, _ = store.create(_result("first"), tool_name="example_tool")
     first_path = store._artifact_path(first_id)
     os.utime(first_path, (1, 1))
+    os.utime(tmp_path / store._manifest_name(first_id), (1, 1))
     second_id, _ = store.create(_result("second"), tool_name="example_tool")
     third_id, _ = store.create(_result("third"), tool_name="example_tool")
 
@@ -102,6 +104,11 @@ def test_cleanup_enforces_ttl_and_file_quota(tmp_path: Path) -> None:
     expired_path = expiring_store._artifact_path(expired_id)
     old = time.time() - 5
     os.utime(expired_path, (old, old))
+    os.utime(
+        expiring_store.export_directory
+        / expiring_store._manifest_name(expired_id),
+        (old, old),
+    )
     assert expiring_store.cleanup()["removed_files"] == 1
     assert not expired_path.exists()
 
@@ -116,7 +123,7 @@ def test_store_rejects_oversized_artifact_and_invalid_reads(tmp_path: Path) -> N
     with pytest.raises(ValidationError, match="export_id"):
         store.read("../escape")
     with pytest.raises(ValidationError, match="max_bytes"):
-        store.read(export_id, max_bytes=8_001)
+        store.read(export_id, max_bytes=44_001)
     with pytest.raises(ValidationError, match="offset"):
         store.read(export_id, offset=10**9)
 
@@ -199,6 +206,153 @@ def test_read_rejects_truncated_and_same_size_corrupt_artifacts(
 
     with pytest.raises(ValidationError, match="integrity"):
         corrupt_store.read(corrupt_id, max_bytes=8_000)
+
+
+def test_read_rejects_corruption_before_returning_a_nonfinal_chunk(
+    tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    result = ToolResult(
+        content=[TextContent(type="text", text="A" * 200_000)],
+        structured_content={"payload": "B" * 200_000},
+    )
+    export_id, _ = store.create(result, tool_name="large_tool")
+    artifact_path = store._artifact_path(export_id)
+    artifact_bytes = bytearray(artifact_path.read_bytes())
+    artifact_bytes[artifact_bytes.index(ord("A"))] = ord("Z")
+    artifact_path.write_bytes(artifact_bytes)
+
+    with pytest.raises(ValidationError, match="integrity"):
+        store.read(export_id, offset=0, max_bytes=1_000)
+
+
+def test_chunk_reads_reuse_one_stable_full_artifact_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    result = ToolResult(
+        content=[TextContent(type="text", text="A" * 200_000)],
+        structured_content={"payload": "B" * 200_000},
+    )
+    export_id, _ = store.create(result, tool_name="large_tool")
+    original_sha256 = overflow.hashlib.sha256
+    hash_calls = 0
+
+    def counting_sha256(*args, **kwargs):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(overflow.hashlib, "sha256", counting_sha256)
+    offset = 0
+    while True:
+        chunk = store.read(export_id, offset=offset, max_bytes=44_000)
+        if chunk["complete"]:
+            break
+        offset = chunk["next_offset"]
+
+    assert hash_calls == 1
+
+
+def test_verified_identity_cache_is_bounded_and_eviction_rehashes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path, max_files=70)
+    export_ids = [
+        store.create(_result(str(index)), tool_name="example_tool")[0]
+        for index in range(65)
+    ]
+    original_sha256 = overflow.hashlib.sha256
+    hash_calls = 0
+
+    def counting_sha256(*args, **kwargs):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(overflow.hashlib, "sha256", counting_sha256)
+    for export_id in export_ids:
+        store.read(export_id, max_bytes=1)
+
+    assert hash_calls == 65
+    assert len(store._verified_artifacts) == 64
+    assert export_ids[0] not in store._verified_artifacts
+
+    store.read(export_ids[0], max_bytes=1)
+
+    assert hash_calls == 66
+    assert len(store._verified_artifacts) == 64
+
+
+def test_cleanup_prunes_cache_entries_deleted_by_another_store(
+    tmp_path: Path,
+) -> None:
+    reader = OverflowArtifactStore(tmp_path)
+    writer = OverflowArtifactStore(tmp_path)
+    maximum_cache_entries = 0
+
+    for index in range(80):
+        export_id, _ = writer.create(
+            _result(str(index)),
+            tool_name="example_tool",
+        )
+        reader.read(export_id, max_bytes=1)
+        writer.delete(export_id)
+        maximum_cache_entries = max(
+            maximum_cache_entries,
+            len(reader._verified_artifacts),
+        )
+
+    reader.cleanup()
+
+    assert maximum_cache_entries <= 1
+    assert not reader._verified_artifacts
+
+
+def test_read_errors_evict_cached_identity(
+    tmp_path: Path,
+) -> None:
+    reader = OverflowArtifactStore(tmp_path)
+    writer = OverflowArtifactStore(tmp_path)
+    deleted_id, _ = writer.create(_result("deleted"), tool_name="example_tool")
+    reader.read(deleted_id, max_bytes=1)
+    writer.delete(deleted_id)
+
+    with pytest.raises(NotFoundError):
+        reader.read(deleted_id, max_bytes=1)
+    assert deleted_id not in reader._verified_artifacts
+
+    corrupt_id, _ = writer.create(_result("corrupt"), tool_name="example_tool")
+    reader.read(corrupt_id, max_bytes=1)
+    manifest_path = tmp_path / reader._manifest_name(corrupt_id)
+    manifest_path.write_text("not-json")
+
+    with pytest.raises(ValidationError, match="integrity"):
+        reader.read(corrupt_id, max_bytes=1)
+    assert corrupt_id not in reader._verified_artifacts
+
+
+def test_concurrent_reads_keep_verification_cache_coherent(
+    tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path, max_files=20)
+    export_ids = [
+        store.create(_result(str(index)), tool_name="example_tool")[0]
+        for index in range(20)
+    ]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        chunks = list(
+            executor.map(
+                lambda export_id: store.read(export_id, max_bytes=1),
+                export_ids * 2,
+            )
+        )
+
+    assert len(chunks) == 40
+    assert len(store._verified_artifacts) <= store.max_files
 
 
 def test_read_rejects_fifo_replacement_without_blocking(tmp_path: Path) -> None:
@@ -391,14 +545,67 @@ def test_read_refreshes_ttl_for_active_chunk_retrieval(tmp_path: Path) -> None:
     store = OverflowArtifactStore(tmp_path, ttl_seconds=1)
     export_id, _ = store.create(_result(), tool_name="example_tool")
     artifact_path = store._artifact_path(export_id)
+    manifest_path = tmp_path / store._manifest_name(export_id)
     almost_expired = time.time() - 0.5
     os.utime(artifact_path, (almost_expired, almost_expired))
+    os.utime(manifest_path, (almost_expired, almost_expired))
+    original_artifact_mtime = artifact_path.stat().st_mtime_ns
 
     store.read(export_id, max_bytes=1)
-    refreshed_at = artifact_path.stat().st_mtime
+    refreshed_at = manifest_path.stat().st_mtime
 
     assert refreshed_at > almost_expired
+    assert artifact_path.stat().st_mtime_ns == original_artifact_mtime
     assert store.cleanup(now=refreshed_at + 0.5)["removed_files"] == 0
+    assert artifact_path.exists()
+
+
+def test_lease_refresh_never_trusts_concurrent_artifact_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    result = ToolResult(
+        content=[TextContent(type="text", text="A" * 200_000)],
+    )
+    export_id, _ = store.create(result, tool_name="large_tool")
+    artifact_path = store._artifact_path(export_id)
+    original_utime = os.utime
+    corruption_offset: int | None = None
+
+    def corrupt_before_lease_refresh(path_or_fd, *args, **kwargs) -> None:
+        nonlocal corruption_offset
+        artifact_bytes = bytearray(artifact_path.read_bytes())
+        corruption_offset = artifact_bytes.index(ord("A"))
+        artifact_bytes[corruption_offset] = ord("Z")
+        artifact_path.write_bytes(artifact_bytes)
+        original_utime(path_or_fd, *args, **kwargs)
+        monkeypatch.setattr(overflow.os, "utime", original_utime)
+
+    monkeypatch.setattr(overflow.os, "utime", corrupt_before_lease_refresh)
+
+    store.read(export_id, offset=0, max_bytes=100)
+
+    assert corruption_offset is not None
+    with pytest.raises(ValidationError, match="integrity"):
+        store.read(export_id, offset=corruption_offset, max_bytes=1)
+
+
+def test_cleanup_uses_manifest_lease_without_mutating_artifact(
+    tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path, ttl_seconds=10)
+    export_id, _ = store.create(_result(), tool_name="example_tool")
+    artifact_path = store._artifact_path(export_id)
+    manifest_path = tmp_path / store._manifest_name(export_id)
+    old = time.time() - 20
+    active = time.time()
+    os.utime(artifact_path, (old, old))
+    os.utime(manifest_path, (active, active))
+
+    result = store.cleanup(now=active + 5)
+
+    assert result["removed_files"] == 0
     assert artifact_path.exists()
 
 

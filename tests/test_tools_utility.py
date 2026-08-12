@@ -104,6 +104,29 @@ def test_get_capabilities_routes_terse_intents() -> None:
     assert appointments["closest_intents"][0]["intent"] == "inspect_single_entity_performance"
 
 
+def test_get_capabilities_routes_audience_metadata_through_discovery() -> None:
+    result = asyncio.run(
+        utility.get_capabilities(intent="lightweight audience metadata")
+    )
+
+    assert result["closest_intents"][0]["intent"] == "discover_accounts_or_ids"
+
+
+def test_get_capabilities_has_overflow_retrieval_intent() -> None:
+    fuzzy = asyncio.run(
+        utility.get_capabilities(intent="retrieve oversized response")
+    )
+    exact = asyncio.run(
+        utility.get_capabilities(intent="retrieve_oversized_response")
+    )
+
+    assert fuzzy["closest_intents"][0]["intent"] == "retrieve_oversized_response"
+    assert exact["selected_intent"]["recommended_order"] == [
+        "read_overflow_artifact",
+        "delete_overflow_artifact",
+    ]
+
+
 def test_get_capabilities_has_feedback_intent() -> None:
     result = asyncio.run(utility.get_capabilities(intent="read_ad_comments_or_quality_signals"))
     assert result["selected_intent"]["recommended_order"][0] == "list_ad_comments"
