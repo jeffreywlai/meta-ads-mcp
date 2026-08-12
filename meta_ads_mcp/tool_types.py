@@ -43,10 +43,27 @@ def coerce_csv_string_list(value: Any) -> Any:
     return items
 
 
+def coerce_strict_csv_string_list(value: Any) -> Any:
+    """Accept simple CSV while preserving blank entries for domain validation."""
+    if value is None:
+        return []
+    if not isinstance(value, str):
+        return value
+    return [item.strip() for item in value.split(",")]
+
+
 StringList: TypeAlias = Annotated[
     list[str],
     BeforeValidator(
         coerce_csv_string_list,
+        json_schema_input_type=str | list[str],
+    ),
+]
+
+StrictStringList: TypeAlias = Annotated[
+    list[str],
+    BeforeValidator(
+        coerce_strict_csv_string_list,
         json_schema_input_type=str | list[str],
     ),
 ]

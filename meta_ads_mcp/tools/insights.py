@@ -24,7 +24,13 @@ from meta_ads_mcp.normalize import (
     normalize_insights_row,
 )
 from meta_ads_mcp.schemas import analysis_response, collection_response
-from meta_ads_mcp.tool_types import FieldList, StringList, normalize_field_list
+from meta_ads_mcp.tool_types import (
+    FieldList,
+    StrictStringList,
+    StringList,
+    coerce_strict_csv_string_list,
+    normalize_field_list,
+)
 
 DEFAULT_INSIGHTS_FIELDS = [
     "campaign_id",
@@ -331,16 +337,44 @@ def _insights_fields(
 
 
 def _normalize_flatten_actions(
-    flatten_actions: list[str] | None,
+    flatten_actions: list[str] | str | None,
 ) -> list[str]:
     """Normalize and validate scalar action projections before Graph calls."""
+    values = coerce_strict_csv_string_list(flatten_actions)
+    if not isinstance(values, list) or not all(
+        isinstance(item, str) for item in values
+    ):
+        raise ValidationError(
+            "flatten_actions must be a list of strings or a comma-separated string."
+        )
     normalized: list[str] = []
-    for raw_label in flatten_actions or []:
+    for raw_label in values:
         label = _normalize_key(raw_label)
         if not label:
             raise ValidationError("flatten_actions values must not be blank.")
         if label not in normalized:
             normalized.append(label)
+    return normalized
+
+
+def _normalize_action_types(
+    action_types: list[str] | str | None,
+) -> list[str]:
+    """Normalize action filters once so filtering and metadata cannot diverge."""
+    values = coerce_strict_csv_string_list(action_types)
+    if not isinstance(values, list) or not all(
+        isinstance(item, str) for item in values
+    ):
+        raise ValidationError(
+            "action_types must be a list of strings or a comma-separated string."
+        )
+    normalized: list[str] = []
+    for raw_action_type in values:
+        action_type = _normalize_key(raw_action_type)
+        if not action_type:
+            raise ValidationError("action_types values must not be blank.")
+        if action_type not in normalized:
+            normalized.append(action_type)
     return normalized
 
 
@@ -436,15 +470,22 @@ def _normalize_rows(
 ) -> list[dict[str, Any]]:
     """Normalize insights rows and attach derived metrics."""
     action_patterns = _action_patterns(action_types)
-    rows = [normalize_insights_row(_filter_action_arrays(row, action_patterns)) for row in payload.get("data", [])]
-    for row in rows:
+    rows: list[dict[str, Any]] = []
+    for raw_row in payload.get("data", []):
+        row = normalize_insights_row(_filter_action_arrays(raw_row, action_patterns))
+        flatten_source = (
+            normalize_insights_row(raw_row)
+            if action_patterns and flatten_actions
+            else row
+        )
         row["metrics"] = derive_core_metrics(row)
-        row.update(_flatten_action_columns(row, flatten_actions))
+        row.update(_flatten_action_columns(flatten_source, flatten_actions))
         if not include_raw_actions:
             for field in RAW_ACTION_ARRAY_FIELDS:
                 row.pop(field, None)
             row.pop("actions_map", None)
             row.pop("action_values_map", None)
+        rows.append(row)
     return rows
 
 
@@ -704,8 +745,8 @@ async def get_entity_insights(
     since: str | None = None,
     until: str | None = None,
     fields: FieldList | None = None,
-    action_types: StringList | None = None,
-    flatten_actions: StringList | None = None,
+    action_types: StrictStringList | None = None,
+    flatten_actions: StrictStringList | None = None,
     breakdowns: StringList | None = None,
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
@@ -715,6 +756,7 @@ async def get_entity_insights(
     after: str | None = None,
 ) -> dict[str, Any]:
     """Return paginated insights rows with optional flattened purchase, purchase-value, or other action columns; use summarize_actions for totals."""
+    action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     client = get_graph_api_client()
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
@@ -769,8 +811,8 @@ async def get_insights(
     until: str | None = None,
     time_range: dict[str, str] | None = None,
     fields: FieldList | None = None,
-    action_types: StringList | None = None,
-    flatten_actions: StringList | None = None,
+    action_types: StrictStringList | None = None,
+    flatten_actions: StrictStringList | None = None,
     breakdowns: StringList | None = None,
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
@@ -804,7 +846,7 @@ async def get_insights(
 async def summarize_actions(
     level: str,
     object_id: str,
-    action_types: StringList | None = None,
+    action_types: StrictStringList | None = None,
     date_preset: str | None = None,
     since: str | None = None,
     until: str | None = None,
@@ -819,6 +861,7 @@ async def summarize_actions(
 ) -> dict[str, Any]:
     """Use this for appointment, purchase, lead, or custom action counts over last 30 days or any trailing window."""
     after = blank_to_none(after)
+    action_types = _normalize_action_types(action_types)
     if max_action_types < 1 or max_action_types > 100:
         raise ValidationError("max_action_types must be between 1 and 100.")
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
@@ -995,13 +1038,14 @@ async def compare_performance(
     breakdowns: StringList | None = None,
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
-    action_types: StringList | None = None,
+    action_types: StrictStringList | None = None,
     limit: int = 100,
     metrics: StringList | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants the same metrics compared across multiple campaigns, ad sets, ads, or accounts."""
     if not object_ids:
         raise ValidationError("Provide at least one object_id.")
+    action_types = _normalize_action_types(action_types)
     effective_window = _effective_date_window(
         date_preset,
         since,
@@ -1042,7 +1086,7 @@ async def compare_performance(
                 "date_preset": effective_window["date_preset"],
                 "since": effective_window["since"],
                 "until": effective_window["until"],
-                "action_types": action_types,
+                "action_types": action_types or None,
             },
         },
     )
@@ -1057,8 +1101,8 @@ async def export_insights(
     since: str | None = None,
     until: str | None = None,
     fields: FieldList | None = None,
-    action_types: StringList | None = None,
-    flatten_actions: StringList | None = None,
+    action_types: StrictStringList | None = None,
+    flatten_actions: StrictStringList | None = None,
     breakdowns: StringList | None = None,
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
@@ -1069,6 +1113,7 @@ async def export_insights(
 ) -> dict[str, Any]:
     """Use this when the user explicitly wants export-style output; JSON returns structured rows, CSV returns serialized text."""
     after = blank_to_none(after)
+    action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     export_format = format.lower()
     if export_format not in {"json", "csv"}:
@@ -1176,7 +1221,7 @@ async def create_async_insights_report(
     until: str | None = None,
     fields: FieldList | None = None,
     field_preset: Literal["lean", "full"] = "lean",
-    flatten_actions: StringList | None = None,
+    flatten_actions: StrictStringList | None = None,
     breakdowns: StringList | None = None,
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
@@ -1230,7 +1275,7 @@ async def create_async_insights_report_batch(
     until: str | None = None,
     fields: FieldList | None = None,
     field_preset: Literal["lean", "full"] = "lean",
-    flatten_actions: StringList | None = None,
+    flatten_actions: StrictStringList | None = None,
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     limit: int = 100,
@@ -1313,8 +1358,8 @@ async def create_async_insights_report_batch(
 async def get_async_insights_report(
     report_run_id: str,
     fields: FieldList | None = None,
-    action_types: StringList | None = None,
-    flatten_actions: StringList | None = None,
+    action_types: StrictStringList | None = None,
+    flatten_actions: StrictStringList | None = None,
     include_raw_actions: bool = False,
     limit: int = 100,
     after: str | None = None,
@@ -1330,6 +1375,7 @@ async def get_async_insights_report(
         )
     if poll_interval_seconds <= 0 or poll_interval_seconds > 10:
         raise ValidationError("poll_interval_seconds must be greater than 0 and at most 10.")
+    action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     requested_fields = normalize_field_list(fields)
     if requested_fields is not None:

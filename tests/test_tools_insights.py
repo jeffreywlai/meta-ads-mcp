@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pydantic_core
 import pytest
+from pydantic import TypeAdapter
 
 from meta_ads_mcp.coordinator import (
     MAX_TOOL_RESPONSE_BYTES,
@@ -16,6 +17,7 @@ from meta_ads_mcp.coordinator import (
     RESPONSE_LIMITING_MIDDLEWARE,
     mcp_server,
 )
+from meta_ads_mcp.tool_types import StrictStringList
 from meta_ads_mcp.tools import insights
 
 
@@ -144,6 +146,84 @@ def test_get_entity_insights_action_filter_adds_required_fields(monkeypatch) -> 
         )
     )
     assert result["summary"]["action_filter"]["matched"] == ["purchase"]
+
+
+@pytest.mark.parametrize("action_types", [[" "], ["lead", " "]])
+def test_get_entity_insights_rejects_blank_action_types_before_api_call(
+    monkeypatch,
+    action_types,
+) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+
+    with pytest.raises(insights.ValidationError, match="action_types values must not be blank"):
+        asyncio.run(
+            insights.get_entity_insights(
+                level="account",
+                object_id="act_123",
+                action_types=action_types,
+            )
+        )
+
+
+@pytest.mark.parametrize("raw_value", [" ", "lead, ,purchase"])
+def test_action_csv_coercion_preserves_blanks_for_domain_validation(
+    raw_value,
+) -> None:
+    coerced = TypeAdapter(StrictStringList).validate_python(raw_value)
+
+    with pytest.raises(
+        insights.ValidationError,
+        match="action_types values must not be blank",
+    ):
+        insights._normalize_action_types(coerced)
+
+
+def test_flatten_action_csv_coercion_preserves_blanks_for_domain_validation() -> None:
+    coerced = TypeAdapter(StrictStringList).validate_python("purchase, ")
+
+    with pytest.raises(
+        insights.ValidationError,
+        match="flatten_actions values must not be blank",
+    ):
+        insights._normalize_flatten_actions(coerced)
+
+
+def test_direct_action_csv_normalization_matches_transport_behavior() -> None:
+    assert insights._normalize_action_types("lead,purchase") == [
+        "lead",
+        "purchase",
+    ]
+    assert insights._normalize_flatten_actions("purchase,purchase_value") == [
+        "purchase",
+        "purchase_value",
+    ]
+
+    with pytest.raises(
+        insights.ValidationError,
+        match="action_types values must not be blank",
+    ):
+        insights._normalize_action_types("lead,")
+    with pytest.raises(
+        insights.ValidationError,
+        match="flatten_actions values must not be blank",
+    ):
+        insights._normalize_flatten_actions(" ")
+
+
+def test_get_entity_insights_normalizes_and_deduplicates_action_types(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            action_types=[" Purchase ", "purchase"],
+        )
+    )
+
+    assert result["summary"]["action_filter"]["requested"] == ["purchase"]
 
 
 def test_get_entity_insights_flattens_requested_action_columns(monkeypatch) -> None:
@@ -1203,6 +1283,35 @@ def test_normalize_rows_preserves_full_raw_action_shape_when_requested() -> None
     assert row["action_values_map"]["purchase"] == 250.0
     assert row["purchase"] == 2.0
     assert row["purchase_value"] == 250.0
+
+
+def test_flatten_actions_are_independent_of_raw_action_filter() -> None:
+    rows = insights._normalize_rows(
+        {
+            "data": [
+                {
+                    "spend": "100",
+                    "actions": [
+                        {"action_type": "lead", "value": "3"},
+                        {"action_type": "purchase", "value": "2"},
+                    ],
+                    "action_values": [
+                        {"action_type": "purchase", "value": "250"}
+                    ],
+                }
+            ]
+        },
+        action_types=["lead"],
+        include_raw_actions=True,
+        flatten_actions=["purchase", "purchase_value"],
+    )
+
+    row = rows[0]
+    assert row["purchase"] == 2.0
+    assert row["purchase_value"] == 250.0
+    assert row["actions"] == [{"action_type": "lead", "value": "3"}]
+    assert row["action_values"] == []
+    assert row["metrics"]["conversions"] == 3.0
 
 
 def test_create_async_insights_report_adds_only_requested_action_dependencies(monkeypatch) -> None:
