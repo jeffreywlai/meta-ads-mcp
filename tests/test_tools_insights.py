@@ -54,6 +54,52 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+def test_get_entity_insights_can_include_instagram_profile_follows(
+    monkeypatch,
+) -> None:
+    class InstagramFollowClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert fields[-1] == "instagram_profile_follow"
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["instagram_profile_follow"] = "7"
+            return payload
+
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: InstagramFollowClient())
+
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            include_instagram_profile_follow=True,
+        )
+    )
+
+    assert result["items"][0]["instagram_profile_follow"] == 7
+
+
+def test_instagram_profile_follow_option_requires_v26_before_client_creation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    monkeypatch.setattr(
+        insights,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+
+    with pytest.raises(insights.ValidationError, match="META_API_VERSION=v26.0"):
+        asyncio.run(
+            insights.get_entity_insights(
+                level="account",
+                object_id="act_123",
+                include_instagram_profile_follow=True,
+            )
+        )
+
+
 def test_get_entity_insights_rejects_removed_v26_metric_before_api(
     monkeypatch,
 ) -> None:

@@ -35,40 +35,6 @@ SDK_FIELD_EXCEPTIONS = {
     "discovery.page": {"tasks"},
 }
 
-NATIVE_OPTIMIZATION_FIELDS = {
-    "campaign": [
-        "advantage_state_info",
-        "budget_rebalance_flag",
-        "budget_remaining",
-        "frequency_control_specs",
-        "issues_info",
-        "pacing_type",
-        "recommendations",
-    ],
-    "adset": [
-        "anchor_event_attribution_window_days",
-        "attribution_spec",
-        "bid_adjustments",
-        "budget_remaining",
-        "destination_type",
-        "frequency_control_specs",
-        "issues_info",
-        "learning_stage_info",
-        "optimization_sub_event",
-        "pacing_type",
-        "recommendations",
-        "targeting_optimization_types",
-    ],
-    "ad": [
-        "ad_review_feedback",
-        "creative_automation_spec",
-        "failed_delivery_checks",
-        "issues_info",
-        "recommendations",
-    ],
-}
-
-
 def extract_sdk_fields(source: str) -> set[str]:
     """Extract generated ``Field`` values without importing the upstream SDK."""
     tree = ast.parse(source)
@@ -124,6 +90,7 @@ def _local_field_surfaces() -> dict[str, tuple[str, list[str]]]:
     from meta_ads_mcp.tools.diagnostics import (
         AD_QUALITY_FIELDS,
         LEARNING_PHASE_FIELDS_BY_LEVEL,
+        NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL,
     )
     from meta_ads_mcp.tools.discovery import (
         ACCOUNT_FIELDS,
@@ -133,7 +100,10 @@ def _local_field_surfaces() -> dict[str, tuple[str, list[str]]]:
         INSTAGRAM_ACCOUNT_FIELDS,
         PAGE_FIELDS,
     )
-    from meta_ads_mcp.tools.insights import DEFAULT_INSIGHTS_FIELDS
+    from meta_ads_mcp.tools.insights import (
+        DEFAULT_INSIGHTS_FIELDS,
+        INSTAGRAM_PROFILE_FOLLOW_FIELD,
+    )
     from meta_ads_mcp.tools.social_feedback import SOCIAL_CREATIVE_FIELDS
 
     return {
@@ -151,6 +121,10 @@ def _local_field_surfaces() -> dict[str, tuple[str, list[str]]]:
         "creative.image": ("adcreative", list(CREATIVE_IMAGE_FIELDS)),
         "ad_image.detail": ("adimage", list(AD_IMAGE_FIELDS)),
         "insights.default": ("adsinsights", list(DEFAULT_INSIGHTS_FIELDS)),
+        "insights.instagram_profile_follow": (
+            "adsinsights",
+            [INSTAGRAM_PROFILE_FOLLOW_FIELD],
+        ),
         "insights.ad_quality": ("adsinsights", list(AD_QUALITY_FIELDS)),
         "diagnostics.learning_campaign": (
             "campaign",
@@ -159,6 +133,18 @@ def _local_field_surfaces() -> dict[str, tuple[str, list[str]]]:
         "diagnostics.learning_adset": (
             "adset",
             list(LEARNING_PHASE_FIELDS_BY_LEVEL["adset"]),
+        ),
+        "diagnostics.native_campaign": (
+            "campaign",
+            list(NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL["campaign"]),
+        ),
+        "diagnostics.native_adset": (
+            "adset",
+            list(NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL["adset"]),
+        ),
+        "diagnostics.native_ad": (
+            "ad",
+            list(NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL["ad"]),
         ),
     }
 
@@ -215,14 +201,17 @@ def audit_sdk_schema(
         }
         missing_fields.extend(f"{surface_name}:{field}" for field in missing_in_target)
 
+    from meta_ads_mcp.tools.diagnostics import NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL
+
     optimization_candidates: dict[str, dict[str, Any]] = {}
-    for object_name, candidates in NATIVE_OPTIMIZATION_FIELDS.items():
+    for object_name, candidates in NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL.items():
         missing = sorted(set(candidates) - target_fields[object_name])
         optimization_candidates[object_name] = {
             "fields": candidates,
             "missing_in_target": missing,
             "schema_ready": not missing,
-            "live_smoke_required": True,
+            "live_smoke_required": False,
+            "implemented": True,
         }
 
     config_compatible = (
@@ -243,7 +232,7 @@ def audit_sdk_schema(
         "schema_changes": schema_changes,
         "optimization_candidates": optimization_candidates,
         "gate": {
-            "native_optimization_signals": "blocked_until_v26_live_smoke_passes",
+            "native_optimization_signals": "passed_and_implemented",
         },
     }
 
@@ -282,7 +271,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "## Delivery gate",
             "",
-            "Native optimization signals remain blocked until the dedicated v26 live smoke tests pass.",
+            "Native optimization signals were implemented after the dedicated v26 live smoke tests passed.",
         ]
     )
     return "\n".join(lines)

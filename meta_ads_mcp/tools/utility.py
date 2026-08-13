@@ -55,6 +55,7 @@ TOOL_GROUPS = {
     "optimization": [
         "get_account_optimization_snapshot",
         "get_campaign_optimization_snapshot",
+        "get_native_optimization_signals",
         "get_account_health_snapshot",
         "detect_auction_overlap",
         "get_ad_feedback_signals",
@@ -230,6 +231,7 @@ INTENT_GUIDE = {
             "get_campaign_optimization_snapshot",
             "get_account_health_snapshot",
             "detect_auction_overlap",
+            "get_native_optimization_signals",
             "get_recommendations",
             "get_budget_pacing_report",
             "get_creative_fatigue_report",
@@ -244,6 +246,7 @@ INTENT_GUIDE = {
         ],
         "notes": [
             "Call get_recommendations once for a broad Meta-native opportunity scan.",
+            "Use get_native_optimization_signals for v26 campaign, ad-set, or ad delivery and issue diagnostics.",
             "Use typed opportunity tools only when the user asks for one category specifically.",
         ],
     },

@@ -9,7 +9,8 @@ from datetime import date
 from io import StringIO
 from typing import Any, Literal
 
-from meta_ads_mcp.api_compat import validate_insights_fields
+from meta_ads_mcp.api_compat import is_api_version_at_least, validate_insights_fields
+from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import (
     compare_metric_sets,
@@ -92,6 +93,7 @@ DEFAULT_COMPARE_METRICS = [
 LOWER_IS_BETTER_METRICS = {"cpc", "cpm", "cpa", "cpp", "cost_per_result", "spend"}
 DEFAULT_EXPORT_LIMIT = 100
 DEFAULT_INLINE_EXPORT_ROWS = 100
+INSTAGRAM_PROFILE_FOLLOW_FIELD = "instagram_profile_follow"
 
 META_DATE_PRESETS = {
     "data_maximum",
@@ -325,6 +327,7 @@ def _insights_fields(
     *,
     action_types: list[str] | None = None,
     flatten_actions: list[str] | None = None,
+    include_instagram_profile_follow: bool = False,
 ) -> list[str]:
     """Return requested fields with action-filter dependencies when needed."""
     requested = list(normalize_field_list(fields) or DEFAULT_INSIGHTS_FIELDS)
@@ -334,6 +337,14 @@ def _insights_fields(
     ):
         if field not in requested:
             requested.append(field)
+    if include_instagram_profile_follow:
+        if not is_api_version_at_least((26, 0)):
+            raise ValidationError(
+                "include_instagram_profile_follow requires META_API_VERSION=v26.0 "
+                f"or newer; the configured version is {get_settings().api_version!r}."
+            )
+        if INSTAGRAM_PROFILE_FOLLOW_FIELD not in requested:
+            requested.append(INSTAGRAM_PROFILE_FOLLOW_FIELD)
     validate_insights_fields(requested)
     return requested
 
@@ -754,6 +765,7 @@ async def get_entity_insights(
     time_increment: int | str | None = None,
     use_unified_attribution_setting: bool = True,
     action_attribution_windows: StringList | None = None,
+    include_instagram_profile_follow: bool = False,
     limit: int = 100,
     after: str | None = None,
 ) -> dict[str, Any]:
@@ -765,6 +777,7 @@ async def get_entity_insights(
         fields,
         action_types=action_types,
         flatten_actions=flatten_actions,
+        include_instagram_profile_follow=include_instagram_profile_follow,
     )
     params = _insights_params(
         level=level,

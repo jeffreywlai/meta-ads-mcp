@@ -6,6 +6,8 @@ import asyncio
 from datetime import date, timedelta
 from typing import Any
 
+from meta_ads_mcp.api_compat import is_api_version_at_least
+from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import (
     annotate_share_metrics,
@@ -19,6 +21,7 @@ from meta_ads_mcp.diagnostics import (
 )
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.money import from_minor_units, resolve_account_currency
 from meta_ads_mcp.normalize import blank_to_none, to_float
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
@@ -59,6 +62,39 @@ LEARNING_PHASE_FIELDS_BY_LEVEL = {
         "start_time",
         "end_time",
         "targeting",
+    ],
+}
+
+NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL = {
+    "campaign": [
+        "advantage_state_info",
+        "budget_rebalance_flag",
+        "budget_remaining",
+        "frequency_control_specs",
+        "issues_info",
+        "pacing_type",
+        "recommendations",
+    ],
+    "adset": [
+        "anchor_event_attribution_window_days",
+        "attribution_spec",
+        "bid_adjustments",
+        "budget_remaining",
+        "destination_type",
+        "frequency_control_specs",
+        "issues_info",
+        "learning_stage_info",
+        "optimization_sub_event",
+        "pacing_type",
+        "recommendations",
+        "targeting_optimization_types",
+    ],
+    "ad": [
+        "ad_review_feedback",
+        "creative_automation_spec",
+        "failed_delivery_checks",
+        "issues_info",
+        "recommendations",
     ],
 }
 
@@ -169,6 +205,86 @@ def _snapshot_analysis(
         evidence=summary_metric_evidence(metrics),
         suggestions=_snapshot_suggestions(findings),
         extra=extra,
+    )
+
+
+def _validate_native_optimization_scope(level: str, object_id: str) -> tuple[str, str]:
+    """Validate the v26-only native optimization scope before client creation."""
+    normalized_level = level.strip().lower() if isinstance(level, str) else ""
+    normalized_object_id = blank_to_none(object_id)
+    if normalized_level not in NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL:
+        raise ValidationError(
+            "level must be campaign, adset, or ad for native optimization signals."
+        )
+    if normalized_object_id is None:
+        raise ValidationError("object_id is required for native optimization signals.")
+    if not is_api_version_at_least((26, 0)):
+        raise ValidationError(
+            "Native optimization signals require META_API_VERSION=v26.0 or newer; "
+            f"the configured version is {get_settings().api_version!r}."
+        )
+    return normalized_level, normalized_object_id
+
+
+async def _native_optimization_payload(level: str, object_id: str) -> dict[str, Any]:
+    """Fetch and normalize one entity's Meta-native optimization fields."""
+    requested_signals = list(NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL[level])
+    client = get_graph_api_client()
+    payload = await client.get_object(
+        object_id,
+        fields=["id", "account_id", *requested_signals],
+    )
+    signals = {
+        field: payload[field]
+        for field in requested_signals
+        if field in payload
+    }
+    currency: str | None = None
+    if "budget_remaining" in signals and payload.get("account_id"):
+        account_id = normalize_account_id(str(payload["account_id"]))
+        currency = await resolve_account_currency(client, account_id)
+        signals["budget_remaining"] = from_minor_units(
+            signals["budget_remaining"],
+            currency,
+            field_name="budget_remaining",
+        )
+    available_signals = list(signals)
+    missing_signals = [
+        field for field in requested_signals
+        if field not in signals
+    ]
+    return {
+        "scope": {
+            "level": level,
+            "object_id": str(payload.get("id") or object_id),
+        },
+        "signals": signals,
+        "requested_signals": requested_signals,
+        "available_signals": available_signals,
+        "missing_signals": missing_signals,
+        "summary": {
+            "requested": len(requested_signals),
+            "returned": len(available_signals),
+            "missing": len(missing_signals),
+            "currency": currency,
+            "api_version": get_settings().api_version,
+        },
+    }
+
+
+@mcp_server.tool(tags={"read-only"})
+async def get_native_optimization_signals(
+    level: str,
+    object_id: str,
+) -> dict[str, Any]:
+    """Read v26-native campaign, ad-set, or ad delivery, learning, issue, automation, and recommendation signals."""
+    normalized_level, normalized_object_id = _validate_native_optimization_scope(
+        level,
+        object_id,
+    )
+    return await _native_optimization_payload(
+        normalized_level,
+        normalized_object_id,
     )
 
 
@@ -638,10 +754,11 @@ async def get_campaign_optimization_snapshot(
     until: str | None = None,
     top_n_adsets: int = 5,
     top_n_ads: int = 5,
+    include_native_signals: bool = False,
 ) -> dict[str, Any]:
     """Use this for a campaign health or optimization snapshot that ranks the most important ad sets and ads."""
     window = _window_kwargs(date_preset=date_preset, since=since, until=until)
-    campaign_scope, adsets, ads = await asyncio.gather(
+    reads = [
         get_entity_insights(
             level="campaign",
             object_id=campaign_id,
@@ -649,18 +766,30 @@ async def get_campaign_optimization_snapshot(
         ),
         _child_insights(campaign_id, level="adset", **window),
         _child_insights(campaign_id, level="ad", **window),
-    )
+    ]
+    if include_native_signals:
+        level, object_id = _validate_native_optimization_scope(
+            "campaign",
+            campaign_id,
+        )
+        reads.append(_native_optimization_payload(level, object_id))
+    results = await asyncio.gather(*reads)
+    campaign_scope, adsets, ads = results[:3]
+    native_signals = results[3] if include_native_signals else None
     adsets = annotate_share_metrics(adsets)
     ads = annotate_share_metrics(ads)
+    extra = {
+        "top_adsets_by_spend": rank_rows(adsets, "spend")[:top_n_adsets],
+        "top_ads_by_spend": rank_rows(ads, "spend")[:top_n_ads],
+        "top_ads_by_roas": rank_rows(ads, "roas")[:top_n_ads],
+    }
+    if native_signals is not None:
+        extra["native_optimization_signals"] = native_signals
     return _snapshot_analysis(
         scope={"level": "campaign", "object_id": campaign_id},
         metrics=campaign_scope["summary"]["metrics"],
         child_rows=adsets,
-        extra={
-            "top_adsets_by_spend": rank_rows(adsets, "spend")[:top_n_adsets],
-            "top_ads_by_spend": rank_rows(ads, "spend")[:top_n_ads],
-            "top_ads_by_roas": rank_rows(ads, "roas")[:top_n_ads],
-        },
+        extra=extra,
     )
 
 

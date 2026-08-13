@@ -330,6 +330,7 @@ class UniversalFakeClient:
             "objective": "OUTCOME_SALES",
             "daily_budget": "5000",
             "lifetime_budget": "25000",
+            "budget_remaining": "12500",
             "bid_amount": "1250",
             "optimization_goal": "OFFSITE_CONVERSIONS",
             "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
@@ -755,6 +756,9 @@ def test_every_fields_parameter_accepts_csv_strings(
 @pytest.mark.parametrize("tool_name", sorted(REGISTERED_TOOLS))
 def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) -> None:
     """Every registered tool should be directly callable with Claude-friendly args."""
+    if tool_name == "get_native_optimization_signals":
+        monkeypatch.setenv("META_API_VERSION", "v26.0")
+        reload_settings()
     _patch_clients(monkeypatch)
     fn = REGISTERED_TOOLS[tool_name]
     result = asyncio.run(fn(**_tool_kwargs(tool_name, fn)))
