@@ -48,10 +48,10 @@ def _assert_process_boots(proc: subprocess.Popen[str]) -> None:
 def _terminate(proc: subprocess.Popen[str]) -> None:
     proc.terminate()
     try:
-        proc.wait(timeout=2)
+        proc.communicate(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=2)
+        proc.communicate(timeout=2)
 
 
 def test_stdio_server_boots_with_real_runtime() -> None:

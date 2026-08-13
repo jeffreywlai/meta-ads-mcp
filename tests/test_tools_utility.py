@@ -50,7 +50,7 @@ def test_get_capabilities_returns_compact_summary_by_default() -> None:
     assert result["recommended_start"]["if_you_need_the_entire_manifest"] == "get_capabilities(include_full_manifest=true)"
     assert any("Ads Library API access" in note for note in result["notes"])
     assert "meta://docs/tool-routing" in result["resources"]
-    assert result["server"]["fastmcp_version_target"] == "3.4.5"
+    assert result["server"]["fastmcp_version_target"] == "3.4.7"
     assert result["server"]["tool_search_enabled"] is True
     assert result["server"]["dynamic_search_tools"] == ["search_tools", "call_tool"]
 

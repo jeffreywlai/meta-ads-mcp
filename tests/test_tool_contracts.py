@@ -33,7 +33,7 @@ from meta_ads_mcp.tools import (
 
 
 def _registered_tools() -> dict[str, Any]:
-    """Read registered tools across FastMCP 2-style and 3.1-style registries."""
+    """Read registered tools across legacy and FastMCP 3-style registries."""
     legacy = getattr(mcp_server, "_tools", None)
     if isinstance(legacy, dict) and legacy:
         return dict(sorted(legacy.items()))
