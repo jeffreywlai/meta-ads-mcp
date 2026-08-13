@@ -87,7 +87,7 @@ INSTAGRAM_ACCOUNT_FIELDS = [
     "id",
     "name",
     "username",
-    "profile_pic",
+    "profile_picture_url",
     "ig_id",
 ]
 
@@ -372,7 +372,7 @@ async def get_ad(ad_id: str, include_creative_summary: bool = False) -> dict[str
         fields.remove("creative")
         fields.append(
             "creative{id,name,title,body,object_story_id,effective_object_story_id,"
-            "effective_instagram_media_id,effective_instagram_story_id,object_story_spec}"
+            "effective_instagram_media_id,object_story_spec}"
         )
     ad = await client.get_object(ad_id, fields=fields)
     item = (await _hydrate_and_normalize_monetary_fields(client, [ad]))[0]
@@ -427,7 +427,11 @@ async def list_instagram_accounts(
         account_id=account_id or "me",
         limit=limit,
         after=after,
-        fields=["id", "name", "instagram_business_account"],
+        fields=[
+            "id",
+            "name",
+            "instagram_business_account{id,ig_id,username,name,profile_picture_url}",
+        ],
     )
     items: list[dict[str, Any]] = []
     for page in pages["items"]:
@@ -441,7 +445,10 @@ async def list_instagram_accounts(
                 "ig_id": instagram_account.get("ig_id") or instagram_id,
                 "username": instagram_account.get("username"),
                 "name": instagram_account.get("name") or page.get("name"),
-                "profile_pic": instagram_account.get("profile_pic"),
+                "profile_picture_url": (
+                    instagram_account.get("profile_picture_url")
+                    or instagram_account.get("profile_pic")
+                ),
                 "page_id": page.get("id"),
                 "page_name": page.get("name"),
             }

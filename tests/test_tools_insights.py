@@ -11,6 +11,7 @@ import pydantic_core
 import pytest
 from pydantic import TypeAdapter
 
+from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import (
     MAX_TOOL_RESPONSE_BYTES,
     RESPONSE_LIMIT_HINT,
@@ -51,6 +52,27 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
     assert result["summary"]["metrics"]["spend"] == 100.0
     assert result["items"][0]["metrics"]["roas"] == 2.5
+
+
+def test_get_entity_insights_rejects_removed_v26_metric_before_api(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(
+        insights,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+
+    with pytest.raises(insights.ValidationError, match="marketing_messages_website_purchase"):
+        asyncio.run(
+            insights.get_entity_insights(
+                level="account",
+                object_id="act_123",
+                fields=["spend", "marketing_messages_website_purchase"],
+            )
+        )
 
 
 def test_get_entity_insights_normalizes_numeric_account_ids(monkeypatch) -> None:
@@ -1093,6 +1115,27 @@ def test_create_async_insights_report_returns_poll_hint(monkeypatch) -> None:
     ]
     assert result["field_preset"] == "lean"
     assert "get_async_insights_report" in result["poll_hint"]
+
+
+def test_create_async_insights_report_rejects_removed_v26_metric_before_api(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(
+        insights,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+
+    with pytest.raises(insights.ValidationError, match="marketing_messages_website_purchase_values"):
+        asyncio.run(
+            insights.create_async_insights_report(
+                level="campaign",
+                object_id="cmp_1",
+                fields=["marketing_messages_website_purchase_values"],
+            )
+        )
 
 
 def test_create_async_insights_report_supports_explicit_full_default(monkeypatch) -> None:

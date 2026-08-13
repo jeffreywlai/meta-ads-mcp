@@ -16,7 +16,6 @@ SOCIAL_CREATIVE_FIELDS = [
     "object_story_id",
     "effective_object_story_id",
     "effective_instagram_media_id",
-    "effective_instagram_story_id",
     "instagram_permalink_url",
     "object_story_spec",
 ]

@@ -117,6 +117,137 @@ def _extract_image_hash(upload_result: dict[str, Any]) -> str | None:
     return None
 
 
+@pytest.mark.v26_live
+def test_live_v26_core_read_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gate v26 adoption on the default account, campaign, ad-set, and ad reads."""
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+    client = get_graph_api_client()
+
+    account = _run(client.get_object(normalize_account_id(account_id), fields=discovery.ACCOUNT_FIELDS))
+    assert account["id"] == normalize_account_id(account_id)
+
+    pages = _run(discovery.get_account_pages(account_id=account_id, limit=1))
+    assert pages["summary"]["count"] >= 0
+
+    campaigns_page = _run(discovery.list_campaigns(account_id=account_id, limit=1))
+    assert campaigns_page["summary"]["count"] >= 0
+    if not campaigns_page["items"]:
+        pytest.skip("The v26 live account has no campaign for entity contract probes.")
+
+    campaign_id = str(campaigns_page["items"][0]["id"])
+    campaign = _run(client.get_object(campaign_id, fields=discovery.CAMPAIGN_FIELDS))
+    assert campaign["id"] == campaign_id
+
+    adsets_page = _run(discovery.list_adsets(campaign_id=campaign_id, limit=1))
+    assert adsets_page["summary"]["count"] >= 0
+    if adsets_page["items"]:
+        adset_id = str(adsets_page["items"][0]["id"])
+        adset = _run(client.get_object(adset_id, fields=discovery.ADSET_FIELDS))
+        assert adset["id"] == adset_id
+
+    ads_page = _run(discovery.list_ads(campaign_id=campaign_id, limit=1))
+    assert ads_page["summary"]["count"] >= 0
+    if ads_page["items"]:
+        ad_id = str(ads_page["items"][0]["id"])
+        ad = _run(client.get_object(ad_id, fields=discovery.AD_FIELDS))
+        assert ad["id"] == ad_id
+
+
+@pytest.mark.v26_live
+def test_live_v26_insights_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gate v26 adoption on the default synchronous insights projection."""
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+
+    result = _run(
+        insights.get_entity_insights(
+            level="account",
+            object_id=account_id,
+            date_preset="last_7d",
+        )
+    )
+
+    assert result["summary"]["count"] >= 0
+    assert "metrics" in result["summary"]
+
+
+@pytest.mark.v26_live
+def test_live_v26_native_optimization_field_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove native optimization fields before exposing them in default tools."""
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+    client = get_graph_api_client()
+
+    campaigns_page = _run(discovery.list_campaigns(account_id=account_id, limit=1))
+    if not campaigns_page["items"]:
+        pytest.skip("The v26 live account has no campaign for optimization probes.")
+    campaign_id = str(campaigns_page["items"][0]["id"])
+    campaign = _run(
+        client.get_object(
+            campaign_id,
+            fields=[
+                "advantage_state_info",
+                "budget_rebalance_flag",
+                "budget_remaining",
+                "frequency_control_specs",
+                "issues_info",
+                "pacing_type",
+                "recommendations",
+            ],
+        )
+    )
+    assert campaign.get("id") in {None, campaign_id}
+
+    adsets_page = _run(discovery.list_adsets(campaign_id=campaign_id, limit=1))
+    if not adsets_page["items"]:
+        pytest.skip("The v26 live campaign has no ad set for optimization probes.")
+    adset_id = str(adsets_page["items"][0]["id"])
+    adset = _run(
+        client.get_object(
+            adset_id,
+            fields=[
+                "anchor_event_attribution_window_days",
+                "attribution_spec",
+                "bid_adjustments",
+                "budget_remaining",
+                "destination_type",
+                "frequency_control_specs",
+                "issues_info",
+                "learning_stage_info",
+                "optimization_sub_event",
+                "pacing_type",
+                "recommendations",
+                "targeting_optimization_types",
+            ],
+        )
+    )
+    assert adset.get("id") in {None, adset_id}
+
+    ads_page = _run(discovery.list_ads(campaign_id=campaign_id, limit=1))
+    if not ads_page["items"]:
+        pytest.skip("The v26 live campaign has no ad for optimization probes.")
+    ad_id = str(ads_page["items"][0]["id"])
+    ad = _run(
+        client.get_object(
+            ad_id,
+            fields=[
+                "ad_review_feedback",
+                "creative_automation_spec",
+                "failed_delivery_checks",
+                "issues_info",
+                "recommendations",
+            ],
+        )
+    )
+    assert ad.get("id") in {None, ad_id}
+
+
 def test_live_read_only_account_with_no_spend_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
     account_id = _env("META_LIVE_NO_SPEND_ACCOUNT_ID")

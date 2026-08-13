@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from meta_ads_mcp.api_compat import validate_targeting_placements
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
@@ -228,6 +229,7 @@ async def create_ad_set(
             validate_positive_amount(value, field_name=field_name)
     if bid_constraints and not bid_strategy:
         raise ValidationError("bid_strategy is required when bid_constraints is provided.")
+    validate_targeting_placements(targeting)
     payload: dict[str, Any] = {
         "campaign_id": campaign_id,
         "name": name,

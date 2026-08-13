@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.tools import campaigns
 
 
@@ -183,6 +184,31 @@ def test_create_ad_set_rejects_both_budgets(monkeypatch) -> None:
                 targeting={"geo_locations": {"countries": ["US"]}},
                 daily_budget=10.0,
                 lifetime_budget=20.0,
+            )
+        )
+
+
+def test_create_ad_set_rejects_removed_v26_placement_before_api(monkeypatch) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(
+        campaigns,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+
+    with pytest.raises(campaigns.ValidationError, match="instagram_positions=explore"):
+        asyncio.run(
+            campaigns.create_ad_set(
+                account_id="123",
+                campaign_id="cmp_123",
+                name="Removed placement",
+                billing_event="IMPRESSIONS",
+                optimization_goal="OFFSITE_CONVERSIONS",
+                targeting={
+                    "geo_locations": {"countries": ["US"]},
+                    "instagram_positions": ["explore"],
+                },
             )
         )
 

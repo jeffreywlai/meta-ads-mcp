@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.tools import targeting
 
 
@@ -25,6 +26,15 @@ class FakeTargetingClient:
                 }
             ]
         }
+
+    async def estimate_audience_size(
+        self,
+        account_id: str,
+        *,
+        targeting_spec,
+        optimization_goal=None,
+    ):
+        return {"data": [{"estimate_mau": 12000}]}
 
     async def search_targeting_categories(
         self,
@@ -51,6 +61,29 @@ def test_get_interest_suggestions_returns_collection(monkeypatch) -> None:
     result = asyncio.run(targeting.get_interest_suggestions(interest_list=["running"]))
     assert result["summary"]["count"] == 1
     assert result["items"][0]["id"] == "int_suggested"
+
+
+def test_estimate_audience_size_rejects_silently_removed_v26_placement(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(
+        targeting,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+
+    with pytest.raises(targeting.ValidationError, match="messenger_positions=story"):
+        asyncio.run(
+            targeting.estimate_audience_size(
+                account_id="123",
+                targeting_spec={
+                    "geo_locations": {"countries": ["US"]},
+                    "messenger_positions": ["story"],
+                },
+            )
+        )
 
 
 def test_validate_interests_supports_interest_ids(monkeypatch) -> None:
