@@ -10,13 +10,13 @@ It is an optimization-first tool: it should prioritize API calls and derived
 analysis that help an LLM understand what is happening in an ad account,
 diagnose performance problems, and recommend changes with evidence.
 
-As of March 7, 2026, the implementation baseline is:
+As of August 12, 2026, the implementation baseline is:
 
 - Meta Marketing API `v25.0`
-- FastMCP latest stable `3.1.0`
+- FastMCP latest stable `3.4.5`
 - Python `3.12+`
 
-FastMCP `3.1.0` is the stable target and should be used with tool-search
+FastMCP `3.4.5` is the stable target and should be used with tool-search
 transforms enabled to reduce upfront tool-context usage in compatible clients.
 
 ## Product Goals
@@ -105,7 +105,7 @@ and covered by catalog-wide contract tests rather than repeated inside tools.
 ## Technical Baseline
 
 - Runtime: Python `3.12+`
-- Framework: FastMCP stable `3.1.0` at project start
+- Framework: FastMCP stable `3.4.5`
 - Protocol: MCP over `stdio` first, HTTP second
 - Upstream API: Meta Marketing API `v25.0`
 - HTTP client: `httpx.AsyncClient`
@@ -1539,7 +1539,7 @@ Suggested console script:
 These assumptions should be re-verified immediately before implementation:
 
 - Meta Marketing API target version is `v25.0`
-- FastMCP latest stable is `3.1.0` as of March 9, 2026
+- FastMCP latest stable is `3.4.5` as of August 12, 2026
 
 ## Source Notes
 
