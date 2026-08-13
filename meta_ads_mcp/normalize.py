@@ -72,6 +72,10 @@ def normalize_insights_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized["cpc"] = to_float(row.get("cpc"))
     normalized["cpm"] = to_float(row.get("cpm"))
     normalized["frequency"] = to_float(row.get("frequency"))
+    if "instagram_profile_follow" in row:
+        normalized["instagram_profile_follow"] = to_int(
+            row.get("instagram_profile_follow")
+        )
     normalized["actions_map"] = action_list_to_map(row.get("actions"))
     normalized["action_values_map"] = action_list_to_map(row.get("action_values"))
     normalized["results"] = first_present(

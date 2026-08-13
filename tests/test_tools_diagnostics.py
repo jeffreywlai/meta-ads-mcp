@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 
+from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.tools import diagnostics
 
 
@@ -105,6 +106,131 @@ def test_campaign_snapshot_includes_top_adsets_and_ads(monkeypatch) -> None:
     assert result["top_ads_by_roas"][0]["ad_id"] == "ad2"
     assert result["evidence"]
     assert "spend_share" in result["top_adsets_by_spend"][0]["metrics"]
+
+
+def test_native_optimization_signals_require_v26_before_client_creation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    monkeypatch.setattr(
+        diagnostics,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+
+    with pytest.raises(diagnostics.ValidationError, match="META_API_VERSION=v26.0"):
+        asyncio.run(
+            diagnostics.get_native_optimization_signals(
+                level="campaign",
+                object_id="cmp_123",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("level", "object_id"),
+    [("campaign", "cmp_123"), ("adset", "adset_123"), ("ad", "ad_123")],
+)
+def test_native_optimization_signals_request_exact_level_fields(
+    monkeypatch,
+    level: str,
+    object_id: str,
+) -> None:
+    calls: list[tuple[str, list[str]]] = []
+
+    class NativeSignalClient:
+        async def get_object(self, requested_id: str, *, fields=None, params=None):
+            calls.append((requested_id, fields))
+            return {
+                "id": requested_id,
+                "account_id": "123",
+                fields[2]: {"status": "available"},
+            }
+
+    async def fake_currency(_client, account_id: str) -> str:
+        assert account_id == "act_123"
+        return "USD"
+
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: NativeSignalClient())
+    monkeypatch.setattr(diagnostics, "resolve_account_currency", fake_currency)
+
+    result = asyncio.run(
+        diagnostics.get_native_optimization_signals(
+            level=level,
+            object_id=object_id,
+        )
+    )
+
+    expected = diagnostics.NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL[level]
+    assert calls == [(object_id, ["id", "account_id", *expected])]
+    assert result["scope"] == {"level": level, "object_id": object_id}
+    assert result["available_signals"] == [expected[0]]
+    assert result["summary"]["api_version"] == "v26.0"
+    assert result["summary"]["returned"] == 1
+
+
+def test_native_optimization_signals_normalize_budget_remaining(
+    monkeypatch,
+) -> None:
+    class BudgetSignalClient:
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            return {
+                "id": object_id,
+                "account_id": "123",
+                "budget_remaining": "1250",
+            }
+
+    async def fake_currency(_client, _account_id: str) -> str:
+        return "USD"
+
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: BudgetSignalClient())
+    monkeypatch.setattr(diagnostics, "resolve_account_currency", fake_currency)
+
+    result = asyncio.run(
+        diagnostics.get_native_optimization_signals(
+            level="campaign",
+            object_id="cmp_123",
+        )
+    )
+
+    assert result["signals"]["budget_remaining"] == 12.5
+    assert result["summary"]["currency"] == "USD"
+
+
+def test_campaign_snapshot_can_include_native_signals(monkeypatch) -> None:
+    async def fake_get_entity_insights(**kwargs):
+        return {"summary": {"metrics": {"spend": 100.0, "roas": 1.5}}}
+
+    async def fake_child_insights(*args, **kwargs):
+        return []
+
+    async def fake_native_payload(level: str, object_id: str):
+        return {
+            "scope": {"level": level, "object_id": object_id},
+            "signals": {"pacing_type": ["standard"]},
+        }
+
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    monkeypatch.setattr(diagnostics, "_native_optimization_payload", fake_native_payload)
+
+    result = asyncio.run(
+        diagnostics.get_campaign_optimization_snapshot(
+            campaign_id="cmp_123",
+            include_native_signals=True,
+        )
+    )
+
+    assert result["native_optimization_signals"]["signals"] == {
+        "pacing_type": ["standard"]
+    }
 
 
 def test_account_health_snapshot_compares_explicit_windows(monkeypatch) -> None:
