@@ -418,6 +418,13 @@ async def list_instagram_accounts(
             params=params,
         )
         normalized = normalize_collection(payload)
+        for item in normalized["items"]:
+            if "profile_picture_url" in item or "profile_pic" in item:
+                profile_picture_url = (
+                    item.get("profile_picture_url") or item.get("profile_pic")
+                )
+                item["profile_picture_url"] = profile_picture_url
+                item["profile_pic"] = profile_picture_url
         normalized["summary"].update({"source": "instagram_accounts", "source_attempts": source_attempts})
         return normalized
     except UnsupportedFeatureError:
@@ -439,16 +446,18 @@ async def list_instagram_accounts(
         instagram_id = instagram_account.get("id") or instagram_account.get("ig_id")
         if not instagram_id:
             continue
+        profile_picture_url = (
+            instagram_account.get("profile_picture_url")
+            or instagram_account.get("profile_pic")
+        )
         items.append(
             {
                 "id": instagram_id,
                 "ig_id": instagram_account.get("ig_id") or instagram_id,
                 "username": instagram_account.get("username"),
                 "name": instagram_account.get("name") or page.get("name"),
-                "profile_picture_url": (
-                    instagram_account.get("profile_picture_url")
-                    or instagram_account.get("profile_pic")
-                ),
+                "profile_picture_url": profile_picture_url,
+                "profile_pic": profile_picture_url,
                 "page_id": page.get("id"),
                 "page_name": page.get("name"),
             }

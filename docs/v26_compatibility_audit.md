@@ -54,7 +54,9 @@ surfaces are:
 The audit also found and corrected two stale local defaults that predated v26:
 
 - Instagram account discovery now requests the generated IGUser field
-  `profile_picture_url`, not `profile_pic`.
+  `profile_picture_url`, not `profile_pic`. Tool responses temporarily expose
+  both names with the same value so existing `profile_pic` consumers continue
+  to work during the migration.
 - Default creative projections no longer request the non-generated
   `effective_instagram_story_id`; `effective_instagram_media_id` remains the
   supported Instagram feedback path.
