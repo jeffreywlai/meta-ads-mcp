@@ -144,8 +144,10 @@ Optional env vars:
 
 - `stdio` clients use `META_ACCESS_TOKEN` from environment.
 - HTTP clients may additionally use `Authorization: Bearer <token>`.
-- When `META_APP_SECRET` is configured, authenticated Graph API requests include
-  an HMAC-SHA256 `appsecret_proof` derived from the effective access token.
+- When `META_APP_SECRET` is configured, authenticated Graph API requests using
+  the configured `META_ACCESS_TOKEN` include an HMAC-SHA256 `appsecret_proof`.
+  Different per-request token overrides remain unproved because they may belong
+  to another app.
 - No browser login flow in v1.
 - No Pipeboard-specific auth.
 - No local token cache in v1.

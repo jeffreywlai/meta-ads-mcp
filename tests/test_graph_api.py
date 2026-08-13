@@ -62,8 +62,8 @@ class FakeAsyncClient:
         return None
 
     async def request(self, *args, **kwargs) -> FakeResponse:  # noqa: ANN002, ANN003
-        self.requests.append({"args": args, **kwargs})
-        return self.responses.popleft()
+        FakeAsyncClient.requests.append({"args": args, **kwargs})
+        return FakeAsyncClient.responses.popleft()
 
     async def aclose(self) -> None:
         self.is_closed = True
@@ -133,7 +133,7 @@ def test_request_adds_appsecret_proof_without_mutating_caller_params(
     }
 
 
-def test_request_uses_override_token_for_bearer_header_and_appsecret_proof(
+def test_request_omits_appsecret_proof_for_unmatched_override_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeAsyncClient.responses = deque([FakeResponse(200, {"id": "ok"})])
@@ -148,9 +148,7 @@ def test_request_uses_override_token_for_bearer_header_and_appsecret_proof(
 
     request = FakeAsyncClient.requests[0]
     assert request["headers"]["Authorization"] == "Bearer override_token"
-    assert request["params"] == {
-        "appsecret_proof": build_appsecret_proof("override_token", "secret_456")
-    }
+    assert request["params"] is None
     assert request["data"] == {"async": "true"}
 
 
@@ -188,7 +186,7 @@ def test_unauthenticated_request_does_not_add_appsecret_proof(
     }
 
 
-def test_system_user_token_request_adds_proof_for_its_explicit_access_token(
+def test_system_user_token_request_omits_proof_for_unmatched_explicit_access_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeAsyncClient.responses = deque([FakeResponse(200, {"access_token": "generated"})])
@@ -207,7 +205,28 @@ def test_system_user_token_request_adds_proof_for_its_explicit_access_token(
     assert "Authorization" not in request["headers"]
     assert request["params"] == {
         "access_token": "admin_token",
-        "appsecret_proof": build_appsecret_proof("admin_token", "secret_456"),
+    }
+
+
+def test_system_user_token_request_adds_proof_for_configured_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"access_token": "generated"})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+
+    asyncio.run(
+        _client(app_secret="secret_456").generate_system_user_token(
+            "sys_123",
+            business_app="app_123",
+            scope=["ads_management"],
+            access_token="token_123",
+        )
+    )
+
+    request = FakeAsyncClient.requests[0]
+    assert request["params"] == {
+        "access_token": "token_123",
+        "appsecret_proof": build_appsecret_proof("token_123", "secret_456"),
     }
 
 

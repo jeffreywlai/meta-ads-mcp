@@ -41,6 +41,16 @@ def normalize_account_id(account_id: str) -> str:
     return account_id if account_id.startswith("act_") else f"act_{account_id}"
 
 
+def _build_configured_appsecret_proof(
+    access_token: str,
+    settings: Settings,
+) -> str | None:
+    """Build a proof only when the configured secret is known to match the token."""
+    if not settings.app_secret or access_token != settings.access_token:
+        return None
+    return build_appsecret_proof(access_token, settings.app_secret)
+
+
 def _serialize_fields(fields: FieldList | None) -> str | None:
     """Serialize either validated field arrays or direct CSV client input."""
     normalized_fields = coerce_csv_string_list(fields)
@@ -226,12 +236,14 @@ class GraphAPIClient:
         url = f"{(base_url or self.base_url).rstrip('/')}/{endpoint.lstrip('/')}"
         retries = self.settings.max_retries + 1
         encoded_params = self._encode_mapping(params)
-        if effective_access_token is not None and self.settings.app_secret:
+        appsecret_proof = (
+            _build_configured_appsecret_proof(effective_access_token, self.settings)
+            if effective_access_token is not None
+            else None
+        )
+        if appsecret_proof is not None:
             encoded_params = dict(encoded_params or {})
-            encoded_params["appsecret_proof"] = build_appsecret_proof(
-                effective_access_token,
-                self.settings.app_secret,
-            )
+            encoded_params["appsecret_proof"] = appsecret_proof
         encoded_data = self._encode_mapping(data)
 
         client = self._get_shared_client(base_url=base_url)
@@ -672,11 +684,12 @@ class GraphAPIClient:
             settings=self.settings,
         )
         params = {"access_token": effective_access_token}
-        if self.settings.app_secret:
-            params["appsecret_proof"] = build_appsecret_proof(
-                effective_access_token,
-                self.settings.app_secret,
-            )
+        appsecret_proof = _build_configured_appsecret_proof(
+            effective_access_token,
+            self.settings,
+        )
+        if appsecret_proof is not None:
+            params["appsecret_proof"] = appsecret_proof
         return await self.request(
             "POST",
             f"{system_user_id}/access_tokens",
