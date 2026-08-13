@@ -25,9 +25,13 @@ dev = [
 
 [project.scripts]
 run-meta-ads-mcp = "meta_ads_mcp.stdio:main"
+audit-meta-sdk-schema = "meta_ads_mcp.schema_audit:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+markers = [
+  "v26_live: read-only live contract probes required before exposing v26 optimization signals",
+]
 
 [tool.uv]
 package = true

@@ -102,6 +102,7 @@ def test_get_ad_social_context_uses_expanded_creative_without_extra_call(monkeyp
         "instagram_media_id": "ig_media_1",
         "surface": "instagram",
     }
+    assert "effective_instagram_story_id" not in result["creative"]
     assert [call[0] for call in client.get_calls] == ["ad_full"]
 
 

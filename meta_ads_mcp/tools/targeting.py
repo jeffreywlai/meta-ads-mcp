@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from meta_ads_mcp.api_compat import validate_targeting_placements
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
@@ -168,6 +169,7 @@ async def estimate_audience_size(
     optimization_goal: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants a reach-size estimate for a draft targeting spec before creating an ad set."""
+    validate_targeting_placements(targeting_spec)
     client = get_graph_api_client()
     payload = await client.estimate_audience_size(
         _resolve_account_id(account_id),

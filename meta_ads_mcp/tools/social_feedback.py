@@ -16,7 +16,6 @@ SOCIAL_CREATIVE_FIELDS = [
     "object_story_id",
     "effective_object_story_id",
     "effective_instagram_media_id",
-    "effective_instagram_story_id",
     "instagram_permalink_url",
     "object_story_spec",
 ]
@@ -121,7 +120,6 @@ def _compact_creative(creative: dict[str, Any]) -> dict[str, Any]:
         "object_story_id": creative.get("object_story_id"),
         "effective_object_story_id": creative.get("effective_object_story_id"),
         "effective_instagram_media_id": creative.get("effective_instagram_media_id"),
-        "effective_instagram_story_id": creative.get("effective_instagram_story_id"),
         "instagram_permalink_url": creative.get("instagram_permalink_url"),
         "page_id": _story_page_id(story_id, object_story_spec),
     }
@@ -141,7 +139,6 @@ async def _resolve_ad_social_context(ad_id: str, *, resolve_creative: bool = Tru
                 "object_story_id",
                 "effective_object_story_id",
                 "effective_instagram_media_id",
-                "effective_instagram_story_id",
             )
         )
         if resolve_creative and creative_id and not has_social_ids:

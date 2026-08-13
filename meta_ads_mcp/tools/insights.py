@@ -9,6 +9,7 @@ from datetime import date
 from io import StringIO
 from typing import Any, Literal
 
+from meta_ads_mcp.api_compat import validate_insights_fields
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import (
     compare_metric_sets,
@@ -333,6 +334,7 @@ def _insights_fields(
     ):
         if field not in requested:
             requested.append(field)
+    validate_insights_fields(requested)
     return requested
 
 
@@ -758,29 +760,31 @@ async def get_entity_insights(
     """Return paginated insights rows with optional flattened purchase, purchase-value, or other action columns; use summarize_actions for totals."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
-    client = get_graph_api_client()
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
+    requested_fields = _insights_fields(
+        fields,
+        action_types=action_types,
+        flatten_actions=flatten_actions,
+    )
+    params = _insights_params(
+        level=level,
+        date_preset=date_preset,
+        since=since,
+        until=until,
+        default_date_preset="last_7d",
+        breakdowns=breakdowns,
+        action_breakdowns=action_breakdowns,
+        time_increment=time_increment,
+        use_unified_attribution_setting=use_unified_attribution_setting,
+        action_attribution_windows=action_attribution_windows,
+        limit=limit,
+        after=after,
+    )
+    client = get_graph_api_client()
     payload = await client.get_insights(
         resolved_object_id,
-        fields=_insights_fields(
-            fields,
-            action_types=action_types,
-            flatten_actions=flatten_actions,
-        ),
-        params=_insights_params(
-            level=level,
-            date_preset=date_preset,
-            since=since,
-            until=until,
-            default_date_preset="last_7d",
-            breakdowns=breakdowns,
-            action_breakdowns=action_breakdowns,
-            time_increment=time_increment,
-            use_unified_attribution_setting=use_unified_attribution_setting,
-            action_attribution_windows=action_attribution_windows,
-            limit=limit,
-            after=after,
-        ),
+        fields=requested_fields,
+        params=params,
     )
     rows = _normalize_rows(
         payload,
@@ -1229,7 +1233,6 @@ async def create_async_insights_report(
 ) -> dict[str, Any]:
     """Create a large report using lean fields by default and optional scalar action projections."""
     flatten_actions = _normalize_flatten_actions(flatten_actions)
-    client = get_graph_api_client()
     requested_fields = normalize_field_list(fields)
     effective_field_preset = "custom" if requested_fields else field_preset
     requested_fields = requested_fields or _default_async_fields(level, field_preset)
@@ -1239,7 +1242,9 @@ async def create_async_insights_report(
     ):
         if dependency not in requested_fields:
             requested_fields.append(dependency)
+    validate_insights_fields(requested_fields)
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
+    client = get_graph_api_client()
     payload = await client.create_async_insights_report(
         resolved_object_id,
         fields=requested_fields,
@@ -1385,6 +1390,7 @@ async def get_async_insights_report(
         ):
             if required_field not in requested_fields:
                 requested_fields.append(required_field)
+        validate_insights_fields(requested_fields)
     client = get_graph_api_client()
     deadline = asyncio.get_running_loop().time() + wait_timeout_seconds
     wait_timed_out = False

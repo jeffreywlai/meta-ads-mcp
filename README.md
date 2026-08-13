@@ -246,6 +246,22 @@ configured `META_ACCESS_TOKEN` automatically include Meta's HMAC-SHA256
 unproved because it may belong to another app. The secret and generated proof
 are never included in public error payloads.
 
+### Marketing API v26 audit
+
+The repository includes an SDK-backed compatibility audit that compares local
+default field projections with Meta's generated Python Business SDK schemas:
+
+```bash
+uv run audit-meta-sdk-schema \
+  --sdk-repo /path/to/facebook-python-business-sdk \
+  --base-ref 25.0.3 \
+  --target-ref 26.0.0
+```
+
+See [the v26 compatibility audit](docs/v26_compatibility_audit.md) for current
+findings and the read-only live gate required before enabling v26-native
+optimization signals.
+
 Overflow settings are optional. Oversized MCP responses are saved as complete,
 owner-only JSON artifacts and replaced inline by an opaque `export_id`. Use the
 visible `call_tool` proxy with `name="read_overflow_artifact"` and the returned

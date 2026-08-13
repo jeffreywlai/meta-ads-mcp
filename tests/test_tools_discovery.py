@@ -30,7 +30,15 @@ class FakeDiscoveryClient:
             return {"data": [{"id": "page_1", "name": "Test Page"}]}
         if edge == "instagram_accounts":
             assert parent_id == "act_123"
-            return {"data": [{"id": "ig_1", "username": "test_brand"}]}
+            return {
+                "data": [
+                    {
+                        "id": "ig_1",
+                        "username": "test_brand",
+                        "profile_picture_url": "https://example.com/direct-profile.jpg",
+                    }
+                ]
+            }
         if edge == "adsets":
             return {
                 "data": [
@@ -151,6 +159,10 @@ def test_list_instagram_accounts_uses_ad_account_scope(monkeypatch) -> None:
     assert result["summary"]["count"] == 1
     assert result["summary"]["source"] == "instagram_accounts"
     assert result["items"][0]["username"] == "test_brand"
+    assert result["items"][0]["profile_picture_url"] == "https://example.com/direct-profile.jpg"
+    assert result["items"][0]["profile_pic"] == "https://example.com/direct-profile.jpg"
+    assert "profile_picture_url" in discovery.INSTAGRAM_ACCOUNT_FIELDS
+    assert "profile_pic" not in discovery.INSTAGRAM_ACCOUNT_FIELDS
 
 
 def test_list_instagram_accounts_falls_back_to_page_instagram_accounts(monkeypatch) -> None:
@@ -168,6 +180,7 @@ def test_list_instagram_accounts_falls_back_to_page_instagram_accounts(monkeypat
                                 "id": "ig_2",
                                 "username": "fallback_brand",
                                 "name": "Fallback Brand",
+                                "profile_picture_url": "https://example.com/profile.jpg",
                             },
                         }
                     ]
@@ -179,6 +192,8 @@ def test_list_instagram_accounts_falls_back_to_page_instagram_accounts(monkeypat
     assert result["summary"]["source"] == "accounts.instagram_business_account"
     assert result["summary"]["source_attempts"] == ["instagram_accounts", "accounts.instagram_business_account"]
     assert result["items"][0]["username"] == "fallback_brand"
+    assert result["items"][0]["profile_picture_url"] == "https://example.com/profile.jpg"
+    assert result["items"][0]["profile_pic"] == "https://example.com/profile.jpg"
 
 
 def test_list_instagram_accounts_default_fallback_uses_me_pages(monkeypatch) -> None:
