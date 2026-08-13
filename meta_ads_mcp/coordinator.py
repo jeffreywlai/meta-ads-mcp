@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover - fallback for tests without the package
             self.artifact_store = artifact_store
 
     class BM25SearchTransform:  # type: ignore[override]
-        """Minimal local fallback for the FastMCP 3.4.5 search transform."""
+        """Minimal local fallback for the FastMCP 3.4.7 search transform."""
 
         def __init__(
             self,
@@ -340,7 +340,7 @@ mcp_server = FastMCP(
     name="Meta Ads FastMCP",
     version="0.1.0",
     instructions=(
-        "Optimization-first Meta Ads MCP server running on FastMCP 3.4.5. "
+        "Optimization-first Meta Ads MCP server running on FastMCP 3.4.7. "
         "FastMCP tool search is enabled, so if the exact tool is not visible, "
         "use search_tools and then call_tool instead of exploring multiple "
         "tools blindly. If you are unsure which tool to use, call "
