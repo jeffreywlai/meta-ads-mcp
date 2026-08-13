@@ -3,9 +3,9 @@
 ## Commands
 
 ```bash
-uv sync
+uv sync --extra dev
 uv run -m meta_ads_mcp.stdio
-uv run pytest
+uv run --extra dev pytest
 ```
 
 ## Project Notes
@@ -14,4 +14,3 @@ uv run pytest
 - Keep Graph API calls isolated in `meta_ads_mcp/graph_api.py`.
 - Return dicts and lists, not serialized JSON strings.
 - Keep IDs as strings.
-

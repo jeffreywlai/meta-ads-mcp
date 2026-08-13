@@ -1471,7 +1471,7 @@ Suggested console script:
 
 ## Suggested Dependencies
 
-- `fastmcp==3.1.0`
+- `fastmcp==3.4.5`
 - `mcp>=1.26.0`
 - `httpx[http2]>=0.28.1`
 - `pydantic>=2`
