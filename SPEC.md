@@ -82,6 +82,10 @@ The server should help the LLM decide what to change before it changes anything.
 Every tool should return predictable shapes so the LLM can chain calls without
 guessing.
 
+The MCP boundary owns compatibility normalization. Common envelope aliases,
+stringified argument objects, and string-list coercion must be implemented once
+and covered by catalog-wide contract tests rather than repeated inside tools.
+
 ## Primary Users
 
 - Developers using Claude Code or Gemini CLI
@@ -162,11 +166,15 @@ meta_ads_mcp/
 │   ├── config.py
 │   ├── auth.py
 │   ├── errors.py
+│   ├── error_middleware.py
 │   ├── graph_api.py
+│   ├── graph_payload.py
+│   ├── input_compat.py
 │   ├── pagination.py
 │   ├── normalize.py
 │   ├── diagnostics.py
 │   ├── schemas.py
+│   ├── tool_types.py
 │   ├── tools/
 │   │   ├── discovery.py
 │   │   ├── insights.py
@@ -193,7 +201,8 @@ meta_ads_mcp/
 
 ### `coordinator.py`
 
-Defines the shared FastMCP instance and server instructions.
+Defines the shared FastMCP instance, intent-aware tool search, compatibility
+aliases, and server-wide middleware.
 
 ### `stdio.py`
 
@@ -212,11 +221,30 @@ Responsibilities:
 - auth header injection
 - versioned base URL handling
 - retries and backoff
+- safe-read-only retry policy; writes are never retried automatically after an
+  ambiguous transport or transient server failure
 - timeout handling
 - paging helpers
 - sync insights calls
 - async insights job creation and polling
 - Meta error parsing
+
+### `input_compat.py` and `tool_types.py`
+
+Define the LLM-facing compatibility boundary: canonical tool-name aliases,
+`call_tool` envelope normalization, and reusable CSV-or-array string-list input
+types.
+
+### `graph_payload.py`
+
+Builds mutation payloads without allowing generic extension parameters to
+supply present or omitted typed fields, transport-managed authentication, or
+server-managed execution controls.
+
+### `error_middleware.py`
+
+Converts typed Graph and rate-limit failures into compact, allowlisted,
+machine-readable MCP errors after FastMCP exception wrapping.
 
 ### `normalize.py`
 
@@ -262,13 +290,18 @@ The FastMCP server instructions should tell the LLM:
 - Reads return stable envelopes such as `{items, paging, summary}` or
   `{item, summary}`.
 - Analysis tools return `{scope, metrics, findings, evidence, suggestions}`.
-- Writes return `{ok, action, target, previous, current}`.
-- Errors raise typed exceptions, not free-form error text.
+- Updates return `{ok, action, target, previous, current}`; creations return a
+  stable creation/validation envelope.
+- Internal errors use typed exceptions. The MCP boundary exposes safe structured
+  Graph fields, retry guidance, and ambiguous-mutation warnings.
 - Any derived metric must include the raw components used to compute it.
 - If a metric is not available, omit it and record why in `missing_signals`.
-- LLM-facing `fields` inputs accept either JSON string arrays or
-  comma-separated strings; commas nested inside Graph field expressions are
+- Every public string-list input accepts either a JSON string array or a
+  comma-separated string; commas nested inside Graph field expressions are
   preserved.
+- Generic mutation `params` may extend typed payloads but cannot supply any
+  present or omitted tool-managed field, `access_token`, or
+  `execution_options`.
 - The MCP transport caps inline tool responses. Oversized results are preserved
   as complete private JSON artifacts and replaced inline with an opaque
   `export_id`. Callers retrieve bounded chunks with `read_overflow_artifact`
@@ -348,6 +381,14 @@ The FastMCP server instructions should tell the LLM:
 - `AsyncJobError`
 - `UnsupportedFeatureError`
 
+`RateLimitError` carries retry timing, Graph codes, operation, and parsed Meta
+usage headers when available. `MetaApiError` carries allowlisted Graph code,
+subcode, user title/message, trace id, error data, retryability, operation, and
+`mutation_outcome_unknown`. Safe reads may retry bounded transient failures;
+writes do not retry automatically and instruct callers to verify state when the
+outcome may be ambiguous. Ambiguous mutation outcomes expose `retryable=false`
+even when Meta marks the underlying failure as transient.
+
 ## Optimization-First Scope
 
 The project should prioritize tools that answer questions like:
@@ -391,6 +432,7 @@ These are the core v1 tools.
 - `get_delivery_risk_report`
 - `get_learning_phase_report`
 - `create_async_insights_report`
+- `create_async_insights_report_batch`
 - `get_async_insights_report`
 
 ### Group C: Social Feedback
@@ -429,6 +471,15 @@ These are deliberately narrow and should be secondary to analysis tools.
 - `set_ad_status`
 - `update_campaign_budget`
 - `update_adset_budget`
+- `update_campaign_bid_strategy`
+- `update_adset_bid_strategy`
+- `update_adset_bid_amount`
+- `create_campaign`
+- `create_ad_set`
+- `create_ad`
+- `delete_campaign`
+- `delete_adset`
+- `delete_ad`
 
 ## Detailed Tool Spec
 
@@ -477,6 +528,7 @@ Inputs:
 
 - `account_id`
 - `effective_status`
+- `name_contains`
 - `limit`
 - `after`
 
@@ -513,13 +565,15 @@ Inputs:
 - `account_id`
 - `campaign_id`
 - `effective_status`
+- `name_contains`
 - `limit`
 - `after`
 
 Output:
 
 - ad set metadata including optimization goal, billing event, bid strategy,
-  targeting summary, schedule, budget fields
+  bid amount, bid constraints, promoted object, targeting summary, schedule,
+  and budget fields
 
 ### `get_adset`
 
@@ -541,6 +595,7 @@ Inputs:
 - `campaign_id`
 - `adset_id`
 - `effective_status`
+- `name_contains`
 - `limit`
 - `after`
 
@@ -644,6 +699,8 @@ Inputs:
 - `date_preset` or `since` and `until`
 - `fields`
 - `action_types` to filter large Meta action arrays
+- `flatten_actions` to promote requested counts or values such as `purchase`
+  and `purchase_value` into scalar columns
 - `breakdowns`
 - `action_breakdowns`
 - `time_increment`
@@ -1079,13 +1136,24 @@ Underlying API surface:
 
 Inputs:
 
-- same core filters as `get_entity_insights`
+- core date, breakdown, increment, field, and pagination filters
+- `field_preset`: lean by default or explicit full compatibility fields
+- `flatten_actions`: adds only the action fields required by requested scalar
+  projections
 
 Output:
 
 - report run id
 - status
+- effective field preset and requested fields
 - polling hint
+
+### `create_async_insights_report_batch`
+
+Purpose:
+Submit up to ten independent breakdown reports in one bounded, sequential call.
+The sequence stops early on rate limits or transient failures and returns both
+created jobs and the unsubmitted count so callers never guess which jobs exist.
 
 ### `get_async_insights_report`
 
@@ -1095,14 +1163,18 @@ Poll an async insights job and fetch results when ready.
 Inputs:
 
 - `report_run_id`
+- optional fetch-time `fields`, `action_types`, and `flatten_actions`
+- `include_raw_actions`, false by default
 - `limit`
 - `after`
+- `wait`, `wait_timeout_seconds`, and `poll_interval_seconds`
 
 Output:
 
 - job status
-- progress
-- rows if complete
+- normalized ready/terminal/progress/poll-after state
+- compact rows if complete, with action arrays and maps omitted by default
+- explicit wait-timeout state when bounded polling expires
 
 ## Audience and Planning Tools
 
@@ -1192,7 +1264,7 @@ failure.
 
 Inputs:
 
-- `account_id`
+- `account_id` or compatibility alias `object_id`
 - optional `campaign_id`
 
 Output:
@@ -1268,6 +1340,12 @@ Inputs:
 - `ad_id`
 - `status`: `ACTIVE` or `PAUSED`
 
+Deletion is intentionally separate from status updates:
+
+- `delete_campaign(campaign_id)`
+- `delete_adset(adset_id)`
+- `delete_ad(ad_id)`
+
 ### `update_campaign_budget`
 
 Inputs:
@@ -1287,6 +1365,14 @@ Inputs:
 
 - `adset_id`
 - `daily_budget` or `lifetime_budget`
+
+### Creation and bidding
+
+- `create_campaign`, `create_ad_set`, and `create_ad` accept `validate_only`.
+- `create_ad_set` accepts `bid_strategy` and structured `bid_constraints`.
+- `create_ad` accepts either top-level `creative_id` or the familiar nested
+  `creative.creative_id`/`creative.id` form, with conflicts rejected.
+- `update_adset_bid_strategy` accepts both bid amount and bid constraints.
 
 ## Derived Metrics and Heuristics
 
@@ -1402,6 +1488,10 @@ Suggested console script:
 - Test failure modes:
   missing auth, invalid fields, unsupported breakdowns, rate limits, partial
   data, empty data.
+- Enforce a catalog-wide schema invariant that every public array-of-string
+  input also advertises and accepts a comma-separated string.
+- Verify safe reads retry bounded transient failures while create, update, and
+  delete calls do not retry after ambiguous outcomes.
 - Keep live integration tests opt-in behind env vars.
 
 ## Phasing

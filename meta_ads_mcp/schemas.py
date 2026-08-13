@@ -60,3 +60,22 @@ def mutation_response(
         "current": current or {},
     }
 
+
+def creation_response(
+    *,
+    action: str,
+    target: dict[str, Any],
+    result: dict[str, Any],
+    validate_only: bool = False,
+) -> dict[str, Any]:
+    """Build a stable creation or validation-only mutation envelope."""
+    response: dict[str, Any] = {
+        "ok": True,
+        "action": action,
+        "target": target,
+        "validation_only": validate_only,
+        "created": None if validate_only else result,
+    }
+    if validate_only:
+        response["validation"] = result
+    return response

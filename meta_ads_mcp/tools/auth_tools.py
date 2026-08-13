@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-from meta_ads_mcp.auth import build_app_access_token, resolve_access_token, resolve_app_credentials
+from meta_ads_mcp.auth import (
+    build_app_access_token,
+    resolve_access_token,
+    resolve_app_credentials,
+)
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ConfigError
 from meta_ads_mcp.graph_api import get_graph_api_client
+from meta_ads_mcp.tool_types import StringList
 
 
 def _resolve_redirect_uri(redirect_uri: str | None) -> str:
@@ -22,7 +27,7 @@ def _resolve_redirect_uri(redirect_uri: str | None) -> str:
 @mcp_server.tool()
 async def generate_auth_url(
     redirect_uri: str | None = None,
-    scopes: list[str] | None = None,
+    scopes: StringList | None = None,
     state: str | None = None,
     app_id: str | None = None,
     response_type: str = "code",
@@ -96,7 +101,7 @@ async def refresh_to_long_lived_token(
 @mcp_server.tool()
 async def generate_system_user_token(
     system_user_id: str,
-    scope: list[str],
+    scope: StringList,
     business_app: str | None = None,
     access_token: str | None = None,
     app_id: str | None = None,

@@ -18,7 +18,6 @@ from meta_ads_mcp.overflow import (
     compact_overflow_chunk_result,
 )
 
-
 MAX_INLINE_ARTIFACT_RESULT_BYTES = 63_000
 
 TOOL_GROUPS = {
@@ -47,6 +46,7 @@ TOOL_GROUPS = {
         "compare_performance",
         "export_insights",
         "create_async_insights_report",
+        "create_async_insights_report_batch",
         "get_async_insights_report",
     ],
     "activity": [
@@ -93,6 +93,8 @@ TOOL_GROUPS = {
         "update_campaign",
         "delete_campaign",
         "create_ad_set",
+        "delete_adset",
+        "delete_ad",
         "set_campaign_status",
         "set_adset_status",
         "set_ad_status",
@@ -632,6 +634,7 @@ async def list_mutation_tools() -> dict[str, object]:
             "budget_changes": ["update_campaign_budget", "update_adset_budget"],
             "bid_changes": ["update_campaign_bid_strategy", "update_adset_bid_strategy", "update_adset_bid_amount"],
             "creation": ["create_campaign", "create_ad_set", "create_ad", "create_ad_creative"],
+            "deletion": ["delete_campaign", "delete_adset", "delete_ad", "delete_creative"],
             "audiences": ["create_custom_audience", "create_lookalike_audience", "update_custom_audience", "delete_audience"],
         },
         "safety_notes": [

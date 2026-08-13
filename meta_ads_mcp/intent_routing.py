@@ -15,14 +15,13 @@ validate against the live schema supplied by the coordinator.
 from __future__ import annotations
 
 import ast
+import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-import math
-import re
 
 from meta_ads_mcp.tool_contracts import ToolContract
-
 
 MAX_QUERY_CHARS = 4_096
 
@@ -76,6 +75,7 @@ _READ_VERBS = frozenset(
         "get",
         "inspect",
         "list",
+        "preview",
         "read",
         "refresh",
         "search",
@@ -92,7 +92,6 @@ _WRITE_VERBS = frozenset(
         "disable",
         "enable",
         "pause",
-        "preview",
         "resume",
         "set",
         "setup",
@@ -133,6 +132,9 @@ _BUDGET_ALIASES = {
     "ad set": "update_adset_budget",
     "adset": "update_adset_budget",
     "campaign": "update_campaign_budget",
+}
+_CREATE_ALIASES = {
+    "creative": "create_ad_creative",
 }
 
 
@@ -248,11 +250,25 @@ def _strip_articles(words: Iterable[str]) -> str:
 def _canonical_surface_route(text: str, names: frozenset[str]) -> str | None:
     """Match the longest direct command against a canonical tool surface."""
     simplified = _strip_articles(text.replace("-", " ").replace("/", " ").split())
-    candidates = sorted(names, key=lambda item: (-len(item), item))
+    surfaces = {
+        name: tuple(
+            dict.fromkeys(
+                (
+                    name.replace("_", " "),
+                    name.replace("_", " ").replace("adset", "ad set"),
+                )
+            )
+        )
+        for name in names
+    }
+    candidates = sorted(
+        names,
+        key=lambda item: (-max(len(surface) for surface in surfaces[item]), item),
+    )
     for name in candidates:
-        surface = name.replace("_", " ")
-        if simplified == surface or simplified.startswith(f"{surface} "):
-            return name
+        for surface in surfaces[name]:
+            if simplified == surface or simplified.startswith(f"{surface} "):
+                return name
 
     words = simplified.split()
     if not words:
@@ -260,12 +276,12 @@ def _canonical_surface_route(text: str, names: frozenset[str]) -> str | None:
     verb, tail = words[0], " ".join(words[1:])
     if verb in _GET_SYNONYMS:
         for name in candidates:
-            surface = name.replace("_", " ")
-            if not surface.startswith(("get ", "list ")):
-                continue
-            canonical_tail = surface.split(" ", 1)[1]
-            if tail == canonical_tail or tail.startswith(f"{canonical_tail} "):
-                return name
+            for surface in surfaces[name]:
+                if not surface.startswith(("get ", "list ")):
+                    continue
+                canonical_tail = surface.split(" ", 1)[1]
+                if tail == canonical_tail or tail.startswith(f"{canonical_tail} "):
+                    return name
     return None
 
 
@@ -284,6 +300,10 @@ def _entity_route(text: str) -> str | None:
                 return name
     if verb == "list":
         for phrase, name in sorted(_ENTITY_LISTERS.items(), key=lambda item: -len(item[0])):
+            if tail == phrase or tail.startswith(f"{phrase} "):
+                return name
+    if verb == "create":
+        for phrase, name in sorted(_CREATE_ALIASES.items(), key=lambda item: -len(item[0])):
             if tail == phrase or tail.startswith(f"{phrase} "):
                 return name
     if verb in {"pause", "resume", "enable", "disable"}:
@@ -348,6 +368,7 @@ class StructuredIntentRouter:
             )
 
         preferred: list[str] = []
+        verb_scoped_candidates: set[str] = set()
         excluded: set[str] = set()
         invalid_exact = False
         for raw_clause in _operation_clauses(query):
@@ -407,6 +428,12 @@ class StructuredIntentRouter:
                 continue
             route = _canonical_surface_route(clause, names) or _entity_route(clause)
             if route is None or route not in names:
+                if negated is None and direct_verb in _WRITE_VERBS:
+                    verb_scoped_candidates.update(
+                        name
+                        for name in names
+                        if name.startswith(f"{direct_verb}_")
+                    )
                 continue
             if negated is not None:
                 excluded.add(route)
@@ -418,6 +445,8 @@ class StructuredIntentRouter:
             compatible = frozenset()
         elif preferred:
             compatible = frozenset(preferred)
+        elif verb_scoped_candidates:
+            compatible = frozenset(verb_scoped_candidates) - excluded
         else:
             compatible = read_names - excluded
         return self._decision(
@@ -452,7 +481,7 @@ class StructuredIntentRouter:
             compatible_tools=compatible,
             excluded_tools=frozenset(excluded),
             suppress_mutations=not any(
-                name in mutation_names for name in preferred
+                name in mutation_names for name in compatible
             ),
         )
 

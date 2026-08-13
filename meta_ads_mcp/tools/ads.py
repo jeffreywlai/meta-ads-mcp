@@ -7,7 +7,14 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-
+from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
+from meta_ads_mcp.input_compat import resolve_identifier_alias
+from meta_ads_mcp.money import (
+    resolve_account_currency,
+    to_minor_units,
+    validate_positive_amount,
+)
+from meta_ads_mcp.schemas import creation_response
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -112,40 +119,83 @@ async def create_ad(
     account_id: str,
     name: str,
     adset_id: str,
-    creative_id: str,
+    creative_id: str | None = None,
+    creative: dict[str, Any] | None = None,
     status: str = "PAUSED",
     bid_amount: float | None = None,
     tracking_specs: list[dict[str, Any]] | None = None,
+    validate_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user already has an ad set and creative and wants to create the final ad object."""
+    """Create or validate an ad from a top-level or nested creative id."""
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
+    if bid_amount is not None:
+        validate_positive_amount(bid_amount, field_name="bid_amount")
+    nested_creative_id: str | None = None
+    if creative is not None:
+        unknown_keys = sorted(set(creative) - {"creative_id", "id"})
+        if unknown_keys:
+            raise ValidationError(
+                "creative accepts only creative_id or id when used as an alias; "
+                f"unexpected fields: {', '.join(unknown_keys)}."
+            )
+        nested_id = creative.get("id")
+        nested_creative_value = creative.get("creative_id")
+        if any(
+            value is not None and not isinstance(value, str)
+            for value in (nested_id, nested_creative_value)
+        ):
+            raise ValidationError("creative.creative_id and creative.id must be strings.")
+        nested_creative_id = resolve_identifier_alias(
+            nested_creative_value,
+            nested_id,
+            primary_name="creative.creative_id",
+            alias_name="creative.id",
+        )
+    resolved_creative_id = resolve_identifier_alias(
+        creative_id,
+        nested_creative_id,
+        primary_name="creative_id",
+        alias_name="creative.creative_id",
+        required=True,
+    )
     payload: dict[str, Any] = {
         "name": name,
         "adset_id": adset_id,
-        "creative": {"creative_id": creative_id},
+        "creative": {"creative_id": resolved_creative_id},
         "status": status,
+        "bid_amount": OMIT,
+        "tracking_specs": tracking_specs or OMIT,
     }
-    if bid_amount is not None:
-        payload["bid_amount"] = int(bid_amount * 100)
-    if tracking_specs:
-        payload["tracking_specs"] = tracking_specs
-    if params:
-        payload.update(params)
-
+    add_validate_only(payload, validate_only=validate_only)
+    merge_graph_payload(payload, params)
     client = get_graph_api_client()
+    account_id = normalize_account_id(account_id)
+    currency = (
+        await resolve_account_currency(client, account_id)
+        if bid_amount is not None
+        else None
+    )
+    if bid_amount is not None:
+        payload["bid_amount"] = to_minor_units(
+            bid_amount,
+            currency,
+            field_name="bid_amount",
+        )
+    payload = merge_graph_payload(payload, params)
+
     created = await client.create_edge_object(
-        normalize_account_id(account_id),
+        account_id,
         "ads",
         data=payload,
     )
-    return {
-        "ok": True,
-        "action": "create_ad",
-        "target": {"account_id": normalize_account_id(account_id), "adset_id": adset_id},
-        "created": created,
-    }
+    return creation_response(
+        action="create_ad",
+        target={"account_id": account_id, "adset_id": adset_id},
+        result=created,
+        validate_only=validate_only,
+    )
 
 
 @mcp_server.tool()

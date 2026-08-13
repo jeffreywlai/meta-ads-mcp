@@ -109,9 +109,11 @@ def test_live_catalog_exposes_read_and_write_contracts_with_exact_validation() -
 
     get_creative = contracts["get_creative"]
     create_campaign = contracts["create_campaign"]
+    create_async_report = contracts["create_async_insights_report"]
     generate_token = contracts["generate_system_user_token"]
     assert get_creative.effect == "read"
     assert create_campaign.effect == "write"
+    assert create_async_report.effect == "read"
     assert generate_token.effect == "write"
     assert get_creative.validator.is_valid({"creative_id": "123"})
     assert not get_creative.validator.is_valid({"creative_id": 123})
@@ -137,11 +139,12 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "create_ad",
         "create_ad_creative",
         "create_ad_set",
-        "create_async_insights_report",
         "create_campaign",
         "create_custom_audience",
         "create_lookalike_audience",
         "delete_audience",
+        "delete_ad",
+        "delete_adset",
         "delete_campaign",
         "delete_creative",
         "delete_overflow_artifact",

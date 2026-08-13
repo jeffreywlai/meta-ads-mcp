@@ -7,10 +7,10 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
-from meta_ads_mcp.tool_types import FieldList
-
+from meta_ads_mcp.tool_types import FieldList, StringList
 
 AUDIENCE_SUMMARY_FIELDS = [
     "id",
@@ -108,17 +108,16 @@ async def create_custom_audience(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants to create a first-party or rule-based custom audience."""
-    payload: dict[str, Any] = {"name": name, "subtype": subtype, "prefill": prefill}
-    if description:
-        payload["description"] = description
-    if customer_file_source:
-        payload["customer_file_source"] = customer_file_source
-    if retention_days is not None:
-        payload["retention_days"] = retention_days
-    if rule:
-        payload["rule"] = rule
-    if params:
-        payload.update(params)
+    payload: dict[str, Any] = {
+        "name": name,
+        "subtype": subtype,
+        "prefill": prefill,
+        "description": description or OMIT,
+        "customer_file_source": customer_file_source or OMIT,
+        "retention_days": OMIT if retention_days is None else retention_days,
+        "rule": rule or OMIT,
+    }
+    payload = merge_graph_payload(payload, params)
     client = get_graph_api_client()
     created = await client.create_edge_object(
         normalize_account_id(account_id),
@@ -139,7 +138,7 @@ async def create_lookalike_audience(
     name: str,
     origin_audience_id: str,
     country: str | None = None,
-    countries: list[str] | None = None,
+    countries: StringList | None = None,
     ratio: float | None = None,
     starting_ratio: float | None = None,
     lookalike_type: str = "similarity",
@@ -158,11 +157,9 @@ async def create_lookalike_audience(
             starting_ratio=starting_ratio,
             lookalike_type=lookalike_type,
         ),
+        "description": description or OMIT,
     }
-    if description:
-        payload["description"] = description
-    if params:
-        payload.update(params)
+    payload = merge_graph_payload(payload, params)
     client = get_graph_api_client()
     created = await client.create_edge_object(
         normalize_account_id(account_id),
@@ -187,7 +184,12 @@ async def update_custom_audience(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user already has an audience id and needs to change audience metadata."""
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {
+        "name": OMIT,
+        "description": OMIT,
+        "retention_days": OMIT,
+        "customer_file_source": OMIT,
+    }
     if name is not None:
         payload["name"] = name
     if description is not None:
@@ -196,8 +198,7 @@ async def update_custom_audience(
         payload["retention_days"] = retention_days
     if customer_file_source is not None:
         payload["customer_file_source"] = customer_file_source
-    if params:
-        payload.update(params)
+    payload = merge_graph_payload(payload, params)
     if not payload:
         raise ValidationError("At least one field must be provided for update_custom_audience.")
     client = get_graph_api_client()

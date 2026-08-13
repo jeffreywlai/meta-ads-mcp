@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import asyncio
 import json
+import math
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +26,14 @@ from .tool_types import FieldList, coerce_csv_string_list
 
 USER_AGENT = "meta-ads-fastmcp/0.1.0"
 _CLIENT_POOL: dict[tuple[asyncio.AbstractEventLoop, str, str | None, float], httpx.AsyncClient] = {}
+SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
+TRANSIENT_HTTP_STATUSES = {500, 502, 503, 504}
+MAX_AUTOMATIC_RETRY_DELAY_SECONDS = 60.0
+USAGE_HEADER_NAMES = (
+    "x-ad-account-usage",
+    "x-app-usage",
+    "x-business-use-case-usage",
+)
 
 
 def normalize_account_id(account_id: str) -> str:
@@ -61,6 +72,85 @@ def _is_rate_limit_error(error: MetaApiError) -> bool:
     if error.code in {4, 17, 32, 613}:
         return True
     return "rate limit" in message or "limit reached" in message or "too many calls" in message
+
+
+def _header_value(headers: Any, name: str) -> str | None:
+    """Read a response header from httpx or simple test mappings."""
+    value = headers.get(name)
+    if value is not None:
+        return str(value)
+    lowered = name.lower()
+    for key, candidate in headers.items():
+        if str(key).lower() == lowered:
+            return str(candidate)
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class RetryTiming:
+    """Separate upstream retry guidance from the automatic wait budget."""
+
+    delay_seconds: float
+    server_retry_after_seconds: float | None
+
+    @property
+    def can_automatically_wait(self) -> bool:
+        return self.delay_seconds <= MAX_AUTOMATIC_RETRY_DELAY_SECONDS
+
+
+def _parse_retry_after_seconds(
+    raw_value: str | None,
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    """Parse RFC Retry-After delay-seconds or HTTP-date without truncation."""
+    if raw_value is None:
+        return None
+    try:
+        numeric = float(raw_value.strip())
+    except ValueError:
+        numeric = None
+    if numeric is not None:
+        return numeric if math.isfinite(numeric) and numeric >= 0 else None
+
+    try:
+        retry_at = parsedate_to_datetime(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(0.0, (retry_at - current).total_seconds())
+
+
+def _retry_timing(response: Any, attempt: int) -> RetryTiming:
+    """Build full public guidance plus a bounded automatic retry decision."""
+    server_delay = _parse_retry_after_seconds(
+        _header_value(response.headers, "retry-after")
+    )
+    delay = (
+        server_delay
+        if server_delay is not None
+        else float(min(2**attempt, MAX_AUTOMATIC_RETRY_DELAY_SECONDS))
+    )
+    return RetryTiming(
+        delay_seconds=delay,
+        server_retry_after_seconds=server_delay,
+    )
+
+
+def _usage_headers(response: Any) -> dict[str, Any] | None:
+    """Return parsed Meta usage headers without exposing unrelated headers."""
+    usage: dict[str, Any] = {}
+    for name in USAGE_HEADER_NAMES:
+        raw_value = _header_value(response.headers, name)
+        if raw_value is None:
+            continue
+        try:
+            usage[name] = json.loads(raw_value)
+        except json.JSONDecodeError:
+            usage[name] = raw_value
+    return usage or None
 
 
 @dataclass(slots=True)
@@ -136,26 +226,45 @@ class GraphAPIClient:
         encoded_data = self._encode_mapping(data)
 
         client = self._get_shared_client(base_url=base_url)
+        normalized_method = method.upper()
+        operation = f"{normalized_method} /{endpoint.lstrip('/')}"
+        safe_to_retry = normalized_method in SAFE_RETRY_METHODS
         for attempt in range(retries):
-            response = await client.request(
-                method=method,
-                url=url,
-                params=encoded_params,
-                data=encoded_data,
-                headers=headers,
-                files=files,
-            )
-            if response.status_code == 429:
-                if attempt + 1 < retries:
-                    await asyncio.sleep(2**attempt)
+            try:
+                response = await client.request(
+                    method=normalized_method,
+                    url=url,
+                    params=encoded_params,
+                    data=encoded_data,
+                    headers=headers,
+                    files=files,
+                )
+            except httpx.RequestError as exc:
+                delay = float(min(2**attempt, 60))
+                if safe_to_retry and attempt + 1 < retries:
+                    await asyncio.sleep(delay)
                     continue
-                raise RateLimitError("Meta API rate limit reached.")
+                raise MetaApiError(
+                    message="Meta API request failed before a response was received.",
+                    operation=operation,
+                    is_transient=True,
+                    mutation_outcome_unknown=not safe_to_retry,
+                    details={"exception_type": type(exc).__name__},
+                ) from exc
+
+            retry_timing = _retry_timing(response, attempt)
+            delay = retry_timing.delay_seconds
+            usage = _usage_headers(response)
             if response.status_code == 404:
                 raise NotFoundError(f"Meta object or edge not found: {endpoint}")
-            if response.status_code in {501, 503}:
-                if attempt + 1 < retries:
-                    await asyncio.sleep(2**attempt)
-                    continue
+            if (
+                response.status_code in TRANSIENT_HTTP_STATUSES
+                and safe_to_retry
+                and attempt + 1 < retries
+                and retry_timing.can_automatically_wait
+            ):
+                await asyncio.sleep(delay)
+                continue
 
             try:
                 payload = response.json()
@@ -166,10 +275,33 @@ class GraphAPIClient:
                     "status_code": response.status_code,
                 }
                 if response.is_error:
+                    if response.status_code == 429:
+                        if (
+                            safe_to_retry
+                            and attempt + 1 < retries
+                            and retry_timing.can_automatically_wait
+                        ):
+                            await asyncio.sleep(delay)
+                            continue
+                        raise RateLimitError(
+                            "Meta API rate limit reached.",
+                            retry_after_seconds=delay,
+                            usage=usage,
+                            operation=operation,
+                        )
                     raise MetaApiError(
                         message="Non-JSON error response from Meta API",
                         status_code=response.status_code,
                         details=payload,
+                        operation=operation,
+                        is_transient=response.status_code in TRANSIENT_HTTP_STATUSES,
+                        retry_after_seconds=(
+                            retry_timing.server_retry_after_seconds
+                        ),
+                        mutation_outcome_unknown=(
+                            not safe_to_retry
+                            and response.status_code in TRANSIENT_HTTP_STATUSES
+                        ),
                     )
                 return payload
 
@@ -179,13 +311,42 @@ class GraphAPIClient:
                 payload = {"data": payload}
             if response.is_error or "error" in payload:
                 error = MetaApiError.from_payload(payload, status_code=response.status_code)
-                if _is_rate_limit_error(error):
-                    if attempt + 1 < retries:
-                        await asyncio.sleep(2**attempt)
+                error.operation = operation
+                error.retry_after_seconds = retry_timing.server_retry_after_seconds
+                error.is_transient = bool(
+                    error.is_transient
+                    or response.status_code in TRANSIENT_HTTP_STATUSES
+                )
+                error.mutation_outcome_unknown = (
+                    not safe_to_retry
+                    and bool(error.is_transient)
+                )
+                if response.status_code == 429 or _is_rate_limit_error(error):
+                    if (
+                        safe_to_retry
+                        and attempt + 1 < retries
+                        and retry_timing.can_automatically_wait
+                    ):
+                        await asyncio.sleep(delay)
                         continue
-                    raise RateLimitError(error.message) from error
+                    raise RateLimitError(
+                        error.message,
+                        retry_after_seconds=delay,
+                        code=error.code,
+                        subcode=error.subcode,
+                        usage=usage,
+                        operation=operation,
+                    ) from error
                 if _is_unsupported_surface_error(error):
                     raise UnsupportedFeatureError(error.message) from error
+                if (
+                    error.is_transient
+                    and safe_to_retry
+                    and attempt + 1 < retries
+                    and retry_timing.can_automatically_wait
+                ):
+                    await asyncio.sleep(delay)
+                    continue
                 raise error
             return payload
 
@@ -290,7 +451,10 @@ class GraphAPIClient:
                 "error_user_msg",
             ],
         )
-        if status.get("async_status") not in {"Job Completed", "COMPLETED"}:
+        normalized_status = " ".join(
+            str(status.get("async_status") or "").replace("_", " ").lower().split()
+        )
+        if normalized_status not in {"job completed", "completed"}:
             return {"status": status, "rows": []}
 
         rows = await self.list_objects(

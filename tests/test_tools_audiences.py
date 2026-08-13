@@ -154,6 +154,36 @@ def test_update_custom_audience_returns_previous_and_current(monkeypatch) -> Non
     assert result["current"]["retention_days"] == 45
 
 
+def test_audience_params_cannot_supply_omitted_typed_fields(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: FakeAudienceClient())
+
+    with pytest.raises(audiences.ValidationError, match="retention_days"):
+        asyncio.run(
+            audiences.create_custom_audience(
+                account_id="123",
+                name="Audience",
+                params={"retention_days": 90},
+            )
+        )
+    with pytest.raises(audiences.ValidationError, match="description"):
+        asyncio.run(
+            audiences.create_lookalike_audience(
+                account_id="123",
+                name="Lookalike",
+                origin_audience_id="aud_origin",
+                country="US",
+                params={"description": "bypass"},
+            )
+        )
+    with pytest.raises(audiences.ValidationError, match="retention_days"):
+        asyncio.run(
+            audiences.update_custom_audience(
+                audience_id="aud_1",
+                params={"retention_days": 90},
+            )
+        )
+
+
 def test_delete_audience_returns_success(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: FakeAudienceClient())
     result = asyncio.run(audiences.delete_audience(audience_id="aud_1"))

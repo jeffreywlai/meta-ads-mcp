@@ -12,6 +12,7 @@ import pytest
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.errors import RateLimitError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.money import from_minor_units, resolve_account_currency
 from meta_ads_mcp.tools import (
     ads,
     audiences,
@@ -381,19 +382,27 @@ def test_live_adset_execution_reversible(monkeypatch: pytest.MonkeyPatch) -> Non
     previous = _run(
         client.get_object(
             adset_id,
-            fields=["id", "status", "effective_status", "bid_amount", "bid_strategy", "currency"],
+            fields=[
+                "id",
+                "account_id",
+                "status",
+                "effective_status",
+                "bid_amount",
+                "bid_strategy",
+            ],
         )
     )
     previous_status = previous.get("status") or previous.get("effective_status") or "PAUSED"
     previous_bid_amount = previous.get("bid_amount")
     previous_bid_strategy = previous.get("bid_strategy")
-    currency = previous.get("currency")
+    currency = _run(resolve_account_currency(client, previous.get("account_id")))
 
     try:
         next_status = "ACTIVE" if previous_status == "PAUSED" else "PAUSED"
         _run(execution.set_adset_status(adset_id=adset_id, status=next_status))
         if previous_bid_amount is not None:
-            human_bid = float(previous_bid_amount if currency and currency.upper() == "JPY" else float(previous_bid_amount) / 100.0)
+            human_bid = from_minor_units(previous_bid_amount, currency, field_name="bid_amount")
+            assert human_bid is not None
             _run(execution.update_adset_bid_amount(adset_id=adset_id, bid_amount=max(human_bid + 1.0, 1.0)))
         if previous_bid_strategy:
             _run(
@@ -401,7 +410,7 @@ def test_live_adset_execution_reversible(monkeypatch: pytest.MonkeyPatch) -> Non
                     adset_id=adset_id,
                     bid_strategy=str(previous_bid_strategy),
                     bid_amount=(
-                        float(previous_bid_amount if currency and currency.upper() == "JPY" else float(previous_bid_amount) / 100.0)
+                        from_minor_units(previous_bid_amount, currency, field_name="bid_amount")
                         if previous_bid_amount is not None
                         else None
                     ),
@@ -573,11 +582,14 @@ def test_live_zero_decimal_campaign_budget_reversible(monkeypatch: pytest.Monkey
         pytest.skip("META_LIVE_ZERO_DECIMAL_CAMPAIGN_ID is required.")
     _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_WRITE")
     client = get_graph_api_client()
-    previous = _run(client.get_object(campaign_id, fields=["daily_budget", "currency"]))
+    previous = _run(client.get_object(campaign_id, fields=["account_id", "daily_budget"]))
     previous_budget = previous.get("daily_budget")
     if previous_budget is None:
         pytest.skip("The zero-decimal live campaign does not expose daily_budget.")
+    currency = _run(resolve_account_currency(client, previous.get("account_id")))
+    human_budget = from_minor_units(previous_budget, currency, field_name="daily_budget")
+    assert human_budget is not None
     try:
-        _run(execution.update_campaign_budget(campaign_id=campaign_id, daily_budget=float(previous_budget) + 1.0))
+        _run(execution.update_campaign_budget(campaign_id=campaign_id, daily_budget=human_budget + 1.0))
     finally:
         _run(client.update_object(campaign_id, data={"daily_budget": previous_budget}))

@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import stat
+from pathlib import Path
 
 import pydantic_core
 import pytest
+from pydantic import TypeAdapter
 
-from meta_ads_mcp.coordinator import MAX_TOOL_RESPONSE_BYTES, RESPONSE_LIMIT_HINT, mcp_server
+from meta_ads_mcp.coordinator import (
+    MAX_TOOL_RESPONSE_BYTES,
+    RESPONSE_LIMIT_HINT,
+    RESPONSE_LIMITING_MIDDLEWARE,
+    mcp_server,
+)
+from meta_ads_mcp.tool_types import StrictStringList
 from meta_ads_mcp.tools import insights
 
 
@@ -139,6 +146,108 @@ def test_get_entity_insights_action_filter_adds_required_fields(monkeypatch) -> 
         )
     )
     assert result["summary"]["action_filter"]["matched"] == ["purchase"]
+
+
+@pytest.mark.parametrize("action_types", [[" "], ["lead", " "]])
+def test_get_entity_insights_rejects_blank_action_types_before_api_call(
+    monkeypatch,
+    action_types,
+) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FailIfCalledClient())
+
+    with pytest.raises(insights.ValidationError, match="action_types values must not be blank"):
+        asyncio.run(
+            insights.get_entity_insights(
+                level="account",
+                object_id="act_123",
+                action_types=action_types,
+            )
+        )
+
+
+@pytest.mark.parametrize("raw_value", [" ", "lead, ,purchase"])
+def test_action_csv_coercion_preserves_blanks_for_domain_validation(
+    raw_value,
+) -> None:
+    coerced = TypeAdapter(StrictStringList).validate_python(raw_value)
+
+    with pytest.raises(
+        insights.ValidationError,
+        match="action_types values must not be blank",
+    ):
+        insights._normalize_action_types(coerced)
+
+
+def test_flatten_action_csv_coercion_preserves_blanks_for_domain_validation() -> None:
+    coerced = TypeAdapter(StrictStringList).validate_python("purchase, ")
+
+    with pytest.raises(
+        insights.ValidationError,
+        match="flatten_actions values must not be blank",
+    ):
+        insights._normalize_flatten_actions(coerced)
+
+
+def test_direct_action_csv_normalization_matches_transport_behavior() -> None:
+    assert insights._normalize_action_types("lead,purchase") == [
+        "lead",
+        "purchase",
+    ]
+    assert insights._normalize_flatten_actions("purchase,purchase_value") == [
+        "purchase",
+        "purchase_value",
+    ]
+
+    with pytest.raises(
+        insights.ValidationError,
+        match="action_types values must not be blank",
+    ):
+        insights._normalize_action_types("lead,")
+    with pytest.raises(
+        insights.ValidationError,
+        match="flatten_actions values must not be blank",
+    ):
+        insights._normalize_flatten_actions(" ")
+
+
+def test_get_entity_insights_normalizes_and_deduplicates_action_types(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            action_types=[" Purchase ", "purchase"],
+        )
+    )
+
+    assert result["summary"]["action_filter"]["requested"] == ["purchase"]
+
+
+def test_get_entity_insights_flattens_requested_action_columns(monkeypatch) -> None:
+    class FlattenActionClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert fields == ["campaign_id", "actions", "action_values"]
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FlattenActionClient())
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account",
+            object_id="act_123",
+            fields=["campaign_id"],
+            flatten_actions=["purchase", "purchase_value"],
+        )
+    )
+    row = result["items"][0]
+    assert row["purchase"] == 2.0
+    assert row["purchase_value"] == 250.0
+    assert result["summary"]["flattened_action_columns"] == [
+        "purchase",
+        "purchase_value",
+    ]
 
 
 def test_get_entity_insights_treats_blank_date_inputs_as_missing(monkeypatch) -> None:
@@ -977,8 +1086,30 @@ def test_create_async_insights_report_returns_poll_hint(monkeypatch) -> None:
     )
     result = asyncio.run(insights.create_async_insights_report(level="campaign", object_id="cmp_1"))
     assert result["report_run_id"] == "rpt_created"
-    assert result["requested_fields"] == insights.DEFAULT_INSIGHTS_FIELDS
+    assert result["requested_fields"] == [
+        "campaign_id",
+        "campaign_name",
+        *insights.ASYNC_LEAN_METRIC_FIELDS,
+    ]
+    assert result["field_preset"] == "lean"
     assert "get_async_insights_report" in result["poll_hint"]
+
+
+def test_create_async_insights_report_supports_explicit_full_default(monkeypatch) -> None:
+    monkeypatch.setattr(
+        insights,
+        "get_graph_api_client",
+        lambda: FakeAsyncInsightsClient({"report_run_id": "rpt_created", "async_status": "Job Running"}),
+    )
+    result = asyncio.run(
+        insights.create_async_insights_report(
+            level="campaign",
+            object_id="cmp_1",
+            field_preset="full",
+        )
+    )
+    assert result["requested_fields"] == insights.DEFAULT_INSIGHTS_FIELDS
+    assert result["field_preset"] == "full"
 
 
 def test_create_async_insights_report_accepts_since_until_without_explicit_date_preset(monkeypatch) -> None:
@@ -1026,6 +1157,14 @@ def test_get_async_insights_report_handles_in_progress_state(monkeypatch) -> Non
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeAsyncInsightsClient(payload))
     result = asyncio.run(insights.get_async_insights_report(report_run_id="rpt_123"))
     assert result["status"]["async_status"] == "Job Running"
+    assert result["job"] == {
+        "state": "Job Running",
+        "progress_percent": 50,
+        "ready": False,
+        "terminal": False,
+        "poll_after_seconds": 2.0,
+        "wait_timed_out": False,
+    }
     assert result["rows"]["items"] == []
     assert result["rows"]["paging"]["after"] is None
 
@@ -1065,6 +1204,299 @@ def test_get_async_insights_report_handles_completed_rows_and_paging(monkeypatch
     assert result["rows"]["summary"]["count"] == 1
     assert result["rows"]["paging"]["after"] == "after_1"
     assert result["rows"]["items"][0]["metrics"]["roas"] == 2.5
+    assert result["job"]["ready"] is True
+    row = result["rows"]["items"][0]
+    assert row["spend"] == 100.0
+    assert row["impressions"] == 1000.0
+    assert row["clicks"] == 50.0
+    assert "actions" not in row
+    assert "action_values" not in row
+    assert "actions_map" not in row
+    assert "action_values_map" not in row
+
+
+def test_get_async_insights_report_flattens_actions_and_requests_dependencies(monkeypatch) -> None:
+    payload = {
+        "status": {"id": "rpt_123", "async_status": "Job Completed", "async_percent_completion": 100},
+        "rows": {
+            "data": [
+                {
+                    "date_start": "2026-03-01",
+                    "spend": "100",
+                    "actions": [{"action_type": "purchase", "value": "2"}],
+                    "action_values": [{"action_type": "purchase", "value": "250"}],
+                }
+            ]
+        },
+    }
+
+    class FlattenAsyncClient(FakeAsyncInsightsClient):
+        async def get_async_report(self, report_run_id: str, *, fields=None, limit=100, after=None):
+            assert fields == ["date_start", "spend", "actions", "action_values"]
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FlattenAsyncClient(payload))
+    result = asyncio.run(
+        insights.get_async_insights_report(
+            report_run_id="rpt_123",
+            fields=["date_start", "spend"],
+            flatten_actions=["purchase", "purchase_value"],
+        )
+    )
+    row = result["rows"]["items"][0]
+    assert row["spend"] == 100.0
+    assert row["purchase"] == 2.0
+    assert row["purchase_value"] == 250.0
+    assert "actions" not in row
+    assert result["rows"]["summary"]["flattened_action_columns"] == [
+        "purchase",
+        "purchase_value",
+    ]
+    assert "actions_map" not in row
+    assert "action_values_map" not in row
+
+
+def test_normalize_rows_preserves_full_raw_action_shape_when_requested() -> None:
+    rows = insights._normalize_rows(
+        {
+            "data": [
+                {
+                    "spend": "100",
+                    "impressions": "1000",
+                    "clicks": "50",
+                    "actions": [{"action_type": "purchase", "value": "2"}],
+                    "action_values": [
+                        {"action_type": "purchase", "value": "250"}
+                    ],
+                }
+            ]
+        },
+        include_raw_actions=True,
+        flatten_actions=["purchase", "purchase_value"],
+    )
+
+    row = rows[0]
+    assert row["spend"] == 100.0
+    assert row["actions"][0]["action_type"] == "purchase"
+    assert row["action_values"][0]["action_type"] == "purchase"
+    assert row["actions_map"]["purchase"] == 2.0
+    assert row["action_values_map"]["purchase"] == 250.0
+    assert row["purchase"] == 2.0
+    assert row["purchase_value"] == 250.0
+
+
+def test_flatten_actions_are_independent_of_raw_action_filter() -> None:
+    rows = insights._normalize_rows(
+        {
+            "data": [
+                {
+                    "spend": "100",
+                    "actions": [
+                        {"action_type": "lead", "value": "3"},
+                        {"action_type": "purchase", "value": "2"},
+                    ],
+                    "action_values": [
+                        {"action_type": "purchase", "value": "250"}
+                    ],
+                }
+            ]
+        },
+        action_types=["lead"],
+        include_raw_actions=True,
+        flatten_actions=["purchase", "purchase_value"],
+    )
+
+    row = rows[0]
+    assert row["purchase"] == 2.0
+    assert row["purchase_value"] == 250.0
+    assert row["actions"] == [{"action_type": "lead", "value": "3"}]
+    assert row["action_values"] == []
+    assert row["metrics"]["conversions"] == 3.0
+
+
+def test_create_async_insights_report_adds_only_requested_action_dependencies(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    class ProjectionClient(FakeAsyncInsightsClient):
+        async def create_async_insights_report(self, object_id: str, *, fields, params):
+            calls.append(fields)
+            return {"report_run_id": f"rpt_{len(calls)}", "async_status": "Job Running"}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ProjectionClient({}))
+    count_report = asyncio.run(
+        insights.create_async_insights_report(
+            level="campaign",
+            object_id="cmp_1",
+            flatten_actions=["purchase"],
+        )
+    )
+    value_report = asyncio.run(
+        insights.create_async_insights_report(
+            level="campaign",
+            object_id="cmp_1",
+            flatten_actions=["purchase_value"],
+        )
+    )
+
+    assert calls[0][-1] == "actions"
+    assert "action_values" not in calls[0]
+    assert calls[1][-1] == "action_values"
+    assert "actions" not in calls[1]
+    assert count_report["flatten_actions"] == ["purchase"]
+    assert value_report["flatten_actions"] == ["purchase_value"]
+
+
+def test_flatten_actions_validation_happens_before_api_call(monkeypatch) -> None:
+    def fail_client():
+        raise AssertionError("Graph client must not be resolved for invalid projections")
+
+    monkeypatch.setattr(insights, "get_graph_api_client", fail_client)
+    with pytest.raises(insights.ValidationError, match="must not be blank"):
+        asyncio.run(
+            insights.create_async_insights_report(
+                level="campaign",
+                object_id="cmp_1",
+                flatten_actions=[" "],
+            )
+        )
+
+
+def test_get_async_insights_report_marks_running_100_as_not_ready(monkeypatch) -> None:
+    payload = {
+        "status": {
+            "id": "rpt_123",
+            "async_status": "Job Running",
+            "async_percent_completion": 100,
+        },
+        "rows": [],
+    }
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeAsyncInsightsClient(payload))
+    result = asyncio.run(insights.get_async_insights_report(report_run_id="rpt_123"))
+    assert result["job"]["progress_percent"] == 100
+    assert result["job"]["ready"] is False
+    assert result["job"]["poll_after_seconds"] == 2.0
+
+
+def test_get_async_insights_report_can_wait_until_rows_are_fetchable(monkeypatch) -> None:
+    class TransitioningClient(FakeAsyncInsightsClient):
+        def __init__(self):
+            super().__init__({})
+            self.calls = 0
+
+        async def get_async_report(self, report_run_id: str, *, fields=None, limit=100, after=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "status": {
+                        "id": report_run_id,
+                        "async_status": "Job Running",
+                        "async_percent_completion": 100,
+                    },
+                    "rows": [],
+                }
+            return {
+                "status": {
+                    "id": report_run_id,
+                    "async_status": "Job Completed",
+                    "async_percent_completion": 100,
+                },
+                "rows": {"data": [{"spend": "12", "actions": []}]},
+            }
+
+    client = TransitioningClient()
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(insights.asyncio, "sleep", no_sleep)
+    result = asyncio.run(
+        insights.get_async_insights_report(
+            report_run_id="rpt_123",
+            wait=True,
+            wait_timeout_seconds=10,
+            poll_interval_seconds=0.1,
+        )
+    )
+    assert client.calls == 2
+    assert result["job"]["ready"] is True
+    assert result["rows"]["summary"]["count"] == 1
+
+
+def test_create_async_insights_report_batch_is_bounded_and_returns_each_job(monkeypatch) -> None:
+    class BatchClient(FakeAsyncInsightsClient):
+        def __init__(self):
+            super().__init__({})
+            self.created = 0
+
+        async def create_async_insights_report(self, object_id: str, *, fields, params):
+            self.created += 1
+            return {"report_run_id": f"rpt_{self.created}", "async_status": "Job Running"}
+
+    client = BatchClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        insights.create_async_insights_report_batch(
+            level="adset",
+            object_id="act_123",
+            breakdown_sets=[["country"], ["device_platform"]],
+        )
+    )
+    assert [item["report_run_id"] for item in result["items"]] == ["rpt_1", "rpt_2"]
+    assert result["summary"] == {
+        "count": 2,
+        "requested": 2,
+        "succeeded": 2,
+        "failed": 0,
+        "stopped_early": False,
+        "remaining_unsubmitted": 0,
+    }
+
+    with pytest.raises(insights.ValidationError, match="at most"):
+        asyncio.run(
+            insights.create_async_insights_report_batch(
+                level="adset",
+                object_id="act_123",
+                breakdown_sets=[["country"]] * (insights.MAX_ASYNC_BATCH_JOBS + 1),
+            )
+        )
+
+
+def test_create_async_insights_report_batch_stops_after_rate_limit(monkeypatch) -> None:
+    class RateLimitedBatchClient(FakeAsyncInsightsClient):
+        def __init__(self):
+            super().__init__({})
+            self.calls = 0
+
+        async def create_async_insights_report(self, object_id: str, *, fields, params):
+            self.calls += 1
+            if self.calls == 2:
+                raise insights.RateLimitError(
+                    "Too many calls",
+                    retry_after_seconds=12,
+                )
+            return {"report_run_id": "rpt_1", "async_status": "Job Running"}
+
+    client = RateLimitedBatchClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        insights.create_async_insights_report_batch(
+            level="campaign",
+            object_id="cmp_1",
+            breakdown_sets=[["country"], ["device_platform"], ["age"]],
+        )
+    )
+
+    assert client.calls == 2
+    assert result["summary"] == {
+        "count": 2,
+        "requested": 3,
+        "succeeded": 1,
+        "failed": 1,
+        "stopped_early": True,
+        "remaining_unsubmitted": 1,
+    }
+    assert result["items"][1]["error"]["retry_after_seconds"] == 12
 
 
 def test_get_async_insights_report_preserves_error_fields(monkeypatch) -> None:
@@ -1108,7 +1540,7 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
             }
 
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
-    middleware = mcp_server.middleware[-1]
+    middleware = RESPONSE_LIMITING_MIDDLEWARE
     artifact_store = middleware.artifact_store
     monkeypatch.setattr(artifact_store, "export_directory", tmp_path)
 
@@ -1186,7 +1618,7 @@ def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
 
     blocked_directory = tmp_path / "not-a-directory"
     blocked_directory.write_text("blocked")
-    middleware = mcp_server.middleware[-1]
+    middleware = RESPONSE_LIMITING_MIDDLEWARE
     monkeypatch.setattr(middleware.artifact_store, "export_directory", blocked_directory)
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: OversizedInsightsClient())
 

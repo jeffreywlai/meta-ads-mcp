@@ -302,3 +302,64 @@ def test_live_effect_metadata_controls_future_mutation_safety() -> None:
 def test_canonical_name_inside_unsupported_prose_still_routes() -> None:
     decision = ROUTER.decide("find tool get_campaign for this task")
     assert decision.preferred_tool == "get_campaign"
+
+
+def test_canonical_surface_prefers_ad_set_over_shorter_ad_prefix() -> None:
+    contracts = {
+        "delete_ad": _contract("delete_ad", effect="write"),
+        "delete_adset": _contract("delete_adset", effect="write"),
+    }
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide("delete an ad set")
+
+    assert decision.preferred_tool == "delete_adset"
+    assert decision.compatible_tools == {"delete_adset"}
+
+
+def test_unmatched_explicit_write_verb_exposes_only_same_verb_candidates() -> None:
+    contracts = {
+        "create_ad_set": _contract("create_ad_set", effect="write"),
+        "create_campaign": _contract("create_campaign", effect="write"),
+        "delete_campaign": _contract("delete_campaign", effect="write"),
+        "get_adset": _contract("get_adset"),
+    }
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide("create target ROAS ad set with bid constraints")
+
+    assert decision.preferred_tool is None
+    assert decision.compatible_tools == {"create_ad_set", "create_campaign"}
+    assert "delete_campaign" not in decision.compatible_tools
+    assert "get_adset" not in decision.compatible_tools
+    assert decision.suppress_mutations is False
+
+
+def test_write_verb_scope_can_include_explicitly_read_safe_name_exception() -> None:
+    contracts = {
+        "create_async_insights_report": _contract("create_async_insights_report"),
+        "create_campaign": _contract("create_campaign", effect="write"),
+        "get_entity_insights": _contract("get_entity_insights"),
+    }
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide("create report summary")
+
+    assert decision.compatible_tools == {
+        "create_async_insights_report",
+        "create_campaign",
+    }
+    assert "get_entity_insights" not in decision.compatible_tools
+
+
+def test_create_creative_alias_routes_to_ad_creative_tool() -> None:
+    contracts = {
+        "create_ad": _contract("create_ad", effect="write"),
+        "create_ad_creative": _contract("create_ad_creative", effect="write"),
+    }
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide("create creative")
+
+    assert decision.preferred_tool == "create_ad_creative"
+    assert decision.compatible_tools == {"create_ad_creative"}

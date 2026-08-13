@@ -9,6 +9,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.tool_types import StringList
 
 
 def _resolve_account_id(account_id: str | None) -> str:
@@ -45,7 +46,7 @@ async def search_interests(
 
 @mcp_server.tool()
 async def get_interest_suggestions(
-    interest_list: list[str],
+    interest_list: StringList,
     limit: int = 25,
     after: str | None = None,
 ) -> dict[str, Any]:
@@ -63,8 +64,8 @@ async def get_interest_suggestions(
 
 @mcp_server.tool()
 async def validate_interests(
-    interest_list: list[str] | None = None,
-    interest_ids: list[str] | None = None,
+    interest_list: StringList | None = None,
+    interest_ids: StringList | None = None,
     after: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user wants to confirm that proposed interests still resolve in Meta's targeting catalog."""
@@ -82,7 +83,7 @@ async def validate_interests(
 @mcp_server.tool()
 async def search_geo_locations(
     query: str,
-    location_types: list[str] | None = None,
+    location_types: StringList | None = None,
     limit: int = 25,
     after: str | None = None,
 ) -> dict[str, Any]:

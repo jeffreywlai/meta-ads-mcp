@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from meta_ads_mcp.tools import ads
 
 
 class FakeAdsClient:
     """Fake ad client."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, currency: str = "USD") -> None:
         self.created_payload = None
+        self.currency = currency
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
         self.created_payload = {"parent_id": parent_id, "edge": edge, "data": data}
         return {"id": "ad_created", "payload": data}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
+        if object_id == "act_123":
+            assert fields == ["currency"]
+            return {"id": object_id, "currency": self.currency}
         if object_id == "ad_123":
             return {
                 "id": "ad_123",
@@ -61,6 +67,131 @@ def test_create_ad_wraps_creative_id(monkeypatch) -> None:
     assert client.created_payload["parent_id"] == "act_123"
     assert client.created_payload["data"]["creative"] == {"creative_id": "crt_123"}
     assert client.created_payload["data"]["bid_amount"] == 1234
+
+
+def test_create_ad_encodes_exact_decimal_bid(monkeypatch) -> None:
+    client = FakeAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(
+        ads.create_ad(
+            account_id="123",
+            name="New Ad",
+            adset_id="adset_123",
+            creative_id="crt_123",
+            bid_amount=19.99,
+        )
+    )
+    assert client.created_payload["data"]["bid_amount"] == 1999
+
+
+def test_create_ad_encodes_zero_decimal_bid(monkeypatch) -> None:
+    client = FakeAdsClient(currency="JPY")
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(
+        ads.create_ad(
+            account_id="123",
+            name="JPY Ad",
+            adset_id="adset_123",
+            creative_id="crt_123",
+            bid_amount=1250.0,
+        )
+    )
+    assert client.created_payload["data"]["bid_amount"] == 1250
+
+
+@pytest.mark.parametrize("bid_amount", [0, -1, float("inf")])
+def test_create_ad_rejects_invalid_bid_before_client_lookup(
+    monkeypatch,
+    bid_amount,
+) -> None:
+    monkeypatch.setattr(
+        ads,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+    with pytest.raises(ads.ValidationError, match="bid_amount"):
+        asyncio.run(
+            ads.create_ad(
+                account_id="123",
+                name="Invalid Bid",
+                adset_id="adset_123",
+                creative_id="crt_123",
+                bid_amount=bid_amount,
+            )
+        )
+
+
+def test_create_ad_accepts_nested_graph_creative_shape(monkeypatch) -> None:
+    client = FakeAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        ads.create_ad(
+            account_id="123",
+            name="Nested creative",
+            adset_id="adset_123",
+            creative={"creative_id": "crt_123"},
+            validate_only=True,
+        )
+    )
+    assert client.created_payload["data"]["creative"] == {"creative_id": "crt_123"}
+    assert client.created_payload["data"]["execution_options"] == ["validate_only"]
+    assert result["validation_only"] is True
+
+
+def test_create_ad_rejects_conflicting_creative_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
+    with pytest.raises(ads.ValidationError, match="must match"):
+        asyncio.run(
+            ads.create_ad(
+                account_id="123",
+                name="Conflict",
+                adset_id="adset_123",
+                creative_id="crt_1",
+                creative={"creative_id": "crt_2"},
+            )
+        )
+
+
+def test_create_ad_rejects_ignored_nested_creative_fields(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
+    with pytest.raises(ads.ValidationError, match="unexpected fields"):
+        asyncio.run(
+            ads.create_ad(
+                account_id="123",
+                name="Unsupported creative body",
+                adset_id="adset_123",
+                creative={"creative_id": "crt_1", "name": "would be ignored"},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "params, expected_field",
+    [
+        ({"bid_amount": 25}, "bid_amount"),
+        ({"execution_options": ["validate_only"]}, "execution_options"),
+    ],
+)
+def test_create_ad_params_cannot_supply_omitted_managed_fields(
+    monkeypatch,
+    params,
+    expected_field,
+) -> None:
+    monkeypatch.setattr(
+        ads,
+        "get_graph_api_client",
+        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
+    )
+    with pytest.raises(ads.ValidationError, match=expected_field):
+        asyncio.run(
+            ads.create_ad(
+                account_id="123",
+                name="Ad",
+                adset_id="adset_123",
+                creative_id="crt_123",
+                params=params,
+            )
+        )
 
 
 def test_get_ad_image_resolves_candidates(monkeypatch) -> None:

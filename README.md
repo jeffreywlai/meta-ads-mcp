@@ -5,7 +5,7 @@
 [![FastMCP 3.1](https://img.shields.io/badge/FastMCP-3.1-green.svg)](https://github.com/jlowin/fastmcp)
 [![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
-**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 94 tools for querying, managing, and optimizing your ad accounts through natural language.**
+**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 97 tools for querying, managing, and optimizing your ad accounts through natural language.**
 
 > Ask Claude or Gemini to "show me which creatives are fatiguing" or "give me an optimization snapshot for this account" — and it just works.
 
@@ -13,16 +13,16 @@
 
 ## ✨ Features
 
-- 📊 **94 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **97 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, and v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 94 up front
+- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 97 up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (94)
+## 📋 Available Tools (97)
 
 ### 🔍 Discovery
 
@@ -32,11 +32,11 @@
 | `get_ad_account` | Get details for a specific ad account |
 | `get_account_pages` | Get Pages linked to an ad account |
 | `list_instagram_accounts` | List Instagram accounts linked to an ad account |
-| `list_campaigns` | List campaigns in an ad account |
+| `list_campaigns` | List campaigns in an ad account, optionally filtered by name |
 | `get_campaign` | Get details for a specific campaign |
-| `list_adsets` | List ad sets in a campaign or account |
+| `list_adsets` | List ad sets in a campaign or account, optionally filtered by name |
 | `get_adset` | Get details for a specific ad set |
-| `list_ads` | List ads in an ad set or account |
+| `list_ads` | List ads in an ad set or account, optionally filtered by name |
 | `get_ad` | Get details for a specific ad |
 | `list_audiences` | List custom and lookalike audiences with lightweight summary fields by default |
 | `get_audience` | Read one custom or lookalike audience by ID |
@@ -48,14 +48,15 @@
 | Tool | Description |
 |------|-------------|
 | `get_insights` | Backward-compatible alias for older insights calls |
-| `get_entity_insights` | Get performance insights for any entity |
+| `get_entity_insights` | Get performance insights with optional scalar action columns |
 | `get_performance_breakdown` | Break down performance by dimension |
 | `summarize_actions` | Count selected actions without returning full action arrays |
 | `compare_time_ranges` | Compare metrics across two time ranges |
 | `compare_performance` | Compare metrics across multiple entities |
 | `export_insights` | Export insights as CSV or structured data |
-| `create_async_insights_report` | Create a large async insights report |
-| `get_async_insights_report` | Poll and retrieve an async report |
+| `create_async_insights_report` | Create a large async report with lean defaults or an explicit full preset |
+| `create_async_insights_report_batch` | Submit up to 10 independent breakdown reports sequentially |
+| `get_async_insights_report` | Poll or bounded-wait for an async report and retrieve compact rows |
 
 ### ⚡ Optimization
 
@@ -115,8 +116,10 @@
 | `create_campaign` | Create a new campaign |
 | `update_campaign` | Update campaign settings |
 | `delete_campaign` | Delete a campaign |
-| `create_ad_set` | Create a new ad set |
-| `create_ad` | Create a new ad |
+| `create_ad_set` | Create or validate an ad set, including bid strategy and constraints |
+| `create_ad` | Create or validate an ad using a top-level or nested creative ID |
+| `delete_adset` | Explicitly delete an ad set |
+| `delete_ad` | Explicitly delete an ad |
 | `set_campaign_status` | Pause or enable a campaign |
 | `set_adset_status` | Pause or enable an ad set |
 | `set_ad_status` | Pause or enable an ad |
@@ -124,7 +127,7 @@
 | `update_adset_budget` | Update an ad set's budget |
 | `update_adset_bid_amount` | Update an ad set's bid amount |
 | `update_campaign_bid_strategy` | Update a campaign's bidding strategy |
-| `update_adset_bid_strategy` | Update an ad set's bidding strategy |
+| `update_adset_bid_strategy` | Update an ad set's bidding strategy and constraints |
 | `create_custom_audience` | Create a custom audience |
 | `create_lookalike_audience` | Create a lookalike audience |
 | `update_custom_audience` | Update a custom audience |
@@ -181,8 +184,18 @@ FastMCP 3.1 also exposes dynamic search tools at runtime:
 | `call_tool` | Call a discovered tool by name |
 
 These let the LLM discover the right tool on demand instead of loading the full catalog into context up front.
-All public `fields` parameters accept either a JSON string list or a
-comma-separated string such as `"id,name,url_tags"`.
+`call_tool` accepts `name` or the common `tool_name` alias, and `arguments` may
+be a JSON object or an object-valued JSON string. Familiar `list_ad_sets`,
+`get_ad_set`, and `delete_ad_set` spellings resolve to the canonical `adset`
+tool names without duplicating search results. Public string-list parameters,
+including `fields`, breakdowns, statuses, countries, scopes, and action types,
+accept either JSON string lists or comma-separated strings.
+
+Budget and bid inputs use human-readable account-currency units. The server
+resolves currency from the owning Ad Account, converts values to Meta minor
+units exactly, and rejects precision the currency cannot represent (for
+example, fractional JPY). Campaign bidding strategy and Ad Set bid amounts are
+separate operations because Meta does not expose a campaign-level `bid_amount`.
 
 ## 📚 MCP Resources
 
@@ -242,6 +255,23 @@ manifests are stored alongside those payloads. The three retention variables
 above override those defaults.
 If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
+
+Async insights use a lean scalar field set by default; pass
+`field_preset="full"` or explicit `fields` when the wider Meta response is
+required. Pass `flatten_actions=["purchase","purchase_value"]` when creating
+and retrieving a report to request only the required action dependencies and
+promote those values into scalar row columns. Async retrieval omits verbose
+action arrays and maps unless `include_raw_actions=true`, while preserving
+requested scalar fields such as spend, impressions, and clicks. Use `wait=true`
+for a bounded server-side poll, or inspect the returned `job.ready`,
+`job.terminal`, and `job.poll_after_seconds` fields yourself.
+
+Graph API failures are returned as allowlisted structured error JSON with Meta
+codes, subcodes, user guidance, retry timing, and usage diagnostics when
+available. Reads may retry transient failures; create, update, and delete calls
+are not automatically retried after ambiguous failures. If
+`mutation_outcome_unknown=true`, `retryable` is false and callers must verify
+current object state before deciding whether to retry.
 
 `META_DEFAULT_ACCOUNT_ID` is an optional convenience, not a requirement for
 object-scoped activity history. When a campaign, ad set, or ad ID is supplied,
@@ -330,6 +360,8 @@ Once connected, just talk naturally:
 "Compare these two campaigns on ROAS, CPA, and CTR"
 "Break down campaign performance by country"
 "Export ad-level insights for the last 30 days as CSV"
+"Create async reports for country and device breakdowns, then wait for each result"
+"Return purchase and purchase_value as flat columns without raw action arrays"
 ```
 
 ### Optimization
@@ -356,6 +388,7 @@ Once connected, just talk naturally:
 "Create a paused campaign for this account"
 "Pause this campaign"
 "Update this ad set budget to 75 dollars daily"
+"Validate a target-ROAS ad set with a 30000 ROAS floor without creating it"
 "Create an ad in this ad set using creative 123"
 ```
 
@@ -372,6 +405,7 @@ meta-ads-mcp/
 │   ├── diagnostics.py         # Derived metrics & optimization heuristics
 │   ├── errors.py              # Error handling
 │   ├── graph_api.py           # Meta Graph API client
+│   ├── money.py               # Account-currency resolution & exact conversion
 │   ├── normalize.py           # Response normalization
 │   ├── pagination.py          # Graph API pagination helpers
 │   ├── schemas.py             # Pydantic schemas

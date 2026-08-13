@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+
+import pytest
+from fastmcp.exceptions import ToolError
 
 from meta_ads_mcp import stdio  # noqa: F401 - ensures tools are registered
 from meta_ads_mcp.config import Settings
@@ -10,9 +14,11 @@ from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
     MAX_TOOL_RESPONSE_BYTES,
     RESPONSE_LIMIT_HINT,
+    RESPONSE_LIMITING_MIDDLEWARE,
     mcp_server,
     serialize_search_results_compact,
 )
+from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import discovery, insights, utility
 
 
@@ -26,10 +32,12 @@ def test_fastmcp_31_search_transform_is_configured() -> None:
 
 
 def test_response_size_guard_is_configured() -> None:
-    middleware = mcp_server.middleware[-1]
+    middleware = RESPONSE_LIMITING_MIDDLEWARE
     assert type(middleware).__name__ == "ArchivedResponseLimitingMiddleware"
     assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
     assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
+    assert mcp_server.middleware[-2] is RESPONSE_LIMITING_MIDDLEWARE
+    assert type(mcp_server.middleware[-1]).__name__ == "StructuredMetaErrorMiddleware"
 
 
 def test_list_tools_exposes_compact_search_surface() -> None:
@@ -42,6 +50,52 @@ def test_list_tools_exposes_compact_search_surface() -> None:
         "search_tools",
         "call_tool",
     ]
+
+
+def test_call_tool_proxy_accepts_alias_name_and_stringified_arguments(monkeypatch) -> None:
+    class AliasDiscoveryClient:
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            assert parent_id == "act_123"
+            assert edge == "adsets"
+            assert params["limit"] == 1
+            return {
+                "data": [
+                    {"id": "adset_1", "account_id": "123", "name": "Alias result"}
+                ]
+            }
+
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            assert object_id == "act_123"
+            assert fields == ["currency"]
+            return {"currency": "USD"}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: AliasDiscoveryClient())
+    result = asyncio.run(
+        mcp_server.call_tool(
+            "call_tool",
+            {
+                "tool_name": "list_ad_sets",
+                "arguments": json.dumps({"account_id": "123", "limit": 1}),
+            },
+        )
+    )
+    assert result.structured_content["items"][0]["id"] == "adset_1"
+
+    direct = asyncio.run(
+        mcp_server.call_tool(
+            "list_ad_sets",
+            {"account_id": "123", "limit": 1},
+        )
+    )
+    assert direct.structured_content["items"][0]["id"] == "adset_1"
+
+
+def test_call_tool_proxy_schema_documents_both_compatible_envelopes() -> None:
+    tools = {tool.name: tool for tool in asyncio.run(mcp_server.list_tools())}
+    properties = tools["call_tool"].parameters["properties"]
+    assert {"name", "tool_name", "arguments"} <= set(properties)
+    argument_types = properties["arguments"]["anyOf"]
+    assert {schema.get("type") for schema in argument_types} == {"object", "string", "null"}
 
 
 def test_historical_missing_tools_remain_visible_on_compact_surface() -> None:
@@ -80,6 +134,26 @@ def test_historical_missing_tools_respond_through_tool_layer(monkeypatch) -> Non
 
     assert health.structured_content["status"] == "unhealthy"
     assert accounts.structured_content["items"][0]["id"] == "act_123"
+
+
+def test_tool_layer_returns_allowlisted_structured_meta_errors(monkeypatch) -> None:
+    class FailingDiscoveryClient:
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            raise MetaApiError(
+                "Invalid parameter",
+                code=100,
+                user_message="Check the requested filter.",
+                details={"access_token": "must-not-leak"},
+            )
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FailingDiscoveryClient())
+    with pytest.raises(ToolError) as exc_info:
+        asyncio.run(mcp_server.call_tool("list_campaigns", {"account_id": "123"}))
+
+    payload = json.loads(str(exc_info.value))["error"]
+    assert payload["code"] == 100
+    assert payload["user_message"] == "Check the requested filter."
+    assert "access_token" not in str(exc_info.value)
 
 
 def test_compare_performance_responds_through_tool_layer(monkeypatch) -> None:
@@ -145,3 +219,16 @@ def test_compact_search_serializer_surfaces_required_targeting_category_params()
     result = serialize_search_results_compact([components["tool:get_targeting_categories@"]])
     assert "`get_targeting_categories` | req: category_class" in result
     assert "opt: query, account_id, limit" in result
+
+
+def test_live_search_routes_new_workflow_language_to_exact_tools() -> None:
+    cases = {
+        "submit multiple breakdown reports": "create_async_insights_report_batch",
+        "delete an ad set": "delete_adset",
+        "create target ROAS ad set with bid constraints": "create_ad_set",
+        "create creative": "create_ad_creative",
+        "insights with flattened purchase and purchase value columns": "get_entity_insights",
+    }
+    for query, expected in cases.items():
+        result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+        assert f"- `{expected}`" in result.content[0].text.splitlines()[1]
