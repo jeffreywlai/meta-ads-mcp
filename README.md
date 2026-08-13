@@ -240,6 +240,12 @@ export META_EXPORT_MAX_BYTES='1000000000'
 
 You can also place these in a `.env` file at the repo root.
 
+When `META_APP_SECRET` is set, authenticated Graph API requests using the
+configured `META_ACCESS_TOKEN` automatically include Meta's HMAC-SHA256
+`appsecret_proof`. A different token supplied as a request override is left
+unproved because it may belong to another app. The secret and generated proof
+are never included in public error payloads.
+
 Overflow settings are optional. Oversized MCP responses are saved as complete,
 owner-only JSON artifacts and replaced inline by an opaque `export_id`. Use the
 visible `call_tool` proxy with `name="read_overflow_artifact"` and the returned

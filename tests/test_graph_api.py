@@ -7,6 +7,7 @@ from collections import deque
 from datetime import datetime, timezone
 import pytest
 
+from meta_ads_mcp.auth import build_appsecret_proof
 from meta_ads_mcp.config import Settings
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError
 from meta_ads_mcp.graph_api import (
@@ -48,6 +49,7 @@ class FakeAsyncClient:
 
     responses: deque[FakeResponse]
     instances: list["FakeAsyncClient"] = []
+    requests: list[dict[str, object]] = []
 
     def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
         self.is_closed = False
@@ -60,27 +62,35 @@ class FakeAsyncClient:
         return None
 
     async def request(self, *args, **kwargs) -> FakeResponse:  # noqa: ANN002, ANN003
-        return self.responses.popleft()
+        FakeAsyncClient.requests.append({"args": args, **kwargs})
+        return FakeAsyncClient.responses.popleft()
 
     async def aclose(self) -> None:
         self.is_closed = True
 
 
-def _client(*, max_retries: int = 0) -> GraphAPIClient:
+def _client(
+    *,
+    max_retries: int = 0,
+    access_token: str = "token_123",
+    app_secret: str | None = None,
+    access_token_override: str | None = None,
+) -> GraphAPIClient:
     return GraphAPIClient(
         settings=Settings(
-            access_token="token_123",
+            access_token=access_token,
             api_version="v25.0",
             default_account_id=None,
             app_id=None,
-            app_secret=None,
+            app_secret=app_secret,
             redirect_uri=None,
             log_level="INFO",
             host="127.0.0.1",
             port=8000,
             request_timeout=30.0,
             max_retries=max_retries,
-        )
+        ),
+        access_token_override=access_token_override,
     )
 
 
@@ -88,9 +98,136 @@ def _client(*, max_retries: int = 0) -> GraphAPIClient:
 def clear_client_pool() -> None:
     _CLIENT_POOL.clear()
     FakeAsyncClient.instances.clear()
+    FakeAsyncClient.requests.clear()
     yield
     _CLIENT_POOL.clear()
     FakeAsyncClient.instances.clear()
+    FakeAsyncClient.requests.clear()
+
+
+def test_build_appsecret_proof_matches_meta_hmac_contract() -> None:
+    assert build_appsecret_proof("token_123", "secret_456") == (
+        "44e47e2eac8b6a54fe7a82ce8a314d259ff7359ad6e5888ad929f8012afaf369"
+    )
+
+
+def test_request_adds_appsecret_proof_without_mutating_caller_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"data": []})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    caller_params = {"limit": 25}
+
+    asyncio.run(
+        _client(app_secret="secret_456").request(
+            "GET",
+            "act_1/campaigns",
+            params=caller_params,
+        )
+    )
+
+    assert caller_params == {"limit": 25}
+    assert FakeAsyncClient.requests[0]["params"] == {
+        "limit": 25,
+        "appsecret_proof": "44e47e2eac8b6a54fe7a82ce8a314d259ff7359ad6e5888ad929f8012afaf369",
+    }
+
+
+def test_request_omits_appsecret_proof_for_unmatched_override_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"id": "ok"})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+
+    asyncio.run(
+        _client(
+            app_secret="secret_456",
+            access_token_override="override_token",
+        ).request("POST", "act_1/insights", data={"async": "true"})
+    )
+
+    request = FakeAsyncClient.requests[0]
+    assert request["headers"]["Authorization"] == "Bearer override_token"
+    assert request["params"] is None
+    assert request["data"] == {"async": "true"}
+
+
+def test_request_omits_appsecret_proof_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"data": []})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+
+    asyncio.run(_client().request("GET", "act_1/campaigns"))
+
+    assert FakeAsyncClient.requests[0]["params"] is None
+
+
+def test_unauthenticated_request_does_not_add_appsecret_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"data": {"is_valid": True}})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+
+    asyncio.run(
+        _client(app_secret="secret_456").request(
+            "GET",
+            "debug_token",
+            params={"input_token": "input", "access_token": "app|secret"},
+            use_auth_header=False,
+        )
+    )
+
+    request = FakeAsyncClient.requests[0]
+    assert "Authorization" not in request["headers"]
+    assert request["params"] == {
+        "input_token": "input",
+        "access_token": "app|secret",
+    }
+
+
+def test_system_user_token_request_omits_proof_for_unmatched_explicit_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"access_token": "generated"})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+
+    asyncio.run(
+        _client(app_secret="secret_456").generate_system_user_token(
+            "sys_123",
+            business_app="app_123",
+            scope=["ads_management"],
+            access_token="admin_token",
+        )
+    )
+
+    request = FakeAsyncClient.requests[0]
+    assert "Authorization" not in request["headers"]
+    assert request["params"] == {
+        "access_token": "admin_token",
+    }
+
+
+def test_system_user_token_request_adds_proof_for_configured_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"access_token": "generated"})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+
+    asyncio.run(
+        _client(app_secret="secret_456").generate_system_user_token(
+            "sys_123",
+            business_app="app_123",
+            scope=["ads_management"],
+            access_token="token_123",
+        )
+    )
+
+    request = FakeAsyncClient.requests[0]
+    assert request["params"] == {
+        "access_token": "token_123",
+        "appsecret_proof": build_appsecret_proof("token_123", "secret_456"),
+    }
 
 
 def test_request_maps_unsupported_get_request_to_unsupported_feature(monkeypatch: pytest.MonkeyPatch) -> None:

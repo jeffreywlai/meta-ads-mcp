@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from .auth import build_app_access_token, build_auth_headers
+from .auth import build_app_access_token, build_appsecret_proof, resolve_access_token
 from .config import Settings, get_settings
 from .errors import (
     AsyncJobError,
@@ -39,6 +39,16 @@ USAGE_HEADER_NAMES = (
 def normalize_account_id(account_id: str) -> str:
     """Ensure account ids use the Graph API act_ prefix."""
     return account_id if account_id.startswith("act_") else f"act_{account_id}"
+
+
+def _build_configured_appsecret_proof(
+    access_token: str,
+    settings: Settings,
+) -> str | None:
+    """Build a proof only when the configured secret is known to match the token."""
+    if not settings.app_secret or access_token != settings.access_token:
+        return None
+    return build_appsecret_proof(access_token, settings.app_secret)
 
 
 def _serialize_fields(fields: FieldList | None) -> str | None:
@@ -216,13 +226,24 @@ class GraphAPIClient:
     ) -> dict[str, Any]:
         """Make a Graph API request with basic retries."""
         headers = {"User-Agent": USER_AGENT}
+        effective_access_token: str | None = None
         if use_auth_header:
-            headers.update(
-                build_auth_headers(self.access_token_override, settings=self.settings)
+            effective_access_token = resolve_access_token(
+                self.access_token_override,
+                settings=self.settings,
             )
+            headers["Authorization"] = f"Bearer {effective_access_token}"
         url = f"{(base_url or self.base_url).rstrip('/')}/{endpoint.lstrip('/')}"
         retries = self.settings.max_retries + 1
         encoded_params = self._encode_mapping(params)
+        appsecret_proof = (
+            _build_configured_appsecret_proof(effective_access_token, self.settings)
+            if effective_access_token is not None
+            else None
+        )
+        if appsecret_proof is not None:
+            encoded_params = dict(encoded_params or {})
+            encoded_params["appsecret_proof"] = appsecret_proof
         encoded_data = self._encode_mapping(data)
 
         client = self._get_shared_client(base_url=base_url)
@@ -658,13 +679,23 @@ class GraphAPIClient:
         access_token: str | None = None,
     ) -> dict[str, Any]:
         """Request a system user token."""
-        headers = build_auth_headers(access_token or self.access_token_override, settings=self.settings)
+        effective_access_token = resolve_access_token(
+            access_token or self.access_token_override,
+            settings=self.settings,
+        )
+        params = {"access_token": effective_access_token}
+        appsecret_proof = _build_configured_appsecret_proof(
+            effective_access_token,
+            self.settings,
+        )
+        if appsecret_proof is not None:
+            params["appsecret_proof"] = appsecret_proof
         return await self.request(
             "POST",
             f"{system_user_id}/access_tokens",
             data={"business_app": business_app, "scope": scope},
             use_auth_header=False,
-            params={"access_token": headers["Authorization"].split(" ", 1)[1]},
+            params=params,
         )
 
     async def preview_ad(
