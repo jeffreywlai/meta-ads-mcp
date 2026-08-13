@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 from .config import Settings, get_settings
 from .errors import AuthError, ConfigError
 
@@ -30,6 +33,15 @@ def build_auth_headers(
 ) -> dict[str, str]:
     """Build Graph API auth headers."""
     return {"Authorization": f"Bearer {resolve_access_token(override, settings=settings)}"}
+
+
+def build_appsecret_proof(access_token: str, app_secret: str) -> str:
+    """Build Meta's HMAC-SHA256 proof for one effective access token."""
+    return hmac.new(
+        app_secret.encode("utf-8"),
+        msg=access_token.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
 
 
 def resolve_app_credentials(
