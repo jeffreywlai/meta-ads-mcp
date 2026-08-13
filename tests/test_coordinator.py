@@ -22,7 +22,7 @@ from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import discovery, insights, utility
 
 
-def test_fastmcp_31_search_transform_is_configured() -> None:
+def test_fastmcp_345_search_transform_is_configured() -> None:
     transforms = getattr(mcp_server, "transforms", [])
     assert transforms
     transform = transforms[0]

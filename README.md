@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![FastMCP 3.1](https://img.shields.io/badge/FastMCP-3.1-green.svg)](https://github.com/jlowin/fastmcp)
+[![FastMCP 3.4.5](https://img.shields.io/badge/FastMCP-3.4.5-green.svg)](https://github.com/PrefectHQ/fastmcp)
 [![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
 **An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 97 tools for querying, managing, and optimizing your ad accounts through natural language.**
@@ -19,7 +19,7 @@
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.1 tool search lets the LLM discover tools on demand instead of loading all 97 up front
+- 🔎 **Tool Search** — FastMCP 3.4.5 tool search lets the LLM discover tools on demand instead of loading all 97 up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
 ## 📋 Available Tools (97)
@@ -176,7 +176,7 @@
 | `read_overflow_artifact` | Retrieve one bounded JSON chunk from an oversized response |
 | `delete_overflow_artifact` | Delete an oversized response artifact after retrieval |
 
-FastMCP 3.1 also exposes dynamic search tools at runtime:
+FastMCP 3.4.5 also exposes dynamic search tools at runtime:
 
 | Tool | Description |
 |------|-------------|
@@ -438,8 +438,8 @@ meta-ads-mcp/
 ## 🛠️ Development
 
 ```bash
-uv sync                          # Install dependencies
-uv run pytest                    # Run tests
+uv sync --extra dev              # Install runtime and test dependencies
+uv run --extra dev pytest        # Run tests
 ```
 
 ### Project Notes
@@ -460,4 +460,4 @@ Questions, suggestions, or feedback? [Open an issue](https://github.com/jeffreyw
 
 ---
 
-**Built with [FastMCP 3.1](https://github.com/jlowin/fastmcp) and [Meta Marketing API v25.0](https://developers.facebook.com/docs/marketing-apis/)**
+**Built with [FastMCP 3.4.5](https://github.com/PrefectHQ/fastmcp) and [Meta Marketing API v25.0](https://developers.facebook.com/docs/marketing-apis/)**
