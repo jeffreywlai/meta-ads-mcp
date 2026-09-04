@@ -128,6 +128,27 @@ def test_native_optimization_signals_require_v26_before_client_creation(
         )
 
 
+def test_campaign_snapshot_rejects_native_signals_before_creating_reads(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("insights reads should not be created before v26 validation")
+
+    monkeypatch.setattr(diagnostics, "get_entity_insights", unexpected_read)
+    monkeypatch.setattr(diagnostics, "_child_insights", unexpected_read)
+
+    with pytest.raises(diagnostics.ValidationError, match="META_API_VERSION=v26.0"):
+        asyncio.run(
+            diagnostics.get_campaign_optimization_snapshot(
+                campaign_id="cmp_123",
+                include_native_signals=True,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("level", "object_id"),
     [("campaign", "cmp_123"), ("adset", "adset_123"), ("ad", "ad_123")],

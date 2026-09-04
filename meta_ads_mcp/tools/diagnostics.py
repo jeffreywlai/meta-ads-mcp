@@ -758,6 +758,11 @@ async def get_campaign_optimization_snapshot(
 ) -> dict[str, Any]:
     """Use this for a campaign health or optimization snapshot that ranks the most important ad sets and ads."""
     window = _window_kwargs(date_preset=date_preset, since=since, until=until)
+    native_scope = (
+        _validate_native_optimization_scope("campaign", campaign_id)
+        if include_native_signals
+        else None
+    )
     reads = [
         get_entity_insights(
             level="campaign",
@@ -767,11 +772,8 @@ async def get_campaign_optimization_snapshot(
         _child_insights(campaign_id, level="adset", **window),
         _child_insights(campaign_id, level="ad", **window),
     ]
-    if include_native_signals:
-        level, object_id = _validate_native_optimization_scope(
-            "campaign",
-            campaign_id,
-        )
+    if native_scope is not None:
+        level, object_id = native_scope
         reads.append(_native_optimization_payload(level, object_id))
     results = await asyncio.gather(*reads)
     campaign_scope, adsets, ads = results[:3]
