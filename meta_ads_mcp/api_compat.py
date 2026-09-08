@@ -91,8 +91,14 @@ def validate_insights_fields(
     *,
     api_version: str | None = None,
 ) -> None:
-    """Reject Insights metrics removed from Graph API v26 before an API call."""
+    """Reject Insights metrics unavailable in the configured API version."""
+    api_version = api_version or get_settings().api_version
     if not is_api_version_at_least((26, 0), api_version=api_version):
+        if any(field.strip() == "instagram_profile_follow" for field in fields):
+            raise ValidationError(
+                "instagram_profile_follow requires META_API_VERSION=v26.0 "
+                f"or newer; the configured version is {api_version!r}."
+            )
         return
 
     removed = sorted(

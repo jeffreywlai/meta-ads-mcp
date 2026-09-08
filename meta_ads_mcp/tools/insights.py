@@ -9,8 +9,7 @@ from datetime import date
 from io import StringIO
 from typing import Any, Literal
 
-from meta_ads_mcp.api_compat import is_api_version_at_least, validate_insights_fields
-from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.api_compat import validate_insights_fields
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import (
     compare_metric_sets,
@@ -337,14 +336,8 @@ def _insights_fields(
     ):
         if field not in requested:
             requested.append(field)
-    if include_instagram_profile_follow:
-        if not is_api_version_at_least((26, 0)):
-            raise ValidationError(
-                "include_instagram_profile_follow requires META_API_VERSION=v26.0 "
-                f"or newer; the configured version is {get_settings().api_version!r}."
-            )
-        if INSTAGRAM_PROFILE_FOLLOW_FIELD not in requested:
-            requested.append(INSTAGRAM_PROFILE_FOLLOW_FIELD)
+    if include_instagram_profile_follow and INSTAGRAM_PROFILE_FOLLOW_FIELD not in requested:
+        requested.append(INSTAGRAM_PROFILE_FOLLOW_FIELD)
     validate_insights_fields(requested)
     return requested
 

@@ -54,12 +54,22 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"include_instagram_profile_follow": True},
+        {"fields": ["instagram_profile_follow"]},
+        {"fields": "spend, instagram_profile_follow"},
+        {"fields": ["instagram_profile_follow"], "include_instagram_profile_follow": True},
+    ],
+)
 def test_get_entity_insights_can_include_instagram_profile_follows(
-    monkeypatch,
+    monkeypatch, options,
 ) -> None:
     class InstagramFollowClient(FakeInsightsClient):
         async def get_insights(self, object_id: str, *, fields, params):
             assert fields[-1] == "instagram_profile_follow"
+            assert fields.count("instagram_profile_follow") == 1
             payload = await super().get_insights(object_id, fields=fields, params=params)
             payload["data"][0]["instagram_profile_follow"] = "7"
             return payload
@@ -72,15 +82,27 @@ def test_get_entity_insights_can_include_instagram_profile_follows(
         insights.get_entity_insights(
             level="account",
             object_id="act_123",
-            include_instagram_profile_follow=True,
+            **options,
         )
     )
 
     assert result["items"][0]["instagram_profile_follow"] == 7
 
 
-def test_instagram_profile_follow_option_requires_v26_before_client_creation(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("tool_name", "scope", "options"),
+    [
+        ("get_entity_insights", {"level": "account", "object_id": "act_123"}, {"include_instagram_profile_follow": True}),
+        ("get_entity_insights", {"level": "account", "object_id": "act_123"}, {"fields": ["instagram_profile_follow"]}),
+        ("get_entity_insights", {"level": "account", "object_id": "act_123"}, {"fields": "spend, instagram_profile_follow"}),
+        ("get_insights", {"level": "account", "object_id": "act_123"}, {"fields": ["instagram_profile_follow"]}),
+        ("export_insights", {"level": "account", "object_id": "act_123"}, {"fields": ["instagram_profile_follow"]}),
+        ("create_async_insights_report", {"level": "account", "object_id": "act_123"}, {"fields": ["instagram_profile_follow"]}),
+        ("get_async_insights_report", {"report_run_id": "rpt_123"}, {"fields": "spend, instagram_profile_follow"}),
+    ],
+)
+def test_instagram_profile_follow_requires_v26_before_client_creation(
+    monkeypatch, tool_name, scope, options,
 ) -> None:
     monkeypatch.setenv("META_API_VERSION", "v25.0")
     reload_settings()
@@ -92,11 +114,7 @@ def test_instagram_profile_follow_option_requires_v26_before_client_creation(
 
     with pytest.raises(insights.ValidationError, match="META_API_VERSION=v26.0"):
         asyncio.run(
-            insights.get_entity_insights(
-                level="account",
-                object_id="act_123",
-                include_instagram_profile_follow=True,
-            )
+            getattr(insights, tool_name)(**scope, **options)
         )
 
 
@@ -1144,6 +1162,35 @@ class FakeAsyncInsightsClient:
 
     async def create_async_insights_report(self, object_id: str, *, fields, params):
         return {"report_run_id": "rpt_created", "async_status": "Job Running"}
+
+
+def test_async_insights_accept_explicit_instagram_profile_follow_on_v26(monkeypatch) -> None:
+    class InstagramFollowClient(FakeAsyncInsightsClient):
+        async def create_async_insights_report(self, object_id: str, *, fields, params):
+            assert fields == ["instagram_profile_follow"]
+            return await super().create_async_insights_report(object_id, fields=fields, params=params)
+
+        async def get_async_report(self, report_run_id: str, *, fields=None, limit=100, after=None):
+            assert fields == ["instagram_profile_follow"]
+            return {
+                "status": {"id": report_run_id, "async_status": "Job Completed"},
+                "rows": {"data": [{"instagram_profile_follow": "7"}]},
+            }
+
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    reload_settings()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: InstagramFollowClient({}))
+    report = asyncio.run(
+        insights.create_async_insights_report(
+            level="account", object_id="act_123", fields=["instagram_profile_follow"],
+        )
+    )
+    result = asyncio.run(
+        insights.get_async_insights_report(
+            report_run_id=report["report_run_id"], fields="instagram_profile_follow",
+        )
+    )
+    assert result["rows"]["items"][0]["instagram_profile_follow"] == 7
 
 
 def test_create_async_insights_report_returns_poll_hint(monkeypatch) -> None:
