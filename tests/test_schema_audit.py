@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from meta_ads_mcp import schema_audit
+from meta_ads_mcp.tools.diagnostics import NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL
 
 
 def _field_source(fields: set[str]) -> str:
@@ -25,7 +26,7 @@ def _fake_sources(*, missing_target: tuple[str, str] | None = None):
     for surface_name, exceptions in schema_audit.SDK_FIELD_EXCEPTIONS.items():
         object_name, _ = schema_audit._local_field_surfaces()[surface_name]
         fields_by_object[object_name].difference_update(exceptions)
-    for object_name, fields in schema_audit.NATIVE_OPTIMIZATION_FIELDS.items():
+    for object_name, fields in NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL.items():
         fields_by_object[object_name].update(fields)
 
     def read_ref_file(_repo: Path, ref: str, path: str) -> str:
@@ -66,9 +67,9 @@ def test_v26_audit_accepts_current_local_field_surfaces(monkeypatch) -> None:
     assert all(surface["compatible"] for surface in report["surfaces"].values())
     assert report["surfaces"]["discovery.page"]["sdk_unverified_fields"] == ["tasks"]
     assert report["schema_changes"]["adsinsights"]["removed"] == ["removed_metric"]
-    assert report["gate"]["native_optimization_signals"] == (
-        "blocked_until_v26_live_smoke_passes"
-    )
+    assert report["gate"]["native_optimization_signals"] == "passed_and_implemented"
+    assert report["surfaces"]["diagnostics.native_adset"]["compatible"] is True
+    assert report["surfaces"]["insights.instagram_profile_follow"]["compatible"] is True
 
 
 def test_v26_audit_fails_when_target_removes_a_local_field(monkeypatch) -> None:

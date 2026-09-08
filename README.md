@@ -64,6 +64,7 @@
 |------|-------------|
 | `get_account_optimization_snapshot` | Full account health and optimization summary |
 | `get_campaign_optimization_snapshot` | Campaign-level optimization summary |
+| `get_native_optimization_signals` | v26-native campaign, ad-set, or ad delivery and issue signals |
 | `get_account_health_snapshot` | Account totals with previous-window and YoY comparisons |
 | `detect_auction_overlap` | Directional cannibalization screen across campaigns |
 | `get_ad_feedback_signals` | Feedback availability and quality-ranking signals |
@@ -261,6 +262,13 @@ uv run audit-meta-sdk-schema \
 See [the v26 compatibility audit](docs/v26_compatibility_audit.md) for current
 findings and the read-only live gate required before enabling v26-native
 optimization signals.
+
+With `META_API_VERSION=v26.0` or newer, use
+`get_native_optimization_signals` for entity-native delivery, learning, issue,
+automation, and recommendation payloads. `get_entity_insights` can opt into
+the v26 `instagram_profile_follow` metric with
+`include_instagram_profile_follow=true`. The repository default remains v25,
+so both options fail early with a version-specific validation error on v25.
 
 Overflow settings are optional. Oversized MCP responses are saved as complete,
 owner-only JSON artifacts and replaced inline by an opaque `export_id`. Use the

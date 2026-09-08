@@ -429,6 +429,7 @@ These are the core v1 tools.
 - `compare_time_ranges`
 - `get_account_optimization_snapshot`
 - `get_campaign_optimization_snapshot`
+- `get_native_optimization_signals`
 - `get_budget_pacing_report`
 - `get_creative_performance_report`
 - `get_creative_fatigue_report`
@@ -866,6 +867,27 @@ Output:
 - creative concentration
 - delivery risks
 - suggested next tools
+
+### `get_native_optimization_signals`
+
+Purpose:
+Read Meta's native campaign, ad-set, or ad optimization diagnostics after the
+v26 live compatibility gate has passed.
+
+Inputs:
+
+- `level`: `campaign`, `adset`, or `ad`
+- `object_id`
+
+Output:
+
+- returned native delivery, learning, issue, automation, and recommendation signals
+- requested and available signal names
+- fields not returned for the selected entity
+- normalized `budget_remaining` and its currency when available
+
+This tool requires `META_API_VERSION=v26.0` or newer. Campaign snapshots can
+include the campaign-level payload with `include_native_signals=true`.
 
 ### `get_account_health_snapshot`
 

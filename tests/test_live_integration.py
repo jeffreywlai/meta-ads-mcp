@@ -167,11 +167,18 @@ def test_live_v26_insights_contract(monkeypatch: pytest.MonkeyPatch) -> None:
             level="account",
             object_id=account_id,
             date_preset="last_7d",
+            include_instagram_profile_follow=True,
         )
     )
 
     assert result["summary"]["count"] >= 0
     assert "metrics" in result["summary"]
+    assert all(
+        "instagram_profile_follow" not in row
+        or row["instagram_profile_follow"] is None
+        or isinstance(row["instagram_profile_follow"], int)
+        for row in result["items"]
+    )
 
 
 @pytest.mark.v26_live
@@ -182,70 +189,48 @@ def test_live_v26_native_optimization_field_contract(
     monkeypatch.setenv("META_API_VERSION", "v26.0")
     _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
     account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
-    client = get_graph_api_client()
-
     campaigns_page = _run(discovery.list_campaigns(account_id=account_id, limit=1))
     if not campaigns_page["items"]:
         pytest.skip("The v26 live account has no campaign for optimization probes.")
     campaign_id = str(campaigns_page["items"][0]["id"])
     campaign = _run(
-        client.get_object(
-            campaign_id,
-            fields=[
-                "advantage_state_info",
-                "budget_rebalance_flag",
-                "budget_remaining",
-                "frequency_control_specs",
-                "issues_info",
-                "pacing_type",
-                "recommendations",
-            ],
+        diagnostics.get_native_optimization_signals(
+            level="campaign",
+            object_id=campaign_id,
         )
     )
-    assert campaign.get("id") in {None, campaign_id}
+    assert campaign["scope"]["object_id"] == campaign_id
+    assert campaign["requested_signals"] == (
+        diagnostics.NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL["campaign"]
+    )
 
     adsets_page = _run(discovery.list_adsets(campaign_id=campaign_id, limit=1))
     if not adsets_page["items"]:
         pytest.skip("The v26 live campaign has no ad set for optimization probes.")
     adset_id = str(adsets_page["items"][0]["id"])
     adset = _run(
-        client.get_object(
-            adset_id,
-            fields=[
-                "anchor_event_attribution_window_days",
-                "attribution_spec",
-                "bid_adjustments",
-                "budget_remaining",
-                "destination_type",
-                "frequency_control_specs",
-                "issues_info",
-                "learning_stage_info",
-                "optimization_sub_event",
-                "pacing_type",
-                "recommendations",
-                "targeting_optimization_types",
-            ],
+        diagnostics.get_native_optimization_signals(
+            level="adset",
+            object_id=adset_id,
         )
     )
-    assert adset.get("id") in {None, adset_id}
+    assert adset["scope"]["object_id"] == adset_id
+    assert "anchor_event_attribution_window_days" in adset["requested_signals"]
 
     ads_page = _run(discovery.list_ads(campaign_id=campaign_id, limit=1))
     if not ads_page["items"]:
         pytest.skip("The v26 live campaign has no ad for optimization probes.")
     ad_id = str(ads_page["items"][0]["id"])
     ad = _run(
-        client.get_object(
-            ad_id,
-            fields=[
-                "ad_review_feedback",
-                "creative_automation_spec",
-                "failed_delivery_checks",
-                "issues_info",
-                "recommendations",
-            ],
+        diagnostics.get_native_optimization_signals(
+            level="ad",
+            object_id=ad_id,
         )
     )
-    assert ad.get("id") in {None, ad_id}
+    assert ad["scope"]["object_id"] == ad_id
+    assert ad["requested_signals"] == (
+        diagnostics.NATIVE_OPTIMIZATION_FIELDS_BY_LEVEL["ad"]
+    )
 
 
 def test_live_read_only_account_with_no_spend_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -84,3 +84,20 @@ def test_validate_insights_fields_preserves_v25_behavior() -> None:
         ["marketing_messages_website_purchase"],
         api_version="v25.0",
     )
+
+
+@pytest.mark.parametrize("api_version", ["v25.0", "latest"])
+def test_instagram_profile_follow_requires_v26(api_version: str) -> None:
+    with pytest.raises(ValidationError, match="instagram_profile_follow requires META_API_VERSION=v26.0"):
+        validate_insights_fields(
+            ["spend", " instagram_profile_follow "],
+            api_version=api_version,
+        )
+
+
+@pytest.mark.parametrize("api_version", ["v26.0", "v27.0"])
+def test_instagram_profile_follow_accepts_v26_or_newer(api_version: str) -> None:
+    validate_insights_fields(
+        ["spend", "instagram_profile_follow"],
+        api_version=api_version,
+    )
