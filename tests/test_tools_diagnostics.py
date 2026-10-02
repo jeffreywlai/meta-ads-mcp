@@ -702,7 +702,7 @@ def test_creative_fatigue_report_accepts_level_and_object_id(monkeypatch) -> Non
     assert result["analyzed_level"] == "ad"
 
 
-def test_creative_fatigue_report_returns_insufficient_data_when_no_signal(monkeypatch) -> None:
+def test_creative_fatigue_report_returns_no_pattern_when_no_signal(monkeypatch) -> None:
     async def fake_child_insights(*args, **kwargs):
         return [{"ad_id": "ad1", "metrics": {"ctr": 0.03, "frequency": 2.0}}]
 
@@ -714,7 +714,20 @@ def test_creative_fatigue_report_returns_insufficient_data_when_no_signal(monkey
     monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
     monkeypatch.setattr(diagnostics, "date", FixedDate)
     result = asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123"))
+    assert result["findings"][0]["type"] == "no_pattern_detected"
+    assert result["comparison_count"] == 1
+
+
+@pytest.mark.parametrize("rows", [[], [{"ad_id": "ad1", "metrics": {"ctr": None, "frequency": 2.0}}]])
+def test_fatigue_keeps_insufficient_data_for_unusable_comparisons(monkeypatch, rows) -> None:
+    async def fake_child_insights(*args, **kwargs):
+        return rows
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123"))
+
     assert result["findings"][0]["type"] == "insufficient_data"
+    assert result["comparison_count"] == 0
 
 
 def test_creative_fatigue_report_supports_explicit_windows(monkeypatch) -> None:

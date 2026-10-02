@@ -1118,6 +1118,7 @@ async def get_creative_fatigue_report(
     )
     previous_by_id = {row.get("ad_id") or row.get("id"): row for row in previous_rows}
     findings: list[dict[str, Any]] = []
+    comparison_count = 0
     for current in current_rows:
         entity_id = current.get("ad_id") or current.get("id")
         prior = previous_by_id.get(entity_id)
@@ -1126,7 +1127,10 @@ async def get_creative_fatigue_report(
         comparison = compare_metric_sets(current["metrics"], prior["metrics"])
         ctr_drop = comparison["ctr"]["pct_delta"]
         freq_rise = comparison["frequency"]["pct_delta"]
-        if (ctr_drop is not None and ctr_drop <= -0.2) and (freq_rise is not None and freq_rise >= 0.2):
+        if ctr_drop is None or freq_rise is None:
+            continue
+        comparison_count += 1
+        if ctr_drop <= -0.2 and freq_rise >= 0.2:
             findings.append(
                 build_finding(
                     "creative_fatigue_risk",
@@ -1167,8 +1171,12 @@ async def get_creative_fatigue_report(
         metrics={},
         findings=findings or [
             build_finding(
-                "insufficient_data",
-                "No strong fatigue pattern was detected across the compared windows.",
+                "no_pattern_detected" if comparison_count else "insufficient_data",
+                (
+                    "No strong fatigue pattern was detected across the compared windows."
+                    if comparison_count
+                    else "No comparable CTR and frequency data was available across the selected windows."
+                ),
                 severity="low",
                 confidence=0.4,
             )
@@ -1177,6 +1185,7 @@ async def get_creative_fatigue_report(
             "analyzed_level": "ad",
             "current_window": current_window,
             "previous_window": previous_window_range,
+            "comparison_count": comparison_count,
         },
     )
 

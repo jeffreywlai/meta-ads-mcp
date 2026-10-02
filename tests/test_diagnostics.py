@@ -28,6 +28,18 @@ def test_detect_snapshot_findings_does_not_treat_unknown_conversions_as_zero(met
     assert not any(finding["type"] == "high_spend_low_conversion" for finding in findings)
 
 
+@pytest.mark.parametrize(
+    ("metrics", "expected"),
+    [
+        ({"spend": 100, "conversions": 2, "roas": 2}, "no_pattern_detected"),
+        ({}, "insufficient_data"),
+        ({"spend": 100, "conversions": None}, "insufficient_data"),
+    ],
+)
+def test_snapshot_distinguishes_no_pattern_from_missing_data(metrics, expected) -> None:
+    assert detect_snapshot_findings(metrics)[0]["type"] == expected
+
+
 def test_detect_snapshot_findings_supports_nested_child_spend() -> None:
     findings = detect_snapshot_findings(
         {"spend": 400.0, "conversions": 4.0},
