@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import mcp.types as mt
 import pytest
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware.middleware import MiddlewareContext
 
-from meta_ads_mcp.error_middleware import StructuredMetaErrorMiddleware
+from meta_ads_mcp.error_middleware import StructuredMetaErrorMiddleware, ToolParameterHelpMiddleware
 from meta_ads_mcp.errors import MetaApiError, RateLimitError
 
 
@@ -18,6 +19,36 @@ def _context() -> MiddlewareContext:
     return MiddlewareContext(
         message=mt.CallToolRequestParams(name="failing_tool", arguments={})
     )
+
+
+@pytest.mark.parametrize("additional_properties", [True, False])
+def test_keyword_help_respects_the_live_schema_before_execution(additional_properties) -> None:
+    class SchemaServer:
+        async def get_tool(self, name):
+            return SimpleNamespace(name=name, parameters={
+                "properties": {"known": {"type": "string"}},
+                "additionalProperties": additional_properties,
+            })
+
+    context = MiddlewareContext(
+        message=mt.CallToolRequestParams(name="example", arguments={"extra": "must-not-leak"}),
+        fastmcp_context=SimpleNamespace(fastmcp=SchemaServer()),
+    )
+    executed = []
+
+    async def call_next(context):
+        executed.append(True)
+        return "result"
+
+    middleware = ToolParameterHelpMiddleware()
+    if additional_properties:
+        assert asyncio.run(middleware.on_call_tool(context, call_next)) == "result"
+        assert executed
+    else:
+        with pytest.raises(ToolError, match="Accepted parameters: known") as exc_info:
+            asyncio.run(middleware.on_call_tool(context, call_next))
+        assert "must-not-leak" not in str(exc_info.value)
+        assert not executed
 
 
 def test_meta_api_errors_are_allowlisted_and_actionable() -> None:

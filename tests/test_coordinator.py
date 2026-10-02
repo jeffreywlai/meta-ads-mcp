@@ -9,7 +9,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 
 from meta_ads_mcp import stdio  # noqa: F401 - ensures tools are registered
-from meta_ads_mcp.config import Settings
+from meta_ads_mcp.config import Settings, reload_settings
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
     MAX_TOOL_RESPONSE_BYTES,
@@ -19,7 +19,7 @@ from meta_ads_mcp.coordinator import (
     serialize_search_results_compact,
 )
 from meta_ads_mcp.errors import MetaApiError
-from meta_ads_mcp.tools import discovery, insights, utility
+from meta_ads_mcp.tools import diagnostics, discovery, insights, utility
 
 
 def test_fastmcp_347_search_transform_is_configured() -> None:
@@ -36,9 +36,10 @@ def test_response_size_guard_is_configured() -> None:
     assert type(middleware).__name__ == "ArchivedResponseLimitingMiddleware"
     assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
     assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
-    assert mcp_server.middleware[-3] is RESPONSE_LIMITING_MIDDLEWARE
-    assert type(mcp_server.middleware[-2]).__name__ == "StructuredMetaErrorMiddleware"
-    assert type(mcp_server.middleware[-1]).__name__ == "ReadOnlyAdvertisingMiddleware"
+    assert mcp_server.middleware[-4] is RESPONSE_LIMITING_MIDDLEWARE
+    assert type(mcp_server.middleware[-3]).__name__ == "StructuredMetaErrorMiddleware"
+    assert type(mcp_server.middleware[-2]).__name__ == "ReadOnlyAdvertisingMiddleware"
+    assert type(mcp_server.middleware[-1]).__name__ == "ToolParameterHelpMiddleware"
 
 
 def test_list_tools_exposes_compact_search_surface() -> None:
@@ -201,8 +202,12 @@ def test_compact_search_serializer_returns_minimal_markdown() -> None:
     ]
     result = serialize_search_results_compact(tools)
     assert "Matches:" in result
-    assert "`get_entity_insights` | req: level, object_id" in result
-    assert "`compare_performance` | req: level, object_ids" in result
+    assert "`get_entity_insights` | req: level (string), object_id (string)" in result
+    assert "`compare_performance` | req: level (string), object_ids (string or list[string])" in result
+    assert "fields (string or list[string] or null)" in result
+    assert "filtering (list[object] or null)" in result
+    assert "limit (integer)" in result
+    assert "fetch_all (boolean)" in result
     assert "properties" not in result
     assert "additionalProperties" not in result
     assert "Next: use `call_tool`" in result
@@ -213,26 +218,160 @@ def test_compact_search_serializer_returns_minimal_markdown() -> None:
         assert "+" not in line
 
 
-def test_proxy_unknown_arguments_list_accepted_parameters_before_fetch(monkeypatch) -> None:
+def test_every_registered_tool_has_all_parameter_names_and_types_in_search() -> None:
+    components = mcp_server.local_provider.__dict__["_components"]
+    for key, tool in components.items():
+        if not key.startswith("tool:"):
+            continue
+        result = serialize_search_results_compact([tool])
+        for name in tool.parameters.get("properties", {}):
+            assert f"{name} (" in result.splitlines()[1]
+        assert "+" not in result
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_unknown_arguments_list_accepted_parameters_before_fetch(monkeypatch, routed) -> None:
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: pytest.fail("must not fetch"))
+    arguments = {"account_id": "act_123", "not_a_parameter": True}
+    if routed:
+        arguments = {"name": "list_ads", "arguments": arguments}
     with pytest.raises(ToolError, match="Accepted parameters: account_id, campaign_id, adset_id"):
-        asyncio.run(mcp_server.call_tool("call_tool", {
-            "name": "list_ads", "arguments": {"account_id": "act_123", "not_a_parameter": True},
-        }))
+        asyncio.run(mcp_server.call_tool("call_tool" if routed else "list_ads", arguments))
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_every_registered_tool_lists_all_accepted_keywords_before_execution(routed) -> None:
+    components = mcp_server.local_provider.__dict__["_components"]
+    for key, component in components.items():
+        if not key.startswith("tool:"):
+            continue
+        arguments = {"not_a_parameter": "must-not-be-echoed"}
+        if routed:
+            arguments = {"name": component.name, "arguments": arguments}
+        with pytest.raises(ToolError) as exc_info:
+            asyncio.run(mcp_server.call_tool("call_tool" if routed else component.name, arguments))
+        expected = ", ".join(component.parameters.get("properties", {})) or "(none)"
+        assert f"Accepted parameters: {expected}." in str(exc_info.value)
+        assert "must-not-be-echoed" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_keyword_help_preserves_tool_name_and_argument_aliases(monkeypatch, routed) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: pytest.fail("must not fetch"))
+    arguments = {"not_a_parameter": True}
+    if routed:
+        arguments = {"tool_name": "list_ad_sets", "arguments": json.dumps(arguments)}
+    with pytest.raises(ToolError, match="Unknown parameters for list_adsets") as exc_info:
+        asyncio.run(mcp_server.call_tool("call_tool" if routed else "list_ad_sets", arguments))
+    tool = asyncio.run(mcp_server.get_tool("list_adsets"))
+    assert f"Accepted parameters: {', '.join(tool.parameters['properties'])}." in str(exc_info.value)
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_read_only_policy_rejects_names_before_keyword_help(monkeypatch, routed) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    for name in ("create_adset", "get_unknown_action"):
+        arguments = {"not_a_parameter": True}
+        if routed:
+            arguments = {"tool_name": name, "arguments": json.dumps(arguments)}
+        with pytest.raises(ToolError, match="META_READ_ONLY") as exc_info:
+            asyncio.run(mcp_server.call_tool("call_tool" if routed else name, arguments))
+        assert "Accepted parameters:" not in str(exc_info.value)
+
+
+HISTORICAL_F10_ARGUMENTS = [
+    ("get_creative_fatigue_report", {"account_id": "act_123"}, True),
+    ("get_creative_fatigue_report", {"level": "account", "object_id": "act_123"}, True),
+    ("get_creative_fatigue_report", {
+        "level": "campaign", "object_id": "cmp_123", "window_days": 28,
+        "date_preset": "last_30d", "since": "2026-07-01", "until": "2026-08-12",
+        "min_spend": 1, "limit": 50, "include_low_confidence": True, "refresh": True,
+        "adset_id": "x", "ad_id": "x", "breakdowns": ["publisher_platform"],
+    }, False),
+    ("get_creative_fatigue_report", {
+        "level": "campaign", "object_id": "cmp_123", "previous_since": "2026-06-01",
+        "previous_until": "2026-06-30", "current_since": "2026-07-13", "current_until": "2026-08-12",
+        "min_impressions": 1000, "threshold": 0.1, "time_increment": 7, "format": "json",
+    }, False),
+    ("list_ads", {
+        "account_id": "act_123", "effective_status": ["ACTIVE"], "name_contains": "Ada",
+        "limit": 200, "fields": ["id", "name"],
+    }, True),
+    ("get_insights", {
+        "level": "account", "object_id": "act_123", "since": "2025-04-17", "until": "2026-09-16",
+        "breakdowns": ["publisher_platform", "platform_position"],
+        "fields": ["spend", "impressions", "inline_link_clicks", "purchase_roas"],
+        "filtering": [{"field": "ad.name", "operator": "CONTAIN", "value": "NAME_PREFIX"}],
+        "action_attribution_windows": ["7d_click"],
+    }, True),
+    ("get_entity_insights", {
+        "level": "ad", "object_id": "ad_123", "since": "2026-03-17", "until": "2026-07-28",
+        "breakdowns": ["publisher_platform", "platform_position"],
+        "fields": ["spend", "impressions", "clicks", "actions", "action_values"],
+        "action_attribution_windows": ["7d_click"], "action_columns": ["purchase"],
+        "bogus_param_to_list": True,
+    }, False),
+    ("list_ads", {
+        "account_id": "act_123", "name_contains": "NAME_PREFIX", "limit": 100,
+        "fields": ["id", "creative{asset_feed_spec{images}}"],
+    }, True),
+    ("get_insights", {
+        "level": "adset", "object_id": "adset_123", "since": "2025-04-17", "until": "2025-06-30",
+        "fields": ["ad_id", "ad_name", "spend", "impressions", "inline_link_clicks"],
+        "breakdowns": ["publisher_platform", "platform_position"], "insights_level": "ad",
+    }, False),
+]
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize(("name", "arguments", "now_supported"), HISTORICAL_F10_ARGUMENTS)
+def test_historical_f10_argument_sets_are_supported_or_list_accepted_keywords(
+    monkeypatch, routed, name, arguments, now_supported,
+) -> None:
+    client_creations = []
+
+    class RecordedClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            return {"data": []}
+
+        async def get_insights(self, object_id, *, fields, params):
+            return {"data": []}
+
+    def get_client():
+        client_creations.append(True)
+        return RecordedClient()
+
+    for module in (discovery, insights, diagnostics):
+        monkeypatch.setattr(module, "get_graph_api_client", get_client)
+    tool = "call_tool" if routed else name
+    call_arguments = {"name": name, "arguments": arguments} if routed else arguments
+    if now_supported:
+        result = asyncio.run(mcp_server.call_tool(tool, call_arguments))
+        assert result.structured_content is not None
+        assert client_creations
+    else:
+        with pytest.raises(ToolError) as exc_info:
+            asyncio.run(mcp_server.call_tool(tool, call_arguments))
+        schema = asyncio.run(mcp_server.get_tool(name)).parameters
+        assert f"Accepted parameters: {', '.join(schema['properties'])}." in str(exc_info.value)
+        for rejected in set(arguments) - set(schema["properties"]):
+            assert rejected in str(exc_info.value)
+        assert not client_creations
 
 
 def test_compact_search_serializer_surfaces_required_archive_params() -> None:
     components = mcp_server.local_provider.__dict__["_components"]
     result = serialize_search_results_compact([components["tool:search_ads_archive@"]])
-    assert "`search_ads_archive` | req: search_terms, ad_reached_countries" in result
-    assert "opt: ad_type, limit, fields" in result
+    assert "`search_ads_archive` | req: search_terms (string), ad_reached_countries (string or list[string])" in result
+    assert "opt: ad_type (string), limit (integer), fields (string or list[string] or null)" in result
 
 
 def test_compact_search_serializer_surfaces_required_targeting_category_params() -> None:
     components = mcp_server.local_provider.__dict__["_components"]
     result = serialize_search_results_compact([components["tool:get_targeting_categories@"]])
-    assert "`get_targeting_categories` | req: category_class" in result
-    assert "opt: query, account_id, limit" in result
+    assert "`get_targeting_categories` | req: category_class (string)" in result
+    assert "opt: query (string or null), account_id (string or null), limit (integer)" in result
 
 
 def test_live_search_routes_new_workflow_language_to_exact_tools() -> None:
