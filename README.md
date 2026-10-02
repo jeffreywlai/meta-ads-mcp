@@ -328,6 +328,11 @@ It includes reporting-position hints (Instagram `stream` becomes `feed`;
 unknown values pass through). These are configured eligibility rules, not proof
 that a specific image served. Placement Insights show delivery totals, but do
 not establish image-level delivery when several assets are eligible.
+Pass `ad_ids=["AD_1","AD_2"]` instead of `ad_id` for a collection of up to 100
+distinct ads. Creative reads and image-hash lookups are reused within that call,
+with image caching scoped to the owning account. Unresolved image hashes remain
+explicit. This uses the existing per-object Graph reads, not a new batch job or
+persistent cache.
 
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is

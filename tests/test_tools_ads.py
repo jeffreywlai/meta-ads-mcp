@@ -240,6 +240,62 @@ def test_image_rules_are_exposed_without_claiming_actual_delivery(monkeypatch) -
     assert "not actual delivery" in result["summary"]["placement_note"]
 
 
+def test_bulk_image_inspection_reuses_creative_and_image_reads_for_95_ads(monkeypatch) -> None:
+    calls = []
+
+    class BulkClient(FakeAdsClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            calls.append(object_id)
+            if object_id.startswith("ad_"):
+                return {"id": object_id, "name": object_id, "account_id": "act_123", "creative": {"id": "crt_123"}}
+            return await super().get_object(object_id, fields=fields, params=params)
+
+        async def get_ad_images_by_hashes(self, account_id, *, hashes, fields=None):
+            calls.append((account_id, tuple(hashes)))
+            return await super().get_ad_images_by_hashes(account_id, hashes=hashes, fields=fields)
+
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: BulkClient())
+    result = asyncio.run(ads.get_ad_image(ad_ids=[f"ad_{index}" for index in range(95)]))
+    assert len(result["items"]) == 95
+    assert result["summary"]["complete"] is True
+    assert result["summary"]["unique_creative_count"] == 1
+    assert len(calls) == 97  # 95 ad reads, one creative read, one image lookup.
+    assert calls.count("crt_123") == 1
+
+
+def test_bulk_image_cache_is_account_scoped_and_preserves_unresolved_hashes(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+    accounts = []
+
+    class AccountImagesClient:
+        async def get_object(self, object_id, *, fields=None):
+            if object_id.startswith("ad_"):
+                return {"id": object_id, "account_id": "123" if object_id == "ad_1" else "456", "creative": {"id": "crt"}}
+            return {"image_hash": "same_hash"}
+
+        async def get_ad_images_by_hashes(self, account_id, *, hashes, fields=None):
+            accounts.append(account_id)
+            return {"data": [{"hash": "same_hash", "url": "https://example.com/123"}]} if account_id == "123" else {"data": []}
+
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: AccountImagesClient())
+    result = asyncio.run(mcp_server.call_tool("get_ad_image", {"ad_ids": "ad_1,ad_1,ad_2"})).structured_content
+    assert accounts == ["123", "456"]
+    assert result["summary"]["count"] == 2
+    assert result["items"][0]["resolved_images"][0]["url"] == "https://example.com/123"
+    assert result["items"][1]["unresolved_image_hashes"] == ["same_hash"]
+    assert result["items"][1]["resolved_images"] == []
+
+
+@pytest.mark.parametrize("arguments", [
+    {}, {"ad_id": "ad_1", "ad_ids": ["ad_2"]}, {"ad_ids": []}, {"ad_id": " "},
+    {"ad_ids": [f"ad_{index}" for index in range(101)]},
+])
+def test_bulk_image_inputs_are_bounded_before_client(monkeypatch, arguments) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError):
+        asyncio.run(ads.get_ad_image(**arguments))
+
+
 def test_get_ad_image_handles_ad_without_creative(monkeypatch) -> None:
     class NoCreativeClient(FakeAdsClient):
         async def get_object(self, object_id: str, *, fields=None, params=None):
