@@ -773,11 +773,11 @@ async def get_entity_insights(
     include_instagram_profile_follow: bool = False,
     limit: int = 100,
     after: str | None = None,
-    include_raw_actions: bool = True,
+    include_raw_actions: bool = False,
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
 ) -> dict[str, Any]:
-    """Return paginated insights with optional flattened purchase, purchase-value, or other action columns. level selects row granularity; object_id selects the parent scope. Supports native filtering and compact rows with include_raw_actions=false."""
+    """Return compact paginated insights with optional flattened action columns. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for raw action arrays/maps or named click/view attribution-window comparisons; derived metrics use Meta's generic action values."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     if limit < 1:
@@ -843,7 +843,7 @@ async def get_entity_insights(
     if action_attribution_windows:
         response["summary"]["attribution_note"] = (
             "Derived conversion metrics, action maps, and flattened action columns use Meta's generic value, "
-            "not the named attribution-window fields. Keep include_raw_actions=true and read the named "
+            "not the named attribution-window fields. Set include_raw_actions=true and read the named "
             "window keys in actions/action_values for a click/view split."
         )
     if action_types:
@@ -879,11 +879,11 @@ async def get_insights(
     action_attribution_windows: StringList | None = None,
     limit: int = 100,
     after: str | None = None,
-    include_raw_actions: bool = True,
+    include_raw_actions: bool = False,
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
 ) -> dict[str, Any]:
-    """Compatibility alias for older Claude calls; prefer get_entity_insights for new reporting reads."""
+    """Compatibility alias with compact rows by default; prefer get_entity_insights for new reads. Set include_raw_actions=true for raw action arrays/maps and named click/view attribution-window comparisons."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
     return await get_entity_insights(
         level=level,
@@ -959,6 +959,7 @@ async def summarize_actions(
         time_increment=time_increment,
         limit=limit,
         after=after,
+        include_raw_actions=True,
     )
     rows = payload["items"]
     paging = payload.get(
@@ -1221,6 +1222,7 @@ async def export_insights(
         after=after,
         filtering=filtering,
         fetch_all=fetch_all,
+        include_raw_actions=True,
     )
     rows = payload["items"]
     returned_rows = rows if allow_large_output else rows[:inline_limit]
