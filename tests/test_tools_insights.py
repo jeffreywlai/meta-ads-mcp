@@ -54,6 +54,24 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+@pytest.mark.parametrize("window", ["7d_click", "1d_view"])
+def test_explicit_attribution_controls_reach_meta_without_unified_defaults(monkeypatch, tool, window) -> None:
+    class AttributionClient(FakeInsightsClient):
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["use_unified_attribution_setting"] == "false"
+            assert params["action_attribution_windows"] == window
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: AttributionClient())
+    result = asyncio.run(tool(
+        level="account", object_id="act_123", use_unified_attribution_setting=False,
+        action_attribution_windows=[window], flatten_actions=["purchase", "purchase_value"],
+        include_raw_actions=False,
+    ))
+    assert result["items"][0]["purchase_value"] == 250
+
+
 @pytest.mark.parametrize(
     "tool_name",
     ["get_entity_insights", "get_insights", "export_insights",

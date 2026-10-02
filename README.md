@@ -345,6 +345,14 @@ Analysis agents using tool search need access to `search_tools`, `call_tool`, an
 The default remains writable; no existing server or dbt agent configuration is
 changed automatically.
 
+For click/view attribution comparisons, make separate `get_entity_insights`
+calls with identical dates/scope, `use_unified_attribution_setting=false`, and
+one `action_attribution_windows` value per call (for example `["7d_click"]` and
+`["1d_view"]`). Existing `flatten_actions` can project purchase counts/values.
+These are requested attribution views, not independent or necessarily additive
+purchase totals. Historical ad set setting changes still require retained
+activity or warehouse history.
+
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating
