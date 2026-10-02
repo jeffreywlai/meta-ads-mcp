@@ -841,6 +841,26 @@ def test_fatigue_rejects_negative_volume_floor_before_fetch(monkeypatch) -> None
         asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123", min_impressions=-1))
 
 
+@pytest.mark.parametrize("max_ads", [0, -1, 10001])
+def test_fatigue_rejects_invalid_scan_bound_before_client(monkeypatch, max_ads) -> None:
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(diagnostics.ValidationError, match="max_ads"):
+        asyncio.run(diagnostics.get_creative_fatigue_report(account_id="123", max_ads=max_ads))
+
+
+def test_fatigue_scan_bound_is_forwarded_to_both_windows(monkeypatch) -> None:
+    limits = []
+
+    async def fake_child_insights(*args, **kwargs):
+        limits.append(kwargs["max_rows"])
+        return []
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_creative_fatigue_report(account_id="123", max_ads=5000))
+    assert limits == [5000, 5000]
+    assert result["max_ads"] == 5000
+
+
 def test_creative_fatigue_report_supports_explicit_windows(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 

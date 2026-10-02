@@ -310,9 +310,11 @@ cannot finish. Narrow the query or use async reports for larger results.
 For an account-wide fatigue sweep, call `get_creative_fatigue_report` with
 `account_id` or `level="account", object_id="act_ACCOUNT_ID"`. It reads both
 windows at ad granularity, follows pagination, and includes ad/campaign/ad set
-names without extra lookups. Findings are ranked by current spend. Scans over
-1,000 rows or unusable pagination fail explicitly; no partial diagnosis is
-returned. Creative IDs are not Insights fields and are not inferred from names.
+names without extra lookups. Findings are ranked by current spend. Each window
+defaults to a 1,000-ad bound; use `max_ads=5000` for a larger account (maximum
+10,000). Scans beyond the selected bound or unusable pagination fail explicitly;
+no partial diagnosis is returned. Creative IDs are not Insights fields and are
+not inferred from names.
 
 Use `list_ads(name_contains_any=["Ada","Grace"], whole_term_match=true,
 effective_status=["ACTIVE"], fields=["id","name"])` to search several names in

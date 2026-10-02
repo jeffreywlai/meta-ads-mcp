@@ -1089,10 +1089,13 @@ async def get_creative_fatigue_report(
     previous_window_days: int = 7,
     min_impressions: int = 1000,
     account_id: str | None = None,
+    max_ads: int = 1000,
 ) -> dict[str, Any]:
-    """Compare account, campaign, or ad set fatigue; rank flagged ads by current spend. Requires 1,000 impressions per window by default (policy, not statistical significance); confidence is uncalibrated/null."""
+    """Compare account, campaign, or ad set fatigue; rank flagged ads by current spend. max_ads bounds each window (1–10,000; default 1,000). Requires 1,000 impressions per window by default (policy, not statistical significance); confidence is uncalibrated/null."""
     if min_impressions < 0:
         raise ValidationError("min_impressions must be nonnegative; zero disables the volume gate.")
+    if not 1 <= max_ads <= 10_000:
+        raise ValidationError("max_ads must be between 1 and 10000.")
     scope_level, resolved_object_id = _resolve_scope(
         allowed_levels=("account", "campaign", "adset"),
         level=level,
@@ -1117,6 +1120,7 @@ async def get_creative_fatigue_report(
             since=current_window["since"],
             until=current_window["until"],
             date_preset=None,
+            max_rows=max_ads,
         ),
         _child_insights(
             resolved_object_id,
@@ -1124,6 +1128,7 @@ async def get_creative_fatigue_report(
             since=previous_window_range["since"],
             until=previous_window_range["until"],
             date_preset=None,
+            max_rows=max_ads,
         ),
     )
     previous_by_id = {row.get("ad_id") or row.get("id"): row for row in previous_rows}
@@ -1227,6 +1232,7 @@ async def get_creative_fatigue_report(
             "previous_ad_count": len(previous_rows),
             "complete": True,
             "ranked_by": "current_spend",
+            "max_ads": max_ads,
         },
     )
 
