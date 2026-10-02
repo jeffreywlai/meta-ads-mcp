@@ -401,18 +401,35 @@ class OverflowArtifactStore:
             )
 
     def create(self, result: ToolResult, *, tool_name: str) -> tuple[str, int]:
-        """Write a versioned, complete ToolResult envelope and return its opaque id."""
+        """Store compact JSON, omitting only redundant unannotated compatibility text."""
         created_at = datetime.now(timezone.utc).isoformat()
+        archived_result = result.model_dump(mode="json", by_alias=True)
+        content = archived_result.get("content", [])
+        structured = archived_result.get("structured_content")
+        if (
+            structured is not None
+            and len(content) == 1
+            and content[0].get("type") == "text"
+            and all(value is None for key, value in content[0].items() if key not in {"type", "text"})
+        ):
+            try:
+                decoded = json.loads(content[0]["text"])
+            except (TypeError, ValueError):
+                pass
+            else:
+                # Canonical JSON keeps booleans distinct from numbers (True != 1).
+                if json.dumps(decoded, sort_keys=True) == json.dumps(structured, sort_keys=True):
+                    archived_result["content"] = []
         artifact_payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "tool_name": tool_name,
             "created_at": created_at,
-            "tool_result": result.model_dump(mode="json", by_alias=True),
+            "tool_result": archived_result,
         }
         artifact_bytes = json.dumps(
             artifact_payload,
             ensure_ascii=True,
-            indent=2,
+            separators=(",", ":"),
             default=str,
         ).encode("utf-8")
         manifest_bytes = json.dumps(
