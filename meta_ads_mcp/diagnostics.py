@@ -213,9 +213,13 @@ def build_finding(
 def detect_snapshot_findings(
     summary_metrics: dict[str, Any],
     child_rows: list[dict[str, Any]] | None = None,
+    *,
+    has_rows: bool = True,
 ) -> list[dict[str, Any]]:
     """Generate coarse optimization findings."""
     findings: list[dict[str, Any]] = []
+    if not has_rows:
+        summary_metrics = {}
 
     spend = to_float(summary_metrics.get("spend"))
     ctr = to_float(summary_metrics.get("ctr"))
@@ -260,15 +264,16 @@ def detect_snapshot_findings(
 
     if child_rows:
         sorted_rows = rank_rows(child_rows, "spend")
-        def row_spend(row: dict[str, Any]) -> float:
+        def row_spend(row: dict[str, Any]) -> float | None:
             direct = to_float(row.get("spend"))
             if direct is not None:
                 return direct
-            return to_float((row.get("metrics") or {}).get("spend")) or 0.0
+            return to_float((row.get("metrics") or {}).get("spend"))
 
-        total_spend = sum(row_spend(row) for row in sorted_rows)
-        has_usable_data = has_usable_data or total_spend > 0
-        top_three_spend = sum(row_spend(row) for row in sorted_rows[:3])
+        child_spend = [row_spend(row) for row in sorted_rows]
+        total_spend = sum(value or 0.0 for value in child_spend)
+        has_usable_data = has_usable_data or any(value is not None for value in child_spend)
+        top_three_spend = sum(value or 0.0 for value in child_spend[:3])
         if total_spend and (top_three_spend / total_spend) >= 0.8:
             findings.append(
                 build_finding(

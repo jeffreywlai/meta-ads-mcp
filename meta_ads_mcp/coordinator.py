@@ -24,7 +24,10 @@ try:
     from fastmcp.server.transforms.search import BM25SearchTransform
     from fastmcp.tools.tool import Tool, ToolResult
 
-    from meta_ads_mcp.error_middleware import StructuredMetaErrorMiddleware
+    from meta_ads_mcp.error_middleware import (
+        StructuredMetaErrorMiddleware,
+        ToolParameterHelpMiddleware,
+    )
     from meta_ads_mcp.read_only import ReadOnlyAdvertisingMiddleware
     from meta_ads_mcp.overflow import (
         ArchivedResponseLimitingMiddleware,
@@ -36,6 +39,9 @@ except ImportError:  # pragma: no cover - fallback for tests without the package
     ToolResult = Any
 
     class StructuredMetaErrorMiddleware:  # type: ignore[override]
+        """Minimal local fallback for tests without FastMCP."""
+
+    class ToolParameterHelpMiddleware:  # type: ignore[override]
         """Minimal local fallback for tests without FastMCP."""
 
     class ReadOnlyAdvertisingMiddleware:  # type: ignore[override]
@@ -246,16 +252,6 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
                     f"'{resolved_name}' is a synthetic search tool and cannot be called via the call_tool proxy"
                 )
             normalized_arguments = normalize_tool_arguments(arguments)
-            tool = await ctx.fastmcp.get_tool(resolved_name)
-            if tool is not None:
-                accepted = list((tool.parameters or {}).get("properties", {}))
-                unexpected = sorted(set(normalized_arguments) - set(accepted))
-                if unexpected:
-                    raise ValueError(
-                        f"Unknown parameters for {resolved_name}: {', '.join(unexpected)}. "
-                        f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
-                        f"Inspect types and defaults with get_capabilities(tool_name='{resolved_name}')."
-                    )
             return await ctx.fastmcp.call_tool(resolved_name, normalized_arguments)
 
         return Tool.from_function(fn=call_tool, name=self._call_tool_name)
@@ -301,6 +297,15 @@ def _compact_description(text: str | None) -> str:
     return sentence
 
 
+def _parameter_type(schema: dict[str, Any]) -> str:
+    """Render the small JSON-schema type vocabulary used by tool inputs."""
+    if "anyOf" in schema:
+        return " or ".join(dict.fromkeys(_parameter_type(choice) for choice in schema["anyOf"]))
+    if schema.get("type") == "array":
+        return f"list[{_parameter_type(schema.get('items', {}))}]"
+    return schema.get("type", "value")
+
+
 def _argument_summary(tool: Any) -> str:
     """Render a compact argument summary from the tool parameter schema."""
     parameters = getattr(tool, "parameters", None) or {}
@@ -311,7 +316,8 @@ def _argument_summary(tool: Any) -> str:
     def _format_names(names: list[str], *, label: str) -> str:
         if not names:
             return ""
-        return f"{label}: {', '.join(names)}"
+        typed_names = [f"{name} ({_parameter_type(properties[name])})" for name in names]
+        return f"{label}: {', '.join(typed_names)}"
 
     parts = []
     required_part = _format_names(required, label="req")
@@ -324,7 +330,7 @@ def _argument_summary(tool: Any) -> str:
 
 
 def serialize_search_results_compact(tools: list[Any]) -> str:
-    """Serialize complete parameter names; full schemas are available on demand."""
+    """Serialize complete parameter names and types; full schemas remain on demand."""
     if not tools:
         return "No tools matched. Try a narrower query or call get_capabilities(intent=...)."
 
@@ -409,3 +415,4 @@ RESPONSE_LIMITING_MIDDLEWARE = ArchivedResponseLimitingMiddleware(
 mcp_server.add_middleware(RESPONSE_LIMITING_MIDDLEWARE)
 mcp_server.add_middleware(StructuredMetaErrorMiddleware())
 mcp_server.add_middleware(ReadOnlyAdvertisingMiddleware())
+mcp_server.add_middleware(ToolParameterHelpMiddleware())

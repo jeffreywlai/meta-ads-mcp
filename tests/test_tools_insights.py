@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import stat
+from io import StringIO
 from pathlib import Path
 
 import pydantic_core
 import pytest
+from fastmcp.exceptions import ToolError
 from pydantic import TypeAdapter
 
 from meta_ads_mcp.config import reload_settings
@@ -55,25 +58,29 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
-@pytest.mark.parametrize("window", ["7d_click", "1d_view"])
-def test_attribution_controls_and_distinct_window_values_are_preserved(monkeypatch, tool, window) -> None:
+@pytest.mark.parametrize("windows", [["7d_click"], ["1d_view"], ["7d_click", "1d_view"]])
+def test_attribution_controls_and_distinct_window_values_are_preserved(monkeypatch, tool, windows) -> None:
+    window_counts = {"7d_click": "1", "1d_view": "2"}
+    window_values = {"7d_click": "100", "1d_view": "75"}
+
     class AttributionClient(FakeInsightsClient):
         async def get_insights(self, object_id, *, fields, params):
             assert params["use_unified_attribution_setting"] == "false"
-            assert params["action_attribution_windows"] == window
+            assert params["action_attribution_windows"] == ",".join(windows)
             return {"data": [{
-                "actions": [{"action_type": "purchase", "value": "2", window: "1"}],
-                "action_values": [{"action_type": "purchase", "value": "250", window: "100"}],
+                "actions": [{"action_type": "purchase", "value": "2", **{window: window_counts[window] for window in windows}}],
+                "action_values": [{"action_type": "purchase", "value": "250", **{window: window_values[window] for window in windows}}],
             }]}
 
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: AttributionClient())
     result = asyncio.run(tool(
         level="account", object_id="act_123", use_unified_attribution_setting=False,
-        action_attribution_windows=[window], flatten_actions=["purchase", "purchase_value"],
+        action_attribution_windows=windows, flatten_actions=["purchase", "purchase_value"],
         include_raw_actions=True,
     ))
-    assert result["items"][0]["actions"][0][window] == "1"
-    assert result["items"][0]["action_values"][0][window] == "100"
+    for window in windows:
+        assert result["items"][0]["actions"][0][window] == window_counts[window]
+        assert result["items"][0]["action_values"][0][window] == window_values[window]
     # Generic scalar projections must not be presented as window-specific totals.
     assert result["items"][0]["purchase_value"] == 250
     assert "not the named attribution-window fields" in result["summary"]["attribution_note"]
@@ -145,6 +152,72 @@ def test_fetch_all_combines_filtered_pages_before_summarizing(monkeypatch, tool_
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("tool_name", ["get_entity_insights", "get_insights", "export_insights"])
+def test_usage_report_name_prefix_placement_fixture_is_complete(monkeypatch, tool_name) -> None:
+    # S4 workload shape: 46 named copies, with placement rows under an account.
+    prefix = "A3_"
+    filters = [{"field": "ad.name", "operator": "CONTAIN", "value": prefix}]
+    requested_fields = ["ad_id", "ad_name", "spend", "impressions", "inline_link_clicks"]
+    fixture_rows = [
+        {
+            "ad_id": f"ad_{index}", "ad_name": f"{prefix}copy_{index}",
+            "publisher_platform": platform, "platform_position": position,
+            "spend": str(index + 1), "impressions": "1000", "inline_link_clicks": "10",
+        }
+        for index in range(46)
+        for platform, position in [("facebook", "feed"), ("instagram", "story")]
+    ]
+    pages = [
+        {
+            "data": fixture_rows[start:start + 35],
+            **({"paging": {"next": "next-page", "cursors": {"after": f"page_{page + 2}"}}}
+               if start + 35 < len(fixture_rows) else {}),
+        }
+        for page, start in enumerate(range(0, len(fixture_rows), 35))
+    ]
+    calls = []
+
+    class PlacementFixtureClient:
+        async def get_insights(self, object_id, *, fields, params):
+            page = len(calls)
+            assert object_id == "act_123"
+            assert params["level"] == "ad"
+            assert params["filtering"] == filters
+            assert params["breakdowns"] == "publisher_platform,platform_position"
+            assert json.loads(params["time_range"]) == {"since": "2025-04-17", "until": "2026-09-16"}
+            assert fields == requested_fields
+            assert params.get("after") == (None if page == 0 else f"page_{page + 1}")
+            calls.append(dict(params))
+            return pages[page]
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PlacementFixtureClient())
+    arguments = {
+        "level": "ad", "object_id": "act_123", "filtering": filters, "fetch_all": True,
+        "breakdowns": ["publisher_platform", "platform_position"], "fields": requested_fields,
+        "since": "2025-04-17", "until": "2026-09-16", "limit": 35,
+    }
+    if tool_name == "export_insights":
+        arguments["allow_large_output"] = True
+    result = asyncio.run(getattr(insights, tool_name)(**arguments))
+    rows = result["rows"] if tool_name == "export_insights" else result["items"]
+
+    assert len(rows) == 92
+    assert {(row["ad_id"], row["ad_name"], row["publisher_platform"], row["platform_position"])
+            for row in rows} == {
+        (row["ad_id"], row["ad_name"], row["publisher_platform"], row["platform_position"])
+        for row in fixture_rows
+    }
+    assert all(prefix in row["ad_name"] for row in rows)
+    assert result["summary"]["count"] == 92
+    assert result["summary"]["metrics"]["spend"] == sum(int(row["spend"]) for row in fixture_rows)
+    assert result["summary"]["complete"] is True
+    assert result["summary"]["pages_fetched"] == len(calls) == 3
+    assert result["paging"]["next"] is None
+    if tool_name == "export_insights":
+        assert result["complete"] is True
+        assert result["truncated"] is False
+
+
 @pytest.mark.parametrize("failure", ["cap", "missing_cursor", "repeated_cursor"])
 def test_fetch_all_fails_instead_of_returning_incomplete_insights(monkeypatch, failure) -> None:
     class IncompleteClient:
@@ -189,14 +262,204 @@ def test_sync_insights_can_omit_raw_actions_without_losing_metrics(monkeypatch, 
     assert row["purchase_value"] == 250
     assert row["metrics"]["roas"] == 2.5
     assert result["summary"]["action_filter"]["matched"] == ["purchase"]
-    for field in ("actions", "action_values", "actions_map", "action_values_map"):
+    assert row["actions_map"] == {"purchase": 2.0}
+    assert row["action_values_map"] == {"purchase": 250.0}
+    for field in ("actions", "action_values"):
         assert field not in row
 
 
-def test_sync_insights_keeps_raw_actions_by_default(monkeypatch) -> None:
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+@pytest.mark.parametrize("raw_option", [{}, {"include_raw_actions": False}, {"include_raw_actions": True}])
+def test_sync_insights_is_compact_by_default_and_raw_actions_are_opt_in(monkeypatch, tool, raw_option) -> None:
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
-    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
-    assert result["items"][0]["actions"][0]["value"] == "2"
+    result = asyncio.run(tool(
+        level="account", object_id="act_123", flatten_actions=["purchase", "purchase_value"], **raw_option,
+    ))
+    row = result["items"][0]
+    assert row["purchase"] == 2
+    assert row["purchase_value"] == 250
+    assert row["metrics"]["roas"] == result["summary"]["metrics"]["roas"] == 2.5
+    assert row["actions_map"]["purchase"] == 2
+    assert row["action_values_map"]["purchase"] == 250
+    if raw_option.get("include_raw_actions"):
+        assert row["actions"][0]["value"] == "2"
+        assert row["action_values"][0]["value"] == "250"
+    else:
+        assert all(field not in row for field in ("actions", "action_values"))
+
+
+@pytest.mark.parametrize("tool_name", ["get_entity_insights", "get_insights"])
+@pytest.mark.parametrize("call_path", ["python", "registered", "routed"])
+@pytest.mark.parametrize("raw_option", [{}, {"include_raw_actions": False}, {"include_raw_actions": True}])
+@pytest.mark.parametrize("action_breakdowns", [
+    ["action_type", "action_device"], "action_type, action_device",
+])
+def test_dimensional_actions_require_raw_output_before_client_creation(
+    monkeypatch, tool_name, call_path, raw_option, action_breakdowns,
+) -> None:
+    client_creations = []
+    actions = [
+        {"action_type": "purchase", "action_device": "android_smartphone", "value": "2"},
+        {"action_type": "purchase", "action_device": "desktop", "value": "7"},
+    ]
+    action_values = [
+        {"action_type": "purchase", "action_device": "android_smartphone", "value": "20"},
+        {"action_type": "purchase", "action_device": "desktop", "value": "70"},
+    ]
+
+    class DimensionalClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["action_breakdowns"] == "action_type,action_device"
+            return {"data": [{"actions": actions, "action_values": action_values}]}
+
+    def create_client():
+        client_creations.append(True)
+        return DimensionalClient()
+
+    monkeypatch.setattr(insights, "get_graph_api_client", create_client)
+    arguments = {
+        "level": "account", "object_id": "act_123",
+        "action_breakdowns": action_breakdowns, **raw_option,
+    }
+
+    async def call():
+        if call_path == "python":
+            return await getattr(insights, tool_name)(**arguments)
+        result = await mcp_server.call_tool(
+            "call_tool" if call_path == "routed" else tool_name,
+            {"name": tool_name, "arguments": arguments} if call_path == "routed" else arguments,
+        )
+        return result.structured_content
+
+    if not raw_option.get("include_raw_actions"):
+        error_type = insights.ValidationError if call_path == "python" else ToolError
+        with pytest.raises(error_type, match="require include_raw_actions=true"):
+            asyncio.run(call())
+        assert client_creations == []
+    else:
+        result = asyncio.run(call())
+        assert client_creations == [True]
+        assert result["items"][0]["actions"] == actions
+        assert result["items"][0]["action_values"] == action_values
+        assert "do not aggregate" in result["summary"]["action_breakdown_note"]
+
+
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+@pytest.mark.parametrize("action_breakdowns", [["action_type"], "action_type"])
+def test_action_type_only_breakdown_remains_compact(monkeypatch, tool, action_breakdowns) -> None:
+    class ActionTypeClient(FakeInsightsClient):
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["action_breakdowns"] == "action_type"
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ActionTypeClient())
+    result = asyncio.run(tool(
+        level="account", object_id="act_123", action_breakdowns=action_breakdowns,
+    ))
+    row = result["items"][0]
+    assert row["actions_map"] == {"purchase": 2.0}
+    assert row["action_values_map"] == {"purchase": 250.0}
+    assert "actions" not in row and "action_values" not in row
+    assert "action_breakdown_note" not in result["summary"]
+
+
+def test_export_preserves_dimensional_action_records(monkeypatch) -> None:
+    actions = [{"action_type": "purchase", "action_device": "desktop", "value": "2"}]
+
+    class DimensionalClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["action_breakdowns"] == "action_type,action_device"
+            return {"data": [{"actions": actions}]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: DimensionalClient())
+    result = asyncio.run(insights.export_insights(
+        level="account", object_id="act_123", action_breakdowns=["action_type", "action_device"],
+    ))
+    assert result["rows"][0]["actions"] == actions
+
+
+def test_comparison_rejects_lossy_dimensional_action_totals_before_client_creation(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    result = asyncio.run(insights.compare_performance(
+        level="account", object_ids=["act_123", "act_456"],
+        action_breakdowns=["action_type", "action_device"],
+    ))
+    assert result["summary"]["successful"] == 0
+    assert result["summary"]["failed"] == 2
+    assert all("require include_raw_actions=true" in row["error"] for row in result["items"])
+
+
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+@pytest.mark.parametrize("raw_option", [{}, {"include_raw_actions": False}])
+@pytest.mark.parametrize("query", [
+    {"fields": ["actions", "action_values"]},
+    {"action_types": ["schedule"]},
+    {"fields": ["actions", "action_values"], "action_types": ["schedule"]},
+])
+def test_compact_sync_preserves_custom_action_counts_and_values(monkeypatch, tool, raw_option, query) -> None:
+    class CustomActionClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert "actions" in fields and "action_values" in fields
+            return {"data": [{
+                "actions": [{"action_type": "schedule", "value": "17.5"},
+                            {"action_type": "purchase", "value": "2"}],
+                "action_values": [{"action_type": "schedule", "value": "777"},
+                                  {"action_type": "purchase", "value": "250"}],
+            }]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: CustomActionClient())
+    result = asyncio.run(tool(level="account", object_id="act_123", **query, **raw_option))
+    row = result["items"][0]
+    assert row["actions_map"]["schedule"] == 17.5
+    assert row["action_values_map"]["schedule"] == 777
+    assert "actions" not in row and "action_values" not in row
+    expected_keys = {"schedule"} if query.get("action_types") else {"schedule", "purchase"}
+    assert set(row["actions_map"]) == set(row["action_values_map"]) == expected_keys
+    if query.get("action_types"):
+        assert result["summary"]["action_filter"]["matched"] == ["schedule"]
+
+
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+def test_compact_attribution_queries_explain_raw_opt_in_for_named_windows(monkeypatch, tool) -> None:
+    class AttributionClient(FakeInsightsClient):
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["action_attribution_windows"] == "7d_click,1d_view"
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            payload["data"][0]["action_values"][0].update({"7d_click": "100", "1d_view": "75"})
+            return payload
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: AttributionClient())
+    result = asyncio.run(tool(
+        level="account", object_id="act_123", action_attribution_windows=["7d_click", "1d_view"],
+        flatten_actions=["purchase_value"],
+    ))
+    assert result["items"][0]["purchase_value"] == 250  # Generic value, not either named window.
+    assert result["items"][0]["action_values_map"] == {"purchase": 250.0}
+    assert "action_values" not in result["items"][0]
+    assert "Set include_raw_actions=true" in result["summary"]["attribution_note"]
+
+
+def test_summarize_actions_preserves_totals_and_rows_with_compact_insights_default(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(insights.summarize_actions(level="account", object_id="act_123", include_rows=True))
+    assert result["action_totals"] == [{"action_type": "purchase", "count": 2.0, "value": 250.0, "cost_per_action": 50.0}]
+    assert result["rows"][0]["actions"] == {"purchase": 2.0}
+    assert result["rows"][0]["action_values"] == {"purchase": 250.0}
+
+
+@pytest.mark.parametrize("export_format", ["json", "csv"])
+def test_exports_preserve_action_schema_with_compact_insights_default(monkeypatch, export_format) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(insights.export_insights(level="account", object_id="act_123", format=export_format))
+    if export_format == "json":
+        row = result["rows"][0]
+    else:
+        row = next(csv.DictReader(StringIO(result["data"])))
+        row = {field: json.loads(row[field]) for field in ("actions", "action_values", "actions_map", "action_values_map")}
+    assert row["actions"] == [{"action_type": "purchase", "value": "2"}]
+    assert row["action_values"] == [{"action_type": "purchase", "value": "250"}]
+    assert row["actions_map"] == {"purchase": 2.0}
+    assert row["action_values_map"] == {"purchase": 250.0}
 
 
 @pytest.mark.parametrize("row_count", [1, 2])

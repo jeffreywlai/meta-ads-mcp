@@ -289,10 +289,17 @@ above override those defaults.
 If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
 
-Synchronous `get_entity_insights` (and its `get_insights` alias) accepts
-`include_raw_actions=false` to omit duplicate action arrays and maps while
-keeping derived metrics and requested `flatten_actions` columns. Its default
-response remains unchanged.
+Synchronous `get_entity_insights` (and its `get_insights` alias) omits duplicate
+raw action arrays by default, keeping numeric action maps, derived metrics, and
+requested `flatten_actions` columns. Custom action counts and values remain
+available without an extra opt-in. Set `include_raw_actions=true` to retain raw
+arrays, including named attribution-window values needed for click/view
+comparisons; generic maps are not window-specific totals. `summarize_actions`
+and JSON/CSV exports retain their existing action output. Existing callers that
+read raw action arrays must now opt in. Dimensional `action_breakdowns` (anything
+beyond `action_type`, such as `action_device`) require `include_raw_actions=true`;
+read the raw records for those dimensions, not the scalar maps or derived totals.
+Compact calls fail before making a request instead of discarding the dimensions.
 
 For placement reporting across copies of an ad, use `level="ad"` with the
 parent `object_id="act_ACCOUNT_ID"` (or a campaign/ad set ID),
@@ -310,11 +317,22 @@ cannot finish. Narrow the query or use async reports for larger results.
 For an account-wide fatigue sweep, call `get_creative_fatigue_report` with
 `account_id` or `level="account", object_id="act_ACCOUNT_ID"`. It reads both
 windows at ad granularity, follows pagination, and includes ad/campaign/ad set
-names without extra lookups. Findings are ranked by current spend. Each window
+names. Findings use a transparent ordering: minimum impressions across both
+windows, CTR decline, frequency increase, current spend, then ad ID. This is a
+rule-based priority order, not statistical significance. Each window
 defaults to a 1,000-ad bound; use `max_ads=5000` for a larger account (maximum
 10,000). Scans beyond the selected bound or unusable pagination fail explicitly;
-no partial diagnosis is returned. Creative IDs are not Insights fields and are
-not inferred from names.
+no partial diagnosis is returned. Flagged ads receive current creative IDs via
+up to 100 extra metadata reads (`max_creative_lookups`, 0–1,000; zero disables
+enrichment). Missing IDs, failed reads, rate limits, and the lookup cap remain
+explicit without discarding findings. An exhausted transient error stops further
+optional reads for that call; unread identities are marked `skipped_transient_error`.
+Exact creative-ID groups cover flagged ads only; current IDs do not prove
+historical creative identity and are not
+inferred from names. `creative_identity_complete` is separate from the complete
+Insights scan. Confidence remains null/uncalibrated. Medium severity requires
+at least 20% CTR decline and 20% frequency rise; high requires at least 50% of
+both. These thresholds are a prioritization policy, not probabilities.
 
 Use `list_ads(name_contains_any=["Ada","Grace"], whole_term_match=true,
 effective_status=["ACTIVE"], fields=["id","name"])` to search several names in

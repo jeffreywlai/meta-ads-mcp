@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, timedelta
+from math import isclose
 from typing import Any
 
 from meta_ads_mcp.api_compat import is_api_version_at_least
@@ -19,7 +20,13 @@ from meta_ads_mcp.diagnostics import (
     rank_rows,
     summary_metric_evidence,
 )
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import (
+    MetaApiError,
+    NotFoundError,
+    RateLimitError,
+    UnsupportedFeatureError,
+    ValidationError,
+)
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, resolve_account_currency
 from meta_ads_mcp.normalize import blank_to_none, to_float
@@ -193,16 +200,17 @@ def _snapshot_analysis(
     *,
     scope: dict[str, Any],
     metrics: dict[str, Any],
+    has_rows: bool,
     child_rows: list[dict[str, Any]] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the standard optimization analysis envelope."""
-    findings = detect_snapshot_findings(metrics, child_rows)
+    findings = detect_snapshot_findings(metrics, child_rows, has_rows=has_rows)
     return analysis_response(
         scope=scope,
         metrics=metrics,
         findings=findings,
-        evidence=summary_metric_evidence(metrics),
+        evidence=summary_metric_evidence(metrics) if has_rows else [],
         suggestions=_snapshot_suggestions(findings),
         extra=extra,
     )
@@ -656,6 +664,7 @@ async def get_account_optimization_snapshot(
     return _snapshot_analysis(
         scope={"level": "account", "object_id": resolved_account_id},
         metrics=account_scope["summary"]["metrics"],
+        has_rows=bool(account_scope.get("items")),
         child_rows=campaigns,
         extra=extra,
     )
@@ -747,6 +756,7 @@ async def get_account_health_snapshot(
     return _snapshot_analysis(
         scope={"level": "account", "object_id": resolved_account_id},
         metrics=current_metrics,
+        has_rows=bool(current.get("items")),
         extra=extra,
     )
 
@@ -795,6 +805,7 @@ async def get_campaign_optimization_snapshot(
     return _snapshot_analysis(
         scope={"level": "campaign", "object_id": campaign_id},
         metrics=campaign_scope["summary"]["metrics"],
+        has_rows=bool(campaign_scope.get("items")),
         child_rows=adsets,
         extra=extra,
     )
@@ -926,6 +937,7 @@ async def get_budget_pacing_report(
     return _snapshot_analysis(
         scope={"level": level, "object_id": object_id},
         metrics=summary_metrics,
+        has_rows=bool(rows),
         extra={
             "daily_rows": rows if include_full_daily_rows else _compact_timeseries_rows(rows),
             "daily_row_detail": "full" if include_full_daily_rows else "compact",
@@ -972,6 +984,7 @@ async def get_creative_performance_report(
     return _snapshot_analysis(
         scope={"level": scope_level, "object_id": resolved_object_id},
         metrics=summary_metrics,
+        has_rows=bool(rows),
         child_rows=rows,
         extra={
             "analyzed_level": "ad",
@@ -1075,6 +1088,11 @@ async def get_ad_feedback_signals(
     )
 
 
+def _fatigue_change_meets_threshold(value: float, threshold: float) -> bool:
+    """Include exact decimal boundaries despite float representation noise."""
+    return value >= threshold or isclose(value, threshold, rel_tol=1e-9, abs_tol=1e-12)
+
+
 @mcp_server.tool()
 async def get_creative_fatigue_report(
     level: str | None = None,
@@ -1090,12 +1108,15 @@ async def get_creative_fatigue_report(
     min_impressions: int = 1000,
     account_id: str | None = None,
     max_ads: int = 1000,
+    max_creative_lookups: int = 100,
 ) -> dict[str, Any]:
-    """Compare account, campaign, or ad set fatigue; rank flagged ads by current spend. max_ads bounds each window (1–10,000; default 1,000). Requires 1,000 impressions per window by default (policy, not statistical significance); confidence is uncalibrated/null."""
+    """Compare account, campaign, or ad set fatigue with rule-based evidence ordering and severity, not statistical significance. Requires 1,000 impressions per window by default; confidence is uncalibrated/null. max_ads bounds each window (1–10,000); max_creative_lookups bounds flagged-ad current creative-ID reads (0–1,000, default 100). Exact-ID groups cover flagged ads only; historical creative identity is not established."""
     if min_impressions < 0:
         raise ValidationError("min_impressions must be nonnegative; zero disables the volume gate.")
     if not 1 <= max_ads <= 10_000:
         raise ValidationError("max_ads must be between 1 and 10000.")
+    if not 0 <= max_creative_lookups <= 1000:
+        raise ValidationError("max_creative_lookups must be between 0 and 1000.")
     scope_level, resolved_object_id = _resolve_scope(
         allowed_levels=("account", "campaign", "adset"),
         level=level,
@@ -1135,7 +1156,7 @@ async def get_creative_fatigue_report(
     findings: list[dict[str, Any]] = []
     comparison_count = 0
     excluded_low_volume_count = 0
-    for current in rank_rows(current_rows, "spend"):
+    for current in current_rows:
         entity_id = current.get("ad_id") or current.get("id")
         prior = previous_by_id.get(entity_id)
         if not prior:
@@ -1152,65 +1173,138 @@ async def get_creative_fatigue_report(
         if ctr_drop is None or freq_rise is None:
             continue
         comparison_count += 1
-        if ctr_drop <= -0.2 and freq_rise >= 0.2:
-            findings.append(
-                build_finding(
-                    "creative_fatigue_risk",
-                    f"Ad {entity_id} shows higher frequency and weaker CTR than the prior window.",
-                    severity="medium",
-                    confidence=None,
-                    evidence=[
-                        metric_evidence(
-                            "frequency_change",
-                            comparison["frequency"]["pct_delta"],
-                            "(current_frequency - previous_frequency) / previous_frequency",
-                            {
-                                "current_frequency": current["metrics"].get("frequency"),
-                                "previous_frequency": prior["metrics"].get("frequency"),
-                            },
-                        ),
-                        metric_evidence(
-                            "ctr",
-                            current["metrics"].get("ctr"),
-                            "clicks / impressions",
-                            {
-                                "current_clicks": current.get("clicks"),
-                                "current_impressions": current.get("impressions"),
-                                "previous_clicks": prior.get("clicks"),
-                                "previous_impressions": prior.get("impressions"),
-                            },
-                        ),
-                        metric_evidence(
-                            "ctr_change",
-                            ctr_drop,
-                            "(current_ctr - previous_ctr) / previous_ctr",
-                            {
-                                "current_ctr": current["metrics"].get("ctr"),
-                                "previous_ctr": prior["metrics"].get("ctr"),
-                            },
-                        ),
-                        metric_evidence(
-                            "spend", current["metrics"].get("spend"), "Meta-reported spend",
-                            {"current_spend": current["metrics"].get("spend")},
-                        ),
-                    ],
-                    affected_entities=[{
-                        "ad_id": entity_id,
-                        **{key: current[key] for key in (
-                            "ad_name", "campaign_id", "campaign_name", "adset_id", "adset_name",
-                        ) if current.get(key) is not None},
-                    }],
-                    next_actions=[
-                        "Review creative freshness.",
-                        "Check audience saturation.",
-                    ],
-                )
+        if _fatigue_change_meets_threshold(-ctr_drop, 0.2) and _fatigue_change_meets_threshold(freq_rise, 0.2):
+            finding = build_finding(
+                "creative_fatigue_risk",
+                f"Ad {entity_id} shows higher frequency and weaker CTR than the prior window.",
+                severity="high" if (
+                    _fatigue_change_meets_threshold(-ctr_drop, 0.5)
+                    and _fatigue_change_meets_threshold(freq_rise, 0.5)
+                ) else "medium",
+                confidence=None,
+                evidence=[
+                    metric_evidence(
+                        "frequency_change",
+                        comparison["frequency"]["pct_delta"],
+                        "(current_frequency - previous_frequency) / previous_frequency",
+                        {
+                            "current_frequency": current["metrics"].get("frequency"),
+                            "previous_frequency": prior["metrics"].get("frequency"),
+                        },
+                    ),
+                    metric_evidence(
+                        "ctr",
+                        current["metrics"].get("ctr"),
+                        "clicks / impressions",
+                        {
+                            "current_clicks": current.get("clicks"),
+                            "current_impressions": current.get("impressions"),
+                            "previous_clicks": prior.get("clicks"),
+                            "previous_impressions": prior.get("impressions"),
+                        },
+                    ),
+                    metric_evidence(
+                        "ctr_change",
+                        ctr_drop,
+                        "(current_ctr - previous_ctr) / previous_ctr",
+                        {
+                            "current_ctr": current["metrics"].get("ctr"),
+                            "previous_ctr": prior["metrics"].get("ctr"),
+                        },
+                    ),
+                    metric_evidence(
+                        "spend", current["metrics"].get("spend"), "Meta-reported spend",
+                        {"current_spend": current["metrics"].get("spend")},
+                    ),
+                ],
+                affected_entities=[{
+                    "ad_id": entity_id,
+                    "creative_id": None,
+                    "creative_resolution_status": "lookup_limit_reached",
+                    **{key: current[key] for key in (
+                        "ad_name", "campaign_id", "campaign_name", "adset_id", "adset_name",
+                    ) if current.get(key) is not None},
+                }],
+                next_actions=[
+                    "Review creative freshness.",
+                    "Check audience saturation.",
+                ],
             )
+            finding["confidence_status"] = "uncalibrated"
+            impressions = [to_float(row.get("impressions")) for row in (current, prior)]
+            finding["ranking_values"] = {
+                "min_window_impressions": None if None in impressions else min(impressions),
+                "ctr_decline": -ctr_drop,
+                "frequency_increase": freq_rise,
+                "current_spend": to_float(current["metrics"].get("spend")),
+            }
+            findings.append(finding)
+
+    findings.sort(key=lambda finding: (
+        -(finding["ranking_values"]["min_window_impressions"] or 0),
+        -finding["ranking_values"]["ctr_decline"],
+        -finding["ranking_values"]["frequency_increase"],
+        -(finding["ranking_values"]["current_spend"] or 0),
+        str(finding["affected_entities"][0]["ad_id"] or ""),
+    ))
+    creative_metadata: dict[str, dict[str, Any]] = {}
+    creative_groups: dict[str, dict[str, Any]] = {}
+    creative_lookups = 0
+    lookup_stop_reason: str | None = None
+    client = None
+    for finding in findings:
+        entity = finding["affected_entities"][0]
+        ad_id = entity["ad_id"]
+        if not isinstance(ad_id, str) or not ad_id.strip():
+            entity["creative_resolution_status"] = "missing_ad_id"
+            continue
+        if ad_id not in creative_metadata:
+            metadata: dict[str, Any] = {
+                "creative_id": None,
+                "creative_resolution_status": lookup_stop_reason or "lookup_limit_reached",
+            }
+            if lookup_stop_reason is None and creative_lookups < max_creative_lookups:
+                if client is None:
+                    client = get_graph_api_client()
+                creative_lookups += 1
+                try:
+                    ad = await client.get_object(ad_id, fields=["id", "name", "creative{id}"])
+                except RateLimitError:
+                    lookup_stop_reason = "rate_limited"
+                    metadata["creative_resolution_status"] = lookup_stop_reason
+                except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+                    metadata["creative_resolution_status"] = "lookup_failed"
+                    metadata["creative_resolution_error"] = type(exc).__name__
+                    if isinstance(exc, MetaApiError) and exc.is_transient:
+                        lookup_stop_reason = "skipped_transient_error"
+                else:
+                    creative = ad.get("creative")
+                    creative_id = creative.get("id") if isinstance(creative, dict) else None
+                    if isinstance(creative_id, str) and creative_id.strip():
+                        metadata["creative_id"] = creative_id.strip()
+                        metadata["creative_resolution_status"] = "resolved"
+                    else:
+                        metadata["creative_resolution_status"] = "missing_creative_id"
+                    if ad.get("name"):
+                        metadata["ad_name"] = ad["name"]
+            creative_metadata[ad_id] = metadata
+        metadata = creative_metadata[ad_id]
+        for key, value in metadata.items():
+            if key != "ad_name" or not entity.get("ad_name"):
+                entity[key] = value
+        if entity["creative_id"] is not None:
+            group = creative_groups.setdefault(entity["creative_id"], {
+                "creative_id": entity["creative_id"], "ad_ids": [], "campaign_ids": [],
+            })
+            if ad_id not in group["ad_ids"]:
+                group["ad_ids"].append(ad_id)
+            if entity.get("campaign_id") and entity["campaign_id"] not in group["campaign_ids"]:
+                group["campaign_ids"].append(entity["campaign_id"])
     return analysis_response(
         scope={"level": scope_level, "object_id": resolved_object_id},
         metrics={},
-        findings=findings or [
-            build_finding(
+        findings=findings or [{
+            **build_finding(
                 "no_pattern_detected" if comparison_count else "insufficient_data",
                 (
                     "No strong fatigue pattern was detected across the compared windows."
@@ -1219,8 +1313,9 @@ async def get_creative_fatigue_report(
                 ),
                 severity="low",
                 confidence=None,
-            )
-        ],
+            ),
+            "confidence_status": "uncalibrated",
+        }],
         extra={
             "analyzed_level": "ad",
             "current_window": current_window,
@@ -1231,8 +1326,25 @@ async def get_creative_fatigue_report(
             "current_ad_count": len(current_rows),
             "previous_ad_count": len(previous_rows),
             "complete": True,
-            "ranked_by": "current_spend",
+            "ranked_by": "evidence_strength",
+            "ranking_order": [
+                "min_window_impressions_desc", "ctr_decline_desc", "frequency_increase_desc",
+                "current_spend_desc", "ad_id_asc",
+            ],
+            "ranking_note": "Rule-based evidence ordering, not statistical significance or a calibrated confidence score. Unknown volume/spend ranks as zero but remains null in ranking_values.",
+            "severity_policy": "Medium requires at least 20% CTR decline and 20% frequency rise; high requires at least 50% of both. This is a prioritization policy, not a probability.",
+            "confidence_status": "uncalibrated",
             "max_ads": max_ads,
+            "max_creative_lookups": max_creative_lookups,
+            "creative_lookups_attempted": creative_lookups,
+            "creative_identity_complete": all(
+                finding["affected_entities"][0]["creative_resolution_status"] == "resolved"
+                for finding in findings
+            ),
+            "creative_identity_source": "current_ad_metadata",
+            "historical_creative_identity_established": False,
+            "creative_groups_scope": "flagged_ads_only",
+            "creative_groups": list(creative_groups.values()),
         },
     )
 
@@ -1259,8 +1371,8 @@ async def get_audience_performance_report(
     return analysis_response(
         scope={"level": level, "object_id": object_id},
         metrics=payload["summary"]["metrics"],
-        findings=detect_snapshot_findings(payload["summary"]["metrics"], rows),
-        evidence=summary_metric_evidence(payload["summary"]["metrics"]),
+        findings=detect_snapshot_findings(payload["summary"]["metrics"], rows, has_rows=bool(rows)),
+        evidence=summary_metric_evidence(payload["summary"]["metrics"]) if rows else [],
         extra={
             "segment_by": segment_by,
             "top_segments": ranked[:10],
@@ -1296,6 +1408,7 @@ async def get_delivery_risk_report(
     return _snapshot_analysis(
         scope={"level": resolved_level, "object_id": resolved_object_id},
         metrics=metrics,
+        has_rows=bool(payload.get("items")),
     )
 
 
