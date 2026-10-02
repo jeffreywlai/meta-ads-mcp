@@ -1250,7 +1250,7 @@ async def get_creative_fatigue_report(
     creative_metadata: dict[str, dict[str, Any]] = {}
     creative_groups: dict[str, dict[str, Any]] = {}
     creative_lookups = 0
-    rate_limited = False
+    lookup_stop_reason: str | None = None
     client = None
     for finding in findings:
         entity = finding["affected_entities"][0]
@@ -1261,20 +1261,22 @@ async def get_creative_fatigue_report(
         if ad_id not in creative_metadata:
             metadata: dict[str, Any] = {
                 "creative_id": None,
-                "creative_resolution_status": "rate_limited" if rate_limited else "lookup_limit_reached",
+                "creative_resolution_status": lookup_stop_reason or "lookup_limit_reached",
             }
-            if not rate_limited and creative_lookups < max_creative_lookups:
+            if lookup_stop_reason is None and creative_lookups < max_creative_lookups:
                 if client is None:
                     client = get_graph_api_client()
                 creative_lookups += 1
                 try:
                     ad = await client.get_object(ad_id, fields=["id", "name", "creative{id}"])
                 except RateLimitError:
-                    rate_limited = True
-                    metadata["creative_resolution_status"] = "rate_limited"
+                    lookup_stop_reason = "rate_limited"
+                    metadata["creative_resolution_status"] = lookup_stop_reason
                 except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
                     metadata["creative_resolution_status"] = "lookup_failed"
                     metadata["creative_resolution_error"] = type(exc).__name__
+                    if isinstance(exc, MetaApiError) and exc.is_transient:
+                        lookup_stop_reason = "skipped_transient_error"
                 else:
                     creative = ad.get("creative")
                     creative_id = creative.get("id") if isinstance(creative, dict) else None

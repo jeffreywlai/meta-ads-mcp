@@ -1057,6 +1057,94 @@ def test_fatigue_stops_creative_reads_after_rate_limit(monkeypatch) -> None:
         assert entity["creative_resolution_status"] == "rate_limited"
 
 
+def test_fatigue_transient_enrichment_stop_preserves_resolved_groups_and_cached_ids(monkeypatch) -> None:
+    _patch_fatigue_rows(monkeypatch, [
+        {"ad_id": "ad_a", "campaign_id": "cmp_1"},
+        {"ad_id": "ad_a", "campaign_id": "cmp_1"},
+        {"ad_id": "ad_b"}, {"ad_id": "ad_c"},
+    ])
+    calls = []
+
+    class InterruptedCreativeClient:
+        async def get_object(self, object_id, *, fields):
+            calls.append(object_id)
+            if object_id == "ad_b":
+                raise diagnostics.MetaApiError("temporary outage", is_transient=True)
+            return {"id": object_id, "creative": {"id": "crt_a"}}
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: InterruptedCreativeClient())
+    result = asyncio.run(diagnostics.get_creative_fatigue_report(
+        campaign_id="cmp_1", since="2026-03-01", until="2026-03-07",
+    ))
+
+    assert calls == ["ad_a", "ad_b"]
+    assert result["creative_lookups_attempted"] == 2
+    assert result["complete"] is True
+    assert result["creative_identity_complete"] is False
+    assert len(result["findings"]) == 4
+    entities = [finding["affected_entities"][0] for finding in result["findings"]]
+    assert [entity["creative_resolution_status"] for entity in entities] == [
+        "resolved", "resolved", "lookup_failed", "skipped_transient_error",
+    ]
+    assert entities[2]["creative_resolution_error"] == "MetaApiError"
+    assert entities[2]["creative_id"] is entities[3]["creative_id"] is None
+    assert result["creative_groups"] == [{
+        "creative_id": "crt_a", "ad_ids": ["ad_a"], "campaign_ids": ["cmp_1"],
+    }]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "503"])
+def test_fatigue_retries_only_one_creative_read_during_transient_outage(monkeypatch, failure) -> None:
+    import httpx
+
+    from meta_ads_mcp.config import Settings
+    from meta_ads_mcp.graph_api import GraphAPIClient
+
+    _patch_fatigue_rows(monkeypatch, [{"ad_id": "ad_a"}, {"ad_id": "ad_b"}, {"ad_id": "ad_c"}])
+    paths = []
+    sleeps = []
+
+    def fail_request(request):
+        paths.append(request.url.path)
+        assert request.url.params["fields"] == "id,name,creative{id}"
+        if failure == "timeout":
+            raise httpx.ReadTimeout("simulated timeout", request=request)
+        return httpx.Response(503, json={"error": {"message": "Service unavailable", "code": 2}})
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    settings = Settings(
+        access_token="test-token", api_version="v25.0", default_account_id=None,
+        app_id=None, app_secret=None, redirect_uri=None, log_level="INFO",
+        host="127.0.0.1", port=8000, request_timeout=30, max_retries=2,
+    )
+
+    async def run_report():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fail_request)) as http_client:
+            monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda self, **kwargs: http_client)
+            graph_client = GraphAPIClient(settings=settings, access_token_override="test-token")
+            monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: graph_client)
+            return await diagnostics.get_creative_fatigue_report(
+                campaign_id="cmp_1", since="2026-03-01", until="2026-03-07",
+            )
+
+    result = asyncio.run(run_report())
+
+    assert paths == ["/v25.0/ad_a"] * 3  # Initial request plus only this ad's two retries.
+    assert sleeps == [1.0, 2.0]
+    assert result["creative_lookups_attempted"] == 1
+    assert result["complete"] is True
+    assert result["creative_identity_complete"] is False
+    assert [finding["type"] for finding in result["findings"]] == ["creative_fatigue_risk"] * 3
+    entities = [finding["affected_entities"][0] for finding in result["findings"]]
+    assert [entity["creative_resolution_status"] for entity in entities] == [
+        "lookup_failed", "skipped_transient_error", "skipped_transient_error",
+    ]
+    assert all(entity["creative_id"] is None for entity in entities)
+
+
 def test_fatigue_reuses_creative_metadata_for_duplicate_flagged_ad_ids(monkeypatch) -> None:
     _patch_fatigue_rows(monkeypatch, [{"ad_id": "ad_1"}, {"ad_id": "ad_1"}])
     calls = []

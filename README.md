@@ -325,8 +325,10 @@ defaults to a 1,000-ad bound; use `max_ads=5000` for a larger account (maximum
 no partial diagnosis is returned. Flagged ads receive current creative IDs via
 up to 100 extra metadata reads (`max_creative_lookups`, 0–1,000; zero disables
 enrichment). Missing IDs, failed reads, rate limits, and the lookup cap remain
-explicit without discarding findings. Exact creative-ID groups cover flagged
-ads only; current IDs do not prove historical creative identity and are not
+explicit without discarding findings. An exhausted transient error stops further
+optional reads for that call; unread identities are marked `skipped_transient_error`.
+Exact creative-ID groups cover flagged ads only; current IDs do not prove
+historical creative identity and are not
 inferred from names. `creative_identity_complete` is separate from the complete
 Insights scan. Confidence remains null/uncalibrated. Medium severity requires
 at least 20% CTR decline and 20% frequency rise; high requires at least 50% of
