@@ -14,7 +14,7 @@ from meta_ads_mcp.normalize import (
     normalize_collection,
 )
 from meta_ads_mcp.schemas import collection_response
-from meta_ads_mcp.tool_types import FieldList, StringList
+from meta_ads_mcp.tool_types import FieldList, StringList, normalize_field_list
 
 ACCOUNT_FIELDS = [
     "id",
@@ -334,8 +334,9 @@ async def list_ads(
     name_contains: str | None = None,
     limit: int = 50,
     after: str | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """Discover ads under one scope, optionally filtering names and statuses server-side."""
+    """Discover paginated ads under one scope; select fields such as id,name for lean output. Omitted status filters use Meta's visibility defaults, not historical inventory."""
     account_id = blank_to_none(account_id)
     campaign_id = blank_to_none(campaign_id)
     adset_id = blank_to_none(adset_id)
@@ -343,6 +344,9 @@ async def list_ads(
     if scope_count > 1:
         raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")
     parent_id = adset_id or campaign_id or _resolve_account_id(account_id)
+    requested_fields = normalize_field_list(fields) or list(AD_FIELDS)
+    if "bid_amount" in requested_fields and "account_id" not in requested_fields:
+        requested_fields.append("account_id")
     client = get_graph_api_client()
     params: dict[str, Any] = {
         "limit": limit,
@@ -351,8 +355,13 @@ async def list_ads(
     }
     if after:
         params["after"] = after
-    payload = await client.list_objects(parent_id, "ads", fields=AD_FIELDS, params=params)
+    payload = await client.list_objects(parent_id, "ads", fields=requested_fields, params=params)
     normalized = normalize_collection(payload)
+    normalized["summary"].update({
+        "complete": not bool(normalized["paging"].get("next")),
+        "effective_status_filter": effective_status or None,
+        "visibility": "explicit_status_filter" if effective_status else "meta_default",
+    })
     normalized["items"] = await _hydrate_and_normalize_monetary_fields(
         client,
         normalized["items"],

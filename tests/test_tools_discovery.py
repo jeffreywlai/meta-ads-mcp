@@ -10,6 +10,55 @@ from meta_ads_mcp.errors import UnsupportedFeatureError
 from meta_ads_mcp.tools import discovery
 
 
+@pytest.mark.parametrize("fields", [["id", "name"], "id,name"])
+def test_list_ads_accepts_lean_fields_without_currency_lookups(monkeypatch, fields) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    class LeanClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert fields == ["id", "name"]
+            return {"data": [{"id": "ad1", "name": "Test"}],
+                    "paging": {"next": "next", "cursors": {"after": "cursor"}}}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: LeanClient())
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": "list_ads", "arguments": {"account_id": "act_123", "fields": fields},
+    })).structured_content
+    assert result["items"] == [{"id": "ad1", "name": "Test"}]
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["visibility"] == "meta_default"
+    assert result["summary"]["effective_status_filter"] is None
+
+
+def test_list_ads_discloses_explicit_status_selection(monkeypatch) -> None:
+    class StatusClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert params["effective_status"] == ["ACTIVE"]
+            return {"data": []}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: StatusClient())
+    result = asyncio.run(discovery.list_ads(account_id="act_123", effective_status=["ACTIVE"]))
+    assert result["summary"]["complete"] is True
+    assert result["summary"]["effective_status_filter"] == ["ACTIVE"]
+    assert result["summary"]["visibility"] == "explicit_status_filter"
+
+
+def test_custom_bid_fields_include_currency_dependency(monkeypatch) -> None:
+    class BidClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert fields == ["id", "bid_amount", "account_id"]
+            return {"data": [{"id": "ad1", "bid_amount": "150", "account_id": "123"}]}
+
+        async def get_object(self, object_id, *, fields):
+            assert object_id == "act_123"
+            assert fields == ["currency"]
+            return {"currency": "USD"}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: BidClient())
+    result = asyncio.run(discovery.list_ads(adset_id="as1", fields="id,bid_amount"))
+    assert result["items"][0]["bid_amount"] == 1.5
+
+
 class FakeDiscoveryClient:
     """Simple fake API client for discovery tests."""
 
