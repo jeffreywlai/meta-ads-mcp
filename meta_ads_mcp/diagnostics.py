@@ -193,7 +193,7 @@ def build_finding(
     summary: str,
     *,
     severity: str = "medium",
-    confidence: float = 0.5,
+    confidence: float | None = 0.5,
     evidence: list[dict[str, Any]] | None = None,
     affected_entities: list[dict[str, Any]] | None = None,
     next_actions: list[str] | None = None,

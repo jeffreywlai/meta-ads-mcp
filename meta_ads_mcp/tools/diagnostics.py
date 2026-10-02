@@ -1082,8 +1082,11 @@ async def get_creative_fatigue_report(
     previous_until: str | None = None,
     current_window_days: int = 7,
     previous_window_days: int = 7,
+    min_impressions: int = 1000,
 ) -> dict[str, Any]:
-    """Use this when the user asks whether ads are fatiguing between a current and previous window. Prefer level/object_id for consistency."""
+    """Compare fatigue heuristics between windows; require 1,000 impressions in each by default (a configurable policy, not statistical significance). Prefer level/object_id; confidence is uncalibrated/null."""
+    if min_impressions < 0:
+        raise ValidationError("min_impressions must be nonnegative; zero disables the volume gate.")
     scope_level, resolved_object_id = _resolve_scope(
         allowed_levels=("campaign", "adset"),
         level=level,
@@ -1119,10 +1122,17 @@ async def get_creative_fatigue_report(
     previous_by_id = {row.get("ad_id") or row.get("id"): row for row in previous_rows}
     findings: list[dict[str, Any]] = []
     comparison_count = 0
+    excluded_low_volume_count = 0
     for current in current_rows:
         entity_id = current.get("ad_id") or current.get("id")
         prior = previous_by_id.get(entity_id)
         if not prior:
+            continue
+        if min_impressions and any(
+            (to_float(row.get("impressions")) or 0) < min_impressions
+            for row in (current, prior)
+        ):
+            excluded_low_volume_count += 1
             continue
         comparison = compare_metric_sets(current["metrics"], prior["metrics"])
         ctr_drop = comparison["ctr"]["pct_delta"]
@@ -1136,7 +1146,7 @@ async def get_creative_fatigue_report(
                     "creative_fatigue_risk",
                     f"Ad {entity_id} shows higher frequency and weaker CTR than the prior window.",
                     severity="medium",
-                    confidence=0.75,
+                    confidence=None,
                     evidence=[
                         metric_evidence(
                             "frequency_change",
@@ -1158,6 +1168,15 @@ async def get_creative_fatigue_report(
                                 "previous_impressions": prior.get("impressions"),
                             },
                         ),
+                        metric_evidence(
+                            "ctr_change",
+                            ctr_drop,
+                            "(current_ctr - previous_ctr) / previous_ctr",
+                            {
+                                "current_ctr": current["metrics"].get("ctr"),
+                                "previous_ctr": prior["metrics"].get("ctr"),
+                            },
+                        ),
                     ],
                     affected_entities=[{"ad_id": entity_id}],
                     next_actions=[
@@ -1175,10 +1194,10 @@ async def get_creative_fatigue_report(
                 (
                     "No strong fatigue pattern was detected across the compared windows."
                     if comparison_count
-                    else "No comparable CTR and frequency data was available across the selected windows."
+                    else "No comparable CTR and frequency data met the selected minimum-impressions policy."
                 ),
                 severity="low",
-                confidence=0.4,
+                confidence=None,
             )
         ],
         extra={
@@ -1186,6 +1205,8 @@ async def get_creative_fatigue_report(
             "current_window": current_window,
             "previous_window": previous_window_range,
             "comparison_count": comparison_count,
+            "min_impressions": min_impressions,
+            "excluded_low_volume_count": excluded_low_volume_count,
         },
     )
 

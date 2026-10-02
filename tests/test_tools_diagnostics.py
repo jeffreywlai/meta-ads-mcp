@@ -631,8 +631,8 @@ def test_creative_performance_report_rejects_conflicting_scope_inputs(monkeypatc
 def test_creative_fatigue_report_detects_declining_ctr_with_rising_frequency(monkeypatch) -> None:
     async def fake_child_insights(object_id: str, *, since: str | None = None, **kwargs):
         if since == "2026-03-01":
-            return [{"ad_id": "ad1", "metrics": {"ctr": 0.01, "frequency": 3.0}}]
-        return [{"ad_id": "ad1", "metrics": {"ctr": 0.03, "frequency": 2.0}}]
+            return [{"ad_id": "ad1", "impressions": 1000, "metrics": {"ctr": 0.01, "frequency": 3.0}}]
+        return [{"ad_id": "ad1", "impressions": 1000, "metrics": {"ctr": 0.03, "frequency": 2.0}}]
 
     class FixedDate(diagnostics.date):
         @classmethod
@@ -685,8 +685,8 @@ def test_creative_fatigue_report_accepts_level_and_object_id(monkeypatch) -> Non
     async def fake_child_insights(object_id: str, *, since: str | None = None, **kwargs):
         calls.append(object_id)
         if since == "2026-03-01":
-            return [{"ad_id": "ad1", "metrics": {"ctr": 0.01, "frequency": 3.0}}]
-        return [{"ad_id": "ad1", "metrics": {"ctr": 0.03, "frequency": 2.0}}]
+            return [{"ad_id": "ad1", "impressions": 1000, "metrics": {"ctr": 0.01, "frequency": 3.0}}]
+        return [{"ad_id": "ad1", "impressions": 1000, "metrics": {"ctr": 0.03, "frequency": 2.0}}]
 
     monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
     result = asyncio.run(
@@ -704,7 +704,7 @@ def test_creative_fatigue_report_accepts_level_and_object_id(monkeypatch) -> Non
 
 def test_creative_fatigue_report_returns_no_pattern_when_no_signal(monkeypatch) -> None:
     async def fake_child_insights(*args, **kwargs):
-        return [{"ad_id": "ad1", "metrics": {"ctr": 0.03, "frequency": 2.0}}]
+        return [{"ad_id": "ad1", "impressions": 1000, "metrics": {"ctr": 0.03, "frequency": 2.0}}]
 
     class FixedDate(diagnostics.date):
         @classmethod
@@ -728,6 +728,49 @@ def test_fatigue_keeps_insufficient_data_for_unusable_comparisons(monkeypatch, r
 
     assert result["findings"][0]["type"] == "insufficient_data"
     assert result["comparison_count"] == 0
+
+
+@pytest.mark.parametrize("low_window", ["current", "previous"])
+def test_fatigue_excludes_low_volume_in_either_window(monkeypatch, low_window) -> None:
+    async def fake_child_insights(*args, since=None, **kwargs):
+        current = since == "2026-03-01"
+        low = current == (low_window == "current")
+        return [{"ad_id": "ad1", "impressions": 4 if low else 1000,
+                 "metrics": {"ctr": 0.01 if current else 0.03, "frequency": 3 if current else 2}}]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_creative_fatigue_report(
+        campaign_id="cmp_123", since="2026-03-01", until="2026-03-07",
+    ))
+
+    assert result["findings"][0]["type"] == "insufficient_data"
+    assert result["excluded_low_volume_count"] == 1
+    assert result["comparison_count"] == 0
+
+
+def test_fatigue_volume_gate_can_be_disabled_without_claiming_confidence(monkeypatch) -> None:
+    async def fake_child_insights(*args, since=None, **kwargs):
+        current = since == "2026-03-01"
+        return [{"ad_id": "ad1", "impressions": 4,
+                 "metrics": {"ctr": 0.25 if current else 0.5, "frequency": 3 if current else 2}}]
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    result = asyncio.run(diagnostics.get_creative_fatigue_report(
+        campaign_id="cmp_123", since="2026-03-01", until="2026-03-07", min_impressions=0,
+    ))
+
+    finding = result["findings"][0]
+    assert finding["type"] == "creative_fatigue_risk"
+    assert finding["confidence"] is None
+    evidence = next(item for item in finding["evidence"] if item["metric"] == "ctr_change")
+    assert evidence["value"] == -0.5
+    assert evidence["inputs"] == {"current_ctr": 0.25, "previous_ctr": 0.5}
+
+
+def test_fatigue_rejects_negative_volume_floor_before_fetch(monkeypatch) -> None:
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: pytest.fail("must not fetch"))
+    with pytest.raises(diagnostics.ValidationError, match="min_impressions"):
+        asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123", min_impressions=-1))
 
 
 def test_creative_fatigue_report_supports_explicit_windows(monkeypatch) -> None:
