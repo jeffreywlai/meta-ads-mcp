@@ -984,8 +984,13 @@ async def get_performance_breakdown(
     sort_by: str = "spend",
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants ranked segment performance, such as by country, device, or age."""
+    """Rank segment performance. platform_position also requests publisher_platform so placement rows retain their platform context."""
     after = blank_to_none(after)
+    effective_breakdowns = (
+        ["publisher_platform", "platform_position"]
+        if breakdown == "platform_position"
+        else [breakdown]
+    )
     payload = await get_entity_insights(
         level=level,
         object_id=object_id,
@@ -993,7 +998,7 @@ async def get_performance_breakdown(
         since=since,
         until=until,
         fields=fields,
-        breakdowns=[breakdown],
+        breakdowns=effective_breakdowns,
         limit=500,
         after=after,
     )
@@ -1008,6 +1013,7 @@ async def get_performance_breakdown(
         summary={
             "count": len(ranked),
             "breakdown": breakdown,
+            "breakdowns": effective_breakdowns,
             "metrics": payload["summary"]["metrics"],
             "top_segments": ranked[:5],
             "bottom_segments": ranked[-5:] if ranked else [],

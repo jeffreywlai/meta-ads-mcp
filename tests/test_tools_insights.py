@@ -1016,6 +1016,23 @@ def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:
     assert result["paging"]["after"] == "after_1"
 
 
+@pytest.mark.parametrize(
+    ("breakdown", "expected"),
+    [("platform_position", "publisher_platform,platform_position"), ("country", "country")],
+)
+def test_performance_breakdown_pairs_only_platform_position(monkeypatch, breakdown, expected) -> None:
+    class PlacementClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["breakdowns"] == expected
+            return {"data": [{"publisher_platform": "instagram", "platform_position": "story", "spend": "10"}]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PlacementClient())
+    result = asyncio.run(insights.get_performance_breakdown(level="ad", object_id="ad_1", breakdown=breakdown))
+    assert result["summary"]["breakdowns"] == expected.split(",")
+    assert result["items"][0]["publisher_platform"] == "instagram"
+    assert result["items"][0]["platform_position"] == "story"
+
+
 def test_compare_time_ranges_compares_previous_zero_metrics(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
