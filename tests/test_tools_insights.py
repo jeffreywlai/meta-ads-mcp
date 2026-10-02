@@ -54,6 +54,30 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+def test_sync_insights_can_omit_raw_actions_without_losing_metrics(monkeypatch, tool) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(
+        tool(
+            level="account", object_id="act_123", action_types=["purchase"],
+            flatten_actions=["purchase", "purchase_value"], include_raw_actions=False,
+        )
+    )
+    row = result["items"][0]
+    assert row["purchase"] == 2
+    assert row["purchase_value"] == 250
+    assert row["metrics"]["roas"] == 2.5
+    assert result["summary"]["action_filter"]["matched"] == ["purchase"]
+    for field in ("actions", "action_values", "actions_map", "action_values_map"):
+        assert field not in row
+
+
+def test_sync_insights_keeps_raw_actions_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+    assert result["items"][0]["actions"][0]["value"] == "2"
+
+
 @pytest.mark.parametrize("row_count", [1, 2])
 def test_get_entity_insights_keeps_unrequested_metrics_unknown(monkeypatch, row_count) -> None:
     class ProjectedInsightsClient:
@@ -1808,8 +1832,9 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
 
     archived = json.loads("".join(chunks))
     archived_result = archived["tool_result"]
+    assert archived["schema_version"] == 2
     assert archived_result["structured_content"]["items"][0]["ad_name"] == oversized_name
-    assert archived_result["content"]
+    assert archived_result["content"] == []  # Duplicate compatibility JSON is omitted.
     assert "meta" in archived_result
     artifact_path = artifact_store._artifact_path(export_id)
     assert overflow["artifact_bytes"] == artifact_path.stat().st_size

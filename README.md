@@ -289,6 +289,11 @@ above override those defaults.
 If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
 
+Synchronous `get_entity_insights` (and its `get_insights` alias) accepts
+`include_raw_actions=false` to omit duplicate action arrays and maps while
+keeping derived metrics and requested `flatten_actions` columns. Its default
+response remains unchanged.
+
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating

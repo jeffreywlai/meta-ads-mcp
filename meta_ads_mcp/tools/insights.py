@@ -467,6 +467,12 @@ def _normalize_reporting_object_id(level: str, object_id: str) -> str:
     return object_id
 
 
+def _remove_raw_actions(row: dict[str, Any]) -> None:
+    """Remove redundant action formats after metrics and projections are derived."""
+    for field in (*RAW_ACTION_ARRAY_FIELDS, "actions_map", "action_values_map"):
+        row.pop(field, None)
+
+
 def _normalize_rows(
     payload: dict[str, Any],
     action_types: list[str] | None = None,
@@ -487,10 +493,7 @@ def _normalize_rows(
         row["metrics"] = derive_core_metrics(row)
         row.update(_flatten_action_columns(flatten_source, flatten_actions))
         if not include_raw_actions:
-            for field in RAW_ACTION_ARRAY_FIELDS:
-                row.pop(field, None)
-            row.pop("actions_map", None)
-            row.pop("action_values_map", None)
+            _remove_raw_actions(row)
         rows.append(row)
     return rows
 
@@ -767,8 +770,9 @@ async def get_entity_insights(
     include_instagram_profile_follow: bool = False,
     limit: int = 100,
     after: str | None = None,
+    include_raw_actions: bool = True,
 ) -> dict[str, Any]:
-    """Return paginated insights rows with optional flattened purchase, purchase-value, or other action columns; use summarize_actions for totals."""
+    """Return paginated insights with optional scalar action columns; set include_raw_actions=false for compact rows while retaining metrics and flattened columns."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
@@ -815,6 +819,9 @@ async def get_entity_insights(
         response["summary"]["flattened_action_columns"] = [
             _normalize_key(label) for label in flatten_actions
         ]
+    if not include_raw_actions:
+        for row in rows:
+            _remove_raw_actions(row)
     return response
 
 
@@ -836,6 +843,7 @@ async def get_insights(
     action_attribution_windows: StringList | None = None,
     limit: int = 100,
     after: str | None = None,
+    include_raw_actions: bool = True,
 ) -> dict[str, Any]:
     """Compatibility alias for older Claude calls; prefer get_entity_insights for new reporting reads."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
@@ -855,6 +863,7 @@ async def get_insights(
         action_attribution_windows=action_attribution_windows,
         limit=limit,
         after=after,
+        include_raw_actions=include_raw_actions,
     )
 
 
