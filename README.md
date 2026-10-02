@@ -312,11 +312,20 @@ cannot finish. Narrow the query or use async reports for larger results.
 For an account-wide fatigue sweep, call `get_creative_fatigue_report` with
 `account_id` or `level="account", object_id="act_ACCOUNT_ID"`. It reads both
 windows at ad granularity, follows pagination, and includes ad/campaign/ad set
-names without extra lookups. Findings are ranked by current spend. Each window
+names. Findings use a transparent ordering: minimum impressions across both
+windows, CTR decline, frequency increase, current spend, then ad ID. This is a
+rule-based priority order, not statistical significance. Each window
 defaults to a 1,000-ad bound; use `max_ads=5000` for a larger account (maximum
 10,000). Scans beyond the selected bound or unusable pagination fail explicitly;
-no partial diagnosis is returned. Creative IDs are not Insights fields and are
-not inferred from names.
+no partial diagnosis is returned. Flagged ads receive current creative IDs via
+up to 100 extra metadata reads (`max_creative_lookups`, 0–1,000; zero disables
+enrichment). Missing IDs, failed reads, rate limits, and the lookup cap remain
+explicit without discarding findings. Exact creative-ID groups cover flagged
+ads only; current IDs do not prove historical creative identity and are not
+inferred from names. `creative_identity_complete` is separate from the complete
+Insights scan. Confidence remains null/uncalibrated. Medium severity requires
+at least 20% CTR decline and 20% frequency rise; high requires at least 50% of
+both. These thresholds are a prioritization policy, not probabilities.
 
 Use `list_ads(name_contains_any=["Ada","Grace"], whole_term_match=true,
 effective_status=["ACTIVE"], fields=["id","name"])` to search several names in
