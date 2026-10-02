@@ -780,12 +780,23 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         max_size: int,
         export_id: str,
         response_kind: str = "response",
+        artifact_bytes: int | None = None,
+        ttl_seconds: int | None = None,
+        row_count: int | None = None,
     ) -> str:
         """Return compact remote-retrieval guidance for an archived payload."""
+        details = []
+        if artifact_bytes is not None:
+            details.append(f"{artifact_bytes:,} archived bytes")
+        if row_count is not None:
+            details.append(f"{row_count:,} rows")
+        if ttl_seconds is not None:
+            details.append(f"retention {ttl_seconds:,} seconds")
+        size_hint = f" ({'; '.join(details)})" if details else ""
         return (
             f"[{response_kind.capitalize()} exceeded the {max_size:,}-byte "
             f"inline limit. The complete JSON is available as export_id "
-            f"'{export_id}'. Use call_tool with name='read_overflow_artifact' "
+            f"'{export_id}'{size_hint}. Use call_tool with name='read_overflow_artifact' "
             f'and arguments={{"export_id": "{export_id}", "offset": 0}} '
             "repeatedly using next_offset. When done, use call_tool with "
             "name='delete_overflow_artifact' and that export_id.]"
@@ -817,7 +828,7 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
             if len(serialized_error) <= self.max_size:
                 raise
             try:
-                export_id, _artifact_size = self.artifact_store.create(
+                export_id, artifact_size = self.artifact_store.create(
                     error_result,
                     tool_name=context.message.name,
                 )
@@ -828,6 +839,8 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                     max_size=self.max_size,
                     export_id=export_id,
                     response_kind="error",
+                    artifact_bytes=artifact_size,
+                    ttl_seconds=self.artifact_store.ttl_seconds,
                 )
             ) from None
 
@@ -864,9 +877,14 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                 },
             )
 
+        structured = result.structured_content or {}
+        rows = structured.get("items", structured.get("rows"))
         message = self._retrieval_message(
             max_size=self.max_size,
             export_id=export_id,
+            artifact_bytes=artifact_size,
+            ttl_seconds=self.artifact_store.ttl_seconds,
+            row_count=len(rows) if isinstance(rows, list) else None,
         )
         return ToolResult(
             content=[TextContent(type="text", text=message)],

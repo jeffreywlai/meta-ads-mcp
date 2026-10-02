@@ -279,6 +279,9 @@ from local or remote MCP transports. Then use `call_tool` with
 server uses the operating system's temporary `meta-ads-mcp-exports` directory.
 The 64 KB threshold applies only to the inline MCP response: Meta's complete
 result is retained in the artifact and is not truncated or discarded.
+Archive schema v2 uses compact JSON and stores identical JSON compatibility
+text only once, under `tool_result.structured_content`. Distinct or annotated
+text remains intact. Overflow notices include archive size and retention.
 Artifacts expire after 24 hours by default, and the store retains at most 100
 response artifacts totaling 1 GB of JSON payload data; small private integrity
 manifests are stored alongside those payloads. The three retention variables

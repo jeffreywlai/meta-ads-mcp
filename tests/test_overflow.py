@@ -76,6 +76,16 @@ def test_artifact_stores_redundant_json_once_compactly(tmp_path: Path) -> None:
     assert result.content[0].text == json.dumps(payload, indent=2)
 
 
+def test_overflow_notice_exposes_size_rows_and_retention() -> None:
+    notice = ArchivedResponseLimitingMiddleware._retrieval_message(
+        max_size=64000, export_id="opaque", artifact_bytes=88169, row_count=22, ttl_seconds=86400,
+    )
+    assert "88,169 archived bytes" in notice
+    assert "22 rows" in notice
+    assert "retention 86,400 seconds" in notice
+    assert "next_offset" in notice
+
+
 @pytest.mark.parametrize(
     ("text", "structured"),
     [('not JSON', {"value": 1}), ('{"value": 1}', {"value": True}), ('{"value": 2}', {"value": 1})],
