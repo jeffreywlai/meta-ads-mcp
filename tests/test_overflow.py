@@ -19,6 +19,8 @@ from mcp.types import TextContent
 import pytest
 
 from meta_ads_mcp.errors import NotFoundError, ValidationError
+from meta_ads_mcp.diagnostics import derive_core_metrics
+from meta_ads_mcp.normalize import normalize_insights_row
 from meta_ads_mcp import overflow
 from meta_ads_mcp.overflow import (
     ArchivedResponseLimitingMiddleware,
@@ -73,6 +75,43 @@ def test_artifact_stores_redundant_json_once_compactly(tmp_path: Path) -> None:
     assert artifact["tool_result"]["structured_content"] == payload
     assert artifact["tool_result"]["meta"] == {"source": "test"}
     assert size < 1.1 * len(json.dumps(payload, separators=(",", ":")).encode())
+    assert result.content[0].text == json.dumps(payload, indent=2)
+
+
+def test_s4_shaped_22_row_action_artifact_has_one_compact_copy(tmp_path: Path) -> None:
+    # Reproduce the redacted report's shape, not its unavailable original values.
+    action_types = ["purchase", *[f"offsite_conversion.fb_pixel_custom.action_{index}" for index in range(16)]]
+    rows = []
+    for index in range(22):
+        row = normalize_insights_row({
+            "ad_id": "ad_s4", "ad_name": "A3_story_creative",
+            "date_start": "2026-03-17", "date_stop": "2026-07-28",
+            "publisher_platform": "instagram", "platform_position": "story",
+            "spend": "100", "impressions": "10000", "clicks": "80", "ctr": "0.8", "cpm": "10",
+            "actions": [{"action_type": action, "value": str(index + 2), "7d_click": str(index + 1)}
+                        for action in action_types],
+            "action_values": [{"action_type": action, "value": str((index + 2) * 100), "7d_click": str((index + 1) * 100)}
+                              for action in action_types],
+        })
+        row["metrics"] = derive_core_metrics(row)
+        rows.append(row)
+    payload = {"items": rows, "summary": {"count": 22, "complete": True}}
+    compact_payload = json.dumps(payload, separators=(",", ":")).encode()
+    assert len(compact_payload) > 64_000  # Exercise the actual overflow-sized workload.
+    result = ToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, indent=2))],
+        structured_content=payload,
+    )
+    store = OverflowArtifactStore(tmp_path)
+    export_id, artifact_bytes = store.create(result, tool_name="get_insights")
+    artifact_text = store._artifact_path(export_id).read_text()
+    artifact = json.loads(artifact_text)
+
+    assert artifact["tool_result"]["content"] == []
+    assert artifact["tool_result"]["structured_content"] == payload
+    assert artifact_text.count('"ad_name":') == 22
+    assert "\n" not in artifact_text
+    assert artifact_bytes <= 1.1 * len(compact_payload)
     assert result.content[0].text == json.dumps(payload, indent=2)
 
 
