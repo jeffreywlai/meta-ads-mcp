@@ -840,6 +840,12 @@ async def get_entity_insights(
     response["summary"]["pages_fetched"] = pages_fetched
     response["summary"]["metrics"] = _aggregate_metrics(rows)
     response["summary"]["complete"] = not bool(response["paging"].get("next"))
+    if action_attribution_windows:
+        response["summary"]["attribution_note"] = (
+            "Derived conversion metrics, action maps, and flattened action columns use Meta's generic value, "
+            "not the named attribution-window fields. Keep include_raw_actions=true and read the named "
+            "window keys in actions/action_values for a click/view split."
+        )
     if action_types:
         response["summary"]["action_filter"] = {
             "requested": action_types,

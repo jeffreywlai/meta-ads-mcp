@@ -28,9 +28,10 @@ Action counts:
 
 Explicit click/view attribution reads:
 
-- Use `get_entity_insights` with the same scope, dates, and fields for each query. Set `use_unified_attribution_setting=false` and request one `action_attribution_windows` value per call, such as `["7d_click"]` or `["1d_view"]`, rather than mixing windows into one total.
-- Request `flatten_actions=["purchase","purchase_value"]` and `include_raw_actions=false` for compact scalar results. These controls already exist; no separate attribution tool is needed.
-- These reads compare Meta-attributed outcomes under the requested settings. They do not reconstruct historical ad set attribution-setting changes; use activity history or retained warehouse snapshots for that evidence.
+- Use `get_entity_insights` with explicit dates and `fields=["actions","action_values"]`. Set `use_unified_attribution_setting=false`, request `action_attribution_windows=["7d_click","1d_view"]`, and keep `include_raw_actions=true`.
+- For each selected purchase action type, read the named `7d_click` and `1d_view` keys from `actions` (counts) and `action_values` (values). Do not substitute the generic `value`: a live v26 check returned different values even when only one window was requested. Meta's [v26 action stats schema](https://github.com/facebook/facebook-python-business-sdk/blob/26.0.0/facebook_business/adobjects/adsactionstats.py) defines these as separate fields.
+- Core metrics, action maps, and `flatten_actions` preserve Meta's generic `value`; they are not window-specific projections. Compact mode removes the raw arrays, including their named attribution fields, so do not use it for this split. No separate attribution tool is needed.
+- Do not sum overlapping purchase action aliases or assume attribution windows are additive. These reads also do not reconstruct historical ad set attribution-setting changes; use activity history or retained warehouse snapshots for that evidence.
 
 Useful breakdowns:
 
