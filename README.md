@@ -310,6 +310,14 @@ names without extra lookups. Findings are ranked by current spend. Scans over
 1,000 rows or unusable pagination fail explicitly; no partial diagnosis is
 returned. Creative IDs are not Insights fields and are not inferred from names.
 
+Use `list_ads(name_contains_any=["Ada","Grace"], whole_term_match=true,
+effective_status=["ACTIVE"], fields=["id","name"])` to search several names in
+one bounded inventory scan. Matching is case-insensitive; whole-term mode treats
+punctuation and underscores as separators and avoids matching `Ada` in `Adam`.
+Each ad includes `matched_terms`. The scan follows pagination up to 1,000 ads and
+fails explicitly if it cannot finish; completeness still reflects the selected
+scope and status filters, not all historical ads.
+
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating

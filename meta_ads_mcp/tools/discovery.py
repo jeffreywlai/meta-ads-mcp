@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from meta_ads_mcp.config import get_settings
@@ -14,7 +15,9 @@ from meta_ads_mcp.normalize import (
     normalize_collection,
 )
 from meta_ads_mcp.schemas import collection_response
-from meta_ads_mcp.tool_types import FieldList, StringList, normalize_field_list
+from meta_ads_mcp.tool_types import (
+    FieldList, StrictStringList, StringList, coerce_strict_csv_string_list, normalize_field_list,
+)
 
 ACCOUNT_FIELDS = [
     "id",
@@ -335,8 +338,24 @@ async def list_ads(
     limit: int = 50,
     after: str | None = None,
     fields: FieldList | None = None,
+    name_contains_any: StrictStringList | None = None,
+    whole_term_match: bool = False,
 ) -> dict[str, Any]:
-    """Discover paginated ads under one scope; select fields such as id,name for lean output. Omitted status filters use Meta's visibility defaults, not historical inventory."""
+    """Discover ads with selectable fields. name_contains_any scans up to 1,000 ads once, case-insensitively; whole_term_match treats punctuation/underscores as delimiters. Omitted status uses Meta defaults, not historical inventory."""
+    terms = coerce_strict_csv_string_list(name_contains_any)
+    if not isinstance(terms, list) or any(not isinstance(term, str) or not term.strip() for term in terms):
+        raise ValidationError("name_contains_any must contain nonblank strings.")
+    if name_contains_any is not None and not terms:
+        raise ValidationError("name_contains_any must contain at least one term.")
+    terms = list(dict.fromkeys(term.strip().casefold() for term in terms))
+    if terms and blank_to_none(name_contains):
+        raise ValidationError("Use name_contains or name_contains_any, not both.")
+    if whole_term_match and not terms:
+        raise ValidationError("whole_term_match requires name_contains_any.")
+    if terms and blank_to_none(after):
+        raise ValidationError("name_contains_any performs a complete scan; omit after.")
+    if limit < 1:
+        raise ValidationError("limit must be positive.")
     account_id = blank_to_none(account_id)
     campaign_id = blank_to_none(campaign_id)
     adset_id = blank_to_none(adset_id)
@@ -344,12 +363,19 @@ async def list_ads(
     if scope_count > 1:
         raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")
     parent_id = adset_id or campaign_id or _resolve_account_id(account_id)
-    requested_fields = normalize_field_list(fields) or list(AD_FIELDS)
+    requested_fields = normalize_field_list(fields) or (
+        ["id", "name", "status", "effective_status", "campaign_id", "adset_id"]
+        if terms else list(AD_FIELDS)
+    )
+    if terms:
+        for field in ("id", "name"):
+            if field not in requested_fields:
+                requested_fields.append(field)
     if "bid_amount" in requested_fields and "account_id" not in requested_fields:
         requested_fields.append("account_id")
     client = get_graph_api_client()
     params: dict[str, Any] = {
-        "limit": limit,
+        "limit": min(limit, 1000) if terms else limit,
         **_status_filter(effective_status),
         **_name_filter(name_contains),
     }
@@ -357,6 +383,40 @@ async def list_ads(
         params["after"] = after
     payload = await client.list_objects(parent_id, "ads", fields=requested_fields, params=params)
     normalized = normalize_collection(payload)
+    if terms:
+        # Fetch the inventory once, not once per term. Never label a capped scan complete.
+        scanned = list(normalized["items"])
+        seen_cursors: set[str] = set()
+        while normalized["paging"].get("next"):
+            if len(scanned) >= 1000:
+                raise ValidationError("Name search exceeded the 1,000-ad scan limit; narrow scope or status. No partial result was returned.")
+            cursor = normalized["paging"].get("after")
+            if not cursor or cursor in seen_cursors or not normalized["items"]:
+                raise ValidationError("Name search pagination could not finish: missing/repeated cursor or empty next page.")
+            seen_cursors.add(cursor)
+            params.update({"after": cursor, "limit": min(limit, 1000 - len(scanned))})
+            payload = await client.list_objects(parent_id, "ads", fields=requested_fields, params=params)
+            normalized = normalize_collection(payload)
+            scanned.extend(normalized["items"])
+        if len(scanned) > 1000:
+            raise ValidationError("Name search exceeded the 1,000-ad scan limit; narrow scope or status. No partial result was returned.")
+        patterns = {
+            term: re.compile(r"(?<![^\W_])" + re.escape(term) + r"(?![^\W_])")
+            for term in terms
+        } if whole_term_match else {}
+        matched = []
+        for item in scanned:
+            name = str(item.get("name") or "").casefold()
+            matches = [term for term in terms if (
+                patterns[term].search(name) if whole_term_match else term in name
+            )]
+            if matches:
+                matched.append({**item, "matched_terms": matches})
+        normalized["items"] = matched
+        normalized["summary"].update({
+            "count": len(matched), "scanned_count": len(scanned),
+            "name_terms": terms, "match_mode": "whole_term" if whole_term_match else "substring",
+        })
     normalized["summary"].update({
         "complete": not bool(normalized["paging"].get("next")),
         "effective_status_filter": effective_status or None,
