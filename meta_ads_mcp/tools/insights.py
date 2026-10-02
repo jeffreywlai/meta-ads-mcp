@@ -776,7 +776,7 @@ async def get_entity_insights(
     include_raw_actions: bool = True,
     filtering: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Return paginated insights: level selects row granularity, object_id selects the parent scope. Supports native Meta filtering and compact rows with include_raw_actions=false."""
+    """Return paginated insights with optional flattened purchase, purchase-value, or other action columns. level selects row granularity; object_id selects the parent scope. Supports native filtering and compact rows with include_raw_actions=false."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
