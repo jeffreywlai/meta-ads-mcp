@@ -54,6 +54,44 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+@pytest.mark.parametrize(
+    "tool_name",
+    ["get_entity_insights", "get_insights", "export_insights",
+     "create_async_insights_report", "create_async_insights_report_batch"],
+)
+def test_reporting_filters_ad_rows_under_account_scope(monkeypatch, tool_name) -> None:
+    filters = [{"field": "ad.name", "operator": "CONTAIN", "value": "A3"}]
+    calls = []
+
+    class FilteredClient:
+        async def get_insights(self, object_id, *, fields, params):
+            calls.append((object_id, params))
+            return {
+                "data": [{"ad_id": "ad_1", "ad_name": "A3 story", "spend": "10"}],
+                "paging": {"next": "next-page", "cursors": {"after": "cursor-2"}},
+            }
+
+        async def create_async_insights_report(self, object_id, *, fields, params):
+            calls.append((object_id, params))
+            return {"report_run_id": "job-1"}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FilteredClient())
+    arguments = {"level": "ad", "object_id": "act_123", "filtering": filters}
+    if tool_name == "create_async_insights_report_batch":
+        arguments["breakdown_sets"] = [["publisher_platform", "platform_position"]]
+    result = asyncio.run(mcp_server.call_tool(tool_name, arguments)).structured_content
+    assert len(calls) == 1
+    object_id, params = calls[0]
+    assert object_id == "act_123"
+    assert params["level"] == "ad"
+    assert params["filtering"] == filters
+    if tool_name in {"get_entity_insights", "get_insights", "export_insights"}:
+        rows = result["rows"] if tool_name == "export_insights" else result["items"]
+        assert rows[0]["ad_name"] == "A3 story"
+        assert result["summary"]["complete"] is False
+        assert result["paging"]["after"] == "cursor-2"
+
+
 @pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
 def test_sync_insights_can_omit_raw_actions_without_losing_metrics(monkeypatch, tool) -> None:
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())

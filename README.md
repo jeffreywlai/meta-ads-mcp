@@ -294,6 +294,15 @@ Synchronous `get_entity_insights` (and its `get_insights` alias) accepts
 keeping derived metrics and requested `flatten_actions` columns. Its default
 response remains unchanged.
 
+For placement reporting across copies of an ad, use `level="ad"` with the
+parent `object_id="act_ACCOUNT_ID"` (or a campaign/ad set ID),
+`breakdowns=["publisher_platform","platform_position"]`, and native
+`filtering=[{"field":"ad.name","operator":"CONTAIN","value":"NAME_PREFIX"}]`.
+`level` already selects row granularity; no separate `row_level` is needed.
+Filters also work with exports and async report creation. Synchronous summaries
+cover the returned page only: check `summary.complete` and continue with
+`paging.after` before treating the result as exhaustive.
+
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating

@@ -434,6 +434,7 @@ def _insights_params(
     action_attribution_windows: list[str] | None = None,
     limit: int = 100,
     after: str | None = None,
+    filtering: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build insights params."""
     params: dict[str, Any] = {
@@ -457,6 +458,8 @@ def _insights_params(
         params["action_attribution_windows"] = ",".join(action_attribution_windows)
     if normalized_after := blank_to_none(after):
         params["after"] = normalized_after
+    if filtering:
+        params["filtering"] = filtering
     return params
 
 
@@ -771,8 +774,9 @@ async def get_entity_insights(
     limit: int = 100,
     after: str | None = None,
     include_raw_actions: bool = True,
+    filtering: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Return paginated insights with optional scalar action columns; set include_raw_actions=false for compact rows while retaining metrics and flattened columns."""
+    """Return paginated insights: level selects row granularity, object_id selects the parent scope. Supports native Meta filtering and compact rows with include_raw_actions=false."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
@@ -795,6 +799,7 @@ async def get_entity_insights(
         action_attribution_windows=action_attribution_windows,
         limit=limit,
         after=after,
+        filtering=filtering,
     )
     client = get_graph_api_client()
     payload = await client.get_insights(
@@ -810,6 +815,7 @@ async def get_entity_insights(
     response = normalize_collection(payload)
     response["items"] = rows
     response["summary"]["metrics"] = _aggregate_metrics(rows)
+    response["summary"]["complete"] = not bool(response["paging"].get("next"))
     if action_types:
         response["summary"]["action_filter"] = {
             "requested": action_types,
@@ -844,6 +850,7 @@ async def get_insights(
     limit: int = 100,
     after: str | None = None,
     include_raw_actions: bool = True,
+    filtering: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compatibility alias for older Claude calls; prefer get_entity_insights for new reporting reads."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
@@ -864,6 +871,7 @@ async def get_insights(
         limit=limit,
         after=after,
         include_raw_actions=include_raw_actions,
+        filtering=filtering,
     )
 
 
@@ -1135,6 +1143,7 @@ async def export_insights(
     inline_limit: int = DEFAULT_INLINE_EXPORT_ROWS,
     allow_large_output: bool = False,
     after: str | None = None,
+    filtering: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user explicitly wants export-style output; JSON returns structured rows, CSV returns serialized text."""
     after = blank_to_none(after)
@@ -1171,6 +1180,7 @@ async def export_insights(
         time_increment=time_increment,
         limit=limit,
         after=after,
+        filtering=filtering,
     )
     rows = payload["items"]
     returned_rows = rows if allow_large_output else rows[:inline_limit]
@@ -1208,6 +1218,7 @@ async def export_insights(
             "inline_limit": inline_limit,
             "allow_large_output": allow_large_output,
             "after": after,
+            "filtering": filtering or [],
         },
     }
     if export_format == "json":
@@ -1251,6 +1262,7 @@ async def create_async_insights_report(
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     limit: int = 100,
+    filtering: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a large report using lean fields by default and optional scalar action projections."""
     flatten_actions = _normalize_flatten_actions(flatten_actions)
@@ -1279,6 +1291,7 @@ async def create_async_insights_report(
             action_breakdowns=action_breakdowns,
             time_increment=time_increment,
             limit=limit,
+            filtering=filtering,
         ),
     )
     return {
@@ -1305,6 +1318,7 @@ async def create_async_insights_report_batch(
     action_breakdowns: StringList | None = None,
     time_increment: int | str | None = None,
     limit: int = 100,
+    filtering: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Submit a bounded sequence of async reports for several independent breakdown sets."""
     if not breakdown_sets:
@@ -1333,6 +1347,7 @@ async def create_async_insights_report_batch(
                 action_breakdowns=action_breakdowns,
                 time_increment=time_increment,
                 limit=limit,
+                filtering=filtering,
             )
             items.append(
                 {
