@@ -302,6 +302,10 @@ parent `object_id="act_ACCOUNT_ID"` (or a campaign/ad set ID),
 Filters also work with exports and async report creation. Synchronous summaries
 cover the returned page only: check `summary.complete` and continue with
 `paging.after` before treating the result as exhaustive.
+Alternatively, set `fetch_all=true` to collect up to 1,000 rows from the first
+page onward in one call (also supported by `get_insights` and `export_insights`).
+The server combines metrics after pagination, or fails explicitly if the scan
+cannot finish. Narrow the query or use async reports for larger results.
 
 For an account-wide fatigue sweep, call `get_creative_fatigue_report` with
 `account_id` or `level="account", object_id="act_ACCOUNT_ID"`. It reads both

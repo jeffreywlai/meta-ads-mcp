@@ -92,6 +92,64 @@ def test_reporting_filters_ad_rows_under_account_scope(monkeypatch, tool_name) -
         assert result["paging"]["after"] == "cursor-2"
 
 
+@pytest.mark.parametrize("tool_name", ["get_entity_insights", "get_insights", "export_insights"])
+def test_fetch_all_combines_filtered_pages_before_summarizing(monkeypatch, tool_name) -> None:
+    calls = []
+    filters = [{"field": "ad.id", "operator": "IN", "value": ["ad1", "ad2"]}]
+
+    class PagedClient:
+        async def get_insights(self, object_id, *, fields, params):
+            calls.append(dict(params))
+            assert object_id == "act_123"
+            assert params["filtering"] == filters
+            second = "after" in params
+            return {"data": [{"ad_id": "ad2" if second else "ad1", "spend": "20" if second else "10",
+                              "publisher_platform": "instagram", "platform_position": "story"}],
+                    **({} if second else {"paging": {"next": "next", "cursors": {"after": "page2"}}})}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PagedClient())
+    result = asyncio.run(mcp_server.call_tool(tool_name, {
+        "level": "ad", "object_id": "act_123", "filtering": filters, "fetch_all": True,
+    })).structured_content
+    rows = result["rows"] if tool_name == "export_insights" else result["items"]
+    assert [row["ad_id"] for row in rows] == ["ad1", "ad2"]
+    assert result["summary"]["metrics"]["spend"] == 30
+    assert result["summary"]["count"] == 2
+    assert result["summary"]["complete"] is True
+    assert result["summary"]["pages_fetched"] == 2
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("failure", ["cap", "missing_cursor", "repeated_cursor"])
+def test_fetch_all_fails_instead_of_returning_incomplete_insights(monkeypatch, failure) -> None:
+    class IncompleteClient:
+        async def get_insights(self, object_id, *, fields, params):
+            return {"data": [{"ad_id": str(index)} for index in range(1000 if failure == "cap" else 1)],
+                    "paging": {"next": "next", "cursors": {"after": None if failure == "missing_cursor" else "same"}}}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: IncompleteClient())
+    with pytest.raises(insights.ValidationError, match="scan limit|pagination"):
+        asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", fetch_all=True))
+
+
+def test_fetch_all_accepts_complete_result_exactly_at_cap(monkeypatch) -> None:
+    class CompleteClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["limit"] == 1000
+            return {"data": [{"ad_id": str(index)} for index in range(1000)]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: CompleteClient())
+    result = asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", fetch_all=True, limit=5000))
+    assert result["summary"]["count"] == 1000
+    assert result["summary"]["complete"] is True
+
+
+def test_fetch_all_rejects_starting_cursor_before_client(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(insights.ValidationError, match="omit after"):
+        asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", fetch_all=True, after="page2"))
+
+
 @pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
 def test_sync_insights_can_omit_raw_actions_without_losing_metrics(monkeypatch, tool) -> None:
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())

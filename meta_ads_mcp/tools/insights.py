@@ -775,10 +775,15 @@ async def get_entity_insights(
     after: str | None = None,
     include_raw_actions: bool = True,
     filtering: list[dict[str, Any]] | None = None,
+    fetch_all: bool = False,
 ) -> dict[str, Any]:
     """Return paginated insights with optional flattened purchase, purchase-value, or other action columns. level selects row granularity; object_id selects the parent scope. Supports native filtering and compact rows with include_raw_actions=false."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
+    if limit < 1:
+        raise ValidationError("limit must be positive.")
+    if fetch_all and blank_to_none(after):
+        raise ValidationError("fetch_all starts at the first page; omit after.")
     resolved_object_id = _normalize_reporting_object_id(level, object_id)
     requested_fields = _insights_fields(
         fields,
@@ -797,7 +802,7 @@ async def get_entity_insights(
         time_increment=time_increment,
         use_unified_attribution_setting=use_unified_attribution_setting,
         action_attribution_windows=action_attribution_windows,
-        limit=limit,
+        limit=min(limit, 1000) if fetch_all else limit,
         after=after,
         filtering=filtering,
     )
@@ -813,7 +818,26 @@ async def get_entity_insights(
         flatten_actions=flatten_actions,
     )
     response = normalize_collection(payload)
+    pages_fetched = 1
+    if fetch_all:
+        seen_cursors: set[str] = set()
+        while response["paging"].get("next"):
+            if len(rows) >= 1000:
+                raise ValidationError("Insights exceeded the 1,000-row scan limit; narrow filters or use an async report. No partial result was returned.")
+            cursor = response["paging"].get("after")
+            if not cursor or cursor in seen_cursors or not response["items"]:
+                raise ValidationError("Insights pagination could not finish: missing/repeated cursor or empty next page.")
+            seen_cursors.add(cursor)
+            params.update({"after": cursor, "limit": min(limit, 1000 - len(rows))})
+            payload = await client.get_insights(resolved_object_id, fields=requested_fields, params=params)
+            rows.extend(_normalize_rows(payload, action_types=action_types, flatten_actions=flatten_actions))
+            response = normalize_collection(payload)
+            pages_fetched += 1
+        if len(rows) > 1000:
+            raise ValidationError("Insights exceeded the 1,000-row scan limit; narrow filters or use an async report. No partial result was returned.")
     response["items"] = rows
+    response["summary"]["count"] = len(rows)
+    response["summary"]["pages_fetched"] = pages_fetched
     response["summary"]["metrics"] = _aggregate_metrics(rows)
     response["summary"]["complete"] = not bool(response["paging"].get("next"))
     if action_types:
@@ -851,6 +875,7 @@ async def get_insights(
     after: str | None = None,
     include_raw_actions: bool = True,
     filtering: list[dict[str, Any]] | None = None,
+    fetch_all: bool = False,
 ) -> dict[str, Any]:
     """Compatibility alias for older Claude calls; prefer get_entity_insights for new reporting reads."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
@@ -872,6 +897,7 @@ async def get_insights(
         after=after,
         include_raw_actions=include_raw_actions,
         filtering=filtering,
+        fetch_all=fetch_all,
     )
 
 
@@ -1150,6 +1176,7 @@ async def export_insights(
     allow_large_output: bool = False,
     after: str | None = None,
     filtering: list[dict[str, Any]] | None = None,
+    fetch_all: bool = False,
 ) -> dict[str, Any]:
     """Use this when the user explicitly wants export-style output; JSON returns structured rows, CSV returns serialized text."""
     after = blank_to_none(after)
@@ -1187,6 +1214,7 @@ async def export_insights(
         limit=limit,
         after=after,
         filtering=filtering,
+        fetch_all=fetch_all,
     )
     rows = payload["items"]
     returned_rows = rows if allow_large_output else rows[:inline_limit]
@@ -1225,6 +1253,7 @@ async def export_insights(
             "allow_large_output": allow_large_output,
             "after": after,
             "filtering": filtering or [],
+            "fetch_all": fetch_all,
         },
     }
     if export_format == "json":
