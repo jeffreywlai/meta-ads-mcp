@@ -223,7 +223,7 @@ def detect_snapshot_findings(
     conversions = to_float(summary_metrics.get("conversions"))
     roas = to_float(summary_metrics.get("roas"))
 
-    if spend and spend > 0 and not conversions:
+    if spend and spend > 0 and conversions == 0:
         findings.append(
             build_finding(
                 "high_spend_low_conversion",
