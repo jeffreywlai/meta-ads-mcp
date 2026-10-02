@@ -392,7 +392,7 @@ async def _child_insights(
     limit: int = 250,
     max_rows: int = 1000,
 ) -> list[dict[str, Any]]:
-    """Fetch child-entity insights rows."""
+    """Fetch complete child insights or fail clearly when pagination cannot finish."""
     if limit < 1 or max_rows < 1:
         raise ValidationError("limit and max_rows must be positive.")
     client = get_graph_api_client()
@@ -411,6 +411,7 @@ async def _child_insights(
     seen_after: set[str] = set()
     while True:
         params = dict(base_params)
+        params["limit"] = min(page_limit, max_rows - len(rows))
         if after:
             params["after"] = after
         payload = await client.get_insights(
@@ -419,15 +420,19 @@ async def _child_insights(
             params=params,
         )
         rows.extend(_normalize_rows(payload))
-        if len(rows) >= max_rows:
-            return rows[:max_rows]
         paging = extract_paging(payload)
-        next_after = paging.get("after") if paging.get("next") else None
+        if len(rows) > max_rows or (len(rows) == max_rows and paging.get("next")):
+            raise ValidationError(
+                f"Diagnostics exceeded the {max_rows}-row scan limit; narrow the scope or date window. "
+                "No partial diagnostic was returned."
+            )
+        if not paging.get("next"):
+            return rows
+        next_after = paging.get("after")
         if not next_after or next_after in seen_after:
-            break
+            raise ValidationError("Meta pagination could not finish: the next cursor is missing or repeated.")
         seen_after.add(next_after)
         after = next_after
-    return rows
 
 
 def _parse_required_date(value: str, *, field: str) -> date:

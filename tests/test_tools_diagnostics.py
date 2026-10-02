@@ -47,11 +47,33 @@ def test_child_insights_respects_max_rows_cap(monkeypatch) -> None:
             }
 
     monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: PagingInsightsClient())
-    rows = asyncio.run(diagnostics._child_insights("act_123", level="campaign", limit=2, max_rows=2))
+    with pytest.raises(diagnostics.ValidationError, match="No partial diagnostic"):
+        asyncio.run(diagnostics._child_insights("act_123", level="campaign", limit=2, max_rows=2))
 
-    assert [row["campaign_id"] for row in rows] == ["cmp_1", "cmp_2"]
-    assert [call["limit"] for call in calls] == [2, 2]
+    assert [call["limit"] for call in calls] == [2, 1]
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("cursor", [None, "repeated"])
+def test_child_insights_rejects_unusable_pagination(monkeypatch, cursor) -> None:
+    class BrokenPagingClient:
+        async def get_insights(self, *args, **kwargs):
+            return {"data": [{"ad_id": "ad1"}],
+                    "paging": {"next": "next", "cursors": {"after": cursor}}}
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: BrokenPagingClient())
+    with pytest.raises(diagnostics.ValidationError, match="missing or repeated"):
+        asyncio.run(diagnostics._child_insights("act_123", level="ad"))
+
+
+def test_child_insights_allows_complete_report_exactly_at_cap(monkeypatch) -> None:
+    class CompleteClient:
+        async def get_insights(self, *args, **kwargs):
+            return {"data": [{"ad_id": "ad1"}, {"ad_id": "ad2"}]}
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: CompleteClient())
+    rows = asyncio.run(diagnostics._child_insights("act_123", level="ad", max_rows=2))
+    assert [row["ad_id"] for row in rows] == ["ad1", "ad2"]
 
 
 def test_account_snapshot_ranks_children(monkeypatch) -> None:
