@@ -33,6 +33,12 @@ def test_get_capabilities_returns_live_named_tool_schema() -> None:
     assert "flatten_actions" in result["tool"]["input_schema"]["properties"]
 
 
+@pytest.mark.parametrize(("query", "expected"), [("creative fatigue report", "get_creative_fatigue_report"), ("list_ads", "list_ads")])
+def test_free_text_capabilities_reuse_live_search(query, expected) -> None:
+    result = asyncio.run(utility.get_capabilities(intent=query))
+    assert f"`{expected}`" in result["tool_matches"]
+
+
 @pytest.mark.parametrize("options", [{"tool_name": ""}, {"tool_name": "get_ad", "intent": "list_ads"}])
 def test_named_schema_rejects_ambiguous_request(options) -> None:
     with pytest.raises(ValidationError, match="tool_name alone"):

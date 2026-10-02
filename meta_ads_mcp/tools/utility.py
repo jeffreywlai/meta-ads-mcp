@@ -553,16 +553,18 @@ async def get_capabilities(
         route = INTENT_GUIDE.get(intent)
         if route is None:
             closest = _closest_intents(intent)
+            matches = await mcp_server.call_tool("search_tools", {"query": intent})
             return {
                 "server": _server_metadata(),
                 "unmatched_intent": intent,
                 "closest_intents": closest,
+                "tool_matches": "\n".join(item.text for item in matches.content if item.type == "text"),
                 "suggested_search": {"tool": "search_tools", "arguments": {"query": intent}},
                 "resources": RESOURCE_URIS,
                 "valid_intents": sorted(INTENT_GUIDE),
                 "notes": [
                     "No exact intent key matched, so this response returns fuzzy routing candidates.",
-                    "Use the top closest_intents entry when it fits, or search_tools with the original query.",
+                    "Prefer tool_matches from the live tool search; closest_intents are legacy workflow hints.",
                 ],
             }
         return {

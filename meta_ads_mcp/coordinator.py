@@ -172,6 +172,17 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
         ranked = [
             tool for tool in ranked if self._is_compatible(tool, decision)
         ]
+        if decision.preferred_tool != "get_insights":
+            canonical = self._tool_named(compatible_candidates, "get_entity_insights")
+            if canonical is not None:
+                ranked = [canonical if tool.name == "get_insights" else tool for tool in ranked]
+                seen_names: set[str] = set()
+                unique_ranked: list[Tool] = []
+                for tool in ranked:
+                    if tool.name not in seen_names:
+                        seen_names.add(tool.name)
+                        unique_ranked.append(tool)
+                ranked = unique_ranked
 
         preferred_names = (
             (decision.preferred_tool,) + decision.additional_preferred_tools

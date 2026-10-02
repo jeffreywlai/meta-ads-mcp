@@ -245,3 +245,13 @@ def test_live_search_routes_new_workflow_language_to_exact_tools() -> None:
     for query, expected in cases.items():
         result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
         assert f"- `{expected}`" in result.content[0].text.splitlines()[1]
+
+
+def test_placement_search_prefers_canonical_insights_but_exact_alias_still_works() -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": "insights breakdown by placement platform_position for an ad over a date range",
+    }))
+    assert "`get_entity_insights`" in result.content[0].text
+    assert "`get_insights`" not in result.content[0].text
+    exact = asyncio.run(mcp_server.call_tool("search_tools", {"query": "get_insights"}))
+    assert "- `get_insights`" in exact.content[0].text.splitlines()[1]
