@@ -303,6 +303,13 @@ Filters also work with exports and async report creation. Synchronous summaries
 cover the returned page only: check `summary.complete` and continue with
 `paging.after` before treating the result as exhaustive.
 
+For an account-wide fatigue sweep, call `get_creative_fatigue_report` with
+`account_id` or `level="account", object_id="act_ACCOUNT_ID"`. It reads both
+windows at ad granularity, follows pagination, and includes ad/campaign/ad set
+names without extra lookups. Findings are ranked by current spend. Scans over
+1,000 rows or unusable pagination fail explicitly; no partial diagnosis is
+returned. Creative IDs are not Insights fields and are not inferred from names.
+
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating

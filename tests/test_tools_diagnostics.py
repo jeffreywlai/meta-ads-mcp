@@ -668,7 +668,11 @@ def test_creative_fatigue_report_detects_declining_ctr_with_rising_frequency(mon
     assert result["findings"][0]["evidence"]
 
 
-def test_creative_fatigue_report_handles_ctr_crossing_one_percent(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("previous_ctr", "current_ctr", "flagged"),
+    [(1.2, 0.8, True), (0.6, 1.05, False), (0.8, 0.4, True)],
+)
+def test_creative_fatigue_report_handles_small_ctr_rates(monkeypatch, previous_ctr, current_ctr, flagged) -> None:
     class FatigueInsightsClient:
         async def get_insights(self, object_id: str, *, fields, params):
             assert object_id == "cmp_123"
@@ -676,9 +680,9 @@ def test_creative_fatigue_report_handles_ctr_crossing_one_percent(monkeypatch) -
             return {
                 "data": [{
                     "ad_id": "ad1",
-                    "ctr": "0.8" if current else "1.2",
-                    "clicks": "8" if current else "12",
-                    "impressions": "1000",
+                    "ctr": str(current_ctr if current else previous_ctr),
+                    "clicks": str(round((current_ctr if current else previous_ctr) * 100)),
+                    "impressions": "10000",
                     "frequency": "3.0" if current else "2.0",
                 }],
             }
@@ -695,10 +699,52 @@ def test_creative_fatigue_report_handles_ctr_crossing_one_percent(monkeypatch) -
     )
 
     finding = result["findings"][0]
+    if not flagged:
+        assert finding["type"] == "no_pattern_detected"
+        return
     assert finding["type"] == "creative_fatigue_risk"
     assert finding["affected_entities"] == [{"ad_id": "ad1"}]
     ctr_evidence = next(item for item in finding["evidence"] if item["metric"] == "ctr")
-    assert ctr_evidence["value"] == pytest.approx(0.008)
+    assert ctr_evidence["value"] == pytest.approx(current_ctr / 100)
+
+
+@pytest.mark.parametrize("scope", [{"account_id": "123"}, {"level": "account", "object_id": "123"}])
+def test_account_fatigue_matches_campaign_sweep_and_includes_names(monkeypatch, scope) -> None:
+    calls = []
+
+    class AccountFatigueClient:
+        async def get_insights(self, object_id, *, fields, params):
+            calls.append(object_id)
+            assert params["level"] == "ad"
+            current = json.loads(params["time_range"])["since"] == "2026-03-01"
+            indices = range(22) if object_id == "act_123" else [int(object_id.removeprefix("cmp_"))]
+            return {"data": [{
+                "ad_id": f"ad_{index}", "ad_name": f"Ad {index}",
+                "campaign_id": f"cmp_{index}", "campaign_name": f"Campaign {index}",
+                "adset_id": f"set_{index}", "adset_name": f"Ad set {index}",
+                "spend": str(index + 1), "impressions": "1000",
+                "clicks": "8" if current else "12", "ctr": "0.8" if current else "1.2",
+                "frequency": "3" if current else "2",
+            } for index in indices]}
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: AccountFatigueClient())
+    window = {"since": "2026-03-01", "until": "2026-03-07"}
+    result = asyncio.run(diagnostics.get_creative_fatigue_report(**scope, **window))
+    assert calls == ["act_123", "act_123"]  # No per-ad name or creative lookup.
+    assert result["scope"] == {"level": "account", "object_id": "act_123"}
+    assert result["complete"] is True
+    assert result["comparison_count"] == 22
+    assert result["ranked_by"] == "current_spend"
+    entities = [finding["affected_entities"][0] for finding in result["findings"]]
+    assert entities[0] == {
+        "ad_id": "ad_21", "ad_name": "Ad 21", "campaign_id": "cmp_21",
+        "campaign_name": "Campaign 21", "adset_id": "set_21", "adset_name": "Ad set 21",
+    }
+    sweep_ids = set()
+    for index in range(22):
+        campaign = asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id=f"cmp_{index}", **window))
+        sweep_ids.update(finding["affected_entities"][0]["ad_id"] for finding in campaign["findings"])
+    assert {entity["ad_id"] for entity in entities} == sweep_ids
 
 
 def test_creative_fatigue_report_accepts_level_and_object_id(monkeypatch) -> None:

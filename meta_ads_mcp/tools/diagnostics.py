@@ -1088,16 +1088,18 @@ async def get_creative_fatigue_report(
     current_window_days: int = 7,
     previous_window_days: int = 7,
     min_impressions: int = 1000,
+    account_id: str | None = None,
 ) -> dict[str, Any]:
-    """Compare fatigue heuristics between windows; require 1,000 impressions in each by default (a configurable policy, not statistical significance). Prefer level/object_id; confidence is uncalibrated/null."""
+    """Compare account, campaign, or ad set fatigue; rank flagged ads by current spend. Requires 1,000 impressions per window by default (policy, not statistical significance); confidence is uncalibrated/null."""
     if min_impressions < 0:
         raise ValidationError("min_impressions must be nonnegative; zero disables the volume gate.")
     scope_level, resolved_object_id = _resolve_scope(
-        allowed_levels=("campaign", "adset"),
+        allowed_levels=("account", "campaign", "adset"),
         level=level,
         object_id=object_id,
         campaign_id=campaign_id,
         adset_id=adset_id,
+        account_id=account_id,
     )
     current_window, previous_window_range = _fatigue_windows(
         since=since,
@@ -1128,7 +1130,7 @@ async def get_creative_fatigue_report(
     findings: list[dict[str, Any]] = []
     comparison_count = 0
     excluded_low_volume_count = 0
-    for current in current_rows:
+    for current in rank_rows(current_rows, "spend"):
         entity_id = current.get("ad_id") or current.get("id")
         prior = previous_by_id.get(entity_id)
         if not prior:
@@ -1182,8 +1184,17 @@ async def get_creative_fatigue_report(
                                 "previous_ctr": prior["metrics"].get("ctr"),
                             },
                         ),
+                        metric_evidence(
+                            "spend", current["metrics"].get("spend"), "Meta-reported spend",
+                            {"current_spend": current["metrics"].get("spend")},
+                        ),
                     ],
-                    affected_entities=[{"ad_id": entity_id}],
+                    affected_entities=[{
+                        "ad_id": entity_id,
+                        **{key: current[key] for key in (
+                            "ad_name", "campaign_id", "campaign_name", "adset_id", "adset_name",
+                        ) if current.get(key) is not None},
+                    }],
                     next_actions=[
                         "Review creative freshness.",
                         "Check audience saturation.",
@@ -1212,6 +1223,10 @@ async def get_creative_fatigue_report(
             "comparison_count": comparison_count,
             "min_impressions": min_impressions,
             "excluded_low_volume_count": excluded_low_volume_count,
+            "current_ad_count": len(current_rows),
+            "previous_ad_count": len(previous_rows),
+            "complete": True,
+            "ranked_by": "current_spend",
         },
     )
 
