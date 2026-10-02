@@ -67,7 +67,8 @@ def normalize_insights_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized["reach"] = to_int(row.get("reach"))
     normalized["clicks"] = to_int(row.get("clicks"))
     normalized["ctr"] = to_float(row.get("ctr"))
-    if normalized["ctr"] is not None and normalized["ctr"] > 1:
+    if normalized["ctr"] is not None:
+        # Meta reports CTR as a percentage, including values at or below 1%.
         normalized["ctr"] = normalized["ctr"] / 100.0
     normalized["cpc"] = to_float(row.get("cpc"))
     normalized["cpm"] = to_float(row.get("cpm"))

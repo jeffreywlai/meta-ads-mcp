@@ -54,6 +54,92 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+@pytest.mark.parametrize("row_count", [1, 2])
+def test_get_entity_insights_keeps_unrequested_metrics_unknown(monkeypatch, row_count) -> None:
+    class ProjectedInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert fields == ["spend", "impressions", "clicks"]
+            return {"data": [{"spend": "100", "impressions": "1000", "clicks": "50"} for _ in range(row_count)]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ProjectedInsightsClient())
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account", object_id="act_123", fields=["spend", "impressions", "clicks"],
+        )
+    )
+    metrics = result["summary"]["metrics"]
+
+    assert metrics["spend"] == 100.0 * row_count
+    assert metrics["impressions"] == 1000 * row_count
+    assert metrics["clicks"] == 50 * row_count
+    assert metrics["ctr"] == 0.05
+    for name in ("conversions", "conversion_value", "cvr", "cpa", "roas"):
+        assert metrics[name] is None
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "unknown_metrics"),
+    [
+        ("spend", ("spend", "cpc", "cpm", "cpa", "roas")),
+        ("impressions", ("impressions", "ctr", "cpm", "frequency")),
+        ("clicks", ("clicks", "ctr", "cpc", "cvr")),
+        ("actions", ("conversions", "cvr", "cpa")),
+        ("action_values", ("conversion_value", "roas")),
+        ("reach", ("frequency",)),
+    ],
+)
+def test_get_entity_insights_does_not_total_incomplete_metrics(
+    monkeypatch, missing_field, unknown_metrics,
+) -> None:
+    class IncompleteInsightsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            complete = payload["data"][0]
+            complete["reach"] = "500"
+            incomplete = {key: value for key, value in complete.items() if key != missing_field}
+            return {"data": [complete, incomplete]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: IncompleteInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+
+    for name in unknown_metrics:
+        assert result["summary"]["metrics"][name] is None
+
+
+@pytest.mark.parametrize("row_count", [1, 2])
+def test_get_entity_insights_preserves_explicit_zero_metrics(monkeypatch, row_count) -> None:
+    class ZeroInsightsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            row = payload["data"][0]
+            row["actions"][0]["value"] = "0"
+            row["action_values"][0]["value"] = "0"
+            return {"data": [dict(row) for _ in range(row_count)]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ZeroInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+    metrics = result["summary"]["metrics"]
+
+    for name in ("conversions", "conversion_value", "cvr", "roas"):
+        assert metrics[name] == 0.0
+    assert metrics["cpa"] is None
+
+
+def test_get_entity_insights_preserves_empty_report_totals(monkeypatch) -> None:
+    class EmptyInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            return {"data": []}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: EmptyInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+    metrics = result["summary"]["metrics"]
+
+    for name in ("spend", "impressions", "clicks", "conversions", "conversion_value"):
+        assert metrics[name] == 0
+    for name in ("frequency", "ctr", "cpc", "cpm", "cvr", "cpa", "roas"):
+        assert metrics[name] is None
+
+
 @pytest.mark.parametrize(
     "options",
     [

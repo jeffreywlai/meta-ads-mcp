@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pytest
 
 from meta_ads_mcp.config import reload_settings
@@ -643,6 +644,39 @@ def test_creative_fatigue_report_detects_declining_ctr_with_rising_frequency(mon
     result = asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123"))
     assert any(finding["type"] == "creative_fatigue_risk" for finding in result["findings"])
     assert result["findings"][0]["evidence"]
+
+
+def test_creative_fatigue_report_handles_ctr_crossing_one_percent(monkeypatch) -> None:
+    class FatigueInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert object_id == "cmp_123"
+            current = json.loads(params["time_range"])["since"] == "2026-03-01"
+            return {
+                "data": [{
+                    "ad_id": "ad1",
+                    "ctr": "0.8" if current else "1.2",
+                    "clicks": "8" if current else "12",
+                    "impressions": "1000",
+                    "frequency": "3.0" if current else "2.0",
+                }],
+            }
+
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: FatigueInsightsClient())
+    result = asyncio.run(
+        diagnostics.get_creative_fatigue_report(
+            campaign_id="cmp_123",
+            since="2026-03-01",
+            until="2026-03-07",
+            previous_since="2026-02-22",
+            previous_until="2026-02-28",
+        )
+    )
+
+    finding = result["findings"][0]
+    assert finding["type"] == "creative_fatigue_risk"
+    assert finding["affected_entities"] == [{"ad_id": "ad1"}]
+    ctr_evidence = next(item for item in finding["evidence"] if item["metric"] == "ctr")
+    assert ctr_evidence["value"] == pytest.approx(0.008)
 
 
 def test_creative_fatigue_report_accepts_level_and_object_id(monkeypatch) -> None:

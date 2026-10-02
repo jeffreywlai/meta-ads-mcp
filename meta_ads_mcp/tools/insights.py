@@ -711,22 +711,28 @@ def _aggregate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if len(rows) == 1:
         return rows[0]["metrics"]
 
-    spend = sum((row["metrics"].get("spend") or 0.0) for row in rows)
-    impressions = sum((row["metrics"].get("impressions") or 0) for row in rows)
-    clicks = sum((row["metrics"].get("clicks") or 0) for row in rows)
-    conversions = sum((row["metrics"].get("conversions") or 0.0) for row in rows)
-    conversion_value = sum((row["metrics"].get("conversion_value") or 0.0) for row in rows)
+    def sum_known(values: list[int | float | None]) -> int | float | None:
+        # Missing inputs cannot establish a total; an empty report still totals zero.
+        if any(value is None for value in values):
+            return None
+        return sum(value for value in values if value is not None)
+
+    spend = sum_known([row["metrics"].get("spend") for row in rows])
+    impressions = sum_known([row["metrics"].get("impressions") for row in rows])
+    clicks = sum_known([row["metrics"].get("clicks") for row in rows])
+    conversions = sum_known([row["metrics"].get("conversions") for row in rows])
+    conversion_value = sum_known([row["metrics"].get("conversion_value") for row in rows])
     frequency = None
     if impressions:
-        reach = sum((row.get("reach") or 0) for row in rows)
+        reach = sum_known([row.get("reach") for row in rows])
         if reach:
             frequency = impressions / reach
-    ctr = (clicks / impressions) if impressions else None
-    cpc = (spend / clicks) if clicks else None
-    cpm = ((spend / impressions) * 1000) if impressions else None
-    cvr = (conversions / clicks) if clicks else None
-    cpa = (spend / conversions) if conversions else None
-    roas = (conversion_value / spend) if spend else None
+    ctr = (clicks / impressions) if clicks is not None and impressions else None
+    cpc = (spend / clicks) if spend is not None and clicks else None
+    cpm = ((spend / impressions) * 1000) if spend is not None and impressions else None
+    cvr = (conversions / clicks) if conversions is not None and clicks else None
+    cpa = (spend / conversions) if spend is not None and conversions else None
+    roas = (conversion_value / spend) if conversion_value is not None and spend else None
     return {
         "spend": spend,
         "impressions": impressions,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from meta_ads_mcp.diagnostics import derive_core_metrics
 from meta_ads_mcp.normalize import blank_to_none, normalize_insights_row
 
@@ -10,6 +12,20 @@ def test_blank_to_none_strips_optional_strings() -> None:
     assert blank_to_none(None) is None
     assert blank_to_none("  ") is None
     assert blank_to_none(" act_123 ") == "act_123"
+
+
+@pytest.mark.parametrize(
+    ("raw_ctr", "expected"),
+    [("0", 0.0), ("0.8", 0.008), ("1.0", 0.01), ("1.2", 0.012), ("5.0", 0.05)],
+)
+def test_normalize_insights_row_converts_ctr_percentages(raw_ctr, expected) -> None:
+    row = normalize_insights_row({"ctr": raw_ctr})
+
+    assert row["ctr"] == pytest.approx(expected)
+
+
+def test_normalize_insights_row_keeps_missing_ctr_unknown() -> None:
+    assert normalize_insights_row({})["ctr"] is None
 
 
 def test_normalize_insights_row_extracts_actions() -> None:
