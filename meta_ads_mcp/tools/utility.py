@@ -7,6 +7,7 @@ import re
 import pydantic_core
 
 from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
     OVERFLOW_ARTIFACT_STORE,
@@ -535,8 +536,19 @@ async def health_check() -> dict[str, object]:
 async def get_capabilities(
     intent: str | None = None,
     include_full_manifest: bool = False,
+    tool_name: str | None = None,
 ) -> dict[str, object]:
-    """Use this when Claude is unsure which tool to use. Prefer intent for compact routing, and request the full manifest only when needed."""
+    """Get routing guidance or a named tool's complete input schema via tool_name; the full manifest lists workflows, not parameter schemas."""
+    if tool_name is not None:
+        if not tool_name.strip() or intent is not None or include_full_manifest:
+            raise ValidationError("Provide tool_name alone to inspect one tool's input schema.")
+        tool = await mcp_server.get_tool(tool_name.strip())
+        if tool is None:
+            raise ValidationError(f"Unknown tool: {tool_name}.")
+        return {
+            "server": _server_metadata(),
+            "tool": {"name": tool.name, "description": tool.description, "input_schema": tool.parameters},
+        }
     if intent is not None:
         route = INTENT_GUIDE.get(intent)
         if route is None:

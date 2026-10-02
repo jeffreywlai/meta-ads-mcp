@@ -205,6 +205,19 @@ def test_compact_search_serializer_returns_minimal_markdown() -> None:
     assert "properties" not in result
     assert "additionalProperties" not in result
     assert "Next: use `call_tool`" in result
+    for tool in tools:
+        line = next(line for line in result.splitlines() if f"`{tool.name}`" in line)
+        for name in tool.parameters["properties"]:
+            assert name in line
+        assert "+" not in line
+
+
+def test_proxy_unknown_arguments_list_accepted_parameters_before_fetch(monkeypatch) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: pytest.fail("must not fetch"))
+    with pytest.raises(ToolError, match="Accepted parameters: account_id, campaign_id, adset_id"):
+        asyncio.run(mcp_server.call_tool("call_tool", {
+            "name": "list_ads", "arguments": {"account_id": "act_123", "not_a_parameter": True},
+        }))
 
 
 def test_compact_search_serializer_surfaces_required_archive_params() -> None:

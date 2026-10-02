@@ -225,10 +225,18 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
                 raise ValueError(
                     f"'{resolved_name}' is a synthetic search tool and cannot be called via the call_tool proxy"
                 )
-            return await ctx.fastmcp.call_tool(
-                resolved_name,
-                normalize_tool_arguments(arguments),
-            )
+            normalized_arguments = normalize_tool_arguments(arguments)
+            tool = await ctx.fastmcp.get_tool(resolved_name)
+            if tool is not None:
+                accepted = list((tool.parameters or {}).get("properties", {}))
+                unexpected = sorted(set(normalized_arguments) - set(accepted))
+                if unexpected:
+                    raise ValueError(
+                        f"Unknown parameters for {resolved_name}: {', '.join(unexpected)}. "
+                        f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
+                        f"Inspect types and defaults with get_capabilities(tool_name='{resolved_name}')."
+                    )
+            return await ctx.fastmcp.call_tool(resolved_name, normalized_arguments)
 
         return Tool.from_function(fn=call_tool, name=self._call_tool_name)
 
@@ -283,10 +291,7 @@ def _argument_summary(tool: Any) -> str:
     def _format_names(names: list[str], *, label: str) -> str:
         if not names:
             return ""
-        shown = names[:3]
-        extra = len(names) - len(shown)
-        suffix = f" +{extra}" if extra > 0 else ""
-        return f"{label}: {', '.join(shown)}{suffix}"
+        return f"{label}: {', '.join(names)}"
 
     parts = []
     required_part = _format_names(required, label="req")
@@ -299,7 +304,7 @@ def _argument_summary(tool: Any) -> str:
 
 
 def serialize_search_results_compact(tools: list[Any]) -> str:
-    """Serialize search results as compact markdown with minimal argument hints."""
+    """Serialize complete parameter names; full schemas are available on demand."""
     if not tools:
         return "No tools matched. Try a narrower query or call get_capabilities(intent=...)."
 
@@ -313,6 +318,7 @@ def serialize_search_results_compact(tools: list[Any]) -> str:
             line += f" | {description}"
         lines.append(line)
     lines.append("Next: use `call_tool` with the exact tool name and JSON arguments.")
+    lines.append("For types, defaults, and constraints: `get_capabilities(tool_name='TOOL_NAME')`.")
     return "\n".join(lines)
 
 TOOL_SEARCH_TRANSFORM = IntentAwareBM25SearchTransform(
