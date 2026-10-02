@@ -29,6 +29,7 @@ from meta_ads_mcp.tool_types import (
     FieldList,
     StrictStringList,
     StringList,
+    coerce_csv_string_list,
     coerce_strict_csv_string_list,
     normalize_field_list,
 )
@@ -777,9 +778,16 @@ async def get_entity_insights(
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
 ) -> dict[str, Any]:
-    """Return compact paginated insights with generic action maps and optional flattened columns. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for raw action arrays or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values."""
+    """Return compact paginated insights with generic action maps and optional flattened columns. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
+    action_breakdowns = coerce_csv_string_list(action_breakdowns)
+    dimensional_actions = any(value != "action_type" for value in action_breakdowns or [])
+    if dimensional_actions and not include_raw_actions:
+        raise ValidationError(
+            "Dimensional action_breakdowns require include_raw_actions=true in "
+            "get_entity_insights/get_insights; compact action maps cannot preserve those dimensions."
+        )
     if limit < 1:
         raise ValidationError("limit must be positive.")
     if fetch_all and blank_to_none(after):
@@ -840,6 +848,11 @@ async def get_entity_insights(
     response["summary"]["pages_fetched"] = pages_fetched
     response["summary"]["metrics"] = _aggregate_metrics(rows)
     response["summary"]["complete"] = not bool(response["paging"].get("next"))
+    if dimensional_actions:
+        response["summary"]["action_breakdown_note"] = (
+            "Read actions/action_values for dimensional action records. Action maps, flattened "
+            "columns, and derived conversion metrics do not aggregate action breakdown dimensions."
+        )
     if action_attribution_windows:
         response["summary"]["attribution_note"] = (
             "Derived conversion metrics, action maps, and flattened action columns use Meta's generic value, "
@@ -884,7 +897,7 @@ async def get_insights(
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
 ) -> dict[str, Any]:
-    """Compatibility alias with compact rows and generic action maps by default; prefer get_entity_insights for new reads. Set include_raw_actions=true for raw action arrays and named click/view attribution-window comparisons."""
+    """Compatibility alias with compact rows and generic action maps by default; prefer get_entity_insights for new reads. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, and named click/view attribution-window comparisons."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
     return await get_entity_insights(
         level=level,

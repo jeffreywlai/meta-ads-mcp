@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pydantic_core
 import pytest
+from fastmcp.exceptions import ToolError
 from pydantic import TypeAdapter
 
 from meta_ads_mcp.config import reload_settings
@@ -285,6 +286,107 @@ def test_sync_insights_is_compact_by_default_and_raw_actions_are_opt_in(monkeypa
         assert row["action_values"][0]["value"] == "250"
     else:
         assert all(field not in row for field in ("actions", "action_values"))
+
+
+@pytest.mark.parametrize("tool_name", ["get_entity_insights", "get_insights"])
+@pytest.mark.parametrize("call_path", ["python", "registered", "routed"])
+@pytest.mark.parametrize("raw_option", [{}, {"include_raw_actions": False}, {"include_raw_actions": True}])
+@pytest.mark.parametrize("action_breakdowns", [
+    ["action_type", "action_device"], "action_type, action_device",
+])
+def test_dimensional_actions_require_raw_output_before_client_creation(
+    monkeypatch, tool_name, call_path, raw_option, action_breakdowns,
+) -> None:
+    client_creations = []
+    actions = [
+        {"action_type": "purchase", "action_device": "android_smartphone", "value": "2"},
+        {"action_type": "purchase", "action_device": "desktop", "value": "7"},
+    ]
+    action_values = [
+        {"action_type": "purchase", "action_device": "android_smartphone", "value": "20"},
+        {"action_type": "purchase", "action_device": "desktop", "value": "70"},
+    ]
+
+    class DimensionalClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["action_breakdowns"] == "action_type,action_device"
+            return {"data": [{"actions": actions, "action_values": action_values}]}
+
+    def create_client():
+        client_creations.append(True)
+        return DimensionalClient()
+
+    monkeypatch.setattr(insights, "get_graph_api_client", create_client)
+    arguments = {
+        "level": "account", "object_id": "act_123",
+        "action_breakdowns": action_breakdowns, **raw_option,
+    }
+
+    async def call():
+        if call_path == "python":
+            return await getattr(insights, tool_name)(**arguments)
+        result = await mcp_server.call_tool(
+            "call_tool" if call_path == "routed" else tool_name,
+            {"name": tool_name, "arguments": arguments} if call_path == "routed" else arguments,
+        )
+        return result.structured_content
+
+    if not raw_option.get("include_raw_actions"):
+        error_type = insights.ValidationError if call_path == "python" else ToolError
+        with pytest.raises(error_type, match="require include_raw_actions=true"):
+            asyncio.run(call())
+        assert client_creations == []
+    else:
+        result = asyncio.run(call())
+        assert client_creations == [True]
+        assert result["items"][0]["actions"] == actions
+        assert result["items"][0]["action_values"] == action_values
+        assert "do not aggregate" in result["summary"]["action_breakdown_note"]
+
+
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+@pytest.mark.parametrize("action_breakdowns", [["action_type"], "action_type"])
+def test_action_type_only_breakdown_remains_compact(monkeypatch, tool, action_breakdowns) -> None:
+    class ActionTypeClient(FakeInsightsClient):
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["action_breakdowns"] == "action_type"
+            return await super().get_insights(object_id, fields=fields, params=params)
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ActionTypeClient())
+    result = asyncio.run(tool(
+        level="account", object_id="act_123", action_breakdowns=action_breakdowns,
+    ))
+    row = result["items"][0]
+    assert row["actions_map"] == {"purchase": 2.0}
+    assert row["action_values_map"] == {"purchase": 250.0}
+    assert "actions" not in row and "action_values" not in row
+    assert "action_breakdown_note" not in result["summary"]
+
+
+def test_export_preserves_dimensional_action_records(monkeypatch) -> None:
+    actions = [{"action_type": "purchase", "action_device": "desktop", "value": "2"}]
+
+    class DimensionalClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["action_breakdowns"] == "action_type,action_device"
+            return {"data": [{"actions": actions}]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: DimensionalClient())
+    result = asyncio.run(insights.export_insights(
+        level="account", object_id="act_123", action_breakdowns=["action_type", "action_device"],
+    ))
+    assert result["rows"][0]["actions"] == actions
+
+
+def test_comparison_rejects_lossy_dimensional_action_totals_before_client_creation(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    result = asyncio.run(insights.compare_performance(
+        level="account", object_ids=["act_123", "act_456"],
+        action_breakdowns=["action_type", "action_device"],
+    ))
+    assert result["summary"]["successful"] == 0
+    assert result["summary"]["failed"] == 2
+    assert all("require include_raw_actions=true" in row["error"] for row in result["items"])
 
 
 @pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])

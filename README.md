@@ -296,7 +296,10 @@ available without an extra opt-in. Set `include_raw_actions=true` to retain raw
 arrays, including named attribution-window values needed for click/view
 comparisons; generic maps are not window-specific totals. `summarize_actions`
 and JSON/CSV exports retain their existing action output. Existing callers that
-read raw action arrays must now opt in.
+read raw action arrays must now opt in. Dimensional `action_breakdowns` (anything
+beyond `action_type`, such as `action_device`) require `include_raw_actions=true`;
+read the raw records for those dimensions, not the scalar maps or derived totals.
+Compact calls fail before making a request instead of discarding the dimensions.
 
 For placement reporting across copies of an ad, use `level="ad"` with the
 parent `object_id="act_ACCOUNT_ID"` (or a campaign/ad set ID),
