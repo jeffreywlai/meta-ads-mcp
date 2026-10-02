@@ -290,11 +290,13 @@ If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
 
 Synchronous `get_entity_insights` (and its `get_insights` alias) omits duplicate
-action arrays and maps by default, keeping derived metrics and requested
-`flatten_actions` columns. Set `include_raw_actions=true` to retain raw action
-evidence, including named attribution-window values needed for click/view
-comparisons. `summarize_actions` and JSON/CSV exports retain their existing action
-output. Existing callers that read action arrays or maps must now opt in.
+raw action arrays by default, keeping numeric action maps, derived metrics, and
+requested `flatten_actions` columns. Custom action counts and values remain
+available without an extra opt-in. Set `include_raw_actions=true` to retain raw
+arrays, including named attribution-window values needed for click/view
+comparisons; generic maps are not window-specific totals. `summarize_actions`
+and JSON/CSV exports retain their existing action output. Existing callers that
+read raw action arrays must now opt in.
 
 For placement reporting across copies of an ad, use `level="ad"` with the
 parent `object_id="act_ACCOUNT_ID"` (or a campaign/ad set ID),

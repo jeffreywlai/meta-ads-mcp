@@ -777,7 +777,7 @@ async def get_entity_insights(
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
 ) -> dict[str, Any]:
-    """Return compact paginated insights with optional flattened action columns. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for raw action arrays/maps or named click/view attribution-window comparisons; derived metrics use Meta's generic action values."""
+    """Return compact paginated insights with generic action maps and optional flattened columns. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for raw action arrays or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     if limit < 1:
@@ -857,7 +857,8 @@ async def get_entity_insights(
         ]
     if not include_raw_actions:
         for row in rows:
-            _remove_raw_actions(row)
+            for field in RAW_ACTION_ARRAY_FIELDS:
+                row.pop(field, None)
     return response
 
 
@@ -883,7 +884,7 @@ async def get_insights(
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
 ) -> dict[str, Any]:
-    """Compatibility alias with compact rows by default; prefer get_entity_insights for new reads. Set include_raw_actions=true for raw action arrays/maps and named click/view attribution-window comparisons."""
+    """Compatibility alias with compact rows and generic action maps by default; prefer get_entity_insights for new reads. Set include_raw_actions=true for raw action arrays and named click/view attribution-window comparisons."""
     resolved_since, resolved_until = _coerce_time_range(time_range, since=since, until=until)
     return await get_entity_insights(
         level=level,
