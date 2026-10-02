@@ -64,6 +64,27 @@ def test_empty_parent_does_not_discard_observed_child_spend() -> None:
     assert not any(finding["type"] == "no_pattern_detected" for finding in findings)
 
 
+@pytest.mark.parametrize(("child_rows", "expected"), [
+    ([{"spend": 0.0}], "no_pattern_detected"),
+    ([{"metrics": {"spend": 0.0}}], "no_pattern_detected"),
+    ([{"spend": "0"}], "no_pattern_detected"),
+    ([{"metrics": {"spend": "0"}}], "no_pattern_detected"),
+    ([{"spend": 0.0}, {"metrics": {"spend": 0.0}}, {"spend": "0"}], "no_pattern_detected"),
+    ([{"spend": None, "metrics": {"spend": 0.0}}], "no_pattern_detected"),
+    ([{"spend": 0.0, "metrics": {"spend": 100.0}}], "no_pattern_detected"),
+    ([{}, {"metrics": {"spend": 0.0}}], "no_pattern_detected"),
+    ([], "insufficient_data"),
+    ([{}], "insufficient_data"),
+    ([{"spend": None, "metrics": {"spend": None}}], "insufficient_data"),
+    ([{"spend": "not-a-number", "metrics": {"spend": ""}}], "insufficient_data"),
+])
+def test_empty_parent_distinguishes_known_zero_child_spend_from_missing_metrics(child_rows, expected) -> None:
+    findings = detect_snapshot_findings(
+        {"spend": 0.0, "conversions": 0.0}, child_rows, has_rows=False,
+    )
+    assert [finding["type"] for finding in findings] == [expected]
+
+
 def test_rank_rows_supports_nested_metrics() -> None:
     rows = [
         {"id": "a", "metrics": {"roas": 1.2}},

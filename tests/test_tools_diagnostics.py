@@ -310,6 +310,34 @@ def test_snapshot_consumers_distinguish_empty_reports_from_real_zero_rows(
         assert result["evidence"] == []
 
 
+@pytest.mark.parametrize(("tool_name", "arguments", "parent_level"), [
+    ("get_account_optimization_snapshot", {"account_id": "123"}, "account"),
+    ("get_campaign_optimization_snapshot", {"campaign_id": "123"}, "campaign"),
+])
+@pytest.mark.parametrize("child_data", ["zero", "unknown", "empty"])
+def test_snapshot_empty_parent_preserves_known_zero_child_data(
+    monkeypatch, tool_name, arguments, parent_level, child_data,
+) -> None:
+    from meta_ads_mcp.tools import insights
+
+    class EmptyParentClient:
+        async def get_insights(self, object_id, *, fields=None, params=None):
+            if params["level"] == parent_level or child_data == "empty":
+                return {"data": []}
+            row = {f"{params['level']}_id": "456"}
+            if child_data == "zero":
+                row["spend"] = "0"
+            return {"data": [row]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: EmptyParentClient())
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: EmptyParentClient())
+    result = asyncio.run(getattr(diagnostics, tool_name)(**arguments))
+
+    expected = "no_pattern_detected" if child_data == "zero" else "insufficient_data"
+    assert [finding["type"] for finding in result["findings"]] == [expected]
+    assert result["evidence"] == []  # Empty parent totals never become observed evidence.
+
+
 def test_account_health_snapshot_compares_explicit_windows(monkeypatch) -> None:
     calls: list[tuple[str | None, str | None]] = []
 
