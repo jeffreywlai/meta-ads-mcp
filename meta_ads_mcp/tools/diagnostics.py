@@ -392,7 +392,7 @@ async def _child_insights(
     limit: int = 250,
     max_rows: int = 1000,
 ) -> list[dict[str, Any]]:
-    """Fetch child-entity insights rows."""
+    """Fetch complete child insights or fail clearly when pagination cannot finish."""
     if limit < 1 or max_rows < 1:
         raise ValidationError("limit and max_rows must be positive.")
     client = get_graph_api_client()
@@ -411,6 +411,7 @@ async def _child_insights(
     seen_after: set[str] = set()
     while True:
         params = dict(base_params)
+        params["limit"] = min(page_limit, max_rows - len(rows))
         if after:
             params["after"] = after
         payload = await client.get_insights(
@@ -419,15 +420,19 @@ async def _child_insights(
             params=params,
         )
         rows.extend(_normalize_rows(payload))
-        if len(rows) >= max_rows:
-            return rows[:max_rows]
         paging = extract_paging(payload)
-        next_after = paging.get("after") if paging.get("next") else None
+        if len(rows) > max_rows or (len(rows) == max_rows and paging.get("next")):
+            raise ValidationError(
+                f"Diagnostics exceeded the {max_rows}-row scan limit; narrow the scope or date window. "
+                "No partial diagnostic was returned."
+            )
+        if not paging.get("next"):
+            return rows
+        next_after = paging.get("after")
         if not next_after or next_after in seen_after:
-            break
+            raise ValidationError("Meta pagination could not finish: the next cursor is missing or repeated.")
         seen_after.add(next_after)
         after = next_after
-    return rows
 
 
 def _parse_required_date(value: str, *, field: str) -> date:
@@ -1082,14 +1087,22 @@ async def get_creative_fatigue_report(
     previous_until: str | None = None,
     current_window_days: int = 7,
     previous_window_days: int = 7,
+    min_impressions: int = 1000,
+    account_id: str | None = None,
+    max_ads: int = 1000,
 ) -> dict[str, Any]:
-    """Use this when the user asks whether ads are fatiguing between a current and previous window. Prefer level/object_id for consistency."""
+    """Compare account, campaign, or ad set fatigue; rank flagged ads by current spend. max_ads bounds each window (1–10,000; default 1,000). Requires 1,000 impressions per window by default (policy, not statistical significance); confidence is uncalibrated/null."""
+    if min_impressions < 0:
+        raise ValidationError("min_impressions must be nonnegative; zero disables the volume gate.")
+    if not 1 <= max_ads <= 10_000:
+        raise ValidationError("max_ads must be between 1 and 10000.")
     scope_level, resolved_object_id = _resolve_scope(
-        allowed_levels=("campaign", "adset"),
+        allowed_levels=("account", "campaign", "adset"),
         level=level,
         object_id=object_id,
         campaign_id=campaign_id,
         adset_id=adset_id,
+        account_id=account_id,
     )
     current_window, previous_window_range = _fatigue_windows(
         since=since,
@@ -1107,6 +1120,7 @@ async def get_creative_fatigue_report(
             since=current_window["since"],
             until=current_window["until"],
             date_preset=None,
+            max_rows=max_ads,
         ),
         _child_insights(
             resolved_object_id,
@@ -1114,25 +1128,37 @@ async def get_creative_fatigue_report(
             since=previous_window_range["since"],
             until=previous_window_range["until"],
             date_preset=None,
+            max_rows=max_ads,
         ),
     )
     previous_by_id = {row.get("ad_id") or row.get("id"): row for row in previous_rows}
     findings: list[dict[str, Any]] = []
-    for current in current_rows:
+    comparison_count = 0
+    excluded_low_volume_count = 0
+    for current in rank_rows(current_rows, "spend"):
         entity_id = current.get("ad_id") or current.get("id")
         prior = previous_by_id.get(entity_id)
         if not prior:
             continue
+        if min_impressions and any(
+            (to_float(row.get("impressions")) or 0) < min_impressions
+            for row in (current, prior)
+        ):
+            excluded_low_volume_count += 1
+            continue
         comparison = compare_metric_sets(current["metrics"], prior["metrics"])
         ctr_drop = comparison["ctr"]["pct_delta"]
         freq_rise = comparison["frequency"]["pct_delta"]
-        if (ctr_drop is not None and ctr_drop <= -0.2) and (freq_rise is not None and freq_rise >= 0.2):
+        if ctr_drop is None or freq_rise is None:
+            continue
+        comparison_count += 1
+        if ctr_drop <= -0.2 and freq_rise >= 0.2:
             findings.append(
                 build_finding(
                     "creative_fatigue_risk",
                     f"Ad {entity_id} shows higher frequency and weaker CTR than the prior window.",
                     severity="medium",
-                    confidence=0.75,
+                    confidence=None,
                     evidence=[
                         metric_evidence(
                             "frequency_change",
@@ -1154,8 +1180,26 @@ async def get_creative_fatigue_report(
                                 "previous_impressions": prior.get("impressions"),
                             },
                         ),
+                        metric_evidence(
+                            "ctr_change",
+                            ctr_drop,
+                            "(current_ctr - previous_ctr) / previous_ctr",
+                            {
+                                "current_ctr": current["metrics"].get("ctr"),
+                                "previous_ctr": prior["metrics"].get("ctr"),
+                            },
+                        ),
+                        metric_evidence(
+                            "spend", current["metrics"].get("spend"), "Meta-reported spend",
+                            {"current_spend": current["metrics"].get("spend")},
+                        ),
                     ],
-                    affected_entities=[{"ad_id": entity_id}],
+                    affected_entities=[{
+                        "ad_id": entity_id,
+                        **{key: current[key] for key in (
+                            "ad_name", "campaign_id", "campaign_name", "adset_id", "adset_name",
+                        ) if current.get(key) is not None},
+                    }],
                     next_actions=[
                         "Review creative freshness.",
                         "Check audience saturation.",
@@ -1167,16 +1211,28 @@ async def get_creative_fatigue_report(
         metrics={},
         findings=findings or [
             build_finding(
-                "insufficient_data",
-                "No strong fatigue pattern was detected across the compared windows.",
+                "no_pattern_detected" if comparison_count else "insufficient_data",
+                (
+                    "No strong fatigue pattern was detected across the compared windows."
+                    if comparison_count
+                    else "No comparable CTR and frequency data met the selected minimum-impressions policy."
+                ),
                 severity="low",
-                confidence=0.4,
+                confidence=None,
             )
         ],
         extra={
             "analyzed_level": "ad",
             "current_window": current_window,
             "previous_window": previous_window_range,
+            "comparison_count": comparison_count,
+            "min_impressions": min_impressions,
+            "excluded_low_volume_count": excluded_low_volume_count,
+            "current_ad_count": len(current_rows),
+            "previous_ad_count": len(previous_rows),
+            "complete": True,
+            "ranked_by": "current_spend",
+            "max_ads": max_ads,
         },
     )
 

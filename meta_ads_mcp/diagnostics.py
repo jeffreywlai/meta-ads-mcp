@@ -193,7 +193,7 @@ def build_finding(
     summary: str,
     *,
     severity: str = "medium",
-    confidence: float = 0.5,
+    confidence: float | None = 0.5,
     evidence: list[dict[str, Any]] | None = None,
     affected_entities: list[dict[str, Any]] | None = None,
     next_actions: list[str] | None = None,
@@ -222,8 +222,13 @@ def detect_snapshot_findings(
     frequency = to_float(summary_metrics.get("frequency"))
     conversions = to_float(summary_metrics.get("conversions"))
     roas = to_float(summary_metrics.get("roas"))
+    has_usable_data = (
+        (spend is not None and conversions is not None)
+        or (frequency is not None and ctr is not None)
+        or roas is not None
+    )
 
-    if spend and spend > 0 and not conversions:
+    if spend and spend > 0 and conversions == 0:
         findings.append(
             build_finding(
                 "high_spend_low_conversion",
@@ -262,6 +267,7 @@ def detect_snapshot_findings(
             return to_float((row.get("metrics") or {}).get("spend")) or 0.0
 
         total_spend = sum(row_spend(row) for row in sorted_rows)
+        has_usable_data = has_usable_data or total_spend > 0
         top_three_spend = sum(row_spend(row) for row in sorted_rows[:3])
         if total_spend and (top_three_spend / total_spend) >= 0.8:
             findings.append(
@@ -276,8 +282,12 @@ def detect_snapshot_findings(
     if not findings:
         findings.append(
             build_finding(
-                "insufficient_data",
-                "No strong optimization signal was detected from the selected metrics.",
+                "no_pattern_detected" if has_usable_data else "insufficient_data",
+                (
+                    "No strong optimization signal was detected from the selected metrics."
+                    if has_usable_data
+                    else "The selected metrics do not provide enough data for the optimization checks."
+                ),
                 severity="low",
                 confidence=0.4,
             )

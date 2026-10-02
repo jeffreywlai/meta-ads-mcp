@@ -10,6 +10,122 @@ from meta_ads_mcp.errors import UnsupportedFeatureError
 from meta_ads_mcp.tools import discovery
 
 
+@pytest.mark.parametrize("fields", [["id", "name"], "id,name"])
+def test_list_ads_accepts_lean_fields_without_currency_lookups(monkeypatch, fields) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    class LeanClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert fields == ["id", "name"]
+            return {"data": [{"id": "ad1", "name": "Test"}],
+                    "paging": {"next": "next", "cursors": {"after": "cursor"}}}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: LeanClient())
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": "list_ads", "arguments": {"account_id": "act_123", "fields": fields},
+    })).structured_content
+    assert result["items"] == [{"id": "ad1", "name": "Test"}]
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["visibility"] == "meta_default"
+    assert result["summary"]["effective_status_filter"] is None
+
+
+def test_list_ads_discloses_explicit_status_selection(monkeypatch) -> None:
+    class StatusClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert params["effective_status"] == ["ACTIVE"]
+            return {"data": []}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: StatusClient())
+    result = asyncio.run(discovery.list_ads(account_id="act_123", effective_status=["ACTIVE"]))
+    assert result["summary"]["complete"] is True
+    assert result["summary"]["effective_status_filter"] == ["ACTIVE"]
+    assert result["summary"]["visibility"] == "explicit_status_filter"
+
+
+@pytest.mark.parametrize("whole_term", [True, False])
+def test_multi_name_search_scans_once_and_matches_case_insensitively(monkeypatch, whole_term) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+    calls = []
+
+    class NameClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            calls.append(dict(params))
+            assert parent_id == "cmp_1"
+            assert fields == ["id", "name"]
+            assert params["effective_status"] == ["ACTIVE"]
+            assert "filtering" not in params  # Meta filters are AND, not an invented OR query.
+            if not params.get("after"):
+                return {"data": [{"id": "1", "name": "VIDEO_ADA-v1"}, {"id": "2", "name": "Adam"}],
+                        "paging": {"next": "next", "cursors": {"after": "page2"}}}
+            assert params["after"] == "page2"
+            return {"data": [{"id": "3", "name": "grâce-Ada"}, {"id": "4", "name": "other"}]}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: NameClient())
+    result = asyncio.run(mcp_server.call_tool("list_ads", {
+        "campaign_id": "cmp_1", "fields": ["id", "name"], "effective_status": ["ACTIVE"],
+        "name_contains_any": "ADA, grâce", "whole_term_match": whole_term,
+    })).structured_content
+    assert len(calls) == 2
+    assert result["summary"]["scanned_count"] == 4
+    assert result["summary"]["complete"] is True
+    assert {item["id"] for item in result["items"]} == ({"1", "3"} if whole_term else {"1", "2", "3"})
+    assert result["items"][-1]["matched_terms"] == ["ada", "grâce"]
+
+
+@pytest.mark.parametrize("arguments", [
+    {"name_contains_any": []}, {"name_contains_any": [""]},
+    {"name_contains_any": ["Ada"], "name_contains": "Ada"}, {"whole_term_match": True},
+    {"name_contains_any": ["Ada"], "after": "page2"},
+])
+def test_multi_name_search_validates_before_client(monkeypatch, arguments) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(discovery.ValidationError):
+        asyncio.run(discovery.list_ads(account_id="123", **arguments))
+
+
+@pytest.mark.parametrize("failure", ["cap", "missing_cursor", "repeated_cursor"])
+def test_multi_name_search_never_returns_a_partial_inventory(monkeypatch, failure) -> None:
+    class IncompleteClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            return {"data": [{"id": str(index), "name": "Ada"} for index in range(1000 if failure == "cap" else 1)],
+                    "paging": {"next": "next", "cursors": {"after": None if failure == "missing_cursor" else "same"}}}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: IncompleteClient())
+    with pytest.raises(discovery.ValidationError, match="scan limit|pagination"):
+        asyncio.run(discovery.list_ads(account_id="123", name_contains_any=["Ada"]))
+
+
+@pytest.mark.parametrize("count", [0, 1000])
+def test_multi_name_search_accepts_complete_inventory_at_cap(monkeypatch, count) -> None:
+    class CompleteClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert params["limit"] == 1000
+            return {"data": [{"id": str(index), "name": "other"} for index in range(count)]}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: CompleteClient())
+    result = asyncio.run(discovery.list_ads(account_id="123", name_contains_any=["Ada"], limit=5000))
+    assert result["items"] == []
+    assert result["summary"]["complete"] is True
+    assert result["summary"]["scanned_count"] == count
+
+
+def test_custom_bid_fields_include_currency_dependency(monkeypatch) -> None:
+    class BidClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert fields == ["id", "bid_amount", "account_id"]
+            return {"data": [{"id": "ad1", "bid_amount": "150", "account_id": "123"}]}
+
+        async def get_object(self, object_id, *, fields):
+            assert object_id == "act_123"
+            assert fields == ["currency"]
+            return {"currency": "USD"}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: BidClient())
+    result = asyncio.run(discovery.list_ads(adset_id="as1", fields="id,bid_amount"))
+    assert result["items"][0]["bid_amount"] == 1.5
+
+
 class FakeDiscoveryClient:
     """Simple fake API client for discovery tests."""
 

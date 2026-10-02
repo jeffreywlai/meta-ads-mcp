@@ -279,12 +279,84 @@ from local or remote MCP transports. Then use `call_tool` with
 server uses the operating system's temporary `meta-ads-mcp-exports` directory.
 The 64 KB threshold applies only to the inline MCP response: Meta's complete
 result is retained in the artifact and is not truncated or discarded.
+Archive schema v2 uses compact JSON and stores identical JSON compatibility
+text only once, under `tool_result.structured_content`. Distinct or annotated
+text remains intact. Overflow notices include archive size and retention.
 Artifacts expire after 24 hours by default, and the store retains at most 100
 response artifacts totaling 1 GB of JSON payload data; small private integrity
 manifests are stored alongside those payloads. The three retention variables
 above override those defaults.
 If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
+
+Synchronous `get_entity_insights` (and its `get_insights` alias) accepts
+`include_raw_actions=false` to omit duplicate action arrays and maps while
+keeping derived metrics and requested `flatten_actions` columns. Its default
+response remains unchanged.
+
+For placement reporting across copies of an ad, use `level="ad"` with the
+parent `object_id="act_ACCOUNT_ID"` (or a campaign/ad set ID),
+`breakdowns=["publisher_platform","platform_position"]`, and native
+`filtering=[{"field":"ad.name","operator":"CONTAIN","value":"NAME_PREFIX"}]`.
+`level` already selects row granularity; no separate `row_level` is needed.
+Filters also work with exports and async report creation. Synchronous summaries
+cover the returned page only: check `summary.complete` and continue with
+`paging.after` before treating the result as exhaustive.
+Alternatively, set `fetch_all=true` to collect up to 1,000 rows from the first
+page onward in one call (also supported by `get_insights` and `export_insights`).
+The server combines metrics after pagination, or fails explicitly if the scan
+cannot finish. Narrow the query or use async reports for larger results.
+
+For an account-wide fatigue sweep, call `get_creative_fatigue_report` with
+`account_id` or `level="account", object_id="act_ACCOUNT_ID"`. It reads both
+windows at ad granularity, follows pagination, and includes ad/campaign/ad set
+names without extra lookups. Findings are ranked by current spend. Each window
+defaults to a 1,000-ad bound; use `max_ads=5000` for a larger account (maximum
+10,000). Scans beyond the selected bound or unusable pagination fail explicitly;
+no partial diagnosis is returned. Creative IDs are not Insights fields and are
+not inferred from names.
+
+Use `list_ads(name_contains_any=["Ada","Grace"], whole_term_match=true,
+effective_status=["ACTIVE"], fields=["id","name"])` to search several names in
+one bounded inventory scan. Matching is case-insensitive; whole-term mode treats
+punctuation and underscores as separators and avoids matching `Ada` in `Adam`.
+Each ad includes `matched_terms`. The scan follows pagination up to 1,000 ads and
+fails explicitly if it cannot finish; completeness still reflects the selected
+scope and status filters, not all historical ads.
+
+`get_ad_image` joins asset labels to `configured_image_rules`, retaining crop
+coordinates, explicit default flags, rule constraints, and unresolved labels.
+It includes reporting-position hints (Instagram `stream` becomes `feed`;
+unknown values pass through). These are configured eligibility rules, not proof
+that a specific image served. Placement Insights show delivery totals, but do
+not establish image-level delivery when several assets are eligible.
+Pass `ad_ids=["AD_1","AD_2"]` instead of `ad_id` for a collection of up to 100
+distinct ads. Creative reads and image-hash lookups are reused within that call,
+with image caching scoped to the owning account. Unresolved image hashes remain
+explicit. This uses the existing per-object Graph reads, not a new batch job or
+persistent cache.
+
+For an analysis-only server, set `META_READ_ONLY=true` in its launch environment
+and restart it. This opt-in mode hides mutation tools from search and rejects
+advertising mutations, asset uploads, A/B-test setup, and token mutations before
+execution—even through `call_tool` or compatibility aliases. Unknown tools fail
+closed. Reporting jobs and local overflow-artifact cleanup remain available.
+Use an `ads_read` token as an additional permission boundary where possible.
+Analysis agents using tool search need access to `search_tools`, `call_tool`, and
+`get_capabilities`; allowing only underlying tool names is not sufficient.
+The default remains writable; no existing server or dbt agent configuration is
+changed automatically.
+
+For click/view attribution comparisons, use `get_entity_insights` with explicit
+dates, `fields=["actions","action_values"]`,
+`use_unified_attribution_setting=false`,
+`action_attribution_windows=["7d_click","1d_view"]`, and
+`include_raw_actions=true`. Read the named window keys from the raw purchase
+action entries. Meta's generic `value` can differ from them even for a single
+requested window; core metrics, action maps, and `flatten_actions` use that
+generic value, not window-specific totals. Do not assume the window values or
+overlapping action aliases are additive. Historical ad set setting changes
+still require retained activity or warehouse history.
 
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is

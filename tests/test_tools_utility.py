@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import pytest
 
 from meta_ads_mcp.config import reload_settings
+from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.tools import utility
 
 
@@ -21,6 +24,25 @@ class FakeUtilityClient:
                 {"id": "act_123", "name": "Test Account", "account_status": 1},
             ]
         }
+
+
+def test_get_capabilities_returns_live_named_tool_schema() -> None:
+    result = asyncio.run(utility.get_capabilities(tool_name="get_entity_insights"))
+    tool = asyncio.run(mcp_server.get_tool("get_entity_insights"))
+    assert result["tool"]["input_schema"] == tool.parameters
+    assert "flatten_actions" in result["tool"]["input_schema"]["properties"]
+
+
+@pytest.mark.parametrize(("query", "expected"), [("creative fatigue report", "get_creative_fatigue_report"), ("list_ads", "list_ads")])
+def test_free_text_capabilities_reuse_live_search(query, expected) -> None:
+    result = asyncio.run(utility.get_capabilities(intent=query))
+    assert f"`{expected}`" in result["tool_matches"]
+
+
+@pytest.mark.parametrize("options", [{"tool_name": ""}, {"tool_name": "get_ad", "intent": "list_ads"}])
+def test_named_schema_rejects_ambiguous_request(options) -> None:
+    with pytest.raises(ValidationError, match="tool_name alone"):
+        asyncio.run(utility.get_capabilities(**options))
 
 
 def test_health_check_returns_healthy_status(monkeypatch) -> None:

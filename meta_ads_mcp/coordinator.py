@@ -25,6 +25,7 @@ try:
     from fastmcp.tools.tool import Tool, ToolResult
 
     from meta_ads_mcp.error_middleware import StructuredMetaErrorMiddleware
+    from meta_ads_mcp.read_only import ReadOnlyAdvertisingMiddleware
     from meta_ads_mcp.overflow import (
         ArchivedResponseLimitingMiddleware,
         OverflowArtifactStore,
@@ -35,6 +36,9 @@ except ImportError:  # pragma: no cover - fallback for tests without the package
     ToolResult = Any
 
     class StructuredMetaErrorMiddleware:  # type: ignore[override]
+        """Minimal local fallback for tests without FastMCP."""
+
+    class ReadOnlyAdvertisingMiddleware:  # type: ignore[override]
         """Minimal local fallback for tests without FastMCP."""
 
     class OverflowArtifactStore:  # type: ignore[override]
@@ -161,6 +165,11 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
 
     async def _search(self, tools: Sequence[Tool], query: str) -> Sequence[Tool]:
         """Parse first, filter incompatible contracts, then use BM25 for rank."""
+        if get_settings().read_only:
+            from meta_ads_mcp.read_only import read_only_tool_names
+
+            allowed = read_only_tool_names()
+            tools = [tool for tool in tools if tool.name in allowed]
         decision = self._router.decide(
             query,
             tool_contracts=self._contracts_for(tools),
@@ -172,6 +181,17 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
         ranked = [
             tool for tool in ranked if self._is_compatible(tool, decision)
         ]
+        if decision.preferred_tool != "get_insights":
+            canonical = self._tool_named(compatible_candidates, "get_entity_insights")
+            if canonical is not None:
+                ranked = [canonical if tool.name == "get_insights" else tool for tool in ranked]
+                seen_names: set[str] = set()
+                unique_ranked: list[Tool] = []
+                for tool in ranked:
+                    if tool.name not in seen_names:
+                        seen_names.add(tool.name)
+                        unique_ranked.append(tool)
+                ranked = unique_ranked
 
         preferred_names = (
             (decision.preferred_tool,) + decision.additional_preferred_tools
@@ -225,10 +245,18 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
                 raise ValueError(
                     f"'{resolved_name}' is a synthetic search tool and cannot be called via the call_tool proxy"
                 )
-            return await ctx.fastmcp.call_tool(
-                resolved_name,
-                normalize_tool_arguments(arguments),
-            )
+            normalized_arguments = normalize_tool_arguments(arguments)
+            tool = await ctx.fastmcp.get_tool(resolved_name)
+            if tool is not None:
+                accepted = list((tool.parameters or {}).get("properties", {}))
+                unexpected = sorted(set(normalized_arguments) - set(accepted))
+                if unexpected:
+                    raise ValueError(
+                        f"Unknown parameters for {resolved_name}: {', '.join(unexpected)}. "
+                        f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
+                        f"Inspect types and defaults with get_capabilities(tool_name='{resolved_name}')."
+                    )
+            return await ctx.fastmcp.call_tool(resolved_name, normalized_arguments)
 
         return Tool.from_function(fn=call_tool, name=self._call_tool_name)
 
@@ -283,10 +311,7 @@ def _argument_summary(tool: Any) -> str:
     def _format_names(names: list[str], *, label: str) -> str:
         if not names:
             return ""
-        shown = names[:3]
-        extra = len(names) - len(shown)
-        suffix = f" +{extra}" if extra > 0 else ""
-        return f"{label}: {', '.join(shown)}{suffix}"
+        return f"{label}: {', '.join(names)}"
 
     parts = []
     required_part = _format_names(required, label="req")
@@ -299,7 +324,7 @@ def _argument_summary(tool: Any) -> str:
 
 
 def serialize_search_results_compact(tools: list[Any]) -> str:
-    """Serialize search results as compact markdown with minimal argument hints."""
+    """Serialize complete parameter names; full schemas are available on demand."""
     if not tools:
         return "No tools matched. Try a narrower query or call get_capabilities(intent=...)."
 
@@ -313,6 +338,7 @@ def serialize_search_results_compact(tools: list[Any]) -> str:
             line += f" | {description}"
         lines.append(line)
     lines.append("Next: use `call_tool` with the exact tool name and JSON arguments.")
+    lines.append("For types, defaults, and constraints: `get_capabilities(tool_name='TOOL_NAME')`.")
     return "\n".join(lines)
 
 TOOL_SEARCH_TRANSFORM = IntentAwareBM25SearchTransform(
@@ -382,3 +408,4 @@ RESPONSE_LIMITING_MIDDLEWARE = ArchivedResponseLimitingMiddleware(
 )
 mcp_server.add_middleware(RESPONSE_LIMITING_MIDDLEWARE)
 mcp_server.add_middleware(StructuredMetaErrorMiddleware())
+mcp_server.add_middleware(ReadOnlyAdvertisingMiddleware())

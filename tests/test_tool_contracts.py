@@ -86,6 +86,7 @@ SAMPLE_INSIGHTS_ROW = {
 }
 
 TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
+    "get_ad_image": {"ad_id": "ad_123"},
     "create_campaign": {"daily_budget": 50.0},
     "create_ad": {"creative_id": "crt_123", "bid_amount": 12.34},
     "create_ad_set": {"daily_budget": 25.0},

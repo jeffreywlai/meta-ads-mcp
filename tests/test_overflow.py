@@ -51,7 +51,7 @@ def test_artifact_preserves_complete_tool_result_envelope(tmp_path: Path) -> Non
     export_id, artifact_bytes = store.create(_result(), tool_name="example_tool")
 
     artifact = _read_complete(store, export_id)
-    assert artifact["schema_version"] == 1
+    assert artifact["schema_version"] == 2
     assert artifact["tool_name"] == "example_tool"
     assert artifact["tool_result"]["content"][0]["text"] == "content-marker"
     assert artifact["tool_result"]["structured_content"] == {
@@ -59,6 +59,50 @@ def test_artifact_preserves_complete_tool_result_envelope(tmp_path: Path) -> Non
     }
     assert artifact["tool_result"]["meta"] == {"source": "meta-marker"}
     assert artifact_bytes == store._artifact_path(export_id).stat().st_size
+
+
+def test_artifact_stores_redundant_json_once_compactly(tmp_path: Path) -> None:
+    payload = {"items": [{"name": "ad", "actions": [{"action_type": "purchase", "value": "2"}]} for _ in range(500)]}
+    result = ToolResult(content=[TextContent(type="text", text=json.dumps(payload, indent=2))],
+                        structured_content=payload, meta={"source": "test"})
+    store = OverflowArtifactStore(tmp_path)
+    export_id, size = store.create(result, tool_name="get_insights")
+    artifact = _read_complete(store, export_id)
+
+    assert artifact["tool_result"]["content"] == []
+    assert artifact["tool_result"]["structured_content"] == payload
+    assert artifact["tool_result"]["meta"] == {"source": "test"}
+    assert size < 1.1 * len(json.dumps(payload, separators=(",", ":")).encode())
+    assert result.content[0].text == json.dumps(payload, indent=2)
+
+
+def test_overflow_notice_exposes_size_rows_and_retention() -> None:
+    notice = ArchivedResponseLimitingMiddleware._retrieval_message(
+        max_size=64000, export_id="opaque", artifact_bytes=88169, row_count=22, ttl_seconds=86400,
+    )
+    assert "88,169 archived bytes" in notice
+    assert "22 rows" in notice
+    assert "retention 86,400 seconds" in notice
+    assert "next_offset" in notice
+
+
+@pytest.mark.parametrize(
+    ("text", "structured"),
+    [('not JSON', {"value": 1}), ('{"value": 1}', {"value": True}), ('{"value": 2}', {"value": 1})],
+)
+def test_archive_keeps_distinct_text(tmp_path, text, structured) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(ToolResult(content=[TextContent(type="text", text=text)],
+                                          structured_content=structured), tool_name="test")
+    assert _read_complete(store, export_id)["tool_result"]["content"][0]["text"] == text
+
+
+def test_archive_keeps_annotations_on_duplicate_text(tmp_path) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    result = ToolResult(content=[TextContent(type="text", text='{"value":1}', annotations=mt.Annotations(priority=0.5))],
+                        structured_content={"value": 1})
+    export_id, _ = store.create(result, tool_name="test")
+    assert _read_complete(store, export_id)["tool_result"]["content"][0]["annotations"]["priority"] == 0.5
 
 
 def test_artifact_permissions_are_private_even_with_open_umask(tmp_path: Path) -> None:

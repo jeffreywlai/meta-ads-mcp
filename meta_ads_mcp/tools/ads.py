@@ -14,7 +14,8 @@ from meta_ads_mcp.money import (
     to_minor_units,
     validate_positive_amount,
 )
-from meta_ads_mcp.schemas import creation_response
+from meta_ads_mcp.schemas import collection_response, creation_response
+from meta_ads_mcp.tool_types import StrictStringList, coerce_strict_csv_string_list
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -114,6 +115,41 @@ def _extract_hashes_and_candidates(creative: dict[str, Any]) -> tuple[list[str],
     return sorted(hashes), candidates
 
 
+def _configured_image_rules(creative: dict[str, Any], resolved_images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join explicit image labels to configuration rules, never inferred delivery."""
+    asset_feed = creative.get("asset_feed_spec") or {}
+    resolved_by_hash = {image["hash"]: image for image in resolved_images if image.get("hash")}
+    rules = []
+    for rule in asset_feed.get("asset_customization_rules", []):
+        label = (rule.get("image_label") or {}).get("name")
+        images = [
+            {**image, **resolved_by_hash.get(image.get("hash") or image.get("image_hash"), {})}
+            for image in asset_feed.get("images", [])
+            if label and label in [item.get("name") for item in (image.get("adlabels") or [])]
+        ]
+        spec = rule.get("customization_spec") or {}
+        positions = [
+            {
+                "publisher_platform": key.removesuffix("_positions"),
+                "configured_position": position,
+                "platform_position": "feed" if key == "instagram_positions" and position == "stream" else position,
+            }
+            for key, values in spec.items()
+            if key.endswith("_positions") and isinstance(values, list)
+            for position in values
+        ]
+        rules.append({
+            "image_label": label,
+            "images": images,
+            "mapping_status": "matched" if images else "unresolved_image_label" if label else "no_image_label",
+            "is_default": rule.get("is_default"),
+            "priority": rule.get("priority"),
+            "customization_spec": spec,
+            "configured_reporting_positions": positions,
+        })
+    return rules
+
+
 @mcp_server.tool()
 async def create_ad(
     account_id: str,
@@ -198,27 +234,39 @@ async def create_ad(
     )
 
 
-@mcp_server.tool()
-async def get_ad_image(ad_id: str) -> dict[str, Any]:
-    """Use this when the user wants Claude to inspect the main image assets behind an existing ad."""
-    client = get_graph_api_client()
+async def _get_ad_image(
+    ad_id: str,
+    client: Any,
+    creatives: dict[str, dict[str, Any]],
+    images: dict[tuple[str, str], dict[str, Any] | None],
+) -> dict[str, Any]:
+    """Read one ad, reusing creative and account-scoped image lookups in this call."""
     ad = await client.get_object(ad_id, fields=["id", "name", "account_id", "creative{id}"])
     creative_ref = ad.get("creative") or {}
     creative_id = creative_ref.get("id")
     creative: dict[str, Any] = {}
     if creative_id:
-        creative = await client.get_object(creative_id, fields=CREATIVE_IMAGE_FIELDS)
+        if creative_id not in creatives:
+            creatives[creative_id] = await client.get_object(creative_id, fields=CREATIVE_IMAGE_FIELDS)
+        creative = creatives[creative_id]
 
     image_hashes, image_candidates = _extract_hashes_and_candidates(creative)
     account_id = ad.get("account_id")
     resolved_images: list[dict[str, Any]] = []
     if account_id and image_hashes:
-        payload = await client.get_ad_images_by_hashes(
-            account_id,
-            hashes=image_hashes,
-            fields=AD_IMAGE_FIELDS,
-        )
-        resolved_images = payload.get("data", [])
+        cache_account = normalize_account_id(account_id)
+        missing = [image_hash for image_hash in image_hashes if (cache_account, image_hash) not in images]
+        if missing:
+            payload = await client.get_ad_images_by_hashes(account_id, hashes=missing, fields=AD_IMAGE_FIELDS)
+            if (payload.get("paging") or {}).get("next"):
+                raise ValidationError("Image lookup returned more pages; a complete image result could not be obtained.")
+            found = {image["hash"]: image for image in payload.get("data", []) if image.get("hash")}
+            for image_hash in missing:
+                images[(cache_account, image_hash)] = found.get(image_hash)
+        resolved_images = [
+            image for image_hash in image_hashes
+            if (image := images[(cache_account, image_hash)]) is not None
+        ]
         existing_urls = {candidate["url"] for candidate in image_candidates}
         for image in resolved_images:
             for field_name in ("url", "permalink_url"):
@@ -242,11 +290,41 @@ async def get_ad_image(ad_id: str) -> dict[str, Any]:
             "image_candidates": image_candidates,
             "best_image_url": image_candidates[0]["url"] if image_candidates else None,
             "thumbnail_url": creative.get("thumbnail_url"),
+            "configured_image_rules": _configured_image_rules(creative, resolved_images),
+            "placement_delivery_verified": False,
+            "unresolved_image_hashes": sorted(set(image_hashes) - {image.get("hash") for image in resolved_images}),
         },
         "summary": {
             "count": 1,
             "image_hash_count": len(image_hashes),
             "resolved_image_count": len(resolved_images),
             "candidate_count": len(image_candidates),
+            "placement_note": "Rules describe configured image eligibility, not actual delivery. Unmatched labels and unknown positions are retained; no default image is guessed.",
         },
     }
+
+
+@mcp_server.tool()
+async def get_ad_image(ad_id: str | None = None, ad_ids: StrictStringList | None = None) -> dict[str, Any]:
+    """Inspect image assets, crops, and configured placement rules for one ad_id or up to 100 ad_ids. Bulk calls reuse creative/image lookups; configuration is not proof of delivery."""
+    if (ad_id is not None) == (ad_ids is not None):
+        raise ValidationError("Provide exactly one of ad_id or ad_ids.")
+    ids = [ad_id] if ad_id is not None else coerce_strict_csv_string_list(ad_ids)
+    if not isinstance(ids, list) or not ids or any(not isinstance(value, str) or not value.strip() for value in ids):
+        raise ValidationError("Ad IDs must be nonblank strings.")
+    ids = list(dict.fromkeys(value.strip() for value in ids))
+    if len(ids) > 100:
+        raise ValidationError("ad_ids supports at most 100 distinct ads per call.")
+    client = get_graph_api_client()
+    creatives: dict[str, dict[str, Any]] = {}
+    images: dict[tuple[str, str], dict[str, Any] | None] = {}
+    results = [await _get_ad_image(value, client, creatives, images) for value in ids]
+    if ad_id is not None:
+        return results[0]
+    return collection_response(
+        [result["item"] for result in results],
+        summary={
+            "count": len(results), "complete": True, "unique_creative_count": len(creatives),
+            "placement_note": results[0]["summary"]["placement_note"],
+        },
+    )

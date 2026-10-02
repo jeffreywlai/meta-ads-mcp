@@ -54,6 +54,237 @@ def test_get_entity_insights_normalizes_rows(monkeypatch) -> None:
     assert result["items"][0]["metrics"]["roas"] == 2.5
 
 
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+@pytest.mark.parametrize("window", ["7d_click", "1d_view"])
+def test_attribution_controls_and_distinct_window_values_are_preserved(monkeypatch, tool, window) -> None:
+    class AttributionClient(FakeInsightsClient):
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["use_unified_attribution_setting"] == "false"
+            assert params["action_attribution_windows"] == window
+            return {"data": [{
+                "actions": [{"action_type": "purchase", "value": "2", window: "1"}],
+                "action_values": [{"action_type": "purchase", "value": "250", window: "100"}],
+            }]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: AttributionClient())
+    result = asyncio.run(tool(
+        level="account", object_id="act_123", use_unified_attribution_setting=False,
+        action_attribution_windows=[window], flatten_actions=["purchase", "purchase_value"],
+        include_raw_actions=True,
+    ))
+    assert result["items"][0]["actions"][0][window] == "1"
+    assert result["items"][0]["action_values"][0][window] == "100"
+    # Generic scalar projections must not be presented as window-specific totals.
+    assert result["items"][0]["purchase_value"] == 250
+    assert "not the named attribution-window fields" in result["summary"]["attribution_note"]
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["get_entity_insights", "get_insights", "export_insights",
+     "create_async_insights_report", "create_async_insights_report_batch"],
+)
+def test_reporting_filters_ad_rows_under_account_scope(monkeypatch, tool_name) -> None:
+    filters = [{"field": "ad.name", "operator": "CONTAIN", "value": "A3"}]
+    calls = []
+
+    class FilteredClient:
+        async def get_insights(self, object_id, *, fields, params):
+            calls.append((object_id, params))
+            return {
+                "data": [{"ad_id": "ad_1", "ad_name": "A3 story", "spend": "10"}],
+                "paging": {"next": "next-page", "cursors": {"after": "cursor-2"}},
+            }
+
+        async def create_async_insights_report(self, object_id, *, fields, params):
+            calls.append((object_id, params))
+            return {"report_run_id": "job-1"}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FilteredClient())
+    arguments = {"level": "ad", "object_id": "act_123", "filtering": filters}
+    if tool_name == "create_async_insights_report_batch":
+        arguments["breakdown_sets"] = [["publisher_platform", "platform_position"]]
+    result = asyncio.run(mcp_server.call_tool(tool_name, arguments)).structured_content
+    assert len(calls) == 1
+    object_id, params = calls[0]
+    assert object_id == "act_123"
+    assert params["level"] == "ad"
+    assert params["filtering"] == filters
+    if tool_name in {"get_entity_insights", "get_insights", "export_insights"}:
+        rows = result["rows"] if tool_name == "export_insights" else result["items"]
+        assert rows[0]["ad_name"] == "A3 story"
+        assert result["summary"]["complete"] is False
+        assert result["paging"]["after"] == "cursor-2"
+
+
+@pytest.mark.parametrize("tool_name", ["get_entity_insights", "get_insights", "export_insights"])
+def test_fetch_all_combines_filtered_pages_before_summarizing(monkeypatch, tool_name) -> None:
+    calls = []
+    filters = [{"field": "ad.id", "operator": "IN", "value": ["ad1", "ad2"]}]
+
+    class PagedClient:
+        async def get_insights(self, object_id, *, fields, params):
+            calls.append(dict(params))
+            assert object_id == "act_123"
+            assert params["filtering"] == filters
+            second = "after" in params
+            return {"data": [{"ad_id": "ad2" if second else "ad1", "spend": "20" if second else "10",
+                              "publisher_platform": "instagram", "platform_position": "story"}],
+                    **({} if second else {"paging": {"next": "next", "cursors": {"after": "page2"}}})}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PagedClient())
+    result = asyncio.run(mcp_server.call_tool(tool_name, {
+        "level": "ad", "object_id": "act_123", "filtering": filters, "fetch_all": True,
+    })).structured_content
+    rows = result["rows"] if tool_name == "export_insights" else result["items"]
+    assert [row["ad_id"] for row in rows] == ["ad1", "ad2"]
+    assert result["summary"]["metrics"]["spend"] == 30
+    assert result["summary"]["count"] == 2
+    assert result["summary"]["complete"] is True
+    assert result["summary"]["pages_fetched"] == 2
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("failure", ["cap", "missing_cursor", "repeated_cursor"])
+def test_fetch_all_fails_instead_of_returning_incomplete_insights(monkeypatch, failure) -> None:
+    class IncompleteClient:
+        async def get_insights(self, object_id, *, fields, params):
+            return {"data": [{"ad_id": str(index)} for index in range(1000 if failure == "cap" else 1)],
+                    "paging": {"next": "next", "cursors": {"after": None if failure == "missing_cursor" else "same"}}}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: IncompleteClient())
+    with pytest.raises(insights.ValidationError, match="scan limit|pagination"):
+        asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", fetch_all=True))
+
+
+def test_fetch_all_accepts_complete_result_exactly_at_cap(monkeypatch) -> None:
+    class CompleteClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["limit"] == 1000
+            return {"data": [{"ad_id": str(index)} for index in range(1000)]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: CompleteClient())
+    result = asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", fetch_all=True, limit=5000))
+    assert result["summary"]["count"] == 1000
+    assert result["summary"]["complete"] is True
+
+
+def test_fetch_all_rejects_starting_cursor_before_client(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(insights.ValidationError, match="omit after"):
+        asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", fetch_all=True, after="page2"))
+
+
+@pytest.mark.parametrize("tool", [insights.get_entity_insights, insights.get_insights])
+def test_sync_insights_can_omit_raw_actions_without_losing_metrics(monkeypatch, tool) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(
+        tool(
+            level="account", object_id="act_123", action_types=["purchase"],
+            flatten_actions=["purchase", "purchase_value"], include_raw_actions=False,
+        )
+    )
+    row = result["items"][0]
+    assert row["purchase"] == 2
+    assert row["purchase_value"] == 250
+    assert row["metrics"]["roas"] == 2.5
+    assert result["summary"]["action_filter"]["matched"] == ["purchase"]
+    for field in ("actions", "action_values", "actions_map", "action_values_map"):
+        assert field not in row
+
+
+def test_sync_insights_keeps_raw_actions_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: FakeInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+    assert result["items"][0]["actions"][0]["value"] == "2"
+
+
+@pytest.mark.parametrize("row_count", [1, 2])
+def test_get_entity_insights_keeps_unrequested_metrics_unknown(monkeypatch, row_count) -> None:
+    class ProjectedInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            assert fields == ["spend", "impressions", "clicks"]
+            return {"data": [{"spend": "100", "impressions": "1000", "clicks": "50"} for _ in range(row_count)]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ProjectedInsightsClient())
+    result = asyncio.run(
+        insights.get_entity_insights(
+            level="account", object_id="act_123", fields=["spend", "impressions", "clicks"],
+        )
+    )
+    metrics = result["summary"]["metrics"]
+
+    assert metrics["spend"] == 100.0 * row_count
+    assert metrics["impressions"] == 1000 * row_count
+    assert metrics["clicks"] == 50 * row_count
+    assert metrics["ctr"] == 0.05
+    for name in ("conversions", "conversion_value", "cvr", "cpa", "roas"):
+        assert metrics[name] is None
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "unknown_metrics"),
+    [
+        ("spend", ("spend", "cpc", "cpm", "cpa", "roas")),
+        ("impressions", ("impressions", "ctr", "cpm", "frequency")),
+        ("clicks", ("clicks", "ctr", "cpc", "cvr")),
+        ("actions", ("conversions", "cvr", "cpa")),
+        ("action_values", ("conversion_value", "roas")),
+        ("reach", ("frequency",)),
+    ],
+)
+def test_get_entity_insights_does_not_total_incomplete_metrics(
+    monkeypatch, missing_field, unknown_metrics,
+) -> None:
+    class IncompleteInsightsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            complete = payload["data"][0]
+            complete["reach"] = "500"
+            incomplete = {key: value for key, value in complete.items() if key != missing_field}
+            return {"data": [complete, incomplete]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: IncompleteInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+
+    for name in unknown_metrics:
+        assert result["summary"]["metrics"][name] is None
+
+
+@pytest.mark.parametrize("row_count", [1, 2])
+def test_get_entity_insights_preserves_explicit_zero_metrics(monkeypatch, row_count) -> None:
+    class ZeroInsightsClient(FakeInsightsClient):
+        async def get_insights(self, object_id: str, *, fields, params):
+            payload = await super().get_insights(object_id, fields=fields, params=params)
+            row = payload["data"][0]
+            row["actions"][0]["value"] = "0"
+            row["action_values"][0]["value"] = "0"
+            return {"data": [dict(row) for _ in range(row_count)]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ZeroInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+    metrics = result["summary"]["metrics"]
+
+    for name in ("conversions", "conversion_value", "cvr", "roas"):
+        assert metrics[name] == 0.0
+    assert metrics["cpa"] is None
+
+
+def test_get_entity_insights_preserves_empty_report_totals(monkeypatch) -> None:
+    class EmptyInsightsClient:
+        async def get_insights(self, object_id: str, *, fields, params):
+            return {"data": []}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: EmptyInsightsClient())
+    result = asyncio.run(insights.get_entity_insights(level="account", object_id="act_123"))
+    metrics = result["summary"]["metrics"]
+
+    for name in ("spend", "impressions", "clicks", "conversions", "conversion_value"):
+        assert metrics[name] == 0
+    for name in ("frequency", "ctr", "cpc", "cpm", "cvr", "cpa", "roas"):
+        assert metrics[name] is None
+
+
 @pytest.mark.parametrize(
     "options",
     [
@@ -866,6 +1097,23 @@ def test_get_performance_breakdown_ranks_segments(monkeypatch) -> None:
     assert result["summary"]["top_segments"][0]["country"] == "CA"
     assert result["summary"]["complete"] is False
     assert result["paging"]["after"] == "after_1"
+
+
+@pytest.mark.parametrize(
+    ("breakdown", "expected"),
+    [("platform_position", "publisher_platform,platform_position"), ("country", "country")],
+)
+def test_performance_breakdown_pairs_only_platform_position(monkeypatch, breakdown, expected) -> None:
+    class PlacementClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["breakdowns"] == expected
+            return {"data": [{"publisher_platform": "instagram", "platform_position": "story", "spend": "10"}]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: PlacementClient())
+    result = asyncio.run(insights.get_performance_breakdown(level="ad", object_id="ad_1", breakdown=breakdown))
+    assert result["summary"]["breakdowns"] == expected.split(",")
+    assert result["items"][0]["publisher_platform"] == "instagram"
+    assert result["items"][0]["platform_position"] == "story"
 
 
 def test_compare_time_ranges_compares_previous_zero_metrics(monkeypatch) -> None:
@@ -1722,8 +1970,9 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
 
     archived = json.loads("".join(chunks))
     archived_result = archived["tool_result"]
+    assert archived["schema_version"] == 2
     assert archived_result["structured_content"]["items"][0]["ad_name"] == oversized_name
-    assert archived_result["content"]
+    assert archived_result["content"] == []  # Duplicate compatibility JSON is omitted.
     assert "meta" in archived_result
     artifact_path = artifact_store._artifact_path(export_id)
     assert overflow["artifact_bytes"] == artifact_path.stat().st_size

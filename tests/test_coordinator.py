@@ -36,8 +36,9 @@ def test_response_size_guard_is_configured() -> None:
     assert type(middleware).__name__ == "ArchivedResponseLimitingMiddleware"
     assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
     assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
-    assert mcp_server.middleware[-2] is RESPONSE_LIMITING_MIDDLEWARE
-    assert type(mcp_server.middleware[-1]).__name__ == "StructuredMetaErrorMiddleware"
+    assert mcp_server.middleware[-3] is RESPONSE_LIMITING_MIDDLEWARE
+    assert type(mcp_server.middleware[-2]).__name__ == "StructuredMetaErrorMiddleware"
+    assert type(mcp_server.middleware[-1]).__name__ == "ReadOnlyAdvertisingMiddleware"
 
 
 def test_list_tools_exposes_compact_search_surface() -> None:
@@ -205,6 +206,19 @@ def test_compact_search_serializer_returns_minimal_markdown() -> None:
     assert "properties" not in result
     assert "additionalProperties" not in result
     assert "Next: use `call_tool`" in result
+    for tool in tools:
+        line = next(line for line in result.splitlines() if f"`{tool.name}`" in line)
+        for name in tool.parameters["properties"]:
+            assert name in line
+        assert "+" not in line
+
+
+def test_proxy_unknown_arguments_list_accepted_parameters_before_fetch(monkeypatch) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: pytest.fail("must not fetch"))
+    with pytest.raises(ToolError, match="Accepted parameters: account_id, campaign_id, adset_id"):
+        asyncio.run(mcp_server.call_tool("call_tool", {
+            "name": "list_ads", "arguments": {"account_id": "act_123", "not_a_parameter": True},
+        }))
 
 
 def test_compact_search_serializer_surfaces_required_archive_params() -> None:
@@ -232,3 +246,13 @@ def test_live_search_routes_new_workflow_language_to_exact_tools() -> None:
     for query, expected in cases.items():
         result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
         assert f"- `{expected}`" in result.content[0].text.splitlines()[1]
+
+
+def test_placement_search_prefers_canonical_insights_but_exact_alias_still_works() -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": "insights breakdown by placement platform_position for an ad over a date range",
+    }))
+    assert "`get_entity_insights`" in result.content[0].text
+    assert "`get_insights`" not in result.content[0].text
+    exact = asyncio.run(mcp_server.call_tool("search_tools", {"query": "get_insights"}))
+    assert "- `get_insights`" in exact.content[0].text.splitlines()[1]

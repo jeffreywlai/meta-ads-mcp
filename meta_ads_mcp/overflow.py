@@ -401,18 +401,35 @@ class OverflowArtifactStore:
             )
 
     def create(self, result: ToolResult, *, tool_name: str) -> tuple[str, int]:
-        """Write a versioned, complete ToolResult envelope and return its opaque id."""
+        """Store compact JSON, omitting only redundant unannotated compatibility text."""
         created_at = datetime.now(timezone.utc).isoformat()
+        archived_result = result.model_dump(mode="json", by_alias=True)
+        content = archived_result.get("content", [])
+        structured = archived_result.get("structured_content")
+        if (
+            structured is not None
+            and len(content) == 1
+            and content[0].get("type") == "text"
+            and all(value is None for key, value in content[0].items() if key not in {"type", "text"})
+        ):
+            try:
+                decoded = json.loads(content[0]["text"])
+            except (TypeError, ValueError):
+                pass
+            else:
+                # Canonical JSON keeps booleans distinct from numbers (True != 1).
+                if json.dumps(decoded, sort_keys=True) == json.dumps(structured, sort_keys=True):
+                    archived_result["content"] = []
         artifact_payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "tool_name": tool_name,
             "created_at": created_at,
-            "tool_result": result.model_dump(mode="json", by_alias=True),
+            "tool_result": archived_result,
         }
         artifact_bytes = json.dumps(
             artifact_payload,
             ensure_ascii=True,
-            indent=2,
+            separators=(",", ":"),
             default=str,
         ).encode("utf-8")
         manifest_bytes = json.dumps(
@@ -763,12 +780,23 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         max_size: int,
         export_id: str,
         response_kind: str = "response",
+        artifact_bytes: int | None = None,
+        ttl_seconds: int | None = None,
+        row_count: int | None = None,
     ) -> str:
         """Return compact remote-retrieval guidance for an archived payload."""
+        details = []
+        if artifact_bytes is not None:
+            details.append(f"{artifact_bytes:,} archived bytes")
+        if row_count is not None:
+            details.append(f"{row_count:,} rows")
+        if ttl_seconds is not None:
+            details.append(f"retention {ttl_seconds:,} seconds")
+        size_hint = f" ({'; '.join(details)})" if details else ""
         return (
             f"[{response_kind.capitalize()} exceeded the {max_size:,}-byte "
             f"inline limit. The complete JSON is available as export_id "
-            f"'{export_id}'. Use call_tool with name='read_overflow_artifact' "
+            f"'{export_id}'{size_hint}. Use call_tool with name='read_overflow_artifact' "
             f'and arguments={{"export_id": "{export_id}", "offset": 0}} '
             "repeatedly using next_offset. When done, use call_tool with "
             "name='delete_overflow_artifact' and that export_id.]"
@@ -800,7 +828,7 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
             if len(serialized_error) <= self.max_size:
                 raise
             try:
-                export_id, _artifact_size = self.artifact_store.create(
+                export_id, artifact_size = self.artifact_store.create(
                     error_result,
                     tool_name=context.message.name,
                 )
@@ -811,6 +839,8 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                     max_size=self.max_size,
                     export_id=export_id,
                     response_kind="error",
+                    artifact_bytes=artifact_size,
+                    ttl_seconds=self.artifact_store.ttl_seconds,
                 )
             ) from None
 
@@ -847,9 +877,14 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                 },
             )
 
+        structured = result.structured_content or {}
+        rows = structured.get("items", structured.get("rows"))
         message = self._retrieval_message(
             max_size=self.max_size,
             export_id=export_id,
+            artifact_bytes=artifact_size,
+            ttl_seconds=self.artifact_store.ttl_seconds,
+            row_count=len(rows) if isinstance(rows, list) else None,
         )
         return ToolResult(
             content=[TextContent(type="text", text=message)],

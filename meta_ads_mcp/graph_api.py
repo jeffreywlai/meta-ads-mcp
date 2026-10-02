@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -21,6 +22,7 @@ from .errors import (
     NotFoundError,
     RateLimitError,
     UnsupportedFeatureError,
+    ValidationError,
 )
 from .tool_types import FieldList, coerce_csv_string_list
 
@@ -444,6 +446,8 @@ class GraphAPIClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Start an async insights report."""
+        if re.fullmatch(r"(?:act_)?[0-9]+", object_id) is None:
+            raise ValidationError("Async report object_id must be a numeric ID or act_<numeric>.")
         query = dict(params or {})
         query["fields"] = _serialize_fields(fields) or ""
         query["async"] = "true"

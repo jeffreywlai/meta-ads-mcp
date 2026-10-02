@@ -7,6 +7,7 @@ import re
 import pydantic_core
 
 from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
     OVERFLOW_ARTIFACT_STORE,
@@ -479,6 +480,7 @@ def _server_metadata() -> dict[str, object]:
         "name": "Meta Ads FastMCP",
         "fastmcp_version_target": "3.4.7",
         "api_version": settings.api_version,
+        "read_only": settings.read_only,
         "optimization_first": True,
         "primary_transport": "stdio",
         "secondary_transport": "streamable-http",
@@ -535,22 +537,35 @@ async def health_check() -> dict[str, object]:
 async def get_capabilities(
     intent: str | None = None,
     include_full_manifest: bool = False,
+    tool_name: str | None = None,
 ) -> dict[str, object]:
-    """Use this when Claude is unsure which tool to use. Prefer intent for compact routing, and request the full manifest only when needed."""
+    """Get routing guidance or a named tool's complete input schema via tool_name; the full manifest lists workflows, not parameter schemas."""
+    if tool_name is not None:
+        if not tool_name.strip() or intent is not None or include_full_manifest:
+            raise ValidationError("Provide tool_name alone to inspect one tool's input schema.")
+        tool = await mcp_server.get_tool(tool_name.strip())
+        if tool is None:
+            raise ValidationError(f"Unknown tool: {tool_name}.")
+        return {
+            "server": _server_metadata(),
+            "tool": {"name": tool.name, "description": tool.description, "input_schema": tool.parameters},
+        }
     if intent is not None:
         route = INTENT_GUIDE.get(intent)
         if route is None:
             closest = _closest_intents(intent)
+            matches = await mcp_server.call_tool("search_tools", {"query": intent})
             return {
                 "server": _server_metadata(),
                 "unmatched_intent": intent,
                 "closest_intents": closest,
+                "tool_matches": "\n".join(item.text for item in matches.content if item.type == "text"),
                 "suggested_search": {"tool": "search_tools", "arguments": {"query": intent}},
                 "resources": RESOURCE_URIS,
                 "valid_intents": sorted(INTENT_GUIDE),
                 "notes": [
                     "No exact intent key matched, so this response returns fuzzy routing candidates.",
-                    "Use the top closest_intents entry when it fits, or search_tools with the original query.",
+                    "Prefer tool_matches from the live tool search; closest_intents are legacy workflow hints.",
                 ],
             }
         return {
@@ -579,6 +594,7 @@ async def get_capabilities(
             "META_EXPORT_TTL_SECONDS",
             "META_EXPORT_MAX_FILES",
             "META_EXPORT_MAX_BYTES",
+            "META_READ_ONLY",
         ],
     }
     notes = [
@@ -598,11 +614,18 @@ async def get_capabilities(
         "search_ads_archive is public research data and does not depend on an ad account id, but the app still needs Ads Library API access.",
         "Write operations still depend on the token having ads_management-level permissions.",
     ]
+    tool_groups = TOOL_GROUPS
+    if get_settings().read_only:
+        from meta_ads_mcp.read_only import read_only_tool_names
+
+        allowed = read_only_tool_names()
+        tool_groups = {group: [name for name in names if name in allowed] for group, names in TOOL_GROUPS.items()}
+        notes.append("META_READ_ONLY is enabled; advertising mutations and token mutations are disabled, including through call_tool.")
     if include_full_manifest:
         return {
             "server": _server_metadata(),
             "auth": auth,
-            "tool_groups": TOOL_GROUPS,
+            "tool_groups": tool_groups,
             "routing_hints": ROUTING_HINTS,
             "intent_guide": INTENT_GUIDE,
             "resources": RESOURCE_URIS,
@@ -613,7 +636,7 @@ async def get_capabilities(
         "server": _server_metadata(),
         "auth": auth,
         "valid_intents": sorted(INTENT_GUIDE),
-        "tool_group_counts": {group: len(tools) for group, tools in TOOL_GROUPS.items()},
+        "tool_group_counts": {group: len(tools) for group, tools in tool_groups.items()},
         "recommended_start": {
             "if_auth_or_connectivity_is_unclear": "health_check",
             "if_the_needed_tool_is_not_visible": "search_tools",
@@ -628,6 +651,8 @@ async def get_capabilities(
 @mcp_server.tool()
 async def list_mutation_tools() -> dict[str, object]:
     """Use this when the user asks what Meta Ads state this MCP can create, pause, update, or delete."""
+    if get_settings().read_only:
+        return {"tool_group": "writes", "count": 0, "tools": [], "message": "META_READ_ONLY disables mutations."}
     return {
         "tool_group": "writes",
         "count": len(TOOL_GROUPS["writes"]),
