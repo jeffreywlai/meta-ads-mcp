@@ -9,7 +9,7 @@ import pytest
 
 from meta_ads_mcp.auth import build_appsecret_proof
 from meta_ads_mcp.config import Settings
-from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError
+from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import (
     _CLIENT_POOL,
     GraphAPIClient,
@@ -314,6 +314,35 @@ def test_graph_client_accepts_csv_fields_for_direct_callers(
             "params": {"fields": "id,name,url_tags"},
         }
     ]
+
+
+@pytest.mark.parametrize("object_id", ["123", "act_123", "12345678901234567890"])
+def test_async_report_posts_only_to_the_insights_edge(monkeypatch, object_id) -> None:
+    calls = []
+
+    async def fake_request(self, method, endpoint, **kwargs):
+        calls.append((method, endpoint, kwargs))
+        return {"report_run_id": "report-1"}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    result = asyncio.run(_client().create_async_insights_report(object_id, fields=["spend"]))
+
+    assert result == {"report_run_id": "report-1"}
+    assert calls == [("POST", f"{object_id}/insights", {"data": {"fields": "spend", "async": "true"}})]
+
+
+@pytest.mark.parametrize("object_id", [
+    "123?status=PAUSED#", "act_123?method=delete#", "123#", "123/insights",
+    "../123", "123%3Fstatus=PAUSED%23", "123\\456", "１２３", "123\n",
+    " 123", "", "act_", "ad_123",
+])
+def test_async_report_rejects_invalid_identifiers_before_request(monkeypatch, object_id) -> None:
+    async def unexpected_request(*args, **kwargs):
+        pytest.fail("Invalid identifiers must not reach the request builder")
+
+    monkeypatch.setattr(GraphAPIClient, "request", unexpected_request)
+    with pytest.raises(ValidationError, match="numeric ID or act_<numeric>"):
+        asyncio.run(_client().create_async_insights_report(object_id, fields=["spend"]))
 
 
 def test_get_async_report_accepts_normalized_completed_status(monkeypatch) -> None:

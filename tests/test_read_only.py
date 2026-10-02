@@ -9,6 +9,7 @@ from mcp.types import CallToolRequestParams
 
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.graph_api import GraphAPIClient
 from meta_ads_mcp.read_only import ReadOnlyAdvertisingMiddleware, read_only_tool_names
 from meta_ads_mcp.tools import insights, utility
 
@@ -72,6 +73,33 @@ def test_read_only_keeps_routed_reads_and_async_reporting_jobs(read_only, monkey
             "name": name, "arguments": {"level": "ad", "object_id": "ad_1"},
         }))
         assert result.structured_content is not None
+
+
+@pytest.mark.parametrize("api_version", ["v25.0", "v26.0"])
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("name", ["create_async_insights_report", "create_async_insights_report_batch"])
+@pytest.mark.parametrize(("level", "object_id"), [
+    ("ad", "123?status=PAUSED#"), ("account", "123?method=delete#"),
+])
+def test_read_only_async_reports_reject_endpoint_injection(
+    read_only, monkeypatch, api_version, routed, name, level, object_id,
+) -> None:
+    monkeypatch.setenv("META_API_VERSION", api_version)
+    client = GraphAPIClient(reload_settings())
+
+    def unexpected_http_client(*args, **kwargs):
+        pytest.fail("Rejected report identifiers must not create an HTTP client")
+
+    monkeypatch.setattr(GraphAPIClient, "_get_shared_client", unexpected_http_client)
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+    arguments = {"level": level, "object_id": object_id}
+    if name == "create_async_insights_report_batch":
+        arguments["breakdown_sets"] = [["publisher_platform"]]
+    tool = "call_tool" if routed else name
+    if routed:
+        arguments = {"name": name, "arguments": arguments}
+    with pytest.raises(ToolError, match="numeric ID or act_<numeric>"):
+        asyncio.run(mcp_server.call_tool(tool, arguments))
 
 
 @pytest.mark.parametrize(("value", "expected"), [("true", True), ("1", True), ("false", False), ("0", False)])
