@@ -322,6 +322,13 @@ Each ad includes `matched_terms`. The scan follows pagination up to 1,000 ads an
 fails explicitly if it cannot finish; completeness still reflects the selected
 scope and status filters, not all historical ads.
 
+`get_ad_image` joins asset labels to `configured_image_rules`, retaining crop
+coordinates, explicit default flags, rule constraints, and unresolved labels.
+It includes reporting-position hints (Instagram `stream` becomes `feed`;
+unknown values pass through). These are configured eligibility rules, not proof
+that a specific image served. Placement Insights show delivery totals, but do
+not establish image-level delivery when several assets are eligible.
+
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating

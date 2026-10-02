@@ -114,6 +114,41 @@ def _extract_hashes_and_candidates(creative: dict[str, Any]) -> tuple[list[str],
     return sorted(hashes), candidates
 
 
+def _configured_image_rules(creative: dict[str, Any], resolved_images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join explicit image labels to configuration rules, never inferred delivery."""
+    asset_feed = creative.get("asset_feed_spec") or {}
+    resolved_by_hash = {image["hash"]: image for image in resolved_images if image.get("hash")}
+    rules = []
+    for rule in asset_feed.get("asset_customization_rules", []):
+        label = (rule.get("image_label") or {}).get("name")
+        images = [
+            {**image, **resolved_by_hash.get(image.get("hash") or image.get("image_hash"), {})}
+            for image in asset_feed.get("images", [])
+            if label and label in [item.get("name") for item in (image.get("adlabels") or [])]
+        ]
+        spec = rule.get("customization_spec") or {}
+        positions = [
+            {
+                "publisher_platform": key.removesuffix("_positions"),
+                "configured_position": position,
+                "platform_position": "feed" if key == "instagram_positions" and position == "stream" else position,
+            }
+            for key, values in spec.items()
+            if key.endswith("_positions") and isinstance(values, list)
+            for position in values
+        ]
+        rules.append({
+            "image_label": label,
+            "images": images,
+            "mapping_status": "matched" if images else "unresolved_image_label" if label else "no_image_label",
+            "is_default": rule.get("is_default"),
+            "priority": rule.get("priority"),
+            "customization_spec": spec,
+            "configured_reporting_positions": positions,
+        })
+    return rules
+
+
 @mcp_server.tool()
 async def create_ad(
     account_id: str,
@@ -200,7 +235,7 @@ async def create_ad(
 
 @mcp_server.tool()
 async def get_ad_image(ad_id: str) -> dict[str, Any]:
-    """Use this when the user wants Claude to inspect the main image assets behind an existing ad."""
+    """Inspect an ad's image assets, crops, and configured placement rules; configuration is not proof of which image served."""
     client = get_graph_api_client()
     ad = await client.get_object(ad_id, fields=["id", "name", "account_id", "creative{id}"])
     creative_ref = ad.get("creative") or {}
@@ -242,11 +277,14 @@ async def get_ad_image(ad_id: str) -> dict[str, Any]:
             "image_candidates": image_candidates,
             "best_image_url": image_candidates[0]["url"] if image_candidates else None,
             "thumbnail_url": creative.get("thumbnail_url"),
+            "configured_image_rules": _configured_image_rules(creative, resolved_images),
+            "placement_delivery_verified": False,
         },
         "summary": {
             "count": 1,
             "image_hash_count": len(image_hashes),
             "resolved_image_count": len(resolved_images),
             "candidate_count": len(image_candidates),
+            "placement_note": "Rules describe configured image eligibility, not actual delivery. Unmatched labels and unknown positions are retained; no default image is guessed.",
         },
     }

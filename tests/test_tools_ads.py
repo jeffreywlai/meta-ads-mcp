@@ -203,6 +203,43 @@ def test_get_ad_image_resolves_candidates(monkeypatch) -> None:
     assert result["summary"]["resolved_image_count"] == 2
 
 
+def test_image_rules_preserve_crops_defaults_and_ambiguous_assets() -> None:
+    creative = {"asset_feed_spec": {
+        "images": [
+            {"hash": "portrait1", "adlabels": [{"name": "story"}], "image_crops": {"9x16": [[0, 0], [9, 16]]}},
+            {"hash": "portrait2", "adlabels": [{"name": "story"}]},
+            {"hash": "square", "adlabels": [{"name": "default"}]},
+        ],
+        "asset_customization_rules": [
+            {"image_label": {"name": "story"}, "is_default": False, "priority": 1,
+             "customization_spec": {"instagram_positions": ["story", "stream", "future_position"], "age_min": 25}},
+            {"image_label": {"name": "default"}, "is_default": True},
+            {"image_label": {"name": "missing"}},
+            {"video_label": {"name": "video"}},
+        ],
+    }}
+    rules = ads._configured_image_rules(creative, [{"hash": "portrait1", "url": "https://example.com/portrait", "original_width": 900}])
+    assert [image["hash"] for image in rules[0]["images"]] == ["portrait1", "portrait2"]
+    assert rules[0]["images"][0]["url"] == "https://example.com/portrait"
+    assert rules[0]["images"][0]["image_crops"] == {"9x16": [[0, 0], [9, 16]]}
+    assert rules[0]["customization_spec"]["age_min"] == 25
+    assert rules[0]["is_default"] is False
+    assert [position["platform_position"] for position in rules[0]["configured_reporting_positions"]] == ["story", "feed", "future_position"]
+    assert rules[1]["is_default"] is True
+    assert rules[2]["images"] == []
+    assert rules[2]["mapping_status"] == "unresolved_image_label"
+    assert rules[2]["is_default"] is None  # Do not infer a default from absent rules.
+    assert rules[3]["mapping_status"] == "no_image_label"
+
+
+def test_image_rules_are_exposed_without_claiming_actual_delivery(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
+    result = asyncio.run(ads.get_ad_image(ad_id="ad_123"))
+    assert result["item"]["configured_image_rules"] == []
+    assert result["item"]["placement_delivery_verified"] is False
+    assert "not actual delivery" in result["summary"]["placement_note"]
+
+
 def test_get_ad_image_handles_ad_without_creative(monkeypatch) -> None:
     class NoCreativeClient(FakeAdsClient):
         async def get_object(self, object_id: str, *, fields=None, params=None):
