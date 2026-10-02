@@ -35,11 +35,15 @@ class Settings:
     export_ttl_seconds: int = 86_400
     export_max_files: int = 100
     export_max_bytes: int = 1_000_000_000
+    read_only: bool = False
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return cached runtime settings."""
+    read_only = os.getenv("META_READ_ONLY", "false").strip().lower()
+    if read_only not in {"true", "false", "1", "0"}:
+        raise ValueError("META_READ_ONLY must be true, false, 1, or 0.")
     return Settings(
         access_token=os.getenv("META_ACCESS_TOKEN"),
         api_version=os.getenv("META_API_VERSION", "v25.0"),
@@ -56,6 +60,7 @@ def get_settings() -> Settings:
         export_ttl_seconds=int(os.getenv("META_EXPORT_TTL_SECONDS", "86400")),
         export_max_files=int(os.getenv("META_EXPORT_MAX_FILES", "100")),
         export_max_bytes=int(os.getenv("META_EXPORT_MAX_BYTES", "1000000000")),
+        read_only=read_only in {"true", "1"},
     )
 
 

@@ -480,6 +480,7 @@ def _server_metadata() -> dict[str, object]:
         "name": "Meta Ads FastMCP",
         "fastmcp_version_target": "3.4.7",
         "api_version": settings.api_version,
+        "read_only": settings.read_only,
         "optimization_first": True,
         "primary_transport": "stdio",
         "secondary_transport": "streamable-http",
@@ -593,6 +594,7 @@ async def get_capabilities(
             "META_EXPORT_TTL_SECONDS",
             "META_EXPORT_MAX_FILES",
             "META_EXPORT_MAX_BYTES",
+            "META_READ_ONLY",
         ],
     }
     notes = [
@@ -612,11 +614,18 @@ async def get_capabilities(
         "search_ads_archive is public research data and does not depend on an ad account id, but the app still needs Ads Library API access.",
         "Write operations still depend on the token having ads_management-level permissions.",
     ]
+    tool_groups = TOOL_GROUPS
+    if get_settings().read_only:
+        from meta_ads_mcp.read_only import read_only_tool_names
+
+        allowed = read_only_tool_names()
+        tool_groups = {group: [name for name in names if name in allowed] for group, names in TOOL_GROUPS.items()}
+        notes.append("META_READ_ONLY is enabled; advertising mutations and token mutations are disabled, including through call_tool.")
     if include_full_manifest:
         return {
             "server": _server_metadata(),
             "auth": auth,
-            "tool_groups": TOOL_GROUPS,
+            "tool_groups": tool_groups,
             "routing_hints": ROUTING_HINTS,
             "intent_guide": INTENT_GUIDE,
             "resources": RESOURCE_URIS,
@@ -627,7 +636,7 @@ async def get_capabilities(
         "server": _server_metadata(),
         "auth": auth,
         "valid_intents": sorted(INTENT_GUIDE),
-        "tool_group_counts": {group: len(tools) for group, tools in TOOL_GROUPS.items()},
+        "tool_group_counts": {group: len(tools) for group, tools in tool_groups.items()},
         "recommended_start": {
             "if_auth_or_connectivity_is_unclear": "health_check",
             "if_the_needed_tool_is_not_visible": "search_tools",
@@ -642,6 +651,8 @@ async def get_capabilities(
 @mcp_server.tool()
 async def list_mutation_tools() -> dict[str, object]:
     """Use this when the user asks what Meta Ads state this MCP can create, pause, update, or delete."""
+    if get_settings().read_only:
+        return {"tool_group": "writes", "count": 0, "tools": [], "message": "META_READ_ONLY disables mutations."}
     return {
         "tool_group": "writes",
         "count": len(TOOL_GROUPS["writes"]),

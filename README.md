@@ -334,6 +334,17 @@ with image caching scoped to the owning account. Unresolved image hashes remain
 explicit. This uses the existing per-object Graph reads, not a new batch job or
 persistent cache.
 
+For an analysis-only server, set `META_READ_ONLY=true` in its launch environment
+and restart it. This opt-in mode hides mutation tools from search and rejects
+advertising mutations, asset uploads, A/B-test setup, and token mutations before
+execution—even through `call_tool` or compatibility aliases. Unknown tools fail
+closed. Reporting jobs and local overflow-artifact cleanup remain available.
+Use an `ads_read` token as an additional permission boundary where possible.
+Analysis agents using tool search need access to `search_tools`, `call_tool`, and
+`get_capabilities`; allowing only underlying tool names is not sufficient.
+The default remains writable; no existing server or dbt agent configuration is
+changed automatically.
+
 Async insights use a lean scalar field set by default; pass
 `field_preset="full"` or explicit `fields` when the wider Meta response is
 required. Pass `flatten_actions=["purchase","purchase_value"]` when creating

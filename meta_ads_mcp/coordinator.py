@@ -25,6 +25,7 @@ try:
     from fastmcp.tools.tool import Tool, ToolResult
 
     from meta_ads_mcp.error_middleware import StructuredMetaErrorMiddleware
+    from meta_ads_mcp.read_only import ReadOnlyAdvertisingMiddleware
     from meta_ads_mcp.overflow import (
         ArchivedResponseLimitingMiddleware,
         OverflowArtifactStore,
@@ -35,6 +36,9 @@ except ImportError:  # pragma: no cover - fallback for tests without the package
     ToolResult = Any
 
     class StructuredMetaErrorMiddleware:  # type: ignore[override]
+        """Minimal local fallback for tests without FastMCP."""
+
+    class ReadOnlyAdvertisingMiddleware:  # type: ignore[override]
         """Minimal local fallback for tests without FastMCP."""
 
     class OverflowArtifactStore:  # type: ignore[override]
@@ -161,6 +165,11 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
 
     async def _search(self, tools: Sequence[Tool], query: str) -> Sequence[Tool]:
         """Parse first, filter incompatible contracts, then use BM25 for rank."""
+        if get_settings().read_only:
+            from meta_ads_mcp.read_only import read_only_tool_names
+
+            allowed = read_only_tool_names()
+            tools = [tool for tool in tools if tool.name in allowed]
         decision = self._router.decide(
             query,
             tool_contracts=self._contracts_for(tools),
@@ -399,3 +408,4 @@ RESPONSE_LIMITING_MIDDLEWARE = ArchivedResponseLimitingMiddleware(
 )
 mcp_server.add_middleware(RESPONSE_LIMITING_MIDDLEWARE)
 mcp_server.add_middleware(StructuredMetaErrorMiddleware())
+mcp_server.add_middleware(ReadOnlyAdvertisingMiddleware())
