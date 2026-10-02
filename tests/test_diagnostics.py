@@ -53,6 +53,17 @@ def test_detect_snapshot_findings_supports_nested_child_spend() -> None:
     assert any(finding["type"] == "budget_concentration" for finding in findings)
 
 
+def test_empty_parent_does_not_discard_observed_child_spend() -> None:
+    findings = detect_snapshot_findings(
+        {"spend": 0.0, "conversions": 0.0},
+        child_rows=[{"id": str(index), "metrics": {"spend": spend}}
+                    for index, spend in enumerate((200, 120, 80, 0))],
+        has_rows=False,
+    )
+    assert any(finding["type"] == "budget_concentration" for finding in findings)
+    assert not any(finding["type"] == "no_pattern_detected" for finding in findings)
+
+
 def test_rank_rows_supports_nested_metrics() -> None:
     rows = [
         {"id": "a", "metrics": {"roas": 1.2}},

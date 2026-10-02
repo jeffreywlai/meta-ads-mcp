@@ -79,7 +79,7 @@ def test_child_insights_allows_complete_report_exactly_at_cap(monkeypatch) -> No
 def test_account_snapshot_ranks_children(monkeypatch) -> None:
     async def fake_get_entity_insights(**kwargs):
         return {
-            "items": [],
+            "items": [{"metrics": {"spend": 300.0, "ctr": 0.01, "frequency": 3.1, "conversions": 0.0, "roas": 0.7}}],
             "summary": {
                 "metrics": {
                     "spend": 300.0,
@@ -109,7 +109,8 @@ def test_account_snapshot_ranks_children(monkeypatch) -> None:
 
 def test_campaign_snapshot_includes_top_adsets_and_ads(monkeypatch) -> None:
     async def fake_get_entity_insights(**kwargs):
-        return {"summary": {"metrics": {"spend": 200.0, "roas": 1.4, "ctr": 0.02, "conversions": 3.0}}}
+        metrics = {"spend": 200.0, "roas": 1.4, "ctr": 0.02, "conversions": 3.0}
+        return {"items": [{"metrics": metrics}], "summary": {"metrics": metrics}}
 
     async def fake_child_insights(object_id: str, *, level: str, **kwargs):
         if level == "adset":
@@ -275,6 +276,38 @@ def test_campaign_snapshot_can_include_native_signals(monkeypatch) -> None:
     assert result["native_optimization_signals"]["signals"] == {
         "pacing_type": ["standard"]
     }
+
+
+@pytest.mark.parametrize(("tool_name", "arguments"), [
+    ("get_account_health_snapshot", {"account_id": "123"}),
+    ("get_account_optimization_snapshot", {"account_id": "123"}),
+    ("get_campaign_optimization_snapshot", {"campaign_id": "123"}),
+    ("get_budget_pacing_report", {"level": "campaign", "object_id": "123"}),
+    ("get_creative_performance_report", {"account_id": "123"}),
+    ("get_delivery_risk_report", {"campaign_id": "123"}),
+    ("get_audience_performance_report", {"level": "campaign", "object_id": "123"}),
+])
+@pytest.mark.parametrize("has_rows", [False, True])
+def test_snapshot_consumers_distinguish_empty_reports_from_real_zero_rows(
+    monkeypatch, tool_name, arguments, has_rows,
+) -> None:
+    from meta_ads_mcp.tools import insights
+
+    class ZeroClient:
+        async def get_insights(self, object_id, *, fields=None, params=None):
+            return {"data": [{
+                "ad_id": "456", "spend": "0", "impressions": "0", "clicks": "0",
+                "actions": [{"action_type": "purchase", "value": "0"}],
+            }] if has_rows else []}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: ZeroClient())
+    monkeypatch.setattr(diagnostics, "get_graph_api_client", lambda: ZeroClient())
+    result = asyncio.run(getattr(diagnostics, tool_name)(**arguments))
+
+    assert result["findings"][0]["type"] == ("no_pattern_detected" if has_rows else "insufficient_data")
+    assert result["metrics"]["spend"] == 0
+    if not has_rows:
+        assert result["evidence"] == []
 
 
 def test_account_health_snapshot_compares_explicit_windows(monkeypatch) -> None:
@@ -449,7 +482,8 @@ def test_budget_pacing_report_supports_explicit_since_until(monkeypatch) -> None
 
     async def fake_get_entity_insights(**kwargs):
         calls.append(kwargs)
-        return {"items": [], "summary": {"metrics": {"spend": 100.0, "clicks": 10, "impressions": 1000}}}
+        metrics = {"spend": 100.0, "clicks": 10, "impressions": 1000}
+        return {"items": [{"metrics": metrics}], "summary": {"metrics": metrics}}
 
     monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
     result = asyncio.run(
@@ -924,7 +958,8 @@ def test_audience_performance_report_uses_segment_breakdown(monkeypatch) -> None
 
 def test_delivery_risk_report_includes_metric_evidence(monkeypatch) -> None:
     async def fake_get_entity_insights(**kwargs):
-        return {"summary": {"metrics": {"frequency": 3.0, "ctr": 0.005, "roas": 0.8}}}
+        metrics = {"frequency": 3.0, "ctr": 0.005, "roas": 0.8}
+        return {"items": [{"metrics": metrics}], "summary": {"metrics": metrics}}
 
     monkeypatch.setattr(diagnostics, "get_entity_insights", fake_get_entity_insights)
     result = asyncio.run(diagnostics.get_delivery_risk_report(campaign_id="cmp_123"))

@@ -193,16 +193,17 @@ def _snapshot_analysis(
     *,
     scope: dict[str, Any],
     metrics: dict[str, Any],
+    has_rows: bool,
     child_rows: list[dict[str, Any]] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the standard optimization analysis envelope."""
-    findings = detect_snapshot_findings(metrics, child_rows)
+    findings = detect_snapshot_findings(metrics, child_rows, has_rows=has_rows)
     return analysis_response(
         scope=scope,
         metrics=metrics,
         findings=findings,
-        evidence=summary_metric_evidence(metrics),
+        evidence=summary_metric_evidence(metrics) if has_rows else [],
         suggestions=_snapshot_suggestions(findings),
         extra=extra,
     )
@@ -656,6 +657,7 @@ async def get_account_optimization_snapshot(
     return _snapshot_analysis(
         scope={"level": "account", "object_id": resolved_account_id},
         metrics=account_scope["summary"]["metrics"],
+        has_rows=bool(account_scope.get("items")),
         child_rows=campaigns,
         extra=extra,
     )
@@ -747,6 +749,7 @@ async def get_account_health_snapshot(
     return _snapshot_analysis(
         scope={"level": "account", "object_id": resolved_account_id},
         metrics=current_metrics,
+        has_rows=bool(current.get("items")),
         extra=extra,
     )
 
@@ -795,6 +798,7 @@ async def get_campaign_optimization_snapshot(
     return _snapshot_analysis(
         scope={"level": "campaign", "object_id": campaign_id},
         metrics=campaign_scope["summary"]["metrics"],
+        has_rows=bool(campaign_scope.get("items")),
         child_rows=adsets,
         extra=extra,
     )
@@ -926,6 +930,7 @@ async def get_budget_pacing_report(
     return _snapshot_analysis(
         scope={"level": level, "object_id": object_id},
         metrics=summary_metrics,
+        has_rows=bool(rows),
         extra={
             "daily_rows": rows if include_full_daily_rows else _compact_timeseries_rows(rows),
             "daily_row_detail": "full" if include_full_daily_rows else "compact",
@@ -972,6 +977,7 @@ async def get_creative_performance_report(
     return _snapshot_analysis(
         scope={"level": scope_level, "object_id": resolved_object_id},
         metrics=summary_metrics,
+        has_rows=bool(rows),
         child_rows=rows,
         extra={
             "analyzed_level": "ad",
@@ -1259,8 +1265,8 @@ async def get_audience_performance_report(
     return analysis_response(
         scope={"level": level, "object_id": object_id},
         metrics=payload["summary"]["metrics"],
-        findings=detect_snapshot_findings(payload["summary"]["metrics"], rows),
-        evidence=summary_metric_evidence(payload["summary"]["metrics"]),
+        findings=detect_snapshot_findings(payload["summary"]["metrics"], rows, has_rows=bool(rows)),
+        evidence=summary_metric_evidence(payload["summary"]["metrics"]) if rows else [],
         extra={
             "segment_by": segment_by,
             "top_segments": ranked[:10],
@@ -1296,6 +1302,7 @@ async def get_delivery_risk_report(
     return _snapshot_analysis(
         scope={"level": resolved_level, "object_id": resolved_object_id},
         metrics=metrics,
+        has_rows=bool(payload.get("items")),
     )
 
 

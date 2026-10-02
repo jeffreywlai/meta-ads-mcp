@@ -213,9 +213,13 @@ def build_finding(
 def detect_snapshot_findings(
     summary_metrics: dict[str, Any],
     child_rows: list[dict[str, Any]] | None = None,
+    *,
+    has_rows: bool = True,
 ) -> list[dict[str, Any]]:
     """Generate coarse optimization findings."""
     findings: list[dict[str, Any]] = []
+    if not has_rows:
+        summary_metrics = {}
 
     spend = to_float(summary_metrics.get("spend"))
     ctr = to_float(summary_metrics.get("ctr"))
