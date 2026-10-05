@@ -10,11 +10,11 @@ authors = [
 license = "MIT"
 dependencies = [
   "fastmcp==3.4.7",
-  "mcp==1.29.0",
+  "mcp==1.30.0",
   "httpx[http2]==0.28.1",
   "jsonschema==4.26.0",
-  "pydantic==2.13.4",
-  "python-dotenv==1.2.2",
+  "pydantic==2.13.5",
+  "python-dotenv==1.2.4",
 ]
 
 [project.optional-dependencies]
