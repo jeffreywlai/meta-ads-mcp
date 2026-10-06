@@ -646,7 +646,7 @@ class GraphAPIClient:
     ) -> dict[str, Any]:
         """Fetch recommendation surfaces when available."""
         recommendation_names, recommendation_stages = normalize_recommendation_filters(
-            recommendation_names, recommendation_stages
+            recommendation_names, recommendation_stages, api_version=self.settings.api_version
         )
         cursor = _normalize_cursor(after)
         params: dict[str, Any] = {"limit": limit}

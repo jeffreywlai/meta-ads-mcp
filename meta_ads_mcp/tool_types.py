@@ -6,6 +6,8 @@ from typing import Annotated, Any, TypeAlias
 
 from pydantic import BeforeValidator
 
+from meta_ads_mcp.api_compat import is_api_version_at_least
+from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.errors import ValidationError
 
 
@@ -77,6 +79,8 @@ FieldList: TypeAlias = StringList
 def normalize_recommendation_filters(
     recommendation_names: StrictStringList | str | None,
     recommendation_stages: StrictStringList | str | None,
+    *,
+    api_version: str | None = None,
 ) -> tuple[list[str] | None, list[str] | None]:
     """Validate native filters consistently for MCP and direct Python calls."""
     filters: list[list[str] | None] = []
@@ -100,6 +104,14 @@ def normalize_recommendation_filters(
         ):
             raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
         filters.append(normalized)
+    if any(value is not None for value in filters):
+        api_version = api_version or get_settings().api_version
+        if not is_api_version_at_least((26, 0), api_version=api_version):
+            raise ValidationError(
+                "recommendation_names and recommendation_stages require "
+                "META_API_VERSION=v26.0 or newer; "
+                f"the configured version is {api_version!r}."
+            )
     return filters[0], filters[1]
 
 

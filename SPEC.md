@@ -1297,7 +1297,8 @@ Inputs:
 - `account_id` or compatibility alias `object_id`
 - optional `campaign_id`
 - optional `recommendation_names` and `recommendation_stages` (lists or CSV;
-  stage codes `MFR`, `PCR`, `PFR`), also supported by typed opportunity tools
+  stage codes `MFR`, `PCR`, `PFR`; providing either requires v26+), also
+  supported by typed opportunity tools
 
 Output:
 

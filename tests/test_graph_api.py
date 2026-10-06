@@ -73,6 +73,7 @@ class FakeAsyncClient:
 def _client(
     *,
     max_retries: int = 0,
+    api_version: str = "v25.0",
     access_token: str = "token_123",
     app_secret: str | None = None,
     access_token_override: str | None = None,
@@ -80,7 +81,7 @@ def _client(
     return GraphAPIClient(
         settings=Settings(
             access_token=access_token,
-            api_version="v25.0",
+            api_version=api_version,
             default_account_id=None,
             app_id=None,
             app_secret=app_secret,
@@ -328,11 +329,12 @@ def test_recommendations_serialize_native_filters_without_changing_unfiltered_de
         "recommendation_names": " BUDGET_LIMITED, AB_TEST ",
         "recommendation_stages": " MFR, PCR, PFR ",
     } if filtered else {}
-    result = asyncio.run(_client().get_recommendations("123", **options))
+    api_version = "v26.0" if filtered else "v25.0"
+    result = asyncio.run(_client(api_version=api_version).get_recommendations("123", **options))
     assert result == {"data": []}
     request = FakeAsyncClient.requests[0]
     assert request["method"] == "GET"
-    assert request["url"] == "https://graph.facebook.com/v25.0/act_123/recommendations"
+    assert request["url"] == f"https://graph.facebook.com/{api_version}/act_123/recommendations"
     params = request["params"]
     if filtered:
         assert params["campaign_id"] == "cmp_123"
@@ -342,6 +344,38 @@ def test_recommendations_serialize_native_filters_without_changing_unfiltered_de
         assert json.loads(params["recommendation_stages"]) == ["MFR", "PCR", "PFR"]
     else:
         assert params == {"limit": 25}
+
+
+@pytest.mark.parametrize("api_version", ["v25.0", "latest"])
+@pytest.mark.parametrize("options", [
+    {"recommendation_names": ["FRAGMENTATION"]},
+    {"recommendation_stages": "PCR"},
+    {"recommendation_names": []},
+    {"recommendation_stages": []},
+])
+def test_recommendation_filters_use_client_api_version_before_request(monkeypatch, api_version, options) -> None:
+    # A direct client's settings, not the process default, determine its API contract.
+    monkeypatch.setenv("META_API_VERSION", "v27.0")
+
+    async def unexpected_request(*args, **kwargs):
+        pytest.fail("request should not be made")
+
+    monkeypatch.setattr(GraphAPIClient, "request", unexpected_request)
+    with pytest.raises(ValidationError, match="require META_API_VERSION=v26.0"):
+        asyncio.run(_client(api_version=api_version).get_recommendations("123", **options))
+
+
+@pytest.mark.parametrize("api_version", ["v26.0", "v27.0"])
+def test_recommendation_filters_accept_supported_client_versions(monkeypatch, api_version) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"data": []})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    asyncio.run(_client(api_version=api_version).get_recommendations(
+        "123", recommendation_stages=["PCR"],
+    ))
+    request = FakeAsyncClient.requests[0]
+    assert request["url"] == f"https://graph.facebook.com/{api_version}/act_123/recommendations"
+    assert json.loads(request["params"]["recommendation_stages"]) == ["PCR"]
 
 
 @pytest.mark.parametrize("options, expected_message", [

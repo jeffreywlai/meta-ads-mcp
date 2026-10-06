@@ -13,7 +13,7 @@
 
 ## ✨ Features
 
-- 📊 **97 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **99 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, current v26 notes, and historical v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
@@ -22,7 +22,7 @@
 - 🔎 **Tool Search** — FastMCP 3.4.7 tool search lets the LLM discover tools on demand instead of loading the full catalog up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (97)
+## 📋 Available Tools (99)
 
 ### 🔍 Discovery
 
@@ -277,6 +277,8 @@ environment override selects v25. Restart the MCP to pick up a version change.
 For example, `recommendation_stages=["PCR"]` limits Meta's results before any
 local category filtering. Omitting the filters keeps the existing broad scan.
 Stage codes (`MFR`, `PCR`, `PFR`) are passed through without invented meanings.
+Providing either filter requires API v26 or newer and fails before a request
+under an explicit v25 override; unfiltered recommendation scans remain available.
 
 New SDK fields and breakdowns use existing generic inputs: for example,
 `get_entity_insights(..., fields=["shop_clicks"])` or

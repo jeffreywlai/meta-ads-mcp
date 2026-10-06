@@ -9,6 +9,7 @@ import pytest
 from fastmcp.exceptions import ToolError, ValidationError as FastMCPValidationError
 
 from meta_ads_mcp import stdio  # noqa: F401 - registers discovery and proxy tools
+from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.tools import recommendations, utility
 
@@ -370,7 +371,7 @@ def test_recommendation_cache_is_scoped_to_every_request_context(
     alternate = {
         "account_id": "456", "campaign_id": "cmp_2", "limit": 20, "after": "PAGE_B",
         "recommendation_names": ["AB_TEST"], "recommendation_stages": ["PCR"],
-        "api_version": "v25.0", "access_token": "test-token-b",
+        "api_version": "v27.0", "access_token": "test-token-b",
     }[dimension]
     if dimension in {"api_version", "access_token"}:
         setattr(settings, dimension, alternate)
@@ -486,3 +487,49 @@ def test_recommendation_filter_schemas_and_search_are_discoverable(tool_name) ->
     text = "\n".join(content.text for content in result.content if content.type == "text")
     assert "recommendation_names" in text
     assert "recommendation_stages" in text
+
+
+@pytest.mark.parametrize("tool_name", RECOMMENDATION_TOOLS)
+@pytest.mark.parametrize("options", [
+    {"recommendation_names": ["FRAGMENTATION"]},
+    {"recommendation_stages": "PCR"},
+    {"recommendation_names": []},
+    {"recommendation_stages": []},
+])
+def test_native_filters_require_v26_before_scope_cache_or_client(monkeypatch, tool_name, options) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    monkeypatch.setattr(recommendations, "_resolve_account_id", lambda *_: pytest.fail("scope resolved"))
+    monkeypatch.setattr(recommendations, "_get_cached_recommendations", lambda *_: pytest.fail("cache checked"))
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: pytest.fail("client created"))
+    with pytest.raises(recommendations.ValidationError, match="require META_API_VERSION=v26.0"):
+        asyncio.run(getattr(recommendations, tool_name)(**options))
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("parameter", ["recommendation_names", "recommendation_stages"])
+def test_native_filter_version_error_is_exposed_through_mcp(monkeypatch, routed, parameter) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: pytest.fail("client created"))
+    value = "FRAGMENTATION" if parameter == "recommendation_names" else "PCR"
+    arguments = {"account_id": "123", parameter: value}
+    with pytest.raises(ToolError, match="require META_API_VERSION=v26.0"):
+        asyncio.run(mcp_server.call_tool(
+            "call_tool" if routed else "get_recommendations",
+            {"name": "get_recommendations", "arguments": arguments} if routed else arguments,
+        ))
+
+
+@pytest.mark.parametrize("tool_name", RECOMMENDATION_TOOLS)
+def test_unfiltered_recommendations_remain_available_on_v25(monkeypatch, tool_name) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    recommendations._RECOMMENDATION_CACHE.clear()
+    client = FakeRecommendationsClient()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: client)
+    result = asyncio.run(getattr(recommendations, tool_name)(
+        account_id="123", recommendation_names=None, recommendation_stages=None,
+    ))
+    assert result["supported"] is True
+    assert client.calls == 1

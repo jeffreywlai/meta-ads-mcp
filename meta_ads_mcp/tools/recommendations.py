@@ -241,7 +241,7 @@ async def _recommendation_collection(
 ) -> dict[str, object]:
     """Fetch recommendations and return a normalized supported/unsupported response."""
     recommendation_names, recommendation_stages = normalize_recommendation_filters(
-        recommendation_names, recommendation_stages
+        recommendation_names, recommendation_stages, api_version=get_settings().api_version
     )
     resolved_account_id = _resolve_account_id(account_id)
     after = blank_to_none(after)

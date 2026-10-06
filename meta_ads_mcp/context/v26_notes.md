@@ -13,6 +13,9 @@ Stage codes are `MFR`, `PCR`, and `PFR`; treat them as opaque Meta enum values.
 Use Meta's exact recommendation names, not inferred category labels.
 Omitting the filters preserves a broad opportunity scan. Filtered and
 unfiltered results do not share cache entries.
+Providing either filter (including an explicit empty list) requires API v26 or
+newer; explicit v25 overrides fail before cache lookup or requests. Omitted
+filters retain the existing unfiltered request on v25.
 
 ## Existing native signals
 
