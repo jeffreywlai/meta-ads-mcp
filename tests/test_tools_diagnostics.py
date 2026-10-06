@@ -1324,7 +1324,44 @@ def test_fatigue_scan_bound_is_forwarded_to_both_windows(monkeypatch) -> None:
     assert result["max_ads"] == 5000
 
 
-def test_creative_fatigue_report_supports_explicit_windows(monkeypatch) -> None:
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("dates", [
+    {},
+    {"since": "", "until": " \t"},
+    {"previous_since": " \t", "previous_until": ""},
+    {"since": " \t", "until": "", "previous_since": "", "previous_until": " \n"},
+])
+def test_creative_fatigue_report_blank_dates_use_default_windows(monkeypatch, routed, dates) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_child_insights(object_id: str, *, since: str, until: str, **kwargs):
+        calls.append((since, until))
+        return []
+
+    class FixedDate(diagnostics.date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 3, 8)
+
+    monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
+    monkeypatch.setattr(diagnostics, "date", FixedDate)
+    arguments = {"campaign_id": "cmp_123", "current_window_days": 3, "previous_window_days": 5, **dates}
+    result = asyncio.run(diagnostics.mcp_server.call_tool(
+        "call_tool" if routed else "get_creative_fatigue_report",
+        {"name": "get_creative_fatigue_report", "arguments": arguments} if routed else arguments,
+    )).structured_content
+
+    assert calls == [("2026-03-05", "2026-03-07"), ("2026-02-28", "2026-03-04")]
+    assert result["current_window"] == {"since": "2026-03-05", "until": "2026-03-07"}
+    assert result["previous_window"] == {"since": "2026-02-28", "until": "2026-03-04"}
+
+
+@pytest.mark.parametrize(("previous_dates", "expected_previous"), [
+    ({}, ("2026-02-22", "2026-02-28")),
+    ({"previous_since": "", "previous_until": " \t"}, ("2026-02-22", "2026-02-28")),
+    ({"previous_since": "2026-02-01", "previous_until": "2026-02-07"}, ("2026-02-01", "2026-02-07")),
+])
+def test_creative_fatigue_report_supports_explicit_windows(monkeypatch, previous_dates, expected_previous) -> None:
     calls: list[tuple[str, str]] = []
 
     async def fake_child_insights(object_id: str, *, since: str | None = None, until: str | None = None, **kwargs):
@@ -1337,11 +1374,31 @@ def test_creative_fatigue_report_supports_explicit_windows(monkeypatch) -> None:
             campaign_id="cmp_123",
             since="2026-03-01",
             until="2026-03-07",
+            **previous_dates,
         )
     )
-    assert calls == [("2026-03-01", "2026-03-07"), ("2026-02-22", "2026-02-28")]
+    assert calls == [("2026-03-01", "2026-03-07"), expected_previous]
     assert result["current_window"] == {"since": "2026-03-01", "until": "2026-03-07"}
-    assert result["previous_window"] == {"since": "2026-02-22", "until": "2026-02-28"}
+    assert result["previous_window"] == {"since": expected_previous[0], "until": expected_previous[1]}
+
+
+@pytest.mark.parametrize(("dates", "message"), [
+    ({"since": "", "until": "2026-03-07"}, "both since and until"),
+    ({"since": "2026-03-01", "until": " \t"}, "both since and until"),
+    ({"since": "2026-03-01", "until": "2026-03-07", "previous_since": "2026-02-22", "previous_until": ""},
+     "both previous_since and previous_until"),
+    ({"since": "2026-03-01", "until": "2026-03-07", "previous_since": " \t", "previous_until": "2026-02-28"},
+     "both previous_since and previous_until"),
+    ({"previous_since": "2026-02-22", "previous_until": "2026-02-28"}, "both since and until"),
+    ({"since": "2026-03-01", "until": "2026-03-07", "previous_since": "bad-date", "previous_until": "2026-02-28"},
+     "previous_since must be a valid ISO date"),
+    ({"since": "2026-03-01", "until": "2026-03-07", "previous_since": "2026-02-28", "previous_until": "2026-02-22"},
+     "previous_until must be on or after previous_since"),
+])
+def test_creative_fatigue_report_rejects_partial_or_invalid_windows_before_reads(monkeypatch, dates, message) -> None:
+    monkeypatch.setattr(diagnostics, "_child_insights", lambda *args, **kwargs: pytest.fail("must not read"))
+    with pytest.raises(diagnostics.ValidationError, match=message):
+        asyncio.run(diagnostics.get_creative_fatigue_report(campaign_id="cmp_123", **dates))
 
 
 def test_creative_fatigue_report_rejects_invalid_explicit_dates() -> None:

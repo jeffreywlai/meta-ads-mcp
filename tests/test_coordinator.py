@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 from fastmcp.exceptions import ToolError
@@ -20,6 +25,95 @@ from meta_ads_mcp.coordinator import (
 )
 from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import diagnostics, discovery, insights, utility
+
+
+def _run_isolated_import(code: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    env["META_READ_ONLY"] = "false"
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_installed_fastmcp_bootstraps_and_searches_in_clean_process() -> None:
+    result = _run_isolated_import("""
+        import asyncio
+        from meta_ads_mcp import stdio
+
+        result = asyncio.run(stdio.mcp_server.call_tool(
+            "search_tools", {"query": "create creative"},
+        ))
+        assert "- `create_ad_creative`" in result.content[0].text.splitlines()[1]
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_missing_fastmcp_reports_required_dependency_in_clean_process() -> None:
+    result = _run_isolated_import("""
+        import builtins
+
+        real_import = builtins.__import__
+        def without_fastmcp(name, *args, **kwargs):
+            if name == "fastmcp":
+                raise ModuleNotFoundError("No module named 'fastmcp'", name="fastmcp")
+            return real_import(name, *args, **kwargs)
+        builtins.__import__ = without_fastmcp
+
+        import meta_ads_mcp.stdio
+    """)
+    assert result.returncode != 0
+    assert "ImportError: FastMCP is required to run Meta Ads MCP." in result.stderr
+    assert "uv sync" in result.stderr
+    assert "AttributeError" not in result.stderr
+    assert "TypeError" not in result.stderr
+
+
+@pytest.mark.parametrize("module_name", ["fastmcp", "meta_ads_mcp.error_middleware"])
+def test_missing_other_required_module_keeps_original_import_error(module_name: str) -> None:
+    result = _run_isolated_import(f"""
+        import builtins
+
+        real_import = builtins.__import__
+        def missing_dependency(name, *args, **kwargs):
+            if name == {module_name!r}:
+                raise ModuleNotFoundError(
+                    "No module named 'other_required_dependency'",
+                    name="other_required_dependency",
+                )
+            return real_import(name, *args, **kwargs)
+        builtins.__import__ = missing_dependency
+
+        import meta_ads_mcp.stdio
+    """)
+    assert result.returncode != 0
+    assert "ModuleNotFoundError: No module named 'other_required_dependency'" in result.stderr
+    assert "FastMCP is required" not in result.stderr
+    assert "AttributeError" not in result.stderr
+    assert "TypeError" not in result.stderr
+
+
+def test_fastmcp_symbol_import_error_is_not_relabelled_as_missing_package() -> None:
+    result = _run_isolated_import("""
+        import builtins
+
+        real_import = builtins.__import__
+        def incompatible_fastmcp(name, *args, **kwargs):
+            if name == "fastmcp":
+                raise ImportError("cannot import name 'Context' from 'fastmcp'")
+            return real_import(name, *args, **kwargs)
+        builtins.__import__ = incompatible_fastmcp
+
+        import meta_ads_mcp.stdio
+    """)
+    assert result.returncode != 0
+    assert "ImportError: cannot import name 'Context' from 'fastmcp'" in result.stderr
+    assert "FastMCP is required" not in result.stderr
 
 
 def test_fastmcp_347_search_transform_is_configured() -> None:

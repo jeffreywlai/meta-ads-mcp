@@ -46,7 +46,7 @@ def get_settings() -> Settings:
         raise ValueError("META_READ_ONLY must be true, false, 1, or 0.")
     return Settings(
         access_token=os.getenv("META_ACCESS_TOKEN"),
-        api_version=os.getenv("META_API_VERSION", "v25.0"),
+        api_version=os.getenv("META_API_VERSION", "v26.0"),
         default_account_id=os.getenv("META_DEFAULT_ACCOUNT_ID"),
         app_id=os.getenv("META_APP_ID"),
         app_secret=os.getenv("META_APP_SECRET"),

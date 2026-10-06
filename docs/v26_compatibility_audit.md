@@ -1,25 +1,28 @@
 # Marketing API v26 compatibility audit
 
-Audit date: 2026-08-13
+Audit date: 2026-10-05 (original v26 gate: 2026-08-13)
 
 ## Gate status
 
-- Static SDK schema audit: **PASS**
-- Read-only v26 live smoke tests: **PASS — 3 passed, 0 skipped on 2026-08-13**
+- Static SDK schema audit: **PASS — all 21 default projections against SDK 26.0.2**
+- Required read-only v26 live smoke tests: **PASS — 4 core/filter/native tests**
+- Optional SDK field probes: **2 accepted; 2 unavailable to the tested account/token**
+- Combined current live run: **6 passed, 2 explicitly skipped on 2026-10-05**
 - Native optimization signals: **IMPLEMENTED — version-gated to v26+**
 
-The repository still defaults to `v25.0`. Native optimization reads and the
-opt-in Instagram profile-follow metric require `META_API_VERSION=v26.0` or
-newer and fail early on v25.
+The repository now defaults to `v26.0`. An explicit `META_API_VERSION` override
+still wins. Native optimization reads and the opt-in Instagram profile-follow
+metric fail early when an override selects v25. No account configuration,
+campaign, ad set, ad, creative, budget, or optimization enrollment was changed.
 
 ## Authoritative baseline
 
 The audit compares generated field schemas in Meta's official Python Business
-SDK tags `25.0.3` and `26.0.0`. The v26 SDK configuration declares Graph API
-`v26.0` and SDK `v26.0.0`.
+SDK tags `25.0.3` and `26.0.2`. The target configuration declares Graph API
+`v26.0` and SDK `v26.0.2`; a package patch version is not an API version.
 
-- [Meta Business SDK v26.0.0 release](https://github.com/facebook/facebook-python-business-sdk/releases/tag/26.0.0)
-- [v26 generated API configuration](https://github.com/facebook/facebook-python-business-sdk/blob/26.0.0/facebook_business/apiconfig.py)
+- [Meta Business SDK 26.0.2 release](https://github.com/facebook/facebook-python-business-sdk/releases/tag/26.0.2)
+- [v26 generated API configuration](https://github.com/facebook/facebook-python-business-sdk/blob/26.0.2/facebook_business/apiconfig.py)
 
 ## Static findings
 
@@ -52,6 +55,40 @@ surfaces are:
   MCP rejects `messenger_positions=story` for v26+ so requested delivery is not
   changed without notice.
 
+### SDK 26.0.2 additions
+
+- Native recommendation `recommendation_names` and `recommendation_stages`
+  filters are implemented through the existing broad and typed opportunity
+  tools, preserving pagination and category heuristics. Cache keys include API
+  version and both filters. Native stage codes remain opaque `MFR/PCR/PFR`.
+- New Insights metrics and six breakdowns use existing generic inputs; vendor
+  values are retained without invented metric semantics. The complete list is
+  available through `get_v26_notes` and its packaged resource.
+- Campaign reads now accept optional `fields` for SDK-advertised fields.
+  Defaults and currency handling remain unchanged.
+- Existing ad `fields`/create `params` carry dataset splits and audience
+  persona specs. Creative `fields`/create `params` carry media optimization,
+  and nested feature specs can carry video voiceover. No automatic enrollment
+  or broad new mutation tools were added.
+- SDK 26.0.2 removed 15 generated AdSet read-field entries, none present in
+  current default projections. Several similarly named write parameters remain
+  valid in generated mutation definitions; read-schema removal is not a reason
+  to reject all generic mutation params.
+
+### Live limits: schema presence is not API availability
+
+The configured account/token accepted `dataset_split_specs` on ads and
+`media_optimization_spec` on creatives. Two optional probes were unavailable:
+
+- Campaign `bid_constraints`: `(#100) Tried accessing nonexisting field (bid_constraints)`.
+- Ad `creative_audience_pairing_persona`: `(#100) Missing Permission`.
+
+Those fields stay opt-in and out of default reads. The optional probes skip
+only an explicit missing-field/permission response; other API errors fail.
+The passing core/filter/native gate is separate from these limitations.
+Custom-field fixture tests prove input/output preservation, not live entitlement,
+valid metric/breakdown combinations, or acceptance of new writes.
+
 The audit also found and corrected two stale local defaults that predated v26:
 
 - Instagram account discovery now requests the generated IGUser field
@@ -70,11 +107,13 @@ Clone or fetch the official SDK tags, then run:
 uv run audit-meta-sdk-schema \
   --sdk-repo /path/to/facebook-python-business-sdk \
   --base-ref 25.0.3 \
-  --target-ref 26.0.0
+  --target-ref 26.0.2
 ```
 
-The command exits nonzero if the v26 SDK configuration is unexpected or a
-local default field is absent from the target generated schema.
+The command exits nonzero if the requested `26.0.patch` release does not match
+the SDK configuration, the target API is not v26.0, or a local default field
+is absent. Explicit 26.0.0/26.0.1 releases remain supported. The static command
+does not execute or claim a current live validation gate.
 
 ## Live gate
 
@@ -83,6 +122,8 @@ The live probes are read-only and force `META_API_VERSION=v26.0`. They cover:
 1. Account, assigned-Page, campaign, ad-set, and ad default projections.
 2. The default synchronous Insights projection.
 3. The exposed campaign, ad-set, and ad native optimization tool contracts.
+4. Native recommendation name/stage filters on the eligible account.
+5. Four independently probed optional SDK fields (availability-dependent).
 
 Run them with the live read token and active account configured:
 
@@ -97,8 +138,10 @@ Required environment variables:
 - `META_LIVE_ACCESS_TOKEN_READ`
 - `META_LIVE_ACTIVE_ACCOUNT_ID`
 
-The 2026-08-13 gate completed with `3 passed, 0 skipped`. Keep this command as
-a release-regression gate for future Marketing API upgrades.
+The original 2026-08-13 gate completed with `3 passed, 0 skipped`. The current
+upgrade re-ran core/Insights/native reads and verified the native recommendation
+filters; optional field limitations are listed above. Keep this command as a
+release-regression gate and report skips separately from passing validation.
 
 ## Native signal surface
 

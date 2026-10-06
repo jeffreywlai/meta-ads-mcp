@@ -6,6 +6,10 @@ from typing import Annotated, Any, TypeAlias
 
 from pydantic import BeforeValidator
 
+from meta_ads_mcp.api_compat import is_api_version_at_least
+from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.errors import ValidationError
+
 
 def coerce_csv_string_list(value: Any) -> Any:
     """Accept a list or a top-level comma-separated Graph field expression."""
@@ -70,6 +74,45 @@ StrictStringList: TypeAlias = Annotated[
 
 # Graph fields use the same top-level CSV grammar, including nested field expressions.
 FieldList: TypeAlias = StringList
+
+
+def normalize_recommendation_filters(
+    recommendation_names: StrictStringList | str | None,
+    recommendation_stages: StrictStringList | str | None,
+    *,
+    api_version: str | None = None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Validate native filters consistently for MCP and direct Python calls."""
+    filters: list[list[str] | None] = []
+    for parameter, value in (
+        ("recommendation_names", recommendation_names),
+        ("recommendation_stages", recommendation_stages),
+    ):
+        if value is None:
+            filters.append(None)
+            continue
+        normalized = coerce_strict_csv_string_list(value)
+        if not isinstance(normalized, list) or any(
+            not isinstance(item, str) or not item.strip() for item in normalized
+        ):
+            raise ValidationError(
+                f"{parameter} must be a list of nonblank strings or a comma-separated string."
+            )
+        normalized = [item.strip() for item in normalized]
+        if parameter == "recommendation_stages" and any(
+            stage not in {"MFR", "PCR", "PFR"} for stage in normalized
+        ):
+            raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
+        filters.append(normalized)
+    if any(value is not None for value in filters):
+        api_version = get_settings().api_version if api_version is None else api_version
+        if not is_api_version_at_least((26, 0), api_version=api_version):
+            raise ValidationError(
+                "recommendation_names and recommendation_stages require "
+                "META_API_VERSION=v26.0 or newer; "
+                f"the configured version is {api_version!r}."
+            )
+    return filters[0], filters[1]
 
 
 def normalize_field_list(value: FieldList | str | None) -> list[str] | None:

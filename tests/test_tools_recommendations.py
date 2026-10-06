@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
-from meta_ads_mcp.tools import recommendations
+import pytest
+from fastmcp.exceptions import ToolError, ValidationError as FastMCPValidationError
+
+from meta_ads_mcp import stdio  # noqa: F401 - registers discovery and proxy tools
+from meta_ads_mcp.config import reload_settings
+from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.tools import recommendations, utility
 
 
 class FakeRecommendationsClient:
@@ -273,7 +280,7 @@ def test_recommendation_cache_prunes_expired_and_caps_live_entries(
 
     for index in range(recommendations._RECOMMENDATION_CACHE_MAX_ENTRIES + 20):
         recommendations._store_cached_recommendations(
-            ("token", "act_123", "", 25, f"cursor_{index}"),
+            ("token", "v26.0", "act_123", "", 25, f"cursor_{index}", None, None),
             payload,
         )
 
@@ -283,9 +290,246 @@ def test_recommendation_cache_prunes_expired_and_caps_live_entries(
     )
     now += recommendations._RECOMMENDATION_CACHE_TTL_SECONDS + 1
     recommendations._store_cached_recommendations(
-        ("token", "act_123", "", 25, "fresh"),
+        ("token", "v26.0", "act_123", "", 25, "fresh", None, None),
         payload,
     )
     assert list(recommendations._RECOMMENDATION_CACHE) == [
-        ("token", "act_123", "", 25, "fresh")
+        ("token", "v26.0", "act_123", "", 25, "fresh", None, None)
     ]
+
+
+RECOMMENDATION_TOOLS = (
+    "get_recommendations",
+    "get_budget_opportunities",
+    "get_creative_opportunities",
+    "get_audience_opportunities",
+    "get_delivery_opportunities",
+    "get_bidding_opportunities",
+)
+
+
+@pytest.mark.parametrize("tool_name", RECOMMENDATION_TOOLS)
+def test_recommendation_tools_forward_native_filters_without_mapping_categories(
+    monkeypatch, tool_name,
+) -> None:
+    requests = []
+
+    class FilteredClient:
+        async def get_recommendations(self, account_id, **kwargs):
+            requests.append((account_id, kwargs))
+            return {
+                "data": [{"id": "rec_1", "message": "budget creative audience delivery bidding"}],
+                "paging": {"next": "next", "cursors": {"after": "NEXT"}},
+            }
+
+    recommendations._RECOMMENDATION_CACHE.clear()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: FilteredClient())
+    result = asyncio.run(getattr(recommendations, tool_name)(
+        account_id="123", campaign_id="cmp_1", limit=10, after=" PAGE ",
+        recommendation_names=" FUTURE_META_RECOMMENDATION, BUDGET_LIMITED ",
+        recommendation_stages=" MFR, PCR, PFR ",
+    ))
+
+    assert requests == [("act_123", {
+        "campaign_id": "cmp_1", "limit": 10, "after": "PAGE",
+        "recommendation_names": ["FUTURE_META_RECOMMENDATION", "BUDGET_LIMITED"],
+        "recommendation_stages": ["MFR", "PCR", "PFR"],
+    })]
+    assert result["items"][0]["id"] == "rec_1"
+    assert result["paging"]["after"] == "NEXT"
+    assert result["complete"] is False
+
+
+@pytest.mark.parametrize("unsupported", [False, True])
+@pytest.mark.parametrize("dimension", [
+    "account_id", "campaign_id", "limit", "after", "recommendation_names",
+    "recommendation_stages", "api_version", "access_token",
+])
+def test_recommendation_cache_is_scoped_to_every_request_context(
+    monkeypatch, dimension, unsupported,
+) -> None:
+    calls = []
+    settings = SimpleNamespace(access_token="test-token-a", api_version="v26.0")
+    monkeypatch.setattr(recommendations, "get_settings", lambda: settings)
+
+    class CacheClient:
+        async def get_recommendations(self, account_id, **kwargs):
+            calls.append((account_id, kwargs))
+            if unsupported:
+                raise recommendations.UnsupportedFeatureError("unsupported")
+            return {"data": [{"id": f"rec_{len(calls)}", "message": "Increase budget"}]}
+
+    recommendations._RECOMMENDATION_CACHE.clear()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: CacheClient())
+    options = {
+        "account_id": "123", "campaign_id": "cmp_1", "limit": 10, "after": "PAGE_A",
+        "recommendation_names": ["BUDGET_LIMITED"], "recommendation_stages": ["MFR"],
+    }
+    first = asyncio.run(recommendations.get_recommendations(**options))
+    assert asyncio.run(recommendations.get_recommendations(**options)) == first
+    assert len(calls) == 1
+    alternate = {
+        "account_id": "456", "campaign_id": "cmp_2", "limit": 20, "after": "PAGE_B",
+        "recommendation_names": ["AB_TEST"], "recommendation_stages": ["PCR"],
+        "api_version": "v27.0", "access_token": "test-token-b",
+    }[dimension]
+    if dimension in {"api_version", "access_token"}:
+        setattr(settings, dimension, alternate)
+    else:
+        options[dimension] = alternate
+    second = asyncio.run(recommendations.get_recommendations(**options))
+    assert second["supported"] is not unsupported
+    assert asyncio.run(recommendations.get_recommendations(**options)) == second
+    assert len(calls) == 2
+
+
+def test_native_filters_do_not_reuse_unfiltered_or_explicit_empty_filter_cache(monkeypatch) -> None:
+    calls = []
+
+    class FilterClient:
+        async def get_recommendations(self, account_id, **kwargs):
+            calls.append(kwargs)
+            return {"data": []}
+
+    recommendations._RECOMMENDATION_CACHE.clear()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: FilterClient())
+    for options in (
+        {}, {"recommendation_names": ["BUDGET_LIMITED"]},
+        {"recommendation_stages": ["MFR"]}, {"recommendation_names": []},
+        {"recommendation_stages": []},
+    ):
+        asyncio.run(recommendations.get_recommendations(account_id="123", **options))
+        asyncio.run(recommendations.get_recommendations(account_id="123", **options))
+    assert calls == [
+        {"campaign_id": None},
+        {"campaign_id": None, "recommendation_names": ["BUDGET_LIMITED"]},
+        {"campaign_id": None, "recommendation_stages": ["MFR"]},
+        {"campaign_id": None, "recommendation_names": []},
+        {"campaign_id": None, "recommendation_stages": []},
+    ]
+
+
+@pytest.mark.parametrize("options, expected_message", [
+    ({"recommendation_names": [""]}, "nonblank strings"),
+    ({"recommendation_names": "BUDGET_LIMITED,,AB_TEST"}, "nonblank strings"),
+    ({"recommendation_names": " "}, "nonblank strings"),
+    ({"recommendation_names": [123]}, "nonblank strings"),
+    ({"recommendation_names": {"name": "AB_TEST"}}, "nonblank strings"),
+    ({"recommendation_stages": ["MFR", "unknown"]}, "MFR, PCR, or PFR"),
+    ({"recommendation_stages": "mfr"}, "MFR, PCR, or PFR"),
+    ({"recommendation_stages": "MFR,"}, "nonblank strings"),
+])
+def test_native_recommendation_filters_reject_invalid_direct_input_before_client(
+    monkeypatch, options, expected_message,
+) -> None:
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: pytest.fail("client created"))
+    with pytest.raises(recommendations.ValidationError, match=expected_message):
+        asyncio.run(recommendations.get_recommendations(account_id="123", **options))
+
+
+@pytest.mark.parametrize("tool_name", RECOMMENDATION_TOOLS)
+@pytest.mark.parametrize("routed", [False, True])
+def test_native_recommendation_filters_work_through_mcp_coercion(monkeypatch, tool_name, routed) -> None:
+    requests = []
+
+    class FilterClient:
+        async def get_recommendations(self, account_id, **kwargs):
+            requests.append(kwargs)
+            return {"data": []}
+
+    recommendations._RECOMMENDATION_CACHE.clear()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: FilterClient())
+    arguments = {
+        "account_id": "123", "recommendation_names": " BUDGET_LIMITED, AB_TEST ",
+        "recommendation_stages": " MFR, PCR ",
+    }
+    result = asyncio.run(mcp_server.call_tool(
+        "call_tool" if routed else tool_name,
+        {"name": tool_name, "arguments": arguments} if routed else arguments,
+    ))
+    assert result.structured_content["supported"] is True
+    assert requests == [{
+        "campaign_id": None, "recommendation_names": ["BUDGET_LIMITED", "AB_TEST"],
+        "recommendation_stages": ["MFR", "PCR"],
+    }]
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("options", [
+    {"recommendation_names": "BUDGET_LIMITED,,AB_TEST"},
+    {"recommendation_names": [123]},
+    {"recommendation_stages": "UNKNOWN"},
+])
+def test_invalid_native_recommendation_filters_fail_through_mcp_before_client(
+    monkeypatch, routed, options,
+) -> None:
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: pytest.fail("client created"))
+    arguments = {"account_id": "123", **options}
+    with pytest.raises((ToolError, FastMCPValidationError)):
+        asyncio.run(mcp_server.call_tool(
+            "call_tool" if routed else "get_recommendations",
+            {"name": "get_recommendations", "arguments": arguments} if routed else arguments,
+        ))
+
+
+@pytest.mark.parametrize("tool_name", RECOMMENDATION_TOOLS)
+def test_recommendation_filter_schemas_and_search_are_discoverable(tool_name) -> None:
+    capabilities = asyncio.run(utility.get_capabilities(tool_name=tool_name))
+    tool = capabilities["tool"]
+    properties = tool["input_schema"]["properties"]
+    for parameter in ("recommendation_names", "recommendation_stages"):
+        assert properties[parameter]["default"] is None
+        assert {part.get("type") for part in properties[parameter]["anyOf"]} == {
+            "string", "array", "null",
+        }
+    assert "MFR/PCR/PFR" in tool["description"]
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": tool_name}))
+    text = "\n".join(content.text for content in result.content if content.type == "text")
+    assert "recommendation_names" in text
+    assert "recommendation_stages" in text
+
+
+@pytest.mark.parametrize("tool_name", RECOMMENDATION_TOOLS)
+@pytest.mark.parametrize("options", [
+    {"recommendation_names": ["FRAGMENTATION"]},
+    {"recommendation_stages": "PCR"},
+    {"recommendation_names": []},
+    {"recommendation_stages": []},
+])
+def test_native_filters_require_v26_before_scope_cache_or_client(monkeypatch, tool_name, options) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    monkeypatch.setattr(recommendations, "_resolve_account_id", lambda *_: pytest.fail("scope resolved"))
+    monkeypatch.setattr(recommendations, "_get_cached_recommendations", lambda *_: pytest.fail("cache checked"))
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: pytest.fail("client created"))
+    with pytest.raises(recommendations.ValidationError, match="require META_API_VERSION=v26.0"):
+        asyncio.run(getattr(recommendations, tool_name)(**options))
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("parameter", ["recommendation_names", "recommendation_stages"])
+def test_native_filter_version_error_is_exposed_through_mcp(monkeypatch, routed, parameter) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: pytest.fail("client created"))
+    value = "FRAGMENTATION" if parameter == "recommendation_names" else "PCR"
+    arguments = {"account_id": "123", parameter: value}
+    with pytest.raises(ToolError, match="require META_API_VERSION=v26.0"):
+        asyncio.run(mcp_server.call_tool(
+            "call_tool" if routed else "get_recommendations",
+            {"name": "get_recommendations", "arguments": arguments} if routed else arguments,
+        ))
+
+
+@pytest.mark.parametrize("tool_name", RECOMMENDATION_TOOLS)
+def test_unfiltered_recommendations_remain_available_on_v25(monkeypatch, tool_name) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
+    recommendations._RECOMMENDATION_CACHE.clear()
+    client = FakeRecommendationsClient()
+    monkeypatch.setattr(recommendations, "get_graph_api_client", lambda: client)
+    result = asyncio.run(getattr(recommendations, tool_name)(
+        account_id="123", recommendation_names=None, recommendation_stages=None,
+    ))
+    assert result["supported"] is True
+    assert client.calls == 1

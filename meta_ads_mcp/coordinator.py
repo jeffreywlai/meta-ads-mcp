@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from types import SimpleNamespace
+from collections.abc import Sequence
 from typing import Annotated, Any
 
 from meta_ads_mcp.config import get_settings
@@ -21,119 +20,26 @@ from meta_ads_mcp.tool_contracts import ToolContract, build_tool_contracts
 
 try:
     from fastmcp import Context, FastMCP
-    from fastmcp.server.transforms.search import BM25SearchTransform
-    from fastmcp.tools.tool import Tool, ToolResult
+except ModuleNotFoundError as exc:
+    if exc.name != "fastmcp":
+        raise
+    raise ImportError(
+        "FastMCP is required to run Meta Ads MCP. "
+        "Install the project dependencies with `uv sync` before starting the server."
+    ) from exc
 
-    from meta_ads_mcp.error_middleware import (
-        StructuredMetaErrorMiddleware,
-        ToolParameterHelpMiddleware,
-    )
-    from meta_ads_mcp.read_only import ReadOnlyAdvertisingMiddleware
-    from meta_ads_mcp.overflow import (
-        ArchivedResponseLimitingMiddleware,
-        OverflowArtifactStore,
-    )
-except ImportError:  # pragma: no cover - fallback for tests without the package
-    Context = Any
-    Tool = Any
-    ToolResult = Any
+from fastmcp.server.transforms.search import BM25SearchTransform
+from fastmcp.tools.tool import Tool, ToolResult
 
-    class StructuredMetaErrorMiddleware:  # type: ignore[override]
-        """Minimal local fallback for tests without FastMCP."""
-
-    class ToolParameterHelpMiddleware:  # type: ignore[override]
-        """Minimal local fallback for tests without FastMCP."""
-
-    class ReadOnlyAdvertisingMiddleware:  # type: ignore[override]
-        """Minimal local fallback for tests without FastMCP."""
-
-    class OverflowArtifactStore:  # type: ignore[override]
-        """Minimal local fallback for tests without FastMCP."""
-
-        def __init__(self, export_directory: str | None = None, **_: Any) -> None:
-            self.export_directory = export_directory
-
-        def read(self, *_: Any, **__: Any) -> dict[str, Any]:
-            raise RuntimeError("fastmcp is not installed.")
-
-        def delete(self, *_: Any, **__: Any) -> dict[str, Any]:
-            raise RuntimeError("fastmcp is not installed.")
-
-    class ArchivedResponseLimitingMiddleware:  # type: ignore[override]
-        """Minimal local fallback for tests without FastMCP."""
-
-        def __init__(self, *, max_size: int, truncation_suffix: str, artifact_store: Any) -> None:
-            self.max_size = max_size
-            self.truncation_suffix = truncation_suffix
-            self.artifact_store = artifact_store
-
-    class BM25SearchTransform:  # type: ignore[override]
-        """Minimal local fallback for the FastMCP 3.4.7 search transform."""
-
-        def __init__(
-            self,
-            *,
-            max_results: int = 5,
-            always_visible: list[str] | None = None,
-            search_tool_name: str = "search_tools",
-            call_tool_name: str = "call_tool",
-            search_result_serializer: Callable[..., Any] | None = None,
-        ) -> None:
-            self.max_results = max_results
-            self._max_results = max_results
-            self.always_visible = always_visible or []
-            self.search_tool_name = search_tool_name
-            self.call_tool_name = call_tool_name
-            self.search_result_serializer = search_result_serializer
-
-    class FastMCP:  # type: ignore[override]
-        """Minimal local fallback used only when fastmcp is unavailable."""
-
-        def __init__(
-            self,
-            name: str,
-            instructions: str | None = None,
-            version: str | None = None,
-            mask_error_details: bool = False,
-            transforms: list[Any] | None = None,
-            **_: Any,
-        ) -> None:
-            self.name = name
-            self.instructions = instructions
-            self.version = version
-            self.mask_error_details = mask_error_details
-            self._tools: dict[str, Callable[..., Any]] = {}
-            self._resources: dict[str, Callable[..., Any]] = {}
-            self.transforms = list(transforms or [])
-            self._transforms = list(transforms or [])
-
-        def tool(self, name: str | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-            def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-                self._tools[name or fn.__name__] = fn
-                return fn
-
-            return decorator
-
-        def resource(self, uri: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-            def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-                self._resources[uri] = fn
-                return fn
-
-            return decorator
-
-        def add_transform(self, transform: Any) -> None:
-            self.transforms.append(transform)
-            self._transforms.append(transform)
-
-        def add_middleware(self, middleware: Any) -> None:
-            self.middleware = [*getattr(self, "middleware", []), middleware]
-
-        async def list_tools(self, *, run_middleware: bool = True) -> list[Any]:
-            _ = run_middleware
-            return [SimpleNamespace(name=name) for name in self._tools]
-
-        def run(self, *args: Any, **kwargs: Any) -> None:
-            raise RuntimeError("fastmcp is not installed in this environment.")
+from meta_ads_mcp.error_middleware import (
+    StructuredMetaErrorMiddleware,
+    ToolParameterHelpMiddleware,
+)
+from meta_ads_mcp.read_only import ReadOnlyAdvertisingMiddleware
+from meta_ads_mcp.overflow import (
+    ArchivedResponseLimitingMiddleware,
+    OverflowArtifactStore,
+)
 
 
 class IntentAwareBM25SearchTransform(BM25SearchTransform):

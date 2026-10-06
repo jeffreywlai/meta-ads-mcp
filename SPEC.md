@@ -10,10 +10,10 @@ It is an optimization-first tool: it should prioritize API calls and derived
 analysis that help an LLM understand what is happening in an ad account,
 diagnose performance problems, and recommend changes with evidence.
 
-As of August 12, 2026, the implementation baseline is:
+As of October 5, 2026, the implementation baseline is:
 
-- Meta Marketing API `v25.0`
-- FastMCP latest stable `3.4.7`
+- Meta Marketing API `v26.0`, audited against Business SDK `26.0.2`
+- FastMCP pinned at `3.4.7`
 - Python `3.12+`
 
 FastMCP `3.4.7` is the stable target and should be used with tool-search
@@ -27,8 +27,8 @@ transforms enabled to reduce upfront tool-context usage in compatible clients.
   and budgets.
 - Return structured JSON-native objects, not pre-serialized JSON strings.
 - Keep the architecture small, modular, and testable.
-- Use Marketing API `v25.0` and leave room for v25-era recommendation and
-  optimization surfaces.
+- Use Marketing API `v26.0` with native recommendation filters and existing
+  optimization surfaces; preserve an explicit API-version override.
 
 ## Non-Goals
 
@@ -107,7 +107,7 @@ and covered by catalog-wide contract tests rather than repeated inside tools.
 - Runtime: Python `3.12+`
 - Framework: FastMCP stable `3.4.7`
 - Protocol: MCP over `stdio` first, HTTP second
-- Upstream API: Meta Marketing API `v25.0`
+- Upstream API: Meta Marketing API `v26.0`
 - HTTP client: `httpx.AsyncClient`
 - Validation/models: `pydantic>=2`
 - Testing: `pytest`, `pytest-asyncio`
@@ -132,7 +132,7 @@ Required env vars:
 
 Optional env vars:
 
-- `META_API_VERSION` default `v25.0`
+- `META_API_VERSION` default `v26.0`
 - `META_DEFAULT_ACCOUNT_ID`
 - `META_APP_ID`
 - `META_APP_SECRET`
@@ -193,6 +193,7 @@ meta_ads_mcp/
 │       ├── object_model.md
 │       ├── insights_metrics.md
 │       ├── v25_notes.md
+│       ├── v26_notes.md
 │       └── optimization_playbook.md
 └── tests/
     ├── test_stdio.py
@@ -465,6 +466,7 @@ These are the core v1 tools.
 - `get_metrics_reference`
 - `get_meta_object_model`
 - `get_v25_notes`
+- `get_v26_notes`
 - `get_optimization_playbook`
 
 ### Group G: Controlled Execution
@@ -536,6 +538,7 @@ Inputs:
 - `name_contains`
 - `limit`
 - `after`
+- optional `fields` (list or CSV; defaults unchanged)
 
 Output:
 
@@ -550,6 +553,7 @@ Fetch campaign details relevant to optimization.
 Inputs:
 
 - `campaign_id`
+- optional `fields` (list or CSV; budget reads retain the account currency dependency)
 
 Output:
 
@@ -1292,6 +1296,9 @@ Inputs:
 
 - `account_id` or compatibility alias `object_id`
 - optional `campaign_id`
+- optional `recommendation_names` and `recommendation_stages` (lists or CSV;
+  stage codes `MFR`, `PCR`, `PFR`; providing either requires v26+), also
+  supported by typed opportunity tools
 
 Output:
 
@@ -1316,6 +1323,12 @@ relationships.
 Purpose:
 Provide curated notes on supported v25-specific behavior, deprecations, and
 implementation caveats.
+
+### `get_v26_notes`
+
+Purpose:
+Provide current v26 capabilities, native recommendation filters, new generic
+field/breakdown inputs, and migration caveats without duplicating API tools.
 
 ### `get_optimization_playbook`
 
@@ -1462,7 +1475,7 @@ The implementation should spend most of its effort on these Meta surfaces:
 - targeting search
 - reach estimate
 - reach frequency predictions
-- recommendation / opportunity surfaces where exposed in v25-era accounts
+- recommendation / opportunity surfaces where exposed in eligible accounts
 
 The implementation should spend less effort on:
 
@@ -1478,6 +1491,7 @@ The server should expose read-only resources for LLM grounding:
 - `meta://docs/object-model`
 - `meta://docs/insights-metrics`
 - `meta://docs/v25-notes`
+- `meta://docs/v26-notes`
 - `meta://docs/optimization-playbook`
 
 ## Packaging
@@ -1550,7 +1564,7 @@ Suggested console script:
 - recommendation / opportunity tools
 - narrow execution tools
 - optional HTTP hardening
-- broader v25 support where justified
+- broader v26 support where justified
 
 ## Open Decisions
 
@@ -1564,7 +1578,7 @@ Suggested console script:
 
 These assumptions should be re-verified immediately before implementation:
 
-- Meta Marketing API target version is `v25.0`
+- Meta Marketing API target version is `v26.0` (SDK `26.0.2`)
 - FastMCP latest stable is `3.4.7` as of August 12, 2026
 
 ## Source Notes

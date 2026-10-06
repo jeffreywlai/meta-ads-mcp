@@ -9,6 +9,7 @@ from meta_ads_mcp.api_compat import (
     validate_insights_fields,
     validate_targeting_placements,
 )
+from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.errors import ValidationError
 
 
@@ -20,10 +21,21 @@ from meta_ads_mcp.errors import ValidationError
         ("v26.0", True),
         ("v27.0", True),
         ("latest", False),
+        ("", False),
+        (" ", False),
+        ("\t\n", False),
     ],
 )
 def test_is_api_version_at_least_v26(api_version: str, expected: bool) -> None:
     assert is_api_version_at_least((26, 0), api_version=api_version) is expected
+
+
+@pytest.mark.parametrize("api_version, expected", [("v25.0", False), ("v26.0", True)])
+def test_omitted_api_version_uses_process_settings(monkeypatch, api_version, expected) -> None:
+    monkeypatch.setenv("META_API_VERSION", api_version)
+    reload_settings()
+    assert is_api_version_at_least((26, 0)) is expected
+    assert is_api_version_at_least((26, 0), api_version=None) is expected
 
 
 @pytest.mark.parametrize(
@@ -86,7 +98,7 @@ def test_validate_insights_fields_preserves_v25_behavior() -> None:
     )
 
 
-@pytest.mark.parametrize("api_version", ["v25.0", "latest"])
+@pytest.mark.parametrize("api_version", ["v25.0", "latest", "", " ", "\t\n"])
 def test_instagram_profile_follow_requires_v26(api_version: str) -> None:
     with pytest.raises(ValidationError, match="instagram_profile_follow requires META_API_VERSION=v26.0"):
         validate_insights_fields(

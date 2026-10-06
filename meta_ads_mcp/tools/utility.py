@@ -135,6 +135,7 @@ TOOL_GROUPS = {
         "get_meta_object_model",
         "get_metrics_reference",
         "get_v25_notes",
+        "get_v26_notes",
         "get_optimization_playbook",
     ],
     "utility": [
@@ -150,6 +151,7 @@ RESOURCE_URIS = [
     "meta://docs/object-model",
     "meta://docs/insights-metrics",
     "meta://docs/v25-notes",
+    "meta://docs/v26-notes",
     "meta://docs/optimization-playbook",
     "meta://docs/tool-routing",
 ]

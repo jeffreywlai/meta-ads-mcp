@@ -7,6 +7,18 @@ import pytest
 from meta_ads_mcp import config
 
 
+def test_api_version_defaults_to_v26(monkeypatch) -> None:
+    monkeypatch.delenv("META_API_VERSION", raising=False)
+
+    assert config.reload_settings().api_version == "v26.0"
+
+
+def test_api_version_preserves_explicit_override(monkeypatch) -> None:
+    monkeypatch.setenv("META_API_VERSION", "v25.0")
+
+    assert config.reload_settings().api_version == "v25.0"
+
+
 @pytest.mark.parametrize(("contents", "variable", "attribute", "expected"), [
     ("\ufeffMETA_ACCESS_TOKEN=test-bom-token\n", "META_ACCESS_TOKEN", "access_token", "test-bom-token"),
     ("META_APP_SECRET= # intentionally unset\n", "META_APP_SECRET", "app_secret", ""),
