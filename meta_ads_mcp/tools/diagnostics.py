@@ -355,6 +355,10 @@ def _fatigue_windows(
     previous_window_days: int,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Resolve current and previous windows for fatigue analysis."""
+    since = blank_to_none(since)
+    until = blank_to_none(until)
+    previous_since = blank_to_none(previous_since)
+    previous_until = blank_to_none(previous_until)
     if any(value is not None for value in (since, until, previous_since, previous_until)):
         if not since or not until:
             raise ValidationError("Provide both since and until for explicit fatigue windows.")

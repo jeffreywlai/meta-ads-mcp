@@ -467,6 +467,15 @@ def test_list_page_recommendations_normalizes_page_id(monkeypatch) -> None:
     assert client.list_calls[0][0] == "page_1"
 
 
+@pytest.mark.parametrize("after", [None, "", " ", "\t\n"])
+def test_list_page_recommendations_omits_blank_cursor(monkeypatch, after) -> None:
+    client = FakeSocialClient()
+    monkeypatch.setattr(social_feedback, "get_graph_api_client", lambda: client)
+    result = asyncio.run(social_feedback.list_page_recommendations("page_1", after=after))
+    assert result["summary"]["api_calls"] == 1
+    assert client.list_calls[0][3] == {"limit": 25}
+
+
 def test_list_page_recommendations_rejects_blank_page_id() -> None:
     with pytest.raises(social_feedback.ValidationError, match="page_id is required"):
         asyncio.run(social_feedback.list_page_recommendations(" "))
