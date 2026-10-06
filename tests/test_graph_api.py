@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pytest
 
 from meta_ads_mcp.auth import build_appsecret_proof
-from meta_ads_mcp.config import Settings
+from meta_ads_mcp.config import Settings, reload_settings
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import (
     _CLIENT_POOL,
@@ -346,7 +346,7 @@ def test_recommendations_serialize_native_filters_without_changing_unfiltered_de
         assert params == {"limit": 25}
 
 
-@pytest.mark.parametrize("api_version", ["v25.0", "latest"])
+@pytest.mark.parametrize("api_version", ["v25.0", "latest", "", " ", "\t\n"])
 @pytest.mark.parametrize("options", [
     {"recommendation_names": ["FRAGMENTATION"]},
     {"recommendation_stages": "PCR"},
@@ -356,6 +356,7 @@ def test_recommendations_serialize_native_filters_without_changing_unfiltered_de
 def test_recommendation_filters_use_client_api_version_before_request(monkeypatch, api_version, options) -> None:
     # A direct client's settings, not the process default, determine its API contract.
     monkeypatch.setenv("META_API_VERSION", "v27.0")
+    reload_settings()
 
     async def unexpected_request(*args, **kwargs):
         pytest.fail("request should not be made")
@@ -368,6 +369,7 @@ def test_recommendation_filters_use_client_api_version_before_request(monkeypatc
 @pytest.mark.parametrize("api_version", ["v26.0", "v27.0"])
 def test_recommendation_filters_accept_supported_client_versions(monkeypatch, api_version) -> None:
     monkeypatch.setenv("META_API_VERSION", "v25.0")
+    reload_settings()
     FakeAsyncClient.responses = deque([FakeResponse(200, {"data": []})])
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     asyncio.run(_client(api_version=api_version).get_recommendations(

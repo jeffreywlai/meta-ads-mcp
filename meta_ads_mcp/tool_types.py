@@ -105,7 +105,7 @@ def normalize_recommendation_filters(
             raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
         filters.append(normalized)
     if any(value is not None for value in filters):
-        api_version = api_version or get_settings().api_version
+        api_version = get_settings().api_version if api_version is None else api_version
         if not is_api_version_at_least((26, 0), api_version=api_version):
             raise ValidationError(
                 "recommendation_names and recommendation_stages require "
