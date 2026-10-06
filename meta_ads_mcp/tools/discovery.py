@@ -243,8 +243,10 @@ async def list_campaigns(
     name_contains: str | None = None,
     limit: int = 50,
     after: str | None = None,
+    fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """Discover campaign names and ids, with server-side name containment and status filters."""
+    """Discover campaigns with selectable fields, server-side name containment, and status filters. Meta validates optional field availability."""
+    requested_fields = normalize_field_list(fields) or CAMPAIGN_FIELDS
     client = get_graph_api_client()
     account_id = blank_to_none(account_id)
     resolved_account_id = _resolve_account_id(account_id)
@@ -258,7 +260,7 @@ async def list_campaigns(
     payload = await client.list_objects(
         resolved_account_id,
         "campaigns",
-        fields=CAMPAIGN_FIELDS,
+        fields=requested_fields,
         params=params,
     )
     normalized = normalize_collection(payload)
@@ -274,10 +276,13 @@ async def list_campaigns(
 
 
 @mcp_server.tool()
-async def get_campaign(campaign_id: str) -> dict[str, Any]:
-    """Use this when the user already has a campaign id and wants the current campaign configuration."""
+async def get_campaign(campaign_id: str, fields: FieldList | None = None) -> dict[str, Any]:
+    """Inspect one campaign's configuration with optional fields. Meta validates field availability."""
+    requested_fields = list(normalize_field_list(fields) or CAMPAIGN_FIELDS)
+    if {"daily_budget", "lifetime_budget"}.intersection(requested_fields) and "account_id" not in requested_fields:
+        requested_fields.append("account_id")
     client = get_graph_api_client()
-    campaign = await client.get_object(campaign_id, fields=CAMPAIGN_FIELDS)
+    campaign = await client.get_object(campaign_id, fields=requested_fields)
     return {
         "item": (await _hydrate_and_normalize_monetary_fields(client, [campaign]))[0],
         "summary": {"count": 1},

@@ -6,13 +6,13 @@ import argparse
 import ast
 import json
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
 DEFAULT_BASE_REF = "25.0.3"
-DEFAULT_TARGET_REF = "26.0.0"
+DEFAULT_TARGET_REF = "26.0.2"
 EXPECTED_API_VERSION = "v26.0"
-EXPECTED_SDK_VERSION = "v26.0.0"
 
 SDK_OBJECT_PATHS = {
     "adaccount": "facebook_business/adobjects/adaccount.py",
@@ -210,13 +210,14 @@ def audit_sdk_schema(
             "fields": candidates,
             "missing_in_target": missing,
             "schema_ready": not missing,
-            "live_smoke_required": False,
+            "live_smoke_required": True,
             "implemented": True,
         }
 
     config_compatible = (
-        target_config.get("API_VERSION") == EXPECTED_API_VERSION
-        and target_config.get("SDK_VERSION") == EXPECTED_SDK_VERSION
+        re.fullmatch(r"26\.0\.(?:0|[1-9][0-9]*)", target_ref) is not None
+        and target_config.get("API_VERSION") == EXPECTED_API_VERSION
+        and target_config.get("SDK_VERSION") == f"v{target_ref}"
     )
     return {
         "compatible": config_compatible and not missing_fields,
@@ -232,7 +233,8 @@ def audit_sdk_schema(
         "schema_changes": schema_changes,
         "optimization_candidates": optimization_candidates,
         "gate": {
-            "native_optimization_signals": "passed_and_implemented",
+            "native_optimization_signals": "implemented_after_prior_v26_live_smoke",
+            "current_live_validation": "not_run_by_static_audit",
         },
     }
 
@@ -271,7 +273,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "## Delivery gate",
             "",
-            "Native optimization signals were implemented after the dedicated v26 live smoke tests passed.",
+            "Native optimization signals were implemented after prior v26 live smoke tests passed.",
+            "This static schema audit does not run or verify live API tests for the target release.",
         ]
     )
     return "\n".join(lines)

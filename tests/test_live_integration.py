@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from meta_ads_mcp.config import reload_settings
-from meta_ads_mcp.errors import RateLimitError
+from meta_ads_mcp.errors import MetaApiError, RateLimitError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, resolve_account_currency
 from meta_ads_mcp.tools import (
@@ -179,6 +179,50 @@ def test_live_v26_insights_contract(monkeypatch: pytest.MonkeyPatch) -> None:
         or isinstance(row["instagram_profile_follow"], int)
         for row in result["items"]
     )
+
+
+@pytest.mark.v26_live
+def test_live_v26_recommendation_filter_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Meta accepts the native name and stage filters on an eligible account."""
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+    result = _run(recommendations.get_recommendations(
+        account_id=account_id, recommendation_names=["FRAGMENTATION"],
+        recommendation_stages=["PCR"], limit=1, refresh=True,
+    ))
+    if not result["supported"]:
+        pytest.skip("This account does not support the native recommendation surface.")
+    assert isinstance(result["items"], list)
+    assert "paging" in result
+
+
+@pytest.mark.v26_live
+@pytest.mark.parametrize(("surface", "field"), [
+    ("campaign", "bid_constraints"),
+    ("ad", "dataset_split_specs"),
+    ("ad", "creative_audience_pairing_persona"),
+    ("creative", "media_optimization_spec"),
+])
+def test_live_v26_optional_entity_field_contract(monkeypatch: pytest.MonkeyPatch, surface: str, field: str) -> None:
+    """Check opt-in SDK patch fields without changing default projections or ads."""
+    monkeypatch.setenv("META_API_VERSION", "v26.0")
+    _use_token(monkeypatch, "META_LIVE_ACCESS_TOKEN_READ")
+    account_id = _env("META_LIVE_ACTIVE_ACCOUNT_ID")
+    tool = {
+        "campaign": discovery.list_campaigns,
+        "ad": discovery.list_ads,
+        "creative": creatives.list_creatives,
+    }[surface]
+    try:
+        result = _run(tool(account_id=account_id, fields=["id", field], limit=1))
+    except MetaApiError as exc:
+        if exc.code == 100 and f"Tried accessing nonexisting field ({field})" in exc.message:
+            pytest.skip(f"SDK field {surface}.{field} is not exposed by this live API account.")
+        if exc.code in {10, 200} or (exc.code == 100 and "Missing Permission" in exc.message):
+            pytest.skip(f"SDK field {surface}.{field} requires permissions unavailable to the live token.")
+        raise
+    assert result["summary"]["count"] >= 0
 
 
 @pytest.mark.v26_live

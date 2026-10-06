@@ -24,7 +24,12 @@ from .errors import (
     UnsupportedFeatureError,
     ValidationError,
 )
-from .tool_types import FieldList, coerce_csv_string_list
+from .tool_types import (
+    FieldList,
+    StrictStringList,
+    coerce_csv_string_list,
+    normalize_recommendation_filters,
+)
 
 USER_AGENT = "meta-ads-fastmcp/0.1.0"
 _CLIENT_POOL: dict[tuple[asyncio.AbstractEventLoop, str, str | None, float], httpx.AsyncClient] = {}
@@ -636,14 +641,23 @@ class GraphAPIClient:
         campaign_id: str | None = None,
         limit: int = 25,
         after: str | None = None,
+        recommendation_names: StrictStringList | None = None,
+        recommendation_stages: StrictStringList | None = None,
     ) -> dict[str, Any]:
         """Fetch recommendation surfaces when available."""
+        recommendation_names, recommendation_stages = normalize_recommendation_filters(
+            recommendation_names, recommendation_stages
+        )
         cursor = _normalize_cursor(after)
         params: dict[str, Any] = {"limit": limit}
         if campaign_id:
             params["campaign_id"] = campaign_id
         if cursor:
             params["after"] = cursor
+        if recommendation_names is not None:
+            params["recommendation_names"] = recommendation_names
+        if recommendation_stages is not None:
+            params["recommendation_stages"] = recommendation_stages
         return await self.list_objects(
             normalize_account_id(account_id),
             "recommendations",

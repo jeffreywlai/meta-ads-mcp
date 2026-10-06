@@ -31,6 +31,12 @@ def resource_v25_notes() -> str:
     return _read_doc("v25_notes.md")
 
 
+@mcp_server.resource(uri="meta://docs/v26-notes")
+def resource_v26_notes() -> str:
+    """Return current v26 API capabilities and compatibility notes."""
+    return _read_doc("v26_notes.md")
+
+
 @mcp_server.resource(uri="meta://docs/optimization-playbook")
 def resource_optimization_playbook() -> str:
     """Return optimization playbook notes."""
@@ -59,6 +65,12 @@ async def get_metrics_reference() -> dict[str, str]:
 async def get_v25_notes() -> dict[str, str]:
     """Use this when Claude needs v25-specific implementation notes or deprecation guidance."""
     return {"name": "v25_notes", "content": _read_doc("v25_notes.md")}
+
+
+@mcp_server.tool()
+async def get_v26_notes() -> dict[str, str]:
+    """Use this for current v26 API fields, breakdowns, native recommendation filters, and migration guidance."""
+    return {"name": "v26_notes", "content": _read_doc("v26_notes.md")}
 
 
 @mcp_server.tool()

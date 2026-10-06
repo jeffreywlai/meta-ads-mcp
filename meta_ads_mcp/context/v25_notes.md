@@ -1,6 +1,7 @@
 # Marketing API v25 Notes
 
-- Build for v25.0 by default.
+- Historical v25 guidance: the MCP now defaults to v26.0. Select v25 explicitly
+  with `META_API_VERSION=v25.0` when these notes are needed.
 - Prefer unified, current campaign flows over deprecated legacy surfaces.
 - Treat recommendation and opportunity surfaces as version- and entitlement-
   sensitive.

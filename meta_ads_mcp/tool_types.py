@@ -6,6 +6,8 @@ from typing import Annotated, Any, TypeAlias
 
 from pydantic import BeforeValidator
 
+from meta_ads_mcp.errors import ValidationError
+
 
 def coerce_csv_string_list(value: Any) -> Any:
     """Accept a list or a top-level comma-separated Graph field expression."""
@@ -70,6 +72,35 @@ StrictStringList: TypeAlias = Annotated[
 
 # Graph fields use the same top-level CSV grammar, including nested field expressions.
 FieldList: TypeAlias = StringList
+
+
+def normalize_recommendation_filters(
+    recommendation_names: StrictStringList | str | None,
+    recommendation_stages: StrictStringList | str | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Validate native filters consistently for MCP and direct Python calls."""
+    filters: list[list[str] | None] = []
+    for parameter, value in (
+        ("recommendation_names", recommendation_names),
+        ("recommendation_stages", recommendation_stages),
+    ):
+        if value is None:
+            filters.append(None)
+            continue
+        normalized = coerce_strict_csv_string_list(value)
+        if not isinstance(normalized, list) or any(
+            not isinstance(item, str) or not item.strip() for item in normalized
+        ):
+            raise ValidationError(
+                f"{parameter} must be a list of nonblank strings or a comma-separated string."
+            )
+        normalized = [item.strip() for item in normalized]
+        if parameter == "recommendation_stages" and any(
+            stage not in {"MFR", "PCR", "PFR"} for stage in normalized
+        ):
+            raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
+        filters.append(normalized)
+    return filters[0], filters[1]
 
 
 def normalize_field_list(value: FieldList | str | None) -> list[str] | None:

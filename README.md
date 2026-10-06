@@ -3,9 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastMCP 3.4.7](https://img.shields.io/badge/FastMCP-3.4.7-green.svg)](https://github.com/PrefectHQ/fastmcp)
-[![Meta Marketing API v25.0](https://img.shields.io/badge/Meta%20Marketing%20API-v25.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
+[![Meta Marketing API v26.0](https://img.shields.io/badge/Meta%20Marketing%20API-v26.0-blue.svg)](https://developers.facebook.com/docs/marketing-apis/)
 
-**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — 97 tools for querying, managing, and optimizing your ad accounts through natural language.**
+**An optimization-first MCP server that bridges LLMs with the Meta Marketing API — tools for querying, managing, and optimizing your ad accounts through natural language.**
 
 > Ask Claude or Gemini to "show me which creatives are fatiguing" or "give me an optimization snapshot for this account" — and it just works.
 
@@ -15,11 +15,11 @@
 
 - 📊 **97 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
-- 📖 **Built-in Docs** — Object model, metrics, optimization playbook, and v25 notes available as tools and MCP resources
+- 📖 **Built-in Docs** — Object model, metrics, optimization playbook, current v26 notes, and historical v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
 - 🔑 **Auth Helpers** — Generate tokens, exchange codes, refresh tokens, and validate scopes
 - 🖼️ **Creative Ops** — Preview ads, upload assets, and set up A/B tests
-- 🔎 **Tool Search** — FastMCP 3.4.7 tool search lets the LLM discover tools on demand instead of loading all 97 up front
+- 🔎 **Tool Search** — FastMCP 3.4.7 tool search lets the LLM discover tools on demand instead of loading the full catalog up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
 ## 📋 Available Tools (97)
@@ -169,7 +169,8 @@
 |------|-------------|
 | `get_meta_object_model` | Meta Ads object model reference |
 | `get_metrics_reference` | Insights metrics reference |
-| `get_v25_notes` | Marketing API v25.0 release notes |
+| `get_v26_notes` | Current Marketing API v26.0 capabilities and migration notes |
+| `get_v25_notes` | Historical Marketing API v25.0 release notes |
 | `get_optimization_playbook` | Optimization best practices playbook |
 | `health_check` | Server health check |
 | `get_capabilities` | List server capabilities |
@@ -205,6 +206,7 @@ separate operations because Meta does not expose a campaign-level `bid_amount`.
 | `meta://docs/object-model` | Meta Ads object hierarchy |
 | `meta://docs/insights-metrics` | Available insights metrics |
 | `meta://docs/v25-notes` | v25.0 API release notes |
+| `meta://docs/v26-notes` | Current v26.0 API capabilities and migration notes |
 | `meta://docs/optimization-playbook` | Optimization best practices |
 | `meta://docs/tool-routing` | Tool routing guide |
 
@@ -229,7 +231,7 @@ Optional settings:
 
 ```bash
 export META_DEFAULT_ACCOUNT_ID='act_1234567890'
-export META_API_VERSION='v25.0'
+export META_API_VERSION='v26.0'
 export META_APP_ID='YOUR_APP_ID'
 export META_APP_SECRET='YOUR_APP_SECRET'
 export META_REDIRECT_URI='https://example.com/callback'
@@ -256,19 +258,34 @@ default field projections with Meta's generated Python Business SDK schemas:
 uv run audit-meta-sdk-schema \
   --sdk-repo /path/to/facebook-python-business-sdk \
   --base-ref 25.0.3 \
-  --target-ref 26.0.0
+  --target-ref 26.0.2
 ```
 
-See [the v26 compatibility audit](docs/v26_compatibility_audit.md) for current
-findings and the read-only live gate required before enabling v26-native
-optimization signals.
+The default API is `v26.0`; the audit target is SDK `26.0.2`. These are
+different version numbers. See [the v26 compatibility audit](docs/v26_compatibility_audit.md)
+for schema findings and the read-only live validation gate.
 
 With `META_API_VERSION=v26.0` or newer, use
 `get_native_optimization_signals` for entity-native delivery, learning, issue,
 automation, and recommendation payloads. `get_entity_insights` can opt into
 the v26 `instagram_profile_follow` metric with
-`include_instagram_profile_follow=true`. The repository default remains v25,
-so both options fail early with a version-specific validation error on v25.
+`include_instagram_profile_follow=true`. Both options fail early if an explicit
+environment override selects v25. Restart the MCP to pick up a version change.
+
+`get_recommendations` and the five typed opportunity tools accept Meta-native
+`recommendation_names` and `recommendation_stages` filters, as lists or CSV.
+For example, `recommendation_stages=["PCR"]` limits Meta's results before any
+local category filtering. Omitting the filters keeps the existing broad scan.
+Stage codes (`MFR`, `PCR`, `PFR`) are passed through without invented meanings.
+
+New SDK fields and breakdowns use existing generic inputs: for example,
+`get_entity_insights(..., fields=["shop_clicks"])` or
+`get_entity_insights(..., breakdowns=["placement_path"])`. Campaign reads now
+also accept custom `fields`. These examples show input paths, not guaranteed
+account eligibility or valid combinations. The live v26 account rejects the
+SDK-listed campaign `bid_constraints` field, so it is not a default projection.
+The ad persona field also requires permissions unavailable to the tested token.
+Use `get_v26_notes` for the full relevant additions and compatibility caveats.
 
 Overflow settings are optional. Oversized MCP responses are saved as complete,
 owner-only JSON artifacts and replaced inline by an opaque `export_id`. Use the
@@ -568,7 +585,7 @@ uv run --extra dev pytest        # Run tests
 - Prefer optimization and diagnostics tools before mutations
 - Return dicts and lists rather than serialized JSON strings
 - Treat all account IDs and object IDs as strings
-- Keep the implementation aligned with Marketing API v25.0
+- Keep the implementation aligned with Marketing API v26.0
 
 ## 📄 License
 
@@ -580,4 +597,4 @@ Questions, suggestions, or feedback? [Open an issue](https://github.com/jeffreyw
 
 ---
 
-**Built with [FastMCP 3.4.7](https://github.com/PrefectHQ/fastmcp) and [Meta Marketing API v25.0](https://developers.facebook.com/docs/marketing-apis/)**
+**Built with [FastMCP 3.4.7](https://github.com/PrefectHQ/fastmcp) and [Meta Marketing API v26.0](https://developers.facebook.com/docs/marketing-apis/)**

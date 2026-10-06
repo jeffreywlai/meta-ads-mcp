@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import deque
 from datetime import datetime, timezone
 import pytest
@@ -314,6 +315,51 @@ def test_graph_client_accepts_csv_fields_for_direct_callers(
             "params": {"fields": "id,name,url_tags"},
         }
     ]
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_recommendations_serialize_native_filters_without_changing_unfiltered_defaults(
+    monkeypatch, filtered,
+) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"data": []})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    options = {
+        "campaign_id": "cmp_123", "limit": 10, "after": " NEXT ",
+        "recommendation_names": " BUDGET_LIMITED, AB_TEST ",
+        "recommendation_stages": " MFR, PCR, PFR ",
+    } if filtered else {}
+    result = asyncio.run(_client().get_recommendations("123", **options))
+    assert result == {"data": []}
+    request = FakeAsyncClient.requests[0]
+    assert request["method"] == "GET"
+    assert request["url"] == "https://graph.facebook.com/v25.0/act_123/recommendations"
+    params = request["params"]
+    if filtered:
+        assert params["campaign_id"] == "cmp_123"
+        assert params["limit"] == 10
+        assert params["after"] == "NEXT"
+        assert json.loads(params["recommendation_names"]) == ["BUDGET_LIMITED", "AB_TEST"]
+        assert json.loads(params["recommendation_stages"]) == ["MFR", "PCR", "PFR"]
+    else:
+        assert params == {"limit": 25}
+
+
+@pytest.mark.parametrize("options, expected_message", [
+    ({"recommendation_names": [""]}, "nonblank strings"),
+    ({"recommendation_names": "BUDGET_LIMITED,"}, "nonblank strings"),
+    ({"recommendation_names": [123]}, "nonblank strings"),
+    ({"recommendation_stages": ["UNKNOWN"]}, "MFR, PCR, or PFR"),
+    ({"recommendation_stages": "MFR,,PFR"}, "nonblank strings"),
+])
+def test_recommendations_reject_invalid_native_filters_before_request(
+    monkeypatch, options, expected_message,
+) -> None:
+    async def unexpected_request(*args, **kwargs):
+        pytest.fail("request should not be made")
+
+    monkeypatch.setattr(GraphAPIClient, "request", unexpected_request)
+    with pytest.raises(ValidationError, match=expected_message):
+        asyncio.run(_client().get_recommendations("123", **options))
 
 
 @pytest.mark.parametrize("object_id", ["123", "act_123", "12345678901234567890"])

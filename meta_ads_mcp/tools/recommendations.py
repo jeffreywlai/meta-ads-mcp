@@ -12,11 +12,15 @@ from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.input_compat import resolve_identifier_alias
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.tool_types import StrictStringList, normalize_recommendation_filters
 
 _RECOMMENDATION_CACHE_TTL_SECONDS = 15.0
 _RECOMMENDATION_CACHE_MAX_ENTRIES = 128
+_RecommendationCacheKey = tuple[
+    str, str, str, str, int, str, tuple[str, ...] | None, tuple[str, ...] | None
+]
 _RECOMMENDATION_CACHE: dict[
-    tuple[str, str, str, int, str],
+    _RecommendationCacheKey,
     tuple[float, dict[str, object]],
 ] = {}
 
@@ -170,19 +174,25 @@ def _cache_key(
     campaign_id: str | None,
     limit: int,
     after: str | None,
-) -> tuple[str, str, str, int, str]:
-    """Build a short-lived cache key scoped to the current token and target ids."""
+    recommendation_names: list[str] | None,
+    recommendation_stages: list[str] | None,
+) -> _RecommendationCacheKey:
+    """Scope cached results to the API, token, target, filters, and page."""
+    settings = get_settings()
     return (
-        get_settings().access_token or "",
+        settings.access_token or "",
+        settings.api_version,
         account_id,
         campaign_id or "",
         limit,
         after or "",
+        tuple(recommendation_names) if recommendation_names is not None else None,
+        tuple(recommendation_stages) if recommendation_stages is not None else None,
     )
 
 
 def _get_cached_recommendations(
-    key: tuple[str, str, str, int, str],
+    key: _RecommendationCacheKey,
 ) -> dict[str, object] | None:
     """Return a deep-copied cached recommendation payload when it is still fresh."""
     cached = _RECOMMENDATION_CACHE.get(key)
@@ -196,7 +206,7 @@ def _get_cached_recommendations(
 
 
 def _store_cached_recommendations(
-    key: tuple[str, str, str, int, str],
+    key: _RecommendationCacheKey,
     payload: dict[str, object],
 ) -> None:
     """Store a normalized recommendation payload for a short time."""
@@ -226,8 +236,13 @@ async def _recommendation_collection(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
     """Fetch recommendations and return a normalized supported/unsupported response."""
+    recommendation_names, recommendation_stages = normalize_recommendation_filters(
+        recommendation_names, recommendation_stages
+    )
     resolved_account_id = _resolve_account_id(account_id)
     after = blank_to_none(after)
     cache_key = _cache_key(
@@ -235,6 +250,8 @@ async def _recommendation_collection(
         campaign_id=campaign_id,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
     if not refresh:
         cached = _get_cached_recommendations(cache_key)
@@ -248,6 +265,10 @@ async def _recommendation_collection(
             request_options["limit"] = limit
         if after:
             request_options["after"] = after
+        if recommendation_names is not None:
+            request_options["recommendation_names"] = recommendation_names
+        if recommendation_stages is not None:
+            request_options["recommendation_stages"] = recommendation_stages
         payload = await client.get_recommendations(
             resolved_account_id,
             **request_options,
@@ -276,6 +297,8 @@ async def _typed_opportunities(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
     """Return one filtered opportunity category with stable summary metadata."""
     result = await _recommendation_collection(
@@ -284,6 +307,8 @@ async def _typed_opportunities(
         refresh=refresh,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
     if not result["supported"]:
         return {**result, "category": category}
@@ -313,8 +338,10 @@ async def get_recommendations(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
-    """Use this for a broad Meta-native opportunity scan. Prefer this once before category-specific opportunity tools."""
+    """Scan Meta-native recommendations before category-specific tools. Optional recommendation_names and recommendation_stages (MFR/PCR/PFR) filter at Meta; names are validated by Meta."""
     account_id = resolve_identifier_alias(
         account_id,
         object_id,
@@ -327,6 +354,8 @@ async def get_recommendations(
         refresh=refresh,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
 
 
@@ -337,8 +366,10 @@ async def get_budget_opportunities(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
-    """Use this only when the user specifically wants budget, spend, or scaling opportunities from Meta's recommendation surface."""
+    """Find budget, spend, or scaling opportunities. Optional recommendation_names and recommendation_stages (MFR/PCR/PFR) filter at Meta before local category matching."""
     return await _typed_opportunities(
         "budget",
         account_id=account_id,
@@ -346,6 +377,8 @@ async def get_budget_opportunities(
         refresh=refresh,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
 
 
@@ -356,8 +389,10 @@ async def get_creative_opportunities(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
-    """Use this only when the user wants creative-specific opportunities such as asset, copy, or format improvements."""
+    """Find creative asset, copy, or format opportunities. Optional recommendation_names and recommendation_stages (MFR/PCR/PFR) filter at Meta before local category matching."""
     return await _typed_opportunities(
         "creative",
         account_id=account_id,
@@ -365,6 +400,8 @@ async def get_creative_opportunities(
         refresh=refresh,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
 
 
@@ -375,8 +412,10 @@ async def get_audience_opportunities(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
-    """Use this only when the user wants audience or targeting opportunities rather than general recommendations."""
+    """Find audience or targeting opportunities. Optional recommendation_names and recommendation_stages (MFR/PCR/PFR) filter at Meta before local category matching."""
     return await _typed_opportunities(
         "audience",
         account_id=account_id,
@@ -384,6 +423,8 @@ async def get_audience_opportunities(
         refresh=refresh,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
 
 
@@ -394,8 +435,10 @@ async def get_delivery_opportunities(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
-    """Use this only when the user wants delivery, reach, or learning-related opportunities from the recommendation surface."""
+    """Find delivery, reach, or learning opportunities. Optional recommendation_names and recommendation_stages (MFR/PCR/PFR) filter at Meta before local category matching."""
     return await _typed_opportunities(
         "delivery",
         account_id=account_id,
@@ -403,6 +446,8 @@ async def get_delivery_opportunities(
         refresh=refresh,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
 
 
@@ -413,8 +458,10 @@ async def get_bidding_opportunities(
     refresh: bool = False,
     limit: int = 25,
     after: str | None = None,
+    recommendation_names: StrictStringList | None = None,
+    recommendation_stages: StrictStringList | None = None,
 ) -> dict[str, object]:
-    """Use this only when the user wants bid-cap, cost-cap, or bidding-strategy opportunities from Meta's recommendations."""
+    """Find bid-cap, cost-cap, or bidding-strategy opportunities. Optional recommendation_names and recommendation_stages (MFR/PCR/PFR) filter at Meta before local category matching."""
     return await _typed_opportunities(
         "bidding",
         account_id=account_id,
@@ -422,4 +469,6 @@ async def get_bidding_opportunities(
         refresh=refresh,
         limit=limit,
         after=after,
+        recommendation_names=recommendation_names,
+        recommendation_stages=recommendation_stages,
     )
