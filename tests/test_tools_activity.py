@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -298,3 +299,17 @@ def test_list_change_history_rejects_conflicting_level_alias() -> None:
 def test_list_change_history_requires_level_with_generic_object_id() -> None:
     with pytest.raises(ValidationError):
         asyncio.run(activity.list_change_history(object_id="cmp_123"))
+
+
+def test_unresolvable_validated_scope_uses_validation_error(monkeypatch) -> None:
+    monkeypatch.setattr(activity, "validate_activity_scope_arguments", lambda **_: SimpleNamespace(
+        level="campaign", object_id=None, account_id=None, object_alias=None,
+    ))
+    client = FakeActivityClient()
+    with pytest.raises(ValidationError, match="activity scope could not be resolved"):
+        asyncio.run(activity._resolve_scope(
+            level="campaign", object_id=None, account_id=None, campaign_id=None,
+            adset_id=None, ad_id=None, client=client,
+        ))
+    assert client.calls == []
+    assert client.object_calls == []

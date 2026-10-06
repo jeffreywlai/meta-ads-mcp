@@ -178,7 +178,7 @@ async def _resolve_scope(
             parent_id=resolved_account_id,
             object_filter_id=None,
         )
-    raise AssertionError("validated activity scope was not resolvable")
+    raise ValidationError("The activity scope could not be resolved. Provide an account or object scope.")
 
 
 def _activity_params(
