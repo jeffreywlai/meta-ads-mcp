@@ -278,7 +278,7 @@ mcp_server = FastMCP(
     name="Meta Ads FastMCP",
     version="0.1.0",
     instructions=(
-        "Optimization-first Meta Ads MCP server running on FastMCP 3.4.7. "
+        "Optimization-first Meta Ads MCP server running on FastMCP 3.4.8. "
         "FastMCP tool search is enabled, so if the exact tool is not visible, "
         "use search_tools and then call_tool instead of exploring multiple "
         "tools blindly. If you are unsure which tool to use, call "

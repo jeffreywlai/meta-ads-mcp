@@ -451,7 +451,7 @@ def tool_routing_markdown() -> str:
     lines = [
         "# Tool Routing Guide",
         "",
-        "FastMCP 3.4.7 tool search is enabled. If the exact tool is not visible, use `search_tools` and then `call_tool`.",
+        "FastMCP 3.4.8 tool search is enabled. If the exact tool is not visible, use `search_tools` and then `call_tool`.",
         "",
         "Use `get_capabilities(intent=...)` for a compact routing response.",
         "Use `get_capabilities(include_full_manifest=true)` only when the compact response is insufficient.",
@@ -480,7 +480,7 @@ def _server_metadata() -> dict[str, object]:
     settings = get_settings()
     return {
         "name": "Meta Ads FastMCP",
-        "fastmcp_version_target": "3.4.7",
+        "fastmcp_version_target": "3.4.8",
         "api_version": settings.api_version,
         "read_only": settings.read_only,
         "optimization_first": True,
@@ -581,7 +581,7 @@ async def get_capabilities(
             "notes": [
                 "Use the recommended_order list first and only fall back to avoid_unless_needed when the primary tools cannot answer the question.",
                 "For opportunity scans, prefer get_recommendations once before typed opportunity tools.",
-                "When the exact tool is not visible, use search_tools and then call_tool because FastMCP 3.4.7 tool search is enabled.",
+                "When the exact tool is not visible, use search_tools and then call_tool because FastMCP 3.4.8 tool search is enabled.",
             ],
         }
 
@@ -601,7 +601,7 @@ async def get_capabilities(
     }
     notes = [
         "Use discovery and diagnostics before write operations.",
-        "FastMCP 3.4.7 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
+        "FastMCP 3.4.8 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
         "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
         "export_insights is a convenience wrapper over the core insights surface.",
         "Oversized tool responses return an opaque export_id; use call_tool to invoke read_overflow_artifact for bounded JSON chunks and delete_overflow_artifact when finished.",
