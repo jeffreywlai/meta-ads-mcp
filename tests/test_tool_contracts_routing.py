@@ -156,6 +156,7 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "set_campaign_status",
         "setup_ab_test",
         "update_adset_bid_amount",
+        "update_ad_creative",
         "update_adset_bid_strategy",
         "update_adset_budget",
         "update_campaign",

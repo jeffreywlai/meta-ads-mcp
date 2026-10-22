@@ -363,3 +363,119 @@ def test_create_creative_alias_routes_to_ad_creative_tool() -> None:
 
     assert decision.preferred_tool == "create_ad_creative"
     assert decision.compatible_tools == {"create_ad_creative"}
+
+
+def _configuration_contracts() -> dict[str, Contract]:
+    return {
+        name: _contract(name, effect="write")
+        for name in (
+            "update_campaign", "update_campaign_budget", "update_campaign_bid_strategy",
+            "set_campaign_status", "update_adset_budget", "update_adset_bid_amount",
+            "update_adset_bid_strategy", "set_adset_status",
+        )
+    }
+
+
+def test_compact_daily_apply_query_exposes_each_requested_write() -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide("update ad set budget bid amount status campaign budget bid strategy")
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == (
+        "update_adset_budget", "update_adset_bid_amount", "set_adset_status",
+        "update_campaign_budget", "update_adset_bid_strategy", "update_campaign_bid_strategy",
+    )
+    assert "update_campaign" not in decision.compatible_tools
+    assert "set_campaign_status" not in decision.compatible_tools
+
+
+def test_daily_apply_shorthand_is_recognized_with_explicit_write_context() -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(
+        "bid amount cost cap; pause ad set status; campaign daily budget; bid strategy roas floor"
+    )
+
+    assert decision.compatible_tools == {
+        "update_adset_bid_amount", "set_adset_status", "update_campaign_budget",
+        "update_adset_bid_strategy",
+    }
+    assert router.decide("campaign daily budget; bid strategy roas floor").suppress_mutations
+
+
+@pytest.mark.parametrize("query", ["update campaign daily budget", "update campaign daily budget CBO", "set campaign lifetime budget"])
+def test_budget_intent_selects_dedicated_campaign_budget_tool(query: str) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    assert router.decide(query).compatible_tools == {"update_campaign_budget"}
+
+
+@pytest.mark.parametrize("query", [
+    "do not update campaign daily budget and update adset bid amount",
+    "don't update campaign daily budget, update adset bid strategy",
+    "never set adset budget bid amount status campaign budget bid strategy",
+    "compare campaign budget and bid strategy",
+])
+def test_negated_and_read_queries_do_not_expose_compound_writes(query: str) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(query)
+
+    assert decision.suppress_mutations
+    assert not decision.compatible_tools
+
+
+def test_configuration_qualifiers_do_not_turn_avoided_facets_into_changes() -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide("update adset budget without changing status or bid strategy")
+
+    assert decision.compatible_tools == {"update_adset_budget"}
+
+
+def test_mixed_creative_workflow_keeps_all_explicit_operations() -> None:
+    contracts = {
+        "list_ads": _contract("list_ads"),
+        "get_ad": _contract("get_ad"),
+        "get_creative": _contract("get_creative"),
+        "update_ad_creative": _contract("update_ad_creative", effect="write"),
+        "upload_creative_asset": _contract("upload_creative_asset", effect="write"),
+    }
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide(
+        "list ads filter by name, get ad creative details, update ad creative, upload image"
+    )
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == (
+        "list_ads", "get_creative", "update_ad_creative", "upload_creative_asset",
+    )
+    assert "get_ad" not in decision.compatible_tools
+
+
+def test_compound_exact_calls_preserve_literal_delimiters_and_validation() -> None:
+    decision = ROUTER.decide(
+        'get_campaign(campaign_id="123, and 456"); '
+        'delete_creative(creative_id="789")'
+    )
+
+    assert decision.compatible_tools == {"get_campaign", "delete_creative"}
+    invalid = ROUTER.decide('delete_campaign(campaign_id=123), list_campaigns')
+    assert "delete_campaign" not in invalid.compatible_tools
+    assert invalid.preferred_tool == "list_campaigns"
+    assert invalid.frame.invalid_exact_call
+    literal_negation = ROUTER.decide(
+        'get_campaign(campaign_id="without") and delete_creative(creative_id="789")'
+    )
+    assert literal_negation.compatible_tools == {"get_campaign", "delete_creative"}
+
+
+@pytest.mark.parametrize("query", [
+    "summarize async report spend by product_id",
+    "aggregate spend by month for report_run_id 123",
+])
+def test_saved_report_aggregation_routes_to_read_tool(query: str) -> None:
+    name = "summarize_async_insights_report"
+    router = StructuredIntentRouter(tool_contracts={name: _contract(name)})  # type: ignore[arg-type]
+
+    assert router.decide(query).preferred_tool == name

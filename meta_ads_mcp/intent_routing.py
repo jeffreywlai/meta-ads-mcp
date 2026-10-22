@@ -4,7 +4,7 @@ This module is deliberately not a general natural-language parser.  It gives
 the BM25 search coordinator three guarantees:
 
 * an exact public tool name selects that tool;
-* a small set of direct English commands selects a deterministic route; and
+* a small set of direct English commands selects deterministic routes; and
 * everything else is read-safe and left to BM25 for ranking.
 
 FastMCP remains the coordinator and the source of truth for tool schemas.  An
@@ -64,6 +64,7 @@ _EXACT_CALL = re.compile(
 )
 _READ_VERBS = frozenset(
     {
+        "aggregate",
         "compare",
         "detect",
         "estimate",
@@ -136,6 +137,21 @@ _BUDGET_ALIASES = {
 _CREATE_ALIASES = {
     "creative": "create_ad_creative",
 }
+_CONFIGURATION_TOKEN = re.compile(
+    r"\b(?P<entity>ad set|adset|campaign)\b|"
+    r"\b(?P<facet>daily budget|lifetime budget|bid amount|bid strategy|status|budget)\b"
+)
+_CONFIGURATION_CONTINUATION = re.compile(
+    r"^\s*(?:(?:and(?:\s+then)?|or|then)\s+)?"
+    r"(?:(?P<entity>ad set|adset|campaign)\s+)?"
+    r"(?:daily budget|lifetime budget|budget|bid amount|bid strategy|status)\b",
+    re.IGNORECASE,
+)
+_EXCLUDED_SUFFIX = re.compile(
+    r"\b(?:without|except|not|never|don't|dont|do not|to\s+match|based\s+on|"
+    r"but\s+(?:only\s+)?(?:show|read|list|get|inspect|compare|view))\b",
+    re.IGNORECASE,
+)
 
 
 def normalize_query(query: str) -> str:
@@ -149,12 +165,13 @@ def _compact_query(query: str) -> str:
 
 
 def _operation_clauses(query: str) -> tuple[str, ...]:
-    """Split only on top-level semicolons/newlines outside literals."""
+    """Split a command list outside literals and exact-call arguments."""
     clauses: list[str] = []
     start = 0
     stack: list[str] = []
     quote: str | None = None
     escaped = False
+    qualifier_scope = False
     matching = {")": "(", "]": "[", "}": "{"}
     for index, character in enumerate(query):
         if quote is not None:
@@ -171,11 +188,105 @@ def _operation_clauses(query: str) -> tuple[str, ...]:
             stack.append(character)
         elif character in ")]}" and stack and stack[-1] == matching[character]:
             stack.pop()
-        elif character in ";\n" and not stack:
+        elif not stack and _EXCLUDED_SUFFIX.match(query, index):
+            qualifier_scope = True
+        elif character in ";\n," and not stack:
+            if character == ",":
+                continuation = _CONFIGURATION_CONTINUATION.match(query[index + 1 :])
+                if qualifier_scope or (
+                    continuation is not None and continuation.group("entity") is None
+                ):
+                    continue
             clauses.append(query[start:index])
             start = index + 1
+            qualifier_scope = False
+        elif character.isspace() and not stack:
+            if qualifier_scope:
+                continue
+            separator = re.match(
+                r"\s+(?:and(?:\s+then)?|then)\s+", query[index:], re.IGNORECASE
+            )
+            if separator is not None:
+                continuation = _CONFIGURATION_CONTINUATION.match(query[index + separator.end() :])
+                if continuation is not None and continuation.group("entity") is None:
+                    continue
+                clauses.append(query[start:index])
+                start = index + separator.end()
     clauses.append(query[start:])
     return tuple(clauses)
+
+
+def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...]:
+    """Recognize a bounded budget/bid/status list, never arbitrary write prose."""
+    simplified = _strip_articles(text.replace("-", " ").split())
+    verb, _space, tail = simplified.partition(" ")
+    if verb not in {"update", "set"}:
+        if not allow_shorthand:
+            return ()
+        tail = simplified
+    # Negative, reference, and read-only qualifiers are outside the changes.
+    tail = _EXCLUDED_SUFFIX.split(tail, maxsplit=1)[0].strip()
+    if not _CONFIGURATION_CONTINUATION.match(tail):
+        return ()
+    # A compact list contains adjacent configuration terms and list separators.
+    # Stop at prose such as "to match", "based on", or "only show" so a
+    # referenced configuration cannot become a second requested change.
+    tokens = []
+    previous_end = 0
+    for token in _CONFIGURATION_TOKEN.finditer(tail):
+        gap = tail[previous_end:token.start()].replace(",", " ").split()
+        if any(word not in {"and", "or", "then"} for word in gap):
+            break
+        tokens.append(token)
+        previous_end = token.end()
+    entities = tuple(
+        dict.fromkeys(
+            token.group("entity").replace("ad set", "adset")
+            for token in tokens if token.group("entity")
+        )
+    )
+    entity: str | None = None
+    explicitly_scoped = False
+    routes: list[str] = []
+    for token in tokens:
+        if raw_entity := token.group("entity"):
+            entity = raw_entity.replace("ad set", "adset")
+            explicitly_scoped = True
+            continue
+        facet = token.group("facet")
+        scopes = (entity,) if entity is not None else ()
+        if facet in {"bid amount", "bid strategy"} and not scopes:
+            scopes = ("adset",)
+        if facet == "bid strategy" and not explicitly_scoped and len(entities) > 1:
+            # An unqualified strategy in a compact multi-entity search is
+            # ambiguous: expose both typed tools rather than lose one.
+            scopes = entities
+        for scope in scopes:
+            if facet == "status":
+                routes.append(f"set_{scope}_status")
+            elif facet == "bid amount":
+                routes.append(f"update_{scope}_bid_amount")
+            elif facet == "bid strategy":
+                routes.append(f"update_{scope}_bid_strategy")
+            else:
+                routes.append(f"update_{scope}_budget")
+        explicitly_scoped = False
+    return tuple(dict.fromkeys(routes))
+
+
+def _workflow_route(text: str) -> str | None:
+    """Small aliases for the creative-replacement and saved-report workflows."""
+    if re.match(r"^(?:get|fetch|find|inspect|read|show|view) ad creative\b", text):
+        return "get_creative"
+    if re.match(r"^update ad creative\b", text):
+        return "update_ad_creative"
+    if re.match(r"^upload (?:an? )?image\b", text):
+        return "upload_creative_asset"
+    if re.match(r"^(?:summarize|aggregate)\b", text) and re.search(
+        r"\b(?:async(?: insights)? report|report_run_id|report run id)\b", text
+    ):
+        return "summarize_async_insights_report"
+    return None
 
 
 def _effect_from_contract(contract: ToolContract) -> Effect | None:
@@ -371,7 +482,15 @@ class StructuredIntentRouter:
         verb_scoped_candidates: set[str] = set()
         excluded: set[str] = set()
         invalid_exact = False
-        for raw_clause in _operation_clauses(query):
+        clauses = _operation_clauses(query)
+        allow_shorthand = len(clauses) > 1 and any(
+            re.match(
+                r"^(?:update|set|pause|resume|enable|disable)\b",
+                _OPTIONAL_POLITENESS.sub("", normalize_query(clause)),
+            )
+            for clause in clauses
+        )
+        for raw_clause in clauses:
             literal_clause = _compact_query(raw_clause)
             clause = literal_clause.lower()
             politeness = _OPTIONAL_POLITENESS.match(clause)
@@ -423,10 +542,27 @@ class StructuredIntentRouter:
                     preferred.extend(explicit)
                 continue
 
+            configuration_routes = tuple(
+                name for name in _configuration_routes(
+                    clause, allow_shorthand=allow_shorthand
+                )
+                if name in names
+            )
+            if configuration_routes:
+                if negated is not None:
+                    excluded.update(configuration_routes)
+                else:
+                    preferred.extend(configuration_routes)
+                continue
+
             direct_verb = clause.split(" ", 1)[0]
             if direct_verb not in _READ_VERBS | _WRITE_VERBS:
                 continue
-            route = _canonical_surface_route(clause, names) or _entity_route(clause)
+            route = (
+                _workflow_route(clause)
+                or _canonical_surface_route(clause, names)
+                or _entity_route(clause)
+            )
             if route is None or route not in names:
                 if negated is None and direct_verb in _WRITE_VERBS:
                     verb_scoped_candidates.update(

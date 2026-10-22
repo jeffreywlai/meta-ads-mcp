@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import re
 
-import pydantic_core
-
 from meta_ads_mcp.config import get_settings
+from meta_ads_mcp.build_info import BUILD_IDENTITY
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.coordinator import (
     ALWAYS_VISIBLE_TOOLS,
@@ -16,10 +15,11 @@ from meta_ads_mcp.coordinator import (
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.overflow import (
     DEFAULT_ARTIFACT_CHUNK_BYTES,
-    compact_overflow_chunk_result,
+    DEFAULT_ARTIFACT_ITEM_LIMIT,
+    DEFAULT_ARTIFACT_RESULT_BYTES,
 )
 
-MAX_INLINE_ARTIFACT_RESULT_BYTES = 63_000
+MAX_INLINE_ARTIFACT_RESULT_BYTES = DEFAULT_ARTIFACT_RESULT_BYTES
 
 TOOL_GROUPS = {
     "discovery": [
@@ -49,6 +49,7 @@ TOOL_GROUPS = {
         "create_async_insights_report",
         "create_async_insights_report_batch",
         "get_async_insights_report",
+        "summarize_async_insights_report",
     ],
     "activity": [
         "list_change_history",
@@ -112,6 +113,7 @@ TOOL_GROUPS = {
         "create_ad_creative",
         "create_ad",
         "update_creative",
+        "update_ad_creative",
         "delete_creative",
     ],
     "creative_ops": [
@@ -480,6 +482,7 @@ def _server_metadata() -> dict[str, object]:
     settings = get_settings()
     return {
         "name": "Meta Ads FastMCP",
+        "build": BUILD_IDENTITY,
         "fastmcp_version_target": "3.4.8",
         "api_version": settings.api_version,
         "read_only": settings.read_only,
@@ -497,6 +500,7 @@ async def health_check() -> dict[str, object]:
     """Use this first when auth or connectivity is uncertain before trying account-specific tools."""
     settings = get_settings()
     checks = {
+        "build": BUILD_IDENTITY,
         "access_token_present": bool(settings.access_token),
         "api_version": settings.api_version,
         "default_account_id": settings.default_account_id,
@@ -604,7 +608,8 @@ async def get_capabilities(
         "FastMCP 3.4.8 tool search is enabled, so the server may expose search_tools and call_tool instead of the entire tool catalog up front.",
         "compare_performance reuses the insights surface and avoids extra lookups when names are already present in insights rows.",
         "export_insights is a convenience wrapper over the core insights surface.",
-        "Oversized tool responses return an opaque export_id; use call_tool to invoke read_overflow_artifact for bounded JSON chunks and delete_overflow_artifact when finished.",
+        "Oversized tool responses return an opaque export_id; read_overflow_artifact returns parsed item pages by default or original JSON bytes with offset=0. Follow the issued continuation and delete_overflow_artifact when finished.",
+        "For async reports, pass all returned poll_arguments on every fetch to preserve flatten_actions; summarize_async_insights_report aggregates additive metrics across bounded page ranges.",
         "Pass intent to get_capabilities for a compact routing response instead of the full manifest.",
         "Use get_account_pages before creative creation when a Page or Instagram-linked asset is needed.",
         "Use list_instagram_accounts when creative setup requires an Instagram identity rather than a Facebook Page.",
@@ -678,34 +683,29 @@ async def list_mutation_tools() -> dict[str, object]:
 @mcp_server.tool()
 async def read_overflow_artifact(
     export_id: str,
-    offset: int = 0,
+    offset: int | None = None,
     max_bytes: int = DEFAULT_ARTIFACT_CHUNK_BYTES,
+    item_offset: int | None = None,
+    item_limit: int = DEFAULT_ARTIFACT_ITEM_LIMIT,
 ) -> dict[str, object]:
-    """Read the largest safe JSON chunk from a complete oversized response."""
-    requested_bytes = max_bytes
-    while True:
-        chunk = OVERFLOW_ARTIFACT_STORE.read(
-            export_id,
-            offset=offset,
-            max_bytes=requested_bytes,
-        )
-        result = compact_overflow_chunk_result(chunk)
-        serialized_size = len(
-            pydantic_core.to_json(result, fallback=str)
-        )
-        if serialized_size <= MAX_INLINE_ARTIFACT_RESULT_BYTES:
-            return chunk
-        if requested_bytes == 1:
-            return chunk
-        requested_bytes = max(
-            1,
-            int(
-                requested_bytes
-                * MAX_INLINE_ARTIFACT_RESULT_BYTES
-                / serialized_size
-                * 0.95
-            ),
-        )
+    """Read parsed items/rows by default; use offset=0 for complete original JSON bytes.
+
+    Follow next_item_offset for item pages or next_offset for byte chunks. Only 0
+    and recently issued continuations are accepted; guessed offsets are rejected.
+    Both modes preserve the artifact. A single oversized item explains how to
+    retrieve it in byte mode without skipping it.
+    """
+    if offset is not None and item_offset is not None:
+        raise ValidationError("Use offset for bytes or item_offset for items, not both.")
+    return OVERFLOW_ARTIFACT_STORE.read(
+        export_id,
+        offset=0 if offset is None else offset,
+        max_bytes=max_bytes,
+        item_offset=item_offset,
+        item_limit=item_limit,
+        prefer_items=offset is None and item_offset is None,
+        max_result_bytes=MAX_INLINE_ARTIFACT_RESULT_BYTES,
+    )
 
 
 @mcp_server.tool()

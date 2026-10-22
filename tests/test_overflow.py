@@ -117,11 +117,15 @@ def test_s4_shaped_22_row_action_artifact_has_one_compact_copy(tmp_path: Path) -
 
 def test_overflow_notice_exposes_size_rows_and_retention() -> None:
     notice = ArchivedResponseLimitingMiddleware._retrieval_message(
-        max_size=64000, export_id="opaque", artifact_bytes=88169, row_count=22, ttl_seconds=86400,
+        max_size=64000, export_id="opaque", artifact_bytes=88169, row_count=22,
+        ttl_seconds=86400, response_bytes=90500, item_pages=True,
     )
     assert "88,169 archived bytes" in notice
     assert "22 rows" in notice
     assert "retention 86,400 seconds" in notice
+    assert "90,500 MCP result bytes" in notice
+    assert '"item_offset": 0' in notice
+    assert "next_item_offset" in notice
     assert "next_offset" in notice
 
 
@@ -776,3 +780,157 @@ def test_oversized_exception_uses_serialized_boundary_and_remains_retrievable(
     artifact = _read_complete(store, match.group(1))
     assert artifact["tool_result"]["content"][0]["text"] == full_error
     assert artifact["tool_result"]["meta"]["overflow_exception"]["type"] == "ValueError"
+    assert artifact["tool_result"]["is_error"] is True
+
+
+def test_byte_offsets_must_be_issued_and_survive_store_restart(tmp_path: Path) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(content=[TextContent(type="text", text="x" * 150_000)]),
+        tool_name="large_tool",
+    )
+    first = store.read(export_id)
+    second = store.read(export_id, offset=first["next_offset"], max_bytes=16_803)
+    assert second["next_offset"] == 60_803
+
+    restarted = OverflowArtifactStore(tmp_path)
+    with pytest.raises(ValidationError, match="issued next_offset"):
+        restarted.read(export_id, offset=62_000)
+    resumed = restarted.read(export_id, offset=60_803)
+    assert resumed["offset"] == 60_803
+    assert store.read(export_id, offset=first["next_offset"])["data"]
+
+
+def test_recent_offsets_are_bounded_and_expired_cursors_fail_explicitly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(overflow, "MAX_RECENT_ARTIFACT_OFFSETS", 3)
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(_result(), tool_name="example_tool")
+    offset = 0
+    for _ in range(5):
+        offset = store.read(export_id, offset=offset, max_bytes=1)["next_offset"]
+    manifest = json.loads((tmp_path / store._manifest_name(export_id)).read_text())
+    assert manifest["byte_offsets"] == [3, 4, 5]
+    with pytest.raises(ValidationError, match="history has expired"):
+        store.read(export_id, offset=1)
+    assert store.read(export_id, offset=0, max_bytes=1)["next_offset"] == 1
+
+
+@pytest.mark.parametrize("shape", ["items", "rows", "async"])
+def test_parsed_pages_preserve_every_item_and_collection_context(
+    tmp_path: Path, shape: str,
+) -> None:
+    items = [{"id": str(index), "detail": "x" * 800} for index in range(200)]
+    if shape == "async":
+        payload = {
+            "job": {"state": "Job Completed", "ready": True},
+            "rows": {"items": items, "paging": {"next": "cursor"}, "summary": {"count": 200}},
+        }
+        expected_path = ["rows", "items"]
+    else:
+        payload = {shape: items, "summary": {"count": 200, "complete": True}}
+        expected_path = [shape]
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(content=[TextContent(type="text", text=json.dumps(payload))],
+                   structured_content=payload, meta={"source": "retained"}),
+        tool_name="get_async_insights_report" if shape == "async" else "list_audiences",
+    )
+    retrieved = []
+    item_offset = 0
+    calls = 0
+    while True:
+        page = store.read(export_id, item_offset=item_offset, item_limit=50)
+        assert len(overflow._serialized_mcp_result(overflow.compact_overflow_chunk_result(page))) <= 63_000
+        assert page["item_path"] == expected_path
+        assert page["context_included"] is True
+        assert page["context"]["tool_result"]["meta"] == {"source": "retained"}
+        context = page["context"]["tool_result"]["structured_content"]
+        if shape == "async":
+            assert context["job"]["ready"] is True
+            assert context["rows"]["paging"] == {"next": "cursor"}
+            assert context["rows"]["items"] == []
+        else:
+            assert context["summary"]["complete"] is True
+            assert context[shape] == []
+        retrieved.extend(page["items"])
+        calls += 1
+        if page["complete"]:
+            break
+        item_offset = page["next_item_offset"]
+        store = OverflowArtifactStore(tmp_path)  # Continuations survive a restart.
+    assert retrieved == items
+    assert calls < 10
+    with pytest.raises(ValidationError, match="issued next_item_offset"):
+        store.read(export_id, item_offset=1)
+
+
+def test_large_context_does_not_block_small_item_pages(tmp_path: Path) -> None:
+    payload = {"items": [{"id": "one"}], "context": "x" * 100_000}
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(ToolResult(structured_content=payload), tool_name="list_ads")
+    page = store.read(export_id, item_offset=0)
+    assert page["items"] == [{"id": "one"}]
+    assert page["complete"] is True
+    assert page["context_included"] is False
+    assert "byte mode" in page["context_note"]
+    assert _read_complete(store, export_id)["tool_result"]["structured_content"] == payload
+
+
+def test_single_oversized_item_remains_recoverable_without_skipping(tmp_path: Path) -> None:
+    payload = {"items": [{"id": "huge", "value": '\\"🙂' * 20_000}, {"id": "later"}]}
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(content=[TextContent(type="text", text=json.dumps(payload))], structured_content=payload),
+        tool_name="list_ads",
+    )
+    page = store.read(export_id, item_offset=0)
+    assert page["items"] == []
+    assert page["oversized_item"] == 0
+    assert page["next_item_offset"] == 0
+    assert page["complete"] is False
+    assert "offset=0" in page["next_step"]
+    chunks = []
+    offset = 0
+    while True:
+        chunk = store.read(export_id, offset=offset, max_result_bytes=63_000)
+        assert len(overflow._serialized_mcp_result(overflow.compact_overflow_chunk_result(chunk))) <= 63_000
+        chunks.append(chunk["data"])
+        if chunk["complete"]:
+            break
+        offset = chunk["next_offset"]
+    assert json.loads("".join(chunks))["tool_result"]["structured_content"] == payload
+
+
+@pytest.mark.parametrize("archive_fails", [False, True])
+@pytest.mark.parametrize("is_error", [False, True])
+def test_overflow_preserves_error_status_and_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive_fails: bool, is_error: bool,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    middleware = ArchivedResponseLimitingMiddleware(
+        max_size=64_000, truncation_suffix="fallback", artifact_store=store,
+    )
+    original = ToolResult(structured_content={"payload": "x" * 100_000},
+                          meta={"mutation_outcome_unknown": True}, is_error=is_error)
+
+    async def call_next(_context):
+        return original
+
+    if archive_fails:
+        def fail_create(*_args, **_kwargs):
+            raise OSError("unavailable")
+        monkeypatch.setattr(store, "create", fail_create)
+    result = asyncio.run(middleware.on_call_tool(
+        MiddlewareContext(message=mt.CallToolRequestParams(name="update_adset", arguments={})),
+        call_next,
+    ))
+    assert result.is_error is is_error
+    assert result.meta["mutation_outcome_unknown"] is True
+    assert result.structured_content["overflow"] == result.meta["overflow"]
+    assert len(overflow._serialized_mcp_result(result)) <= 64_000
+    if not archive_fails:
+        archived = _read_complete(store, result.meta["overflow"]["export_id"])
+        assert archived["tool_result"]["is_error"] is is_error
+        assert archived["tool_result"]["meta"]["mutation_outcome_unknown"] is True

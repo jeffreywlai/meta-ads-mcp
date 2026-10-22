@@ -13,7 +13,7 @@
 
 ## ✨ Features
 
-- 📊 **99 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **101 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, current v26 notes, and historical v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
@@ -22,7 +22,7 @@
 - 🔎 **Tool Search** — FastMCP 3.4.8 tool search lets the LLM discover tools on demand instead of loading the full catalog up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (99)
+## 📋 Available Tools (101)
 
 ### 🔍 Discovery
 
@@ -57,6 +57,7 @@
 | `create_async_insights_report` | Create a large async report with lean defaults or an explicit full preset |
 | `create_async_insights_report_batch` | Submit up to 10 independent breakdown reports sequentially |
 | `get_async_insights_report` | Poll or bounded-wait for an async report and retrieve compact rows |
+| `summarize_async_insights_report` | Sum additive metrics across report pages into compact groups |
 
 ### ⚡ Optimization
 
@@ -135,6 +136,7 @@
 | `delete_audience` | Delete an audience |
 | `create_ad_creative` | Create a new ad creative |
 | `update_creative` | Update an ad creative |
+| `update_ad_creative` | Attach a prepared replacement creative to an existing ad |
 | `delete_creative` | Delete an ad creative |
 
 ### 🖼️ Creative Ops
@@ -175,7 +177,7 @@
 | `health_check` | Server health check |
 | `get_capabilities` | List server capabilities |
 | `list_mutation_tools` | List write tools and safety notes |
-| `read_overflow_artifact` | Retrieve one bounded JSON chunk from an oversized response |
+| `read_overflow_artifact` | Retrieve parsed item pages or complete original JSON byte chunks |
 | `delete_overflow_artifact` | Delete an oversized response artifact after retrieval |
 
 FastMCP 3.4.8 also exposes dynamic search tools at runtime:
@@ -198,6 +200,16 @@ resolves currency from the owning Ad Account, converts values to Meta minor
 units exactly, and rejects precision the currency cannot represent (for
 example, fractional JPY). Campaign bidding strategy and Ad Set bid amounts are
 separate operations because Meta does not expose a campaign-level `bid_amount`.
+These units are also present in tool input schemas. `bid_constraints.roas_average_floor`
+is a raw integer scaled by 10,000 (`30000` means a 3.0 ROAS floor).
+`list_change_history` preserves Meta's raw payment amounts in minor currency
+units and labels that convention; USD cents in activity payloads are not budget inputs.
+
+Compound `search_tools` queries can discover several requested operations at once.
+Client-side deferred-tool search can load the visible `search_tools` and `call_tool`
+wrappers; inner tools are then invoked through `call_tool(name=..., arguments=...)`.
+Use `get_adset(fields=["id","name","effective_status","daily_budget","bid_amount"])`
+for a small preflight or read-back. The other single-entity reads also accept `fields`.
 
 ## 📚 MCP Resources
 
@@ -239,9 +251,33 @@ export META_EXPORT_DIR='/path/to/meta-ads-exports'
 export META_EXPORT_TTL_SECONDS='86400'
 export META_EXPORT_MAX_FILES='100'
 export META_EXPORT_MAX_BYTES='1000000000'
+export META_REQUEST_TIMEOUT='30'
 ```
 
 You can also place these in a `.env` file at the repo root.
+
+`META_REQUEST_TIMEOUT` bounds each HTTP attempt's total elapsed time as well as
+network inactivity. Uncertain writes return `mutation_outcome_unknown=true` and
+are never retried automatically. Read the target's current state before deciding
+whether another write is necessary.
+
+### Identify and refresh the running build
+
+`get_capabilities` and `health_check` report installed dependency versions and a
+`build.source_sha256` fingerprint captured when the server imports its source.
+Save this metadata with usage reports. Restart the MCP process after an update;
+an already running process retains its imported code.
+
+With pipx's pip backend, `pipx run` can reuse its environment for 14 days.
+To test a delivered commit, pin its SHA in the launch spec and rebuild the cache:
+
+```bash
+pipx run --no-cache --spec 'git+https://github.com/jeffreywlai/meta-ads-mcp.git@COMMIT_SHA' run-meta-ads-mcp
+```
+
+Replace `COMMIT_SHA` with the delivered commit before running this command.
+See [pipx run caching](https://pipx.pypa.io/latest/tutorial/run-applications.html#run-cache).
+This repository's changes do not update other computers or restart their clients.
 
 When `META_APP_SECRET` is set, authenticated Graph API requests using the
 configured `META_ACCESS_TOKEN` automatically include Meta's HMAC-SHA256
@@ -292,12 +328,20 @@ Use `get_v26_notes` for the full relevant additions and compatibility caveats.
 Overflow settings are optional. Oversized MCP responses are saved as complete,
 owner-only JSON artifacts and replaced inline by an opaque `export_id`. Use the
 visible `call_tool` proxy with `name="read_overflow_artifact"` and the returned
-`export_id`, repeating with `next_offset` to retrieve the complete response
+`export_id`, repeating with `next_item_offset` for parsed item pages (the default
+when the result has items or rows). Use `offset=0` and then each `next_offset`
+when the complete original JSON bytes are needed. Guessed continuations are
+rejected; retain the returned cursor. A single item too large for one response
+remains available through byte mode. Retrieve the complete response
 from local or remote MCP transports. Then use `call_tool` with
 `name="delete_overflow_artifact"`. When `META_EXPORT_DIR` is omitted, the
 server uses the operating system's temporary `meta-ads-mcp-exports` directory.
-The 64 KB threshold applies only to the inline MCP response: Meta's complete
+The 64,000-byte threshold measures the serialized inline MCP result: Meta's complete
 result is retained in the artifact and is not truncated or discarded.
+For oversized results through the schema-free `call_tool` wrapper, identical
+JSON text and structured output are delivered as one compact text copy when
+that fits. Direct tools with output schemas retain their structured content.
+Notices distinguish the measured MCP result size from the smaller archive size.
 Archive schema v2 uses compact JSON and stores identical JSON compatibility
 text only once, under `tool_result.structured_content`. Distinct or annotated
 text remains intact. Overflow notices include archive size and retention.
@@ -309,8 +353,10 @@ If the host lacks secure directory-relative file operations and process locks,
 archival fails closed and the tool returns guidance to narrow the request.
 
 Synchronous `get_entity_insights` (and its `get_insights` alias) omits duplicate
-raw action arrays by default, keeping numeric action maps, derived metrics, and
-requested `flatten_actions` columns. Custom action counts and values remain
+raw action arrays by default, keeping numeric action maps and derived metrics.
+With `flatten_actions=["purchase"]`, it returns a named `purchase` column and
+omits the full action maps. Unrequested null padding is removed; scalar
+projections also omit metrics that duplicate top-level values. Custom action counts and values remain
 available without an extra opt-in. Set `include_raw_actions=true` to retain raw
 arrays, including named attribution-window values needed for click/view
 comparisons; generic maps are not window-specific totals. `summarize_actions`
@@ -332,6 +378,22 @@ Alternatively, set `fetch_all=true` to collect up to 1,000 rows from the first
 page onward in one call (also supported by `get_insights` and `export_insights`).
 The server combines metrics after pagination, or fails explicitly if the scan
 cannot finish. Narrow the query or use async reports for larger results.
+
+Async report creation returns ready-to-use `poll_arguments`. Pass the whole
+object to `get_async_insights_report` on every fetch so `flatten_actions` and
+raw dimensional action settings survive polling. These projection options are
+explicit, not hidden process state. To summarize a large catalog report, call
+`summarize_async_insights_report(report_run_id="REPORT", group_by=["date_start"],
+metrics=["spend"])`. It sums pages with decimal arithmetic and returns grouped
+rows, not the whole catalog. Spend totals use exact decimal strings in major
+currency units; impression/click totals use integers. Only additive spend/impression/click metrics are
+supported; reach, ratios, and action counts cannot safely be summed this way.
+The call is bounded by time and page count. When `next_page_arguments` is present,
+use it to continue the scan; each result covers only its returned pages. Combine
+the group totals across those ranges. If the report is still running, poll again
+with the original arguments. A missing metric yields a
+null total instead of silently contributing zero. An independent account report
+is still needed as the denominator for catalog share of total account spend.
 
 For an account-wide fatigue sweep, call `get_creative_fatigue_report` with
 `account_id` or `level="account", object_id="act_ACCOUNT_ID"`. It reads both
@@ -355,11 +417,34 @@ both. These thresholds are a prioritization policy, not probabilities.
 
 Use `list_ads(name_contains_any=["Ada","Grace"], whole_term_match=true,
 effective_status=["ACTIVE"], fields=["id","name"])` to search several names in
-one bounded inventory scan. Matching is case-insensitive; whole-term mode treats
+one call that pages separate Graph `CONTAIN` queries and deduplicates matching ad IDs.
+The status filter is sent with each query. Meta determines candidate case/Unicode
+matching; local matching uses casefold. Whole-term mode treats
 punctuation and underscores as separators and avoids matching `Ada` in `Adam`.
-Each ad includes `matched_terms`. The scan follows pagination up to 1,000 ads and
-fails explicitly if it cannot finish; completeness still reflects the selected
+Each ad includes `matched_terms`. There is no 1,000-ad account inventory cap.
+Missing or repeated cursors fail explicitly; completeness still reflects the selected
 scope and status filters, not all historical ads.
+
+For a landing-page inventory, request `fields=["id","name","destination_urls"]`.
+The server extracts configured story, carousel, video CTA, and asset-feed links
+without returning the large creative object. These are configured destinations;
+redirects, dynamic catalog substitutions, and `url_tags` are not resolved.
+
+For a placement-image replacement, compose existing operations: inspect the ad's
+creative, upload the new image, create a replacement creative preserving its
+other fields and asset customization rules, attach it with `update_ad_creative`,
+and read back the ad. Preview the replacement before attaching it when appropriate.
+No bulk creative rewrite is inferred from a name or image filename.
+
+Audience lists expose `summary.complete`, `summary.truncated`, and
+`summary.next_after`; follow the cursor before treating the inventory as complete.
+`create_lookalike_audience(countries=["US","CA","AU"], ratio=0.01, ...)`
+uses `custom_ratio` and nested geographic targeting. `lookalike_spec` is managed
+by the typed inputs and cannot be overridden through `params`. Duplicate-source
+errors remain explicit; the server does not delete existing audiences to make a create succeed.
+
+See the [2026-10-22 report dispositions](docs/usage-report-2026-10-22-remediation.md)
+for validation evidence and live API limitations.
 
 `get_ad_image` joins asset labels to `configured_image_rules`, retaining crop
 coordinates, explicit default flags, rule constraints, and unresolved labels.

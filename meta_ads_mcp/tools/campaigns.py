@@ -16,7 +16,7 @@ from meta_ads_mcp.money import (
     validate_positive_amount,
 )
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import StringList
+from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, StringList
 
 
 def _encode_budget_field(
@@ -41,8 +41,8 @@ async def create_campaign(
     objective: str,
     status: str = "PAUSED",
     special_ad_categories: StringList | None = None,
-    daily_budget: float | None = None,
-    lifetime_budget: float | None = None,
+    daily_budget: CurrencyAmount | None = None,
+    lifetime_budget: CurrencyAmount | None = None,
     buying_type: str | None = None,
     bid_strategy: str | None = None,
     validate_only: bool = False,
@@ -95,8 +95,8 @@ async def update_campaign(
     name: str | None = None,
     status: str | None = None,
     objective: str | None = None,
-    daily_budget: float | None = None,
-    lifetime_budget: float | None = None,
+    daily_budget: CurrencyAmount | None = None,
+    lifetime_budget: CurrencyAmount | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user already has a campaign id and wants to change core campaign settings."""
@@ -206,11 +206,11 @@ async def create_ad_set(
     optimization_goal: str,
     targeting: dict[str, Any],
     status: str = "PAUSED",
-    bid_amount: float | None = None,
+    bid_amount: CurrencyAmount | None = None,
     bid_strategy: str | None = None,
-    bid_constraints: dict[str, Any] | None = None,
-    daily_budget: float | None = None,
-    lifetime_budget: float | None = None,
+    bid_constraints: BidConstraints | None = None,
+    daily_budget: CurrencyAmount | None = None,
+    lifetime_budget: CurrencyAmount | None = None,
     promoted_object: dict[str, Any] | None = None,
     start_time: str | None = None,
     end_time: str | None = None,

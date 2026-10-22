@@ -259,15 +259,18 @@ class GraphAPIClient:
         safe_to_retry = normalized_method in SAFE_RETRY_METHODS
         for attempt in range(retries):
             try:
-                response = await client.request(
-                    method=normalized_method,
-                    url=url,
-                    params=encoded_params,
-                    data=encoded_data,
-                    headers=headers,
-                    files=files,
-                )
-            except httpx.RequestError as exc:
+                # HTTPX timeouts bound inactivity in each network phase. Also
+                # bound total elapsed time so a trickling response cannot hang.
+                async with asyncio.timeout(self.settings.request_timeout):
+                    response = await client.request(
+                        method=normalized_method,
+                        url=url,
+                        params=encoded_params,
+                        data=encoded_data,
+                        headers=headers,
+                        files=files,
+                    )
+            except (httpx.RequestError, TimeoutError) as exc:
                 delay = float(min(2**attempt, 60))
                 if safe_to_retry and attempt + 1 < retries:
                     await asyncio.sleep(delay)

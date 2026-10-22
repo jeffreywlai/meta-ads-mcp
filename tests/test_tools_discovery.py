@@ -44,7 +44,7 @@ def test_list_ads_discloses_explicit_status_selection(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("whole_term", [True, False])
-def test_multi_name_search_scans_once_and_matches_case_insensitively(monkeypatch, whole_term) -> None:
+def test_multi_name_search_pages_graph_filters_and_deduplicates_union(monkeypatch, whole_term) -> None:
     from meta_ads_mcp.coordinator import mcp_server
     calls = []
 
@@ -54,23 +54,30 @@ def test_multi_name_search_scans_once_and_matches_case_insensitively(monkeypatch
             assert parent_id == "cmp_1"
             assert fields == ["id", "name"]
             assert params["effective_status"] == ["ACTIVE"]
-            assert "filtering" not in params  # Meta filters are AND, not an invented OR query.
+            assert len(params["filtering"]) == 1
+            assert params["filtering"][0]["field"] == "name"
+            assert params["filtering"][0]["operator"] == "CONTAIN"
+            if params["filtering"][0]["value"] == "grâce":
+                assert "after" not in params  # Each OR term starts its own cursor chain.
+                return {"data": [{"id": "3", "name": "grâce-Ada"}]}
+            assert params["filtering"][0]["value"] == "ADA"
             if not params.get("after"):
                 return {"data": [{"id": "1", "name": "VIDEO_ADA-v1"}, {"id": "2", "name": "Adam"}],
                         "paging": {"next": "next", "cursors": {"after": "page2"}}}
             assert params["after"] == "page2"
-            return {"data": [{"id": "3", "name": "grâce-Ada"}, {"id": "4", "name": "other"}]}
+            return {"data": [{"id": "3", "name": "grâce-Ada"}]}
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: NameClient())
     result = asyncio.run(mcp_server.call_tool("list_ads", {
         "campaign_id": "cmp_1", "fields": ["id", "name"], "effective_status": ["ACTIVE"],
         "name_contains_any": "ADA, grâce", "whole_term_match": whole_term,
     })).structured_content
-    assert len(calls) == 2
-    assert result["summary"]["scanned_count"] == 4
+    assert len(calls) == 3
+    assert result["summary"]["scanned_count"] == 3
     assert result["summary"]["complete"] is True
     assert {item["id"] for item in result["items"]} == ({"1", "3"} if whole_term else {"1", "2", "3"})
     assert result["items"][-1]["matched_terms"] == ["ada", "grâce"]
+    assert result["paging"] == {"before": None, "after": None, "next": None}
 
 
 @pytest.mark.parametrize("arguments", [
@@ -84,30 +91,48 @@ def test_multi_name_search_validates_before_client(monkeypatch, arguments) -> No
         asyncio.run(discovery.list_ads(account_id="123", **arguments))
 
 
-@pytest.mark.parametrize("failure", ["cap", "missing_cursor", "repeated_cursor"])
+@pytest.mark.parametrize("failure", ["missing_cursor", "repeated_cursor", "missing_id"])
 def test_multi_name_search_never_returns_a_partial_inventory(monkeypatch, failure) -> None:
     class IncompleteClient:
         async def list_objects(self, parent_id, edge, *, fields, params):
-            return {"data": [{"id": str(index), "name": "Ada"} for index in range(1000 if failure == "cap" else 1)],
+            return {"data": [{"name": "Ada"} if failure == "missing_id" else {"id": "1", "name": "Ada"}],
                     "paging": {"next": "next", "cursors": {"after": None if failure == "missing_cursor" else "same"}}}
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: IncompleteClient())
-    with pytest.raises(discovery.ValidationError, match="scan limit|pagination"):
+    with pytest.raises(discovery.ValidationError, match="pagination|without an ad id"):
         asyncio.run(discovery.list_ads(account_id="123", name_contains_any=["Ada"]))
 
 
-@pytest.mark.parametrize("count", [0, 1000])
-def test_multi_name_search_accepts_complete_inventory_at_cap(monkeypatch, count) -> None:
+@pytest.mark.parametrize("count", [0, 1000, 1200])
+def test_multi_name_search_has_no_thousand_ad_inventory_cap(monkeypatch, count) -> None:
     class CompleteClient:
         async def list_objects(self, parent_id, edge, *, fields, params):
             assert params["limit"] == 1000
-            return {"data": [{"id": str(index), "name": "other"} for index in range(count)]}
+            assert params["filtering"] == [{"field": "name", "operator": "CONTAIN", "value": "Ada"}]
+            start = 1000 if params.get("after") else 0
+            page = {"data": [{"id": str(index), "name": "Ada"} for index in range(start, min(start + 1000, count))]}
+            if count > 1000 and not start:
+                page["paging"] = {"next": "next", "cursors": {"after": "page2"}}
+            return page
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: CompleteClient())
     result = asyncio.run(discovery.list_ads(account_id="123", name_contains_any=["Ada"], limit=5000))
-    assert result["items"] == []
+    assert len(result["items"]) == count
     assert result["summary"]["complete"] is True
     assert result["summary"]["scanned_count"] == count
+
+
+def test_multi_name_search_follows_empty_pages_with_advancing_cursor(monkeypatch) -> None:
+    class EmptyPageClient:
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            if "after" not in params:
+                return {"data": [], "paging": {"next": "next", "cursors": {"after": "page2"}}}
+            return {"data": [{"id": "1", "name": "Ada"}]}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: EmptyPageClient())
+    result = asyncio.run(discovery.list_ads(account_id="123", name_contains_any=["Ada"]))
+    assert [item["id"] for item in result["items"]] == ["1"]
+    assert result["summary"]["complete"] is True
 
 
 def test_custom_bid_fields_include_currency_dependency(monkeypatch) -> None:
@@ -123,7 +148,151 @@ def test_custom_bid_fields_include_currency_dependency(monkeypatch) -> None:
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: BidClient())
     result = asyncio.run(discovery.list_ads(adset_id="as1", fields="id,bid_amount"))
-    assert result["items"][0]["bid_amount"] == 1.5
+    assert result["items"] == [{"id": "ad1", "bid_amount": 1.5}]
+
+
+@pytest.mark.parametrize(("name", "id_key"), [
+    ("get_adset", "adset_id"), ("get_ad", "ad_id"), ("get_campaign", "campaign_id"),
+    ("get_ad_account", "account_id"),
+])
+@pytest.mark.parametrize("fields", [["id", "name"], "id,name"])
+def test_entity_getters_accept_lean_fields_through_wrapper(monkeypatch, name, id_key, fields) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    class LeanClient:
+        async def get_object(self, object_id, *, fields):
+            assert fields == ["id", "name"]
+            return {"id": object_id, "name": "Selected"}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: LeanClient())
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": name, "arguments": {id_key: "123", "fields": fields},
+    })).structured_content
+    assert result["item"] == {"id": "act_123" if name == "get_ad_account" else "123", "name": "Selected"}
+
+
+@pytest.mark.parametrize(("tool", "id_key", "money_field"), [
+    (discovery.get_adset, "adset_id", "daily_budget"),
+    (discovery.get_ad, "ad_id", "bid_amount"),
+    (discovery.get_campaign, "campaign_id", "lifetime_budget"),
+])
+@pytest.mark.parametrize(("currency", "expected"), [("USD", 12.5), ("JPY", 1250)])
+def test_selected_money_fields_keep_currency_conversion_without_dependency_columns(
+    monkeypatch, tool, id_key, money_field, currency, expected,
+) -> None:
+    class MoneyClient:
+        async def get_object(self, object_id, *, fields):
+            if object_id == "act_456":
+                assert fields == ["currency"]
+                return {"currency": currency}
+            assert fields == ["id", money_field, "account_id"]
+            return {"id": "123", money_field: "1250", "account_id": "456"}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: MoneyClient())
+    result = asyncio.run(tool(**{id_key: "123", "fields": ["id", money_field]}))
+    assert result["item"] == {"id": "123", money_field: expected}
+
+
+def test_selected_account_money_fields_use_hidden_currency_dependency(monkeypatch) -> None:
+    class AccountClient:
+        async def get_object(self, object_id, *, fields):
+            assert object_id == "act_123"
+            assert fields == ["id", "amount_spent", "balance", "currency"]
+            return {"id": object_id, "amount_spent": "12345", "balance": "1250", "currency": "USD"}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: AccountClient())
+    result = asyncio.run(discovery.get_ad_account("123", fields=["id", "amount_spent", "balance"]))
+    assert result["item"] == {"id": "act_123", "amount_spent": 123.45, "balance": 12.5}
+
+
+@pytest.fixture
+def destination_creative():
+    return {
+        "link_url": "https://shop.example/product?color=blue&ref=ad",
+        "object_url": "https://shop.example/product?color=blue&ref=ad",
+        "image_url": "https://cdn.example/image.jpg",
+        "url_tags": "utm_source=meta",
+        "object_story_spec": {
+            "link_data": {
+                "link": "https://shop.example/link",
+                "message": "Large copy " * 1000,
+                "child_attachments": [{"link": "https://shop.example/carousel", "picture": "https://cdn.example/card.jpg"}],
+                "call_to_action": {"value": {"link": "https://shop.example/cta"}},
+            },
+            "template_data": {"link": "https://shop.example/{{product.id}}"},
+            "video_data": {"call_to_action": {"value": {"link": "https://shop.example/video"}}},
+            "photo_data": {"url": "https://cdn.example/photo.jpg"},
+        },
+        "asset_feed_spec": {"link_urls": [
+            {"website_url": "https://shop.example/asset", "deeplink_url": "myapp://product/1", "display_url": "display.example"},
+            {"website_url": "https://shop.example/link"},
+        ]},
+    }
+
+
+@pytest.mark.parametrize("tool_name", ["list_ads", "get_ad"])
+def test_destination_urls_projection_is_compact_and_excludes_asset_urls(monkeypatch, destination_creative, tool_name) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+    import json
+
+    class DestinationClient:
+        def _item(self, fields):
+            assert "destination_urls" not in fields
+            assert len([field for field in fields if field.startswith("creative{")]) == 1
+            assert fields[:2] == ["id", "name"]
+            return {"id": "ad1", "name": "Ada", "creative": destination_creative}
+
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            assert params["filtering"] == [{"field": "name", "operator": "CONTAIN", "value": "Ada"}]
+            assert params["effective_status"] == ["ACTIVE"]
+            return {"data": [self._item(fields)]}
+
+        async def get_object(self, object_id, *, fields):
+            return self._item(fields)
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DestinationClient())
+    arguments = {"fields": ["id", "name", "destination_urls"]}
+    arguments.update({"account_id": "123", "name_contains_any": ["Ada"], "effective_status": ["ACTIVE"]}
+                     if tool_name == "list_ads" else {"ad_id": "ad1"})
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": tool_name, "arguments": arguments,
+    })).structured_content
+    item = result["items"][0] if tool_name == "list_ads" else result["item"]
+    assert item["destination_urls"] == [
+        "https://shop.example/product?color=blue&ref=ad", "https://shop.example/link",
+        "https://shop.example/cta", "https://shop.example/carousel",
+        "https://shop.example/{{product.id}}", "https://shop.example/video",
+        "https://shop.example/asset", "myapp://product/1",
+    ]
+    assert "creative" not in item
+    assert len(json.dumps(result)) < 1200
+
+
+def test_destination_projection_preserves_explicit_creative_selection(monkeypatch, destination_creative) -> None:
+    class CreativeClient:
+        async def get_object(self, object_id, *, fields):
+            assert len(fields) == 2
+            assert "name" in fields[1]
+            assert "asset_feed_spec," in fields[1]  # Both images and links are fetched.
+            assert fields[1].count("asset_feed_spec") == 1
+            return {"id": object_id, "creative": destination_creative}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: CreativeClient())
+    result = asyncio.run(discovery.get_ad(
+        "ad1", fields="id,creative{name,asset_feed_spec{images}},destination_urls",
+    ))
+    assert result["item"]["creative"] == destination_creative
+    assert "https://shop.example/asset" in result["item"]["destination_urls"]
+
+
+def test_destination_urls_are_empty_when_meta_exposes_no_configured_links(monkeypatch) -> None:
+    class NoLinkClient:
+        async def get_object(self, object_id, *, fields):
+            return {"id": object_id, "creative": {"id": "creative1"}}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: NoLinkClient())
+    result = asyncio.run(discovery.get_ad("ad1", fields=["id", "destination_urls"]))
+    assert result["item"] == {"id": "ad1", "destination_urls": []}
 
 
 class FakeDiscoveryClient:
