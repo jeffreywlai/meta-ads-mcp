@@ -496,6 +496,11 @@ def test_placement_search_prefers_canonical_insights_but_exact_alias_still_works
         "update_adset_budget", "update_adset_bid_amount", "set_adset_status",
         "update_campaign_budget", "update_adset_bid_strategy", "update_campaign_bid_strategy",
     ]),
+    ("update ad set budget bid amount status campaign budget bid strategy and name", [
+        "update_adset_budget", "update_adset_bid_amount", "set_adset_status",
+        "update_campaign_budget", "update_adset_bid_strategy", "update_campaign_bid_strategy",
+        "update_campaign",
+    ]),
     ("bid amount cost cap; pause ad set status; campaign daily budget; bid strategy roas floor", [
         "update_adset_bid_amount", "set_adset_status", "update_campaign_budget", "update_adset_bid_strategy",
     ]),
@@ -505,6 +510,75 @@ def test_placement_search_prefers_canonical_insights_but_exact_alias_still_works
     ]),
 ])
 def test_usage_report_compound_queries_return_the_operation_union(query, expected) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("max_results", [1, 6, 12])
+def test_explicit_search_preserves_every_unique_operation_in_order(monkeypatch, max_results) -> None:
+    monkeypatch.setattr(mcp_server.transforms[0], "_max_results", max_results)
+    expected = [
+        "get_ad", "update_campaign", "list_ads", "update_adset_budget",
+        "get_creative", "set_adset_status", "upload_creative_asset",
+        "get_entity_insights", "update_ad_creative",
+    ]
+    query = "; ".join([expected[0], *expected, expected[2]])
+
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("max_results", [1, 3, 6])
+def test_fuzzy_search_keeps_its_configured_cap_and_read_safe_candidates(monkeypatch, max_results) -> None:
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+
+    monkeypatch.setattr(mcp_server.transforms[0], "_max_results", max_results)
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": "performance insights campaign delivery",
+    }))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    contracts = build_tool_contracts(mcp_server.local_provider._components.values())
+    assert len(names) == max_results
+    assert len(set(names)) == len(names)
+    assert all(contracts[name].effect == "read" for name in names)
+
+
+@pytest.mark.parametrize(("call", "include_campaign"), [
+    ('update_campaign(campaign_id="123", name="do not update campaign budget; update_adset_budget")', True),
+    ('update_campaign(campaign_id="123", unknown_argument="update_adset_budget")', False),
+])
+def test_many_explicit_operations_keep_literal_validation_and_negation(call, include_campaign) -> None:
+    expected = [
+        "get_ad", "list_ads", "get_creative", "set_adset_status",
+        "upload_creative_asset", "get_entity_insights", "update_ad_creative",
+    ]
+    query = "; ".join([call, *expected, "do not update_campaign_budget"])
+    if include_campaign:
+        expected.insert(0, "update_campaign")
+
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+def test_read_only_search_preserves_many_explicit_reads_and_filters_writes(monkeypatch) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    expected = [
+        "list_campaigns", "get_campaign", "list_adsets", "get_adset",
+        "list_ads", "get_ad", "get_creative", "list_creatives",
+    ]
+    query = "; ".join([
+        "update_campaign", *expected[:4], "set_adset_status",
+        *expected[4:], "update_ad_creative",
+    ])
+
     result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
 
     names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]

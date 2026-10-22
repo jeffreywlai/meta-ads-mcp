@@ -130,7 +130,8 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
             if str(getattr(tool, "name", "")) not in selected_names
         ]
         ranked = [*selected_tools, *ranked]
-        return ranked[: self._max_results]
+        # The result cap limits fuzzy matches, not explicitly requested operations.
+        return ranked[: max(self._max_results, len(selected_tools))]
 
     def _make_call_tool(self) -> Tool:
         """Create a forgiving proxy while preserving one canonical tool catalog."""

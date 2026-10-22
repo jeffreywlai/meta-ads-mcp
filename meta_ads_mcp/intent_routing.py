@@ -170,9 +170,33 @@ _CONFIGURATION_VALUES = {
         r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)",
     ),
     "status": r"(?:active|paused|archived|deleted)",
+    # Strategies are strings in the live schema. Accept enum-shaped tokens or
+    # quoted strings without interpreting their contents as another field.
+    "bid strategy": rf"(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)+|{_QUOTED_VALUE})",
     "name": _QUOTED_VALUE,
     "objective": rf"(?:outcome_[a-z_]+|{_QUOTED_VALUE})",
 }
+_CONFIGURATION_SEPARATOR = re.compile(
+    r"^[\s,]*(?:(?:and(?:\s+then)?|or|then)[\s,]*)?$"
+)
+_STATUS_VERBS = frozenset({"pause", "resume", "enable", "disable"})
+_EXPLICIT_OPERATION = re.compile(
+    r"^\s*(?:(?:please|kindly)\s+)*(?:"
+    + "|".join(sorted(_READ_VERBS | _WRITE_VERBS))
+    + r"|[a-z][a-z0-9]*_[a-z0-9_]+)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigurationSubject:
+    """One field and its optional entity and literal target value."""
+
+    entity: str | None
+    facet: str
+    end: int
+    has_value: bool
+    scope_group: int
 
 
 def normalize_query(query: str) -> str:
@@ -193,6 +217,7 @@ def _operation_clauses(query: str) -> tuple[str, ...]:
     quote: str | None = None
     escaped = False
     qualifier_scope = False
+    preservation_scope = False
     matching = {")": "(", "]": "[", "}": "{"}
     for index, character in enumerate(query):
         if quote is not None:
@@ -213,28 +238,41 @@ def _operation_clauses(query: str) -> tuple[str, ...]:
             stack.pop()
         elif not stack and _EXCLUDED_SUFFIX.match(query, index):
             qualifier_scope = True
+            clause_prefix = _OPTIONAL_POLITENESS.sub("", normalize_query(query[start:]))
+            if _POSTFIX_PRESERVATION.match(query[index:]) and not _DIRECT_NEGATION.match(clause_prefix):
+                preservation_scope = True
         elif character in ";\n," and not stack:
             if character == ",":
-                continuation = _CONFIGURATION_CONTINUATION.match(query[index + 1 :])
-                if qualifier_scope or _POSTFIX_PRESERVATION.match(query[index + 1:]) or (
-                    continuation is not None and continuation.group("entity") is None
+                remainder = query[index + 1 :]
+                explicit_operation = _EXPLICIT_OPERATION.match(remainder)
+                if (qualifier_scope and not (preservation_scope and explicit_operation)) or (
+                    _POSTFIX_PRESERVATION.match(remainder)
+                    or _CONFIGURATION_CONTINUATION.match(remainder)
                 ):
                     continue
             clauses.append(query[start:index])
             start = index + 1
             qualifier_scope = False
+            preservation_scope = False
         elif character.isspace() and not stack:
-            if qualifier_scope:
-                continue
             separator = re.match(
                 r"\s+(?:and(?:\s+then)?|then)\s+", query[index:], re.IGNORECASE
             )
             if separator is not None:
-                continuation = _CONFIGURATION_CONTINUATION.match(query[index + separator.end() :])
-                if continuation is not None and continuation.group("entity") is None:
+                remainder = query[index + separator.end() :]
+                if qualifier_scope and not (
+                    preservation_scope and _EXPLICIT_OPERATION.match(remainder)
+                ):
+                    continue
+                # Entity repetition does not start a new command. Keep the
+                # complete subject list under its read/write verb and shared
+                # postfix predicate until configuration parsing is complete.
+                if _CONFIGURATION_CONTINUATION.match(remainder):
                     continue
                 clauses.append(query[start:index])
                 start = index + separator.end()
+                qualifier_scope = False
+                preservation_scope = False
     clauses.append(query[start:])
     return tuple(clauses)
 
@@ -243,7 +281,9 @@ def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...
     """Recognize a bounded field list; None leaves other commands to the router."""
     simplified = _strip_articles(text.replace("-", " ").split())
     verb, _space, tail = simplified.partition(" ")
-    if verb not in {"update", "set"}:
+    write_requested = verb in {"update", "set"} | _STATUS_VERBS
+    read_requested = verb in _READ_VERBS
+    if not write_requested and not read_requested:
         if not allow_shorthand:
             return None
         tail = simplified
@@ -254,49 +294,77 @@ def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...
     # Negative, reference, and read-only qualifiers are outside the changes.
     excluded_suffix = _EXCLUDED_SUFFIX.search(full_tail)
     end = excluded_suffix.start() if excluded_suffix is not None else len(full_tail)
-    # A compact list contains adjacent configuration terms and list separators.
-    # Stop at prose such as "to match", "based on", or "only show" so a
-    # referenced configuration cannot become a second requested change.
-    tokens = []
+    # Parse whole subjects before assigning routes. A shared postfix predicate
+    # applies to its coordinated field list, including repeated entity names.
+    subjects: list[_ConfigurationSubject] = []
+    pending_entity: str | None = None
     previous_end = 0
-    for token in _CONFIGURATION_TOKEN.finditer(full_tail, 0, end):
-        gap = tail[previous_end:token.start()].replace(",", " ").split()
-        if any(word not in {"and", "or", "then"} for word in gap):
-            previous_facet = tokens[-1].group("facet") if tokens else None
-            value = _CONFIGURATION_VALUES.get(previous_facet)
-            if value is None or not re.fullmatch(
-                rf"\s*(?:to\s+)?{value}\s*,?\s*(?:(?:and(?:\s+then)?|or|then)\s*)?",
-                tail[previous_end:token.start()],
-            ):
-                break
-        # A facet before "must not change" is excluded too. Splitting only
-        # at "not" would incorrectly accept that facet as a requested write.
-        if token.group("facet") and _POSTFIX_PRESERVATION.match(full_tail[token.end():]):
-            if verb not in {"update", "set"}:
-                # A shorthand subject such as "bid amount and status" shares
-                # its preservation predicate; none of those fields is a write.
-                tokens.clear()
+    scope_group = 0
+    while (token := _CONFIGURATION_TOKEN.search(full_tail, previous_end, end)) is not None:
+        separator = tail[previous_end:token.start()]
+        if not _CONFIGURATION_SEPARATOR.fullmatch(separator):
             break
-        tokens.append(token)
-        previous_end = token.end()
-    entities = tuple(
-        dict.fromkeys(
-            token.group("entity").replace("ad set", "adset")
-            for token in tokens if token.group("entity")
-        )
-    )
+        if raw_entity := token.group("entity"):
+            if subjects and separator.strip():
+                # Explicit entity coordination starts a new field scope while
+                # retaining the command's verb and shared predicate.
+                scope_group += 1
+            pending_entity = raw_entity.replace("ad set", "adset")
+            previous_end = token.end()
+            continue
+        facet = token.group("facet")
+        value_pattern = _CONFIGURATION_VALUES.get(facet)
+        value = re.match(
+            rf"\s+(?:to\s+)?{value_pattern}(?=\s|[,;:]|$)",
+            tail[token.end():end],
+        ) if value_pattern is not None else None
+        previous_end = token.end() + (value.end() if value is not None else 0)
+        subjects.append(_ConfigurationSubject(
+            entity=pending_entity,
+            facet=facet,
+            end=previous_end,
+            has_value=value is not None,
+            scope_group=scope_group,
+        ))
+        pending_entity = None
+    if subjects and not read_requested and _POSTFIX_PRESERVATION.match(full_tail[subjects[-1].end:]):
+        # The explicit verb owns the first field; subsequent unvalued fields
+        # form the preservation subject. A supplied target value also closes
+        # a positive subject before the following preservation list, including
+        # shorthand within an already established write context.
+        keep = 1 if write_requested and len(subjects) > 1 else 0
+        for index, subject in enumerate(subjects[:-1]):
+            if subject.has_value:
+                keep = index + 1
+        subjects = subjects[:keep]
+    if verb in _STATUS_VERBS and subjects and subjects[0].facet != "status":
+        return None
+    if read_requested:
+        if verb in _GET_SYNONYMS | {"get"}:
+            return tuple(dict.fromkeys(
+                _ENTITY_GETTERS[subject.entity]
+                for subject in subjects if subject.entity is not None
+            ))
+        return ()
+    entity_groups = {
+        group: tuple(dict.fromkeys(
+            subject.entity for subject in subjects
+            if subject.scope_group == group and subject.entity is not None
+        ))
+        for group in {subject.scope_group for subject in subjects}
+    }
     entity: str | None = None
     explicitly_scoped = False
     routes: list[str] = []
-    for token in tokens:
-        if raw_entity := token.group("entity"):
-            entity = raw_entity.replace("ad set", "adset")
+    for subject in subjects:
+        if subject.entity is not None:
+            entity = subject.entity
             explicitly_scoped = True
-            continue
-        facet = token.group("facet")
+        facet = subject.facet
         scopes = (entity,) if entity is not None else ()
         if facet in {"bid amount", "bid strategy"} and not scopes:
             scopes = ("adset",)
+        entities = entity_groups[subject.scope_group]
         if facet == "bid strategy" and not explicitly_scoped and len(entities) > 1:
             # An unqualified strategy in a compact multi-entity search is
             # ambiguous: expose both typed tools rather than lose one.
@@ -475,6 +543,13 @@ def _entity_route(text: str) -> str | None:
 
 def _bare_canonical_names(text: str, names: frozenset[str]) -> tuple[str, ...]:
     """Return live underscore identifiers in source order."""
+    if re.fullmatch(_QUOTED_VALUE, text):
+        # Quoting one exact tool identifier is still an explicit tool search.
+        literal = text[1:-1]
+        return (literal,) if literal in names else ()
+    # Quoted configuration values are data, even when they contain the name
+    # of a live tool. Exact call arguments were validated before this scan.
+    text = re.sub(_QUOTED_VALUE, lambda match: " " * len(match[0]), text)
     matches: list[tuple[int, str]] = []
     for name in names:
         match = re.search(rf"(?<![a-z0-9_]){re.escape(name)}(?![a-z0-9_])", text)

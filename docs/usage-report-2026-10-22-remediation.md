@@ -16,7 +16,7 @@ automatic mutation-retry system.
 
 ## Validation
 
-The final full suite passed **1,482 tests**, with **32 live tests skipped**,
+The final full suite passed **1,562 tests**, with **32 live tests skipped**,
 using the project's installed Python environment and this checkout's source.
 The unchanged baseline passed 1,257 tests with the same 32 skips. Installed
 dependencies passed `uv pip check`, and `git diff --check` was clean.
@@ -51,11 +51,12 @@ All three review findings on `327f38d` were reproduced before correction:
   mutate cached data. Integrity failure, replacement, deletion, and expiry
   invalidate it; restart rereads persisted artifacts and continuations.
 
-The final independent pass found no further actionable errors: 4,030 routing
-matrix checks and 250 actual local MCP `search_tools` checks passed. A second
-cross-review passed 36 additional actual discovery calls. The full suite passed
-1,482 tests with 32 live tests skipped, adding 95 regression cases since the
-initial PR. No Meta API calls were needed for these checks.
+For correction commit `4f59a38`, the independent pass completed 4,030 routing
+matrix checks and 250 actual local MCP `search_tools` checks. A second
+cross-review passed 36 additional discovery calls. That commit's full suite
+passed 1,482 tests with 32 live tests skipped. The subsequent GitHub review
+identified two additional cases, addressed below; the earlier matrix did not
+cover them. No Meta API calls were needed for these checks.
 
 One local before/after measurement used the same 100,000 synthetic records,
 5,889,116-byte archive, `item_limit=500`, and 63,000-byte MCP result budget.
@@ -66,6 +67,45 @@ time fell from 3.1633 to 0.4524 seconds. The cold first read increased from
 measurements, not general latency guarantees. The conservative cache estimate
 was 40,091,515 bytes; it is not process RSS. Oversized decoded artifacts bypass
 the cache and retain the original repeated-parse cost.
+
+### Coordinated discovery and result limits
+
+The two later review findings on `4f59a38` were also reproduced before correction:
+
+- [Coordinated preservation subjects](https://github.com/jeffreywlai/meta-ads-mcp/pull/13#discussion_r4351931334):
+  keep the whole field list under its instruction before assigning routes.
+  Repeated entity names and comma-delimited subjects now share the final
+  preservation predicate. For example, `update campaign budget; adset bid amount
+  and adset status must not change` exposes only the campaign budget updater.
+  `update campaign budget, name and objective must not change` does the same.
+- [Explicit result truncation](https://github.com/jeffreywlai/meta-ads-mcp/pull/13#discussion_r4351931383):
+  retain every compatible explicitly selected tool. The configured result cap
+  still bounds fuzzy matches. A seven-operation request now includes the
+  general campaign updater needed for its name change; duplicate names,
+  read-only mode, and exact-call validation retain their existing constraints.
+
+Independent review also reproduced adjacent context errors. Repeated read
+subjects now retain their read verb even beside an explicit write; completed
+target values preserve positive changes before a later preservation list; bid
+strategy values permit following fields; and quoted configuration data cannot
+select a tool merely by containing its canonical name. Explicit entity changes
+continue to scope the following fields. These rules cover a bounded command
+grammar, not arbitrary natural language; unfamiliar strategy strings can be
+quoted or supplied through an exact typed tool call.
+
+The full suite passed 1,562 tests with 32 live tests skipped, adding 80 regression
+cases since `4f59a38`. Router tests and real local MCP discovery tests cover the
+reported queries, positive controls, read context, preservation context,
+literal arguments, and configured result caps.
+
+The final independent GPT-6.1-Sol maximum-reasoning review found no further
+actionable errors in these changes: 527 routing/safety checks and 116 actual
+local MCP search calls passed, with result caps of one, three, six, and twelve.
+Another 16 cap, deduplication, and fuzzy-search checks passed. The reviewed
+source hashes remained unchanged throughout that verification.
+A second GPT-6.1-Sol maximum-reasoning reviewer independently checked the final
+diff and additional real search cases, with no actionable findings; its focused
+intent, preservation, and coordinator suite passed all 288 tests.
 
 ## Findings
 
