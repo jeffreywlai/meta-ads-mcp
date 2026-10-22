@@ -4,7 +4,7 @@ This module is deliberately not a general natural-language parser.  It gives
 the BM25 search coordinator three guarantees:
 
 * an exact public tool name selects that tool;
-* a small set of direct English commands selects a deterministic route; and
+* a small set of direct English commands selects deterministic routes; and
 * everything else is read-safe and left to BM25 for ranking.
 
 FastMCP remains the coordinator and the source of truth for tool schemas.  An
@@ -64,6 +64,7 @@ _EXACT_CALL = re.compile(
 )
 _READ_VERBS = frozenset(
     {
+        "aggregate",
         "compare",
         "detect",
         "estimate",
@@ -136,6 +137,66 @@ _BUDGET_ALIASES = {
 _CREATE_ALIASES = {
     "creative": "create_ad_creative",
 }
+_CONFIGURATION_FACETS = (
+    r"daily budget|lifetime budget|bid amount|bid strategy|status|budget|name|objective"
+)
+_CONFIGURATION_TOKEN = re.compile(
+    r"\b(?P<entity>ad set|adset|campaign)\b|"
+    rf"\b(?P<facet>{_CONFIGURATION_FACETS})\b"
+)
+_CONFIGURATION_CONTINUATION = re.compile(
+    r"^\s*(?:(?:and(?:\s+then)?|or|then)\s+)?"
+    r"(?:(?P<entity>ad set|adset|campaign)\s+)?"
+    rf"(?:{_CONFIGURATION_FACETS})\b",
+    re.IGNORECASE,
+)
+_PRESERVATION = (
+    r"(?:(?:must|should|shall|will|would|can|could|may|might|need|do|does|did|"
+    r"is|are|was|were|has|have)\s+(?:not|never)|cannot|"
+    r"(?:mustn|shouldn|shan|won|wouldn|can|couldn|mightn|don|doesn|didn|isn|aren|wasn|weren)'t)\b|"
+    r"(?:(?:(?:must|should|shall|will|would|may|might|needs?\s+to)\s+)?"
+    r"(?:remain(?:s)?|stay(?:s)?|be|is|are|was|were)\s+)?(?:unchanged|(?:the\s+)?same)\b"
+)
+_POSTFIX_PRESERVATION = re.compile(rf"^[\s,:]*(?:{_PRESERVATION})", re.IGNORECASE)
+_EXCLUDED_SUFFIX = re.compile(
+    rf"\b(?:{_PRESERVATION}|without|except|not|never|don't|dont|do not|to\s+match|based\s+on|"
+    r"but\s+(?:only\s+)?(?:show|read|list|get|inspect|compare|view))\b",
+    re.IGNORECASE,
+)
+_QUOTED_VALUE = r'''(?:"(?:\\.|[^"\\])*"|(?<!\w)'(?:\\.|[^'\\])*')'''
+_CONFIGURATION_VALUES = {
+    **dict.fromkeys(
+        ("budget", "daily budget", "lifetime budget", "bid amount"),
+        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)",
+    ),
+    "status": r"(?:active|paused|archived|deleted)",
+    # Strategies are strings in the live schema. Accept enum-shaped tokens or
+    # quoted strings without interpreting their contents as another field.
+    "bid strategy": rf"(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)+|{_QUOTED_VALUE})",
+    "name": _QUOTED_VALUE,
+    "objective": rf"(?:outcome_[a-z_]+|{_QUOTED_VALUE})",
+}
+_CONFIGURATION_SEPARATOR = re.compile(
+    r"^[\s,]*(?:(?:and(?:\s+then)?|or|then)[\s,]*)?$"
+)
+_STATUS_VERBS = frozenset({"pause", "resume", "enable", "disable"})
+_EXPLICIT_OPERATION = re.compile(
+    r"^\s*(?:(?:please|kindly)\s+)*(?:"
+    + "|".join(sorted(_READ_VERBS | _WRITE_VERBS))
+    + r"|[a-z][a-z0-9]*_[a-z0-9_]+)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigurationSubject:
+    """One field and its optional entity and literal target value."""
+
+    entity: str | None
+    facet: str
+    end: int
+    has_value: bool
+    scope_group: int
 
 
 def normalize_query(query: str) -> str:
@@ -149,12 +210,14 @@ def _compact_query(query: str) -> str:
 
 
 def _operation_clauses(query: str) -> tuple[str, ...]:
-    """Split only on top-level semicolons/newlines outside literals."""
+    """Split a command list outside literals and exact-call arguments."""
     clauses: list[str] = []
     start = 0
     stack: list[str] = []
     quote: str | None = None
     escaped = False
+    qualifier_scope = False
+    preservation_scope = False
     matching = {")": "(", "]": "[", "}": "{"}
     for index, character in enumerate(query):
         if quote is not None:
@@ -165,17 +228,175 @@ def _operation_clauses(query: str) -> tuple[str, ...]:
             elif character == quote:
                 quote = None
             continue
-        if character in {"'", '"'}:
+        if character in {"'", '"'} and not (
+            character == "'" and index and query[index - 1].isalnum()
+        ):
             quote = character
         elif character in "([{":
             stack.append(character)
         elif character in ")]}" and stack and stack[-1] == matching[character]:
             stack.pop()
-        elif character in ";\n" and not stack:
+        elif not stack and _EXCLUDED_SUFFIX.match(query, index):
+            qualifier_scope = True
+            clause_prefix = _OPTIONAL_POLITENESS.sub("", normalize_query(query[start:]))
+            if _POSTFIX_PRESERVATION.match(query[index:]) and not _DIRECT_NEGATION.match(clause_prefix):
+                preservation_scope = True
+        elif character in ";\n," and not stack:
+            if character == ",":
+                remainder = query[index + 1 :]
+                explicit_operation = _EXPLICIT_OPERATION.match(remainder)
+                if (qualifier_scope and not (preservation_scope and explicit_operation)) or (
+                    _POSTFIX_PRESERVATION.match(remainder)
+                    or _CONFIGURATION_CONTINUATION.match(remainder)
+                ):
+                    continue
             clauses.append(query[start:index])
             start = index + 1
+            qualifier_scope = False
+            preservation_scope = False
+        elif character.isspace() and not stack:
+            separator = re.match(
+                r"\s+(?:and(?:\s+then)?|then)\s+", query[index:], re.IGNORECASE
+            )
+            if separator is not None:
+                remainder = query[index + separator.end() :]
+                if qualifier_scope and not (
+                    preservation_scope and _EXPLICIT_OPERATION.match(remainder)
+                ):
+                    continue
+                # Entity repetition does not start a new command. Keep the
+                # complete subject list under its read/write verb and shared
+                # postfix predicate until configuration parsing is complete.
+                if _CONFIGURATION_CONTINUATION.match(remainder):
+                    continue
+                clauses.append(query[start:index])
+                start = index + separator.end()
+                qualifier_scope = False
+                preservation_scope = False
     clauses.append(query[start:])
     return tuple(clauses)
+
+
+def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...] | None:
+    """Recognize a bounded field list; None leaves other commands to the router."""
+    simplified = _strip_articles(text.replace("-", " ").split())
+    verb, _space, tail = simplified.partition(" ")
+    write_requested = verb in {"update", "set"} | _STATUS_VERBS
+    read_requested = verb in _READ_VERBS
+    if not write_requested and not read_requested:
+        if not allow_shorthand:
+            return None
+        tail = simplified
+    if not _CONFIGURATION_CONTINUATION.match(tail):
+        return None
+    # Preserve offsets but hide literal contents from field and qualifier scans.
+    full_tail = re.sub(_QUOTED_VALUE, lambda match: " " * len(match[0]), tail)
+    # Negative, reference, and read-only qualifiers are outside the changes.
+    excluded_suffix = _EXCLUDED_SUFFIX.search(full_tail)
+    end = excluded_suffix.start() if excluded_suffix is not None else len(full_tail)
+    # Parse whole subjects before assigning routes. A shared postfix predicate
+    # applies to its coordinated field list, including repeated entity names.
+    subjects: list[_ConfigurationSubject] = []
+    pending_entity: str | None = None
+    previous_end = 0
+    scope_group = 0
+    while (token := _CONFIGURATION_TOKEN.search(full_tail, previous_end, end)) is not None:
+        separator = tail[previous_end:token.start()]
+        if not _CONFIGURATION_SEPARATOR.fullmatch(separator):
+            break
+        if raw_entity := token.group("entity"):
+            if subjects and separator.strip():
+                # Explicit entity coordination starts a new field scope while
+                # retaining the command's verb and shared predicate.
+                scope_group += 1
+            pending_entity = raw_entity.replace("ad set", "adset")
+            previous_end = token.end()
+            continue
+        facet = token.group("facet")
+        value_pattern = _CONFIGURATION_VALUES.get(facet)
+        value = re.match(
+            rf"\s+(?:to\s+)?{value_pattern}(?=\s|[,;:]|$)",
+            tail[token.end():end],
+        ) if value_pattern is not None else None
+        previous_end = token.end() + (value.end() if value is not None else 0)
+        subjects.append(_ConfigurationSubject(
+            entity=pending_entity,
+            facet=facet,
+            end=previous_end,
+            has_value=value is not None,
+            scope_group=scope_group,
+        ))
+        pending_entity = None
+    if subjects and not read_requested and _POSTFIX_PRESERVATION.match(full_tail[subjects[-1].end:]):
+        # The explicit verb owns the first field; subsequent unvalued fields
+        # form the preservation subject. A supplied target value also closes
+        # a positive subject before the following preservation list, including
+        # shorthand within an already established write context.
+        keep = 1 if write_requested and len(subjects) > 1 else 0
+        for index, subject in enumerate(subjects[:-1]):
+            if subject.has_value:
+                keep = index + 1
+        subjects = subjects[:keep]
+    if verb in _STATUS_VERBS and subjects and subjects[0].facet != "status":
+        return None
+    if read_requested:
+        if verb in _GET_SYNONYMS | {"get"}:
+            return tuple(dict.fromkeys(
+                _ENTITY_GETTERS[subject.entity]
+                for subject in subjects if subject.entity is not None
+            ))
+        return ()
+    entity_groups = {
+        group: tuple(dict.fromkeys(
+            subject.entity for subject in subjects
+            if subject.scope_group == group and subject.entity is not None
+        ))
+        for group in {subject.scope_group for subject in subjects}
+    }
+    entity: str | None = None
+    explicitly_scoped = False
+    routes: list[str] = []
+    for subject in subjects:
+        if subject.entity is not None:
+            entity = subject.entity
+            explicitly_scoped = True
+        facet = subject.facet
+        scopes = (entity,) if entity is not None else ()
+        if facet in {"bid amount", "bid strategy"} and not scopes:
+            scopes = ("adset",)
+        entities = entity_groups[subject.scope_group]
+        if facet == "bid strategy" and not explicitly_scoped and len(entities) > 1:
+            # An unqualified strategy in a compact multi-entity search is
+            # ambiguous: expose both typed tools rather than lose one.
+            scopes = entities
+        for scope in scopes:
+            if facet == "status":
+                routes.append(f"set_{scope}_status")
+            elif facet == "bid amount":
+                routes.append(f"update_{scope}_bid_amount")
+            elif facet == "bid strategy":
+                routes.append(f"update_{scope}_bid_strategy")
+            elif facet in {"name", "objective"}:
+                routes.append(f"update_{scope}")
+            else:
+                routes.append(f"update_{scope}_budget")
+        explicitly_scoped = False
+    return tuple(dict.fromkeys(routes))
+
+
+def _workflow_route(text: str) -> str | None:
+    """Small aliases for the creative-replacement and saved-report workflows."""
+    if re.match(r"^(?:get|fetch|find|inspect|read|show|view) ad creative\b", text):
+        return "get_creative"
+    if re.match(r"^update ad creative\b", text):
+        return "update_ad_creative"
+    if re.match(r"^upload (?:an? )?image\b", text):
+        return "upload_creative_asset"
+    if re.match(r"^(?:summarize|aggregate)\b", text) and re.search(
+        r"\b(?:async(?: insights)? report|report_run_id|report run id)\b", text
+    ):
+        return "summarize_async_insights_report"
+    return None
 
 
 def _effect_from_contract(contract: ToolContract) -> Effect | None:
@@ -322,6 +543,13 @@ def _entity_route(text: str) -> str | None:
 
 def _bare_canonical_names(text: str, names: frozenset[str]) -> tuple[str, ...]:
     """Return live underscore identifiers in source order."""
+    if re.fullmatch(_QUOTED_VALUE, text):
+        # Quoting one exact tool identifier is still an explicit tool search.
+        literal = text[1:-1]
+        return (literal,) if literal in names else ()
+    # Quoted configuration values are data, even when they contain the name
+    # of a live tool. Exact call arguments were validated before this scan.
+    text = re.sub(_QUOTED_VALUE, lambda match: " " * len(match[0]), text)
     matches: list[tuple[int, str]] = []
     for name in names:
         match = re.search(rf"(?<![a-z0-9_]){re.escape(name)}(?![a-z0-9_])", text)
@@ -371,7 +599,15 @@ class StructuredIntentRouter:
         verb_scoped_candidates: set[str] = set()
         excluded: set[str] = set()
         invalid_exact = False
-        for raw_clause in _operation_clauses(query):
+        clauses = _operation_clauses(query)
+        allow_shorthand = len(clauses) > 1 and any(
+            re.match(
+                r"^(?:update|set|pause|resume|enable|disable)\b",
+                _OPTIONAL_POLITENESS.sub("", normalize_query(clause)),
+            )
+            for clause in clauses
+        )
+        for raw_clause in clauses:
             literal_clause = _compact_query(raw_clause)
             clause = literal_clause.lower()
             politeness = _OPTIONAL_POLITENESS.match(clause)
@@ -423,10 +659,25 @@ class StructuredIntentRouter:
                     preferred.extend(explicit)
                 continue
 
+            configuration_routes = _configuration_routes(
+                clause, allow_shorthand=allow_shorthand
+            )
+            if configuration_routes is not None:
+                configuration_routes = tuple(name for name in configuration_routes if name in names)
+                if negated is not None:
+                    excluded.update(configuration_routes)
+                else:
+                    preferred.extend(configuration_routes)
+                continue
+
             direct_verb = clause.split(" ", 1)[0]
             if direct_verb not in _READ_VERBS | _WRITE_VERBS:
                 continue
-            route = _canonical_surface_route(clause, names) or _entity_route(clause)
+            route = (
+                _workflow_route(clause)
+                or _canonical_surface_route(clause, names)
+                or _entity_route(clause)
+            )
             if route is None or route not in names:
                 if negated is None and direct_verb in _WRITE_VERBS:
                     verb_scoped_candidates.update(

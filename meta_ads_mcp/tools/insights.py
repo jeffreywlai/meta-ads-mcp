@@ -6,6 +6,7 @@ import asyncio
 import csv
 import json
 from datetime import date
+from decimal import Decimal, InvalidOperation, localcontext
 from io import StringIO
 from typing import Any, Literal
 
@@ -502,6 +503,34 @@ def _normalize_rows(
     return rows
 
 
+def _compact_rows(
+    rows: list[dict[str, Any]],
+    *,
+    fields: FieldList | None,
+    flatten_actions: list[str],
+) -> list[dict[str, Any]]:
+    """Remove synthesized padding after calculations, preserving requested nulls."""
+    requested = set(normalize_field_list(fields) or [])
+    result = []
+    for row in rows:
+        compact = {
+            key: value for key, value in row.items()
+            if value is not None or key in requested or key in flatten_actions
+        }
+        # Keep the legacy metric envelope for ordinary reports. A scalar action
+        # projection is already an explicit compact output contract.
+        compact["metrics"] = {
+            key: value for key, value in row["metrics"].items()
+            if value is not None and not (
+                flatten_actions and key in compact and compact[key] == value
+            )
+        }
+        if flatten_actions:
+            _remove_raw_actions(compact)
+        result.append(compact)
+    return result
+
+
 def _default_async_fields(level: str, field_preset: str) -> list[str]:
     """Return a bounded async default while preserving an explicit full preset."""
     if field_preset == "full":
@@ -778,7 +807,7 @@ async def get_entity_insights(
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
 ) -> dict[str, Any]:
-    """Return compact paginated insights with generic action maps and optional flattened columns. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values."""
+    """Return paginated insights with optional named scalar actions such as purchase. flatten_actions removes full action maps unless include_raw_actions=true. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values."""
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     action_breakdowns = coerce_csv_string_list(action_breakdowns)
@@ -872,6 +901,9 @@ async def get_entity_insights(
         for row in rows:
             for field in RAW_ACTION_ARRAY_FIELDS:
                 row.pop(field, None)
+        response["items"] = _compact_rows(
+            rows, fields=fields, flatten_actions=flatten_actions,
+        )
     return response
 
 
@@ -1351,13 +1383,23 @@ async def create_async_insights_report(
             filtering=filtering,
         ),
     )
+    report_run_id = payload.get("report_run_id") or payload.get("id")
+    poll_arguments = {"report_run_id": report_run_id, "fields": requested_fields}
+    if flatten_actions:
+        poll_arguments["flatten_actions"] = flatten_actions
+    if any(value != "action_type" for value in coerce_csv_string_list(action_breakdowns) or []):
+        poll_arguments["include_raw_actions"] = True
     return {
-        "report_run_id": payload.get("report_run_id") or payload.get("id"),
+        "report_run_id": report_run_id,
         "status": payload,
         "requested_fields": requested_fields,
         "field_preset": effective_field_preset,
         "flatten_actions": flatten_actions,
-        "poll_hint": "Use get_async_insights_report with the returned report_run_id.",
+        "poll_arguments": poll_arguments,
+        "poll_hint": (
+            "Call get_async_insights_report with poll_arguments, including flatten_actions. "
+            "Projection options are explicit and must be passed on every fetch, including after a server restart."
+        ),
     }
 
 
@@ -1523,12 +1565,17 @@ async def get_async_insights_report(
             row_summary["flattened_action_columns"] = [
                 _normalize_key(label) for label in flatten_actions
             ]
+        paging = normalize_collection(rows_payload)["paging"]
+        row_summary["complete"] = not bool(paging.get("next"))
+        row_summary["truncated"] = bool(paging.get("next"))
+        if not include_raw_actions:
+            rows = _compact_rows(rows, fields=fields, flatten_actions=flatten_actions)
         return {
             "status": payload["status"],
             "job": job,
             "rows": collection_response(
                 rows,
-                paging=normalize_collection(rows_payload)["paging"],
+                paging=paging,
                 summary=row_summary,
             ),
         }
@@ -1537,3 +1584,156 @@ async def get_async_insights_report(
         "job": job,
         "rows": collection_response([], summary={"count": 0}),
     }
+
+
+@mcp_server.tool()
+async def summarize_async_insights_report(
+    report_run_id: str,
+    group_by: StrictStringList | None = None,
+    metrics: StrictStringList | None = None,
+    after: str | None = None,
+    page_size: int = 500,
+    max_pages: int = 250,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Sum spend, impressions, clicks, or inline_link_clicks across async report pages. Spend is an exact decimal string in account-currency major units; counts are integers. For monthly catalog spend use group_by=['date_start'] and metrics=['spend']. Ratios, reach, and action counts are excluded: their rows may overlap. Check summary.complete before interpreting totals as the whole report; next_page_arguments resumes a bounded page range, whose totals must be combined with earlier ranges."""
+    groups = coerce_strict_csv_string_list(group_by)
+    if not isinstance(groups, list) or any(
+        not isinstance(field, str) or not field or not field.isidentifier()
+        for field in groups
+    ):
+        raise ValidationError("group_by must contain simple report column names.")
+    groups = list(dict.fromkeys(groups))
+    metric_values = coerce_strict_csv_string_list(metrics)
+    if not isinstance(metric_values, list) or any(not isinstance(value, str) for value in metric_values):
+        raise ValidationError("metrics must be a string list or comma-separated string.")
+    selected_metrics = list(dict.fromkeys(metric_values or ["spend"]))
+    allowed_metrics = {"spend", "impressions", "clicks", "inline_link_clicks"}
+    if not set(selected_metrics) <= allowed_metrics or set(groups) & set(selected_metrics):
+        raise ValidationError("Use additive metrics only, distinct from group_by columns.")
+    if not 1 <= page_size <= 1000 or not 1 <= max_pages <= 1000:
+        raise ValidationError("page_size and max_pages must each be between 1 and 1000.")
+    if not 0 < timeout_seconds <= 60:
+        raise ValidationError("timeout_seconds must be greater than 0 and at most 60.")
+    after = blank_to_none(after)
+    cursor = after
+    seen_cursors = {after} if after else set()
+    totals: dict[tuple[Any, ...], dict[str, Decimal | int | None]] = {}
+    rows_scanned = 0
+    pages_fetched = 0
+    exhausted = False
+    status: dict[str, Any] = {}
+    job: dict[str, Any] = {}
+    stop_reason = "max_pages"
+    client = get_graph_api_client()
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            for _ in range(max_pages):
+                if pages_fetched == 0:
+                    payload = await client.get_async_report(
+                        report_run_id, fields=None, limit=page_size, after=cursor,
+                    )
+                    status = payload["status"]
+                    job = _async_job_state(status, poll_interval_seconds=2.0)
+                    if not job["ready"]:
+                        stop_reason = "report_not_ready"
+                        break
+                    page = payload.get("rows") or {}
+                else:
+                    page = await client.list_objects(
+                        report_run_id, "insights", fields=None,
+                        params={"limit": page_size, "after": cursor},
+                    )
+                rows = page.get("data", [])
+                paging = normalize_collection(page)["paging"]
+                next_cursor = paging.get("after") if paging.get("next") else None
+                if paging.get("next") and (
+                    not next_cursor or next_cursor in seen_cursors
+                ):
+                    raise ValidationError(
+                        "Report pagination has a missing/repeated cursor; "
+                        "no complete aggregate was returned."
+                    )
+                for row in rows:
+                    if any(field not in row for field in groups):
+                        raise ValidationError("A group_by column is absent from the report; recreate it with that field/breakdown.")
+                    key = tuple(row[field] for field in groups)
+                    if any(isinstance(value, (dict, list)) for value in key):
+                        raise ValidationError("group_by columns must have scalar values.")
+                    if key not in totals:
+                        if len(totals) >= 10_000:
+                            raise ValidationError("Aggregation exceeded 10,000 groups; use fewer group_by columns.")
+                        totals[key] = {
+                            metric: Decimal(0) if metric == "spend" else 0
+                            for metric in selected_metrics
+                        }
+                    for metric in selected_metrics:
+                        value = row.get(metric)
+                        if value is None or value == "":
+                            totals[key][metric] = None
+                            continue
+                        try:
+                            number = Decimal(str(value))
+                        except (InvalidOperation, ValueError) as exc:
+                            raise ValidationError(f"Report metric '{metric}' is not numeric.") from exc
+                        if not number.is_finite():
+                            raise ValidationError(f"Report metric '{metric}' is not finite.")
+                        if metric != "spend" and number != number.to_integral_value():
+                            raise ValidationError(f"Report count metric '{metric}' is not an integer.")
+                        total = totals[key][metric]
+                        if total is not None:
+                            if metric == "spend":
+                                # Align decimal places and leave room for carry;
+                                # the ambient Decimal precision must not round sums.
+                                with localcontext() as decimal_context:
+                                    decimal_context.prec = max(total.adjusted(), number.adjusted(), 0) - min(
+                                        total.as_tuple().exponent, number.as_tuple().exponent, 0,
+                                    ) + 2
+                                    totals[key][metric] = total + number
+                            else:
+                                totals[key][metric] = total + int(number)
+                rows_scanned += len(rows)
+                pages_fetched += 1
+                cursor = next_cursor
+                if cursor is None:
+                    exhausted = True
+                    stop_reason = "end_of_report"
+                    break
+                seen_cursors.add(cursor)
+    except TimeoutError:
+        stop_reason = "timeout"
+    items = [
+        {
+            **dict(zip(groups, key)),
+            **{
+                metric: (format(value, "f") if metric == "spend" else int(value))
+                if value is not None else None
+                for metric, value in values.items()
+            },
+        }
+        for key, values in totals.items()
+    ]
+    result = {
+        "report_run_id": report_run_id,
+        "status": status,
+        "job": job,
+        "items": items,
+        "summary": {
+            "count": len(items), "rows_scanned": rows_scanned,
+            "pages_fetched": pages_fetched, "group_by": groups,
+            "metrics": selected_metrics, "complete": exhausted and after is None,
+            "page_range_complete": exhausted, "stop_reason": stop_reason,
+            "totals_scope": "entire_report" if exhausted and after is None else "returned_pages",
+            "start_after": after,
+            "numeric_encoding": {"spend": "exact_decimal_string", "counts": "integer"},
+            "missing_metric_policy": "A missing value makes its group total null, never zero.",
+        },
+    }
+    if not exhausted and stop_reason != "report_not_ready":
+        result["next_page_arguments"] = {
+            "report_run_id": report_run_id, "group_by": groups,
+            "metrics": selected_metrics, "after": cursor,
+            "page_size": page_size, "max_pages": max_pages,
+            "timeout_seconds": timeout_seconds,
+        }
+    return result

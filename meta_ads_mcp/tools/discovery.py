@@ -77,6 +77,15 @@ AD_FIELDS = [
     "creative",
 ]
 
+MONETARY_FIELDS = {
+    "daily_budget", "lifetime_budget", "amount_spent", "balance", "bid_amount",
+}
+
+DESTINATION_CREATIVE_FIELDS = [
+    "link_url", "object_url", "object_store_url", "template_url", "link_deep_link_url",
+    "object_story_spec", "asset_feed_spec{link_urls}", "call_to_action",
+]
+
 PAGE_FIELDS = [
     "id",
     "name",
@@ -125,20 +134,14 @@ async def _hydrate_and_normalize_monetary_fields(
     items: list[dict[str, Any]],
     *,
     fallback_account_id: str | None = None,
+    selected_fields: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve entity currencies by account, then normalize their monetary fields."""
     currency_by_account: dict[str, str] = {}
-    monetary_fields = {
-        "daily_budget",
-        "lifetime_budget",
-        "amount_spent",
-        "balance",
-        "bid_amount",
-    }
     for item in items:
         if not any(
             key in item and item.get(key) not in (None, "", "null")
-            for key in monetary_fields
+            for key in MONETARY_FIELDS
         ):
             if item.get("account_id"):
                 item["account_id"] = normalize_account_id(str(item["account_id"]))
@@ -155,7 +158,92 @@ async def _hydrate_and_normalize_monetary_fields(
             currency_by_account[account_id] = currency
         item["account_id"] = account_id
         item["currency"] = currency
-    return _normalize_monetary_fields(items)
+    _normalize_monetary_fields(items)
+    if selected_fields is not None:
+        for item in items:
+            for dependency in ("account_id", "currency"):
+                if dependency not in selected_fields:
+                    item.pop(dependency, None)
+    return items
+
+
+def _entity_read_fields(fields: FieldList | None, defaults: list[str]) -> list[str]:
+    """Include account context only when needed to decode selected money fields."""
+    requested_fields = list(normalize_field_list(fields) or defaults)
+    if MONETARY_FIELDS.intersection(requested_fields) and "account_id" not in requested_fields:
+        requested_fields.append("account_id")
+    return requested_fields
+
+
+def _field_name(field: str) -> str:
+    """Return a Graph selection's top-level name."""
+    return re.split(r"[.{]", field, maxsplit=1)[0].strip()
+
+
+def _ad_graph_fields(selected_fields: list[str]) -> list[str]:
+    """Replace the local destination_urls projection with creative URL sources."""
+    if "destination_urls" not in selected_fields:
+        return list(selected_fields)
+    graph_fields = [
+        field for field in selected_fields
+        if field != "destination_urls" and _field_name(field) != "creative"
+    ]
+    creative_fields = list(DESTINATION_CREATIVE_FIELDS)
+    for field in selected_fields:
+        if _field_name(field) != "creative" or "{" not in field:
+            continue
+        # Keep explicitly requested creative details. If two selections for one
+        # structured field differ, fetch that whole field rather than dropping either.
+        for selection in normalize_field_list(field.partition("{")[2].rsplit("}", 1)[0]) or []:
+            name = _field_name(selection)
+            position = next((i for i, value in enumerate(creative_fields) if _field_name(value) == name), None)
+            if position is None:
+                creative_fields.append(selection)
+            elif creative_fields[position] != selection:
+                creative_fields[position] = name
+    graph_fields.append("creative{" + ",".join(creative_fields) + "}")
+    return graph_fields
+
+
+def _destination_urls(creative: dict[str, Any]) -> list[str]:
+    """Extract configured destinations, excluding image/video/display URLs."""
+    urls: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value.strip() and value.strip() not in urls:
+            urls.append(value.strip())
+
+    def add_call_to_action(value: Any) -> None:
+        if isinstance(value, dict) and isinstance(value.get("value"), dict):
+            add(value["value"].get("link"))
+
+    for field in ("link_url", "object_url", "object_store_url", "template_url", "link_deep_link_url"):
+        add(creative.get(field))
+    add_call_to_action(creative.get("call_to_action"))
+    story = creative.get("object_story_spec") or {}
+    for field in ("link_data", "template_data", "video_data"):
+        data = story.get(field) or {}
+        add(data.get("link"))
+        add_call_to_action(data.get("call_to_action"))
+        for attachment in data.get("child_attachments") or []:
+            add(attachment.get("link"))
+            add_call_to_action(attachment.get("call_to_action"))
+    asset_feed = creative.get("asset_feed_spec") or {}
+    for link in asset_feed.get("link_urls") or []:
+        for field in ("website_url", "deeplink_url"):
+            add(link.get(field))
+    return urls
+
+
+def _project_ad_destinations(items: list[dict[str, Any]], fields: list[str]) -> None:
+    """Keep destination-only responses compact while preserving requested creative data."""
+    if "destination_urls" not in fields:
+        return
+    keep_creative = any(_field_name(field) == "creative" for field in fields)
+    for item in items:
+        item["destination_urls"] = _destination_urls(item.get("creative") or {})
+        if not keep_creative:
+            item.pop("creative", None)
 
 
 def _status_filter(effective_status: list[str] | None) -> dict[str, Any]:
@@ -226,12 +314,19 @@ async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[st
 
 
 @mcp_server.tool()
-async def get_ad_account(account_id: str) -> dict[str, Any]:
-    """Use this when the user already has one account id and wants core metadata for that account."""
+async def get_ad_account(account_id: str, fields: FieldList | None = None) -> dict[str, Any]:
+    """Inspect one account with selectable fields. Monetary amounts use major units of the account currency."""
+    selected_fields = normalize_field_list(fields) or None
+    requested_fields = list(selected_fields or ACCOUNT_FIELDS)
+    if MONETARY_FIELDS.intersection(requested_fields) and "currency" not in requested_fields:
+        requested_fields.append("currency")
     client = get_graph_api_client()
-    account = await client.get_object(_resolve_account_id(account_id), fields=ACCOUNT_FIELDS)
+    account = await client.get_object(_resolve_account_id(account_id), fields=requested_fields)
+    _normalize_monetary_fields([account])
+    if selected_fields is not None and "currency" not in selected_fields:
+        account.pop("currency", None)
     return {
-        "item": _normalize_monetary_fields([account])[0],
+        "item": account,
         "summary": {"count": 1},
     }
 
@@ -278,13 +373,13 @@ async def list_campaigns(
 @mcp_server.tool()
 async def get_campaign(campaign_id: str, fields: FieldList | None = None) -> dict[str, Any]:
     """Inspect one campaign's configuration with optional fields. Meta validates field availability."""
-    requested_fields = list(normalize_field_list(fields) or CAMPAIGN_FIELDS)
-    if {"daily_budget", "lifetime_budget"}.intersection(requested_fields) and "account_id" not in requested_fields:
-        requested_fields.append("account_id")
+    requested_fields = _entity_read_fields(fields, CAMPAIGN_FIELDS)
     client = get_graph_api_client()
     campaign = await client.get_object(campaign_id, fields=requested_fields)
     return {
-        "item": (await _hydrate_and_normalize_monetary_fields(client, [campaign]))[0],
+        "item": (await _hydrate_and_normalize_monetary_fields(
+            client, [campaign], selected_fields=normalize_field_list(fields) or None,
+        ))[0],
         "summary": {"count": 1},
     }
 
@@ -323,12 +418,14 @@ async def list_adsets(
 
 
 @mcp_server.tool()
-async def get_adset(adset_id: str) -> dict[str, Any]:
-    """Use this when the user already has an ad set id and wants its current settings."""
+async def get_adset(adset_id: str, fields: FieldList | None = None) -> dict[str, Any]:
+    """Inspect one ad set with selectable fields. Budgets and bids use major units of the account currency; ROAS floors remain raw x10000 integers."""
     client = get_graph_api_client()
-    adset = await client.get_object(adset_id, fields=ADSET_FIELDS)
+    adset = await client.get_object(adset_id, fields=_entity_read_fields(fields, ADSET_FIELDS))
     return {
-        "item": (await _hydrate_and_normalize_monetary_fields(client, [adset]))[0],
+        "item": (await _hydrate_and_normalize_monetary_fields(
+            client, [adset], selected_fields=normalize_field_list(fields) or None,
+        ))[0],
         "summary": {"count": 1},
     }
 
@@ -346,19 +443,22 @@ async def list_ads(
     name_contains_any: StrictStringList | None = None,
     whole_term_match: bool = False,
 ) -> dict[str, Any]:
-    """Discover ads with selectable fields. name_contains_any scans up to 1,000 ads once, case-insensitively; whole_term_match treats punctuation/underscores as delimiters. Omitted status uses Meta defaults, not historical inventory."""
+    """Discover ads with selectable fields. name_contains_any unions all pages of one Graph CONTAIN query per term, deduplicated by id; limit is the page size. Meta determines candidate case/Unicode matching, then local casefold and optional whole_term_match refine names (punctuation/underscores delimit terms). fields may include destination_urls for compact configured creative links without creative metadata; redirects, catalog substitutions, and url_tags are not resolved. Omitted status uses Meta defaults, not historical inventory."""
     terms = coerce_strict_csv_string_list(name_contains_any)
     if not isinstance(terms, list) or any(not isinstance(term, str) or not term.strip() for term in terms):
         raise ValidationError("name_contains_any must contain nonblank strings.")
     if name_contains_any is not None and not terms:
         raise ValidationError("name_contains_any must contain at least one term.")
-    terms = list(dict.fromkeys(term.strip().casefold() for term in terms))
+    query_terms: dict[str, str] = {}
+    for term in terms:
+        query_terms.setdefault(term.strip().casefold(), term.strip())
+    terms = list(query_terms)
     if terms and blank_to_none(name_contains):
         raise ValidationError("Use name_contains or name_contains_any, not both.")
     if whole_term_match and not terms:
         raise ValidationError("whole_term_match requires name_contains_any.")
     if terms and blank_to_none(after):
-        raise ValidationError("name_contains_any performs a complete scan; omit after.")
+        raise ValidationError("name_contains_any retrieves all term pages; omit after.")
     if limit < 1:
         raise ValidationError("limit must be positive.")
     account_id = blank_to_none(account_id)
@@ -368,16 +468,16 @@ async def list_ads(
     if scope_count > 1:
         raise ValidationError("Provide at most one of account_id, campaign_id, or adset_id.")
     parent_id = adset_id or campaign_id or _resolve_account_id(account_id)
-    requested_fields = normalize_field_list(fields) or (
+    selected_fields = normalize_field_list(fields) or None
+    requested_fields = list(selected_fields or (
         ["id", "name", "status", "effective_status", "campaign_id", "adset_id"]
         if terms else list(AD_FIELDS)
-    )
+    ))
     if terms:
         for field in ("id", "name"):
             if field not in requested_fields:
                 requested_fields.append(field)
-    if "bid_amount" in requested_fields and "account_id" not in requested_fields:
-        requested_fields.append("account_id")
+    graph_fields = _entity_read_fields(_ad_graph_fields(requested_fields), AD_FIELDS)
     client = get_graph_api_client()
     params: dict[str, Any] = {
         "limit": min(limit, 1000) if terms else limit,
@@ -386,42 +486,47 @@ async def list_ads(
     }
     if after:
         params["after"] = after
-    payload = await client.list_objects(parent_id, "ads", fields=requested_fields, params=params)
-    normalized = normalize_collection(payload)
     if terms:
-        # Fetch the inventory once, not once per term. Never label a capped scan complete.
-        scanned = list(normalized["items"])
-        seen_cursors: set[str] = set()
-        while normalized["paging"].get("next"):
-            if len(scanned) >= 1000:
-                raise ValidationError("Name search exceeded the 1,000-ad scan limit; narrow scope or status. No partial result was returned.")
-            cursor = normalized["paging"].get("after")
-            if not cursor or cursor in seen_cursors or not normalized["items"]:
-                raise ValidationError("Name search pagination could not finish: missing/repeated cursor or empty next page.")
-            seen_cursors.add(cursor)
-            params.update({"after": cursor, "limit": min(limit, 1000 - len(scanned))})
-            payload = await client.list_objects(parent_id, "ads", fields=requested_fields, params=params)
-            normalized = normalize_collection(payload)
-            scanned.extend(normalized["items"])
-        if len(scanned) > 1000:
-            raise ValidationError("Name search exceeded the 1,000-ad scan limit; narrow scope or status. No partial result was returned.")
+        # Graph combines filters with AND. Separate CONTAIN queries implement OR
+        # without scanning every ad in the account or imposing an inventory cap.
+        scanned_by_id: dict[str, dict[str, Any]] = {}
+        for term in terms:
+            term_params = {**params, **_name_filter(query_terms[term])}
+            seen_cursors: set[str] = set()
+            while True:
+                payload = await client.list_objects(parent_id, "ads", fields=graph_fields, params=term_params)
+                page = normalize_collection(payload)
+                for item in page["items"]:
+                    if not item.get("id"):
+                        raise ValidationError("Name search cannot deduplicate a Graph result without an ad id. No partial result was returned.")
+                    scanned_by_id.setdefault(str(item["id"]), item)
+                if not page["paging"].get("next"):
+                    break
+                cursor = page["paging"].get("after")
+                if not cursor or cursor in seen_cursors:
+                    raise ValidationError("Name search pagination could not finish: missing or repeated cursor. No partial result was returned.")
+                seen_cursors.add(cursor)
+                term_params["after"] = cursor
         patterns = {
             term: re.compile(r"(?<![^\W_])" + re.escape(term) + r"(?![^\W_])")
             for term in terms
         } if whole_term_match else {}
         matched = []
-        for item in scanned:
+        for item in scanned_by_id.values():
             name = str(item.get("name") or "").casefold()
             matches = [term for term in terms if (
                 patterns[term].search(name) if whole_term_match else term in name
             )]
             if matches:
                 matched.append({**item, "matched_terms": matches})
-        normalized["items"] = matched
-        normalized["summary"].update({
-            "count": len(matched), "scanned_count": len(scanned),
+        normalized = collection_response(matched, summary={
+            "count": len(matched), "scanned_count": len(scanned_by_id),
             "name_terms": terms, "match_mode": "whole_term" if whole_term_match else "substring",
+            "name_filtering": "graph_contain",
         })
+    else:
+        payload = await client.list_objects(parent_id, "ads", fields=graph_fields, params=params)
+        normalized = normalize_collection(payload)
     normalized["summary"].update({
         "complete": not bool(normalized["paging"].get("next")),
         "effective_status_filter": effective_status or None,
@@ -433,23 +538,33 @@ async def list_ads(
         fallback_account_id=(
             parent_id if campaign_id is None and adset_id is None else None
         ),
+        selected_fields=selected_fields,
     )
+    _project_ad_destinations(normalized["items"], requested_fields)
     return normalized
 
 
 @mcp_server.tool()
-async def get_ad(ad_id: str, include_creative_summary: bool = False) -> dict[str, Any]:
-    """Use this when the user already has an ad id and wants ad metadata, optionally with a lightweight creative summary."""
+async def get_ad(
+    ad_id: str,
+    include_creative_summary: bool = False,
+    fields: FieldList | None = None,
+) -> dict[str, Any]:
+    """Inspect one ad with selectable fields, optionally including a creative summary. fields may include destination_urls for configured creative links (no redirect/catalog resolution or url_tags expansion). Bid amounts use major units of the account currency."""
     client = get_graph_api_client()
-    fields = list(AD_FIELDS)
+    selected_fields = normalize_field_list(fields) or None
+    requested_fields = list(selected_fields or AD_FIELDS)
     if include_creative_summary:
-        fields.remove("creative")
-        fields.append(
+        requested_fields = [field for field in requested_fields if _field_name(field) != "creative"]
+        requested_fields.append(
             "creative{id,name,title,body,object_story_id,effective_object_story_id,"
             "effective_instagram_media_id,object_story_spec}"
         )
-    ad = await client.get_object(ad_id, fields=fields)
-    item = (await _hydrate_and_normalize_monetary_fields(client, [ad]))[0]
+    ad = await client.get_object(ad_id, fields=_entity_read_fields(_ad_graph_fields(requested_fields), AD_FIELDS))
+    item = (await _hydrate_and_normalize_monetary_fields(
+        client, [ad], selected_fields=selected_fields,
+    ))[0]
+    _project_ad_destinations([item], requested_fields)
     return {"item": item, "summary": {"count": 1}}
 
 

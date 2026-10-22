@@ -130,7 +130,8 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
             if str(getattr(tool, "name", "")) not in selected_names
         ]
         ranked = [*selected_tools, *ranked]
-        return ranked[: self._max_results]
+        # The result cap limits fuzzy matches, not explicitly requested operations.
+        return ranked[: max(self._max_results, len(selected_tools))]
 
     def _make_call_tool(self) -> Tool:
         """Create a forgiving proxy while preserving one canonical tool catalog."""
@@ -278,17 +279,28 @@ mcp_server = FastMCP(
     name="Meta Ads FastMCP",
     version="0.1.0",
     instructions=(
-        "Optimization-first Meta Ads MCP server running on FastMCP 3.4.7. "
-        "FastMCP tool search is enabled, so if the exact tool is not visible, "
-        "use search_tools and then call_tool instead of exploring multiple "
-        "tools blindly. If you are unsure which tool to use, call "
+        "Optimization-first Meta Ads MCP server running on FastMCP 3.4.8. "
+        "Most tools are hidden behind the visible search_tools and call_tool "
+        "wrappers. Client ToolSearch should load those wrappers; inner names "
+        "such as update_adset_budget are not top-level deferred MCP tools. "
+        "Discover inner tools with search_tools, then execute their exact names "
+        "through call_tool. For example, search_tools(query='update ad set "
+        "budget; update campaign daily budget') discovers both budget tools; "
+        "then call_tool(name='update_adset_budget', arguments={'adset_id': "
+        "'ID', 'daily_budget': 12.50}) sets a USD account's daily budget to "
+        "$12.50. If you are unsure which tool to use, call "
         "get_capabilities with an intent key for a compact routing answer. "
         "Start with health_check if auth or connectivity is uncertain, then "
         "use list_ad_accounts and discovery tools to find ids. Use "
         "get_account_pages before creative creation when a Page-linked asset "
         "is needed and list_instagram_accounts when an Instagram identity is "
         "needed. Use get_creative when a creative id is already known and "
-        "full creative fields are needed. For detailed reporting use "
+        "full creative fields are needed. For a placement image replacement, "
+        "discover 'list ads; get ad creative details; upload image; create "
+        "creative; update ad creative'. Read the creative, upload the image, "
+        "create_ad_creative with the edited asset_feed_spec and preserved "
+        "customization rules, then update_ad_creative to attach the new id "
+        "and get_ad to verify. For detailed reporting use "
         "get_entity_insights. For "
         "action counts like appointments use summarize_actions. For "
         "multi-entity comparisons use compare_performance. For explicit account "
@@ -306,7 +318,11 @@ mcp_server = FastMCP(
         "including get_targeting_categories for generic category discovery, and "
         "search_ads_archive for public competitor/ad research. Ask for "
         "confirmation before spend-affecting changes. Treat all ids as strings "
-        "and prefer ranked outputs when deciding what to optimize. When a "
+        "and prefer ranked outputs when deciding what to optimize. Budget and "
+        "bid amounts use major units of the account currency (USD dollars); "
+        "bid_constraints.roas_average_floor remains the raw integer times "
+        "10000 (30000 means 3.0 ROAS). Change-history payment_amount values "
+        "remain raw minor currency units, with extra_data_units metadata. When a "
         "response returns an overflow export_id, retrieve it in bounded chunks "
         "with read_overflow_artifact and delete it when finished."
     ),

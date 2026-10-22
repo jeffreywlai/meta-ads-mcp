@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
+
+from fastmcp import Client
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
 import pytest
 
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.tools import utility
+from meta_ads_mcp import overflow
+from meta_ads_mcp.overflow import OverflowArtifactStore
 
 
 class FakeUtilityClient:
@@ -72,7 +80,7 @@ def test_get_capabilities_returns_compact_summary_by_default() -> None:
     assert result["recommended_start"]["if_you_need_the_entire_manifest"] == "get_capabilities(include_full_manifest=true)"
     assert any("Ads Library API access" in note for note in result["notes"])
     assert "meta://docs/tool-routing" in result["resources"]
-    assert result["server"]["fastmcp_version_target"] == "3.4.7"
+    assert result["server"]["fastmcp_version_target"] == "3.4.8"
     assert result["server"]["tool_search_enabled"] is True
     assert result["server"]["dynamic_search_tools"] == ["search_tools", "call_tool"]
 
@@ -147,6 +155,134 @@ def test_get_capabilities_has_overflow_retrieval_intent() -> None:
         "read_overflow_artifact",
         "delete_overflow_artifact",
     ]
+
+
+def test_overflow_reader_defaults_to_parsed_items_and_retains_byte_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    payload = {"rows": {"items": [{"id": str(index)} for index in range(200)],
+                         "summary": {"count": 200}}}
+    store = OverflowArtifactStore(tmp_path)
+    monkeypatch.setattr(utility, "OVERFLOW_ARTIFACT_STORE", store)
+    export_id, _ = store.create(ToolResult(structured_content=payload), tool_name="async_report")
+    first = asyncio.run(utility.read_overflow_artifact(export_id, item_limit=50))
+    assert first["mode"] == "items"
+    assert first["item_path"] == ["rows", "items"]
+    assert first["next_item_offset"] == 50
+    second = asyncio.run(utility.read_overflow_artifact(export_id, item_offset=50, item_limit=50))
+    assert second["items"][0]["id"] == "50"
+    raw = asyncio.run(utility.read_overflow_artifact(export_id, offset=0))
+    assert raw["offset"] == 0
+    assert json.loads(raw["data"])["tool_result"]["structured_content"] == payload
+    with pytest.raises(ValidationError, match="not both"):
+        asyncio.run(utility.read_overflow_artifact(export_id, offset=0, item_offset=0))
+
+
+def test_overflow_reader_defaults_to_bytes_without_a_collection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    monkeypatch.setattr(utility, "OVERFLOW_ARTIFACT_STORE", store)
+    export_id, _ = store.create(ToolResult(content=[TextContent(type="text", text="original")]), tool_name="text_tool")
+    chunk = asyncio.run(utility.read_overflow_artifact(export_id))
+    assert json.loads(chunk["data"])["tool_result"]["content"][0]["text"] == "original"
+    with pytest.raises(ValidationError, match="no items/rows"):
+        asyncio.run(utility.read_overflow_artifact(export_id, item_offset=0))
+
+
+def test_overflow_reader_issues_only_the_final_safe_byte_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    monkeypatch.setattr(utility, "OVERFLOW_ARTIFACT_STORE", store)
+    export_id, _ = store.create(
+        ToolResult(content=[TextContent(type="text", text='\\"' * 50_000)]), tool_name="text_tool",
+    )
+    chunk = asyncio.run(utility.read_overflow_artifact(export_id, offset=0))
+    assert chunk["next_offset"] < 44_000
+    assert len(overflow._serialized_mcp_result(overflow.compact_overflow_chunk_result(chunk))) <= 63_000
+    with pytest.raises(ValidationError, match="issued next_offset"):
+        asyncio.run(utility.read_overflow_artifact(export_id, offset=44_000))
+
+
+def test_proxy_keeps_43kb_list_inline_through_a_real_mcp_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from meta_ads_mcp.coordinator import RESPONSE_LIMITING_MIDDLEWARE
+    from meta_ads_mcp.tools import discovery
+
+    ads = [{"id": str(index), "name": f"Ad {index}",
+            "creative": {"id": f"creative_{index}", "body": "x" * 450}}
+           for index in range(81)]
+
+    class FakeAdsClient:
+        async def list_objects(self, *_args, **_kwargs):
+            return {"data": ads}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: FakeAdsClient())
+    monkeypatch.setattr(RESPONSE_LIMITING_MIDDLEWARE.artifact_store, "export_directory", tmp_path)
+
+    async def run():
+        async with Client(mcp_server) as client:
+            tools = await client.list_tools()
+            proxy = next(tool for tool in tools if tool.name == "call_tool")
+            assert proxy.outputSchema is None
+            return await client.call_tool("call_tool", {
+                "name": "list_ads",
+                "arguments": {"account_id": "act_123", "limit": 200,
+                              "fields": ["id", "name", "creative"]},
+            })
+
+    result = asyncio.run(run())
+    assert result.is_error is False
+    assert result.structured_content is None
+    inline = json.loads(result.content[0].text)
+    assert inline["items"] == ads
+    assert 40_000 < len(result.content[0].text.encode()) < 50_000
+    assert len(overflow._serialized_mcp_result(result)) <= 64_000
+    assert not list(tmp_path.glob("overflow-*.json"))
+
+
+@pytest.mark.parametrize("archive_fails", [False, True])
+def test_direct_client_receives_schema_valid_overflow_notices(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, archive_fails: bool,
+) -> None:
+    from meta_ads_mcp.coordinator import RESPONSE_LIMITING_MIDDLEWARE
+    from meta_ads_mcp.tools import discovery
+
+    accounts = [{"id": f"act_{index}", "name": "x" * 1_000} for index in range(200)]
+
+    class FakeAccountsClient:
+        async def list_objects(self, *_args, **_kwargs):
+            return {"data": accounts}
+
+    artifact_directory = tmp_path / "artifacts"
+    if archive_fails:
+        artifact_directory.write_text("blocked")
+    monkeypatch.setattr(discovery, "get_graph_api_client", FakeAccountsClient)
+    store = RESPONSE_LIMITING_MIDDLEWARE.artifact_store
+    monkeypatch.setattr(store, "export_directory", artifact_directory)
+
+    async def run():
+        async with Client(mcp_server) as client:
+            tools = await client.list_tools()
+            tool = next(tool for tool in tools if tool.name == "list_ad_accounts")
+            assert tool.outputSchema == {"type": "object", "additionalProperties": True}
+            return await client.call_tool("list_ad_accounts", {"limit": 200})
+
+    result = asyncio.run(run())
+    assert result.is_error is False
+    assert result.structured_content["overflow"] == result.meta["overflow"]
+    assert result.structured_content["message"] == result.content[0].text
+    assert result.meta["overflow"]["archived"] is not archive_fails
+    assert len(overflow._serialized_mcp_result(result)) <= 64_000
+    if archive_fails:
+        assert "could not be archived" in result.content[0].text
+        assert "export_id" not in result.meta["overflow"]
+    else:
+        export_id = result.meta["overflow"]["export_id"]
+        artifact = json.loads(store._artifact_path(export_id).read_text())
+        assert artifact["tool_result"]["structured_content"]["items"] == accounts
 
 
 def test_get_capabilities_has_feedback_intent() -> None:

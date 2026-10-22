@@ -93,7 +93,7 @@ async def create_ad_creative(
     degrees_of_freedom_spec: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to build a reusable creative before attaching it to an ad."""
+    """Build a reusable creative, including a replacement with an edited asset_feed_spec and preserved placement customization rules; attach it to an existing ad with update_ad_creative."""
     if object_story_spec:
         _ensure_v25_creative_payload(object_story_spec)
     if asset_feed_spec:
@@ -119,6 +119,30 @@ async def create_ad_creative(
         "target": {"account_id": normalize_account_id(account_id)},
         "created": created,
     }
+
+
+@mcp_server.tool()
+async def update_ad_creative(ad_id: str, creative_id: str) -> dict[str, Any]:
+    """Replace the creative attached to an existing ad with a prepared creative_id. For placement image changes, inspect get_creative, upload_creative_asset, and create_ad_creative with the edited asset_feed_spec first, then verify the ad with get_ad."""
+    ad_id = blank_to_none(ad_id)
+    creative_id = blank_to_none(creative_id)
+    if ad_id is None or creative_id is None:
+        raise ValidationError("ad_id and creative_id are required.")
+    client = get_graph_api_client()
+    previous = await client.get_object(ad_id, fields=["id", "creative"])
+    previous_creative = previous.get("creative")
+    previous_creative_id = (
+        previous_creative.get("id")
+        if isinstance(previous_creative, dict)
+        else previous_creative
+    )
+    await client.update_object(ad_id, data={"creative": {"creative_id": creative_id}})
+    return mutation_response(
+        action="update_ad_creative",
+        target={"ad_id": ad_id},
+        previous={"creative_id": previous_creative_id},
+        current={"creative_id": creative_id},
+    )
 
 
 @mcp_server.tool()

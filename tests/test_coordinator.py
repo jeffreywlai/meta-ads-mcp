@@ -489,3 +489,265 @@ def test_placement_search_prefers_canonical_insights_but_exact_alias_still_works
     assert "`get_insights`" not in result.content[0].text
     exact = asyncio.run(mcp_server.call_tool("search_tools", {"query": "get_insights"}))
     assert "- `get_insights`" in exact.content[0].text.splitlines()[1]
+
+
+@pytest.mark.parametrize(("query", "expected"), [
+    ("update ad set budget bid amount status campaign budget bid strategy", [
+        "update_adset_budget", "update_adset_bid_amount", "set_adset_status",
+        "update_campaign_budget", "update_adset_bid_strategy", "update_campaign_bid_strategy",
+    ]),
+    ("update ad set budget bid amount status campaign budget bid strategy and name", [
+        "update_adset_budget", "update_adset_bid_amount", "set_adset_status",
+        "update_campaign_budget", "update_adset_bid_strategy", "update_campaign_bid_strategy",
+        "update_campaign",
+    ]),
+    ("bid amount cost cap; pause ad set status; campaign daily budget; bid strategy roas floor", [
+        "update_adset_bid_amount", "set_adset_status", "update_campaign_budget", "update_adset_bid_strategy",
+    ]),
+    ("update campaign daily budget CBO", ["update_campaign_budget"]),
+    ("list ads filter by name, get ad creative details, update ad creative, upload image", [
+        "list_ads", "get_creative", "update_ad_creative", "upload_creative_asset",
+    ]),
+])
+def test_usage_report_compound_queries_return_the_operation_union(query, expected) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("max_results", [1, 6, 12])
+def test_explicit_search_preserves_every_unique_operation_in_order(monkeypatch, max_results) -> None:
+    monkeypatch.setattr(mcp_server.transforms[0], "_max_results", max_results)
+    expected = [
+        "get_ad", "update_campaign", "list_ads", "update_adset_budget",
+        "get_creative", "set_adset_status", "upload_creative_asset",
+        "get_entity_insights", "update_ad_creative",
+    ]
+    query = "; ".join([expected[0], *expected, expected[2]])
+
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("max_results", [1, 3, 6])
+def test_fuzzy_search_keeps_its_configured_cap_and_read_safe_candidates(monkeypatch, max_results) -> None:
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+
+    monkeypatch.setattr(mcp_server.transforms[0], "_max_results", max_results)
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": "performance insights campaign delivery",
+    }))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    contracts = build_tool_contracts(mcp_server.local_provider._components.values())
+    assert len(names) == max_results
+    assert len(set(names)) == len(names)
+    assert all(contracts[name].effect == "read" for name in names)
+
+
+@pytest.mark.parametrize(("call", "include_campaign"), [
+    ('update_campaign(campaign_id="123", name="do not update campaign budget; update_adset_budget")', True),
+    ('update_campaign(campaign_id="123", unknown_argument="update_adset_budget")', False),
+])
+def test_many_explicit_operations_keep_literal_validation_and_negation(call, include_campaign) -> None:
+    expected = [
+        "get_ad", "list_ads", "get_creative", "set_adset_status",
+        "upload_creative_asset", "get_entity_insights", "update_ad_creative",
+    ]
+    query = "; ".join([call, *expected, "do not update_campaign_budget"])
+    if include_campaign:
+        expected.insert(0, "update_campaign")
+
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+def test_read_only_search_preserves_many_explicit_reads_and_filters_writes(monkeypatch) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    expected = [
+        "list_campaigns", "get_campaign", "list_adsets", "get_adset",
+        "list_ads", "get_ad", "get_creative", "list_creatives",
+    ]
+    query = "; ".join([
+        "update_campaign", *expected[:4], "set_adset_status",
+        *expected[4:], "update_ad_creative",
+    ])
+
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("query", [
+    "update ad set budget without changing campaign budget and ad set status",
+    "update ad set budget without changing status, campaign budget, or targeting",
+    "update ad set budget to match campaign budget",
+    "update ad set budget but only show campaign budget",
+    "update ad set budget to match campaign budget and ad set status",
+    "update ad set budget but only show campaign budget and campaign status",
+])
+def test_suffix_negation_keeps_later_facets_out_of_live_search(query) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == ["update_adset_budget"]
+
+
+@pytest.mark.parametrize("query", [
+    "update campaign budget based on ad set status",
+    "update campaign budget based on ad set status and ad set bid strategy",
+])
+def test_configuration_reference_does_not_select_referenced_status_write(query) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": query,
+    }))
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == ["update_campaign_budget"]
+
+
+@pytest.mark.parametrize("separator", [" and ", ", ", " then "])
+def test_configuration_list_continuations_preserve_campaign_scope(separator) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": f"update campaign budget{separator}bid strategy",
+    }))
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == ["update_campaign_budget", "update_campaign_bid_strategy"]
+
+
+@pytest.mark.parametrize(("query", "expected"), [
+    ("update campaign budget; bid amount must not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount should not change", ["update_campaign_budget"]),
+    ("update adset budget and bid amount must not change", ["update_adset_budget"]),
+    ("update campaign budget and name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign status and objective", ["set_campaign_status", "update_campaign"]),
+    ("update campaign name and budget", ["update_campaign", "update_campaign_budget"]),
+    ("update campaign budget and name should not change", ["update_campaign_budget"]),
+    ("update adset budget and campaign name", ["update_adset_budget", "update_campaign"]),
+    ("update campaign budget; bid amount must not change; show campaign name", [
+        "update_campaign_budget", "get_campaign",
+    ]),
+    ("update campaign budget; bid amount shouldn't change; update campaign name", [
+        "update_campaign_budget", "update_campaign",
+    ]),
+    ("update campaign budget; bid amount does not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount did not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount should remain unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount is unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount must never change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount and status must not change", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name and objective must not change", ["update_campaign_budget"]),
+    ("update campaign budget; campaign status and objective should not change", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name and objective should stay unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name and objective unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name needs to stay unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount, must not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount: must not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount should remain unchanged and campaign status", ["update_campaign_budget"]),
+    ("update campaign budget to 100 without changing name and objective", ["update_campaign_budget"]),
+    ("update campaign budget to 100 and name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign budget to 100, name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign budget to 100, and name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign status to paused and objective", ["set_campaign_status", "update_campaign"]),
+    ("update campaign status to paused, objective", ["set_campaign_status", "update_campaign"]),
+    ('update campaign name to "Winter", budget', ["update_campaign", "update_campaign_budget"]),
+    ('update campaign name to "Budget and Status" and objective', ["update_campaign"]),
+])
+def test_configuration_search_preserves_requested_fields_and_postfix_negation(query, expected) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("query", [
+    "update campaign budget must not change",
+    "set adset status should not change",
+    "do not update campaign budget and name",
+    "compare campaign budget and name",
+    "show campaign status and objective",
+])
+def test_configuration_search_does_not_expose_negated_or_read_only_writes(query) -> None:
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+
+    contracts = build_tool_contracts(mcp_server.local_provider._components.values())
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert all(contracts[name].effect == "read" for name in names)
+
+
+@pytest.mark.parametrize("query", [
+    'update_campaign(campaign_id="123", name="budget; bid amount must not change, and objective")',
+    "update_campaign(campaign_id='123', name='budget; bid amount must not change, and objective')",
+])
+def test_configuration_search_treats_negation_and_fields_in_exact_call_values_as_literals(query) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": query,
+    }))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == ["update_campaign"]
+
+
+def test_explicit_read_clause_remains_a_read_in_a_configuration_workflow() -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": "update ad set budget and show campaign budget",
+    }))
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == ["update_adset_budget", "get_campaign"]
+
+
+def test_semicolon_starts_a_new_request_after_an_excluded_reference() -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": "update ad set budget to match campaign budget and ad set status; show campaign budget",
+    }))
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == ["update_adset_budget", "get_campaign"]
+
+
+@pytest.mark.parametrize(("query", "expected"), [
+    ("update campaign status to paused and campaign budget", ["set_campaign_status", "update_campaign_budget"]),
+    ("pause ad set status, campaign budget", ["set_adset_status", "update_campaign_budget"]),
+])
+def test_explicit_entity_continuations_survive_a_valued_status_command(query, expected) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize(("name", "fields"), [
+    ("update_campaign", ["daily_budget", "lifetime_budget"]),
+    ("create_campaign", ["daily_budget", "lifetime_budget"]),
+    ("create_ad_set", ["daily_budget", "lifetime_budget", "bid_amount"]),
+    ("create_ad", ["bid_amount"]),
+    ("update_adset_budget", ["daily_budget", "lifetime_budget"]),
+    ("update_campaign_budget", ["daily_budget", "lifetime_budget"]),
+    ("update_adset_bid_amount", ["bid_amount"]),
+    ("update_adset_bid_strategy", ["bid_amount"]),
+])
+def test_budget_and_bid_machine_schemas_state_account_currency_units(name, fields) -> None:
+    tool = asyncio.run(mcp_server.get_tool(name))
+
+    for field in fields:
+        description = json.dumps(tool.parameters["properties"][field])
+        assert "major units" in description
+        assert "ad account currency" in description
+        assert "12.50" in description
+
+
+@pytest.mark.parametrize("name", ["create_ad_set", "update_adset_bid_strategy"])
+def test_roas_machine_schemas_state_the_raw_scale(name) -> None:
+    tool = asyncio.run(mcp_server.get_tool(name))
+
+    description = json.dumps(tool.parameters["properties"]["bid_constraints"])
+    assert "roas_average_floor" in description
+    assert "10000" in description
+    assert "30000 means 3.0 ROAS" in description

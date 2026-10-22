@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -313,3 +314,47 @@ def test_unresolvable_validated_scope_uses_validation_error(monkeypatch) -> None
         ))
     assert client.calls == []
     assert client.object_calls == []
+
+
+def test_activity_payment_amount_units_preserve_raw_payload(monkeypatch) -> None:
+    detail = {
+        "type": "composite_data",
+        "old_value": {"type": "payment_amount", "currency": "USD", "old_value": 5000},
+        "new_value": {"type": "payment_amount", "currency": "USD", "new_value": 7500, "additional_value": "Per day"},
+    }
+    raw = json.dumps(detail)
+
+    class PaymentActivityClient(FakeActivityClient):
+        async def list_objects(self, *args, **kwargs):
+            return {"data": [{"id": "activity_1", "extra_data": raw}]}
+
+    monkeypatch.setattr(activity, "get_graph_api_client", lambda: PaymentActivityClient())
+
+    result = asyncio.run(activity.list_change_history(account_id="123"))
+
+    item = result["items"][0]
+    assert item["extra_data"] == raw
+    assert item["extra_data_parsed"] == detail
+    assert item["extra_data_units"] == [
+        {"path": "/extra_data_parsed/old_value", "currency": "USD", "unit": "minor_currency_units", "major_unit_divisor": 100},
+        {"path": "/extra_data_parsed/new_value", "currency": "USD", "unit": "minor_currency_units", "major_unit_divisor": 100},
+    ]
+
+
+def test_activity_unit_metadata_does_not_guess_unknown_currency_or_untyped_values() -> None:
+    source = [
+        {"extra_data": {"type": "payment_amount", "currency": "JPY", "new_value": 7500}},
+        {"extra_data": {"type": "payment_amount", "currency": "UNKNOWN", "new_value": 7500}},
+        {"extra_data": '{"old_value":5000,"new_value":7500}'},
+        {"extra_data": "not JSON"},
+    ]
+
+    result = activity._normalize_activity_items(source)
+
+    assert result[0]["extra_data_units"][0]["major_unit_divisor"] == 1
+    assert result[1]["extra_data_units"] == [{
+        "path": "/extra_data", "currency": "UNKNOWN", "unit": "minor_currency_units",
+    }]
+    assert "extra_data_units" not in result[2]
+    assert "extra_data_units" not in result[3]
+    assert source[0]["extra_data"]["new_value"] == 7500
