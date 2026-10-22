@@ -342,6 +342,10 @@ For oversized results through the schema-free `call_tool` wrapper, identical
 JSON text and structured output are delivered as one compact text copy when
 that fits. Direct tools with output schemas retain their structured content.
 Notices distinguish the measured MCP result size from the smaller archive size.
+Parsed item pages reuse verified decoded archives in a cache limited to four
+artifacts and a conservative 64 MiB decoded-payload budget. File replacement,
+integrity failure, deletion, and expiry invalidate cached data. Larger decoded
+artifacts remain readable but bypass this cache, so their pages can take longer.
 Archive schema v2 uses compact JSON and stores identical JSON compatibility
 text only once, under `tool_result.structured_content`. Distinct or annotated
 text remains intact. Overflow notices include archive size and retention.

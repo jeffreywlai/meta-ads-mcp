@@ -16,7 +16,7 @@ automatic mutation-retry system.
 
 ## Validation
 
-The final full suite passed **1,387 tests**, with **32 live tests skipped**,
+The final full suite passed **1,482 tests**, with **32 live tests skipped**,
 using the project's installed Python environment and this checkout's source.
 The unchanged baseline passed 1,257 tests with the same 32 skips. Installed
 dependencies passed `uv pip check`, and `git diff --check` was clean.
@@ -31,6 +31,41 @@ the original operation's success/error status is preserved in each case.
 
 These are repository and local transport results. They do not attest Meta's
 live write behavior or the installed server on Nick's computer.
+
+### Follow-up GitHub review
+
+All three review findings on `327f38d` were reproduced before correction:
+
+- Postfix exclusions such as `bid amount must not change` incorrectly exposed
+  the bid write. Routing now checks negative and preservation clauses before
+  accepting a field, while preserving earlier positive requests. Regression
+  cases include coordinated fields, bare `unchanged`, contractions, and
+  comma/colon punctuation.
+- Mixed requests such as `update campaign budget and name` omitted the general
+  campaign updater. Field continuations retain scope and include every required
+  tool, including continuations after numeric, status, and quoted values.
+  Explicit reads, literal arguments, and reference-only clauses remain constrained.
+- Parsed overflow continuations decoded the entire archive for every page.
+  A verified-identity and digest cache now retains at most four decoded
+  artifacts within a conservative 64 MiB payload budget. Returned pages cannot
+  mutate cached data. Integrity failure, replacement, deletion, and expiry
+  invalidate it; restart rereads persisted artifacts and continuations.
+
+The final independent pass found no further actionable errors: 4,030 routing
+matrix checks and 250 actual local MCP `search_tools` checks passed. A second
+cross-review passed 36 additional actual discovery calls. The full suite passed
+1,482 tests with 32 live tests skipped, adding 95 regression cases since the
+initial PR. No Meta API calls were needed for these checks.
+
+One local before/after measurement used the same 100,000 synthetic records,
+5,889,116-byte archive, `item_limit=500`, and 63,000-byte MCP result budget.
+Across 100 reads, both versions recovered the same 49,262 records; byte limits
+kept pages below 500 records. Full JSON parses fell from 100 to one, and elapsed
+time fell from 3.1633 to 0.4524 seconds. The cold first read increased from
+0.0329 to 0.1404 seconds because it accounts for decoded memory. These are local
+measurements, not general latency guarantees. The conservative cache estimate
+was 40,091,515 bytes; it is not process RSS. Oversized decoded artifacts bypass
+the cache and retain the original repeated-parse cost.
 
 ## Findings
 

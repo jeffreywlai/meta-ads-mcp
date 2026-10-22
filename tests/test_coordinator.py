@@ -547,6 +547,82 @@ def test_configuration_list_continuations_preserve_campaign_scope(separator) -> 
     assert names == ["update_campaign_budget", "update_campaign_bid_strategy"]
 
 
+@pytest.mark.parametrize(("query", "expected"), [
+    ("update campaign budget; bid amount must not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount should not change", ["update_campaign_budget"]),
+    ("update adset budget and bid amount must not change", ["update_adset_budget"]),
+    ("update campaign budget and name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign status and objective", ["set_campaign_status", "update_campaign"]),
+    ("update campaign name and budget", ["update_campaign", "update_campaign_budget"]),
+    ("update campaign budget and name should not change", ["update_campaign_budget"]),
+    ("update adset budget and campaign name", ["update_adset_budget", "update_campaign"]),
+    ("update campaign budget; bid amount must not change; show campaign name", [
+        "update_campaign_budget", "get_campaign",
+    ]),
+    ("update campaign budget; bid amount shouldn't change; update campaign name", [
+        "update_campaign_budget", "update_campaign",
+    ]),
+    ("update campaign budget; bid amount does not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount did not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount should remain unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount is unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount must never change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount and status must not change", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name and objective must not change", ["update_campaign_budget"]),
+    ("update campaign budget; campaign status and objective should not change", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name and objective should stay unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name and objective unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; campaign name needs to stay unchanged", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount, must not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount: must not change", ["update_campaign_budget"]),
+    ("update campaign budget; bid amount should remain unchanged and campaign status", ["update_campaign_budget"]),
+    ("update campaign budget to 100 without changing name and objective", ["update_campaign_budget"]),
+    ("update campaign budget to 100 and name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign budget to 100, name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign budget to 100, and name", ["update_campaign_budget", "update_campaign"]),
+    ("update campaign status to paused and objective", ["set_campaign_status", "update_campaign"]),
+    ("update campaign status to paused, objective", ["set_campaign_status", "update_campaign"]),
+    ('update campaign name to "Winter", budget', ["update_campaign", "update_campaign_budget"]),
+    ('update campaign name to "Budget and Status" and objective', ["update_campaign"]),
+])
+def test_configuration_search_preserves_requested_fields_and_postfix_negation(query, expected) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("query", [
+    "update campaign budget must not change",
+    "set adset status should not change",
+    "do not update campaign budget and name",
+    "compare campaign budget and name",
+    "show campaign status and objective",
+])
+def test_configuration_search_does_not_expose_negated_or_read_only_writes(query) -> None:
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+
+    contracts = build_tool_contracts(mcp_server.local_provider._components.values())
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert all(contracts[name].effect == "read" for name in names)
+
+
+@pytest.mark.parametrize("query", [
+    'update_campaign(campaign_id="123", name="budget; bid amount must not change, and objective")',
+    "update_campaign(campaign_id='123', name='budget; bid amount must not change, and objective')",
+])
+def test_configuration_search_treats_negation_and_fields_in_exact_call_values_as_literals(query) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": query,
+    }))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == ["update_campaign"]
+
+
 def test_explicit_read_clause_remains_a_read_in_a_configuration_workflow() -> None:
     result = asyncio.run(mcp_server.call_tool("search_tools", {
         "query": "update ad set budget and show campaign budget",

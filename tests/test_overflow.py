@@ -866,6 +866,282 @@ def test_parsed_pages_preserve_every_item_and_collection_context(
         store.read(export_id, item_offset=1)
 
 
+def test_many_item_pages_parse_100000_records_only_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(structured_content={
+            "items": [{"id": str(index), "detail": "x" * 32} for index in range(100_000)],
+            "summary": {"count": 100_000, "complete": True},
+        }),
+        tool_name="get_insights",
+    )
+    original_load = overflow.json.load
+    parse_calls = 0
+
+    def counting_load(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(overflow.json, "load", counting_load)
+    item_offset = 0
+    pages = 0
+    while True:
+        page = store.read(export_id, item_offset=item_offset, item_limit=500)
+        assert [item["id"] for item in page["items"]] == [
+            str(index) for index in range(item_offset, page["next_item_offset"])
+        ]
+        assert len(overflow._serialized_mcp_result(overflow.compact_overflow_chunk_result(page))) <= 63_000
+        pages += 1
+        if page["complete"]:
+            break
+        assert page["next_item_offset"] > item_offset
+        item_offset = page["next_item_offset"]
+
+    assert page["next_item_offset"] == 100_000
+    assert pages >= 200
+    assert parse_calls == 1
+    assert 0 < store._parsed_artifact_bytes <= overflow.MAX_PARSED_ARTIFACT_CACHE_BYTES
+
+
+def test_item_cache_revalidates_and_reparses_after_restart_or_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(structured_content={"items": [{"id": str(index)} for index in range(3)]}),
+        tool_name="list_ads",
+    )
+    original_load = overflow.json.load
+    original_sha256 = overflow.hashlib.sha256
+    parse_calls = hash_calls = 0
+
+    def counting_load(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_load(*args, **kwargs)
+
+    def counting_sha256(*args, **kwargs):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(overflow.json, "load", counting_load)
+    monkeypatch.setattr(overflow.hashlib, "sha256", counting_sha256)
+    first = store.read(export_id, item_offset=0, item_limit=1)
+    restarted = OverflowArtifactStore(tmp_path)
+    second = restarted.read(export_id, item_offset=first["next_item_offset"], item_limit=1)
+    assert second["items"] == [{"id": "1"}]
+    assert parse_calls == hash_calls == 2
+
+    artifact_path = store._artifact_path(export_id)
+    original_stat = artifact_path.stat()
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(artifact_path.read_bytes())
+    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    replacement.replace(artifact_path)
+    third = restarted.read(export_id, item_offset=second["next_item_offset"], item_limit=1)
+
+    assert third["items"] == [{"id": "2"}]
+    assert third["complete"] is True
+    assert parse_calls == hash_calls == 3
+
+
+@pytest.mark.parametrize("tamper", ["in_place", "replace", "manifest", "during_parse"])
+def test_item_cache_never_hides_artifact_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tamper: str,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(structured_content={"items": [{"id": "original"}]}),
+        tool_name="list_ads",
+    )
+    artifact_path = store._artifact_path(export_id)
+    original_stat = artifact_path.stat()
+    corrupted_bytes = artifact_path.read_bytes().replace(b'"original"', b'"tampered"')
+
+    if tamper == "during_parse":
+        original_load = overflow.json.load
+
+        def tamper_after_load(*args, **kwargs):
+            artifact = original_load(*args, **kwargs)
+            artifact_path.write_bytes(corrupted_bytes)
+            return artifact
+
+        monkeypatch.setattr(overflow.json, "load", tamper_after_load)
+    else:
+        store.read(export_id, item_offset=0)
+        assert export_id in store._parsed_artifacts
+        if tamper == "manifest":
+            manifest_path = tmp_path / store._manifest_name(export_id)
+            manifest = json.loads(manifest_path.read_text())
+            manifest["sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest))
+        elif tamper == "replace":
+            replacement = tmp_path / "replacement.json"
+            replacement.write_bytes(corrupted_bytes)
+            os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            replacement.replace(artifact_path)
+        else:
+            artifact_path.write_bytes(corrupted_bytes)
+            os.utime(artifact_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    with pytest.raises(ValidationError, match="integrity"):
+        store.read(export_id, item_offset=0)
+    assert export_id not in store._verified_artifacts
+    assert export_id not in store._parsed_artifacts
+    assert store._parsed_artifact_bytes == 0
+
+
+def test_item_cache_keeps_returned_mutable_data_private(tmp_path: Path) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    payload = {
+        "items": [{"id": "one", "details": {"tags": ["original"]}}],
+        "summary": {"notes": ["original"]},
+    }
+    export_id, _ = store.create(
+        ToolResult(structured_content=payload, meta={"notes": ["original"]}),
+        tool_name="list_ads",
+    )
+    first = store.read(export_id, item_offset=0)
+    first["items"][0]["details"]["tags"].append("caller mutation")
+    first["context"]["tool_result"]["structured_content"]["summary"]["notes"].clear()
+    first["context"]["tool_result"]["meta"]["notes"].clear()
+    second = store.read(export_id, item_offset=0)
+
+    assert second["items"] == payload["items"]
+    assert second["context"]["tool_result"]["structured_content"]["summary"] == payload["summary"]
+    assert second["context"]["tool_result"]["meta"] == {"notes": ["original"]}
+
+
+def test_item_cache_count_limit_evicts_least_recently_used_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(overflow, "MAX_PARSED_ARTIFACT_CACHE_ENTRIES", 2)
+    store = OverflowArtifactStore(tmp_path)
+    export_ids = [
+        store.create(ToolResult(structured_content={"items": [{"id": str(index)}]}),
+                     tool_name="list_ads")[0]
+        for index in range(3)
+    ]
+    original_load = overflow.json.load
+    parse_calls = 0
+
+    def counting_load(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(overflow.json, "load", counting_load)
+    for export_id in (export_ids[0], export_ids[1], export_ids[0], export_ids[2]):
+        store.read(export_id, item_offset=0)
+    assert parse_calls == 3
+    assert list(store._parsed_artifacts) == [export_ids[0], export_ids[2]]
+    store.read(export_ids[0], item_offset=0)
+    assert parse_calls == 3
+    assert store.read(export_ids[1], item_offset=0)["items"] == [{"id": "1"}]
+    assert parse_calls == 4
+    assert len(store._parsed_artifacts) == 2
+
+
+def test_concurrent_item_reads_share_one_private_cached_parse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(structured_content={"items": [{"id": str(index)} for index in range(100)]}),
+        tool_name="list_ads",
+    )
+    original_load = overflow.json.load
+    parse_calls = 0
+
+    def counting_load(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(overflow.json, "load", counting_load)
+
+    def read_and_mutate(_index):
+        page = store.read(export_id, item_offset=0, item_limit=1)
+        page["items"][0]["id"] = "caller mutation"
+        return page
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        pages = list(executor.map(read_and_mutate, range(40)))
+
+    assert len(pages) == 40
+    assert parse_calls == 1
+    assert store.read(export_id, item_offset=0, item_limit=1)["items"] == [{"id": "0"}]
+    assert len(store._parsed_artifacts) == 1
+    assert 0 < store._parsed_artifact_bytes <= overflow.MAX_PARSED_ARTIFACT_CACHE_BYTES
+
+
+def test_item_cache_byte_limit_and_oversized_bypass_remain_readable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(overflow, "MAX_PARSED_ARTIFACT_CACHE_BYTES", 65_536)
+    store = OverflowArtifactStore(tmp_path)
+    export_ids = [
+        store.create(ToolResult(structured_content={
+            "items": [{"id": str(index), "detail": str(number) * 32} for index in range(count)],
+        }), tool_name="list_ads")[0]
+        for number, count in ((1, 100), (2, 100), (3, 1_000))
+    ]
+    original_load = overflow.json.load
+    parse_calls = 0
+
+    def counting_load(*args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(overflow.json, "load", counting_load)
+    store.read(export_ids[0], item_offset=0)
+    first_bytes = store._parsed_artifact_bytes
+    assert 32_768 < first_bytes <= 65_536
+    store.read(export_ids[1], item_offset=0)
+    assert list(store._parsed_artifacts) == [export_ids[1]]
+    assert 0 < store._parsed_artifact_bytes <= 65_536
+    for _ in range(2):
+        assert store.read(export_ids[2], item_offset=0)["items"][0]["detail"] == "3" * 32
+    assert export_ids[2] not in store._parsed_artifacts
+    assert list(store._parsed_artifacts) == [export_ids[1]]
+    assert parse_calls == 4
+    assert store.read(export_ids[1], item_offset=0)["complete"] is True
+    assert parse_calls == 4
+
+
+@pytest.mark.parametrize("removal", ["delete", "external_delete", "expire", "quota", "manifest"])
+def test_item_cache_releases_removed_or_invalid_artifact(
+    tmp_path: Path, removal: str,
+) -> None:
+    store = OverflowArtifactStore(tmp_path)
+    export_id, _ = store.create(
+        ToolResult(structured_content={"items": [{"id": "one"}]}), tool_name="list_ads",
+    )
+    store.read(export_id, item_offset=0)
+    assert store._parsed_artifact_bytes > 0
+    if removal == "delete":
+        store.delete(export_id)
+    elif removal == "external_delete":
+        OverflowArtifactStore(tmp_path).delete(export_id)
+        store.cleanup()
+    elif removal == "expire":
+        store.cleanup(now=time.time() + store.ttl_seconds + 1)
+    elif removal == "quota":
+        OverflowArtifactStore(tmp_path, max_files=1).create(_result(), tool_name="example_tool")
+        store.cleanup()
+    else:
+        (tmp_path / store._manifest_name(export_id)).write_text("not-json")
+        with pytest.raises(ValidationError, match="integrity"):
+            store.read(export_id, item_offset=0)
+    assert export_id not in store._parsed_artifacts
+    assert store._parsed_artifact_bytes == 0
+
+
 def test_large_context_does_not_block_small_item_pages(tmp_path: Path) -> None:
     payload = {"items": [{"id": "one"}], "context": "x" * 100_000}
     store = OverflowArtifactStore(tmp_path)

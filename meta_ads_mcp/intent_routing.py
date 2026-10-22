@@ -137,21 +137,42 @@ _BUDGET_ALIASES = {
 _CREATE_ALIASES = {
     "creative": "create_ad_creative",
 }
+_CONFIGURATION_FACETS = (
+    r"daily budget|lifetime budget|bid amount|bid strategy|status|budget|name|objective"
+)
 _CONFIGURATION_TOKEN = re.compile(
     r"\b(?P<entity>ad set|adset|campaign)\b|"
-    r"\b(?P<facet>daily budget|lifetime budget|bid amount|bid strategy|status|budget)\b"
+    rf"\b(?P<facet>{_CONFIGURATION_FACETS})\b"
 )
 _CONFIGURATION_CONTINUATION = re.compile(
     r"^\s*(?:(?:and(?:\s+then)?|or|then)\s+)?"
     r"(?:(?P<entity>ad set|adset|campaign)\s+)?"
-    r"(?:daily budget|lifetime budget|budget|bid amount|bid strategy|status)\b",
+    rf"(?:{_CONFIGURATION_FACETS})\b",
     re.IGNORECASE,
 )
+_PRESERVATION = (
+    r"(?:(?:must|should|shall|will|would|can|could|may|might|need|do|does|did|"
+    r"is|are|was|were|has|have)\s+(?:not|never)|cannot|"
+    r"(?:mustn|shouldn|shan|won|wouldn|can|couldn|mightn|don|doesn|didn|isn|aren|wasn|weren)'t)\b|"
+    r"(?:(?:(?:must|should|shall|will|would|may|might|needs?\s+to)\s+)?"
+    r"(?:remain(?:s)?|stay(?:s)?|be|is|are|was|were)\s+)?(?:unchanged|(?:the\s+)?same)\b"
+)
+_POSTFIX_PRESERVATION = re.compile(rf"^[\s,:]*(?:{_PRESERVATION})", re.IGNORECASE)
 _EXCLUDED_SUFFIX = re.compile(
-    r"\b(?:without|except|not|never|don't|dont|do not|to\s+match|based\s+on|"
+    rf"\b(?:{_PRESERVATION}|without|except|not|never|don't|dont|do not|to\s+match|based\s+on|"
     r"but\s+(?:only\s+)?(?:show|read|list|get|inspect|compare|view))\b",
     re.IGNORECASE,
 )
+_QUOTED_VALUE = r'''(?:"(?:\\.|[^"\\])*"|(?<!\w)'(?:\\.|[^'\\])*')'''
+_CONFIGURATION_VALUES = {
+    **dict.fromkeys(
+        ("budget", "daily budget", "lifetime budget", "bid amount"),
+        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)",
+    ),
+    "status": r"(?:active|paused|archived|deleted)",
+    "name": _QUOTED_VALUE,
+    "objective": rf"(?:outcome_[a-z_]+|{_QUOTED_VALUE})",
+}
 
 
 def normalize_query(query: str) -> str:
@@ -182,7 +203,9 @@ def _operation_clauses(query: str) -> tuple[str, ...]:
             elif character == quote:
                 quote = None
             continue
-        if character in {"'", '"'}:
+        if character in {"'", '"'} and not (
+            character == "'" and index and query[index - 1].isalnum()
+        ):
             quote = character
         elif character in "([{":
             stack.append(character)
@@ -193,7 +216,7 @@ def _operation_clauses(query: str) -> tuple[str, ...]:
         elif character in ";\n," and not stack:
             if character == ",":
                 continuation = _CONFIGURATION_CONTINUATION.match(query[index + 1 :])
-                if qualifier_scope or (
+                if qualifier_scope or _POSTFIX_PRESERVATION.match(query[index + 1:]) or (
                     continuation is not None and continuation.group("entity") is None
                 ):
                     continue
@@ -216,26 +239,43 @@ def _operation_clauses(query: str) -> tuple[str, ...]:
     return tuple(clauses)
 
 
-def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...]:
-    """Recognize a bounded budget/bid/status list, never arbitrary write prose."""
+def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...] | None:
+    """Recognize a bounded field list; None leaves other commands to the router."""
     simplified = _strip_articles(text.replace("-", " ").split())
     verb, _space, tail = simplified.partition(" ")
     if verb not in {"update", "set"}:
         if not allow_shorthand:
-            return ()
+            return None
         tail = simplified
-    # Negative, reference, and read-only qualifiers are outside the changes.
-    tail = _EXCLUDED_SUFFIX.split(tail, maxsplit=1)[0].strip()
     if not _CONFIGURATION_CONTINUATION.match(tail):
-        return ()
+        return None
+    # Preserve offsets but hide literal contents from field and qualifier scans.
+    full_tail = re.sub(_QUOTED_VALUE, lambda match: " " * len(match[0]), tail)
+    # Negative, reference, and read-only qualifiers are outside the changes.
+    excluded_suffix = _EXCLUDED_SUFFIX.search(full_tail)
+    end = excluded_suffix.start() if excluded_suffix is not None else len(full_tail)
     # A compact list contains adjacent configuration terms and list separators.
     # Stop at prose such as "to match", "based on", or "only show" so a
     # referenced configuration cannot become a second requested change.
     tokens = []
     previous_end = 0
-    for token in _CONFIGURATION_TOKEN.finditer(tail):
+    for token in _CONFIGURATION_TOKEN.finditer(full_tail, 0, end):
         gap = tail[previous_end:token.start()].replace(",", " ").split()
         if any(word not in {"and", "or", "then"} for word in gap):
+            previous_facet = tokens[-1].group("facet") if tokens else None
+            value = _CONFIGURATION_VALUES.get(previous_facet)
+            if value is None or not re.fullmatch(
+                rf"\s*(?:to\s+)?{value}\s*,?\s*(?:(?:and(?:\s+then)?|or|then)\s*)?",
+                tail[previous_end:token.start()],
+            ):
+                break
+        # A facet before "must not change" is excluded too. Splitting only
+        # at "not" would incorrectly accept that facet as a requested write.
+        if token.group("facet") and _POSTFIX_PRESERVATION.match(full_tail[token.end():]):
+            if verb not in {"update", "set"}:
+                # A shorthand subject such as "bid amount and status" shares
+                # its preservation predicate; none of those fields is a write.
+                tokens.clear()
             break
         tokens.append(token)
         previous_end = token.end()
@@ -268,6 +308,8 @@ def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...
                 routes.append(f"update_{scope}_bid_amount")
             elif facet == "bid strategy":
                 routes.append(f"update_{scope}_bid_strategy")
+            elif facet in {"name", "objective"}:
+                routes.append(f"update_{scope}")
             else:
                 routes.append(f"update_{scope}_budget")
         explicitly_scoped = False
@@ -542,13 +584,11 @@ class StructuredIntentRouter:
                     preferred.extend(explicit)
                 continue
 
-            configuration_routes = tuple(
-                name for name in _configuration_routes(
-                    clause, allow_shorthand=allow_shorthand
-                )
-                if name in names
+            configuration_routes = _configuration_routes(
+                clause, allow_shorthand=allow_shorthand
             )
-            if configuration_routes:
+            if configuration_routes is not None:
+                configuration_routes = tuple(name for name in configuration_routes if name in names)
                 if negated is not None:
                     excluded.update(configuration_routes)
                 else:

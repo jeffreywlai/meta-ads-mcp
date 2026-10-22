@@ -5,15 +5,18 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from datetime import datetime, timezone
 import errno
 import hashlib
+from itertools import chain
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -41,6 +44,8 @@ DEFAULT_ARTIFACT_MAX_BYTES = 1_000_000_000
 DEFAULT_ARTIFACT_CHUNK_BYTES = 44_000
 MAX_ARTIFACT_CHUNK_BYTES = 44_000
 MAX_VERIFIED_ARTIFACT_CACHE_ENTRIES = 64
+MAX_PARSED_ARTIFACT_CACHE_ENTRIES = 4
+MAX_PARSED_ARTIFACT_CACHE_BYTES = 64 * 1024 * 1024
 EXPORT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32}$")
 ARTIFACT_PREFIX = "overflow-"
 ARTIFACT_FILE_PATTERN = re.compile(
@@ -171,6 +176,11 @@ class OverflowArtifactStore:
             str,
             tuple[ArtifactIdentity, str],
         ] = OrderedDict()
+        self._parsed_artifacts: OrderedDict[
+            str,
+            tuple[ArtifactIdentity, str, dict[str, Any], int],
+        ] = OrderedDict()
+        self._parsed_artifact_bytes = 0
 
     def _ensure_directory(self) -> None:
         """Create the artifact directory without following a final-component link."""
@@ -314,7 +324,7 @@ class OverflowArtifactStore:
         """Remove an artifact and its integrity manifest when present."""
         names = [name]
         if artifact_match := ARTIFACT_FILE_PATTERN.fullmatch(name):
-            self._verified_artifacts.pop(artifact_match.group(1), None)
+            self._forget_artifact(artifact_match.group(1))
             names.append(self._manifest_name(artifact_match.group(1)))
         for candidate in names:
             try:
@@ -341,13 +351,24 @@ class OverflowArtifactStore:
                     directory_fd,
                 )
             except FileNotFoundError:
-                self._verified_artifacts.pop(export_id, None)
+                self._forget_artifact(export_id)
                 continue
             if not (
                 stat.S_ISREG(artifact_stat.st_mode)
                 and stat.S_ISREG(manifest_stat.st_mode)
             ):
-                self._verified_artifacts.pop(export_id, None)
+                self._forget_artifact(export_id)
+
+    def _forget_parsed_artifact(self, export_id: str) -> None:
+        """Release a decoded artifact and its accounted retained memory."""
+        cached = self._parsed_artifacts.pop(export_id, None)
+        if cached is not None:
+            self._parsed_artifact_bytes -= cached[3]
+
+    def _forget_artifact(self, export_id: str) -> None:
+        """Invalidate both caches together while the directory lock is held."""
+        self._verified_artifacts.pop(export_id, None)
+        self._forget_parsed_artifact(export_id)
 
     def _remember_verified_artifact(
         self,
@@ -364,7 +385,78 @@ class OverflowArtifactStore:
             MAX_VERIFIED_ARTIFACT_CACHE_ENTRIES,
         )
         while len(self._verified_artifacts) > cache_limit:
-            self._verified_artifacts.popitem(last=False)
+            oldest_id = next(iter(self._verified_artifacts))
+            self._forget_artifact(oldest_id)
+
+    @staticmethod
+    def _parsed_artifact_size(artifact: dict[str, Any]) -> int | None:
+        """Conservatively count decoded JSON memory, stopping at the cache budget.
+
+        JSON has no cycles. Count shared keys and scalar objects on every use,
+        which overestimates retained memory without a large visited-object set.
+        Iterator storage grows with nesting depth rather than collection length.
+        """
+        total = 0
+        pending = [iter((artifact,))]
+        while pending:
+            try:
+                value = next(pending[-1])
+            except StopIteration:
+                pending.pop()
+                continue
+            total += sys.getsizeof(value)
+            if total > MAX_PARSED_ARTIFACT_CACHE_BYTES:
+                return None
+            if isinstance(value, dict):
+                pending.append(chain.from_iterable(value.items()))
+            elif isinstance(value, list):
+                pending.append(iter(value))
+        return total
+
+    def _read_parsed_artifact(
+        self,
+        *,
+        export_id: str,
+        artifact_file: Any,
+        identity: ArtifactIdentity,
+        expected_digest: str,
+    ) -> dict[str, Any]:
+        """Reuse only a verified file version within count and decoded-byte bounds."""
+        cached = self._parsed_artifacts.get(export_id)
+        if cached is not None and cached[:2] == (identity, expected_digest):
+            self._parsed_artifacts.move_to_end(export_id)
+            return cached[2]
+        self._forget_parsed_artifact(export_id)
+        artifact_file.seek(0)
+        try:
+            artifact = json.load(artifact_file)
+            if not isinstance(artifact, dict) or not isinstance(
+                artifact.get("tool_result"), dict
+            ):
+                raise ValueError("Invalid artifact envelope.")
+        except (TypeError, ValueError) as exc:
+            self._forget_artifact(export_id)
+            raise ValidationError(
+                "Overflow artifact failed integrity validation."
+            ) from exc
+        if self._artifact_identity(os.fstat(artifact_file.fileno())) != identity:
+            self._forget_artifact(export_id)
+            raise ValidationError("Overflow artifact failed integrity validation.")
+        parsed_bytes = self._parsed_artifact_size(artifact)
+        if parsed_bytes is not None:
+            cache_limit = min(self.max_files, MAX_PARSED_ARTIFACT_CACHE_ENTRIES)
+            while self._parsed_artifacts and (
+                len(self._parsed_artifacts) >= cache_limit
+                or self._parsed_artifact_bytes + parsed_bytes
+                > MAX_PARSED_ARTIFACT_CACHE_BYTES
+            ):
+                self._forget_parsed_artifact(next(iter(self._parsed_artifacts)))
+            self._parsed_artifacts[export_id] = (
+                identity, expected_digest, artifact, parsed_bytes
+            )
+            self._parsed_artifact_bytes += parsed_bytes
+        # Oversized decoded artifacts remain readable without retaining them.
+        return artifact
 
     def _cleanup_orphans_unlocked(
         self,
@@ -695,6 +787,7 @@ class OverflowArtifactStore:
         ):
             self._verified_artifacts.move_to_end(export_id)
             return identity
+        self._forget_parsed_artifact(export_id)
         artifact_file.seek(0)
         digest = hashlib.sha256()
         while digest_chunk := artifact_file.read(64 * 1024):
@@ -708,7 +801,7 @@ class OverflowArtifactStore:
                 expected_digest,
             )
         ):
-            self._verified_artifacts.pop(export_id, None)
+            self._forget_artifact(export_id)
             raise ValidationError(
                 "Overflow artifact failed integrity validation."
             )
@@ -795,7 +888,8 @@ class OverflowArtifactStore:
             )
         if not fits():
             raise ValidationError("The requested result byte limit is too small for an item page.")
-        return page
+        # Cached JSON stays private: callers may mutate returned items/context.
+        return deepcopy(page)
 
     def read(
         self,
@@ -828,12 +922,12 @@ class OverflowArtifactStore:
             try:
                 path_stat = self._stat_name(artifact_name, directory_fd)
             except FileNotFoundError as exc:
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise NotFoundError(
                     "Overflow artifact was not found or has expired."
                 ) from exc
             if not stat.S_ISREG(path_stat.st_mode):
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise NotFoundError(
                     "Overflow artifact was not found or has expired."
                 )
@@ -844,7 +938,7 @@ class OverflowArtifactStore:
                 )
                 expected_size, expected_digest = manifest["size"], manifest["sha256"]
             except Exception:
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise
             try:
                 descriptor = self._open_name(
@@ -859,31 +953,28 @@ class OverflowArtifactStore:
                     errno.EISDIR,
                     errno.ENXIO,
                 }:
-                    self._verified_artifacts.pop(
-                        normalized_export_id,
-                        None,
-                    )
+                    self._forget_artifact(normalized_export_id)
                     raise NotFoundError(
                         "Overflow artifact was not found or has expired."
                     ) from exc
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise
             try:
                 file_stat = os.fstat(descriptor)
             except Exception:
                 os.close(descriptor)
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise
             if not stat.S_ISREG(file_stat.st_mode):
                 os.close(descriptor)
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise NotFoundError(
                     "Overflow artifact was not found or has expired."
                 )
             with _owned_fdopen(descriptor, "rb") as artifact_file:
                 total_bytes = file_stat.st_size
                 if total_bytes != expected_size:
-                    self._verified_artifacts.pop(normalized_export_id, None)
+                    self._forget_artifact(normalized_export_id)
                     raise ValidationError(
                         "Overflow artifact failed integrity validation."
                     )
@@ -898,12 +989,13 @@ class OverflowArtifactStore:
                 collection = None
                 artifact = None
                 if item_offset is not None or prefer_items:
-                    artifact_file.seek(0)
-                    try:
-                        artifact = json.load(artifact_file)
-                        collection = _collection(artifact["tool_result"].get("structured_content"))
-                    except (KeyError, TypeError, ValueError) as exc:
-                        raise ValidationError("Overflow artifact failed integrity validation.") from exc
+                    artifact = self._read_parsed_artifact(
+                        export_id=normalized_export_id,
+                        artifact_file=artifact_file,
+                        identity=verified_identity,
+                        expected_digest=expected_digest,
+                    )
+                    collection = _collection(artifact["tool_result"].get("structured_content"))
                 if collection is not None:
                     item_offset = 0 if item_offset is None else item_offset
                     if item_offset != 0 and item_offset not in manifest.get("item_offsets", []):
@@ -933,7 +1025,7 @@ class OverflowArtifactStore:
                     try:
                         chunk_data = chunk_bytes.decode("ascii")
                     except UnicodeDecodeError as exc:
-                        self._verified_artifacts.pop(normalized_export_id, None)
+                        self._forget_artifact(normalized_export_id)
                         raise ValidationError("Overflow artifact failed integrity validation.") from exc
                     chunk = {
                         "export_id": normalized_export_id,
@@ -965,7 +1057,7 @@ class OverflowArtifactStore:
                 if self._artifact_identity(
                     os.fstat(artifact_file.fileno())
                 ) != verified_identity:
-                    self._verified_artifacts.pop(normalized_export_id, None)
+                    self._forget_artifact(normalized_export_id)
                     raise ValidationError(
                         "Overflow artifact failed integrity validation."
                     )
@@ -982,7 +1074,7 @@ class OverflowArtifactStore:
                         directory_fd=directory_fd,
                     )
                 except Exception:
-                    self._verified_artifacts.pop(normalized_export_id, None)
+                    self._forget_artifact(normalized_export_id)
                     raise
         return chunk
 
