@@ -169,4 +169,12 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "create_lift_study",
         "update_ad_study",
         "cancel_ad_study",
+        "create_catalog",
+        "update_catalog",
+        "create_catalog_product",
+        "update_catalog_product",
+        "delete_catalog_product",
+        "create_product_set",
+        "update_product_set",
+        "delete_product_set",
     }
