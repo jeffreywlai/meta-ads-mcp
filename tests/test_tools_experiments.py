@@ -366,6 +366,23 @@ def test_eligibility_validation(monkeypatch, kwargs) -> None:
         run(experiments.check_ab_test_eligibility(account_id="123", **kwargs))
 
 
+@pytest.mark.parametrize("account_id", ["   ", "", "act_"])
+@pytest.mark.parametrize("tool", ["check_ab_test_eligibility", "create_ab_test", "create_lift_study"])
+def test_experiment_required_account_cannot_be_blank(monkeypatch, tool, account_id) -> None:
+    """F33: a blank account id is rejected before any client is created, even with business_id."""
+    no_client(monkeypatch)
+    if tool == "check_ab_test_eligibility":
+        call = experiments.check_ab_test_eligibility(
+            account_id=account_id, level="campaign", entity_ids=["c1"],
+        )
+    elif tool == "create_ab_test":
+        call = _ab(account_id=account_id, cells=_cells(50, 50, key="campaign_ids"))
+    else:
+        call = _lift(account_id=account_id)
+    with pytest.raises(experiments.ValidationError, match="account_id"):
+        run(call)
+
+
 # --- create_ab_test ----------------------------------------------------------------
 
 

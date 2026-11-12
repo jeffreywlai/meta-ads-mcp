@@ -396,6 +396,13 @@ def _build_objectives(objectives: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return built
 
 
+def _required_account_id(account_id: Any) -> str:
+    """Reject a missing or blank account id before normalizing it to the act_ form."""
+    if not isinstance(account_id, str) or not account_id.strip() or account_id.strip() == "act_":
+        raise ValidationError("account_id is required.")
+    return normalize_account_id(account_id.strip())
+
+
 async def _resolve_business_id(client: Any, account_id: str, business_id: str | None) -> str:
     """Meta creates studies on a business; use business_id or the account's owning business."""
     if business_id:
@@ -719,6 +726,7 @@ async def check_ab_test_eligibility(
     public eligibility endpoint. Reports per entity: exists, belongs to the account, status,
     objective, buying type, and any scheduled or running study it is already in.
     """
+    account_id = _required_account_id(account_id)
     normalized_level = (blank_to_none(level) or "").lower().replace("ad_set", "adset")
     if normalized_level not in {"campaign", "adset"}:
         raise ValidationError("level must be campaign or adset.")
@@ -727,7 +735,6 @@ async def check_ab_test_eligibility(
         raise ValidationError("entity_ids needs at least one campaign or ad set id.")
     if len(ids) > MAX_CELLS_PER_STUDY:
         raise ValidationError(f"Check at most {MAX_CELLS_PER_STUDY} entities, Meta's documented maximum cells per study.")
-    account_id = normalize_account_id(account_id)
     account_number = account_id.removeprefix("act_")
     fields = (
         ["id", "name", "account_id", "effective_status", "objective", "buying_type"]
@@ -853,6 +860,7 @@ async def create_ab_test(
     Times are ISO 8601 with offset or Unix seconds. Meta creates studies on the account's business;
     pass business_id if the account has none. hypothesis is stored as the study description.
     """
+    account_id = _required_account_id(account_id)
     if not isinstance(name, str) or not name.strip():
         raise ValidationError("name is required.")
     built_cells = _build_ab_cells(cells)
@@ -876,7 +884,6 @@ async def create_ab_test(
         },
         params,
     )
-    account_id = normalize_account_id(account_id)
     client = get_graph_api_client()
     owner = await _resolve_business_id(client, account_id, blank_to_none(business_id))
     result = await client.create_edge_object(owner, "ad_studies", data=payload)
@@ -907,9 +914,9 @@ async def create_lift_study(
     CONVERSIONS), is_primary, adspixels or applications [{id, event_names}], ...}; one primary.
     start_time must be in the future. observation_end_time defaults to end_time.
     """
+    account_id = _required_account_id(account_id)
     if not isinstance(name, str) or not name.strip():
         raise ValidationError("name is required.")
-    account_id = normalize_account_id(account_id)
     built_cells = _build_lift_cells(cells, account_id)
     built_objectives = _build_objectives(objectives)
     start = _to_unix(start_time, "start_time")
