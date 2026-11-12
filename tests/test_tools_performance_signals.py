@@ -656,3 +656,154 @@ def test_auction_ranking_report_validation_errors_make_no_calls(monkeypatch, kwa
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.get_auction_ranking_report(**kwargs))
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# get_advertiser_context
+# ---------------------------------------------------------------------------
+
+
+def _adset_row(adset_id: str, *, objective: str, goal: str, spend: float, actions: dict[str, float],
+               values: dict[str, float] | None = None) -> dict[str, Any]:
+    return {
+        "campaign_id": f"cmp_{adset_id}",
+        "adset_id": adset_id,
+        "adset_name": f"Ad set {adset_id}",
+        "objective": objective,
+        "optimization_goal": goal,
+        "date_start": "2026-10-13",
+        "date_stop": "2026-11-11",
+        "spend": str(spend),
+        "impressions": "100000",
+        "clicks": "2000",
+        "actions": [{"action_type": key, "value": str(value)} for key, value in actions.items()],
+        "action_values": [{"action_type": key, "value": str(value)} for key, value in (values or {}).items()],
+    }
+
+
+CONTEXT_ROWS = [
+    _adset_row("as_a", objective="OUTCOME_SALES", goal="OFFSITE_CONVERSIONS", spend=600,
+               actions={"link_click": 1500, "landing_page_view": 1200, "add_to_cart": 400,
+                        "initiate_checkout": 350, "purchase": 300}, values={"purchase": 9000}),
+    _adset_row("as_b", objective="OUTCOME_SALES", goal="OFFSITE_CONVERSIONS", spend=200,
+               actions={"link_click": 500, "landing_page_view": 300, "add_to_cart": 100,
+                        "initiate_checkout": 50, "purchase": 30}),
+    _adset_row("as_c", objective="OUTCOME_TRAFFIC", goal="LINK_CLICKS", spend=200,
+               actions={"link_click": 1000, "landing_page_view": 500}),
+]
+
+
+def _context_client(overrides: dict[tuple[str, str], Any] | None = None) -> RecordingClient:
+    edges: dict[tuple[str, str], Any] = {
+        ("act_42", "adspixels"): {"data": [{"id": "px_1", "name": "Main pixel", "last_fired_time": "2026-11-11T10:00:00+0000"}]},
+        ("act_42", "customconversions"): {"data": [{"id": "cc_1", "name": "Big purchase", "custom_event_type": "PURCHASE"}]},
+        ("act_42", "promote_pages"): {"data": [{"id": "page_1", "name": "Shop Page"}]},
+        ("act_42", "instagram_accounts"): {"data": [{"id": "ig_1", "username": "shop"}], "paging": {"next": "n", "cursors": {"after": "c"}}},
+    }
+    edges.update(overrides or {})
+    return RecordingClient(
+        objects={
+            "act_42": {
+                "id": "act_42",
+                "name": "Shop",
+                "account_status": 1,
+                "disable_reason": 0,
+                "currency": "USD",
+                "timezone_name": "America/New_York",
+                "business": {"id": "biz_1", "name": "Shop Inc"},
+                "amount_spent": "123456",
+                "spend_cap": "0",
+            }
+        },
+        edges=edges,
+        insights_handler=lambda object_id, fields, params: {"data": CONTEXT_ROWS},
+    )
+
+
+def test_advertiser_context_labels_itself_as_derived(monkeypatch) -> None:
+    _patch(monkeypatch, _context_client())
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="42"))
+    assert result["source"] == "derived"
+    assert "not Meta's own" in result["derived_note"]
+
+
+def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -> None:
+    client = _patch(monkeypatch, _context_client())
+    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
+
+    insights_call = _calls(client, "get_insights")[0]
+    assert insights_call["object_id"] == "act_42"
+    assert insights_call["params"]["level"] == "adset"
+    assert json.loads(insights_call["params"]["time_range"]) == {"since": "2026-10-15", "until": "2026-11-11"}
+    assert {"objective", "optimization_goal", "actions"} <= set(insights_call["fields"])
+    edges = {call["edge"] for call in _calls(client, "list_objects")}
+    assert edges == {"adspixels", "customconversions", "promote_pages", "instagram_accounts"}
+
+    account = result["account"]
+    assert account["account_status"] == {"code": 1, "label": "ACTIVE"}
+    assert account["disable_reason"] == {"code": 0, "label": "NONE"}
+    assert account["business"] == {"id": "biz_1", "name": "Shop Inc"}
+    assert account["amount_spent"] == 1234.56
+
+    by_objective = {row["objective"]: row for row in result["spend_by_objective"]}
+    assert by_objective["OUTCOME_SALES"]["spend"] == 800.0
+    assert by_objective["OUTCOME_SALES"]["spend_share"] == pytest.approx(0.8)
+    assert by_objective["OUTCOME_SALES"]["adset_count"] == 2
+    by_goal = {row["optimization_goal"]: row for row in result["spend_by_optimization_goal"]}
+    assert by_goal["LINK_CLICKS"]["spend"] == 200.0
+
+    steps = {step["step"]: step for step in result["funnel"]["steps"]}
+    assert steps["link_click"]["count"] == 3000
+    assert steps["landing_page_view"]["count"] == 2000
+    assert steps["purchase"]["count"] == 330
+    assert steps["view_content"]["count"] is None
+    transitions = {(row["from"], row["to"]): row for row in result["funnel"]["drop_off"]}
+    assert transitions[("link_click", "landing_page_view")]["drop_off"] == pytest.approx(1 - 2000 / 3000)
+    assert transitions[("add_to_cart", "initiate_checkout")]["drop_off"] == pytest.approx(1 - 400 / 500)
+
+    volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
+    conversions = volume["OFFSITE_CONVERSIONS"]
+    assert conversions["threshold_events_per_week"] == 50
+    assert conversions["adsets_meeting_threshold"] == 1 and conversions["adset_count"] == 2
+    assert conversions["verdict"] == "some_adsets_meet_threshold"
+    weekly = {row["adset_id"]: row["events_per_week"] for row in conversions["adsets"]}
+    assert weekly["as_a"] == pytest.approx(300 / 28 * 7)
+    assert volume["LINK_CLICKS"]["verdict"] == "all_adsets_meet_threshold"
+
+    assert result["datasets"]["items"][0]["id"] == "px_1"
+    assert result["custom_conversions"]["count"] == 1
+    assert result["pages"]["items"][0]["name"] == "Shop Page"
+    assert result["instagram_accounts"]["complete"] is False
+    assert result["section_errors"] == {}
+
+
+def test_advertiser_context_section_permission_error_is_reported_not_empty(monkeypatch) -> None:
+    _patch(monkeypatch, _context_client({("act_42", "adspixels"): _permission_error()}))
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+
+    assert result["datasets"]["available"] is False
+    assert result["datasets"]["items"] is None
+    assert "Permissions" in result["section_errors"]["datasets"]["message"]
+    assert any("datasets" in signal for signal in result["missing_signals"])
+
+
+def test_advertiser_context_account_permission_error_is_not_swallowed(monkeypatch) -> None:
+    client = _context_client()
+    client.objects["act_42"] = _permission_error()
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError):
+        asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"account_id": ""}, {"account_id": "act_1", "lookback_days": 6}, {"account_id": "act_1", "lookback_days": 91}],
+)
+def test_advertiser_context_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.get_advertiser_context(**kwargs))
+    assert client.calls == []

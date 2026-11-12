@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, timedelta
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import build_finding, metric_evidence
-from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, NotFoundError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, normalize_currency
 from meta_ads_mcp.normalize import blank_to_none, to_float
+from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tool_types import StringList
 from meta_ads_mcp.tools import diagnostics as diagnostics_tools
@@ -970,6 +972,337 @@ async def get_auction_ranking_report(
             "weak_ad_count": len(weak),
             "unranked_ad_count": sum(1 for ad in ads if ad["ranking_points"] is None),
             "rules": RANKING_RULES,
+            "results_definition": RESULTS_DEFINITION,
+        },
+    )
+
+
+ACCOUNT_STATUS_LABELS = {
+    1: "ACTIVE",
+    2: "DISABLED",
+    3: "UNSETTLED",
+    7: "PENDING_RISK_REVIEW",
+    8: "PENDING_SETTLEMENT",
+    9: "IN_GRACE_PERIOD",
+    100: "PENDING_CLOSURE",
+    101: "CLOSED",
+    201: "ANY_ACTIVE",
+    202: "ANY_CLOSED",
+}
+DISABLE_REASON_LABELS = {
+    0: "NONE",
+    1: "ADS_INTEGRITY_POLICY",
+    2: "ADS_IP_REVIEW",
+    3: "RISK_PAYMENT",
+    4: "GRAY_ACCOUNT_SHUT_DOWN",
+    5: "ADS_AFC_REVIEW",
+    6: "BUSINESS_INTEGRITY_RAR",
+    7: "PERMANENT_CLOSE",
+    8: "UNUSED_RESELLER_ACCOUNT",
+    9: "UNUSED_ACCOUNT",
+    10: "UMBRELLA_AD_ACCOUNT",
+    11: "BUSINESS_MANAGER_INTEGRITY_POLICY",
+    12: "MISREPRESENTED_AD_ACCOUNT",
+    13: "AOAB_DESHARE_LEGAL_ENTITY",
+    14: "CTX_THREAD_REVIEW",
+    15: "COMPROMISED_AD_ACCOUNT",
+}
+CONTEXT_ACCOUNT_FIELDS = [
+    "id",
+    "name",
+    "account_status",
+    "disable_reason",
+    "currency",
+    "timezone_name",
+    "business",
+    "amount_spent",
+    "spend_cap",
+    "created_time",
+]
+CONTEXT_INSIGHTS_FIELDS = [
+    "campaign_id",
+    "adset_id",
+    "adset_name",
+    "objective",
+    "optimization_goal",
+    "date_start",
+    "date_stop",
+    "spend",
+    "impressions",
+    "clicks",
+    "actions",
+    "action_values",
+]
+PURCHASE_ACTION_TYPES = [
+    "purchase",
+    "omni_purchase",
+    "offsite_conversion.purchase",
+    "offsite_conversion.fb_pixel_purchase",
+    "onsite_conversion.purchase",
+]
+LEAD_ACTION_TYPES = ["lead", "onsite_conversion.lead", "offsite_conversion.fb_pixel_lead"]
+FUNNEL_STEPS: list[tuple[str, list[str]]] = [
+    ("link_click", ["link_click"]),
+    ("landing_page_view", ["landing_page_view", "omni_landing_page_view"]),
+    ("view_content", ["view_content", "omni_view_content", "offsite_conversion.fb_pixel_view_content"]),
+    ("add_to_cart", ["add_to_cart", "omni_add_to_cart", "offsite_conversion.fb_pixel_add_to_cart"]),
+    (
+        "initiate_checkout",
+        ["initiate_checkout", "omni_initiated_checkout", "offsite_conversion.fb_pixel_initiate_checkout"],
+    ),
+    ("purchase", PURCHASE_ACTION_TYPES),
+]
+LEARNING_EVENTS_PER_WEEK = 50
+GOAL_EVENT_BASIS: dict[str, tuple[str, list[str] | None, str]] = {
+    "OFFSITE_CONVERSIONS": (
+        "results", None,
+        "purchase or lead actions; an approximation, because the ad set's promoted event may be a different event",
+    ),
+    "VALUE": ("results", None, "purchase or lead actions"),
+    "LEAD_GENERATION": ("results", None, "lead actions (purchase if present)"),
+    "QUALITY_LEAD": ("results", None, "lead actions (purchase if present)"),
+    "LINK_CLICKS": ("actions", ["link_click"], "link_click actions"),
+    "LANDING_PAGE_VIEWS": ("actions", ["landing_page_view", "omni_landing_page_view"], "landing_page_view actions"),
+}
+CONTEXT_EDGE_SECTIONS: list[tuple[str, str, list[str]]] = [
+    ("datasets", "adspixels", ["id", "name", "last_fired_time", "is_unavailable"]),
+    ("custom_conversions", "customconversions", ["id", "name", "custom_event_type", "last_fired_time", "is_archived"]),
+    ("pages", "promote_pages", ["id", "name", "category"]),
+    ("instagram_accounts", "instagram_accounts", ["id", "username"]),
+]
+CONTEXT_EDGE_LIMIT = 25
+
+
+def _code_label(value: Any, labels: dict[int, str]) -> dict[str, Any] | None:
+    """Return a numeric Meta code with its documented label."""
+    code = _number(value)
+    if code is None:
+        return None
+    return {"code": code, "label": labels.get(int(code), "UNKNOWN")}
+
+
+def _public_error(exc: Exception) -> dict[str, Any]:
+    """Return a caller-safe description of a section read failure."""
+    if isinstance(exc, MetaApiError):
+        return exc.to_public_dict()
+    return {"type": type(exc).__name__, "message": str(exc)}
+
+
+async def _optional_edge_section(client: Any, account_id: str, edge: str, fields: list[str]) -> dict[str, Any]:
+    """Read the first page of an account edge, reporting failures instead of an empty list."""
+    try:
+        payload = await client.list_objects(account_id, edge, fields=fields, params={"limit": CONTEXT_EDGE_LIMIT})
+    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+        return {"available": False, "edge": edge, "items": None, "count": None, "complete": None, "error": _public_error(exc)}
+    items = [item for item in payload.get("data", []) or [] if isinstance(item, dict)]
+    return {
+        "available": True,
+        "edge": edge,
+        "items": items,
+        "count": len(items),
+        "complete": not bool(extract_paging(payload).get("next")),
+        "page_limit": CONTEXT_EDGE_LIMIT,
+    }
+
+
+def _group_spend(rows: list[dict[str, Any]], key: str, total_spend: float) -> list[dict[str, Any]]:
+    """Group ad set rows by a dimension, with spend, share and results."""
+    groups: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        label = str(row.get(key) or "UNKNOWN")
+        metrics = row.get("metrics") or {}
+        group = groups.setdefault(label, {key: label, "spend": 0.0, "results": 0.0, "adset_count": 0})
+        group["spend"] += to_float(metrics.get("spend")) or 0.0
+        group["results"] += to_float(metrics.get("conversions")) or 0.0
+        group["adset_count"] += 1
+    for group in groups.values():
+        group["spend_share"] = _ratio(group["spend"], total_spend)
+        group["cost_per_result"] = _ratio(group["spend"], group["results"])
+    return sorted(groups.values(), key=lambda group: (-group["spend"], group[key]))
+
+
+def _sum_actions(rows: list[dict[str, Any]]) -> dict[str, float]:
+    """Sum parsed action maps across rows."""
+    totals: dict[str, float] = {}
+    for row in rows:
+        for action_type, value in (row.get("actions_map") or {}).items():
+            totals[action_type] = totals.get(action_type, 0.0) + (to_float(value) or 0.0)
+    return totals
+
+
+def _funnel(action_totals: dict[str, float]) -> dict[str, Any]:
+    """Build funnel step counts and drop-off between adjacent steps that have data."""
+    steps = []
+    for step, candidates in FUNNEL_STEPS:
+        matched = next((candidate for candidate in candidates if candidate in action_totals), None)
+        steps.append({
+            "step": step,
+            "count": _number(action_totals[matched]) if matched else None,
+            "action_type": matched,
+            "action_types_checked": candidates,
+        })
+    present = [step for step in steps if step["count"] is not None]
+    drop_off = []
+    for previous, current in zip(present, present[1:]):
+        rate = _ratio(current["count"], previous["count"])
+        drop_off.append({
+            "from": previous["step"],
+            "to": current["step"],
+            "from_count": previous["count"],
+            "to_count": current["count"],
+            "drop_off": None if rate is None else 1 - rate,
+            "formula": "1 - to_count / from_count",
+        })
+    lead = next((candidate for candidate in LEAD_ACTION_TYPES if candidate in action_totals), None)
+    return {
+        "steps": steps,
+        "drop_off": drop_off,
+        "lead_events": {"count": _number(action_totals[lead]) if lead else None, "action_type": lead},
+        "note": (
+            "Each step uses the first matching action type Meta reports, so the same event is not counted twice. "
+            "Steps with no data are skipped when computing drop-off. Counts use Meta attribution."
+        ),
+    }
+
+
+def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[str, Any]]:
+    """Compare each optimization goal's weekly events per ad set with the learning-phase guidance."""
+    by_goal: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if (to_float((row.get("metrics") or {}).get("spend")) or 0.0) <= 0:
+            continue
+        by_goal.setdefault(str(row.get("optimization_goal") or "UNKNOWN"), []).append(row)
+    output = []
+    for goal in sorted(by_goal):
+        goal_rows = by_goal[goal]
+        basis = GOAL_EVENT_BASIS.get(goal)
+        if basis is None:
+            output.append({
+                "optimization_goal": goal,
+                "adset_count": len(goal_rows),
+                "verdict": "not_assessed",
+                "reason": "No event mapping is defined for this optimization goal.",
+            })
+            continue
+        source, action_types, description = basis
+        adsets = []
+        for row in goal_rows:
+            if source == "results":
+                events = to_float((row.get("metrics") or {}).get("conversions")) or 0.0
+            else:
+                actions = row.get("actions_map") or {}
+                matched = next((candidate for candidate in action_types or [] if candidate in actions), None)
+                events = (to_float(actions.get(matched)) or 0.0) if matched else 0.0
+            per_week = events / lookback_days * 7
+            adsets.append({
+                "adset_id": row.get("adset_id"),
+                "adset_name": row.get("adset_name"),
+                "events": events,
+                "events_per_week": per_week,
+                "meets_threshold": per_week >= LEARNING_EVENTS_PER_WEEK,
+            })
+        meeting = sum(1 for adset in adsets if adset["meets_threshold"])
+        verdict = (
+            "all_adsets_meet_threshold" if meeting == len(adsets)
+            else "some_adsets_meet_threshold" if meeting
+            else "no_adsets_meet_threshold"
+        )
+        output.append({
+            "optimization_goal": goal,
+            "event_basis": description,
+            "threshold_events_per_week": LEARNING_EVENTS_PER_WEEK,
+            "adset_count": len(adsets),
+            "adsets_meeting_threshold": meeting,
+            "verdict": verdict,
+            "adsets": sorted(adsets, key=lambda adset: -adset["events_per_week"]),
+        })
+    return output
+
+
+@mcp_server.tool()
+async def get_advertiser_context(
+    account_id: str,
+    lookback_days: int = 30,
+) -> dict[str, Any]:
+    """Briefing built from this account's data: account and business settings, spend by objective and optimization goal, funnel event volumes with drop-off, pixels/datasets and custom conversions, Pages and Instagram identities, and which optimization goals get about 50 events per ad set per week. Derived here; not Meta's own summary."""
+    resolved_account_id = _require_account_id(account_id)
+    if not 7 <= lookback_days <= 90:
+        raise ValidationError("lookback_days must be between 7 and 90.")
+    end = _today() - timedelta(days=1)
+    start = end - timedelta(days=lookback_days - 1)
+    client = get_graph_api_client()
+    account, rows, *edge_sections = await asyncio.gather(
+        client.get_object(resolved_account_id, fields=CONTEXT_ACCOUNT_FIELDS),
+        diagnostics_tools._child_insights(
+            resolved_account_id,
+            level="adset",
+            date_preset=None,
+            since=start.isoformat(),
+            until=end.isoformat(),
+            fields=CONTEXT_INSIGHTS_FIELDS,
+        ),
+        *(
+            _optional_edge_section(client, resolved_account_id, edge, fields)
+            for _, edge, fields in CONTEXT_EDGE_SECTIONS
+        ),
+    )
+    missing_signals: list[str] = []
+    currency = _supported_currency(account.get("currency"))
+    money: dict[str, float | None] = {}
+    for field in ("amount_spent", "spend_cap"):
+        value = account.get(field)
+        money[field] = from_minor_units(value, currency, field_name=field) if currency else None
+    if currency is None:
+        missing_signals.append("account currency: unknown or unsupported, so amount_spent and spend_cap are null.")
+    business = account.get("business") if isinstance(account.get("business"), dict) else None
+
+    total_spend = sum(to_float((row.get("metrics") or {}).get("spend")) or 0.0 for row in rows)
+    if not rows:
+        missing_signals.append("Meta returned no ad set insights rows for the lookback window.")
+    sections = {
+        name: section for (name, _, _), section in zip(CONTEXT_EDGE_SECTIONS, edge_sections, strict=True)
+    }
+    section_errors = {name: section["error"] for name, section in sections.items() if not section["available"]}
+    for name, error in section_errors.items():
+        missing_signals.append(f"{name}: Meta returned an error, so this section is unknown ({error.get('message')}).")
+
+    return analysis_response(
+        scope={"level": "account", "object_id": resolved_account_id},
+        metrics={"spend": total_spend, "adset_rows": len(rows)},
+        missing_signals=missing_signals,
+        extra={
+            "source": "derived",
+            "derived_note": (
+                "Built by this server from the account's own data. This is not Meta's own advertiser summary."
+            ),
+            "window": {"since": start.isoformat(), "until": end.isoformat(), "days": lookback_days},
+            "account": {
+                "id": str(account.get("id") or resolved_account_id),
+                "name": account.get("name"),
+                "account_status": _code_label(account.get("account_status"), ACCOUNT_STATUS_LABELS),
+                "disable_reason": _code_label(account.get("disable_reason"), DISABLE_REASON_LABELS),
+                "currency": account.get("currency"),
+                "timezone_name": account.get("timezone_name"),
+                "business": (
+                    {"id": str(business.get("id")) if business.get("id") is not None else None, "name": business.get("name")}
+                    if business else None
+                ),
+                "amount_spent": money["amount_spent"],
+                "spend_cap": money["spend_cap"],
+                "money_units": f"major units of {currency}" if currency else None,
+                "created_time": account.get("created_time"),
+            },
+            "spend_by_objective": _group_spend(rows, "objective", total_spend),
+            "spend_by_optimization_goal": _group_spend(rows, "optimization_goal", total_spend),
+            "funnel": _funnel(_sum_actions(rows)),
+            "optimization_goal_volume": _goal_volume(rows, lookback_days),
+            "optimization_goal_volume_rule": (
+                f"An ad set meets the threshold when its events / lookback_days x 7 is at least "
+                f"{LEARNING_EVENTS_PER_WEEK}, following Meta's learning-phase guidance of about 50 optimization "
+                "events per ad set in a 7-day period. Only ad sets with spend in the window are counted."
+            ),
+            **sections,
+            "section_errors": section_errors,
             "results_definition": RESULTS_DEFINITION,
         },
     )
