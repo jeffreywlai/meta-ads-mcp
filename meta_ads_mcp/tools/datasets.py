@@ -4,7 +4,8 @@ Endpoints (Meta Marketing API reference):
 - GET act_{id}/adspixels and {business_id}/adspixels: ad-account/adspixels, business/adspixels
 - GET {pixel_id}: ads-pixel
 - GET {pixel_id}/stats: ads-pixel/stats
-- GET dataset_quality?dataset_id=: conversions-api/dataset-quality-api
+- GET dataset_quality?dataset_id=: conversions-api/dataset-quality-api (web) and
+  conversions-api/dataset-quality-api/offline-events (offline)
 - GET act_{id}/customconversions: ad-account/customconversions
 """
 
@@ -95,6 +96,21 @@ DATASET_QUALITY_FIELDS = (
     "dedupe_key_feedback{dedupe_key,browser_events_with_dedupe_key{percentage},"
     "server_events_with_dedupe_key{percentage}},"
     "data_freshness{upload_frequency,description}}"
+)
+# Offline channel (Meta Dataset Quality API, offline events, v23.0 and later).
+# Each subfield returns Meta's default subfields: a score out of 10 and a
+# recommendation, plus email and phone coverage under match_key.
+OFFLINE_QUALITY_FIELDS = "offline{event_name,composite,match_key,frequency,freshness}"
+DATASET_QUALITY_CHANNELS = ("web", "offline")
+OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST = 8.5
+OFFLINE_THRESHOLD_SOURCE = (
+    "Meta's offline Dataset Quality API documentation: the composite score is out of 10, combining data "
+    "freshness, frequency and attribution over the last 28 days, and a composite score of 8.5 or higher "
+    "allows the use of omnichannel ads."
+)
+OFFLINE_SCORE_NOTE = (
+    "Offline scores are Meta's offline data quality scores (composite, match key, frequency, freshness). "
+    "They are not event match quality (EMQ) scores, which Meta computes only for web events."
 )
 WEAK_EMQ_SCORE_BELOW = 6.0
 DEFAULT_COVERAGE_GOAL_PERCENTAGE = 75
@@ -400,22 +416,101 @@ def _quality_event(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _score_node(node: Any) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    return {"score": to_float(node.get("score")), "recommendation": node.get("recommendation")}
+
+
+def _offline_quality_event(row: dict[str, Any]) -> dict[str, Any]:
+    composite = _score_node(row.get("composite")) or {"score": None, "recommendation": None}
+    match_key = row.get("match_key")
+    match_key_node = _score_node(match_key)
+    if match_key_node is not None:
+        coverage = match_key.get("coverage")
+        match_key_node["coverage"] = coverage if isinstance(coverage, dict) else None
+    score = composite["score"]
+    return {
+        "event_name": row.get("event_name"),
+        "composite_score": score,
+        "composite_recommendation": composite["recommendation"],
+        "below_omnichannel_threshold": None if score is None else score < OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST,
+        "match_key": match_key_node,
+        "frequency": _score_node(row.get("frequency")),
+        "freshness": _score_node(row.get("freshness")),
+    }
+
+
+def _offline_quality_response(payload: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("offline") or []
+    events = [_offline_quality_event(row) for row in rows if isinstance(row, dict)]
+    findings: list[dict[str, Any]] = []
+    missing: list[str] = []
+    if not events:
+        missing.append(
+            "Meta returned no offline data quality for this dataset; the offline channel only scores "
+            "datasets that receive offline events."
+        )
+    for event in events:
+        name = event["event_name"]
+        if event["composite_score"] is None:
+            missing.append(f"No offline composite score returned for {name}.")
+        elif event["below_omnichannel_threshold"]:
+            findings.append({
+                "type": "offline_score_below_omnichannel_threshold",
+                "event_name": name,
+                "composite_score": event["composite_score"],
+                "threshold": OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST,
+                "message": (
+                    f"{name} offline composite score is {event['composite_score']} out of 10, below the "
+                    f"{OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST} Meta states is needed for omnichannel ads."
+                ),
+            })
+    findings.sort(key=lambda item: item["composite_score"])
+    return analysis_response(
+        scope=scope,
+        metrics={
+            "events": len(events),
+            "events_with_composite_score": sum(1 for event in events if event["composite_score"] is not None),
+            "below_omnichannel_threshold_events": len(findings),
+        },
+        findings=findings,
+        missing_signals=missing,
+        extra={
+            "events": events,
+            "score_note": OFFLINE_SCORE_NOTE,
+            "thresholds": {
+                "omnichannel_composite_score_at_least": OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST,
+                "source": OFFLINE_THRESHOLD_SOURCE,
+            },
+        },
+    )
+
+
 @mcp_server.tool()
 async def get_dataset_quality(
     dataset_id: str,
     agent_name: str | None = None,
+    channel: str = "web",
 ) -> dict[str, Any]:
-    """Event match quality (score out of 10) per web event for one pixel, with coverage per match key, event coverage, deduplication and data freshness, and plain flags for weak scores stating the threshold used. agent_name limits scoring to events sent by one partner integration."""
+    """Data quality for one pixel by channel. channel=web (default): event match quality (score out of 10) per web event, coverage per match key, event coverage, deduplication and data freshness, with weak-score flags stating the threshold. channel=offline: Meta's offline composite, match key, frequency and freshness scores, which are not event match quality. agent_name limits scoring to one partner integration."""
     dataset_id = _required_id(dataset_id, "dataset_id")
     agent_name = blank_to_none(agent_name)
+    channel = (blank_to_none(channel) or "web").lower()
+    if channel not in DATASET_QUALITY_CHANNELS:
+        raise ValidationError(f"channel must be one of: {', '.join(DATASET_QUALITY_CHANNELS)}.")
     params: dict[str, Any] = {"dataset_id": dataset_id}
     if agent_name is not None:
         params["agent_name"] = agent_name
     payload = await get_graph_api_client().get_object(
         "dataset_quality",
-        fields=[DATASET_QUALITY_FIELDS],
+        fields=[DATASET_QUALITY_FIELDS if channel == "web" else OFFLINE_QUALITY_FIELDS],
         params=params,
     )
+    if channel == "offline":
+        return _offline_quality_response(
+            payload, {"dataset_id": dataset_id, "channel": "offline", "agent_name": agent_name},
+        )
     rows = payload.get("web") or []
     events = [_quality_event(row) for row in rows if isinstance(row, dict)]
     findings: list[dict[str, Any]] = []

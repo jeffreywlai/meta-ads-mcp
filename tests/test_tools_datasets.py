@@ -491,6 +491,89 @@ def test_dataset_quality_without_web_data_says_so(monkeypatch) -> None:
     assert "web" in result["missing_signals"][0]
 
 
+# Shape from Meta's offline Dataset Quality API documentation example.
+OFFLINE_QUALITY_PAYLOAD = {
+    "offline": [
+        {
+            "event_name": "Purchase",
+            "composite": {"score": 6.6, "recommendation": "Your offline data quality score is ok."},
+            "match_key": {"score": 5.6, "recommendation": "Send email and phone.",
+                          "coverage": {"email": 100.0, "phone": 90.0}},
+            "frequency": {"score": 4.6, "recommendation": "Share offline data more often."},
+            "freshness": {"score": 2.2, "recommendation": "Send recent data sooner."},
+        },
+        {"event_name": "Lead", "composite": {"score": 9.0}},
+        {"event_name": "Other"},
+    ]
+}
+
+
+def test_dataset_quality_offline_channel_requests_and_reports_offline_scores(monkeypatch) -> None:
+    client = FakeDatasetClient(object_payloads={"dataset_quality": OFFLINE_QUALITY_PAYLOAD})
+    _use(monkeypatch, client)
+
+    result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel=" Offline "))
+
+    assert client.get_calls == [{
+        "object_id": "dataset_quality",
+        "fields": ["offline{event_name,composite,match_key,frequency,freshness}"],
+        "params": {"dataset_id": "px1"},
+    }]
+    assert result["scope"] == {"dataset_id": "px1", "channel": "offline", "agent_name": None}
+    purchase = result["events"][0]
+    assert purchase == {
+        "event_name": "Purchase",
+        "composite_score": 6.6,
+        "composite_recommendation": "Your offline data quality score is ok.",
+        "below_omnichannel_threshold": True,
+        "match_key": {"score": 5.6, "recommendation": "Send email and phone.",
+                      "coverage": {"email": 100.0, "phone": 90.0}},
+        "frequency": {"score": 4.6, "recommendation": "Share offline data more often."},
+        "freshness": {"score": 2.2, "recommendation": "Send recent data sooner."},
+    }
+    assert [finding["event_name"] for finding in result["findings"]] == ["Purchase"]
+    assert result["findings"][0]["type"] == "offline_score_below_omnichannel_threshold"
+    assert result["findings"][0]["threshold"] == 8.5
+    assert result["metrics"] == {
+        "events": 3, "events_with_composite_score": 2, "below_omnichannel_threshold_events": 1,
+    }
+    assert any("Other" in signal for signal in result["missing_signals"])
+    assert "not event match quality" in result["score_note"]
+    assert "8.5" in result["thresholds"]["source"]
+
+
+def test_dataset_quality_offline_scores_are_never_labelled_event_match_quality(monkeypatch) -> None:
+    _use(monkeypatch, FakeDatasetClient(object_payloads={"dataset_quality": OFFLINE_QUALITY_PAYLOAD}))
+    result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel="offline"))
+    for event in result["events"]:
+        assert "emq_score" not in event and "emq_is_weak" not in event
+    assert not any(finding["type"] == "weak_event_match_quality" for finding in result["findings"])
+    assert "weak_emq_score_below" not in result["thresholds"]
+
+
+def test_dataset_quality_offline_without_data_says_so(monkeypatch) -> None:
+    _use(monkeypatch, FakeDatasetClient(object_payloads={"dataset_quality": {}}))
+    result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel="offline", agent_name="crm"))
+    assert result["events"] == []
+    assert result["findings"] == []
+    assert "offline" in result["missing_signals"][0]
+    assert result["scope"]["agent_name"] == "crm"
+
+
+def test_dataset_quality_default_channel_stays_web(monkeypatch) -> None:
+    client = FakeDatasetClient(object_payloads={"dataset_quality": QUALITY_PAYLOAD})
+    _use(monkeypatch, client)
+    result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1"))
+    assert client.get_calls[0]["fields"][0].startswith("web{")
+    assert result["scope"]["channel"] == "web"
+
+
+def test_dataset_quality_rejects_unknown_channel_before_any_call(monkeypatch) -> None:
+    monkeypatch.setattr(datasets, "get_graph_api_client", _no_client)
+    with pytest.raises(ValidationError, match="web, offline"):
+        asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel="app"))
+
+
 def test_dataset_quality_requires_id(monkeypatch) -> None:
     monkeypatch.setattr(datasets, "get_graph_api_client", _no_client)
     with pytest.raises(ValidationError, match="dataset_id is required"):
