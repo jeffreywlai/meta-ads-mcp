@@ -241,6 +241,62 @@ def test_get_ad_study_split_results_without_winner_say_so(monkeypatch) -> None:
     assert "no single winner" in result["results"]["message"]
 
 
+def _winner(ad_object_id):
+    return [json.dumps({"winner_ad_object_id": ad_object_id, "winner_confidence": 0.9})]
+
+
+def test_study_winner_uses_primary_objective(monkeypatch) -> None:
+    """F15: a secondary objective listed first never decides the reported winner."""
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS,
+               ("study_1", "objectives"): {"data": [
+                   {"id": "obj_40", "is_primary": False, "results": _winner("as_1")},
+                   {"id": "obj_41", "is_primary": True, "results": _winner("as_2")},
+               ]}},
+    ))
+    results = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
+    assert results["objective_id"] == "obj_41"
+    assert results["winner_basis"] == "primary_objective"
+    assert results["winner"]["cell_id"] == "cell_b"
+    assert [o["objective_id"] for o in results["objectives"]] == ["obj_40", "obj_41"]
+    assert results["objectives"][0]["winner"]["cell_id"] == "cell_a"
+
+
+@pytest.mark.parametrize("flags", [(None, None), (False, False), (True, True)])
+def test_study_without_unique_primary_names_no_winner(monkeypatch, flags) -> None:
+    """F15: with no unique primary objective, outcomes are per objective and no winner is named."""
+    objectives = [{"id": "obj_40", "results": _winner("as_1")}, {"id": "obj_41", "results": _winner("as_2")}]
+    for objective, flag in zip(objectives, flags):
+        if flag is not None:
+            objective["is_primary"] = flag
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS, ("study_1", "objectives"): {"data": objectives}},
+    ))
+    results = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
+    assert results["winner"] is None
+    assert "No single winner can be named" in results["message"]
+    assert [o["winner"]["ad_object_id"] for o in results["objectives"]] == ["as_1", "as_2"]
+    assert "objective_id" not in results
+
+
+def test_study_primary_without_results_does_not_fall_back_to_secondary(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS,
+               ("study_1", "objectives"): {"data": [
+                   {"id": "obj_40", "is_primary": False, "results": _winner("as_1")},
+                   {"id": "obj_41", "is_primary": True},
+               ]}},
+    ))
+    results = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
+    assert results["winner"] is None
+    assert results["objective_id"] == "obj_41"
+    assert "no usable result yet" in results["message"]
+    assert results["objectives"][1] == {"objective_id": "obj_41", "is_primary": True, "status": "not_ready"}
+
+
 def test_get_ad_study_lift_results_report_lift_and_confidence(monkeypatch) -> None:
     row = {"cell_id": "cell_t", "conversions_test": 1200, "conversions_control_scaled": 1000,
            "conversions_incremental": 200, "conversions_incremental_lower": 150,

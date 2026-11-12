@@ -566,58 +566,117 @@ def _to_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _split_outcome(objective: dict[str, Any], cells: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """One objective's split-test outcome, or None when its results are not in a recognised shape."""
+    for entry in objective["parsed_results"]:
+        if not isinstance(entry, dict) or not SPLIT_RESULT_KEYS & set(entry):
+            continue
+        winner_id = entry.get("winner_ad_object_id")
+        response: dict[str, Any] = {
+            "objective_id": objective.get("id"),
+            "is_primary": objective.get("is_primary"),
+            "winner": None,
+            "high_performer_ids": entry.get("high_performer_ids"),
+            "confidence_by_ad_object_id": entry.get("confidence_by_ad_object_id"),
+        }
+        if winner_id not in (None, ""):
+            winner_id = str(winner_id)
+            cell = next(
+                (
+                    cell for cell in cells
+                    if winner_id in cell["campaign_ids"] + cell["adset_ids"] + cell["ad_account_ids"]
+                ),
+                None,
+            )
+            response["winner"] = {
+                "ad_object_id": winner_id,
+                "cell_id": cell["id"] if cell else None,
+                "cell_name": cell["name"] if cell else None,
+                "confidence": entry.get("winner_confidence"),
+            }
+            if cell is None and any(item.get("membership_truncated") for item in cells):
+                response["winner"]["cell_mapping_note"] = (
+                    "The winner was not found in the cell memberships read, which are incomplete; "
+                    "it may belong to a cell whose later membership pages were not returned."
+                )
+        return response
+    return None
+
+
+def _deciding_objective(
+    objectives: list[dict[str, Any]], objectives_complete: bool
+) -> tuple[dict[str, Any] | None, str]:
+    """The objective that decides the study: its unique primary, or its only objective."""
+    primaries = [objective for objective in objectives if objective.get("is_primary") is True]
+    if len(primaries) == 1:
+        return primaries[0], "primary_objective"
+    if not primaries and len(objectives) == 1 and objectives_complete:
+        return objectives[0], "only_objective"
+    if len(primaries) > 1:
+        return None, f"Meta marked {len(primaries)} objectives as primary."
+    if not objectives_complete:
+        return None, "No primary objective was found among the objectives read, and Meta reported more objectives."
+    return None, f"The study has {len(objectives)} objectives and none is marked primary."
+
+
 def _split_results(
     objectives: list[dict[str, Any]],
     cells: list[dict[str, Any]],
+    objectives_complete: bool = True,
 ) -> dict[str, Any]:
-    for objective in objectives:
-        for entry in objective["parsed_results"]:
-            if not isinstance(entry, dict) or not SPLIT_RESULT_KEYS & set(entry):
-                continue
-            winner_id = entry.get("winner_ad_object_id")
-            response: dict[str, Any] = {
-                "status": "available",
-                "kind": "split_test",
-                "objective_id": objective.get("id"),
-                "winner": None,
-                "high_performer_ids": entry.get("high_performer_ids"),
-                "confidence_by_ad_object_id": entry.get("confidence_by_ad_object_id"),
-                "confidence_scale_note": "Meta does not document the scale of these confidence values.",
-            }
-            if winner_id not in (None, ""):
-                winner_id = str(winner_id)
-                cell = next(
-                    (
-                        cell for cell in cells
-                        if winner_id in cell["campaign_ids"] + cell["adset_ids"] + cell["ad_account_ids"]
-                    ),
-                    None,
-                )
-                response["winner"] = {
-                    "ad_object_id": winner_id,
-                    "cell_id": cell["id"] if cell else None,
-                    "cell_name": cell["name"] if cell else None,
-                    "confidence": entry.get("winner_confidence"),
-                }
-                if cell is None and any(item.get("membership_truncated") for item in cells):
-                    response["winner"]["cell_mapping_note"] = (
-                        "The winner was not found in the cell memberships read, which are incomplete; "
-                        "it may belong to a cell whose later membership pages were not returned."
-                    )
-                response["message"] = "Meta reported a winning cell."
-            else:
-                response["message"] = (
-                    "Meta reported no single winner. For creative tests Meta's authoritative "
-                    "outcome is high_performer_ids."
-                )
-            return response
-    return {
+    base: dict[str, Any] = {
         "status": "available",
         "kind": "split_test",
         "winner": None,
-        "message": "Meta returned results in a shape this tool does not recognise; see raw_results.",
-        "raw_results": [objective["parsed_results"] for objective in objectives if objective["parsed_results"]],
+        "confidence_scale_note": "Meta does not document the scale of these confidence values.",
     }
+    outcomes = {id(objective): _split_outcome(objective, cells) for objective in objectives}
+    if not any(outcomes.values()):
+        return {
+            "status": "available",
+            "kind": "split_test",
+            "winner": None,
+            "message": "Meta returned results in a shape this tool does not recognise; see raw_results.",
+            "raw_results": [objective["parsed_results"] for objective in objectives if objective["parsed_results"]],
+        }
+    per_objective = [
+        outcome if outcome is not None else {
+            "objective_id": objective.get("id"),
+            "is_primary": objective.get("is_primary"),
+            "status": "not_ready" if not objective["parsed_results"] else "unrecognised_shape",
+        }
+        for objective in objectives
+        for outcome in [outcomes[id(objective)]]
+    ]
+    deciding, basis = _deciding_objective(objectives, objectives_complete)
+    if deciding is None:
+        return {
+            **base,
+            "message": (
+                f"No single winner can be named: {basis} Each objective's outcome is listed in "
+                "objectives; Meta's results for one objective are not the study's result."
+            ),
+            "objectives": per_objective,
+        }
+    outcome = outcomes[id(deciding)]
+    response = {**base, "objective_id": deciding.get("id"), "winner_basis": basis}
+    if len(objectives) > 1:
+        response["objectives"] = per_objective
+    if outcome is None:
+        response["message"] = (
+            f"Meta has no usable result yet for the deciding objective {deciding.get('id')} ({basis}); "
+            "other objectives' outcomes are listed in objectives and do not decide the study."
+        )
+        return response
+    response.update({key: value for key, value in outcome.items() if key not in {"objective_id", "is_primary"}})
+    if outcome["winner"] is not None:
+        response["message"] = "Meta reported a winning cell."
+    else:
+        response["message"] = (
+            "Meta reported no single winner. For creative tests Meta's authoritative "
+            "outcome is high_performer_ids."
+        )
+    return response
 
 
 def _lift_results(objectives: list[dict[str, Any]], cells: list[dict[str, Any]]) -> dict[str, Any]:
@@ -670,7 +729,8 @@ def _lift_results(objectives: list[dict[str, Any]], cells: list[dict[str, Any]])
 async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str, Any]:
     """Get one A/B test or lift study: settings, cells (shares and the campaigns or ad sets in each) and objectives.
 
-    include_results adds the outcome: the winning cell and confidence for A/B tests, incremental
+    include_results adds the outcome: the winning cell and confidence for A/B tests (decided by the
+    primary objective; with no unique primary, each objective's outcome and no single winner), incremental
     conversions, lift and confidence per cell for lift studies, or a plain not_ready status.
     """
     study_id = blank_to_none(study_id)
@@ -730,7 +790,7 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             ),
         }
     elif str(study.get("type") or "").upper() in SPLIT_TEST_TYPES:
-        response["results"] = _split_results(objectives, cells)
+        response["results"] = _split_results(objectives, cells, response["summary"]["objectives_complete"])
     else:
         response["results"] = _lift_results(objectives, cells)
     return response
