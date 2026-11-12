@@ -394,10 +394,10 @@ def _workflow_route(text: str) -> str | None:
     history_text = re.sub(_QUOTED_VALUE, "", text)
     history_subject = re.split(r"\b(?:named|called)\b", history_text, maxsplit=1)[0]
     if re.match(r"^(?:export|get|fetch|find|inspect|list|read|show|view|summarize)\b", history_text) and (
-        re.search(r"\b(?:change history|activity logs?|audit logs?|changelog)\b", history_text)
+        re.search(r"\b(?:change history|activity logs?|audit logs?|changelog)\b", history_subject)
         or re.search(r"\b(?:changes|changed)\b", history_subject)
     ):
-        return "list_change_history" if re.search(r"\b(?:page|preview)\b", history_text) else "export_change_history"
+        return "list_change_history" if re.search(r"\b(?:page|preview)\b", history_subject) else "export_change_history"
     if re.match(r"^(?:get|fetch|find|inspect|read|show|view) ad creative\b", text):
         return "get_creative"
     if re.match(r"^update ad creative\b", text):

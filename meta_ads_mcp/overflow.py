@@ -1139,11 +1139,12 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                 and EXPORT_ID_PATTERN.fullmatch(structured["export_id"])
             ):
                 overflow["full_history_export_id"] = structured["export_id"]
-                message += (
-                    " The archived response contains only an export preview. "
-                    f"Read every event from full_history_export_id='{structured['export_id']}' "
-                    "with read_overflow_artifact, then inspect its coverage/next_call."
-                )
+                if overflow.get("export_id") != structured["export_id"]:
+                    message += (
+                        " The archived response contains only an export preview. "
+                        f"Read every event from full_history_export_id='{structured['export_id']}' "
+                        "with read_overflow_artifact, then inspect its coverage/next_call."
+                    )
         notice = ToolResult(
             content=[TextContent(type="text", text=message)],
             structured_content={"overflow": overflow, "message": message}
@@ -1277,6 +1278,36 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
             if len(serialized) <= self.max_size:
                 return compact
 
+        structured = result.structured_content or {}
+        delivery = structured.get("delivery")
+        history_export_id = structured.get("export_id")
+        if (
+            archive_tool_name == "export_change_history"
+            and isinstance(delivery, dict)
+            and delivery.get("artifact_contains_all_fetched_events") is True
+            and isinstance(history_export_id, str)
+            and EXPORT_ID_PATTERN.fullmatch(history_export_id)
+        ):
+            # Archiving a preview would consume a second quota slot and could
+            # evict the complete export. The full result is already stored.
+            return self._overflow_notice(
+                message=self._retrieval_message(
+                    max_size=self.max_size, export_id=history_export_id,
+                    artifact_bytes=delivery.get("artifact_bytes"),
+                    ttl_seconds=self.artifact_store.ttl_seconds,
+                    row_count=structured.get("record_count"),
+                    response_bytes=len(serialized), item_pages=True,
+                ),
+                overflow={
+                    "archived": True, "export_id": history_export_id,
+                    "artifact_bytes": delivery.get("artifact_bytes"),
+                    "original_response_bytes": len(serialized),
+                    "max_inline_bytes": self.max_size,
+                },
+                original=result,
+                include_structured=not is_proxy and result.structured_content is not None,
+            )
+
         try:
             export_id, artifact_size = self.artifact_store.create(
                 result,
@@ -1294,7 +1325,6 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                 include_structured=not is_proxy and result.structured_content is not None,
             )
 
-        structured = result.structured_content or {}
         collection = _collection(structured)
         message = self._retrieval_message(
             max_size=self.max_size,

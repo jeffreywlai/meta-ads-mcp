@@ -347,6 +347,9 @@ def test_raw_before_after_and_minor_units_remain_unchanged(setup):
     ("read the next page of change history", "list_change_history"),
     ('get campaign named "Changes"', "get_campaign"),
     ("get campaign named Changes", "get_campaign"),
+    ("get campaign named Change History", "get_campaign"),
+    ("get ad creative called Activity Logs", "get_creative"),
+    ("export change history for campaign named Page Preview", "export_change_history"),
     ("show all changes for campaign named Changes", "export_change_history"),
     ('get ad creative "Change History"', "get_creative"),
     ('export history of changes for campaign "Page Preview"', "export_change_history"),
@@ -401,20 +404,29 @@ def test_oversized_history_notice_exposes_partial_source_coverage(tmp_path):
     assert json.loads("".join(parts))["tool_result"]["structured_content"] == payload
 
 
-def test_oversized_export_preview_points_to_all_events_not_just_the_preview(setup):
+@pytest.mark.parametrize("quota", ["default", "one_file", "one_artifact_bytes"])
+@pytest.mark.parametrize("via_proxy", [False, True])
+def test_oversized_export_preview_reuses_full_artifact_without_eviction(setup, quota, via_proxy):
     from fastmcp.server.middleware.middleware import MiddlewareContext
     from fastmcp.tools.tool import ToolResult
     from mcp.types import CallToolRequestParams
     from meta_ads_mcp.overflow import ArchivedResponseLimitingMiddleware, _serialized_mcp_result
     _, store = setup({None: page([event("large", extra_data="x" * 100_000), event("second")])})
+    if quota == "one_file":
+        store.max_files = 1
+    elif quota == "one_artifact_bytes":
+        store.max_total_bytes = 150_000
     payload = export(inline_limit=1)
+    assert payload["delivery"]["artifact_bytes"] < store.max_total_bytes
     middleware = ArchivedResponseLimitingMiddleware(max_size=64_000, truncation_suffix="fallback", artifact_store=store)
     async def respond(_):
         return ToolResult(content=[], structured_content=payload)
-    notice = asyncio.run(middleware.on_call_tool(MiddlewareContext(message=CallToolRequestParams(name="export_change_history", arguments={})), respond))
+    request = CallToolRequestParams(name="call_tool" if via_proxy else "export_change_history",
+                                   arguments={"name": "export_change_history", "arguments": {}} if via_proxy else {})
+    notice = asyncio.run(middleware.on_call_tool(MiddlewareContext(message=request), respond))
     assert notice.meta["overflow"]["full_history_export_id"] == payload["export_id"]
-    assert notice.meta["overflow"]["export_id"] != payload["export_id"]
-    assert "only an export preview" in notice.content[0].text
+    assert notice.meta["overflow"]["export_id"] == payload["export_id"]
+    assert "only an export preview" not in notice.content[0].text
     assert len(_serialized_mcp_result(notice)) <= 64_000
     parts, offset = [], 0
     while True:
