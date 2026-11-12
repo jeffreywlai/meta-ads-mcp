@@ -641,6 +641,56 @@ def test_disconnect_source_not_connected_sends_no_delete(monkeypatch) -> None:
     assert client.methods() == ["list_objects"]
 
 
+def test_connect_and_disconnect_report_complete_prior_list(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
+    connected = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_2"))
+    disconnected = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+    for result in (connected, disconnected):
+        assert result["previous_complete"] is True
+        assert result["missing_signals"] == []
+
+
+def _capped_sources(params):
+    """A connected-source list longer than the five pages the pre-read takes."""
+    page = int(params.get("after") or 0)
+    return {
+        "data": [{"id": f"px_{page}_{i}"} for i in range(params["limit"])],
+        "paging": {"next": "https://next", "cursors": {"after": str(page + 1)}},
+    }
+
+
+def test_connect_with_capped_pre_read_marks_lists_partial(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): _capped_sources}))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_new"))
+    assert client.methods() == ["list_objects"] * 5 + ["create_edge_object"]
+    assert result["previous_complete"] is False
+    assert len(result["previous"]["connected_event_source_ids"]) == 500
+    assert any("partial (500 read)" in signal and "5 pages" in signal for signal in result["missing_signals"])
+    assert any("may already have been connected" in signal for signal in result["missing_signals"])
+
+
+def test_connect_with_partial_pre_read_seen_source_is_already_connected(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}], "paging": {"next": "https://graph.invalid/next"}},
+    }))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+    assert client.methods() == ["list_objects"]
+    assert result["current"]["already_connected"] is True
+    assert result["previous_complete"] is False
+    assert any("no cursor" in signal for signal in result["missing_signals"])
+
+
+def test_disconnect_with_partial_pre_read_sends_request_and_says_prior_state_unconfirmed(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): _capped_sources}))
+    result = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_beyond_cap"))
+    assert client.methods() == ["list_objects"] * 5 + ["delete_edge_object"]
+    assert client.calls[-1]["data"] == {"external_event_sources": ["px_beyond_cap"]}
+    assert result["previous_complete"] is False
+    assert result["previous"]["event_source"] is None
+    assert not any("is not connected" in signal for signal in result["missing_signals"])
+    assert any("not confirmed" in signal for signal in result["missing_signals"])
+
+
 def test_disconnect_read_failure_sends_no_delete(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(errors={("cat_1", "external_event_sources"): _permission_error()}))
     with pytest.raises(MetaApiError):

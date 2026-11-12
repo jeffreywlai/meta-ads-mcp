@@ -1165,6 +1165,28 @@ async def get_catalog_event_source_recommendations(
     )
 
 
+async def _connection_state(
+    client: Any, catalog_id: str,
+) -> tuple[list[dict[str, Any]], list[str], bool, list[str]]:
+    """Read the connected sources; when the read stops early, say so in plain words."""
+    reasons: list[str] = []
+    sources, complete = await _connected_sources(client, catalog_id, reasons)
+    ids = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    gaps: list[str] = []
+    if not complete:
+        gaps.append(
+            f"The connected-source list is partial ({len(ids)} read): "
+            f"{' '.join(reasons) or 'external_event_sources had more pages than were read.'} "
+            "Sources not read are missing from the before and after lists."
+        )
+    return sources, ids, complete, gaps
+
+
+def _with_completeness(response: dict[str, Any], complete: bool, gaps: list[str]) -> dict[str, Any]:
+    response.update({"previous_complete": complete, "missing_signals": gaps})
+    return response
+
+
 @mcp_server.tool()
 async def connect_catalog_event_source(
     catalog_id: str,
@@ -1174,25 +1196,29 @@ async def connect_catalog_event_source(
     catalog_id = _require_id(catalog_id, "catalog_id")
     event_source_id = _require_id(event_source_id, "event_source_id")
     client = get_graph_api_client()
-    sources, _ = await _connected_sources(client, catalog_id)
-    before = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    _, before, complete, gaps = await _connection_state(client, catalog_id)
     target = {"catalog_id": catalog_id, "event_source_id": event_source_id}
     if event_source_id in before:
-        return mutation_response(
+        return _with_completeness(mutation_response(
             action="connect_catalog_event_source",
             target=target,
             previous={"connected_event_source_ids": before},
             current={"connected_event_source_ids": before, "already_connected": True},
+        ), complete, gaps)
+    if not complete:
+        gaps.append(
+            f"Source {event_source_id} was not among the sources read, so it may already have been "
+            "connected; the connect request was sent either way."
         )
     await client.create_edge_object(
         catalog_id, "external_event_sources", data={"external_event_sources": [event_source_id]},
     )
-    return mutation_response(
+    return _with_completeness(mutation_response(
         action="connect_catalog_event_source",
         target=target,
         previous={"connected_event_source_ids": before},
         current={"connected_event_source_ids": [*before, event_source_id]},
-    )
+    ), complete, gaps)
 
 
 @mcp_server.tool()
@@ -1204,19 +1230,25 @@ async def disconnect_catalog_event_source(
     catalog_id = _require_id(catalog_id, "catalog_id")
     event_source_id = _require_id(event_source_id, "event_source_id")
     client = get_graph_api_client()
-    sources, _ = await _connected_sources(client, catalog_id)
-    before = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    sources, before, complete, gaps = await _connection_state(client, catalog_id)
     source = next((s for s in sources if _object_id(s.get("id")) == event_source_id), None)
-    if source is None:
+    if source is None and complete:
         raise ValidationError(
             f"Event source {event_source_id} is not connected to catalog {catalog_id}; nothing was changed."
+        )
+    if source is None:
+        # The list is capped, so absence proves nothing. Disconnecting a source that is not
+        # connected removes nothing else, while refusing would block a request on large catalogs.
+        gaps.append(
+            f"Source {event_source_id} was not among the sources read, so whether it was connected "
+            "before this request is not confirmed; the disconnect request was sent."
         )
     await client.delete_edge_object(
         catalog_id, "external_event_sources", data={"external_event_sources": [event_source_id]},
     )
-    return mutation_response(
+    return _with_completeness(mutation_response(
         action="disconnect_catalog_event_source",
         target={"catalog_id": catalog_id, "event_source_id": event_source_id},
         previous={"connected_event_source_ids": before, "event_source": source},
         current={"connected_event_source_ids": [s for s in before if s != event_source_id]},
-    )
+    ), complete, gaps)
