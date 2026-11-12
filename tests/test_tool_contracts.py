@@ -16,6 +16,7 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.tools import (
     activity,
     ads,
+    assets,
     audiences,
     auth_tools,
     campaigns,
@@ -142,6 +143,10 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_page_recommendations": {"page_id": "page_123"},
     "list_change_history": {"account_id": "123"},
     "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
+    "list_pages": {"source": "ad_account", "account_id": "123"},
+    "list_instagram_media": {"instagram_account_id": "ig_123"},
+    "list_creative_ads": {"account_id": "123"},
+    "get_field_reference": {"level": "ad", "field_names": ["name", "status"], "object_id": "ad_123"},
 }
 
 
@@ -505,6 +510,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
     for module in [
         activity,
         ads,
+        assets,
         audiences,
         auth_tools,
         campaigns,

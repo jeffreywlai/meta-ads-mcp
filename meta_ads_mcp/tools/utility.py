@@ -127,6 +127,13 @@ TOOL_GROUPS = {
         "search_ads_archive",
     ],
     "assets": [
+        "list_pages",
+        "list_ad_images",
+        "list_ad_videos",
+        "list_creative_ads",
+        "list_instagram_media",
+        "list_audience_adsets",
+        "get_field_reference",
     ],
     "signals": [
     ],
