@@ -53,6 +53,13 @@ STUDY_WRITE_READ_FIELDS = [
     "observation_end_time",
     "canceled_time",
 ]
+# Readable fields in Meta's Ad Study reference. Update parameters outside this set (for example
+# confidence_level, cells, objectives, viewers) cannot be read back, so their prior value is unavailable.
+STUDY_READABLE_FIELDS = frozenset({
+    "id", "business", "canceled_time", "cooldown_start_time", "created_by", "created_time",
+    "description", "end_time", "name", "observation_end_time", "results_first_available_date",
+    "start_time", "type", "updated_by", "updated_time",
+})
 STUDY_TYPES = frozenset({
     "LIFT",
     "SPLIT_TEST",
@@ -1056,8 +1063,11 @@ async def update_ad_study(
         if payload.get("observation_end_time") is not None
         else None
     )
+    readable_changes = [key for key in payload if key in STUDY_READABLE_FIELDS]
+    unreadable_changes = sorted(key for key in payload if key not in STUDY_READABLE_FIELDS)
+    read_fields = [*STUDY_WRITE_READ_FIELDS, *(key for key in readable_changes if key not in STUDY_WRITE_READ_FIELDS)]
     client = get_graph_api_client()
-    previous = await client.get_object(study_id, fields=STUDY_WRITE_READ_FIELDS)
+    previous = await client.get_object(study_id, fields=read_fields)
     now = _now()
     state = _study_state(previous, now)
     previous_start = _parse_meta_time(previous.get("start_time"))
@@ -1074,10 +1084,18 @@ async def update_ad_study(
         key: _iso(value) if key in {"start_time", "end_time"} and isinstance(value, int) else value
         for key, value in payload.items()
     }
+    prior = _previous_study(previous, state)
+    prior.update({key: previous.get(key) for key in readable_changes})
+    if unreadable_changes:
+        prior["unavailable_previous_values"] = {
+            key: "Not readable: Meta's Ad Study reference lists no readable field with this name, "
+            "so its value before this edit could not be read."
+            for key in unreadable_changes
+        }
     return mutation_response(
         action="update_ad_study",
         target={"study_id": study_id},
-        previous=_previous_study(previous, state),
+        previous=prior,
         current=current,
     )
 

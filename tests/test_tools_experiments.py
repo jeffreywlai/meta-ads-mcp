@@ -688,6 +688,26 @@ def test_update_ad_study_passes_params_and_reports_them(monkeypatch) -> None:
     result = run(experiments.update_ad_study(study_id="study_1", params={"confidence_level": 0.8}))
     assert client.calls[1] == ("update", "study_1", {"confidence_level": 0.8})
     assert result["current"] == {"confidence_level": 0.8}
+    # F25: confidence_level is writable but not a readable Ad Study field, so no prior value is invented.
+    assert "confidence_level" not in client.calls[0][2]
+    assert "confidence_level" not in result["previous"]
+    assert list(result["previous"]["unavailable_previous_values"]) == ["confidence_level"]
+    assert "could not be read" in result["previous"]["unavailable_previous_values"]["confidence_level"]
+
+
+def test_update_ad_study_params_change_reads_previous_value(monkeypatch) -> None:
+    """F25: a readable field changed through params is in the pre-read, so previous is its real value."""
+    study = {**SCHEDULED_LIFT, "cooldown_start_time": "2026-12-01T00:00:00+0000"}
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    result = run(experiments.update_ad_study(
+        study_id="study_1", params={"cooldown_start_time": FUTURE_START_TS + 3600},
+    ))
+    assert client.calls[0] == ("get", "study_1", [
+        "id", "name", "description", "type", "start_time", "end_time", "observation_end_time",
+        "canceled_time", "cooldown_start_time",
+    ], None)
+    assert result["previous"]["cooldown_start_time"] == "2026-12-01T00:00:00+0000"
+    assert "unavailable_previous_values" not in result["previous"]
 
 
 # --- cancel_ad_study -----------------------------------------------------------------
