@@ -116,7 +116,7 @@ def test_read_only_typo_does_not_silently_disable_protection(monkeypatch) -> Non
     reload_settings()
 
 
-@pytest.mark.parametrize("group", ["assets", "signals", "experiments", "catalog"])
+@pytest.mark.parametrize("group", ["assets", "signals", "experiments", "catalog", "access"])
 def test_new_read_groups_are_read_only_groups(monkeypatch, group) -> None:
     monkeypatch.setitem(utility.TOOL_GROUPS, group, [*utility.TOOL_GROUPS[group], "probe_read_tool"])
     assert "probe_read_tool" in read_only_tool_names()

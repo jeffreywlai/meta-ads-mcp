@@ -14,6 +14,7 @@ def read_only_tool_names() -> set[str]:
 
     groups = ("discovery", "analysis", "activity", "optimization", "social_feedback",
               "planning", "research", "assets", "signals", "experiments", "catalog",
+              "access",
               "docs", "utility")
     return {name for group in groups for name in TOOL_GROUPS[group]} | {
         "search_tools", "call_tool", "get_ad_image", "preview_ad",

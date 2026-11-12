@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from meta_ads_mcp.tool_types import coerce_csv_string_list, normalize_field_list
 from meta_ads_mcp.tools import insights
 from meta_ads_mcp.tools.insights import _comparison_fields, _insights_fields
@@ -57,3 +59,25 @@ def test_create_async_insights_normalizes_direct_csv_metadata(monkeypatch) -> No
         "impressions",
         "actions{action_type,value}",
     ]
+
+
+def test_graph_id_and_account_id_types_accept_real_ids_and_reject_everything_else() -> None:
+    from pydantic import TypeAdapter
+    from pydantic import ValidationError as PydanticValidationError
+
+    from meta_ads_mcp.tool_types import AccountId, GraphId
+
+    graph_id = TypeAdapter(GraphId)
+    account_id = TypeAdapter(AccountId)
+    assert graph_id.validate_python("1234567890") == "1234567890"
+    assert account_id.validate_python("act_123") == "act_123"
+    assert account_id.validate_python("123") == "123"
+    for bad in ("", " ", "act_123", "12 3", "123/products", "123?x=1", "abc", "1.5", "-1"):
+        with pytest.raises(PydanticValidationError):
+            graph_id.validate_python(bad)
+    for bad in ("", "act_", "act_abc", "123/ads", "act_1?x=1", "me"):
+        with pytest.raises(PydanticValidationError):
+            account_id.validate_python(bad)
+    # Ids stay strings: a number is not silently converted.
+    with pytest.raises(PydanticValidationError):
+        graph_id.validate_python(123)

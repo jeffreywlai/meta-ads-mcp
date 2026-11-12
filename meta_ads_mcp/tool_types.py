@@ -11,6 +11,28 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.errors import ValidationError
 
 
+# Strict id types for tools and parameters added after the master snapshot in
+# tests/fixtures/master_tool_contract.json. Tools already on master keep plain
+# `str` ids, because existing callers must not start failing validation.
+GraphId: TypeAlias = Annotated[
+    str,
+    Field(
+        strict=True,
+        pattern=r"^[0-9]+$",
+        description="A Meta object id: digits only, passed as a string.",
+    ),
+]
+
+AccountId: TypeAlias = Annotated[
+    str,
+    Field(
+        strict=True,
+        pattern=r"^(act_)?[0-9]+$",
+        description="An ad account id: digits, with or without the act_ prefix, passed as a string.",
+    ),
+]
+
+
 def coerce_csv_string_list(value: Any) -> Any:
     """Accept a list or a top-level comma-separated Graph field expression."""
     if not isinstance(value, str):

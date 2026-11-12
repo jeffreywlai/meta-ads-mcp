@@ -196,6 +196,8 @@ TOOL_GROUPS = {
         "get_catalog_event_source_health",
         "get_catalog_event_source_recommendations",
     ],
+    "access": [
+    ],
     "auth": [
         "generate_auth_url",
         "exchange_code_for_token",
