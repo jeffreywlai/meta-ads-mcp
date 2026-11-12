@@ -323,6 +323,7 @@ def test_eligibility_is_labeled_local_precheck(monkeypatch) -> None:
     assert result["check_type"] == "local_precheck"
     assert result["meta_verdict"] is False
     assert "not Meta's verdict" in result["label"]
+    assert result["precheck_outcome"] == "passed"
     assert result["eligible_by_local_precheck"] is True
     assert result["metrics"]["entities_checked"] == 2
     assert all(rule["source"].startswith("https://developers.facebook.com/") for rule in result["rules_applied"])
@@ -350,7 +351,8 @@ def test_eligibility_blocks_missing_entity_and_other_account(monkeypatch) -> Non
     assert result["metrics"]["blocked"] == 2
 
 
-def test_eligibility_warns_when_entity_is_in_an_active_study(monkeypatch) -> None:
+def test_eligibility_entity_in_an_active_study_is_inconclusive(monkeypatch) -> None:
+    """F19: Meta documents no rule on concurrent membership, so it can neither pass nor block."""
     use(monkeypatch, FakeStudyClient(
         objects={"as_1": {"id": "as_1", "account_id": "123", "effective_status": "ACTIVE"}},
         edges={("as_1", "ad_studies"): {"data": [
@@ -362,9 +364,65 @@ def test_eligibility_warns_when_entity_is_in_an_active_study(monkeypatch) -> Non
     ))
     entity = result["entities"][0]
     assert entity["active_studies"] == [{"id": "s1", "name": "Study s1", "type": "SPLIT_TEST", "state": "running"}]
-    assert entity["warnings"]
+    assert entity["unresolved"]
     assert entity["blockers"] == []
-    assert result["eligible_by_local_precheck"] is True
+    assert entity["outcome"] == "inconclusive"
+    assert result["precheck_outcome"] == "inconclusive"
+    assert result["eligible_by_local_precheck"] is None
+    assert result["metrics"]["inconclusive"] == 1
+    assert result["metrics"]["passed_local_precheck"] == 0
+    assert "cannot say the test is eligible" in result["suggestions"][0]
+    assert "not Meta's verdict" in result["label"]
+
+
+def test_eligibility_unknown_study_read_is_not_a_pass(monkeypatch) -> None:
+    """F19: a permission failure reading an entity's studies leaves the check unperformed."""
+    error = MetaApiError(message="(#200) Permissions error", status_code=403, code=200)
+    use(monkeypatch, FakeStudyClient(objects={"c1": _campaign("c1")}, errors={("c1", "ad_studies"): error}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["precheck_outcome"] == "inconclusive"
+    assert result["eligible_by_local_precheck"] is None
+    assert result["entities"][0]["active_studies"] is None
+    assert any("Could not read the studies containing c1" in s for s in result["missing_signals"])
+    assert any(f["severity"] == "unresolved" for f in result["findings"])
+
+
+@pytest.mark.parametrize(("objects", "errors"), [
+    # Entity unreadable for a reason other than not found: none of its checks were performed.
+    ({}, {"c1": MetaApiError(message="(#200) Permissions error", status_code=403, code=200)}),
+    # Meta returned no account_id: the same-account check was not performed.
+    ({"c1": {"id": "c1", "effective_status": "ACTIVE"}}, {}),
+    # Deleted entity: no documented study rule, so it is not settled either way.
+    ({"c1": _campaign("c1", status="DELETED")}, {}),
+])
+def test_eligibility_unperformed_or_unsettled_checks_are_inconclusive(monkeypatch, objects, errors) -> None:
+    use(monkeypatch, FakeStudyClient(objects=objects, errors=errors))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["entities"][0]["outcome"] == "inconclusive"
+    assert result["precheck_outcome"] == "inconclusive"
+    assert result["eligible_by_local_precheck"] is None
+
+
+def test_eligibility_incomplete_account_count_is_inconclusive(monkeypatch) -> None:
+    use(monkeypatch, PagedStudyClient(
+        {("act_123", "impacting_ad_studies", None): {
+            "data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"}}},
+        objects={"c1": _campaign("c1")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["entities"][0]["outcome"] == "passed"
+    assert result["account"]["unresolved"]
+    assert result["precheck_outcome"] == "inconclusive"
+
+
+def test_eligibility_blocker_outranks_unresolved(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"c1": _campaign("c1", account="999"), "c2": _campaign("c2", status="ARCHIVED")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1", "c2"]))
+    assert [entity["outcome"] for entity in result["entities"]] == ["failed", "inconclusive"]
+    assert result["precheck_outcome"] == "failed"
+    assert result["eligible_by_local_precheck"] is False
 
 
 def test_eligibility_blocks_at_documented_concurrent_study_limit(monkeypatch) -> None:
@@ -468,6 +526,7 @@ def test_eligibility_reports_incomplete_entity_study_read(monkeypatch, paging) -
     assert entity["active_studies"] == []
     assert entity["active_studies_complete"] is False
     assert any("studies containing c1" in signal for signal in result["missing_signals"])
+    assert result["precheck_outcome"] == "inconclusive"
 
 
 @pytest.mark.parametrize("kwargs", [

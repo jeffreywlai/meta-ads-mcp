@@ -137,14 +137,29 @@ ELIGIBILITY_RULES = [
     },
 ]
 ELIGIBILITY_NOT_CHECKED = [
-    "Objective and buying-type compatibility: Meta's developer documentation states no rule; "
-    "objective and buying_type are shown per entity for review, not judged.",
+    "Objective and buying-type compatibility: not performed. Meta's developer documentation states no "
+    "rule (its split testing guide even gives comparing objectives as an example); objective and "
+    "buying_type are shown per entity for review, not judged.",
     "Meta's guidance to change only one variable between cells cannot be checked from object settings.",
-    "Whether one object may be in two studies at once is not stated in Meta's developer "
-    "documentation; active studies are reported as a warning only.",
-    "Deliverable status is not stated as a study rule; DELETED or ARCHIVED objects are a warning only.",
+    "Already being in a running study: not performed as a rule, because Meta's developer documentation "
+    "does not say whether it blocks a new test. An entity found in a scheduled or running study makes "
+    "the outcome inconclusive.",
+    "Deliverable state: not performed as a rule, because Meta states none for studies. A DELETED or "
+    "ARCHIVED entity makes the outcome inconclusive.",
     "Test duration limits appear only in Help Center pages that could not be confirmed, so they are not checked.",
 ]
+ELIGIBILITY_SUGGESTIONS = {
+    "passed": (
+        "The checks this server can perform passed; create the test with create_ab_test. "
+        "Meta makes the final eligibility decision."
+    ),
+    "failed": "Resolve the blockers, then run this check again.",
+    "inconclusive": (
+        "Some checks could not be performed or settled (see each entity's unresolved list and "
+        "missing_signals), so this pre-check cannot say the test is eligible. Resolve them or let "
+        "Meta decide at creation."
+    ),
+}
 
 
 def _now() -> datetime:
@@ -782,6 +797,17 @@ async def _count_account_active_studies(client: Any, account_id: str, now: datet
     }
 
 
+def _with_outcome(result: dict[str, Any]) -> dict[str, Any]:
+    """failed when a documented rule is broken; inconclusive when any check could not be settled."""
+    if result["blockers"]:
+        result["outcome"] = "failed"
+    elif result["unresolved"]:
+        result["outcome"] = "inconclusive"
+    else:
+        result["outcome"] = "passed"
+    return result
+
+
 @mcp_server.tool()
 async def check_ab_test_eligibility(
     account_id: str,
@@ -791,7 +817,8 @@ async def check_ab_test_eligibility(
     """Pre-check whether campaigns or ad sets (level campaign or adset) can go into an A/B test.
 
     This is a local pre-check against Meta's documented rules, not Meta's verdict: Meta has no
-    public eligibility endpoint. Reports per entity: exists, belongs to the account, status,
+    public eligibility endpoint. precheck_outcome is passed, failed, or inconclusive when a check
+    could not be performed or settled. Reports per entity: exists, belongs to the account, status,
     objective, buying type, and any scheduled or running study it is already in.
     """
     account_id = _required_account_id(account_id)
@@ -815,52 +842,68 @@ async def check_ab_test_eligibility(
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
     for entity_id in ids:
-        result: dict[str, Any] = {"entity_id": entity_id, "level": normalized_level, "blockers": [], "warnings": []}
+        result: dict[str, Any] = {
+            "entity_id": entity_id, "level": normalized_level, "blockers": [], "unresolved": [], "warnings": [],
+        }
         try:
             entity = await client.get_object(entity_id, fields=fields)
-        except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
+        except NotFoundError as exc:
             result.update({"exists": False, "active_studies": None})
-            result["blockers"].append(f"Could not read {entity_id}: {exc}")
-            entities.append(result)
+            result["blockers"].append(f"{entity_id} was not found: {exc}")
+            entities.append(_with_outcome(result))
+            continue
+        except (MetaApiError, UnsupportedFeatureError) as exc:
+            result.update({"exists": None, "active_studies": None})
+            result["unresolved"].append(f"Could not read {entity_id}, so none of its checks were performed: {exc}")
+            entities.append(_with_outcome(result))
             continue
         result["exists"] = True
         for key in fields[1:]:
             result[key] = entity.get(key)
         entity_account = str(entity.get("account_id") or "").removeprefix("act_")
         if not entity_account:
-            result["warnings"].append("Meta returned no account_id, so the account match was not checked.")
+            result["unresolved"].append("Meta returned no account_id, so the account match was not checked.")
         elif entity_account != account_number:
             result["blockers"].append(
                 f"{entity_id} belongs to ad account {entity_account}, not {account_number}."
             )
         status = str(entity.get("effective_status") or "").upper()
         if status in NON_DELIVERING_STATUSES:
-            result["warnings"].append(f"effective_status is {status}, so it cannot deliver.")
+            result["unresolved"].append(
+                f"effective_status is {status}, so it cannot deliver. Meta's developer documentation states "
+                "no study rule for this, so this pre-check cannot say whether it blocks the test."
+            )
         try:
             scan = await _scan_active_studies(
                 client, entity_id, "ad_studies", now, max_pages=ENTITY_STUDY_SCAN_PAGES,
             )
         except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
             result["active_studies"] = None
-            missing_signals.append(f"Could not read the studies containing {entity_id}: {exc}")
+            message = f"Could not read the studies containing {entity_id}: {exc}"
+            result["unresolved"].append(message)
+            missing_signals.append(message)
         else:
             active = scan["active"]
             result["active_studies"] = active
             result["active_studies_complete"] = scan["complete"]
             if not scan["complete"]:
-                missing_signals.append(
+                message = (
                     f"Read only {scan['pages_read']} page(s) of the studies containing {entity_id}: "
                     f"{scan['stop_reason']}"
                 )
+                result["unresolved"].append(message)
+                missing_signals.append(message)
             if active:
-                result["warnings"].append(
+                result["unresolved"].append(
                     f"Already in {len(active)} scheduled or running study(ies): "
                     f"{', '.join(str(study['id']) for study in active)}. Meta's developer documentation "
-                    "does not say whether this blocks a new test; Meta decides at creation."
+                    "does not say whether this blocks a new test, so this pre-check cannot pass it; "
+                    "Meta decides at creation."
                 )
-        entities.append(result)
+        entities.append(_with_outcome(result))
     account_check = await _count_account_active_studies(client, account_id, now)
     account_check["blockers"] = []
+    account_check["unresolved"] = []
     account_check["warnings"] = []
     if account_check["active_studies"] >= MAX_CONCURRENT_STUDIES:
         account_check["blockers"].append(
@@ -868,10 +911,12 @@ async def check_ab_test_eligibility(
             f"Meta documents a maximum of {MAX_CONCURRENT_STUDIES} concurrent studies per advertiser."
         )
     elif not account_check["count_complete"]:
-        missing_signals.append(
+        message = (
             f"Counted active studies on the first {account_check['pages_read']} page(s) only: "
-            f"{account_check['stop_reason']}"
+            f"{account_check['stop_reason']} The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
         )
+        account_check["unresolved"].append(message)
+        missing_signals.append(message)
     if len(ids) > 100 // MIN_SPLIT_TREATMENT_PERCENTAGE:
         account_check["warnings"].append(
             f"{len(ids)} entities cannot each get their own cell: Meta requires every cell's "
@@ -884,33 +929,43 @@ async def check_ab_test_eligibility(
             for message in entity["blockers"]
         )
         findings.extend(
+            {"entity_id": entity["entity_id"], "severity": "unresolved", "message": message}
+            for message in entity["unresolved"]
+        )
+        findings.extend(
             {"entity_id": entity["entity_id"], "severity": "warning", "message": message}
             for message in entity["warnings"]
         )
-    findings.extend({"entity_id": account_id, "severity": "blocker", "message": m} for m in account_check["blockers"])
-    findings.extend({"entity_id": account_id, "severity": "warning", "message": m} for m in account_check["warnings"])
-    blocked = sum(1 for entity in entities if entity["blockers"])
-    eligible = blocked == 0 and not account_check["blockers"]
+    for severity, key in (("blocker", "blockers"), ("unresolved", "unresolved"), ("warning", "warnings")):
+        findings.extend(
+            {"entity_id": account_id, "severity": severity, "message": message} for message in account_check[key]
+        )
+    blocked = sum(1 for entity in entities if entity["outcome"] == "failed")
+    inconclusive = sum(1 for entity in entities if entity["outcome"] == "inconclusive")
+    if blocked or account_check["blockers"]:
+        outcome = "failed"
+    elif inconclusive or account_check["unresolved"]:
+        outcome = "inconclusive"
+    else:
+        outcome = "passed"
     return analysis_response(
         scope={"account_id": account_id, "level": normalized_level, "entity_ids": ids},
         metrics={
             "entities_checked": len(entities),
-            "passed_local_precheck": len(entities) - blocked,
+            "passed_local_precheck": len(entities) - blocked - inconclusive,
             "blocked": blocked,
+            "inconclusive": inconclusive,
             "with_warnings": sum(1 for entity in entities if entity["warnings"]),
         },
         findings=findings,
-        suggestions=(
-            ["Create the test with create_ab_test; Meta makes the final eligibility decision."]
-            if eligible
-            else ["Resolve the blockers, then run this check again."]
-        ),
+        suggestions=[ELIGIBILITY_SUGGESTIONS[outcome]],
         missing_signals=missing_signals,
         extra={
             "check_type": "local_precheck",
             "meta_verdict": False,
             "label": ELIGIBILITY_LABEL,
-            "eligible_by_local_precheck": eligible,
+            "precheck_outcome": outcome,
+            "eligible_by_local_precheck": {"passed": True, "failed": False}.get(outcome),
             "entities": entities,
             "account": account_check,
             "rules_applied": ELIGIBILITY_RULES,
