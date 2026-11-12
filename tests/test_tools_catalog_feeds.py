@@ -827,6 +827,21 @@ def test_recommendations_permission_error_is_not_swallowed(monkeypatch) -> None:
         run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
 
 
+def test_intent_guide_and_mutation_paths_cover_feed_and_event_source_tools(monkeypatch) -> None:
+    from meta_ads_mcp.tools import utility
+
+    route = utility.INTENT_GUIDE["manage_product_catalog_feeds_and_event_sources"]
+    routed = set(route["recommended_order"]) | set(route["avoid_unless_needed"])
+    assert set(utility.TOOL_GROUPS["catalog"]) & {
+        "list_product_feeds", "get_catalog_event_source_health",
+    } <= routed
+    monkeypatch.delenv("META_READ_ONLY", raising=False)
+    reload_settings()
+    paths = run(utility.list_mutation_tools())["common_paths"]
+    assert "disconnect_catalog_event_source" in paths["product_catalog_event_sources"]
+    assert "delete_product_feed" in paths["product_catalog_feeds"]
+
+
 def test_graph_client_delete_from_edge_sends_delete_with_form_data(monkeypatch) -> None:
     from meta_ads_mcp.graph_api import GraphAPIClient
 

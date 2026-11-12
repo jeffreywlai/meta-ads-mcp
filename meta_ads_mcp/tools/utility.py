@@ -365,6 +365,36 @@ INTENT_GUIDE = {
         "avoid_unless_needed": [],
         "notes": ["Write operations require ads_management-level permissions and should follow discovery or diagnostics reads."],
     },
+    "manage_product_catalog_feeds_and_event_sources": {
+        "description": (
+            "Inspect or change product catalog data feeds, feed uploads and upload errors, feed rules, "
+            "and the pixels or apps connected to a product catalog, including match-rate health."
+        ),
+        "recommended_order": [
+            "list_product_feeds",
+            "list_product_feed_uploads",
+            "list_feed_rules",
+            "list_catalog_event_sources",
+            "get_catalog_event_source_health",
+            "get_catalog_event_source_recommendations",
+            "list_event_source_catalogs",
+        ],
+        "avoid_unless_needed": [
+            "create_product_feed",
+            "update_product_feed",
+            "create_product_feed_upload",
+            "create_feed_rule",
+            "connect_catalog_event_source",
+            "delete_feed_rule",
+            "delete_product_feed",
+            "disconnect_catalog_event_source",
+        ],
+        "notes": [
+            "These tools work on Meta product catalogs and need the catalog_management permission.",
+            "Deleting a feed removes the products it supplied unless another source also supplies them.",
+            "Health and recommendations are derived here from event_stats, connected sources and Meta's Dynamic Ads checks.",
+        ],
+    },
 }
 
 ROUTING_HINTS = {
@@ -701,6 +731,11 @@ async def list_mutation_tools() -> dict[str, object]:
             "creation": ["create_campaign", "create_ad_set", "create_ad", "create_ad_creative"],
             "deletion": ["delete_campaign", "delete_adset", "delete_ad", "delete_creative"],
             "audiences": ["create_custom_audience", "create_lookalike_audience", "update_custom_audience", "delete_audience"],
+            "product_catalog_feeds": [
+                "create_product_feed", "update_product_feed", "delete_product_feed",
+                "create_product_feed_upload", "create_feed_rule", "delete_feed_rule",
+            ],
+            "product_catalog_event_sources": ["connect_catalog_event_source", "disconnect_catalog_event_source"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",
