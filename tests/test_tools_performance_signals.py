@@ -554,3 +554,105 @@ def test_anomalies_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.detect_performance_anomalies(**kwargs))
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# get_auction_ranking_report
+# ---------------------------------------------------------------------------
+
+
+def _ad_row(ad_id: str, *, spend: float, purchases: float, quality: str, engagement: str, conversion: str,
+            impressions: int = 10000, clicks: int = 100) -> dict[str, Any]:
+    row = _day_row("2026-10-01", spend=spend, impressions=impressions, clicks=clicks, purchases=purchases)
+    row["date_stop"] = "2026-10-30"
+    row.update({
+        "ad_id": ad_id,
+        "ad_name": f"Ad {ad_id}",
+        "campaign_id": "cmp_1",
+        "adset_id": "as_1",
+        "quality_ranking": quality,
+        "engagement_rate_ranking": engagement,
+        "conversion_rate_ranking": conversion,
+    })
+    if not purchases:
+        row.pop("actions", None)
+    return row
+
+
+RANKING_ROWS = [
+    _ad_row("creative", spend=300, purchases=10, quality="BELOW_AVERAGE_20", engagement="AVERAGE", conversion="AVERAGE"),
+    _ad_row("bid", spend=400, purchases=4, quality="ABOVE_AVERAGE", engagement="AVERAGE", conversion="AVERAGE"),
+    _ad_row("postclick", spend=100, purchases=5, quality="AVERAGE", engagement="AVERAGE", conversion="BELOW_AVERAGE_35"),
+    _ad_row("unknown", spend=20, purchases=1, quality="UNKNOWN", engagement="UNKNOWN", conversion="UNKNOWN"),
+    _ad_row("healthy", spend=500, purchases=30, quality="ABOVE_AVERAGE", engagement="ABOVE_AVERAGE", conversion="AVERAGE"),
+]
+
+
+def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
+    client = _patch(
+        monkeypatch,
+        RecordingClient(insights_handler=lambda object_id, fields, params: {"data": RANKING_ROWS}),
+    )
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
+
+    call = _calls(client, "get_insights")[0]
+    assert call["object_id"] == "cmp_1"
+    assert call["params"]["level"] == "ad"
+    assert call["params"]["date_preset"] == "last_30d"
+    assert {"quality_ranking", "engagement_rate_ranking", "conversion_rate_ranking", "spend", "actions"} <= set(
+        call["fields"]
+    )
+
+    weak = {ad["ad_id"]: ad for ad in result["weak_ads"]}
+    assert set(weak) == {"creative", "bid", "postclick"}
+    assert weak["creative"]["diagnosis"] == "creative_quality"
+    assert weak["creative"]["below_average_rankings"] == ["quality_ranking"]
+    assert weak["postclick"]["diagnosis"] == "conversion_path"
+    assert weak["bid"]["diagnosis"] == "bid_and_budget"
+    # scope cost per result = 1320 / 50 = 26.4; the bid ad's is 100.
+    assert weak["bid"]["cost_per_result_vs_scope"] == pytest.approx(100 / 26.4)
+    assert [ad["ad_id"] for ad in result["weak_ads"]] == ["bid", "creative", "postclick"]
+    assert result["ranked_ads"][0]["ad_id"] == "creative"
+    assert result["ranked_ads"][-1]["ad_id"] == "unknown"
+    assert result["unranked_ad_count"] == 1
+    assert result["scope_metrics"]["cost_per_result"] == pytest.approx(26.4)
+    assert result["rules"]["cost_ratio_threshold"] == 1.5
+    types = {finding["type"] for finding in result["findings"]}
+    assert types == {"weak_auction_ranking"}
+    assert all(finding["evidence"] for finding in result["findings"])
+
+
+def test_auction_ranking_report_top_n_limits_lists(monkeypatch) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda object_id, fields, params: {"data": RANKING_ROWS}))
+    result = asyncio.run(
+        performance_signals.get_auction_ranking_report(level="account", object_id="42", top_n=1, since="2026-10-01",
+                                                       until="2026-10-30")
+    )
+    assert len(result["weak_ads"]) == 1 and len(result["ranked_ads"]) == 1
+    assert result["weak_ad_count"] == 3
+    assert result["scope"]["object_id"] == "act_42"
+
+
+def test_auction_ranking_report_no_rows_says_so(monkeypatch) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda object_id, fields, params: {"data": []}))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="adset", object_id="as_1"))
+    assert result["weak_ads"] == []
+    assert result["findings"][0]["type"] == "insufficient_data"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"level": "business", "object_id": "1"},
+        {"level": "campaign", "object_id": " "},
+        {"level": "campaign", "object_id": "1", "top_n": 0},
+        {"level": "campaign", "object_id": "1", "since": "2026-10-01"},
+        {"level": "campaign", "object_id": "1", "date_preset": None, "since": "2026-10-05", "until": "2026-10-02"},
+    ],
+)
+def test_auction_ranking_report_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.get_auction_ranking_report(**kwargs))
+    assert client.calls == []

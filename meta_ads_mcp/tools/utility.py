@@ -77,6 +77,7 @@ TOOL_GROUPS = {
         "get_opportunity_score",
         "get_performance_trend",
         "detect_performance_anomalies",
+        "get_auction_ranking_report",
     ],
     "social_feedback": [
         "get_ad_social_context",

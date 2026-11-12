@@ -13,6 +13,7 @@ from meta_ads_mcp.money import from_minor_units, normalize_currency
 from meta_ads_mcp.normalize import blank_to_none, to_float
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tool_types import StringList
+from meta_ads_mcp.tools import diagnostics as diagnostics_tools
 from meta_ads_mcp.tools import recommendations as recommendation_tools
 from meta_ads_mcp.tools.insights import get_entity_insights
 
@@ -759,6 +760,216 @@ async def detect_performance_anomalies(
             "baseline_rows": len(baseline_dates),
             "lookback_rows": sum(1 for day in lookback_dates if day in daily),
             "metric_definitions": {name: METRIC_DEFINITIONS[name] for name in metric_names},
+            "results_definition": RESULTS_DEFINITION,
+        },
+    )
+
+
+RANKING_FIELDS = ("quality_ranking", "engagement_rate_ranking", "conversion_rate_ranking")
+RANKING_POINTS = {
+    "ABOVE_AVERAGE": 4,
+    "AVERAGE": 3,
+    "BELOW_AVERAGE_35": 2,
+    "BELOW_AVERAGE_20": 1,
+    "BELOW_AVERAGE_10": 0,
+}
+BELOW_AVERAGE_POINTS = 2
+COST_RATIO_THRESHOLD = 1.5
+RANKING_REPORT_LEVELS = ("account", "campaign", "adset", "ad")
+RANKING_RULES = {
+    "ranking_values": {
+        "ABOVE_AVERAGE": "above average",
+        "AVERAGE": "average",
+        "BELOW_AVERAGE_35": "below average, bottom 35% of ads competing for the same audience",
+        "BELOW_AVERAGE_20": "below average, bottom 20%",
+        "BELOW_AVERAGE_10": "below average, bottom 10%",
+        "UNKNOWN": "Meta had too little data to rank the ad",
+    },
+    "creative_quality": "quality_ranking or engagement_rate_ranking is below average.",
+    "conversion_path": "only conversion_rate_ranking is below average; quality and engagement are average or above.",
+    "bid_and_budget": (
+        "all three rankings are average or above, and either cost per result is at least cost_ratio_threshold times "
+        "the scope's cost per result, or the ad has no results after spending at least one scope cost per result."
+    ),
+    "cost_ratio_threshold": COST_RATIO_THRESHOLD,
+    "weak_ad_order": "spend descending",
+    "ranked_ad_order": "ranked ads first by total ranking points ascending (above average 4 ... bottom 10% 0), then spend descending; ads with any UNKNOWN ranking last",
+    "note": (
+        "Meta's rankings compare each ad with ads that competed for the same audience. They are the closest "
+        "available comparison with other advertisers. The diagnosis says where the evidence points; it is a rule, "
+        "not a measured cause."
+    ),
+}
+
+
+def _ranking_diagnosis(
+    rankings: dict[str, str | None],
+    metrics: dict[str, float | None],
+    scope_metrics: dict[str, float | None],
+) -> tuple[str | None, str | None, list[str]]:
+    """Apply the ranking rule to one ad and return (diagnosis, reason, below-average fields)."""
+    points = {field: RANKING_POINTS.get(str(value or "").upper()) for field, value in rankings.items()}
+    below = [field for field in RANKING_FIELDS if points[field] is not None and points[field] <= BELOW_AVERAGE_POINTS]
+    if "quality_ranking" in below or "engagement_rate_ranking" in below:
+        return (
+            "creative_quality",
+            "Meta ranks this ad's quality or expected engagement below ads competing for the same audience, which "
+            "points at the creative.",
+            below,
+        )
+    if below == ["conversion_rate_ranking"]:
+        return (
+            "conversion_path",
+            "Only the conversion-rate ranking is below average, which points at what happens after the click "
+            "(offer, landing page or audience intent) rather than the creative or the bid.",
+            below,
+        )
+    if any(value is None for value in points.values()):
+        return None, None, below
+    cost_ratio = _ratio(metrics["cost_per_result"], scope_metrics["cost_per_result"])
+    if cost_ratio is not None and cost_ratio >= COST_RATIO_THRESHOLD:
+        return (
+            "bid_and_budget",
+            f"All three rankings are average or above, yet cost per result is {cost_ratio:.2f} times the scope's. "
+            "With relevance in line with competing ads, the higher cost points at auction competition, bid or budget.",
+            below,
+        )
+    scope_cost = scope_metrics["cost_per_result"]
+    if (metrics["results"] or 0) == 0 and scope_cost and (metrics["spend"] or 0) >= scope_cost:
+        return (
+            "bid_and_budget",
+            "All three rankings are average or above, yet the ad has no results after spending at least one scope "
+            "cost per result, which points at auction competition, bid or budget.",
+            below,
+        )
+    return None, None, below
+
+
+@mcp_server.tool()
+async def get_auction_ranking_report(
+    level: str,
+    object_id: str,
+    date_preset: str | None = "last_30d",
+    since: str | None = None,
+    until: str | None = None,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Rank the ads under an account, campaign, ad set (or one ad) by Meta's quality, engagement-rate and conversion-rate rankings with spend and results, and say for each weak ad whether the evidence points at creative quality, the post-click path, or bid and budget. Rankings compare ads competing for the same audience."""
+    resolved_level = _require_level(level, RANKING_REPORT_LEVELS)
+    resolved_object_id = _require_object_id(resolved_level, object_id)
+    if top_n < 1:
+        raise ValidationError("top_n must be at least 1.")
+    window = diagnostics_tools._window_kwargs(
+        date_preset=date_preset, since=since, until=until, default_date_preset="last_30d",
+    )
+    rows = await diagnostics_tools._child_insights(
+        resolved_object_id,
+        level="ad",
+        fields=diagnostics_tools.AD_QUALITY_FIELDS,
+        **window,
+    )
+    known = _known_inputs(rows)
+    scope_metrics = _derived_metrics(_period_inputs(rows, known))
+    ads: list[dict[str, Any]] = []
+    for row in rows:
+        metrics = _derived_metrics(_period_inputs([row], known))
+        rankings = {field: row.get(field) for field in RANKING_FIELDS}
+        diagnosis, reason, below = _ranking_diagnosis(rankings, metrics, scope_metrics)
+        points = [RANKING_POINTS.get(str(value or "").upper()) for value in rankings.values()]
+        ads.append({
+            "ad_id": str(row.get("ad_id") or row.get("id") or "") or None,
+            "ad_name": row.get("ad_name"),
+            "campaign_id": row.get("campaign_id"),
+            "adset_id": row.get("adset_id"),
+            "rankings": rankings,
+            "ranking_points": None if None in points else sum(points),
+            "below_average_rankings": below,
+            "spend": metrics["spend"],
+            "impressions": metrics["impressions"],
+            "results": metrics["results"],
+            "cost_per_result": metrics["cost_per_result"],
+            "cpm": metrics["cpm"],
+            "ctr": metrics["ctr"],
+            "cost_per_result_vs_scope": _ratio(metrics["cost_per_result"], scope_metrics["cost_per_result"]),
+            "cpm_vs_scope": _ratio(metrics["cpm"], scope_metrics["cpm"]),
+            "diagnosis": diagnosis,
+            "reason": reason,
+        })
+
+    ranked = sorted(
+        ads,
+        key=lambda ad: (ad["ranking_points"] is None, ad["ranking_points"] or 0, -(ad["spend"] or 0.0), ad["ad_id"] or ""),
+    )
+    weak = sorted(
+        (ad for ad in ads if ad["diagnosis"]),
+        key=lambda ad: (-(ad["spend"] or 0.0), ad["ad_id"] or ""),
+    )
+    findings: list[dict[str, Any]] = []
+    for ad in weak[:top_n]:
+        finding = build_finding(
+            "weak_auction_ranking",
+            f"Ad {ad['ad_id']}: {ad['reason']}",
+            severity="high" if ad["diagnosis"] == "creative_quality" and any(
+                str(ad["rankings"][field] or "").upper() == "BELOW_AVERAGE_10" for field in RANKING_FIELDS
+            ) else "medium",
+            confidence=None,
+            evidence=[
+                metric_evidence(
+                    "rankings", None, "Meta-reported ranking fields",
+                    {field: ad["rankings"][field] for field in RANKING_FIELDS},
+                ),
+                metric_evidence(
+                    "cost_per_result_vs_scope",
+                    ad["cost_per_result_vs_scope"],
+                    "ad cost_per_result / scope cost_per_result",
+                    {"ad_cost_per_result": ad["cost_per_result"], "scope_cost_per_result": scope_metrics["cost_per_result"]},
+                ),
+                metric_evidence(
+                    "cpm_vs_scope",
+                    ad["cpm_vs_scope"],
+                    "ad cpm / scope cpm",
+                    {"ad_cpm": ad["cpm"], "scope_cpm": scope_metrics["cpm"], "ad_spend": ad["spend"]},
+                ),
+            ],
+            affected_entities=[{"ad_id": ad["ad_id"], "ad_name": ad["ad_name"], "diagnosis": ad["diagnosis"]}],
+            next_actions={
+                "creative_quality": ["Test new creative against this ad before shifting budget."],
+                "conversion_path": ["Check the landing page, offer and audience intent for this ad."],
+                "bid_and_budget": ["Review bid strategy, cost controls and budget for the ad's ad set."],
+            }[ad["diagnosis"]],
+        )
+        finding["confidence_status"] = "uncalibrated"
+        findings.append(finding)
+    if not findings:
+        has_ranked = any(ad["ranking_points"] is not None for ad in ads)
+        findings.append({
+            **build_finding(
+                "no_weak_ads_detected" if has_ranked else "insufficient_data",
+                (
+                    "No ad matched the weak-ranking or high-cost rules."
+                    if has_ranked
+                    else "No ad in the window had all three Meta rankings."
+                ),
+                severity="low",
+                confidence=None,
+            ),
+            "confidence_status": "uncalibrated",
+        })
+
+    return analysis_response(
+        scope={"level": resolved_level, "object_id": resolved_object_id},
+        metrics=scope_metrics,
+        findings=findings,
+        extra={
+            "analyzed_level": "ad",
+            "window": diagnostics_tools._window_descriptor(date_preset, since, until, default_date_preset="last_30d"),
+            "ads_analyzed": len(ads),
+            "scope_metrics": scope_metrics,
+            "ranked_ads": ranked[:top_n],
+            "weak_ads": weak[:top_n],
+            "weak_ad_count": len(weak),
+            "unranked_ad_count": sum(1 for ad in ads if ad["ranking_points"] is None),
+            "rules": RANKING_RULES,
             "results_definition": RESULTS_DEFINITION,
         },
     )
