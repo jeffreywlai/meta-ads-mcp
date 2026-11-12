@@ -276,6 +276,42 @@ INTENT_GUIDE = {
             "Use typed opportunity tools only when the user asks for one category specifically.",
         ],
     },
+    "check_opportunity_score": {
+        "description": "Read Meta's 0-100 account opportunity score, its recent history, and the recommendations that would raise it.",
+        "recommended_order": ["get_opportunity_score", "get_recommendations"],
+        "avoid_unless_needed": [],
+        "notes": ["Recommendations are ranked by Meta's estimated score gain (opportunity_score_lift)."],
+    },
+    "track_performance_trends_or_anomalies": {
+        "description": "See how CPC, CPM, cost per result, ROAS, CTR or conversion rate moved over days, weeks or months, or find unusual days.",
+        "recommended_order": ["get_performance_trend", "detect_performance_anomalies", "get_budget_pacing_report"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "detect_performance_anomalies compares each recent day with the object's own baseline using median and median absolute deviation; it is a rule-based screen, not a statistical test.",
+        ],
+    },
+    "compare_ads_to_benchmarks_or_competitors": {
+        "description": "Compare ads with ads competing for the same audience using Meta's quality, engagement-rate and conversion-rate rankings.",
+        "recommended_order": ["get_auction_ranking_report", "get_ad_feedback_signals"],
+        "avoid_unless_needed": [],
+        "notes": [
+            "Industry benchmarks from similar advertisers are not available through Meta's public API; Meta's rankings are the nearest comparison.",
+        ],
+    },
+    "brief_on_advertiser_context": {
+        "description": "Get a briefing on the advertiser: account settings, spend by objective and optimization goal, funnel volumes, datasets, Pages and Instagram identities.",
+        "recommended_order": ["get_advertiser_context", "get_account_optimization_snapshot"],
+        "avoid_unless_needed": [],
+        "notes": ["get_advertiser_context is derived from account data by this server, not Meta's own summary."],
+    },
+    "troubleshoot_delivery_errors": {
+        "description": "Find why the account, campaigns, ad sets or ads are not delivering: disapprovals, review feedback, issues, failed delivery checks, account status.",
+        "recommended_order": ["get_delivery_errors", "get_native_optimization_signals", "get_learning_phase_report"],
+        "avoid_unless_needed": [],
+        "notes": [
+            "get_delivery_errors says when its scan stopped before the end; continue with after=scan.next_after.",
+        ],
+    },
     "read_ad_comments_or_quality_signals": {
         "description": (
             "Handle asks for ad comments, reviews, testimonials, customer feedback, negative feedback, "
