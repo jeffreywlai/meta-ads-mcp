@@ -718,6 +718,33 @@ def test_audience_users_mcp_argument_errors_never_echo_values(monkeypatch, caplo
         _assert_nothing_echoed(excinfo.value, caplog, value)
 
 
+@pytest.mark.parametrize("value", [_PRIVATE_EMAIL, _PRIVATE_DIGEST], ids=["raw", "hashed"])
+@pytest.mark.parametrize("shape", ["list", "nested_list", "number_list"])
+def test_call_tool_proxy_rejects_non_object_arguments_without_echo(monkeypatch, caplog, value, shape) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    arguments = {"list": [value], "nested_list": [[value]], "number_list": [value, 1]}[shape]
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(mcp_server.call_tool("call_tool", {"name": "add_audience_users", "arguments": arguments}))
+    assert "arguments must be a JSON object" in str(excinfo.value)
+    _assert_nothing_echoed(excinfo.value, caplog, value)
+
+
+def test_call_tool_proxy_schema_is_unchanged_by_loose_arguments() -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    tools = {tool.name: tool for tool in asyncio.run(mcp_server.list_tools())}
+    assert tools["call_tool"].parameters["properties"]["arguments"] == {
+        "anyOf": [{"additionalProperties": True, "type": "object"}, {"type": "string"}, {"type": "null"}],
+        "default": None,
+        "description": "Tool arguments as an object or object-valued JSON string",
+    }
+
+
 def test_audience_users_mcp_schema_still_describes_the_expected_shape() -> None:
     from meta_ads_mcp.coordinator import mcp_server, serialize_search_results_compact
 

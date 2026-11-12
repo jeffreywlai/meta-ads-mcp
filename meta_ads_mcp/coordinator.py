@@ -30,7 +30,9 @@ except ModuleNotFoundError as exc:
 
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.tools.tool import Tool, ToolResult
+from pydantic import WithJsonSchema
 
+from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.error_middleware import (
     StructuredMetaErrorMiddleware,
     ToolParameterHelpMiddleware,
@@ -139,9 +141,21 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
 
         async def call_tool(
             name: Annotated[str | None, "Canonical tool name"] = None,
+            # Declared as Any so a wrongly shaped value reaches the check below:
+            # the framework's own validation error and log would quote it, and it
+            # can hold customer data meant for a customer-list upload.
             arguments: Annotated[
-                dict[str, Any] | str | None,
-                "Tool arguments as an object or object-valued JSON string",
+                Any,
+                WithJsonSchema(
+                    {
+                        "anyOf": [
+                            {"type": "object", "additionalProperties": True},
+                            {"type": "string"},
+                            {"type": "null"},
+                        ],
+                        "description": "Tool arguments as an object or object-valued JSON string",
+                    }
+                ),
             ] = None,
             tool_name: Annotated[
                 str | None,
@@ -158,6 +172,8 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
                 raise ValueError(
                     f"'{resolved_name}' is a synthetic search tool and cannot be called via the call_tool proxy"
                 )
+            if arguments is not None and not isinstance(arguments, (dict, str)):
+                raise ValidationError("arguments must be a JSON object or object-valued JSON string.")
             normalized_arguments = normalize_tool_arguments(arguments)
             return await ctx.fastmcp.call_tool(resolved_name, normalized_arguments)
 
