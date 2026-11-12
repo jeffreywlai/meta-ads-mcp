@@ -297,6 +297,83 @@ def test_diagnostics_severity_filter_is_sent_and_validated(monkeypatch) -> None:
         _run(catalogs.get_catalog_diagnostics(catalog_id=" "))
 
 
+def _heavy_nested_entry(index: int) -> dict[str, Any]:
+    """A nested diagnostic entry shaped like the 12-key, multi-KB entries Meta returned live."""
+    return {
+        "type": f"NESTED_TYPE_{index}",
+        "severity": "MUST_FIX",
+        "title": f"Nested problem {index}",
+        "subtitle": "Some items are missing a required attribute. " * 8,
+        "call_to_action": {"label": "Fix items", "uri": "https://business.facebook.com/" + "x" * 200},
+        "affected_items": [{"id": f"item_{n}", "retailer_id": f"sku_{n}", "name": "Product " * 6} for n in range(25)],
+        "sample_values": ["value " * 10 for _ in range(20)],
+        "error_code": 1000 + index,
+        "number_of_affected_items": 400 + index,
+        "description": "Long description of the problem. " * 20,
+        "learn_more": "https://www.facebook.com/business/help/" + "y" * 150,
+        "affected_features": ["dynamic_ads", "shops"],
+    }
+
+
+def _heavy_group(index: int, entries: int = 5) -> dict[str, Any]:
+    return {
+        "type": f"GROUP_TYPE_{index}",
+        "severity": "MUST_FIX" if index % 2 else "OPPORTUNITY",
+        "title": f"Group {index}",
+        "subtitle": f"{index} kinds of item problems",
+        "affected_channels": ["da", "shops"],
+        "affected_entity": "product_item",
+        "affected_features": ["dynamic_ads"],
+        "error_code": 2000 + index,
+        "number_of_affected_items": 1000 - index,
+        "number_of_affected_entities": 10 + index,
+        "diagnostics": [_heavy_nested_entry(n) for n in range(entries)],
+    }
+
+
+def test_diagnostics_default_returns_compact_groups_with_capped_detail_sample(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={("cat_1", "diagnostics"): {"data": [
+        _heavy_group(1), _heavy_group(2),
+    ]}}))
+    result = _run(catalogs.get_catalog_diagnostics(catalog_id="cat_1", limit=5))
+    first = result["items"][0]
+    assert set(first) == {
+        "type", "severity", "title", "subtitle", "affected_entity", "error_code",
+        "number_of_affected_items", "number_of_affected_entities", "detail_count", "detail_sample",
+    }
+    assert first["title"] == "Group 1"
+    assert first["number_of_affected_items"] == 999
+    assert first["detail_count"] == 5
+    assert len(first["detail_sample"]) <= catalogs.DIAGNOSTIC_DETAIL_SAMPLE_SIZE
+    sample = first["detail_sample"][0]
+    assert "affected_items" not in sample and "sample_values" not in sample
+    assert sample["title"] == "Nested problem 0"
+    assert all(len(value) <= catalogs.DIAGNOSTIC_DETAIL_TEXT_LIMIT + 3
+               for value in sample.values() if isinstance(value, str))
+    summary = result["summary"]
+    assert summary["details_included"] is False
+    assert summary["detail_entries_total"] == 10
+    assert "include_details" in summary["detail_note"]
+
+
+def test_diagnostics_include_details_returns_full_nested_data(monkeypatch) -> None:
+    group = _heavy_group(1)
+    _use(monkeypatch, FakeCatalogClient(edges={("cat_1", "diagnostics"): {"data": [group]}}))
+    result = _run(catalogs.get_catalog_diagnostics(catalog_id="cat_1", include_details=True))
+    assert result["items"][0] == group
+    assert result["summary"]["details_included"] is True
+    assert "detail_note" not in result["summary"]
+
+
+def test_diagnostics_default_response_stays_small_for_heavy_groups(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={("cat_1", "diagnostics"): {"data": [
+        _heavy_group(index) for index in range(20)
+    ]}}))
+    result = _run(catalogs.get_catalog_diagnostics(catalog_id="cat_1"))
+    assert len(result["items"]) == 20
+    assert len(json.dumps(result).encode()) < 20_000
+
+
 # --------------------------------------------------- get_catalog_dynamic_ads_health
 
 
@@ -306,16 +383,18 @@ def _health_client(**overrides) -> FakeCatalogClient:
         "ps_1": {"id": "ps_1", "name": "Shoes", "product_count": 0, "product_catalog": {"id": "cat_1"}},
     }
     edges = {
-        ("cat_1", "da_checks"): {"data": [
-            {"key": "catalog_has_feed_upload_errors", "result": "passed", "title": "Feed errors"},
-        ]},
         ("cat_1", "diagnostics"): {"data": []},
         ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("ps_1", "da_checks"): {"data": []},
     }
     objects.update(overrides.pop("objects", {}))
     edges.update(overrides.pop("edges", {}))
     return FakeCatalogClient(objects=objects, edges=edges, **overrides)
+
+
+def _assert_no_da_checks(client: FakeCatalogClient, result: dict[str, Any]) -> None:
+    """Meta rejects catalog and product set da_checks live, so the tool must neither read nor mention them."""
+    assert not any(call.get("edge") == "da_checks" for _, call in client.calls)
+    assert "da_checks" not in json.dumps(result)
 
 
 def test_dynamic_ads_health_no_blockers(monkeypatch) -> None:
@@ -323,29 +402,28 @@ def test_dynamic_ads_health_no_blockers(monkeypatch) -> None:
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
     assert result["status"] == "no_blockers_found"
     assert result["findings"] == []
-    assert "product_catalog/da_checks" in result["basis"]["signals_used"]
-    da_call = next(call for kind, call in client.calls if kind == "list" and call["edge"] == "da_checks")
-    assert da_call["fields"] == catalogs.DA_CHECK_FIELDS
+    assert result["basis"]["signals_used"] == [
+        "product_catalog.product_count", "product_catalog/diagnostics", "product_catalog/external_event_sources",
+    ]
+    assert "failed_checks" not in result["metrics"]
     diag_call = next(call for kind, call in client.calls if kind == "list" and call["edge"] == "diagnostics")
     assert diag_call["params"]["affected_channels"] == ["da"]
+    assert "diagnostics" not in diag_call["fields"]
+    _assert_no_da_checks(client, result)
 
 
 def test_dynamic_ads_health_empty_product_set_blocks(monkeypatch) -> None:
-    _use(monkeypatch, _health_client())
+    client = _use(monkeypatch, _health_client())
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1", product_set_id="ps_1"))
     assert result["status"] == "blocked"
     assert result["findings"][0]["severity"] == "blocking"
     assert "will not deliver" in result["findings"][0]["message"]
     assert result["metrics"]["product_set_product_count"] == 0
+    _assert_no_da_checks(client, result)
 
 
-def test_dynamic_ads_health_failed_checks_and_must_fix_are_at_risk(monkeypatch) -> None:
-    _use(monkeypatch, _health_client(edges={
-        ("cat_1", "da_checks"): {"data": [
-            {"key": "catalog_has_feed_upload_errors", "result": "failed", "title": "Feed errors",
-             "user_message": "Your last upload had errors", "action_uri": "https://example.com"},
-            {"key": "other", "result": "unavailable", "title": "Other"},
-        ]},
+def test_dynamic_ads_health_must_fix_diagnostics_are_at_risk(monkeypatch) -> None:
+    client = _use(monkeypatch, _health_client(edges={
         ("cat_1", "diagnostics"): {"data": [
             {"title": "Images missing", "severity": "MUST_FIX", "number_of_affected_items": 7},
             {"title": "Better titles", "severity": "OPPORTUNITY", "number_of_affected_items": 70},
@@ -353,11 +431,11 @@ def test_dynamic_ads_health_failed_checks_and_must_fix_are_at_risk(monkeypatch) 
     }))
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
     assert result["status"] == "at_risk"
-    kinds = [finding["source"] for finding in result["findings"]]
-    assert kinds == ["product_catalog/da_checks", "product_catalog/diagnostics"]
-    assert result["findings"][0]["message"] == "Your last upload had errors"
+    assert [finding["source"] for finding in result["findings"]] == ["product_catalog/diagnostics"]
+    assert result["findings"][0]["affected_items"] == 7
+    assert result["metrics"]["must_fix_groups"] == 1
     assert result["metrics"]["opportunity_groups"] == 1
-    assert any("other" in entry for entry in result["missing_signals"])
+    _assert_no_da_checks(client, result)
 
 
 def test_dynamic_ads_health_no_products_and_no_event_source(monkeypatch) -> None:
@@ -373,10 +451,12 @@ def test_dynamic_ads_health_no_products_and_no_event_source(monkeypatch) -> None
 
 
 def test_dynamic_ads_health_unavailable_signal_is_inconclusive(monkeypatch) -> None:
-    _use(monkeypatch, _health_client(edge_errors={("cat_1", "da_checks"): _permission_error()}))
+    client = _use(monkeypatch, _health_client(edge_errors={("cat_1", "diagnostics"): _permission_error()}))
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
     assert result["status"] == "inconclusive"
-    assert any("da_checks" in entry for entry in result["missing_signals"])
+    assert any("product_catalog/diagnostics" in entry for entry in result["missing_signals"])
+    assert "product_catalog/diagnostics" not in result["basis"]["signals_used"]
+    _assert_no_da_checks(client, result)
 
 
 def test_dynamic_ads_health_rejects_product_set_from_other_catalog(monkeypatch) -> None:
@@ -392,6 +472,13 @@ def test_dynamic_ads_health_catalog_read_error_raises(monkeypatch) -> None:
     _use(monkeypatch, _health_client(get_errors={"cat_1": _permission_error()}))
     with pytest.raises(MetaApiError):
         _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+
+
+def test_catalogs_module_never_reads_da_checks() -> None:
+    import inspect
+
+    assert "da_checks" not in inspect.getsource(catalogs)
+    assert not hasattr(catalogs, "DA_CHECK_FIELDS")
 
 
 # ------------------------------------------------------- list_catalog_data_sources

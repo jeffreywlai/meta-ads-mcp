@@ -173,8 +173,6 @@ TOOL_GROUPS = {
         "get_dataset_stats",
         "get_dataset_quality",
         "list_custom_conversions",
-        "list_pixel_event_rules",
-        "list_pixel_parameters",
     ],
     "experiments": [
         "list_ad_studies",
@@ -434,7 +432,7 @@ INTENT_GUIDE = {
     "inspect_pixels_datasets_or_tracking": {
         "description": (
             "Check pixels, datasets, Conversions API setup, event volume, event match quality, "
-            "custom conversions, and pixel event rules or parameter extractors."
+            "and custom conversions."
         ),
         "recommended_order": [
             "list_datasets",
@@ -443,11 +441,10 @@ INTENT_GUIDE = {
             "get_dataset_quality",
             "list_custom_conversions",
         ],
-        "avoid_unless_needed": ["list_pixel_event_rules", "list_pixel_parameters"],
+        "avoid_unless_needed": [],
         "notes": [
             "Use get_dataset_quality for event match quality and match-key coverage; it flags weak scores and states the threshold used.",
             "get_dataset_stats covers at most 28 days per call and totals hourly counts per event, device, source, or other aggregation.",
-            "Pixel event rules and parameter extractors are read-only through Meta's public API; changes are made in Events Manager.",
         ],
     },
     "writes_after_confirmation": {

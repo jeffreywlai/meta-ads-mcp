@@ -152,8 +152,6 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "get_dataset": {"dataset_id": "px_123"},
     "get_dataset_stats": {"dataset_id": "px_123", "since": "2026-03-01", "until": "2026-03-07"},
     "get_dataset_quality": {"dataset_id": "px_123"},
-    "list_pixel_event_rules": {"pixel_id": "px_123"},
-    "list_pixel_parameters": {"pixel_id": "px_123"},
     "list_ad_studies": {"account_id": "123"},
     "get_ad_study": {"study_id": "study_123", "include_results": True},
     "check_ab_test_eligibility": {"entity_ids": ["cmp_123", "cmp_456"]},

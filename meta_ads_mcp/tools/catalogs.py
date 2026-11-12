@@ -67,8 +67,18 @@ DIAGNOSTIC_FIELDS = [
     "number_of_affected_entities", "diagnostics",
 ]
 DIAGNOSTIC_SEVERITIES = ("MUST_FIX", "OPPORTUNITY")
+# Group keys kept in get_catalog_diagnostics' default compact view.
+DIAGNOSTIC_SUMMARY_KEYS = (
+    "type", "severity", "title", "subtitle", "affected_entity", "error_code",
+    "number_of_affected_items", "number_of_affected_entities",
+)
+# Nested entries can each run to several KB (a live group of 5 entries was 29 KB),
+# so the default view keeps one entry per group for the first few groups, with
+# only its scalar values and long text cut short.
+DIAGNOSTIC_DETAIL_SAMPLE_SIZE = 1
+DIAGNOSTIC_DETAIL_SAMPLE_GROUPS = 5
+DIAGNOSTIC_DETAIL_TEXT_LIMIT = 160
 EVENT_SOURCE_FIELDS = ["id", "name", "source_type"]
-DA_CHECK_FIELDS = ["key", "title", "description", "result", "user_message", "action_uri"]
 
 # Operators named in Meta's product set filter documentation. starts_with is
 # documented as available only for the category field.
@@ -504,14 +514,51 @@ def _diagnostic_sort_key(group: dict[str, Any]) -> tuple[int, int, int]:
     return (affected is None, -(affected or 0), severity_rank if affected is None else -entities)
 
 
+def _short_text(value: str) -> str:
+    if len(value) <= DIAGNOSTIC_DETAIL_TEXT_LIMIT:
+        return value
+    return value[:DIAGNOSTIC_DETAIL_TEXT_LIMIT] + "..."
+
+
+def _detail_sample_entry(entry: Any) -> dict[str, Any] | None:
+    """Keep a nested entry's scalar values, cutting long text; lists and objects are left out."""
+    if not isinstance(entry, dict):
+        return None
+    sample: dict[str, Any] = {}
+    for key, value in entry.items():
+        if isinstance(value, str):
+            sample[key] = _short_text(value)
+        elif value is None or isinstance(value, (bool, int, float)):
+            sample[key] = value
+    return sample
+
+
+def _compact_diagnostic_group(group: dict[str, Any], *, with_sample: bool) -> dict[str, Any]:
+    compact = {key: group.get(key) for key in DIAGNOSTIC_SUMMARY_KEYS}
+    for key in ("title", "subtitle"):
+        if isinstance(compact[key], str):
+            compact[key] = _short_text(compact[key])
+    nested = group.get("diagnostics")
+    nested = nested if isinstance(nested, list) else []
+    compact["detail_count"] = len(nested)
+    sample = []
+    if with_sample:
+        for entry in nested[:DIAGNOSTIC_DETAIL_SAMPLE_SIZE]:
+            if (trimmed := _detail_sample_entry(entry)) is not None:
+                sample.append(trimmed)
+    compact["detail_sample"] = sample
+    return compact
+
+
 @mcp_server.tool()
 async def get_catalog_diagnostics(
     catalog_id: str,
     severity: str | None = None,
     limit: int = 100,
     after: str | None = None,
+    include_details: bool = False,
 ) -> dict[str, Any]:
-    """Product catalog diagnostics (Meta severities MUST_FIX and OPPORTUNITY) ordered by how many products each affects. Ordering applies within the returned page."""
+    """Product catalog diagnostics (Meta severities MUST_FIX and OPPORTUNITY) ordered by how many products each affects. Ordering applies within the returned page. Each group is a compact summary with a short sample of Meta's nested detail; include_details returns the full nested data, which can be very large."""
     catalog_id = _require(catalog_id, "catalog_id")
     _check_limit(limit)
     params = _page_params(limit, after)
@@ -524,12 +571,30 @@ async def get_catalog_diagnostics(
         catalog_id, "diagnostics", fields=DIAGNOSTIC_FIELDS, params=params,
     )
     result = _paged(payload)
-    result["items"] = sorted(result["items"], key=_diagnostic_sort_key)
+    groups = sorted(result["items"], key=_diagnostic_sort_key)
     result["summary"].update({
         "ordered_by": "number_of_affected_items",
         "order_scope": "page",
-        "by_severity": dict(Counter(item.get("severity") or "UNKNOWN" for item in result["items"])),
+        "by_severity": dict(Counter(item.get("severity") or "UNKNOWN" for item in groups)),
+        "details_included": include_details,
     })
+    if include_details:
+        result["items"] = groups
+        return result
+    result["items"] = [
+        _compact_diagnostic_group(group, with_sample=index < DIAGNOSTIC_DETAIL_SAMPLE_GROUPS)
+        for index, group in enumerate(groups)
+    ]
+    detail_total = sum(item["detail_count"] for item in result["items"])
+    sampled = sum(len(item["detail_sample"]) for item in result["items"])
+    result["summary"]["detail_entries_total"] = detail_total
+    result["summary"]["detail_note"] = (
+        f"Nested detail was left out: {sampled} of {detail_total} nested diagnostic entries are shown as a "
+        f"short sample (at most {DIAGNOSTIC_DETAIL_SAMPLE_SIZE} per group for the first "
+        f"{DIAGNOSTIC_DETAIL_SAMPLE_GROUPS} groups, scalar values only, text cut at "
+        f"{DIAGNOSTIC_DETAIL_TEXT_LIMIT} characters). Call again with include_details=true for the full "
+        "nested data."
+    )
     return result
 
 
@@ -543,30 +608,12 @@ async def _health_edge(client, parent_id, edge, fields, params, used, missing, l
     return payload.get("data") or []
 
 
-def _check_findings(checks: list[dict[str, Any]], source: str, missing: list[str]) -> list[dict[str, Any]]:
-    findings = []
-    for check in checks:
-        result = str(check.get("result") or "").lower()
-        if result == "failed":
-            findings.append({
-                "severity": "issue",
-                "source": source,
-                "key": check.get("key"),
-                "title": check.get("title"),
-                "message": check.get("user_message") or check.get("description") or check.get("title"),
-                "action_uri": check.get("action_uri"),
-            })
-        elif result == "unavailable":
-            missing.append(f"{source} check {check.get('key')} was unavailable; Meta says to try again later.")
-    return findings
-
-
 @mcp_server.tool()
 async def get_catalog_dynamic_ads_health(
     catalog_id: str,
     product_set_id: str | None = None,
 ) -> dict[str, Any]:
-    """Whether a product catalog, or one product set in it, can serve catalog (dynamic) ads, and what blocks it. Combines Meta's dynamic-ads checks, diagnostics, product counts and connected event sources; lists the signals used."""
+    """Whether a product catalog, or one product set in it, can serve catalog (dynamic) ads, and what blocks it. Combines the catalog's dynamic-ads diagnostics, product counts and connected event sources; lists the signals used."""
     catalog_id = _require(catalog_id, "catalog_id")
     product_set_id = blank_to_none(product_set_id)
     client = get_graph_api_client()
@@ -581,17 +628,11 @@ async def get_catalog_dynamic_ads_health(
             raise ValidationError(f"Product set {product_set_id} belongs to catalog {owner}, not {catalog_id}.")
         used.append("product_set.product_count")
 
-    checks = await _health_edge(client, catalog_id, "da_checks", DA_CHECK_FIELDS, None,
-                                used, missing, "product_catalog/da_checks")
-    diagnostics = await _health_edge(client, catalog_id, "diagnostics", DIAGNOSTIC_FIELDS,
+    diagnostics = await _health_edge(client, catalog_id, "diagnostics", list(DIAGNOSTIC_SUMMARY_KEYS),
                                      {"affected_channels": ["da"], "limit": 100}, used, missing,
                                      "product_catalog/diagnostics")
     sources = await _health_edge(client, catalog_id, "external_event_sources", EVENT_SOURCE_FIELDS,
                                  {"limit": 25}, used, missing, "product_catalog/external_event_sources")
-    set_checks = None
-    if product_set_id:
-        set_checks = await _health_edge(client, product_set_id, "da_checks", DA_CHECK_FIELDS, None,
-                                        used, missing, "product_set/da_checks")
 
     blocking: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
@@ -608,8 +649,6 @@ async def get_catalog_dynamic_ads_health(
                              "message": f"Product set {product_set_id} contains no products. {_EMPTY_SET_MESSAGE}"})
         elif set_products is None:
             missing.append("Meta did not return the product set's product_count.")
-    issues.extend(_check_findings(checks or [], "product_catalog/da_checks", missing))
-    issues.extend(_check_findings(set_checks or [], "product_set/da_checks", missing))
     must_fix = sorted(
         (group for group in diagnostics or [] if group.get("severity") == "MUST_FIX"),
         key=_diagnostic_sort_key,
@@ -646,7 +685,6 @@ async def get_catalog_dynamic_ads_health(
             "catalog_product_count": catalog_products,
             "product_set_product_count": set_products,
             "event_source_count": None if sources is None else len(sources),
-            "failed_checks": sum(1 for item in issues if item["source"].endswith("da_checks")),
             "must_fix_groups": len(must_fix),
             "opportunity_groups": opportunity_groups,
         },
@@ -663,8 +701,7 @@ async def get_catalog_dynamic_ads_health(
                 "signals_used": used,
                 "rules": {
                     "blocked": "The catalog or the product set has no products.",
-                    "at_risk": ("A Meta dynamic-ads check failed, a must-fix dynamic-ads diagnostic exists, "
-                                "or no event source is connected."),
+                    "at_risk": "A must-fix dynamic-ads diagnostic exists, or no event source is connected.",
                     "inconclusive": "No problem was found but at least one signal could not be read.",
                     "no_blockers_found": "Every signal was read and none showed a problem.",
                 },

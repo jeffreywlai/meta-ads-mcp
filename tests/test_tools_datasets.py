@@ -133,8 +133,6 @@ def test_permission_error_is_not_swallowed(monkeypatch) -> None:
         lambda: datasets.get_dataset(dataset_id="px1"),
         lambda: datasets.get_dataset_quality(dataset_id="px1"),
         lambda: datasets.get_dataset_stats(dataset_id="px1", since="2026-11-01", until="2026-11-02"),
-        lambda: datasets.list_pixel_event_rules(pixel_id="px1"),
-        lambda: datasets.list_pixel_parameters(pixel_id="px1"),
     ):
         with pytest.raises(MetaApiError):
             asyncio.run(call())
@@ -451,101 +449,6 @@ def test_list_custom_conversions_validates_input(monkeypatch) -> None:
         asyncio.run(datasets.list_custom_conversions(account_id="123", limit=0))
 
 
-# ----------------------------------------- list_pixel_event_rules / parameters
-
-
-def test_list_pixel_event_rules_reads_event_rules_edge(monkeypatch) -> None:
-    client = FakeDatasetClient(list_pages={"event_rules": [{
-        "data": [{"id": "r1", "event_type": "Purchase", "status": "ACTIVE"}],
-        "paging": {"next": "https://graph/next", "cursors": {"after": "n"}},
-    }]})
-    _use(monkeypatch, client)
-
-    result = asyncio.run(datasets.list_pixel_event_rules(pixel_id="px1", limit=20, after="p"))
-
-    call = client.list_calls[0]
-    assert (call["parent_id"], call["edge"]) == ("px1", "event_rules")
-    assert call["params"] == {"limit": 20, "after": "p"}
-    assert call["fields"] == datasets.EVENT_RULE_FIELDS
-    assert result["items"][0]["id"] == "r1"
-    assert result["summary"]["complete"] is False
-    assert result["summary"]["next_after"] == "n"
-    assert result["summary"]["read_only_surface"] is True
-
-
-def test_list_pixel_event_rules_finds_one_rule_by_scanning_pages(monkeypatch) -> None:
-    client = FakeDatasetClient(list_pages={"event_rules": [
-        {"data": [{"id": "r1"}], "paging": {"next": "n", "cursors": {"after": "c2"}}},
-        {"data": [{"id": "r2", "event_type": "Lead"}]},
-    ]})
-    _use(monkeypatch, client)
-
-    result = asyncio.run(datasets.list_pixel_event_rules(pixel_id="px1", rule_id="r2"))
-
-    assert [call["params"] for call in client.list_calls] == [{"limit": 100}, {"limit": 100, "after": "c2"}]
-    assert result["item"] == {"id": "r2", "event_type": "Lead"}
-    assert result["summary"] == {
-        "found": True, "count": 1, "examined": 2, "pages_fetched": 2, "complete": True,
-        "read_only_surface": True,
-    }
-
-
-def test_list_pixel_event_rules_missing_rule_reports_scan_coverage(monkeypatch) -> None:
-    client = FakeDatasetClient(list_pages={"event_rules": [
-        {"data": [{"id": "r1"}], "paging": {"next": "n", "cursors": {"after": "c"}}},
-    ]})
-    _use(monkeypatch, client)
-    monkeypatch.setattr(datasets, "MAX_ID_SCAN_PAGES", 2)
-
-    result = asyncio.run(datasets.list_pixel_event_rules(pixel_id="px1", rule_id="zzz"))
-
-    assert result["item"] is None
-    assert result["summary"]["found"] is False
-    assert result["summary"]["complete"] is False
-    assert result["summary"]["examined"] == 2
-    assert "incomplete" in result["summary"]["note"].lower()
-
-
-def test_list_pixel_parameters_reads_extractors_edge(monkeypatch) -> None:
-    client = FakeDatasetClient(list_pages={"extractors": [{
-        "data": [{"id": "x1", "event_type": "Purchase", "extractor_type": "CSS"}],
-    }]})
-    _use(monkeypatch, client)
-
-    result = asyncio.run(datasets.list_pixel_parameters(
-        pixel_id="px1", current_domain="https://shop.example.com", limit=10,
-    ))
-
-    call = client.list_calls[0]
-    assert (call["parent_id"], call["edge"]) == ("px1", "extractors")
-    assert call["params"] == {"limit": 10, "current_domain": "https://shop.example.com"}
-    assert call["fields"] == datasets.PIXEL_PARAMETER_FIELDS
-    assert result["items"][0]["extractor_type"] == "CSS"
-    assert result["summary"]["complete"] is True
-
-
-def test_list_pixel_parameters_finds_one_by_id(monkeypatch) -> None:
-    client = FakeDatasetClient(list_pages={"extractors": [{"data": [{"id": "x1"}, {"id": "x2"}]}]})
-    _use(monkeypatch, client)
-    result = asyncio.run(datasets.list_pixel_parameters(pixel_id="px1", parameter_id="x2"))
-    assert result["item"] == {"id": "x2"}
-    assert result["summary"]["found"] is True
-
-
-@pytest.mark.parametrize(("tool", "arguments", "message"), [
-    ("list_pixel_event_rules", {"pixel_id": " "}, "pixel_id is required"),
-    ("list_pixel_event_rules", {"pixel_id": "px1", "limit": 0}, "limit"),
-    ("list_pixel_event_rules", {"pixel_id": "px1", "rule_id": "r1", "after": "c"}, "after"),
-    ("list_pixel_parameters", {"pixel_id": ""}, "pixel_id is required"),
-    ("list_pixel_parameters", {"pixel_id": "px1", "limit": -1}, "limit"),
-    ("list_pixel_parameters", {"pixel_id": "px1", "parameter_id": "x", "after": "c"}, "after"),
-])
-def test_rule_and_parameter_reads_validate_before_any_call(monkeypatch, tool, arguments, message) -> None:
-    monkeypatch.setattr(datasets, "get_graph_api_client", _no_client)
-    with pytest.raises(ValidationError, match=message):
-        asyncio.run(getattr(datasets, tool)(**arguments))
-
-
 # --------------------------------------------------------------- registration
 
 
@@ -555,8 +458,6 @@ SIGNAL_TOOLS = {
     "get_dataset_stats",
     "get_dataset_quality",
     "list_custom_conversions",
-    "list_pixel_event_rules",
-    "list_pixel_parameters",
 }
 
 
@@ -568,15 +469,29 @@ def test_dataset_tools_are_read_only_signal_tools() -> None:
     assert not SIGNAL_TOOLS & set(utility.TOOL_GROUPS["writes"])
 
 
-def test_unbuilt_pixel_write_tools_are_not_registered() -> None:
+PIXEL_RULE_AND_PARAMETER_TOOL_NAMES = (
+    "list_pixel_event_rules", "create_pixel_event_rule", "update_pixel_event_rule", "delete_pixel_event_rule",
+    "list_pixel_parameters", "create_pixel_parameter", "update_pixel_parameter", "delete_pixel_parameter",
+)
+
+
+def test_pixel_rule_and_parameter_tools_are_not_registered() -> None:
+    """Meta rejects GET {pixel_id}/event_rules (code 190) and {pixel_id}/extractors (#100) live."""
     from meta_ads_mcp.coordinator import mcp_server
 
     registered = {getattr(component, "name", None) for component in mcp_server.local_provider._components.values()}
-    for name in (
-        "create_pixel_event_rule", "update_pixel_event_rule", "delete_pixel_event_rule",
-        "create_pixel_parameter", "update_pixel_parameter", "delete_pixel_parameter",
-    ):
+    grouped = {name for names in utility.TOOL_GROUPS.values() for name in names}
+    for name in PIXEL_RULE_AND_PARAMETER_TOOL_NAMES:
         assert name not in registered
+        assert name not in grouped
+        assert not hasattr(datasets, name)
+
+
+def test_intent_guide_does_not_mention_pixel_rules_or_extractors() -> None:
+    route = utility.INTENT_GUIDE["inspect_pixels_datasets_or_tracking"]
+    text = json.dumps(route).lower()
+    assert "event rule" not in text
+    assert "extractor" not in text
 
 
 def test_dataset_quality_response_is_json_serializable(monkeypatch) -> None:

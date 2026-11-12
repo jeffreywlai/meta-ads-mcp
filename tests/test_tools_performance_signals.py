@@ -620,7 +620,7 @@ def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
 
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
 
-    call = _calls(client, "get_insights")[0]
+    call = _ad_level_calls(client)[0]
     assert call["object_id"] == "cmp_1"
     assert call["params"]["level"] == "ad"
     assert call["params"]["date_preset"] == "last_30d"
@@ -645,6 +645,107 @@ def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
     types = {finding["type"] for finding in result["findings"]}
     assert types == {"weak_auction_ranking"}
     assert all(finding["evidence"] for finding in result["findings"])
+
+
+def _ad_level_calls(client: RecordingClient) -> list[dict[str, Any]]:
+    return [call for call in _calls(client, "get_insights") if call["params"]["level"] == "ad"]
+
+
+def _many_ads(count: int) -> list[dict[str, Any]]:
+    """Ad rows already in spend-descending order, as Meta returns them with sort=spend_descending."""
+    return [
+        _ad_row(f"ad_{index:04d}", spend=float(5000 - index), purchases=2, quality="AVERAGE",
+                engagement="AVERAGE", conversion="AVERAGE")
+        for index in range(count)
+    ]
+
+
+def _account_ranking_handler(ad_rows: list[dict[str, Any]], *, scope_spend: float, more: bool = True):
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if params["level"] == "ad":
+            payload: dict[str, Any] = {"data": ad_rows[: params["limit"]]}
+            if more:
+                payload["paging"] = {"cursors": {"after": "next"}, "next": "https://graph.example/next"}
+            return payload
+        return {"data": [{
+            "date_start": "2026-10-13", "date_stop": "2026-11-11", "spend": str(scope_spend),
+            "impressions": "5000000", "clicks": "50000",
+            "actions": [{"action_type": "purchase", "value": "5000"}],
+        }]}
+
+    return handler
+
+
+def test_auction_ranking_report_account_level_reads_top_spending_ads_in_one_bounded_call(monkeypatch) -> None:
+    ad_rows = _many_ads(2500)
+    examined_spend = sum(5000 - index for index in range(200))
+    client = _patch(monkeypatch, RecordingClient(
+        insights_handler=_account_ranking_handler(ad_rows, scope_spend=examined_spend * 2),
+    ))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42", top_n=5))
+
+    ad_calls = _ad_level_calls(client)
+    assert len(ad_calls) == 1
+    params = ad_calls[0]["params"]
+    assert ad_calls[0]["object_id"] == "act_42"
+    assert params["sort"] == ["spend_descending"]
+    assert params["limit"] == performance_signals.RANKING_DEFAULT_MAX_ADS == 200
+    assert "after" not in params
+    scope_calls = [call for call in _calls(client, "get_insights") if call["params"]["level"] == "account"]
+    assert len(scope_calls) == 1
+    assert scope_calls[0]["object_id"] == "act_42"
+    assert "spend" in scope_calls[0]["fields"]
+    assert len(client.calls) == 2
+
+    examined = result["examined"]
+    assert examined["ads_examined"] == 200
+    assert examined["selection"] == "highest_spend_first"
+    assert examined["more_ads_exist"] is True
+    assert examined["examined_spend"] == pytest.approx(examined_spend)
+    assert examined["scope_spend"] == pytest.approx(examined_spend * 2)
+    assert examined["share_of_scope_spend"] == pytest.approx(0.5)
+    assert "200 highest-spending ads" in examined["note"]
+    assert "50%" in examined["note"]
+    assert any("200 highest-spending ads" in signal for signal in result["missing_signals"])
+    assert result["ads_analyzed"] == 200
+    assert len(result["ranked_ads"]) == 5
+
+
+def test_auction_ranking_report_max_ads_bounds_the_request(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(
+        insights_handler=_account_ranking_handler(_many_ads(50), scope_spend=1000.0, more=False),
+    ))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42", max_ads=20))
+    assert _ad_level_calls(client)[0]["params"]["limit"] == 20
+    assert result["examined"]["ads_examined"] == 20
+    assert result["examined"]["more_ads_exist"] is False
+
+
+def test_auction_ranking_report_scope_spend_failure_is_reported_not_raised(monkeypatch) -> None:
+    rows = _many_ads(3)
+
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if params["level"] == "ad":
+            return {"data": rows}
+        raise _permission_error()
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
+    assert result["examined"]["share_of_scope_spend"] is None
+    assert result["examined"]["scope_spend"] is None
+    assert result["scope_metrics_basis"] == "examined_ads"
+    assert any("scope" in signal and "Permissions" in signal for signal in result["missing_signals"])
+
+
+def test_auction_ranking_report_flags_rows_not_ordered_by_spend(monkeypatch) -> None:
+    rows = list(reversed(_many_ads(3)))
+    _patch(monkeypatch, RecordingClient(
+        insights_handler=_account_ranking_handler(rows, scope_spend=20000.0, more=True),
+    ))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42"))
+    assert result["examined"]["meta_order_confirmed"] is False
+    assert any("not ordered by spend" in signal for signal in result["missing_signals"])
 
 
 def test_auction_ranking_report_top_n_limits_lists(monkeypatch) -> None:
@@ -673,6 +774,8 @@ def test_auction_ranking_report_no_rows_says_so(monkeypatch) -> None:
         {"level": "campaign", "object_id": "1", "top_n": 0},
         {"level": "campaign", "object_id": "1", "since": "2026-10-01"},
         {"level": "campaign", "object_id": "1", "date_preset": None, "since": "2026-10-05", "until": "2026-10-02"},
+        {"level": "campaign", "object_id": "1", "max_ads": 0},
+        {"level": "campaign", "object_id": "1", "max_ads": 501},
     ],
 )
 def test_auction_ranking_report_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
@@ -791,9 +894,14 @@ def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -
     conversions = volume["OFFSITE_CONVERSIONS"]
     assert conversions["threshold_events_per_week"] == 50
     assert conversions["adsets_meeting_threshold"] == 1 and conversions["adset_count"] == 2
+    assert conversions["adsets_below_threshold"] == 1
     assert conversions["verdict"] == "some_adsets_meet_threshold"
-    weekly = {row["adset_id"]: row["events_per_week"] for row in conversions["adsets"]}
-    assert weekly["as_a"] == pytest.approx(300 / 28 * 7)
+    assert conversions["spend"] == 800.0
+    assert "adsets" not in conversions
+    assert [row["adset_id"] for row in conversions["top_meeting_threshold"]] == ["as_a"]
+    assert [row["adset_id"] for row in conversions["top_below_threshold"]] == ["as_b"]
+    assert conversions["top_meeting_threshold"][0]["events_per_week"] == pytest.approx(300 / 28 * 7)
+    assert conversions["top_meeting_threshold"][0]["spend"] == 600.0
     assert volume["LINK_CLICKS"]["verdict"] == "all_adsets_meet_threshold"
 
     assert result["datasets"]["items"][0]["id"] == "px_1"
@@ -801,6 +909,57 @@ def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -
     assert result["pages"]["items"][0]["name"] == "Shop Page"
     assert result["instagram_accounts"]["complete"] is False
     assert result["section_errors"] == {}
+
+
+def _large_context_rows(count: int) -> list[dict[str, Any]]:
+    goals = [
+        ("OUTCOME_SALES", "OFFSITE_CONVERSIONS", {"purchase": 10}),
+        ("OUTCOME_SALES", "VALUE", {"purchase": 400}),
+        ("OUTCOME_TRAFFIC", "LINK_CLICKS", {"link_click": 900}),
+        ("OUTCOME_LEADS", "LEAD_GENERATION", {"lead": 5}),
+        ("OUTCOME_AWARENESS", "REACH", {}),
+    ]
+    rows = []
+    for index in range(count):
+        objective, goal, actions = goals[index % len(goals)]
+        row = _adset_row(f"as_{index:04d}", objective=objective, goal=goal, spend=100 + index, actions=actions)
+        row["adset_name"] = f"Prospecting broad lookalike ad set number {index} with a long descriptive name"
+        rows.append(row)
+    return rows
+
+
+def test_advertiser_context_summarizes_goal_volume_with_top_spenders(monkeypatch) -> None:
+    client = _context_client()
+    rows = _large_context_rows(300)
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
+
+    volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
+    conversions = volume["OFFSITE_CONVERSIONS"]
+    assert conversions["adset_count"] == 60
+    assert conversions["adsets_meeting_threshold"] == 0
+    assert conversions["adsets_below_threshold"] == 60
+    below = conversions["top_below_threshold"]
+    assert len(below) == performance_signals.GOAL_VOLUME_TOP_ADSETS
+    assert [row["spend"] for row in below] == sorted((row["spend"] for row in below), reverse=True)
+    assert below[0]["adset_id"] == "as_0295"
+    assert volume["LINK_CLICKS"]["adsets_meeting_threshold"] == 60
+    assert volume["REACH"]["verdict"] == "not_assessed"
+    assert len(volume["REACH"]["top_adsets_by_spend"]) <= performance_signals.GOAL_VOLUME_TOP_ADSETS
+
+
+def test_advertiser_context_response_stays_small_for_300_adsets(monkeypatch) -> None:
+    client = _context_client()
+    rows = _large_context_rows(300)
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+
+    assert result["metrics"]["adset_rows"] == 300
+    assert len(json.dumps(result).encode()) < 20_000
 
 
 def test_advertiser_context_section_permission_error_is_reported_not_empty(monkeypatch) -> None:
@@ -886,10 +1045,9 @@ def test_delivery_errors_scans_account_and_reads_problem_fields(monkeypatch) -> 
     scan = _calls(client, "list_objects")[0]
     assert scan["edge"] == "ads"
     assert {"issues_info", "failed_delivery_checks", "ad_review_feedback", "effective_status"} <= set(scan["fields"])
-    assert "DELETED" not in scan["params"]["effective_status"]
-    assert "DISAPPROVED" in scan["params"]["effective_status"]
+    assert scan["params"]["effective_status"] == ["DISAPPROVED", "PENDING_BILLING_INFO", "WITH_ISSUES"]
     spend_calls = _calls(client, "get_insights")
-    assert {call["object_id"] for call in spend_calls} == {"ad_medium", "ad_disapproved", "ad_with_issues", "ad_paused"}
+    assert {call["object_id"] for call in spend_calls} == {"ad_medium", "ad_disapproved", "ad_with_issues"}
     assert all(call["params"]["date_preset"] == "last_7d" and call["fields"] == ["spend"] for call in spend_calls)
 
     problems = {problem["object_id"]: problem for problem in result["problems"]}
@@ -903,15 +1061,19 @@ def test_delivery_errors_scans_account_and_reads_problem_fields(monkeypatch) -> 
     assert medium["spend"] == 50.0
     review = problems["ad_disapproved"]["reasons"][0]
     assert review["source"] == "ad_review_feedback" and review["code"] == "Personal attributes"
-    assert problems["ad_paused"]["reasons"][0]["code"] == "no_active_creative"
+    assert "ad_paused" not in problems
     assert result["scan"]["complete"] is True
     assert result["scan"]["objects_examined"] == 5
+    assert result["scan"]["paused_objects_skipped"] == 1
+    assert result["scan"]["paused_included"] is False
+    assert result["scan"]["active_included"] is False
+    assert any("include_active" in note for note in result["scan"]["not_scanned"])
     assert result["missing_signals"] == []
 
 
 def test_delivery_errors_orders_by_severity_then_spend(monkeypatch) -> None:
     account = {**ACTIVE_ACCOUNT, "account_status": 9}
-    _patch(
+    client = _patch(
         monkeypatch,
         RecordingClient(
             objects={"act_42": account},
@@ -922,7 +1084,9 @@ def test_delivery_errors_orders_by_severity_then_spend(monkeypatch) -> None:
         ),
     )
 
-    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    result = asyncio.run(performance_signals.get_delivery_errors(
+        account_id="act_42", include_paused=True, include_active=True,
+    ))
 
     assert [(problem["object_id"], problem["severity"]) for problem in result["problems"]] == [
         ("act_42", "high"),
@@ -931,8 +1095,11 @@ def test_delivery_errors_orders_by_severity_then_spend(monkeypatch) -> None:
         ("ad_medium", "medium"),
         ("ad_paused", "low"),
     ]
-    assert [finding["severity"] for finding in result["findings"]] == ["high", "high", "high", "medium", "low"]
+    assert result["metrics"]["by_severity"] == {"high": 3, "medium": 1, "low": 1}
     assert result["ordering"] == ["severity", "spend_desc", "object_id"]
+    sent = _calls(client, "list_objects")[0]["params"]["effective_status"]
+    assert {"DISAPPROVED", "WITH_ISSUES", "ACTIVE", "PAUSED", "ADSET_PAUSED", "CAMPAIGN_PAUSED"} <= set(sent)
+    assert result["scan"]["not_scanned"] == []
 
 
 def test_delivery_errors_disabled_account_is_critical_with_reason_label(monkeypatch) -> None:
@@ -986,26 +1153,127 @@ def test_delivery_errors_named_objects_read_each_object(monkeypatch) -> None:
                 "as_1": {"id": "as_1", "name": "Set", "effective_status": "WITH_ISSUES",
                          "issues_info": [{"error_code": 2, "error_summary": "Budget too low"}]},
                 "as_2": {"id": "as_2", "name": "Fine", "effective_status": "ACTIVE"},
+                "as_3": {"id": "as_3", "name": "Paused", "effective_status": "PAUSED",
+                         "issues_info": [{"error_code": 3, "error_summary": "Old warning"}]},
             },
             insights_handler=_spend_handler({"as_1": 12.5}),
         ),
     )
 
     result = asyncio.run(
-        performance_signals.get_delivery_errors(account_id="act_42", level="adset", object_ids="as_1, as_2")
+        performance_signals.get_delivery_errors(account_id="act_42", level="adset", object_ids="as_1, as_2, as_3")
     )
 
     assert _calls(client, "list_objects") == []
     reads = {call["object_id"]: call for call in _calls(client, "get_object")}
-    assert set(reads) == {"act_42", "as_1", "as_2"}
+    assert set(reads) == {"act_42", "as_1", "as_2", "as_3"}
     assert "issues_info" in reads["as_1"]["fields"]
     assert "ad_review_feedback" not in reads["as_1"]["fields"]
     assert [problem["object_id"] for problem in result["problems"]] == ["as_1"]
     assert result["problems"][0]["spend"] == 12.5
     assert result["scan"] == {
-        "mode": "named_objects", "level": "adset", "objects_examined": 2, "complete": True,
+        "mode": "named_objects", "level": "adset", "objects_examined": 3, "complete": True,
         "next_after": None, "stop_reason": None, "pages_fetched": 0, "limit": 500, "effective_status_filter": None,
+        "paused_included": False, "active_included": True, "paused_objects_skipped": 1, "not_scanned": [],
     }
+
+
+def _problem_ad(index: int) -> dict[str, Any]:
+    long_text = "This ad was rejected because it does not follow our Advertising Standards on several points. " * 6
+    return {
+        "id": f"ad_{index:04d}", "name": f"Problem ad {index} with a reasonably long descriptive name",
+        "effective_status": "DISAPPROVED" if index % 2 else "WITH_ISSUES", "status": "ACTIVE",
+        "campaign_id": f"cmp_{index % 7}", "adset_id": f"as_{index % 13}",
+        "issues_info": [{"error_code": 1487000 + index, "error_summary": "Ad not delivering " * 3,
+                         "error_message": long_text, "error_type": "HARD_ERROR", "level": "AD"}],
+        "ad_review_feedback": {"global": {"Misleading claims": long_text, "Personal attributes": long_text}},
+        "failed_delivery_checks": [{"check_name": "creative_check", "summary": "Check failed",
+                                    "description": long_text, "extra_info": None}],
+    }
+
+
+def test_delivery_errors_returns_each_problem_once_and_bounds_inline(monkeypatch) -> None:
+    ads = [_problem_ad(index) for index in range(200)]
+    _patch(
+        monkeypatch,
+        RecordingClient(
+            objects={"act_42": ACTIVE_ACCOUNT},
+            edges={("act_42", "ads"): {"data": ads}},
+            insights_handler=_spend_handler({"ad_0003": 99.0}),
+        ),
+    )
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+
+    assert result["metrics"]["problem_count"] == 200
+    assert result["metrics"]["problems_returned"] == performance_signals.DEFAULT_MAX_PROBLEMS
+    assert result["metrics"]["problems_truncated"] is True
+    assert len(result["problems"]) == performance_signals.DEFAULT_MAX_PROBLEMS
+    assert result["problems"][0]["object_id"] == "ad_0003"
+    serialized_findings = json.dumps(result["findings"])
+    assert all(problem["object_id"] not in serialized_findings for problem in result["problems"][1:])
+    assert len(result["findings"]) == 1
+    assert "200" in result["findings"][0]["summary"]
+    assert any("max_problems" in signal for signal in result["missing_signals"])
+    first = result["problems"][0]
+    assert "status" not in first
+    assert all(len(reason.get("message") or "") <= performance_signals.DELIVERY_TEXT_LIMIT + 3
+               for reason in first["reasons"])
+    assert len(first["reasons"]) <= performance_signals.MAX_REASONS_PER_PROBLEM
+    assert first["reasons_omitted"] == 4 - performance_signals.MAX_REASONS_PER_PROBLEM
+    assert all(value is not None for reason in first["reasons"] for value in reason.values())
+    assert len(json.dumps(result).encode()) < 20_000
+
+
+def test_delivery_errors_nested_review_feedback_is_cut_to_short_text(monkeypatch) -> None:
+    placement = {"facebook_feed": {"Misleading claims": "x" * 500}, "instagram_stream": {"Other": "y" * 500}}
+    _patch(
+        monkeypatch,
+        RecordingClient(
+            objects={
+                "act_42": ACTIVE_ACCOUNT,
+                "ad_1": {"id": "ad_1", "effective_status": "ACTIVE",
+                         "ad_review_feedback": {"placement_specific": placement}},
+            },
+            insights_handler=_spend_handler({}),
+        ),
+    )
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42", object_ids=["ad_1"]))
+    message = result["problems"][0]["reasons"][0]["message"]
+    assert isinstance(message, str)
+    assert message.startswith('{"facebook_feed"')
+    assert len(message) == performance_signals.DELIVERY_TEXT_LIMIT + 3
+
+
+def test_delivery_errors_healthy_account_scan_completes_in_one_page(monkeypatch) -> None:
+    client = _patch(
+        monkeypatch,
+        RecordingClient(
+            objects={"act_42": ACTIVE_ACCOUNT},
+            edges={("act_42", "ads"): {"data": []}},
+            insights_handler=_spend_handler({}),
+        ),
+    )
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    assert len(_calls(client, "list_objects")) == 1
+    assert result["scan"]["complete"] is True
+    assert result["metrics"]["problem_count"] == 0
+    assert result["problems"] == []
+    assert result["findings"][0]["type"] == "no_delivery_problems_found"
+
+
+@pytest.mark.parametrize(
+    ("level", "edge", "expected"),
+    [("campaign", "campaigns", ["WITH_ISSUES"]), ("adset", "adsets", ["WITH_ISSUES"])],
+)
+def test_delivery_errors_problem_state_filter_per_level(monkeypatch, level, edge, expected) -> None:
+    client = _patch(
+        monkeypatch,
+        RecordingClient(objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", edge): {"data": []}},
+                        insights_handler=_spend_handler({})),
+    )
+    asyncio.run(performance_signals.get_delivery_errors(account_id="act_42", level=level))
+    assert _calls(client, "list_objects")[0]["params"]["effective_status"] == expected
 
 
 def test_delivery_errors_permission_error_is_not_swallowed(monkeypatch) -> None:
@@ -1028,6 +1296,8 @@ def test_delivery_errors_permission_error_is_not_swallowed(monkeypatch) -> None:
         {"account_id": "act_1", "limit": 0},
         {"account_id": "act_1", "limit": 2001},
         {"account_id": "act_1", "spend_date_preset": "last_forever"},
+        {"account_id": "act_1", "max_problems": 0},
+        {"account_id": "act_1", "max_problems": 201},
     ],
 )
 def test_delivery_errors_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
