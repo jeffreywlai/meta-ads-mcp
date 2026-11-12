@@ -780,6 +780,12 @@ RANKING_POINTS = {
 BELOW_AVERAGE_POINTS = 2
 COST_RATIO_THRESHOLD = 1.5
 RANKING_REPORT_LEVELS = ("account", "campaign", "adset", "ad")
+# The ad-level read is one bounded page ordered by spend, highest first, using the
+# Insights API's documented sort parameter ("reach_descending" style, one element).
+RANKING_DEFAULT_MAX_ADS = 200
+RANKING_MAX_ADS_LIMIT = 500
+RANKING_SORT = ["spend_descending"]
+RANKING_SCOPE_FIELDS = ["spend", "impressions", "clicks", "actions", "action_values"]
 RANKING_RULES = {
     "ranking_values": {
         "ABOVE_AVERAGE": "above average",
@@ -849,6 +855,20 @@ def _ranking_diagnosis(
     return None, None, below
 
 
+async def _ranking_scope_rows(level: str, object_id: str, window: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Read the scope's own insights total for spend coverage; report failure instead of raising."""
+    params = insights_tools._insights_params(level=level, default_date_preset="last_30d", limit=25, **window)
+    try:
+        payload = await get_graph_api_client().get_insights(object_id, fields=RANKING_SCOPE_FIELDS, params=params)
+    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+        return None, str(_public_error(exc).get("message"))
+    return insights_tools._normalize_rows(payload), None
+
+
+def _row_spend(row: dict[str, Any]) -> float:
+    return to_float((row.get("metrics") or {}).get("spend")) or 0.0
+
+
 @mcp_server.tool()
 async def get_auction_ranking_report(
     level: str,
@@ -857,23 +877,75 @@ async def get_auction_ranking_report(
     since: str | None = None,
     until: str | None = None,
     top_n: int = 10,
+    max_ads: int = RANKING_DEFAULT_MAX_ADS,
 ) -> dict[str, Any]:
-    """Rank the ads under an account, campaign, ad set (or one ad) by Meta's quality, engagement-rate and conversion-rate rankings with spend and results, and say for each weak ad whether the evidence points at creative quality, the post-click path, or bid and budget. Rankings compare ads competing for the same audience."""
+    """Rank the ads under an account, campaign, ad set (or one ad) by Meta's quality, engagement-rate and conversion-rate rankings with spend and results, and say for each weak ad whether the evidence points at creative quality, the post-click path, or bid and budget. Reads only the max_ads highest-spending ads (default 200, at most 500) and reports what share of the scope's spend they cover. Rankings compare ads competing for the same audience."""
     resolved_level = _require_level(level, RANKING_REPORT_LEVELS)
     resolved_object_id = _require_object_id(resolved_level, object_id)
     if top_n < 1:
         raise ValidationError("top_n must be at least 1.")
+    if not 1 <= max_ads <= RANKING_MAX_ADS_LIMIT:
+        raise ValidationError(f"max_ads must be between 1 and {RANKING_MAX_ADS_LIMIT}.")
     window = diagnostics_tools._window_kwargs(
         date_preset=date_preset, since=since, until=until, default_date_preset="last_30d",
     )
-    rows = await diagnostics_tools._child_insights(
-        resolved_object_id,
-        level="ad",
-        fields=diagnostics_tools.AD_QUALITY_FIELDS,
-        **window,
+    ad_params = insights_tools._insights_params(
+        level="ad", default_date_preset="last_30d", limit=max_ads, **window,
     )
+    ad_params["sort"] = list(RANKING_SORT)
+
+    async def read_ads() -> dict[str, Any]:
+        return await get_graph_api_client().get_insights(
+            resolved_object_id, fields=diagnostics_tools.AD_QUALITY_FIELDS, params=ad_params,
+        )
+
+    async def read_scope() -> tuple[list[dict[str, Any]] | None, str | None]:
+        if resolved_level == "ad":
+            return None, None
+        return await _ranking_scope_rows(resolved_level, resolved_object_id, window)
+
+    ad_payload, (scope_rows, scope_error) = await asyncio.gather(read_ads(), read_scope())
+    rows = insights_tools._normalize_rows(ad_payload)[:max_ads]
+    more_ads_exist = bool(extract_paging(ad_payload).get("next"))
+    spends = [_row_spend(row) for row in rows]
+    order_confirmed = all(earlier >= later for earlier, later in zip(spends, spends[1:]))
+
+    missing_signals: list[str] = []
+    examined_spend = sum(spends)
+    if resolved_level == "ad":
+        scope_spend: float | None = examined_spend
+    elif scope_rows is None:
+        scope_spend = None
+        missing_signals.append(
+            f"The scope's total spend could not be read, so the share of spend covered is unknown ({scope_error})."
+        )
+    else:
+        scope_spend = sum(_row_spend(row) for row in scope_rows)
+    share = _ratio(examined_spend, scope_spend)
+    if share is not None:
+        share = min(share, 1.0)
+    if more_ads_exist:
+        coverage = f"; they cover {share:.0%} of the scope's spend" if share is not None else ""
+        note = (
+            f"Examined the {len(rows)} highest-spending ads in the window{coverage}. "
+            "More ads exist; lower-spending ads were not ranked. Raise max_ads to examine more."
+        )
+        missing_signals.append(note)
+    else:
+        note = f"Examined all {len(rows)} ads with insights in the window, highest spend first."
+    if not order_confirmed:
+        missing_signals.append(
+            "Meta returned the ad rows not ordered by spend, so the examined ads may not be the highest-spending ones."
+        )
+
     known = _known_inputs(rows)
-    scope_metrics = _derived_metrics(_period_inputs(rows, known))
+    if scope_rows:
+        scope_known = _known_inputs(scope_rows)
+        scope_metrics = _derived_metrics(_period_inputs(scope_rows, scope_known))
+        scope_metrics_basis = "scope_total"
+    else:
+        scope_metrics = _derived_metrics(_period_inputs(rows, known))
+        scope_metrics_basis = "examined_ads"
     ads: list[dict[str, Any]] = []
     for row in rows:
         metrics = _derived_metrics(_period_inputs([row], known))
@@ -964,11 +1036,25 @@ async def get_auction_ranking_report(
         scope={"level": resolved_level, "object_id": resolved_object_id},
         metrics=scope_metrics,
         findings=findings,
+        missing_signals=missing_signals,
         extra={
             "analyzed_level": "ad",
             "window": diagnostics_tools._window_descriptor(date_preset, since, until, default_date_preset="last_30d"),
             "ads_analyzed": len(ads),
+            "examined": {
+                "ads_examined": len(rows),
+                "max_ads": max_ads,
+                "selection": "highest_spend_first",
+                "request_sort": list(RANKING_SORT),
+                "meta_order_confirmed": order_confirmed,
+                "more_ads_exist": more_ads_exist,
+                "examined_spend": examined_spend,
+                "scope_spend": scope_spend,
+                "share_of_scope_spend": share,
+                "note": note,
+            },
             "scope_metrics": scope_metrics,
+            "scope_metrics_basis": scope_metrics_basis,
             "ranked_ads": ranked[:top_n],
             "weak_ads": weak[:top_n],
             "weak_ad_count": len(weak),

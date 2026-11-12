@@ -620,7 +620,7 @@ def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
 
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
 
-    call = _calls(client, "get_insights")[0]
+    call = _ad_level_calls(client)[0]
     assert call["object_id"] == "cmp_1"
     assert call["params"]["level"] == "ad"
     assert call["params"]["date_preset"] == "last_30d"
@@ -645,6 +645,107 @@ def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
     types = {finding["type"] for finding in result["findings"]}
     assert types == {"weak_auction_ranking"}
     assert all(finding["evidence"] for finding in result["findings"])
+
+
+def _ad_level_calls(client: RecordingClient) -> list[dict[str, Any]]:
+    return [call for call in _calls(client, "get_insights") if call["params"]["level"] == "ad"]
+
+
+def _many_ads(count: int) -> list[dict[str, Any]]:
+    """Ad rows already in spend-descending order, as Meta returns them with sort=spend_descending."""
+    return [
+        _ad_row(f"ad_{index:04d}", spend=float(5000 - index), purchases=2, quality="AVERAGE",
+                engagement="AVERAGE", conversion="AVERAGE")
+        for index in range(count)
+    ]
+
+
+def _account_ranking_handler(ad_rows: list[dict[str, Any]], *, scope_spend: float, more: bool = True):
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if params["level"] == "ad":
+            payload: dict[str, Any] = {"data": ad_rows[: params["limit"]]}
+            if more:
+                payload["paging"] = {"cursors": {"after": "next"}, "next": "https://graph.example/next"}
+            return payload
+        return {"data": [{
+            "date_start": "2026-10-13", "date_stop": "2026-11-11", "spend": str(scope_spend),
+            "impressions": "5000000", "clicks": "50000",
+            "actions": [{"action_type": "purchase", "value": "5000"}],
+        }]}
+
+    return handler
+
+
+def test_auction_ranking_report_account_level_reads_top_spending_ads_in_one_bounded_call(monkeypatch) -> None:
+    ad_rows = _many_ads(2500)
+    examined_spend = sum(5000 - index for index in range(200))
+    client = _patch(monkeypatch, RecordingClient(
+        insights_handler=_account_ranking_handler(ad_rows, scope_spend=examined_spend * 2),
+    ))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42", top_n=5))
+
+    ad_calls = _ad_level_calls(client)
+    assert len(ad_calls) == 1
+    params = ad_calls[0]["params"]
+    assert ad_calls[0]["object_id"] == "act_42"
+    assert params["sort"] == ["spend_descending"]
+    assert params["limit"] == performance_signals.RANKING_DEFAULT_MAX_ADS == 200
+    assert "after" not in params
+    scope_calls = [call for call in _calls(client, "get_insights") if call["params"]["level"] == "account"]
+    assert len(scope_calls) == 1
+    assert scope_calls[0]["object_id"] == "act_42"
+    assert "spend" in scope_calls[0]["fields"]
+    assert len(client.calls) == 2
+
+    examined = result["examined"]
+    assert examined["ads_examined"] == 200
+    assert examined["selection"] == "highest_spend_first"
+    assert examined["more_ads_exist"] is True
+    assert examined["examined_spend"] == pytest.approx(examined_spend)
+    assert examined["scope_spend"] == pytest.approx(examined_spend * 2)
+    assert examined["share_of_scope_spend"] == pytest.approx(0.5)
+    assert "200 highest-spending ads" in examined["note"]
+    assert "50%" in examined["note"]
+    assert any("200 highest-spending ads" in signal for signal in result["missing_signals"])
+    assert result["ads_analyzed"] == 200
+    assert len(result["ranked_ads"]) == 5
+
+
+def test_auction_ranking_report_max_ads_bounds_the_request(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(
+        insights_handler=_account_ranking_handler(_many_ads(50), scope_spend=1000.0, more=False),
+    ))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42", max_ads=20))
+    assert _ad_level_calls(client)[0]["params"]["limit"] == 20
+    assert result["examined"]["ads_examined"] == 20
+    assert result["examined"]["more_ads_exist"] is False
+
+
+def test_auction_ranking_report_scope_spend_failure_is_reported_not_raised(monkeypatch) -> None:
+    rows = _many_ads(3)
+
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if params["level"] == "ad":
+            return {"data": rows}
+        raise _permission_error()
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
+    assert result["examined"]["share_of_scope_spend"] is None
+    assert result["examined"]["scope_spend"] is None
+    assert result["scope_metrics_basis"] == "examined_ads"
+    assert any("scope" in signal and "Permissions" in signal for signal in result["missing_signals"])
+
+
+def test_auction_ranking_report_flags_rows_not_ordered_by_spend(monkeypatch) -> None:
+    rows = list(reversed(_many_ads(3)))
+    _patch(monkeypatch, RecordingClient(
+        insights_handler=_account_ranking_handler(rows, scope_spend=20000.0, more=True),
+    ))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42"))
+    assert result["examined"]["meta_order_confirmed"] is False
+    assert any("not ordered by spend" in signal for signal in result["missing_signals"])
 
 
 def test_auction_ranking_report_top_n_limits_lists(monkeypatch) -> None:
@@ -673,6 +774,8 @@ def test_auction_ranking_report_no_rows_says_so(monkeypatch) -> None:
         {"level": "campaign", "object_id": "1", "top_n": 0},
         {"level": "campaign", "object_id": "1", "since": "2026-10-01"},
         {"level": "campaign", "object_id": "1", "date_preset": None, "since": "2026-10-05", "until": "2026-10-02"},
+        {"level": "campaign", "object_id": "1", "max_ads": 0},
+        {"level": "campaign", "object_id": "1", "max_ads": 501},
     ],
 )
 def test_auction_ranking_report_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
