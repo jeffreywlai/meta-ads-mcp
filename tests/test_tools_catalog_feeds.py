@@ -778,6 +778,87 @@ def test_event_source_health_skips_checks_for_unconfirmed_source_types(monkeypat
     assert any("ds_1" in signal and "da_checks" in signal for signal in result["missing_signals"])
 
 
+@pytest.mark.parametrize("result_value", ["unavailable", None, "skipped"])
+def test_event_source_health_unevaluated_check_is_a_missing_signal_not_a_pass(monkeypatch, result_value) -> None:
+    check = {"key": "pixel_missing_dpa_event", "result": result_value}
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 100, 0)]},
+        ("px_1", "da_checks"): {"data": [check]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    pixel = result["sources"][0]
+    assert pixel["failed_checks"] == []
+    assert pixel["unevaluated_checks"] == [check]
+    assert any(
+        "pixel_missing_dpa_event" in signal and "px_1" in signal and "could not be evaluated" in signal
+        for signal in result["missing_signals"]
+    )
+
+
+def test_event_source_health_empty_or_paged_checks_are_missing_signals(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [
+            {"id": "px_1", "source_type": "PIXEL"}, {"id": "px_2", "source_type": "PIXEL"},
+        ]},
+        ("cat_1", "event_stats"): {"data": [
+            _stat("2026-11-01", "px_1", "ViewContent", 100, 0),
+            _stat("2026-11-01", "px_2", "ViewContent", 100, 0),
+        ]},
+        ("px_1", "da_checks"): {"data": []},
+        ("px_2", "da_checks"): {
+            "data": [{"key": "pixel_missing_dpa_event", "result": "passed"}],
+            "paging": {"next": "https://next", "cursors": {"after": "c2"}},
+        },
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert "Meta returned no Dynamic Ads checks for source px_1." in result["missing_signals"]
+    assert "da_checks for source px_2 had more pages than were read." in result["missing_signals"]
+
+
+@pytest.mark.parametrize("omitted", ["total_matched_content_ids", "total_unmatched_content_ids"])
+def test_event_source_health_omitted_counter_is_unknown_not_zero(monkeypatch, omitted) -> None:
+    complete_row = _stat("2026-11-01", "px_1", "ViewContent", 100, 0)
+    partial_row = _stat("2026-11-02", "px_1", "ViewContent", 50, 50)
+    del partial_row[omitted]
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): {"data": [complete_row, partial_row]},
+        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    pixel = result["sources"][0]
+    assert pixel["window_match_rate"] is None
+    if omitted == "total_matched_content_ids":
+        unknown, known, known_total = "matched_content_ids", "unmatched_content_ids", 50
+    else:
+        unknown, known, known_total = "unmatched_content_ids", "matched_content_ids", 150
+    assert pixel[unknown] is None
+    assert pixel[known] == known_total
+    history = {day["date"]: day for day in pixel["match_rate_history"]}
+    assert history["2026-11-01"]["match_rate"] == 1.0
+    assert history["2026-11-02"]["match_rate"] is None
+    assert history["2026-11-02"][unknown] is None
+    assert pixel["by_event"]["ViewContent"]["match_rate"] is None
+    assert any("lacked a matched or unmatched counter" in signal for signal in result["missing_signals"])
+    assert "low_match_rate" not in [finding["type"] for finding in result["findings"]]
+
+
+def test_recommendations_omitted_counter_makes_totals_unknown(monkeypatch) -> None:
+    row = _stat("2026-11-01", "px_1", "ViewContent", 100, 0)
+    del row["total_unmatched_content_ids"]
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): {"data": [row]},
+        ("biz_1", "adspixels"): {"data": []},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    assert result["metrics"]["matched_content_ids_28d"] == 100
+    assert result["metrics"]["unmatched_content_ids_28d"] is None
+    assert result["metrics"]["match_rate_28d"] is None
+    assert any("lacked a matched or unmatched counter" in signal for signal in result["missing_signals"])
+
+
 def test_event_source_health_permission_error_is_not_swallowed(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(
         edges={("cat_1", "external_event_sources"): SOURCES},

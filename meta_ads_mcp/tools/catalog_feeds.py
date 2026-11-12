@@ -129,6 +129,7 @@ LETTER_CASE_TYPES = ("to_upper", "to_lower", "capitalize_all", "capitalize_first
 VALUE_MAPPING_MAX_PAIRS = 10
 VALUE_MAPPING_MAX_LENGTH = 20
 DA_CHECK_SOURCE_TYPES = ("PIXEL", "APP")
+DA_CHECK_EVALUATED_RESULTS = ("passed", "failed")
 
 MAX_CATALOGS_SCANNED = 50
 CATALOG_SCAN_PAGE_SIZE = 25
@@ -392,13 +393,53 @@ async def _connected_sources(
     )
 
 
-def _match_rate(matched: int, unmatched: int) -> float | None:
+def _match_rate(matched: int | None, unmatched: int | None) -> float | None:
+    """Matched share of content ids; None unless both counters are known."""
+    if matched is None or unmatched is None:
+        return None
     total = matched + unmatched
     return round(matched / total, 4) if total else None
 
 
+def _add_counts(totals: list[int], matched: int | None, unmatched: int | None) -> None:
+    """Add one row's counters; [matched, unmatched, rows missing matched, rows missing unmatched]."""
+    if matched is None:
+        totals[2] += 1
+    else:
+        totals[0] += matched
+    if unmatched is None:
+        totals[3] += 1
+    else:
+        totals[1] += unmatched
+
+
+def _counts_view(totals: list[int]) -> dict[str, Any]:
+    """A total is unknown (None) when any row behind it lacked that counter."""
+    matched = None if totals[2] else totals[0]
+    unmatched = None if totals[3] else totals[1]
+    return {
+        "matched_content_ids": matched,
+        "unmatched_content_ids": unmatched,
+        "match_rate": _match_rate(matched, unmatched),
+    }
+
+
+def _known_sum(values: Any) -> int | None:
+    """Sum counters; None when any of them is unknown."""
+    total = 0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], int]:
-    """Group event_stats rows per source: daily match history and per-event totals."""
+    """Group event_stats rows per source: daily match history and per-event totals.
+
+    A counter Meta omitted is unknown, not zero: any total it feeds is None, and
+    match rates are computed only when both counters are known.
+    """
     per_source: dict[str, dict[str, Any]] = {}
     unattributed = 0
     for row in rows:
@@ -406,40 +447,32 @@ def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[s
         if source_id is None:
             unattributed += 1
             continue
-        matched = to_int(row.get("total_matched_content_ids")) or 0
-        unmatched = to_int(row.get("total_unmatched_content_ids")) or 0
-        bucket = per_source.setdefault(source_id, {"days": {}, "events": {}, "matched": 0, "unmatched": 0})
+        matched = to_int(row.get("total_matched_content_ids"))
+        unmatched = to_int(row.get("total_unmatched_content_ids"))
+        bucket = per_source.setdefault(
+            source_id, {"days": {}, "events": {}, "window": [0, 0, 0, 0], "rows_missing_counters": 0},
+        )
+        if matched is None or unmatched is None:
+            bucket["rows_missing_counters"] += 1
         day = str(row.get("date_start") or row.get("date_stop") or "unknown")
-        day_totals = bucket["days"].setdefault(day, [0, 0])
-        day_totals[0] += matched
-        day_totals[1] += unmatched
+        _add_counts(bucket["days"].setdefault(day, [0, 0, 0, 0]), matched, unmatched)
         event = str(row.get("event") or "unknown")
-        event_totals = bucket["events"].setdefault(event, [0, 0])
-        event_totals[0] += matched
-        event_totals[1] += unmatched
-        bucket["matched"] += matched
-        bucket["unmatched"] += unmatched
+        _add_counts(bucket["events"].setdefault(event, [0, 0, 0, 0]), matched, unmatched)
+        _add_counts(bucket["window"], matched, unmatched)
     summaries: dict[str, dict[str, Any]] = {}
     for source_id, bucket in per_source.items():
+        window = _counts_view(bucket["window"])
         summaries[source_id] = {
-            "matched_content_ids": bucket["matched"],
-            "unmatched_content_ids": bucket["unmatched"],
-            "window_match_rate": _match_rate(bucket["matched"], bucket["unmatched"]),
+            "matched_content_ids": window["matched_content_ids"],
+            "unmatched_content_ids": window["unmatched_content_ids"],
+            "window_match_rate": window["match_rate"],
+            "rows_missing_counters": bucket["rows_missing_counters"],
             "match_rate_history": [
-                {
-                    "date": day,
-                    "matched_content_ids": totals[0],
-                    "unmatched_content_ids": totals[1],
-                    "match_rate": _match_rate(*totals),
-                }
+                {"date": day, **_counts_view(totals)}
                 for day, totals in sorted(bucket["days"].items())
             ],
             "by_event": {
-                event: {
-                    "matched_content_ids": totals[0],
-                    "unmatched_content_ids": totals[1],
-                    "match_rate": _match_rate(*totals),
-                }
+                event: _counts_view(totals)
                 for event, totals in sorted(bucket["events"].items())
             },
         }
@@ -812,6 +845,7 @@ async def get_catalog_event_source_health(
             "by_event": stats["by_event"] if stats else {},
             "checks": [],
             "failed_checks": [],
+            "unevaluated_checks": [],
         }
         if stats is None:
             missing.append(
@@ -845,12 +879,32 @@ async def get_catalog_event_source_health(
                 affected_entities=[{"event_source_id": source_id}],
                 next_actions=["Make the content_ids the source sends equal the catalog's retailer ids."],
             ))
+        if stats is not None and stats["rows_missing_counters"]:
+            missing.append(
+                f"{stats['rows_missing_counters']} event_stats rows for source {source_id} lacked a "
+                "matched or unmatched counter; totals and match rates those rows feed are unknown (null)."
+            )
         if source_type in DA_CHECK_SOURCE_TYPES:
             checks_payload = await client.list_objects(source_id, "da_checks", fields=DA_CHECK_FIELDS)
-            checks = normalize_collection(checks_payload)["items"]
+            checks_page = normalize_collection(checks_payload)
+            checks = checks_page["items"]
             failed = [check for check in checks if str(check.get("result") or "").lower() == "failed"]
+            unevaluated = [
+                check for check in checks
+                if str(check.get("result") or "").lower() not in DA_CHECK_EVALUATED_RESULTS
+            ]
             report["checks"] = checks
             report["failed_checks"] = failed
+            report["unevaluated_checks"] = unevaluated
+            for check in unevaluated:
+                missing.append(
+                    f"Meta's check {check.get('key')} for source {source_id} returned result "
+                    f"{check.get('result')!r}, so it was neither passed nor failed and could not be evaluated."
+                )
+            if not checks:
+                missing.append(f"Meta returned no Dynamic Ads checks for source {source_id}.")
+            if checks_page["paging"].get("next"):
+                missing.append(f"da_checks for source {source_id} had more pages than were read.")
             for check in failed:
                 findings.append(build_finding(
                     "failed_dynamic_ads_check",
@@ -923,11 +977,17 @@ async def get_catalog_event_source_recommendations(
             )
     inputs = await _catalog_signal_inputs(client, catalog_id)
     connected_ids = {_object_id(source.get("id")) for source in inputs["sources"]}
-    matched = sum(stat["matched_content_ids"] for stat in inputs["stats"].values())
-    unmatched = sum(stat["unmatched_content_ids"] for stat in inputs["stats"].values())
-    overall_rate = _match_rate(matched, unmatched)
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
+    matched = _known_sum(stat["matched_content_ids"] for stat in inputs["stats"].values())
+    unmatched = _known_sum(stat["unmatched_content_ids"] for stat in inputs["stats"].values())
+    overall_rate = _match_rate(matched, unmatched)
+    rows_missing_counters = sum(stat["rows_missing_counters"] for stat in inputs["stats"].values())
+    if rows_missing_counters:
+        missing.append(
+            f"{rows_missing_counters} event_stats rows lacked a matched or unmatched counter; "
+            "the 28-day totals and match rate they feed are unknown (null)."
+        )
     coverage_evidence = {
         "connected_sources": len(inputs["sources"]),
         "matched_content_ids_28d": matched,
