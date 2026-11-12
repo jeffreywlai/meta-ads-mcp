@@ -1627,6 +1627,8 @@ PAUSED_EFFECTIVE_STATUSES = {"PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"}
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 MAX_DELIVERY_SCAN = 2000
 MAX_DELIVERY_PAGE = 100
+# Pages are capped separately from records, so pages that return no records cannot keep the scan going.
+MAX_DELIVERY_PAGES = 25
 MAX_NAMED_OBJECTS = 50
 DEFAULT_MAX_PROBLEMS = 15
 MAX_PROBLEMS_LIMIT = 200
@@ -1812,6 +1814,7 @@ async def get_delivery_errors(
         complete = False
         next_after: str | None = None
         stop_reason: str | None = None
+        seen_cursors: set[str] = {cursor} if cursor else set()
         while True:
             params: dict[str, Any] = {
                 "limit": min(MAX_DELIVERY_PAGE, limit - len(scanned)),
@@ -1830,13 +1833,18 @@ async def get_delivery_errors(
                 complete = True
                 break
             following = paging.get("after")
-            if not following or following == cursor:
+            if not following or following in seen_cursors:
                 stop_reason = "pagination_cursor_missing_or_repeated"
                 break
             if len(scanned) >= limit:
                 stop_reason = "limit_reached"
                 next_after = following
                 break
+            if pages >= MAX_DELIVERY_PAGES:
+                stop_reason = "page_cap_reached"
+                next_after = following
+                break
+            seen_cursors.add(following)
             cursor = following
         scan = {"mode": "account_scan", "level": resolved_level, "objects_examined": len(scanned),
                 "complete": complete, "next_after": next_after, "stop_reason": stop_reason,
@@ -1917,11 +1925,12 @@ async def get_delivery_errors(
     if not scan["complete"]:
         detail = (
             f"pass after={scan['next_after']!r} to continue" if scan["next_after"]
-            else "Meta's pagination cursor was missing or repeated"
+            else "Meta's pagination cursor was missing or repeated an earlier one, so the scan cannot continue"
         )
+        cap = f" after the {MAX_DELIVERY_PAGES}-page cap" if scan["stop_reason"] == "page_cap_reached" else ""
         missing_signals.append(
-            f"Scan incomplete: examined {scan['objects_examined']} {resolved_level}(s) and more exist; {detail}. "
-            "Problems on objects not yet examined are not listed."
+            f"Scan incomplete: examined {scan['objects_examined']} {resolved_level}(s) in {scan['pages_fetched']} "
+            f"page(s){cap} and more may exist; {detail}. Problems on objects not yet examined are not listed."
         )
     if len(problems) > max_problems:
         missing_signals.append(

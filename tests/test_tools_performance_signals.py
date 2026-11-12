@@ -1391,6 +1391,39 @@ def test_delivery_errors_reports_incomplete_scan(monkeypatch) -> None:
     assert any("incomplete" in signal and "4" in signal for signal in result["missing_signals"])
 
 
+def test_delivery_errors_empty_cursor_cycle_stops_as_incomplete(monkeypatch) -> None:
+    def cycle(params: dict[str, Any]) -> dict[str, Any]:
+        following = "B" if params.get("after") == "A" else "A"
+        return {"data": [], "paging": {"cursors": {"after": following}, "next": "https://graph.example/next"}}
+
+    client = _patch(monkeypatch, RecordingClient(objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): cycle}))
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42", limit=1))
+
+    assert len(_calls(client, "list_objects")) == 3
+    assert result["scan"]["complete"] is False
+    assert result["scan"]["stop_reason"] == "pagination_cursor_missing_or_repeated"
+    assert result["scan"]["next_after"] is None
+    assert any("incomplete" in signal for signal in result["missing_signals"])
+
+
+def test_delivery_errors_endless_empty_pages_stop_at_the_page_cap(monkeypatch) -> None:
+    def endless(params: dict[str, Any]) -> dict[str, Any]:
+        page = int(params.get("after", "0"))
+        return {"data": [], "paging": {"cursors": {"after": str(page + 1)}, "next": "https://graph.example/next"}}
+
+    client = _patch(monkeypatch, RecordingClient(objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): endless}))
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42", limit=5))
+
+    pages = len(_calls(client, "list_objects"))
+    assert pages == performance_signals.MAX_DELIVERY_PAGES
+    assert result["scan"]["complete"] is False
+    assert result["scan"]["stop_reason"] == "page_cap_reached"
+    assert result["scan"]["next_after"] == str(pages)
+    assert any("pass after=" in signal for signal in result["missing_signals"])
+
+
 def test_delivery_errors_named_objects_read_each_object(monkeypatch) -> None:
     client = _patch(
         monkeypatch,
