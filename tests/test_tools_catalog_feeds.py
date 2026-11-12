@@ -900,6 +900,7 @@ def test_recommendations_rank_unconnected_pixels_with_evidence(monkeypatch) -> N
     recommendations = result["recommendations"]
     assert [item["event_source_id"] for item in recommendations] == ["px_2", "px_3"]
     assert recommendations[0]["strength"] == "strong"
+    assert recommendations[0]["connection_status"] == "not_connected"
     assert recommendations[0]["evidence"]
     assert recommendations[0]["next_step"]["tool"] == "connect_catalog_event_source"
     assert recommendations[1]["strength"] == "weak"
@@ -907,6 +908,76 @@ def test_recommendations_rank_unconnected_pixels_with_evidence(monkeypatch) -> N
     assert "weak_catalog_signal_coverage" in finding_types
     assert result["signals_used"]
     assert "derived" in result["method"].lower()
+
+
+def _endless(rows):
+    """An edge that always reports another page, so a capped scan cannot finish."""
+    def page(params):
+        return {"data": rows, "paging": {"next": "https://next", "cursors": {"after": "again"}}}
+    return page
+
+
+def test_recommendations_report_partial_stats_and_draw_no_coverage_conclusion(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): _endless([_stat("2026-11-01", "px_1", "ViewContent", 0, 1)]),
+        ("biz_1", "adspixels"): {"data": []},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    metrics = result["metrics"]
+    assert metrics["stats_complete"] is False
+    assert metrics["sources_complete"] is True
+    assert metrics["matched_content_ids_28d"] is None
+    assert metrics["unmatched_content_ids_28d"] is None
+    assert metrics["match_rate_28d"] is None
+    assert metrics["partial_counts_from_pages_read"] == {
+        "event_stat_rows": 10, "matched_content_ids": 0, "unmatched_content_ids": 10,
+    }
+    assert result["findings"] == []
+    assert any("event_stats was only partly read" in signal and "10 pages" in signal for signal in result["missing_signals"])
+    assert any("could not be determined" in signal for signal in result["missing_signals"])
+
+
+def test_recommendations_partial_source_list_draws_no_unconnected_conclusion(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [], "paging": {"next": "https://graph.invalid/next"}},
+        ("cat_1", "event_stats"): {"data": []},
+        ("biz_1", "adspixels"): {"data": [{"id": "px_2", "name": "Maybe connected"}]},
+        ("px_2", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    assert result["metrics"]["sources_complete"] is False
+    assert "no_connected_event_sources" not in [finding["type"] for finding in result["findings"]]
+    assert any("whether any source is connected could not be determined" in s for s in result["missing_signals"])
+    assert any("no cursor" in signal for signal in result["missing_signals"])
+    assert any("may already be connected" in signal for signal in result["missing_signals"])
+    [recommendation] = result["recommendations"]
+    assert recommendation["connection_status"] == "unknown"
+
+
+def test_event_source_health_partial_scans_draw_no_absence_conclusions(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "ds_1", "source_type": "OFFLINE"}]},
+        ("cat_1", "event_stats"): _endless([_stat("2026-11-01", "px_9", "ViewContent", 1, 99)]),
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert result["metrics"]["stats_complete"] is False
+    finding_types = [finding["type"] for finding in result["findings"]]
+    assert "no_event_stats" not in finding_types
+    assert "low_match_rate" not in finding_types
+    assert any("ds_1" in signal and "unknown" in signal for signal in result["missing_signals"])
+    assert any("only partly read" in signal for signal in result["missing_signals"])
+
+
+def test_event_source_health_partial_empty_source_list_is_not_no_sources(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): _endless([]),
+        ("cat_1", "event_stats"): {"data": []},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert result["metrics"]["sources_complete"] is False
+    assert result["findings"] == []
+    assert any("could not be determined" in signal for signal in result["missing_signals"])
 
 
 def test_recommendations_without_business_reads_catalog_business(monkeypatch) -> None:

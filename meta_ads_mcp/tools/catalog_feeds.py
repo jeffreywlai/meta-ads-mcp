@@ -489,12 +489,29 @@ def _sorted_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def _catalog_signal_inputs(client: Any, catalog_id: str) -> dict[str, Any]:
-    """Read connected sources and 28-day event stats for one product catalog."""
-    sources, sources_complete = await _connected_sources(client, catalog_id)
+    """Read connected sources and 28-day event stats for one product catalog.
+
+    Each incomplete read adds a plain-language entry to scan_gaps, for missing_signals.
+    """
+    source_reasons: list[str] = []
+    sources, sources_complete = await _connected_sources(client, catalog_id, source_reasons)
+    stat_reasons: list[str] = []
     stat_rows, stats_complete = await _collect_edge(
         client, catalog_id, "event_stats", fields=EVENT_STAT_FIELDS, page_size=500,
+        stop_reasons=stat_reasons,
     )
     stats, unattributed = _summarize_event_stats(stat_rows)
+    scan_gaps: list[str] = []
+    if not sources_complete:
+        scan_gaps.append(
+            "The connected-source list is partial: "
+            f"{' '.join(source_reasons) or 'external_event_sources had more pages than were read.'}"
+        )
+    if not stats_complete:
+        scan_gaps.append(
+            f"event_stats was only partly read ({len(stat_rows)} rows), so 28-day counts and match "
+            f"rates are partial: {' '.join(stat_reasons) or 'more pages exist.'}"
+        )
     return {
         "sources": sources,
         "sources_complete": sources_complete,
@@ -502,6 +519,7 @@ async def _catalog_signal_inputs(client: Any, catalog_id: str) -> dict[str, Any]
         "stats_complete": stats_complete,
         "stats": stats,
         "unattributed_rows": unattributed,
+        "scan_gaps": scan_gaps,
     }
 
 
@@ -847,7 +865,12 @@ async def get_catalog_event_source_health(
             "failed_checks": [],
             "unevaluated_checks": [],
         }
-        if stats is None:
+        if stats is None and not inputs["stats_complete"]:
+            missing.append(
+                f"No event_stats rows for source {source_id} were among the pages read; event_stats "
+                "has more pages, so whether it sent catalog events in the 28-day window is unknown."
+            )
+        elif stats is None:
             missing.append(
                 f"No event_stats rows for source {source_id} in Meta's 28-day window, so no "
                 "match-rate history is available for it."
@@ -861,7 +884,8 @@ async def get_catalog_event_source_health(
                 next_actions=["Confirm the pixel or app fires ViewContent, AddToCart and Purchase with content_ids."],
             ))
         elif (
-            stats["window_match_rate"] is not None
+            inputs["stats_complete"]
+            and stats["window_match_rate"] is not None
             and stats["window_match_rate"] < match_rate_threshold
         ):
             findings.append(build_finding(
@@ -921,7 +945,7 @@ async def get_catalog_event_source_health(
                 f"{source.get('source_type')!r} is not one documented for da_checks (pixel or app)."
             )
         reports.append(report)
-    if not inputs["sources"]:
+    if not inputs["sources"] and inputs["sources_complete"]:
         findings.append(build_finding(
             "no_connected_event_sources",
             "No pixel or app is connected to this catalog, so catalog ads get no event signal from it.",
@@ -929,17 +953,23 @@ async def get_catalog_event_source_health(
             confidence=0.9,
             next_actions=["Use get_catalog_event_source_recommendations, then connect_catalog_event_source."],
         ))
+    elif not inputs["sources"]:
+        missing.append(
+            "No connected sources were among the pages read, but the list is partial; whether any "
+            "source is connected could not be determined."
+        )
+    missing.extend(inputs["scan_gaps"])
     if not inputs["stats_complete"]:
-        missing.append("event_stats had more pages than were read; history may be partial.")
-    if not inputs["sources_complete"]:
-        missing.append("external_event_sources had more pages than were read.")
+        missing.append("Low-match-rate findings were not made because event_stats was only partly read.")
     if inputs["unattributed_rows"]:
         missing.append(f"{inputs['unattributed_rows']} event_stats rows had no event_source and were not attributed.")
     return analysis_response(
         scope={"catalog_id": catalog_id},
         metrics={
             "connected_sources": len(reports),
+            "sources_complete": inputs["sources_complete"],
             "event_stat_rows": inputs["stat_rows"],
+            "stats_complete": inputs["stats_complete"],
             "match_rate_threshold": match_rate_threshold,
         },
         findings=_sorted_findings(findings),
@@ -988,14 +1018,30 @@ async def get_catalog_event_source_recommendations(
             f"{rows_missing_counters} event_stats rows lacked a matched or unmatched counter; "
             "the 28-day totals and match rate they feed are unknown (null)."
         )
-    coverage_evidence = {
+    missing.extend(inputs["scan_gaps"])
+    sources_complete = inputs["sources_complete"]
+    stats_complete = inputs["stats_complete"]
+    coverage_evidence: dict[str, Any] = {
         "connected_sources": len(inputs["sources"]),
-        "matched_content_ids_28d": matched,
-        "unmatched_content_ids_28d": unmatched,
-        "match_rate_28d": overall_rate,
+        "sources_complete": sources_complete,
+        "stats_complete": stats_complete,
+        "matched_content_ids_28d": matched if stats_complete else None,
+        "unmatched_content_ids_28d": unmatched if stats_complete else None,
+        "match_rate_28d": overall_rate if stats_complete else None,
         "threshold": match_rate_threshold,
     }
-    if not inputs["sources"]:
+    if not stats_complete:
+        coverage_evidence["partial_counts_from_pages_read"] = {
+            "event_stat_rows": inputs["stat_rows"],
+            "matched_content_ids": matched,
+            "unmatched_content_ids": unmatched,
+        }
+    if not inputs["sources"] and not sources_complete:
+        missing.append(
+            "No connected sources were among the pages read, but the list is partial; whether any "
+            "source is connected could not be determined."
+        )
+    elif not inputs["sources"]:
         findings.append(build_finding(
             "no_connected_event_sources",
             "No pixel or app is connected to this catalog.",
@@ -1003,6 +1049,16 @@ async def get_catalog_event_source_recommendations(
             confidence=0.9,
             evidence=[coverage_evidence],
         ))
+    elif not stats_complete:
+        missing.append(
+            "Whether the connected sources' catalog signal coverage is weak could not be determined "
+            "because event_stats was only partly read."
+        )
+    elif matched != 0 and overall_rate is None:
+        missing.append(
+            "Whether the connected sources' catalog signal coverage is weak could not be determined "
+            "because Meta omitted matched or unmatched counters."
+        )
     elif matched == 0 or (overall_rate is not None and overall_rate < match_rate_threshold):
         findings.append(build_finding(
             "weak_catalog_signal_coverage",
@@ -1031,12 +1087,22 @@ async def get_catalog_event_source_recommendations(
     ]
     if not pixels:
         missing.append(f"No pixels were returned for business {business_id}, so there are no candidates to recommend.")
+    if candidates and not sources_complete:
+        missing.append(
+            "Candidate pixels were not among the connected sources read, but that list is partial, "
+            "so some candidates may already be connected (connection_status unknown)."
+        )
+    connection_status = "not_connected" if sources_complete else "unknown"
     recommendations: list[dict[str, Any]] = []
     for index, pixel in enumerate(candidates):
         pixel_id = _object_id(pixel.get("id"))
         evidence: list[dict[str, Any]] = [{"last_fired_time": pixel.get("last_fired_time")}]
         strength = "unchecked"
-        reason = "Pixel belongs to the business and is not connected to this catalog."
+        reason = (
+            "Pixel belongs to the business and is not connected to this catalog."
+            if sources_complete
+            else "Pixel belongs to the business and was not among the connected sources read."
+        )
         if index < MAX_PIXEL_CANDIDATES_CHECKED:
             checks_payload = await client.list_objects(pixel_id, "da_checks", fields=DA_CHECK_FIELDS)
             checks = normalize_collection(checks_payload)["items"]
@@ -1057,6 +1123,7 @@ async def get_catalog_event_source_recommendations(
             "event_source_id": pixel_id,
             "name": pixel.get("name"),
             "source_type": "PIXEL",
+            "connection_status": connection_status,
             "strength": strength,
             "reason": reason,
             "evidence": evidence,
