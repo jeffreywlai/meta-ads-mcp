@@ -974,3 +974,78 @@ def test_audience_users_csv_keeps_bom_header_matching_and_blank_columns(monkeypa
     ]
     assert result["rows_read"] == 2
     assert result["invalid_values"] == 1
+
+
+# update_custom_audience: named rule (phase two, P4)
+
+
+class RecordingAudienceClient(FakeAudienceClient):
+    """Records every read and write in order, so a test can pin the exact requests."""
+
+    def __init__(self, previous: dict | None = None, read_error: Exception | None = None) -> None:
+        super().__init__()
+        self.calls: list[tuple] = []
+        self.previous = previous
+        self.read_error = read_error
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or []), params))
+        if self.read_error is not None:
+            raise self.read_error
+        if self.previous is not None:
+            return dict(self.previous)
+        return await super().get_object(object_id, fields=fields, params=params)
+
+    async def update_object(self, object_id: str, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+
+OLD_AUDIENCE_READ_FIELDS = [
+    "id", "name", "subtype", "approximate_count_lower_bound", "approximate_count_upper_bound",
+    "time_updated", "operation_status", "description", "customer_file_source", "retention_days",
+    "lookalike_spec",
+]
+WEBSITE_RULE = {
+    "inclusions": {
+        "operator": "or",
+        "rules": [{"event_sources": [{"id": "px_1", "type": "pixel"}], "retention_seconds": 2592000,
+                   "filter": {"operator": "and", "filters": [{"field": "url", "operator": "i_contains",
+                                                              "value": "checkout"}]}}],
+    }
+}
+
+
+def test_update_custom_audience_without_rule_is_unchanged(monkeypatch) -> None:
+    """An old-style call (named fields, or rule through params) sends exactly the requests it sent before rule was named."""
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(
+        audience_id="aud_1", name="Renamed", description="New", retention_days=45,
+        customer_file_source="USER_PROVIDED_ONLY",
+    ))
+    assert client.calls == [
+        ("get", "aud_1", OLD_AUDIENCE_READ_FIELDS, None),
+        ("update", "aud_1", {"name": "Renamed", "description": "New", "retention_days": 45,
+                             "customer_file_source": "USER_PROVIDED_ONLY"}),
+    ]
+    assert result == {
+        "ok": True,
+        "action": "update_custom_audience",
+        "target": {"audience_id": "aud_1"},
+        "previous": {"name": "Existing Audience", "description": "Old", "retention_days": 30,
+                     "customer_file_source": "USER_PROVIDED_ONLY"},
+        "current": {"name": "Renamed", "description": "New", "retention_days": 45,
+                    "customer_file_source": "USER_PROVIDED_ONLY"},
+    }
+
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", params={"rule": WEBSITE_RULE}))
+    assert client.calls == [
+        ("get", "aud_1", OLD_AUDIENCE_READ_FIELDS, None),
+        ("update", "aud_1", {"rule": WEBSITE_RULE}),
+    ]
+    assert result["previous"] == {"name": "Existing Audience", "description": "Old", "retention_days": 30,
+                                  "customer_file_source": "USER_PROVIDED_ONLY"}
+    assert result["current"] == {"rule": WEBSITE_RULE}

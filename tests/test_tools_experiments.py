@@ -1100,3 +1100,39 @@ def test_experiment_intent_and_mutation_paths() -> None:
     assert mutations["common_paths"]["experiments"] == [
         "create_ab_test", "create_lift_study", "update_ad_study", "cancel_ad_study",
     ]
+
+
+# --- phase two (P4): backward compatibility of create_ab_test ------------------------
+
+
+def test_create_ab_test_campaign_and_adset_cells_are_unchanged(monkeypatch) -> None:
+    """Campaign and ad set cells send exactly the request they sent before ad-level cells existed."""
+    client = use(monkeypatch, FakeStudyClient(objects={"act_123": {"id": "act_123", "business": {"id": "biz_9"}}}))
+    result = run(experiments.create_ab_test(
+        account_id="123", name=" Bid test ", start_time=FUTURE_START, end_time=FUTURE_END,
+        cells=[{"name": "A", "treatment_percentage": 50, "campaign_ids": ["c1"], "adset_ids": "as_1"},
+               {"name": "B", "treatment_percentage": 50, "adset_ids": ["as_2"]}],
+        params={"viewers": [5], "cooldown_start_time": FUTURE_START_TS},
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["business"], None),
+        ("create", "biz_9", "ad_studies", {
+            "name": "Bid test",
+            "type": "SPLIT_TEST",
+            "cells": [
+                {"name": "A", "treatment_percentage": 50, "campaigns": ["c1"], "adsets": ["as_1"]},
+                {"name": "B", "treatment_percentage": 50, "adsets": ["as_2"]},
+            ],
+            "start_time": FUTURE_START_TS,
+            "end_time": FUTURE_END_TS,
+            "viewers": [5],
+            "cooldown_start_time": FUTURE_START_TS,
+        }),
+    ]
+    assert result == {
+        "ok": True,
+        "action": "create_ab_test",
+        "target": {"account_id": "act_123", "business_id": "biz_9"},
+        "created": {"id": "study_new"},
+        "validation_only": False,
+    }
