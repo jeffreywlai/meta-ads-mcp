@@ -53,6 +53,13 @@ STUDY_WRITE_READ_FIELDS = [
     "observation_end_time",
     "canceled_time",
 ]
+# Readable fields in Meta's Ad Study reference. Update parameters outside this set (for example
+# confidence_level, cells, objectives, viewers) cannot be read back, so their prior value is unavailable.
+STUDY_READABLE_FIELDS = frozenset({
+    "id", "business", "canceled_time", "cooldown_start_time", "created_by", "created_time",
+    "description", "end_time", "name", "observation_end_time", "results_first_available_date",
+    "start_time", "type", "updated_by", "updated_time",
+})
 STUDY_TYPES = frozenset({
     "LIFT",
     "SPLIT_TEST",
@@ -92,6 +99,8 @@ MAX_CELLS_PER_STUDY = 150
 MAX_ENTITIES_PER_CELL = 100
 MAX_CONCURRENT_STUDIES = 100
 CONCURRENCY_SCAN_PAGES = 10
+ENTITY_STUDY_SCAN_PAGES = 5
+MEMBERSHIP_EDGES = (("campaigns", "campaign_ids"), ("adsets", "adset_ids"), ("adaccounts", "ad_account_ids"))
 END_EARLY_GRACE_SECONDS = 60
 ACTIVE_STATES = frozenset({"scheduled", "running"})
 NON_DELIVERING_STATUSES = frozenset({"DELETED", "ARCHIVED"})
@@ -128,14 +137,29 @@ ELIGIBILITY_RULES = [
     },
 ]
 ELIGIBILITY_NOT_CHECKED = [
-    "Objective and buying-type compatibility: Meta's developer documentation states no rule; "
-    "objective and buying_type are shown per entity for review, not judged.",
+    "Objective and buying-type compatibility: not performed. Meta's developer documentation states no "
+    "rule (its split testing guide even gives comparing objectives as an example); objective and "
+    "buying_type are shown per entity for review, not judged.",
     "Meta's guidance to change only one variable between cells cannot be checked from object settings.",
-    "Whether one object may be in two studies at once is not stated in Meta's developer "
-    "documentation; active studies are reported as a warning only.",
-    "Deliverable status is not stated as a study rule; DELETED or ARCHIVED objects are a warning only.",
+    "Already being in a running study: not performed as a rule, because Meta's developer documentation "
+    "does not say whether it blocks a new test. An entity found in a scheduled or running study makes "
+    "the outcome inconclusive.",
+    "Deliverable state: not performed as a rule, because Meta states none for studies. A DELETED or "
+    "ARCHIVED entity makes the outcome inconclusive.",
     "Test duration limits appear only in Help Center pages that could not be confirmed, so they are not checked.",
 ]
+ELIGIBILITY_SUGGESTIONS = {
+    "passed": (
+        "The checks this server can perform passed; create the test with create_ab_test. "
+        "Meta makes the final eligibility decision."
+    ),
+    "failed": "Resolve the blockers, then run this check again.",
+    "inconclusive": (
+        "Some checks could not be performed or settled (see each entity's unresolved list and "
+        "missing_signals), so this pre-check cannot say the test is eligible. Resolve them or let "
+        "Meta decide at creation."
+    ),
+}
 
 
 def _now() -> datetime:
@@ -305,11 +329,13 @@ def _build_lift_cells(cells: list[dict[str, Any]], account_id: str) -> list[dict
     if len(cells) > MAX_CELLS_PER_STUDY:
         raise ValidationError(f"Meta allows at most {MAX_CELLS_PER_STUDY} cells per study.")
     built: list[dict[str, Any]] = []
+    population = 0.0
     for index, raw in enumerate(cells):
         cell = _check_cell_keys(raw, index, LIFT_CELL_KEYS)
         treatment = _percentage(cell.get("treatment_percentage"), label=f"cells[{index}].treatment_percentage")
         control = _percentage(cell.get("control_percentage"), label=f"cells[{index}].control_percentage")
         combined = round(treatment + control, 2)
+        population += treatment + control
         if combined > 100:
             raise ValidationError(
                 f"cells[{index}] treatment_percentage plus control_percentage is {combined:g}; it cannot exceed 100."
@@ -336,6 +362,11 @@ def _build_lift_cells(cells: list[dict[str, Any]], account_id: str) -> list[dict
         if cell.get("description"):
             payload["description"] = cell["description"]
         built.append(payload)
+    if round(population, 2) > 100:
+        raise ValidationError(
+            "Lift study percentages are shares of the whole study population: treatment_percentage plus "
+            f"control_percentage across all cells can total at most 100; these cells total {round(population, 2):g}."
+        )
     return built
 
 
@@ -394,6 +425,13 @@ def _build_objectives(objectives: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if primaries == 0 and len(built) == 1:
         built[0]["is_primary"] = True
     return built
+
+
+def _required_account_id(account_id: Any) -> str:
+    """Reject a missing or blank account id before normalizing it to the act_ form."""
+    if not isinstance(account_id, str) or not account_id.strip() or account_id.strip() == "act_":
+        raise ValidationError("account_id is required.")
+    return normalize_account_id(account_id.strip())
 
 
 async def _resolve_business_id(client: Any, account_id: str, business_id: str | None) -> str:
@@ -479,15 +517,23 @@ async def list_ad_studies(
 
 
 def _normalize_cell(cell: dict[str, Any]) -> dict[str, Any]:
-    return {
+    normalized: dict[str, Any] = {
         "id": cell.get("id"),
         "name": cell.get("name"),
         "treatment_percentage": cell.get("treatment_percentage"),
         "control_percentage": cell.get("control_percentage"),
-        "campaign_ids": _edge_ids(cell.get("campaigns")),
-        "adset_ids": _edge_ids(cell.get("adsets")),
-        "ad_account_ids": _edge_ids(cell.get("adaccounts")),
     }
+    truncated: list[str] = []
+    for edge, key in MEMBERSHIP_EDGES:
+        value = cell.get(edge)
+        normalized[key] = _edge_ids(value)
+        paging = value.get("paging") if isinstance(value, dict) else None
+        if isinstance(paging, dict) and paging.get("next"):
+            truncated.append(key)
+    if truncated:
+        # Meta expanded only the first page of these memberships; the remaining ids were not read.
+        normalized["membership_truncated"] = truncated
+    return normalized
 
 
 def _parse_results(raw: Any) -> list[Any]:
@@ -520,95 +566,205 @@ def _to_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _split_outcome(objective: dict[str, Any], cells: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """One objective's split-test outcome, or None when its results are not in a recognised shape."""
+    for entry in objective["parsed_results"]:
+        if not isinstance(entry, dict) or not SPLIT_RESULT_KEYS & set(entry):
+            continue
+        winner_id = entry.get("winner_ad_object_id")
+        response: dict[str, Any] = {
+            "objective_id": objective.get("id"),
+            "is_primary": objective.get("is_primary"),
+            "winner": None,
+            "high_performer_ids": entry.get("high_performer_ids"),
+            "confidence_by_ad_object_id": entry.get("confidence_by_ad_object_id"),
+        }
+        if winner_id not in (None, ""):
+            winner_id = str(winner_id)
+            cell = next(
+                (
+                    cell for cell in cells
+                    if winner_id in cell["campaign_ids"] + cell["adset_ids"] + cell["ad_account_ids"]
+                ),
+                None,
+            )
+            response["winner"] = {
+                "ad_object_id": winner_id,
+                "cell_id": cell["id"] if cell else None,
+                "cell_name": cell["name"] if cell else None,
+                "confidence": entry.get("winner_confidence"),
+            }
+            if cell is None and any(item.get("membership_truncated") for item in cells):
+                response["winner"]["cell_mapping_note"] = (
+                    "The winner was not found in the cell memberships read, which are incomplete; "
+                    "it may belong to a cell whose later membership pages were not returned."
+                )
+        return response
+    return None
+
+
+def _deciding_objective(
+    objectives: list[dict[str, Any]], objectives_complete: bool
+) -> tuple[dict[str, Any] | None, str]:
+    """The objective that decides the study: its unique primary, or its only objective."""
+    primaries = [objective for objective in objectives if objective.get("is_primary") is True]
+    if len(primaries) == 1:
+        return primaries[0], "primary_objective"
+    if not primaries and len(objectives) == 1 and objectives_complete:
+        return objectives[0], "only_objective"
+    if len(primaries) > 1:
+        return None, f"Meta marked {len(primaries)} objectives as primary."
+    if not objectives_complete:
+        return None, "No primary objective was found among the objectives read, and Meta reported more objectives."
+    return None, f"The study has {len(objectives)} objectives and none is marked primary."
+
+
 def _split_results(
     objectives: list[dict[str, Any]],
     cells: list[dict[str, Any]],
+    objectives_complete: bool = True,
 ) -> dict[str, Any]:
-    for objective in objectives:
-        for entry in objective["parsed_results"]:
-            if not isinstance(entry, dict) or not SPLIT_RESULT_KEYS & set(entry):
-                continue
-            winner_id = entry.get("winner_ad_object_id")
-            response: dict[str, Any] = {
-                "status": "available",
-                "kind": "split_test",
-                "objective_id": objective.get("id"),
-                "winner": None,
-                "high_performer_ids": entry.get("high_performer_ids"),
-                "confidence_by_ad_object_id": entry.get("confidence_by_ad_object_id"),
-                "confidence_scale_note": "Meta does not document the scale of these confidence values.",
-            }
-            if winner_id not in (None, ""):
-                winner_id = str(winner_id)
-                cell = next(
-                    (
-                        cell for cell in cells
-                        if winner_id in cell["campaign_ids"] + cell["adset_ids"] + cell["ad_account_ids"]
-                    ),
-                    None,
-                )
-                response["winner"] = {
-                    "ad_object_id": winner_id,
-                    "cell_id": cell["id"] if cell else None,
-                    "cell_name": cell["name"] if cell else None,
-                    "confidence": entry.get("winner_confidence"),
-                }
-                response["message"] = "Meta reported a winning cell."
-            else:
-                response["message"] = (
-                    "Meta reported no single winner. For creative tests Meta's authoritative "
-                    "outcome is high_performer_ids."
-                )
-            return response
-    return {
+    base: dict[str, Any] = {
         "status": "available",
         "kind": "split_test",
         "winner": None,
-        "message": "Meta returned results in a shape this tool does not recognise; see raw_results.",
-        "raw_results": [objective["parsed_results"] for objective in objectives if objective["parsed_results"]],
+        "confidence_scale_note": "Meta does not document the scale of these confidence values.",
     }
+    outcomes = {id(objective): _split_outcome(objective, cells) for objective in objectives}
+    if not any(outcomes.values()):
+        return {
+            "status": "available",
+            "kind": "split_test",
+            "winner": None,
+            "message": "Meta returned results in a shape this tool does not recognise; see raw_results.",
+            "raw_results": [objective["parsed_results"] for objective in objectives if objective["parsed_results"]],
+        }
+    per_objective = [
+        outcome if outcome is not None else {
+            "objective_id": objective.get("id"),
+            "is_primary": objective.get("is_primary"),
+            "status": "not_ready" if not objective["parsed_results"] else "unrecognised_shape",
+        }
+        for objective in objectives
+        for outcome in [outcomes[id(objective)]]
+    ]
+    deciding, basis = _deciding_objective(objectives, objectives_complete)
+    if deciding is None:
+        return {
+            **base,
+            "message": (
+                f"No single winner can be named: {basis} Each objective's outcome is listed in "
+                "objectives; Meta's results for one objective are not the study's result."
+            ),
+            "objectives": per_objective,
+        }
+    outcome = outcomes[id(deciding)]
+    response = {**base, "objective_id": deciding.get("id"), "winner_basis": basis}
+    if len(objectives) > 1:
+        response["objectives"] = per_objective
+    if outcome is None:
+        response["message"] = (
+            f"Meta has no usable result yet for the deciding objective {deciding.get('id')} ({basis}); "
+            "other objectives' outcomes are listed in objectives and do not decide the study."
+        )
+        return response
+    response.update({key: value for key, value in outcome.items() if key not in {"objective_id", "is_primary"}})
+    if outcome["winner"] is not None:
+        response["message"] = "Meta reported a winning cell."
+    else:
+        response["message"] = (
+            "Meta reported no single winner. For creative tests Meta's authoritative "
+            "outcome is high_performer_ids."
+        )
+    return response
 
 
-def _lift_results(objectives: list[dict[str, Any]], cells: list[dict[str, Any]]) -> dict[str, Any]:
+def _lift_row(row: Any, names: dict[Any, Any], *, with_cell: bool) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {"meta_fields": row}
+    incremental = _to_number(row.get("conversions_incremental"))
+    baseline = _to_number(row.get("conversions_control_scaled"))
+    rendered: dict[str, Any] = {}
+    if with_cell:
+        cell_id = None if row.get("cell_id") in (None, "") else str(row.get("cell_id"))
+        rendered.update({"cell_id": cell_id, "cell_name": names.get(cell_id)})
+    rendered.update({
+        "incremental_conversions": row.get("conversions_incremental"),
+        "incremental_conversions_lower": row.get("conversions_incremental_lower"),
+        "incremental_conversions_upper": row.get("conversions_incremental_upper"),
+        "conversions_lift": incremental / baseline if incremental is not None and baseline else None,
+        "conversions_lift_basis": "conversions_incremental / conversions_control_scaled",
+        "confidence": row.get("conversions_confidence"),
+        "cost_per_incremental_conversion": row.get("conversions_CPiC"),
+        "meta_fields": row,
+    })
+    return rendered
+
+
+async def _read_cell_breakdowns(client: Any, objectives: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Read each objective's results broken down by cell, as Meta's lift guide documents.
+
+    GET /{objective_id}?fields=results&breakdowns=["cell_id"]; one row per cell.
+    """
+    breakdowns: dict[str, dict[str, Any]] = {}
+    for objective in objectives:
+        objective_id = objective.get("id")
+        if not objective["parsed_results"] or objective_id in (None, ""):
+            continue
+        try:
+            payload = await client.get_object(
+                str(objective_id), fields=["id", "results"], params={"breakdowns": ["cell_id"]},
+            )
+        except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
+            breakdowns[str(objective_id)] = {"status": "unavailable", "reason": f"Could not read per-cell results: {exc}"}
+            continue
+        breakdowns[str(objective_id)] = {"status": "read", "rows": _parse_results(payload.get("results"))}
+    return breakdowns
+
+
+def _lift_results(
+    objectives: list[dict[str, Any]],
+    cells: list[dict[str, Any]],
+    breakdowns: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
     names = {cell["id"]: cell["name"] for cell in cells}
     rendered: list[dict[str, Any]] = []
     for objective in objectives:
         if not objective["parsed_results"]:
             continue
-        rows: list[dict[str, Any]] = []
-        for row in objective["parsed_results"]:
-            if not isinstance(row, dict):
-                rows.append({"meta_fields": row})
-                continue
-            incremental = _to_number(row.get("conversions_incremental"))
-            baseline = _to_number(row.get("conversions_control_scaled"))
-            cell_id = row.get("cell_id")
-            rows.append({
-                "cell_id": cell_id,
-                "cell_name": names.get(cell_id),
-                "incremental_conversions": row.get("conversions_incremental"),
-                "incremental_conversions_lower": row.get("conversions_incremental_lower"),
-                "incremental_conversions_upper": row.get("conversions_incremental_upper"),
-                "conversions_lift": (
-                    incremental / baseline if incremental is not None and baseline else None
-                ),
-                "conversions_lift_basis": "conversions_incremental / conversions_control_scaled",
-                "confidence": row.get("conversions_confidence"),
-                "cost_per_incremental_conversion": row.get("conversions_CPiC"),
-                "meta_fields": row,
-            })
-        rendered.append({
-            "objective_id": objective.get("id"),
+        objective_id = objective.get("id")
+        item: dict[str, Any] = {
+            "objective_id": objective_id,
             "name": objective.get("name"),
             "is_primary": objective.get("is_primary"),
             "last_updated_results": objective.get("last_updated_results"),
-            "cells": rows,
-        })
+            "aggregate": [_lift_row(row, names, with_cell=False) for row in objective["parsed_results"]],
+            "cells": [],
+        }
+        breakdown = breakdowns.get(str(objective_id)) if breakdowns is not None else None
+        if breakdowns is None:
+            item["cells_status"] = "not_requested"
+            item["cells_note"] = "Meta documents the cell_id breakdown for LIFT studies only; it was not requested."
+        elif breakdown is None or breakdown["status"] == "unavailable":
+            item["cells_status"] = "unavailable"
+            item["cells_note"] = (breakdown or {}).get("reason", "Per-cell results were not read.")
+        elif not breakdown["rows"]:
+            item["cells_status"] = "none_returned"
+            item["cells_note"] = (
+                "Meta returned no per-cell rows. Its lift guide says a breakdown needs at least 100 "
+                "conversions from test and control combined to display."
+            )
+        else:
+            item["cells_status"] = "available"
+            item["cells"] = [_lift_row(row, names, with_cell=True) for row in breakdown["rows"]]
+        rendered.append(item)
     return {
         "status": "available",
         "kind": "lift",
         "objectives": rendered,
         "notes": [
+            "aggregate is Meta's result for the whole study; cells is Meta's cell_id breakdown. "
+            "They are separate reads and are not summed or mixed here.",
             "conversions_lift is derived here from Meta's fields as stated in conversions_lift_basis.",
             "Meta's lift guide does not document the scale of conversions_confidence.",
         ],
@@ -619,8 +775,10 @@ def _lift_results(objectives: list[dict[str, Any]], cells: list[dict[str, Any]])
 async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str, Any]:
     """Get one A/B test or lift study: settings, cells (shares and the campaigns or ad sets in each) and objectives.
 
-    include_results adds the outcome: the winning cell and confidence for A/B tests, incremental
-    conversions, lift and confidence per cell for lift studies, or a plain not_ready status.
+    include_results adds the outcome: the winning cell and confidence for A/B tests (decided by the
+    primary objective; with no unique primary, each objective's outcome and no single winner),
+    incremental conversions, lift and confidence for lift studies (whole-study aggregate and Meta's
+    per-cell breakdown, kept separate), or a plain not_ready status.
     """
     study_id = blank_to_none(study_id)
     if study_id is None:
@@ -644,6 +802,8 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             **{key: value for key, value in objective.items() if key != "results"},
             "parsed_results": parsed,
         })
+    cell_nodes_complete = not cells_payload["paging"].get("next")
+    memberships_complete = not any(cell.get("membership_truncated") for cell in cells)
     response: dict[str, Any] = {
         "item": {**study, "state": state},
         "cells": cells,
@@ -655,10 +815,17 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             "count": 1,
             "cell_count": len(cells),
             "objective_count": len(objectives),
-            "cells_complete": not cells_payload["paging"].get("next"),
+            "cells_complete": cell_nodes_complete and memberships_complete,
+            "cell_nodes_complete": cell_nodes_complete,
+            "memberships_complete": memberships_complete,
             "objectives_complete": not objectives_payload["paging"].get("next"),
         },
     }
+    if not memberships_complete:
+        response["summary"]["membership_note"] = (
+            "Meta returned only the first page of some cells' campaigns, ad sets or ad accounts "
+            "(see membership_truncated on those cells); the ids listed for them are incomplete."
+        )
     if not include_results:
         return response
     if not any(objective["parsed_results"] for objective in objectives):
@@ -670,41 +837,87 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             ),
         }
     elif str(study.get("type") or "").upper() in SPLIT_TEST_TYPES:
-        response["results"] = _split_results(objectives, cells)
+        response["results"] = _split_results(objectives, cells, response["summary"]["objectives_complete"])
     else:
-        response["results"] = _lift_results(objectives, cells)
+        breakdowns = (
+            await _read_cell_breakdowns(client, objectives)
+            if str(study.get("type") or "").upper() == "LIFT"
+            else None
+        )
+        response["results"] = _lift_results(objectives, cells, breakdowns)
     return response
 
 
-async def _active_studies(client: Any, parent: str, edge: str, now: datetime) -> list[dict[str, Any]]:
-    payload = await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params={"limit": 100})
-    return [
-        {"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state}
-        for study in payload.get("data", [])
-        if (state := _study_state(study, now)) in ACTIVE_STATES
-    ]
+async def _scan_active_studies(
+    client: Any,
+    parent: str,
+    edge: str,
+    now: datetime,
+    *,
+    max_pages: int,
+    stop_at: int | None = None,
+) -> dict[str, Any]:
+    """Page a study edge for scheduled or running studies.
+
+    complete is true only when Meta's last page had no next link. A next link without a usable
+    cursor, a repeated cursor, the page cap, or reaching stop_at ends the scan as incomplete with
+    stop_reason saying why.
+    """
+    active: list[dict[str, Any]] = []
+    pages = 0
+    params: dict[str, Any] = {"limit": 100}
+    seen_cursors: set[str] = set()
+    while True:
+        normalized = normalize_collection(
+            await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
+        )
+        pages += 1
+        active.extend(
+            {"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state}
+            for study in normalized["items"]
+            if isinstance(study, dict) and (state := _study_state(study, now)) in ACTIVE_STATES
+        )
+        if not normalized["paging"].get("next"):
+            return {"active": active, "pages_read": pages, "complete": True, "stop_reason": None}
+        cursor = normalized["paging"].get("after")
+        if not cursor:
+            reason = "Meta reported another page but returned no cursor to fetch it."
+        elif cursor in seen_cursors:
+            reason = "Meta returned a cursor already read, so paging stopped to avoid counting a page twice."
+        elif stop_at is not None and len(active) >= stop_at:
+            reason = f"Stopped once {stop_at} scheduled or running studies were found."
+        elif pages >= max_pages:
+            reason = f"Stopped at the {max_pages}-page read cap while Meta reported more pages."
+        else:
+            seen_cursors.add(cursor)
+            params = {"limit": 100, "after": cursor}
+            continue
+        return {"active": active, "pages_read": pages, "complete": False, "stop_reason": reason}
 
 
 async def _count_account_active_studies(client: Any, account_id: str, now: datetime) -> dict[str, Any]:
     """Count scheduled or running studies on the account, paging until the documented limit is reached."""
-    active = 0
-    pages = 0
-    params: dict[str, Any] = {"limit": 100}
-    complete = False
-    while pages < CONCURRENCY_SCAN_PAGES:
-        normalized = normalize_collection(
-            await client.list_objects(account_id, "impacting_ad_studies", fields=STUDY_LIST_FIELDS, params=params)
-        )
-        pages += 1
-        active += sum(1 for study in normalized["items"] if _study_state(study, now) in ACTIVE_STATES)
-        cursor = normalized["paging"].get("after")
-        if not normalized["paging"].get("next") or not cursor:
-            complete = True
-            break
-        if active >= MAX_CONCURRENT_STUDIES:
-            break
-        params = {"limit": 100, "after": cursor}
-    return {"active_studies": active, "pages_read": pages, "count_complete": complete}
+    scan = await _scan_active_studies(
+        client, account_id, "impacting_ad_studies", now,
+        max_pages=CONCURRENCY_SCAN_PAGES, stop_at=MAX_CONCURRENT_STUDIES,
+    )
+    return {
+        "active_studies": len(scan["active"]),
+        "pages_read": scan["pages_read"],
+        "count_complete": scan["complete"],
+        "stop_reason": scan["stop_reason"],
+    }
+
+
+def _with_outcome(result: dict[str, Any]) -> dict[str, Any]:
+    """failed when a documented rule is broken; inconclusive when any check could not be settled."""
+    if result["blockers"]:
+        result["outcome"] = "failed"
+    elif result["unresolved"]:
+        result["outcome"] = "inconclusive"
+    else:
+        result["outcome"] = "passed"
+    return result
 
 
 @mcp_server.tool()
@@ -716,9 +929,11 @@ async def check_ab_test_eligibility(
     """Pre-check whether campaigns or ad sets (level campaign or adset) can go into an A/B test.
 
     This is a local pre-check against Meta's documented rules, not Meta's verdict: Meta has no
-    public eligibility endpoint. Reports per entity: exists, belongs to the account, status,
+    public eligibility endpoint. precheck_outcome is passed, failed, or inconclusive when a check
+    could not be performed or settled. Reports per entity: exists, belongs to the account, status,
     objective, buying type, and any scheduled or running study it is already in.
     """
+    account_id = _required_account_id(account_id)
     normalized_level = (blank_to_none(level) or "").lower().replace("ad_set", "adset")
     if normalized_level not in {"campaign", "adset"}:
         raise ValidationError("level must be campaign or adset.")
@@ -727,7 +942,6 @@ async def check_ab_test_eligibility(
         raise ValidationError("entity_ids needs at least one campaign or ad set id.")
     if len(ids) > MAX_CELLS_PER_STUDY:
         raise ValidationError(f"Check at most {MAX_CELLS_PER_STUDY} entities, Meta's documented maximum cells per study.")
-    account_id = normalize_account_id(account_id)
     account_number = account_id.removeprefix("act_")
     fields = (
         ["id", "name", "account_id", "effective_status", "objective", "buying_type"]
@@ -740,43 +954,68 @@ async def check_ab_test_eligibility(
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
     for entity_id in ids:
-        result: dict[str, Any] = {"entity_id": entity_id, "level": normalized_level, "blockers": [], "warnings": []}
+        result: dict[str, Any] = {
+            "entity_id": entity_id, "level": normalized_level, "blockers": [], "unresolved": [], "warnings": [],
+        }
         try:
             entity = await client.get_object(entity_id, fields=fields)
-        except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
+        except NotFoundError as exc:
             result.update({"exists": False, "active_studies": None})
-            result["blockers"].append(f"Could not read {entity_id}: {exc}")
-            entities.append(result)
+            result["blockers"].append(f"{entity_id} was not found: {exc}")
+            entities.append(_with_outcome(result))
+            continue
+        except (MetaApiError, UnsupportedFeatureError) as exc:
+            result.update({"exists": None, "active_studies": None})
+            result["unresolved"].append(f"Could not read {entity_id}, so none of its checks were performed: {exc}")
+            entities.append(_with_outcome(result))
             continue
         result["exists"] = True
         for key in fields[1:]:
             result[key] = entity.get(key)
         entity_account = str(entity.get("account_id") or "").removeprefix("act_")
         if not entity_account:
-            result["warnings"].append("Meta returned no account_id, so the account match was not checked.")
+            result["unresolved"].append("Meta returned no account_id, so the account match was not checked.")
         elif entity_account != account_number:
             result["blockers"].append(
                 f"{entity_id} belongs to ad account {entity_account}, not {account_number}."
             )
         status = str(entity.get("effective_status") or "").upper()
         if status in NON_DELIVERING_STATUSES:
-            result["warnings"].append(f"effective_status is {status}, so it cannot deliver.")
+            result["unresolved"].append(
+                f"effective_status is {status}, so it cannot deliver. Meta's developer documentation states "
+                "no study rule for this, so this pre-check cannot say whether it blocks the test."
+            )
         try:
-            active = await _active_studies(client, entity_id, "ad_studies", now)
+            scan = await _scan_active_studies(
+                client, entity_id, "ad_studies", now, max_pages=ENTITY_STUDY_SCAN_PAGES,
+            )
         except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
             result["active_studies"] = None
-            missing_signals.append(f"Could not read the studies containing {entity_id}: {exc}")
+            message = f"Could not read the studies containing {entity_id}: {exc}"
+            result["unresolved"].append(message)
+            missing_signals.append(message)
         else:
+            active = scan["active"]
             result["active_studies"] = active
+            result["active_studies_complete"] = scan["complete"]
+            if not scan["complete"]:
+                message = (
+                    f"Read only {scan['pages_read']} page(s) of the studies containing {entity_id}: "
+                    f"{scan['stop_reason']}"
+                )
+                result["unresolved"].append(message)
+                missing_signals.append(message)
             if active:
-                result["warnings"].append(
+                result["unresolved"].append(
                     f"Already in {len(active)} scheduled or running study(ies): "
                     f"{', '.join(str(study['id']) for study in active)}. Meta's developer documentation "
-                    "does not say whether this blocks a new test; Meta decides at creation."
+                    "does not say whether this blocks a new test, so this pre-check cannot pass it; "
+                    "Meta decides at creation."
                 )
-        entities.append(result)
+        entities.append(_with_outcome(result))
     account_check = await _count_account_active_studies(client, account_id, now)
     account_check["blockers"] = []
+    account_check["unresolved"] = []
     account_check["warnings"] = []
     if account_check["active_studies"] >= MAX_CONCURRENT_STUDIES:
         account_check["blockers"].append(
@@ -784,9 +1023,12 @@ async def check_ab_test_eligibility(
             f"Meta documents a maximum of {MAX_CONCURRENT_STUDIES} concurrent studies per advertiser."
         )
     elif not account_check["count_complete"]:
-        missing_signals.append(
-            f"Counted active studies on the first {account_check['pages_read']} pages only."
+        message = (
+            f"Counted active studies on the first {account_check['pages_read']} page(s) only: "
+            f"{account_check['stop_reason']} The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
         )
+        account_check["unresolved"].append(message)
+        missing_signals.append(message)
     if len(ids) > 100 // MIN_SPLIT_TREATMENT_PERCENTAGE:
         account_check["warnings"].append(
             f"{len(ids)} entities cannot each get their own cell: Meta requires every cell's "
@@ -799,33 +1041,43 @@ async def check_ab_test_eligibility(
             for message in entity["blockers"]
         )
         findings.extend(
+            {"entity_id": entity["entity_id"], "severity": "unresolved", "message": message}
+            for message in entity["unresolved"]
+        )
+        findings.extend(
             {"entity_id": entity["entity_id"], "severity": "warning", "message": message}
             for message in entity["warnings"]
         )
-    findings.extend({"entity_id": account_id, "severity": "blocker", "message": m} for m in account_check["blockers"])
-    findings.extend({"entity_id": account_id, "severity": "warning", "message": m} for m in account_check["warnings"])
-    blocked = sum(1 for entity in entities if entity["blockers"])
-    eligible = blocked == 0 and not account_check["blockers"]
+    for severity, key in (("blocker", "blockers"), ("unresolved", "unresolved"), ("warning", "warnings")):
+        findings.extend(
+            {"entity_id": account_id, "severity": severity, "message": message} for message in account_check[key]
+        )
+    blocked = sum(1 for entity in entities if entity["outcome"] == "failed")
+    inconclusive = sum(1 for entity in entities if entity["outcome"] == "inconclusive")
+    if blocked or account_check["blockers"]:
+        outcome = "failed"
+    elif inconclusive or account_check["unresolved"]:
+        outcome = "inconclusive"
+    else:
+        outcome = "passed"
     return analysis_response(
         scope={"account_id": account_id, "level": normalized_level, "entity_ids": ids},
         metrics={
             "entities_checked": len(entities),
-            "passed_local_precheck": len(entities) - blocked,
+            "passed_local_precheck": len(entities) - blocked - inconclusive,
             "blocked": blocked,
+            "inconclusive": inconclusive,
             "with_warnings": sum(1 for entity in entities if entity["warnings"]),
         },
         findings=findings,
-        suggestions=(
-            ["Create the test with create_ab_test; Meta makes the final eligibility decision."]
-            if eligible
-            else ["Resolve the blockers, then run this check again."]
-        ),
+        suggestions=[ELIGIBILITY_SUGGESTIONS[outcome]],
         missing_signals=missing_signals,
         extra={
             "check_type": "local_precheck",
             "meta_verdict": False,
             "label": ELIGIBILITY_LABEL,
-            "eligible_by_local_precheck": eligible,
+            "precheck_outcome": outcome,
+            "eligible_by_local_precheck": {"passed": True, "failed": False}.get(outcome),
             "entities": entities,
             "account": account_check,
             "rules_applied": ELIGIBILITY_RULES,
@@ -853,6 +1105,7 @@ async def create_ab_test(
     Times are ISO 8601 with offset or Unix seconds. Meta creates studies on the account's business;
     pass business_id if the account has none. hypothesis is stored as the study description.
     """
+    account_id = _required_account_id(account_id)
     if not isinstance(name, str) or not name.strip():
         raise ValidationError("name is required.")
     built_cells = _build_ab_cells(cells)
@@ -876,7 +1129,6 @@ async def create_ab_test(
         },
         params,
     )
-    account_id = normalize_account_id(account_id)
     client = get_graph_api_client()
     owner = await _resolve_business_id(client, account_id, blank_to_none(business_id))
     result = await client.create_edge_object(owner, "ad_studies", data=payload)
@@ -903,13 +1155,14 @@ async def create_lift_study(
     """Create a conversion lift study (holdout test). Meta limits lift studies to approved advertisers.
 
     cells: each {name, treatment_percentage, control_percentage, campaign_ids or ad_account_ids?};
-    a cell without ids measures the whole account. objectives: each {name, type (default
+    a cell without ids measures the whole account. Percentages are shares of the whole population,
+    so all cells' treatment and control together total at most 100. objectives: each {name, type (default
     CONVERSIONS), is_primary, adspixels or applications [{id, event_names}], ...}; one primary.
     start_time must be in the future. observation_end_time defaults to end_time.
     """
+    account_id = _required_account_id(account_id)
     if not isinstance(name, str) or not name.strip():
         raise ValidationError("name is required.")
-    account_id = normalize_account_id(account_id)
     built_cells = _build_lift_cells(cells, account_id)
     built_objectives = _build_objectives(objectives)
     start = _to_unix(start_time, "start_time")
@@ -957,6 +1210,51 @@ def _previous_study(previous: dict[str, Any], state: str) -> dict[str, Any]:
     }
 
 
+def _stored_unix(study: dict[str, Any], key: str) -> int | None:
+    parsed = _parse_meta_time(study.get(key))
+    return None if parsed is None else int(parsed.timestamp())
+
+
+def _check_effective_times(
+    previous: dict[str, Any],
+    start: int | None,
+    end: int | None,
+    observation_end: int | None,
+) -> None:
+    """Validate the times the study would have after the edit, filling unchanged bounds from the pre-read."""
+    if start is None and end is None and observation_end is None:
+        return
+    effective_start = start if start is not None else _stored_unix(previous, "start_time")
+    effective_end = end if end is not None else _stored_unix(previous, "end_time")
+    if (
+        (start is not None or end is not None)
+        and effective_start is not None
+        and effective_end is not None
+        and effective_end <= effective_start
+    ):
+        raise ValidationError(
+            f"After this edit the study would start at {_iso(effective_start)} and end at "
+            f"{_iso(effective_end)}; end_time must be after start_time. Unchanged times are "
+            "taken from the study's current values."
+        )
+    stored_observation = _stored_unix(previous, "observation_end_time")
+    is_lift = str(previous.get("type") or "").upper() == "LIFT"
+    effective_observation = (
+        observation_end if observation_end is not None else (stored_observation if is_lift else None)
+    )
+    if (
+        (end is not None or observation_end is not None)
+        and effective_observation is not None
+        and effective_end is not None
+        and effective_observation < effective_end
+    ):
+        raise ValidationError(
+            f"After this edit observation_end_time ({_iso(effective_observation)}) would be before "
+            f"end_time ({_iso(effective_end)}); Meta's lift guide sets observation_end_time at or after "
+            "end_time. Pass a later observation_end_time in params as well."
+        )
+
+
 @mcp_server.tool()
 async def update_ad_study(
     study_id: str,
@@ -991,8 +1289,16 @@ async def update_ad_study(
         raise ValidationError("At least one field must be provided for update_ad_study.")
     if start is not None and end is not None and end <= start:
         raise ValidationError("end_time must be after start_time.")
+    observation_end = (
+        _to_unix(payload["observation_end_time"], "params.observation_end_time")
+        if payload.get("observation_end_time") is not None
+        else None
+    )
+    readable_changes = [key for key in payload if key in STUDY_READABLE_FIELDS]
+    unreadable_changes = sorted(key for key in payload if key not in STUDY_READABLE_FIELDS)
+    read_fields = [*STUDY_WRITE_READ_FIELDS, *(key for key in readable_changes if key not in STUDY_WRITE_READ_FIELDS)]
     client = get_graph_api_client()
-    previous = await client.get_object(study_id, fields=STUDY_WRITE_READ_FIELDS)
+    previous = await client.get_object(study_id, fields=read_fields)
     now = _now()
     state = _study_state(previous, now)
     previous_start = _parse_meta_time(previous.get("start_time"))
@@ -1003,15 +1309,24 @@ async def update_ad_study(
             raise ValidationError(f"end_time can only change before a study ends; this study is {state}.")
         if end <= int(now.timestamp()):
             raise ValidationError("end_time must be in the future; use cancel_ad_study to end a study now.")
+    _check_effective_times(previous, start, end, observation_end)
     await client.update_object(study_id, data=payload)
     current = {
         key: _iso(value) if key in {"start_time", "end_time"} and isinstance(value, int) else value
         for key, value in payload.items()
     }
+    prior = _previous_study(previous, state)
+    prior.update({key: previous.get(key) for key in readable_changes})
+    if unreadable_changes:
+        prior["unavailable_previous_values"] = {
+            key: "Not readable: Meta's Ad Study reference lists no readable field with this name, "
+            "so its value before this edit could not be read."
+            for key in unreadable_changes
+        }
     return mutation_response(
         action="update_ad_study",
         target={"study_id": study_id},
-        previous=_previous_study(previous, state),
+        previous=prior,
         current=current,
     )
 
@@ -1021,7 +1336,8 @@ async def cancel_ad_study(study_id: str) -> dict[str, Any]:
     """End or cancel an A/B test or lift study. Use only when the user explicitly asks to stop a study.
 
     A study that has not started is deleted. A running study is ended by moving its end_time to
-    one minute from now, which keeps its results. A study already ended or canceled is left alone.
+    one minute from now, which keeps its results; one already ending within that minute is left
+    to finish, so its end never moves later. A study already ended or canceled is left alone.
     Returns the prior state.
     """
     study_id = blank_to_none(study_id)
@@ -1037,6 +1353,22 @@ async def cancel_ad_study(study_id: str) -> dict[str, Any]:
         current: dict[str, Any] = {"operation": "delete", "result": result}
     elif state == "running":
         new_end = int((now + timedelta(seconds=END_EARLY_GRACE_SECONDS)).timestamp())
+        stored_end = _parse_meta_time(previous.get("end_time"))
+        if stored_end is not None and int(stored_end.timestamp()) <= new_end:
+            # Moving end_time to now plus the grace interval would push this end later, not earlier.
+            response = mutation_response(
+                action="cancel_ad_study",
+                target={"study_id": study_id},
+                previous=prior,
+                current={"operation": "none", "end_time": stored_end.isoformat()},
+                ok=False,
+            )
+            response["message"] = (
+                f"Nothing was sent: the study already ends at {stored_end.isoformat()}, within the "
+                f"{END_EARLY_GRACE_SECONDS} seconds this tool would set, so it will finish on its own shortly. "
+                "Changing end_time now would only make it end later."
+            )
+            return response
         result = await client.update_object(study_id, data={"end_time": new_end})
         current = {"operation": "end_early", "end_time": _iso(new_end), "result": result}
     else:

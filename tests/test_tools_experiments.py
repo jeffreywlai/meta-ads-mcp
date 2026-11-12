@@ -100,7 +100,11 @@ def test_list_ad_studies_account_uses_documented_impacting_edge(monkeypatch) -> 
     result = run(experiments.list_ad_studies(account_id="123"))
     kind, parent, edge, fields, params = client.calls[0]
     assert (kind, parent, edge) == ("list", "act_123", "impacting_ad_studies")
-    assert fields == experiments.STUDY_LIST_FIELDS
+    # Literal field contract from Meta's Ad Study reference, not the module's own constant (F32).
+    assert fields == [
+        "id", "name", "type", "description", "start_time", "end_time", "canceled_time",
+        "results_first_available_date",
+    ]
     assert params == {"limit": 50}
     assert [item["state"] for item in result["items"]] == ["running", "scheduled", "ended", "canceled"]
     assert result["summary"]["count"] == 4
@@ -176,11 +180,18 @@ def test_get_ad_study_reads_study_cells_and_objectives(monkeypatch) -> None:
                ("study_1", "objectives"): {"data": [{"id": "obj_1", "name": "Purchases"}]}},
     ))
     result = run(experiments.get_ad_study(study_id=" study_1 "))
-    assert client.calls[0] == ("get", "study_1", experiments.STUDY_FIELDS, None)
+    # Literal field contracts from Meta's Ad Study, cell and objective documentation (F32).
+    assert client.calls[0] == ("get", "study_1", [
+        "id", "name", "type", "description", "start_time", "end_time", "canceled_time",
+        "results_first_available_date", "observation_end_time", "cooldown_start_time",
+        "created_time", "updated_time", "business",
+    ], None)
     assert client.calls[1][1:3] == ("study_1", "cells")
-    assert client.calls[1][3] == experiments.CELL_FIELDS
+    assert client.calls[1][3] == [
+        "id", "name", "treatment_percentage", "control_percentage", "campaigns", "adsets", "adaccounts",
+    ]
     assert client.calls[2][1:3] == ("study_1", "objectives")
-    assert "results" not in client.calls[2][3]
+    assert client.calls[2][3] == ["id", "name", "type", "is_primary", "last_updated_results"]
     assert result["item"]["state"] == "ended"
     assert result["cells"] == [
         {"id": "cell_a", "name": "Group A", "treatment_percentage": 50, "control_percentage": None,
@@ -241,35 +252,170 @@ def test_get_ad_study_split_results_without_winner_say_so(monkeypatch) -> None:
     assert "no single winner" in result["results"]["message"]
 
 
-def test_get_ad_study_lift_results_report_lift_and_confidence(monkeypatch) -> None:
-    row = {"cell_id": "cell_t", "conversions_test": 1200, "conversions_control_scaled": 1000,
-           "conversions_incremental": 200, "conversions_incremental_lower": 150,
-           "conversions_incremental_upper": 250, "conversions_confidence": 0.97,
-           "conversions_CPiC": 12.5}
+def _winner(ad_object_id):
+    return [json.dumps({"winner_ad_object_id": ad_object_id, "winner_confidence": 0.9})]
+
+
+def test_study_winner_uses_primary_objective(monkeypatch) -> None:
+    """F15: a secondary objective listed first never decides the reported winner."""
     use(monkeypatch, FakeStudyClient(
-        objects={"study_2": {"id": "study_2", "type": "LIFT",
-                             "start_time": "2026-09-01T00:00:00+0000",
-                             "end_time": "2026-10-01T00:00:00+0000"}},
-        edges={("study_2", "cells"): {"data": [{"id": "cell_t", "name": "Test",
-                                                 "treatment_percentage": 90,
-                                                 "control_percentage": 10}]},
-               ("study_2", "objectives"): {"data": [
-                   {"id": "obj_9", "name": "Purchases", "is_primary": True,
-                    "last_updated_results": "2026-10-02", "results": [json.dumps(row)]},
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS,
+               ("study_1", "objectives"): {"data": [
+                   {"id": "obj_40", "is_primary": False, "results": _winner("as_1")},
+                   {"id": "obj_41", "is_primary": True, "results": _winner("as_2")},
                ]}},
     ))
+    results = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
+    assert results["objective_id"] == "obj_41"
+    assert results["winner_basis"] == "primary_objective"
+    assert results["winner"]["cell_id"] == "cell_b"
+    assert [o["objective_id"] for o in results["objectives"]] == ["obj_40", "obj_41"]
+    assert results["objectives"][0]["winner"]["cell_id"] == "cell_a"
+
+
+@pytest.mark.parametrize("flags", [(None, None), (False, False), (True, True)])
+def test_study_without_unique_primary_names_no_winner(monkeypatch, flags) -> None:
+    """F15: with no unique primary objective, outcomes are per objective and no winner is named."""
+    objectives = [{"id": "obj_40", "results": _winner("as_1")}, {"id": "obj_41", "results": _winner("as_2")}]
+    for objective, flag in zip(objectives, flags):
+        if flag is not None:
+            objective["is_primary"] = flag
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS, ("study_1", "objectives"): {"data": objectives}},
+    ))
+    results = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
+    assert results["winner"] is None
+    assert "No single winner can be named" in results["message"]
+    assert [o["winner"]["ad_object_id"] for o in results["objectives"]] == ["as_1", "as_2"]
+    assert "objective_id" not in results
+
+
+def test_study_primary_without_results_does_not_fall_back_to_secondary(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS,
+               ("study_1", "objectives"): {"data": [
+                   {"id": "obj_40", "is_primary": False, "results": _winner("as_1")},
+                   {"id": "obj_41", "is_primary": True},
+               ]}},
+    ))
+    results = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
+    assert results["winner"] is None
+    assert results["objective_id"] == "obj_41"
+    assert "no usable result yet" in results["message"]
+    assert results["objectives"][1] == {"objective_id": "obj_41", "is_primary": True, "status": "not_ready"}
+
+
+LIFT_STUDY = {"id": "study_2", "type": "LIFT",
+              "start_time": "2026-09-01T00:00:00+0000", "end_time": "2026-10-01T00:00:00+0000"}
+LIFT_CELLS = {"data": [
+    {"id": "cell_t", "name": "Test", "treatment_percentage": 45, "control_percentage": 5},
+    {"id": "cell_u", "name": "Other", "treatment_percentage": 45, "control_percentage": 5},
+]}
+AGGREGATE_ROW = {"conversions_test": 2300, "conversions_control_scaled": 2000,
+                 "conversions_incremental": 300, "conversions_confidence": 0.95}
+CELL_ROW = {"cell_id": "cell_t", "conversions_test": 1200, "conversions_control_scaled": 1000,
+            "conversions_incremental": 200, "conversions_incremental_lower": 150,
+            "conversions_incremental_upper": 250, "conversions_confidence": 0.97,
+            "conversions_CPiC": 12.5}
+
+
+def _lift_client(monkeypatch, *, breakdown=None, errors=None, study=LIFT_STUDY):
+    objects = {"study_2": study}
+    if breakdown is not None:
+        objects["obj_9"] = {"id": "obj_9", "results": breakdown}
+    return use(monkeypatch, FakeStudyClient(
+        objects=objects,
+        errors=errors,
+        edges={("study_2", "cells"): LIFT_CELLS,
+               ("study_2", "objectives"): {"data": [
+                   {"id": "obj_9", "name": "Purchases", "is_primary": True,
+                    "last_updated_results": "2026-10-02", "results": [json.dumps(AGGREGATE_ROW)]},
+               ]}},
+    ))
+
+
+def test_get_ad_study_lift_results_report_lift_and_confidence(monkeypatch) -> None:
+    """F21: per-cell lift comes from the documented cell_id breakdown, kept apart from the aggregate."""
+    other = {**CELL_ROW, "cell_id": "cell_u", "conversions_incremental": 100}
+    client = _lift_client(monkeypatch, breakdown=[CELL_ROW, other])
     result = run(experiments.get_ad_study(study_id="study_2", include_results=True))
+    assert ("get", "obj_9", ["id", "results"], {"breakdowns": ["cell_id"]}) in client.calls
     lift = result["results"]
     assert lift["status"] == "available"
     assert lift["kind"] == "lift"
-    cell = lift["objectives"][0]["cells"][0]
+    objective = lift["objectives"][0]
+    assert objective["cells_status"] == "available"
+    aggregate = objective["aggregate"][0]
+    assert "cell_id" not in aggregate
+    assert aggregate["incremental_conversions"] == 300
+    assert aggregate["conversions_lift"] == pytest.approx(0.15)
+    cell = objective["cells"][0]
     assert cell["cell_id"] == "cell_t"
     assert cell["cell_name"] == "Test"
     assert cell["incremental_conversions"] == 200
     assert cell["conversions_lift"] == pytest.approx(0.2)
     assert cell["conversions_lift_basis"] == "conversions_incremental / conversions_control_scaled"
     assert cell["confidence"] == 0.97
-    assert cell["meta_fields"] == row
+    assert cell["meta_fields"] == CELL_ROW
+    assert [row["cell_name"] for row in objective["cells"]] == ["Test", "Other"]
+
+
+def test_lift_aggregate_is_never_presented_as_a_cell(monkeypatch) -> None:
+    """F21: without breakdown rows the aggregate stays aggregate and cells is empty, with the reason."""
+    _lift_client(monkeypatch, breakdown=[])
+    objective = run(experiments.get_ad_study(study_id="study_2", include_results=True))["results"]["objectives"][0]
+    assert objective["cells"] == []
+    assert objective["cells_status"] == "none_returned"
+    assert "100" in objective["cells_note"]
+    assert objective["aggregate"][0]["incremental_conversions"] == 300
+
+
+def test_lift_cell_breakdown_failure_is_reported(monkeypatch) -> None:
+    error = MetaApiError(message="(#100) Unsupported breakdown", status_code=400, code=100)
+    _lift_client(monkeypatch, errors={"obj_9": error})
+    objective = run(experiments.get_ad_study(study_id="study_2", include_results=True))["results"]["objectives"][0]
+    assert objective["cells"] == []
+    assert objective["cells_status"] == "unavailable"
+    assert "Unsupported breakdown" in objective["cells_note"]
+    assert objective["aggregate"][0]["incremental_conversions"] == 300
+
+
+def test_non_lift_study_does_not_request_undocumented_breakdown(monkeypatch) -> None:
+    client = _lift_client(monkeypatch, study={**LIFT_STUDY, "type": "GEO_LIFT"})
+    objective = run(experiments.get_ad_study(study_id="study_2", include_results=True))["results"]["objectives"][0]
+    assert not any(call[0] == "get" and call[1] == "obj_9" for call in client.calls)
+    assert objective["cells_status"] == "not_requested"
+    assert objective["cells"] == []
+
+
+def test_study_nested_membership_paging_is_not_complete(monkeypatch) -> None:
+    """F20: a cell whose expanded ad sets have a next page is not a complete membership."""
+    cells = {"data": [
+        {"id": "cell_a", "name": "Group A",
+         "adsets": {"data": [{"id": "as_1"}], "paging": {"next": "https://graph.invalid/n",
+                                                        "cursors": {"after": "c"}}}},
+        {"id": "cell_b", "name": "Group B", "adsets": {"data": [{"id": "as_2"}]}},
+    ]}
+    results = [json.dumps({"winner_ad_object_id": "as_9", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): cells,
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "results": results}]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    summary = result["summary"]
+    assert summary["cells_complete"] is False
+    assert summary["cell_nodes_complete"] is True
+    assert summary["memberships_complete"] is False
+    assert "incomplete" in summary["membership_note"]
+    assert result["cells"][0]["membership_truncated"] == ["adset_ids"]
+    assert "membership_truncated" not in result["cells"][1]
+    winner = result["results"]["winner"]
+    assert winner["cell_id"] is None
+    assert "incomplete" in winner["cell_mapping_note"]
 
 
 def test_get_ad_study_requires_id(monkeypatch) -> None:
@@ -296,6 +442,7 @@ def test_eligibility_is_labeled_local_precheck(monkeypatch) -> None:
     assert result["check_type"] == "local_precheck"
     assert result["meta_verdict"] is False
     assert "not Meta's verdict" in result["label"]
+    assert result["precheck_outcome"] == "passed"
     assert result["eligible_by_local_precheck"] is True
     assert result["metrics"]["entities_checked"] == 2
     assert all(rule["source"].startswith("https://developers.facebook.com/") for rule in result["rules_applied"])
@@ -323,7 +470,8 @@ def test_eligibility_blocks_missing_entity_and_other_account(monkeypatch) -> Non
     assert result["metrics"]["blocked"] == 2
 
 
-def test_eligibility_warns_when_entity_is_in_an_active_study(monkeypatch) -> None:
+def test_eligibility_entity_in_an_active_study_is_inconclusive(monkeypatch) -> None:
+    """F19: Meta documents no rule on concurrent membership, so it can neither pass nor block."""
     use(monkeypatch, FakeStudyClient(
         objects={"as_1": {"id": "as_1", "account_id": "123", "effective_status": "ACTIVE"}},
         edges={("as_1", "ad_studies"): {"data": [
@@ -335,9 +483,65 @@ def test_eligibility_warns_when_entity_is_in_an_active_study(monkeypatch) -> Non
     ))
     entity = result["entities"][0]
     assert entity["active_studies"] == [{"id": "s1", "name": "Study s1", "type": "SPLIT_TEST", "state": "running"}]
-    assert entity["warnings"]
+    assert entity["unresolved"]
     assert entity["blockers"] == []
-    assert result["eligible_by_local_precheck"] is True
+    assert entity["outcome"] == "inconclusive"
+    assert result["precheck_outcome"] == "inconclusive"
+    assert result["eligible_by_local_precheck"] is None
+    assert result["metrics"]["inconclusive"] == 1
+    assert result["metrics"]["passed_local_precheck"] == 0
+    assert "cannot say the test is eligible" in result["suggestions"][0]
+    assert "not Meta's verdict" in result["label"]
+
+
+def test_eligibility_unknown_study_read_is_not_a_pass(monkeypatch) -> None:
+    """F19: a permission failure reading an entity's studies leaves the check unperformed."""
+    error = MetaApiError(message="(#200) Permissions error", status_code=403, code=200)
+    use(monkeypatch, FakeStudyClient(objects={"c1": _campaign("c1")}, errors={("c1", "ad_studies"): error}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["precheck_outcome"] == "inconclusive"
+    assert result["eligible_by_local_precheck"] is None
+    assert result["entities"][0]["active_studies"] is None
+    assert any("Could not read the studies containing c1" in s for s in result["missing_signals"])
+    assert any(f["severity"] == "unresolved" for f in result["findings"])
+
+
+@pytest.mark.parametrize(("objects", "errors"), [
+    # Entity unreadable for a reason other than not found: none of its checks were performed.
+    ({}, {"c1": MetaApiError(message="(#200) Permissions error", status_code=403, code=200)}),
+    # Meta returned no account_id: the same-account check was not performed.
+    ({"c1": {"id": "c1", "effective_status": "ACTIVE"}}, {}),
+    # Deleted entity: no documented study rule, so it is not settled either way.
+    ({"c1": _campaign("c1", status="DELETED")}, {}),
+])
+def test_eligibility_unperformed_or_unsettled_checks_are_inconclusive(monkeypatch, objects, errors) -> None:
+    use(monkeypatch, FakeStudyClient(objects=objects, errors=errors))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["entities"][0]["outcome"] == "inconclusive"
+    assert result["precheck_outcome"] == "inconclusive"
+    assert result["eligible_by_local_precheck"] is None
+
+
+def test_eligibility_incomplete_account_count_is_inconclusive(monkeypatch) -> None:
+    use(monkeypatch, PagedStudyClient(
+        {("act_123", "impacting_ad_studies", None): {
+            "data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"}}},
+        objects={"c1": _campaign("c1")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["entities"][0]["outcome"] == "passed"
+    assert result["account"]["unresolved"]
+    assert result["precheck_outcome"] == "inconclusive"
+
+
+def test_eligibility_blocker_outranks_unresolved(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"c1": _campaign("c1", account="999"), "c2": _campaign("c2", status="ARCHIVED")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1", "c2"]))
+    assert [entity["outcome"] for entity in result["entities"]] == ["failed", "inconclusive"]
+    assert result["precheck_outcome"] == "failed"
+    assert result["eligible_by_local_precheck"] is False
 
 
 def test_eligibility_blocks_at_documented_concurrent_study_limit(monkeypatch) -> None:
@@ -355,6 +559,95 @@ def test_eligibility_blocks_at_documented_concurrent_study_limit(monkeypatch) ->
     assert result["account"]["blockers"]
 
 
+class PagedStudyClient(FakeStudyClient):
+    """Serves edge pages keyed by (parent, edge, after cursor)."""
+
+    def __init__(self, pages, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.pages = pages
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        self.calls.append(("list", parent_id, edge, list(fields or []), params))
+        if (parent_id, edge) in self.errors:
+            raise self.errors[(parent_id, edge)]
+        return self.pages.get((parent_id, edge, (params or {}).get("after")), {"data": []})
+
+
+RUNNING = ("2026-11-01T00:00:00+0000", "2026-11-30T00:00:00+0000")
+
+
+def test_study_count_with_next_page_but_no_cursor_is_not_complete() -> None:
+    """F11: a next link without a usable cursor is incomplete, never a completed count."""
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): {
+            "data": [_study("s1", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/?after=unextracted"},
+        },
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["count_complete"] is False
+    assert result["active_studies"] == 1
+    assert "no cursor" in result["stop_reason"]
+
+
+def test_study_count_repeated_cursor_stops_incomplete() -> None:
+    page = {"data": [_study("s1", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/next", "cursors": {"after": "same"}}}
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): page,
+        ("act_10", "impacting_ad_studies", "same"): page,
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["count_complete"] is False
+    assert result["pages_read"] == 2
+    assert "already read" in result["stop_reason"]
+
+
+def test_study_count_pages_to_the_last_page() -> None:
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): {
+            "data": [_study("s1", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/next", "cursors": {"after": "p2"}},
+        },
+        ("act_10", "impacting_ad_studies", "p2"): {"data": [_study("s2", "LIFT", *RUNNING)]},
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result == {"active_studies": 2, "pages_read": 2, "count_complete": True, "stop_reason": None}
+
+
+def test_eligibility_does_not_miss_entity_study_second_page(monkeypatch) -> None:
+    """F20: the entity's ad_studies edge is paged, so a running study on page two is found."""
+    use(monkeypatch, PagedStudyClient(
+        {("c1", "ad_studies", None): {"data": [], "paging": {"next": "https://graph.invalid/n",
+                                                             "cursors": {"after": "p2"}}},
+         ("c1", "ad_studies", "p2"): {"data": [_study("s50", "SPLIT_TEST", *RUNNING)]}},
+        objects={"c1": _campaign("c1")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    entity = result["entities"][0]
+    assert [study["id"] for study in entity["active_studies"]] == ["s50"]
+    assert entity["active_studies_complete"] is True
+
+
+@pytest.mark.parametrize("paging", [
+    {"next": "https://graph.invalid/?after=unextracted"},
+    {"next": "https://graph.invalid/n", "cursors": {"after": "p1"}},
+])
+def test_eligibility_reports_incomplete_entity_study_read(monkeypatch, paging) -> None:
+    """F20: a missing cursor or the page cap leaves the entity's study list incomplete, and it is said."""
+    monkeypatch.setattr(experiments, "ENTITY_STUDY_SCAN_PAGES", 1)
+    use(monkeypatch, PagedStudyClient(
+        {("c1", "ad_studies", None): {"data": [], "paging": paging}},
+        objects={"c1": _campaign("c1")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    entity = result["entities"][0]
+    assert entity["active_studies"] == []
+    assert entity["active_studies_complete"] is False
+    assert any("studies containing c1" in signal for signal in result["missing_signals"])
+    assert result["precheck_outcome"] == "inconclusive"
+
+
 @pytest.mark.parametrize("kwargs", [
     {"level": "ad", "entity_ids": ["a1"]},
     {"level": "campaign", "entity_ids": []},
@@ -364,6 +657,23 @@ def test_eligibility_validation(monkeypatch, kwargs) -> None:
     no_client(monkeypatch)
     with pytest.raises(experiments.ValidationError):
         run(experiments.check_ab_test_eligibility(account_id="123", **kwargs))
+
+
+@pytest.mark.parametrize("account_id", ["   ", "", "act_"])
+@pytest.mark.parametrize("tool", ["check_ab_test_eligibility", "create_ab_test", "create_lift_study"])
+def test_experiment_required_account_cannot_be_blank(monkeypatch, tool, account_id) -> None:
+    """F33: a blank account id is rejected before any client is created, even with business_id."""
+    no_client(monkeypatch)
+    if tool == "check_ab_test_eligibility":
+        call = experiments.check_ab_test_eligibility(
+            account_id=account_id, level="campaign", entity_ids=["c1"],
+        )
+    elif tool == "create_ab_test":
+        call = _ab(account_id=account_id, cells=_cells(50, 50, key="campaign_ids"))
+    else:
+        call = _lift(account_id=account_id)
+    with pytest.raises(experiments.ValidationError, match="account_id"):
+        run(call)
 
 
 # --- create_ab_test ----------------------------------------------------------------
@@ -535,6 +845,29 @@ def test_create_lift_study_uses_campaign_cells_when_given(monkeypatch) -> None:
     assert payload["observation_end_time"] == FUTURE_END_TS + 7 * 86400
 
 
+def test_lift_cell_allocations_cannot_exceed_population(monkeypatch) -> None:
+    """F24: percentages are shares of the whole population, so two 90/10 cells (200%) are rejected."""
+    no_client(monkeypatch)
+    cells = [{"name": "A", "treatment_percentage": 90, "control_percentage": 10, "campaign_ids": ["c1"]},
+             {"name": "B", "treatment_percentage": 90, "control_percentage": 10, "campaign_ids": ["c2"]}]
+    with pytest.raises(experiments.ValidationError, match="total 200"):
+        run(_lift(cells=cells))
+
+
+@pytest.mark.parametrize("cells", [
+    # Meta's multi-cell example: A 50/20 and B 20/10, totalling 100.
+    [{"name": "A", "treatment_percentage": 50, "control_percentage": 20, "campaign_ids": ["c1"]},
+     {"name": "B", "treatment_percentage": 20, "control_percentage": 10, "campaign_ids": ["c2"]}],
+    # Documented under-allocation: three evenly split groups totalling 99.
+    [{"name": n, "treatment_percentage": 30, "control_percentage": 3, "campaign_ids": [f"c{n}"]}
+     for n in ("A", "B", "C")],
+])
+def test_lift_cell_allocations_at_or_under_population_are_sent(monkeypatch, cells) -> None:
+    client = use(monkeypatch, FakeStudyClient())
+    run(_lift(cells=cells))
+    assert client.kinds() == ["create"]
+
+
 @pytest.mark.parametrize("overrides", [
     {"start_time": "2026-11-01T00:00:00Z"},
     {"cells": [{"name": "T", "treatment_percentage": 80, "control_percentage": 10}]},
@@ -598,11 +931,76 @@ def test_update_ad_study_rejects_past_end_time(monkeypatch) -> None:
     assert client.kinds() == ["get"]
 
 
+SCHEDULED_STUDY = {
+    "id": "study_1", "name": "Planned", "type": "SPLIT_TEST",
+    "start_time": "2026-12-01T00:00:00+0000", "end_time": "2026-12-15T00:00:00+0000",
+}
+SCHEDULED_LIFT = {
+    **SCHEDULED_STUDY, "type": "LIFT", "observation_end_time": "2026-12-15T00:00:00+0000",
+}
+
+
+@pytest.mark.parametrize(("study", "kwargs"), [
+    # F23: new start after the stored end.
+    (SCHEDULED_STUDY, {"start_time": "2026-12-20T00:00:00Z"}),
+    # F23: new end before the stored (future) start.
+    (SCHEDULED_STUDY, {"end_time": "2026-11-20T00:00:00Z"}),
+    # Lift study: new end past the stored observation end with no new observation end.
+    (SCHEDULED_LIFT, {"end_time": "2026-12-20T00:00:00Z"}),
+    # Lift study: an observation end supplied in params that is before the new end.
+    (SCHEDULED_LIFT, {"end_time": "2026-12-20T00:00:00Z",
+                      "params": {"observation_end_time": "2026-12-18T00:00:00Z"}}),
+])
+def test_update_study_one_sided_edit_is_checked_against_stored_values(monkeypatch, study, kwargs) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    with pytest.raises(experiments.ValidationError):
+        run(experiments.update_ad_study(study_id="study_1", **kwargs))
+    assert client.kinds() == ["get"]
+
+
+@pytest.mark.parametrize(("study", "kwargs"), [
+    (SCHEDULED_STUDY, {"start_time": "2026-12-10T00:00:00Z"}),
+    (SCHEDULED_STUDY, {"end_time": "2026-12-20T00:00:00Z"}),
+    (SCHEDULED_LIFT, {"end_time": "2026-12-20T00:00:00Z",
+                      "params": {"observation_end_time": "2026-12-27T00:00:00Z"}}),
+])
+def test_update_study_valid_one_sided_edit_is_sent(monkeypatch, study, kwargs) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    run(experiments.update_ad_study(study_id="study_1", **kwargs))
+    assert client.kinds() == ["get", "update"]
+
+
+def test_update_study_bad_params_observation_end_fails_before_network(monkeypatch) -> None:
+    no_client(monkeypatch)
+    with pytest.raises(experiments.ValidationError, match="observation_end_time"):
+        run(experiments.update_ad_study(study_id="study_1", params={"observation_end_time": "soon"}))
+
+
 def test_update_ad_study_passes_params_and_reports_them(monkeypatch) -> None:
     client = use(monkeypatch, FakeStudyClient(objects={"study_1": RUNNING_STUDY}))
     result = run(experiments.update_ad_study(study_id="study_1", params={"confidence_level": 0.8}))
     assert client.calls[1] == ("update", "study_1", {"confidence_level": 0.8})
     assert result["current"] == {"confidence_level": 0.8}
+    # F25: confidence_level is writable but not a readable Ad Study field, so no prior value is invented.
+    assert "confidence_level" not in client.calls[0][2]
+    assert "confidence_level" not in result["previous"]
+    assert list(result["previous"]["unavailable_previous_values"]) == ["confidence_level"]
+    assert "could not be read" in result["previous"]["unavailable_previous_values"]["confidence_level"]
+
+
+def test_update_ad_study_params_change_reads_previous_value(monkeypatch) -> None:
+    """F25: a readable field changed through params is in the pre-read, so previous is its real value."""
+    study = {**SCHEDULED_LIFT, "cooldown_start_time": "2026-12-01T00:00:00+0000"}
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    result = run(experiments.update_ad_study(
+        study_id="study_1", params={"cooldown_start_time": FUTURE_START_TS + 3600},
+    ))
+    assert client.calls[0] == ("get", "study_1", [
+        "id", "name", "description", "type", "start_time", "end_time", "observation_end_time",
+        "canceled_time", "cooldown_start_time",
+    ], None)
+    assert result["previous"]["cooldown_start_time"] == "2026-12-01T00:00:00+0000"
+    assert "unavailable_previous_values" not in result["previous"]
 
 
 # --- cancel_ad_study -----------------------------------------------------------------
@@ -642,6 +1040,28 @@ def test_cancel_ad_study_finished_study_sends_nothing(monkeypatch, study) -> Non
     assert result["ok"] is False
     assert result["current"]["operation"] == "none"
     assert result["previous"]["state"] in {"ended", "canceled"}
+
+
+@pytest.mark.parametrize("end_time", ["2026-11-12T12:00:30+0000", "2026-11-12T12:01:00+0000"])
+def test_cancel_study_never_extends_running_study(monkeypatch, end_time) -> None:
+    """F4: a running study already ending within the grace interval is left alone, never extended."""
+    study = {**RUNNING_STUDY, "end_time": end_time}
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    result = run(experiments.cancel_ad_study(study_id="study_1"))
+    assert client.kinds() == ["get"]
+    assert result["previous"]["state"] == "running"
+    assert result["current"]["operation"] == "none"
+    assert datetime.fromisoformat(result["current"]["end_time"]) == datetime.fromisoformat(end_time)
+    assert "finish on its own shortly" in result["message"]
+    assert "Nothing was sent" in result["message"]
+
+
+def test_cancel_study_moves_end_earlier_when_it_ends_after_grace(monkeypatch) -> None:
+    study = {**RUNNING_STUDY, "end_time": "2026-11-12T12:01:01+0000"}
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    result = run(experiments.cancel_ad_study(study_id="study_1"))
+    assert client.calls[1] == ("update", "study_1", {"end_time": NOW_TS + 60})
+    assert result["current"]["operation"] == "end_early"
 
 
 def test_cancel_ad_study_failed_pre_read_sends_no_write(monkeypatch) -> None:
