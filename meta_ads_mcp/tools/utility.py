@@ -126,6 +126,14 @@ TOOL_GROUPS = {
     "research": [
         "search_ads_archive",
     ],
+    "assets": [
+    ],
+    "signals": [
+    ],
+    "experiments": [
+    ],
+    "catalog": [
+    ],
     "auth": [
         "generate_auth_url",
         "exchange_code_for_token",

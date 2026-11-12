@@ -13,7 +13,8 @@ def read_only_tool_names() -> set[str]:
     from meta_ads_mcp.tools.utility import TOOL_GROUPS
 
     groups = ("discovery", "analysis", "activity", "optimization", "social_feedback",
-              "planning", "research", "docs", "utility")
+              "planning", "research", "assets", "signals", "experiments", "catalog",
+              "docs", "utility")
     return {name for group in groups for name in TOOL_GROUPS[group]} | {
         "search_tools", "call_tool", "get_ad_image", "preview_ad",
         "generate_auth_url", "get_token_info", "validate_token",
