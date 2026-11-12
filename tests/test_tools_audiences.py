@@ -288,24 +288,36 @@ def _sha(value: str) -> str:
 
 
 class FakeUsersClient:
-    """Records audience user uploads; can fail on one batch with a value-echoing error."""
+    """Records audience user uploads; can fail on one batch with a value-echoing error.
 
-    def __init__(self, *, fail_on_batch: int | None = None, error: Exception | None = None) -> None:
+    num_received follows Meta's add-members guide: the total received in the session so far.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_on_batch: int | None = None,
+        error: Exception | None = None,
+        invalid_entries: list[int] | None = None,
+    ) -> None:
         self.requests: list[dict[str, object]] = []
         self.fail_on_batch = fail_on_batch
         self.error = error
+        self.invalid_entries = invalid_entries
+        self.received = 0
 
     def _record(self, method: str, parent_id: str, edge: str, data: dict) -> dict:
         self.requests.append({"method": method, "parent_id": parent_id, "edge": edge, "data": data})
         if self.fail_on_batch == len(self.requests):
             raise self.error
         rows = data["payload"]["data"]
+        self.received += len(rows)
         return {
             "audience_id": parent_id,
             "session_id": str(data["session"]["session_id"]),
-            "num_received": len(rows),
-            "num_invalid_entries": 0,
-            "invalid_entry_samples": {rows[0][0]: "sample echoing a hash"},
+            "num_received": self.received,
+            "num_invalid_entries": self.invalid_entries[len(self.requests) - 1] if self.invalid_entries else 0,
+            "invalid_entry_samples": {next(value for value in rows[0] if value): "sample echoing a hash"},
         }
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
@@ -582,8 +594,52 @@ def test_audience_users_batches_share_one_session(monkeypatch) -> None:
     assert [len(request["data"]["payload"]["data"]) for request in client.requests] == [2, 2, 1]
     assert result["session"]["batches"] == 3
     assert result["session"]["session_id"] == str(sessions[0]["session_id"])
-    assert result["meta"] == {"num_received": 5, "num_invalid_entries": 0}
+    assert [batch["num_received"] for batch in result["batches"]] == [2, 4, 5]
+    # num_received is a session-to-date count, so the latest value is the session total.
+    assert result["meta"]["num_received"] == 5 == result["rows_sent"]
     assert "invalid_entry_samples" not in json.dumps(result)
+
+
+def test_audience_users_received_count_is_latest_session_snapshot(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+
+    class Snapshots(FakeUsersClient):
+        snapshots = iter([10_000, 20_000, None])
+
+        def _record(self, method, parent_id, edge, data):
+            response = super()._record(method, parent_id, edge, data)
+            response["num_received"] = next(self.snapshots)
+            return response
+
+    client = Snapshots()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL"], rows=[[f"u{index}@example.com"] for index in range(3)],
+    ))
+    # The last batch did not report a count, so the latest reported snapshot is used and labelled.
+    assert result["meta"]["num_received"] == 20_000
+    assert result["meta"]["num_received_as_of_batch"] == 2
+    assert [batch["num_received"] for batch in result["batches"]] == [10_000, 20_000, None]
+
+
+def test_audience_users_invalid_entry_count_is_not_summed_across_batches(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+    client = FakeUsersClient(invalid_entries=[1, 1])
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL"], rows=[["a@example.com"], ["b@example.com"]],
+    ))
+    # Meta does not document whether this counter is per request or session-to-date.
+    assert result["meta"]["num_invalid_entries"] is None
+    assert "num_invalid_entries" in result["meta"]["counter_note"]
+    assert [batch["num_invalid_entries"] for batch in result["batches"]] == [1, 1]
+
+    single = FakeUsersClient(invalid_entries=[3])
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: single)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL"], rows=[["a@example.com"]],
+    ))
+    assert result["meta"] == {"num_received": 1, "num_received_as_of_batch": 1, "num_invalid_entries": 3}
 
 
 @pytest.mark.parametrize(

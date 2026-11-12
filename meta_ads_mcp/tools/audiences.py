@@ -606,6 +606,33 @@ def _sanitized_upload_error(
     )
 
 
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _session_counters(batch_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize Meta's per-response counters without adding them up.
+
+    Meta's add-members guide defines num_received as the total received in the
+    session so far, so the latest reported value is the session total. It calls
+    num_invalid_entries approximate and does not say whether it covers the request
+    or the session, so it is reported as a total only when there was one batch.
+    """
+    reported = [batch for batch in batch_results if batch["num_received"] is not None]
+    counters: dict[str, Any] = {
+        "num_received": reported[-1]["num_received"] if reported else None,
+        "num_received_as_of_batch": reported[-1]["batch_seq"] if reported else None,
+        "num_invalid_entries": batch_results[0]["num_invalid_entries"] if len(batch_results) == 1 else None,
+    }
+    if len(batch_results) > 1:
+        counters["counter_note"] = (
+            "num_received is Meta's session-to-date count from the latest batch that reported it. "
+            "Meta does not say whether num_invalid_entries covers one request or the session, so no "
+            "total is given; see batches for each reported value."
+        )
+    return counters
+
+
 async def _send_audience_users(
     *,
     action: str,
@@ -644,7 +671,6 @@ async def _send_audience_users(
     session_id = secrets.randbelow(2**62) + 1
     client = get_graph_api_client()
     send = client.create_edge_object if action == "add_audience_users" else client.delete_edge_object
-    totals = {"num_received": 0, "num_invalid_entries": 0}
     batch_results: list[dict[str, Any]] = []
     for batch_seq, (batch, batch_raw) in enumerate(batches, start=1):
         data = {
@@ -674,12 +700,9 @@ async def _send_audience_users(
             # echo uploaded values, is not chained as __context__.
             raise failure
         counts = {
-            key: result.get(key) if isinstance(result.get(key), int) else None
+            key: result.get(key) if _is_count(result.get(key)) else None
             for key in ("num_received", "num_invalid_entries")
         }
-        for key, value in counts.items():
-            if value is not None:
-                totals[key] += value
         batch_results.append({"batch_seq": batch_seq, "rows_sent": len(batch), **counts})
     return {
         "ok": True,
@@ -697,7 +720,7 @@ async def _send_audience_users(
             "batches": len(batches),
             "last_batch_flag_sent": True,
         },
-        "meta": totals,
+        "meta": _session_counters(batch_results),
         "batches": batch_results,
         "privacy_note": "No row values or hashes are returned; the sample invalid entries Meta sends back are discarded.",
     }
