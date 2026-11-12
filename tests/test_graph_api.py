@@ -948,3 +948,54 @@ def test_request_rejects_http_method_override(recording_client, key, http_method
     with pytest.raises(ValidationError, match="method"):
         asyncio.run(_client().request(http_method, "123", **{kind: {key: "delete"}}))
     assert recording_client.sent == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.get_object("123/products"),
+        lambda c: c.update_object("123/products", data={"name": "x"}),
+        lambda c: c.delete_object("123/products"),
+        lambda c: c.list_objects("123/products", "ads"),
+        lambda c: c.list_objects("123", "ads/456"),
+        lambda c: c.create_edge_object("123/products", "ads", data={"name": "x"}),
+        lambda c: c.create_edge_object("123", "ads/456", data={"name": "x"}),
+        lambda c: c.delete_edge_object("123/x", "users", data={"a": 1}),
+        lambda c: c.delete_edge_object("123", "users/9", data={"a": 1}),
+        lambda c: c.get_insights("act_1/campaigns", fields=["spend"], params={}),
+        lambda c: c.create_async_insights_report("act_1/campaigns", fields=["spend"], params={}),
+        lambda c: c.get_object(""),
+        lambda c: c.get_object("me/accounts"),
+    ],
+)
+def test_node_and_edge_helpers_require_single_segment_ids(recording_client, call) -> None:
+    """An id with a slash would turn an update of one object into a write on another edge."""
+    with pytest.raises(ValidationError):
+        asyncio.run(call(_client()))
+    assert recording_client.sent == []
+
+
+def test_node_and_edge_helpers_accept_ordinary_ids(recording_client) -> None:
+    client = _client()
+    asyncio.run(client.get_object("act_123", fields=["id"]))
+    asyncio.run(client.get_object("me"))
+    asyncio.run(client.list_objects("act_123", "ads"))
+    asyncio.run(client.update_object("123_456", data={"name": "x"}))
+    asyncio.run(client.create_edge_object("act_123", "adcreatives", data={"name": "x"}))
+    asyncio.run(client.delete_edge_object("123", "users", data={"a": 1}))
+    asyncio.run(client.get_insights("act_123", fields=["spend"], params={}))
+    assert len(recording_client.sent) == 7
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.estimate_audience_size(account_id="123/ads", targeting_spec={"geo_locations": {"countries": ["US"]}}),
+        lambda c: c.preview_ad(account_id="act_123/ads", creative={"object_story_id": "1_2"}, ad_format="DESKTOP_FEED_STANDARD"),
+        lambda c: c.get_ad_images_by_hashes("act_1/ads", hashes=["abc"]),
+    ],
+)
+def test_account_scoped_helpers_reject_an_account_id_with_a_path(recording_client, call) -> None:
+    with pytest.raises(ValidationError):
+        asyncio.run(call(_client()))
+    assert recording_client.sent == []

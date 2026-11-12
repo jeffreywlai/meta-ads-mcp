@@ -65,6 +65,25 @@ def _validate_endpoint(endpoint: str) -> None:
         )
 
 
+def _segment(value: str) -> str:
+    """Return one caller-supplied path segment, refusing anything that is not one.
+
+    Object ids and edge names come from tool callers. An id such as
+    ``123/products`` would turn an update of object 123 into a write on its
+    ``products`` edge, so node and edge helpers accept a single segment only.
+    """
+    if (
+        not isinstance(value, str)
+        or value in {".", ".."}
+        or _ENDPOINT_SEGMENT.fullmatch(value) is None
+    ):
+        raise ValidationError(
+            "A Graph object id or edge name must be a single value containing only "
+            "letters, digits, '_', '-', '.' and ':'."
+        )
+    return value
+
+
 def _reject_method_override(mapping: dict[str, Any] | None, kind: str) -> None:
     """Refuse a ``method`` parameter, which Graph treats as an HTTP method override."""
     if not mapping:
@@ -430,7 +449,7 @@ class GraphAPIClient:
         query = dict(params or {})
         if serialized_fields := _serialize_fields(fields):
             query["fields"] = serialized_fields
-        return await self.request("GET", object_id, params=query)
+        return await self.request("GET", _segment(object_id), params=query)
 
     async def list_objects(
         self,
@@ -444,7 +463,7 @@ class GraphAPIClient:
         query = dict(params or {})
         if serialized_fields := _serialize_fields(fields):
             query["fields"] = serialized_fields
-        return await self.request("GET", f"{parent_id}/{edge}", params=query)
+        return await self.request("GET", f"{_segment(parent_id)}/{_segment(edge)}", params=query)
 
     async def update_object(
         self,
@@ -453,7 +472,7 @@ class GraphAPIClient:
         data: dict[str, Any],
     ) -> dict[str, Any]:
         """Send an object update."""
-        return await self.request("POST", object_id, data=data)
+        return await self.request("POST", _segment(object_id), data=data)
 
     async def create_edge_object(
         self,
@@ -464,11 +483,11 @@ class GraphAPIClient:
         files: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create an object on a collection edge."""
-        return await self.request("POST", f"{parent_id}/{edge}", data=data, files=files)
+        return await self.request("POST", f"{_segment(parent_id)}/{_segment(edge)}", data=data, files=files)
 
     async def delete_object(self, object_id: str) -> dict[str, Any]:
         """Delete an object."""
-        return await self.request("DELETE", object_id)
+        return await self.request("DELETE", _segment(object_id))
 
     async def get_insights(
         self,
@@ -480,7 +499,7 @@ class GraphAPIClient:
         """Fetch insights for an object."""
         query = dict(params or {})
         query["fields"] = _serialize_fields(fields) or ""
-        return await self.request("GET", f"{object_id}/insights", params=query)
+        return await self.request("GET", f"{_segment(object_id)}/insights", params=query)
 
     async def create_async_insights_report(
         self,
@@ -495,7 +514,7 @@ class GraphAPIClient:
         query = dict(params or {})
         query["fields"] = _serialize_fields(fields) or ""
         query["async"] = "true"
-        return await self.request("POST", f"{object_id}/insights", data=query)
+        return await self.request("POST", f"{_segment(object_id)}/insights", data=query)
 
     async def get_async_report(
         self,
@@ -634,7 +653,7 @@ class GraphAPIClient:
             params["after"] = cursor
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/broadtargetingcategories",
+            f"{_segment(normalize_account_id(account_id))}/broadtargetingcategories",
             params=params,
         )
 
@@ -648,7 +667,7 @@ class GraphAPIClient:
         """Fetch reach estimate data for a targeting spec."""
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/reachestimate",
+            f"{_segment(normalize_account_id(account_id))}/reachestimate",
             params={
                 "targeting_spec": json.dumps(targeting_spec),
                 **({"optimization_goal": optimization_goal} if optimization_goal else {}),
@@ -749,7 +768,7 @@ class GraphAPIClient:
             params["appsecret_proof"] = appsecret_proof
         return await self.request(
             "POST",
-            f"{system_user_id}/access_tokens",
+            f"{_segment(system_user_id)}/access_tokens",
             data={"business_app": business_app, "scope": scope},
             use_auth_header=False,
             params=params,
@@ -776,7 +795,7 @@ class GraphAPIClient:
             params["creative"] = creative
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/generatepreviews",
+            f"{_segment(normalize_account_id(account_id))}/generatepreviews",
             params=params,
         )
 
@@ -815,7 +834,7 @@ class GraphAPIClient:
             params["fields"] = serialized_fields
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/adimages",
+            f"{_segment(normalize_account_id(account_id))}/adimages",
             params=params,
         )
 
@@ -851,7 +870,7 @@ class GraphAPIClient:
         data: dict[str, Any],
     ) -> dict[str, Any]:
         """Send a DELETE to a collection edge with form-encoded parameters in the body."""
-        return await self.request("DELETE", f"{parent_id}/{edge}", data=data)
+        return await self.request("DELETE", f"{_segment(parent_id)}/{_segment(edge)}", data=data)
 
 
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:
