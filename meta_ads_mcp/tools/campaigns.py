@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from meta_ads_mcp.api_compat import validate_targeting_placements
@@ -290,6 +291,44 @@ _ADSET_MINOR_UNIT_FIELDS = {
     "lifetime_min_spend_target",
 }
 _UPDATABLE_ADSET_STATUSES = {"ACTIVE", "PAUSED"}
+_ADSET_TIME_FORMAT = "an ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00) or Unix seconds"
+
+
+def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
+    """Check an ad set schedule time; None when absent or end_time 0 (Meta's no-end-date value)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.")
+    text = value.strip()
+    if text.isdigit():
+        seconds = int(text)
+        if seconds == 0 and field_name == "end_time":
+            return None
+        if seconds == 0:
+            raise ValidationError(f"{field_name} must be a positive Unix time.")
+        return datetime.fromtimestamp(seconds, timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.") from exc
+    if parsed.tzinfo is None:
+        raise ValidationError(
+            f"{field_name} needs a UTC offset or Z (for example 2026-12-01T00:00:00-05:00) "
+            "so the schedule does not shift by the account's time zone."
+        )
+    return parsed
+
+
+def _stored_adset_time(value: Any) -> datetime | None:
+    """Read a stored ad set time such as 2026-12-01T00:00:00+0000; None when absent or unreadable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 @mcp_server.tool()
@@ -324,6 +363,10 @@ async def update_adset(
         )
     if targeting is not None:
         validate_targeting_placements(targeting)
+    new_start = _validate_adset_time(start_time, "start_time")
+    new_end = _validate_adset_time(end_time, "end_time")
+    if new_start is not None and new_end is not None and new_end <= new_start:
+        raise ValidationError("end_time must be after start_time.")
     typed = {
         "name": name,
         "targeting": targeting,
@@ -343,8 +386,26 @@ async def update_adset(
     readable = FIELD_REFERENCE["adset"]
     read_fields = [key for key in changes if key in readable]
     not_read = [key for key in changes if key not in readable]
+    # A one-sided schedule edit is checked against the stored other bound.
+    other_bound = None
+    if new_start is not None and end_time is None:
+        other_bound = "end_time"
+    elif new_end is not None and start_time is None:
+        other_bound = "start_time"
+    bound_reads = [other_bound] if other_bound and other_bound not in read_fields else []
     client = get_graph_api_client()
-    previous = await client.get_object(adset_id, fields=["id", *read_fields])
+    previous = await client.get_object(adset_id, fields=["id", *read_fields, *bound_reads])
+    stored = _stored_adset_time(previous.get(other_bound)) if other_bound else None
+    if stored is not None and other_bound == "end_time" and new_start is not None and new_start >= stored:
+        raise ValidationError(
+            f"start_time must be before the ad set's stored end_time {previous.get('end_time')}; "
+            "nothing was changed. Pass a later end_time as well."
+        )
+    if stored is not None and other_bound == "start_time" and new_end is not None and new_end <= stored:
+        raise ValidationError(
+            f"end_time must be after the ad set's stored start_time {previous.get('start_time')}; "
+            "nothing was changed."
+        )
     result = await client.update_object(adset_id, data=payload)
     response = mutation_response(
         action="update_adset",

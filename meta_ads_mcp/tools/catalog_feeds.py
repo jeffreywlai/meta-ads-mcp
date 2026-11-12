@@ -85,6 +85,9 @@ FEED_UPDATE_READ_FIELDS = [
     "update_schedule",
     "migrated_from_feed_id",
 ]
+# Fields this module already reads from a ProductFeed; a params change to one of
+# them is read first so previous shows its real prior value.
+FEED_READABLE_FIELDS = frozenset(field.split("{", 1)[0] for field in FEED_FIELDS)
 RULE_FIELDS = ["id", "attribute", "rule_type", "params"]
 EVENT_SOURCE_FIELDS = ["id", "name", "source_type"]
 EVENT_STAT_FIELDS = [
@@ -129,6 +132,7 @@ LETTER_CASE_TYPES = ("to_upper", "to_lower", "capitalize_all", "capitalize_first
 VALUE_MAPPING_MAX_PAIRS = 10
 VALUE_MAPPING_MAX_LENGTH = 20
 DA_CHECK_SOURCE_TYPES = ("PIXEL", "APP")
+DA_CHECK_EVALUATED_RESULTS = ("passed", "failed")
 
 MAX_CATALOGS_SCANNED = 50
 CATALOG_SCAN_PAGE_SIZE = 25
@@ -191,10 +195,20 @@ async def _collect_edge(
     max_items: int | None = None,
     max_pages: int = MAX_EDGE_PAGES,
     extra_params: dict[str, Any] | None = None,
+    stop_reasons: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Read an edge across pages up to a cap; report whether the end was reached."""
+    """Read an edge across pages up to a cap; report whether the end was reached.
+
+    The end is reached only when Meta's page has no next link. When the read stops
+    early, a plain-language reason is appended to stop_reasons if a list is given.
+    """
     items: list[dict[str, Any]] = []
     after: str | None = None
+
+    def stopped(reason: str) -> None:
+        if stop_reasons is not None:
+            stop_reasons.append(f"{edge} of {parent_id}: {reason}")
+
     for _ in range(max_pages):
         params: dict[str, Any] = {**(extra_params or {}), "limit": page_size}
         if after:
@@ -202,12 +216,19 @@ async def _collect_edge(
         payload = await client.list_objects(parent_id, edge, fields=fields, params=params)
         page = normalize_collection(payload)
         items.extend(page["items"])
+        has_next = bool(page["paging"].get("next"))
         if max_items is not None and len(items) >= max_items:
-            more = len(items) > max_items or bool(page["paging"].get("next"))
+            more = len(items) > max_items or has_next
+            if more:
+                stopped(f"stopped at the {max_items}-item cap; more items exist.")
             return items[:max_items], not more
-        after = page["paging"].get("after")
-        if not page["paging"].get("next") or not after:
+        if not has_next:
             return items, True
+        after = page["paging"].get("after")
+        if not after:
+            stopped("Meta reported another page but gave no cursor to read it.")
+            return items, False
+    stopped(f"stopped after {max_pages} pages; more pages exist.")
     return items, False
 
 
@@ -366,20 +387,62 @@ def _validate_rule_params(rule_type: str, params: Any) -> dict[str, str]:
     return dict(params)
 
 
-async def _connected_sources(client: Any, catalog_id: str) -> tuple[list[dict[str, Any]], bool]:
+async def _connected_sources(
+    client: Any, catalog_id: str, stop_reasons: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     return await _collect_edge(
         client, catalog_id, "external_event_sources",
-        fields=EVENT_SOURCE_FIELDS, page_size=100, max_pages=5,
+        fields=EVENT_SOURCE_FIELDS, page_size=100, max_pages=5, stop_reasons=stop_reasons,
     )
 
 
-def _match_rate(matched: int, unmatched: int) -> float | None:
+def _match_rate(matched: int | None, unmatched: int | None) -> float | None:
+    """Matched share of content ids; None unless both counters are known."""
+    if matched is None or unmatched is None:
+        return None
     total = matched + unmatched
     return round(matched / total, 4) if total else None
 
 
+def _add_counts(totals: list[int], matched: int | None, unmatched: int | None) -> None:
+    """Add one row's counters; [matched, unmatched, rows missing matched, rows missing unmatched]."""
+    if matched is None:
+        totals[2] += 1
+    else:
+        totals[0] += matched
+    if unmatched is None:
+        totals[3] += 1
+    else:
+        totals[1] += unmatched
+
+
+def _counts_view(totals: list[int]) -> dict[str, Any]:
+    """A total is unknown (None) when any row behind it lacked that counter."""
+    matched = None if totals[2] else totals[0]
+    unmatched = None if totals[3] else totals[1]
+    return {
+        "matched_content_ids": matched,
+        "unmatched_content_ids": unmatched,
+        "match_rate": _match_rate(matched, unmatched),
+    }
+
+
+def _known_sum(values: Any) -> int | None:
+    """Sum counters; None when any of them is unknown."""
+    total = 0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], int]:
-    """Group event_stats rows per source: daily match history and per-event totals."""
+    """Group event_stats rows per source: daily match history and per-event totals.
+
+    A counter Meta omitted is unknown, not zero: any total it feeds is None, and
+    match rates are computed only when both counters are known.
+    """
     per_source: dict[str, dict[str, Any]] = {}
     unattributed = 0
     for row in rows:
@@ -387,40 +450,32 @@ def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[s
         if source_id is None:
             unattributed += 1
             continue
-        matched = to_int(row.get("total_matched_content_ids")) or 0
-        unmatched = to_int(row.get("total_unmatched_content_ids")) or 0
-        bucket = per_source.setdefault(source_id, {"days": {}, "events": {}, "matched": 0, "unmatched": 0})
+        matched = to_int(row.get("total_matched_content_ids"))
+        unmatched = to_int(row.get("total_unmatched_content_ids"))
+        bucket = per_source.setdefault(
+            source_id, {"days": {}, "events": {}, "window": [0, 0, 0, 0], "rows_missing_counters": 0},
+        )
+        if matched is None or unmatched is None:
+            bucket["rows_missing_counters"] += 1
         day = str(row.get("date_start") or row.get("date_stop") or "unknown")
-        day_totals = bucket["days"].setdefault(day, [0, 0])
-        day_totals[0] += matched
-        day_totals[1] += unmatched
+        _add_counts(bucket["days"].setdefault(day, [0, 0, 0, 0]), matched, unmatched)
         event = str(row.get("event") or "unknown")
-        event_totals = bucket["events"].setdefault(event, [0, 0])
-        event_totals[0] += matched
-        event_totals[1] += unmatched
-        bucket["matched"] += matched
-        bucket["unmatched"] += unmatched
+        _add_counts(bucket["events"].setdefault(event, [0, 0, 0, 0]), matched, unmatched)
+        _add_counts(bucket["window"], matched, unmatched)
     summaries: dict[str, dict[str, Any]] = {}
     for source_id, bucket in per_source.items():
+        window = _counts_view(bucket["window"])
         summaries[source_id] = {
-            "matched_content_ids": bucket["matched"],
-            "unmatched_content_ids": bucket["unmatched"],
-            "window_match_rate": _match_rate(bucket["matched"], bucket["unmatched"]),
+            "matched_content_ids": window["matched_content_ids"],
+            "unmatched_content_ids": window["unmatched_content_ids"],
+            "window_match_rate": window["match_rate"],
+            "rows_missing_counters": bucket["rows_missing_counters"],
             "match_rate_history": [
-                {
-                    "date": day,
-                    "matched_content_ids": totals[0],
-                    "unmatched_content_ids": totals[1],
-                    "match_rate": _match_rate(*totals),
-                }
+                {"date": day, **_counts_view(totals)}
                 for day, totals in sorted(bucket["days"].items())
             ],
             "by_event": {
-                event: {
-                    "matched_content_ids": totals[0],
-                    "unmatched_content_ids": totals[1],
-                    "match_rate": _match_rate(*totals),
-                }
+                event: _counts_view(totals)
                 for event, totals in sorted(bucket["events"].items())
             },
         }
@@ -437,12 +492,29 @@ def _sorted_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def _catalog_signal_inputs(client: Any, catalog_id: str) -> dict[str, Any]:
-    """Read connected sources and 28-day event stats for one product catalog."""
-    sources, sources_complete = await _connected_sources(client, catalog_id)
+    """Read connected sources and 28-day event stats for one product catalog.
+
+    Each incomplete read adds a plain-language entry to scan_gaps, for missing_signals.
+    """
+    source_reasons: list[str] = []
+    sources, sources_complete = await _connected_sources(client, catalog_id, source_reasons)
+    stat_reasons: list[str] = []
     stat_rows, stats_complete = await _collect_edge(
         client, catalog_id, "event_stats", fields=EVENT_STAT_FIELDS, page_size=500,
+        stop_reasons=stat_reasons,
     )
     stats, unattributed = _summarize_event_stats(stat_rows)
+    scan_gaps: list[str] = []
+    if not sources_complete:
+        scan_gaps.append(
+            "The connected-source list is partial: "
+            f"{' '.join(source_reasons) or 'external_event_sources had more pages than were read.'}"
+        )
+    if not stats_complete:
+        scan_gaps.append(
+            f"event_stats was only partly read ({len(stat_rows)} rows), so 28-day counts and match "
+            f"rates are partial: {' '.join(stat_reasons) or 'more pages exist.'}"
+        )
     return {
         "sources": sources,
         "sources_complete": sources_complete,
@@ -450,6 +522,7 @@ async def _catalog_signal_inputs(client: Any, catalog_id: str) -> dict[str, Any]
         "stats_complete": stats_complete,
         "stats": stats,
         "unattributed_rows": unattributed,
+        "scan_gaps": scan_gaps,
     }
 
 
@@ -553,17 +626,29 @@ async def update_product_feed(
     data = merge_graph_payload(payload, params)
     if not data:
         raise ValidationError("At least one field must be provided for update_product_feed.")
+    extra_reads = [key for key in data if key in FEED_READABLE_FIELDS and key not in FEED_UPDATE_READ_FIELDS]
     client = get_graph_api_client()
-    previous = await client.get_object(feed_id, fields=FEED_UPDATE_READ_FIELDS)
+    previous = await client.get_object(feed_id, fields=[*FEED_UPDATE_READ_FIELDS, *extra_reads])
     await client.update_object(feed_id, data=data)
-    return mutation_response(
+    unavailable: dict[str, str] = {}
+    for key in data:
+        if key not in FEED_READABLE_FIELDS:
+            unavailable[key] = "not a field this server reads back from a product feed"
+        elif key not in previous:
+            unavailable[key] = "Meta returned no value for it; it may have been unset"
+    for key in ("schedule", "update_schedule"):
+        if isinstance(data.get(key), dict) and "password" in data[key]:
+            unavailable[f"{key}.password"] = "schedule passwords are never shown in responses"
+    response = mutation_response(
         action="update_product_feed",
         target={"feed_id": feed_id},
         previous=_redact_schedules({
-            key: previous.get(key) for key in data if key in FEED_UPDATE_READ_FIELDS
+            key: previous[key] for key in data if key in FEED_READABLE_FIELDS and key in previous
         }),
         current=_redact_schedules(data),
     )
+    response["previous_unavailable"] = unavailable
+    return response
 
 
 @mcp_server.tool()
@@ -722,10 +807,11 @@ async def list_event_source_catalogs(
                 "The event source has no readable owner_business; pass business_id to choose "
                 "which business's catalogs to check."
             )
+    stop_reasons: list[str] = []
     catalogs, catalogs_complete = await _collect_edge(
         client, business_id, "owned_product_catalogs",
         fields=CATALOG_SCAN_FIELDS, page_size=CATALOG_SCAN_PAGE_SIZE,
-        max_items=MAX_CATALOGS_SCANNED,
+        max_items=MAX_CATALOGS_SCANNED, stop_reasons=stop_reasons,
     )
     matches: list[dict[str, Any]] = []
     sources_complete = True
@@ -733,7 +819,7 @@ async def list_event_source_catalogs(
         catalog_id = _object_id(catalog.get("id"))
         if catalog_id is None:
             continue
-        sources, complete = await _connected_sources(client, catalog_id)
+        sources, complete = await _connected_sources(client, catalog_id, stop_reasons)
         sources_complete = sources_complete and complete
         if any(_object_id(source.get("id")) == event_source_id for source in sources):
             matches.append(catalog)
@@ -741,8 +827,8 @@ async def list_event_source_catalogs(
     note = (
         "Every owned catalog of the business was checked."
         if complete
-        else f"The scan is incomplete: it stopped after {len(catalogs)} catalogs or a catalog "
-        "had more connected sources than were read. Catalogs not checked may also be connected."
+        else f"The scan is incomplete after checking {len(catalogs)} catalogs: "
+        f"{' '.join(stop_reasons)} Catalogs or sources not read may also be connected."
     )
     return {
         "items": matches,
@@ -752,6 +838,7 @@ async def list_event_source_catalogs(
             "business_id": business_id,
             "catalogs_scanned": len(catalogs),
             "complete": complete,
+            "stop_reasons": stop_reasons,
             "method": "derived: each catalog owned by the business is checked for this source "
             "on its external_event_sources edge; catalogs shared with the business by others "
             "are not checked.",
@@ -791,8 +878,14 @@ async def get_catalog_event_source_health(
             "by_event": stats["by_event"] if stats else {},
             "checks": [],
             "failed_checks": [],
+            "unevaluated_checks": [],
         }
-        if stats is None:
+        if stats is None and not inputs["stats_complete"]:
+            missing.append(
+                f"No event_stats rows for source {source_id} were among the pages read; event_stats "
+                "has more pages, so whether it sent catalog events in the 28-day window is unknown."
+            )
+        elif stats is None:
             missing.append(
                 f"No event_stats rows for source {source_id} in Meta's 28-day window, so no "
                 "match-rate history is available for it."
@@ -806,7 +899,8 @@ async def get_catalog_event_source_health(
                 next_actions=["Confirm the pixel or app fires ViewContent, AddToCart and Purchase with content_ids."],
             ))
         elif (
-            stats["window_match_rate"] is not None
+            inputs["stats_complete"]
+            and stats["window_match_rate"] is not None
             and stats["window_match_rate"] < match_rate_threshold
         ):
             findings.append(build_finding(
@@ -824,12 +918,32 @@ async def get_catalog_event_source_health(
                 affected_entities=[{"event_source_id": source_id}],
                 next_actions=["Make the content_ids the source sends equal the catalog's retailer ids."],
             ))
+        if stats is not None and stats["rows_missing_counters"]:
+            missing.append(
+                f"{stats['rows_missing_counters']} event_stats rows for source {source_id} lacked a "
+                "matched or unmatched counter; totals and match rates those rows feed are unknown (null)."
+            )
         if source_type in DA_CHECK_SOURCE_TYPES:
             checks_payload = await client.list_objects(source_id, "da_checks", fields=DA_CHECK_FIELDS)
-            checks = normalize_collection(checks_payload)["items"]
+            checks_page = normalize_collection(checks_payload)
+            checks = checks_page["items"]
             failed = [check for check in checks if str(check.get("result") or "").lower() == "failed"]
+            unevaluated = [
+                check for check in checks
+                if str(check.get("result") or "").lower() not in DA_CHECK_EVALUATED_RESULTS
+            ]
             report["checks"] = checks
             report["failed_checks"] = failed
+            report["unevaluated_checks"] = unevaluated
+            for check in unevaluated:
+                missing.append(
+                    f"Meta's check {check.get('key')} for source {source_id} returned result "
+                    f"{check.get('result')!r}, so it was neither passed nor failed and could not be evaluated."
+                )
+            if not checks:
+                missing.append(f"Meta returned no Dynamic Ads checks for source {source_id}.")
+            if checks_page["paging"].get("next"):
+                missing.append(f"da_checks for source {source_id} had more pages than were read.")
             for check in failed:
                 findings.append(build_finding(
                     "failed_dynamic_ads_check",
@@ -846,7 +960,7 @@ async def get_catalog_event_source_health(
                 f"{source.get('source_type')!r} is not one documented for da_checks (pixel or app)."
             )
         reports.append(report)
-    if not inputs["sources"]:
+    if not inputs["sources"] and inputs["sources_complete"]:
         findings.append(build_finding(
             "no_connected_event_sources",
             "No pixel or app is connected to this catalog, so catalog ads get no event signal from it.",
@@ -854,17 +968,23 @@ async def get_catalog_event_source_health(
             confidence=0.9,
             next_actions=["Use get_catalog_event_source_recommendations, then connect_catalog_event_source."],
         ))
+    elif not inputs["sources"]:
+        missing.append(
+            "No connected sources were among the pages read, but the list is partial; whether any "
+            "source is connected could not be determined."
+        )
+    missing.extend(inputs["scan_gaps"])
     if not inputs["stats_complete"]:
-        missing.append("event_stats had more pages than were read; history may be partial.")
-    if not inputs["sources_complete"]:
-        missing.append("external_event_sources had more pages than were read.")
+        missing.append("Low-match-rate findings were not made because event_stats was only partly read.")
     if inputs["unattributed_rows"]:
         missing.append(f"{inputs['unattributed_rows']} event_stats rows had no event_source and were not attributed.")
     return analysis_response(
         scope={"catalog_id": catalog_id},
         metrics={
             "connected_sources": len(reports),
+            "sources_complete": inputs["sources_complete"],
             "event_stat_rows": inputs["stat_rows"],
+            "stats_complete": inputs["stats_complete"],
             "match_rate_threshold": match_rate_threshold,
         },
         findings=_sorted_findings(findings),
@@ -902,19 +1022,41 @@ async def get_catalog_event_source_recommendations(
             )
     inputs = await _catalog_signal_inputs(client, catalog_id)
     connected_ids = {_object_id(source.get("id")) for source in inputs["sources"]}
-    matched = sum(stat["matched_content_ids"] for stat in inputs["stats"].values())
-    unmatched = sum(stat["unmatched_content_ids"] for stat in inputs["stats"].values())
-    overall_rate = _match_rate(matched, unmatched)
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
-    coverage_evidence = {
+    matched = _known_sum(stat["matched_content_ids"] for stat in inputs["stats"].values())
+    unmatched = _known_sum(stat["unmatched_content_ids"] for stat in inputs["stats"].values())
+    overall_rate = _match_rate(matched, unmatched)
+    rows_missing_counters = sum(stat["rows_missing_counters"] for stat in inputs["stats"].values())
+    if rows_missing_counters:
+        missing.append(
+            f"{rows_missing_counters} event_stats rows lacked a matched or unmatched counter; "
+            "the 28-day totals and match rate they feed are unknown (null)."
+        )
+    missing.extend(inputs["scan_gaps"])
+    sources_complete = inputs["sources_complete"]
+    stats_complete = inputs["stats_complete"]
+    coverage_evidence: dict[str, Any] = {
         "connected_sources": len(inputs["sources"]),
-        "matched_content_ids_28d": matched,
-        "unmatched_content_ids_28d": unmatched,
-        "match_rate_28d": overall_rate,
+        "sources_complete": sources_complete,
+        "stats_complete": stats_complete,
+        "matched_content_ids_28d": matched if stats_complete else None,
+        "unmatched_content_ids_28d": unmatched if stats_complete else None,
+        "match_rate_28d": overall_rate if stats_complete else None,
         "threshold": match_rate_threshold,
     }
-    if not inputs["sources"]:
+    if not stats_complete:
+        coverage_evidence["partial_counts_from_pages_read"] = {
+            "event_stat_rows": inputs["stat_rows"],
+            "matched_content_ids": matched,
+            "unmatched_content_ids": unmatched,
+        }
+    if not inputs["sources"] and not sources_complete:
+        missing.append(
+            "No connected sources were among the pages read, but the list is partial; whether any "
+            "source is connected could not be determined."
+        )
+    elif not inputs["sources"]:
         findings.append(build_finding(
             "no_connected_event_sources",
             "No pixel or app is connected to this catalog.",
@@ -922,6 +1064,16 @@ async def get_catalog_event_source_recommendations(
             confidence=0.9,
             evidence=[coverage_evidence],
         ))
+    elif not stats_complete:
+        missing.append(
+            "Whether the connected sources' catalog signal coverage is weak could not be determined "
+            "because event_stats was only partly read."
+        )
+    elif matched != 0 and overall_rate is None:
+        missing.append(
+            "Whether the connected sources' catalog signal coverage is weak could not be determined "
+            "because Meta omitted matched or unmatched counters."
+        )
     elif matched == 0 or (overall_rate is not None and overall_rate < match_rate_threshold):
         findings.append(build_finding(
             "weak_catalog_signal_coverage",
@@ -950,12 +1102,22 @@ async def get_catalog_event_source_recommendations(
     ]
     if not pixels:
         missing.append(f"No pixels were returned for business {business_id}, so there are no candidates to recommend.")
+    if candidates and not sources_complete:
+        missing.append(
+            "Candidate pixels were not among the connected sources read, but that list is partial, "
+            "so some candidates may already be connected (connection_status unknown)."
+        )
+    connection_status = "not_connected" if sources_complete else "unknown"
     recommendations: list[dict[str, Any]] = []
     for index, pixel in enumerate(candidates):
         pixel_id = _object_id(pixel.get("id"))
         evidence: list[dict[str, Any]] = [{"last_fired_time": pixel.get("last_fired_time")}]
         strength = "unchecked"
-        reason = "Pixel belongs to the business and is not connected to this catalog."
+        reason = (
+            "Pixel belongs to the business and is not connected to this catalog."
+            if sources_complete
+            else "Pixel belongs to the business and was not among the connected sources read."
+        )
         if index < MAX_PIXEL_CANDIDATES_CHECKED:
             checks_payload = await client.list_objects(pixel_id, "da_checks", fields=DA_CHECK_FIELDS)
             checks = normalize_collection(checks_payload)["items"]
@@ -976,6 +1138,7 @@ async def get_catalog_event_source_recommendations(
             "event_source_id": pixel_id,
             "name": pixel.get("name"),
             "source_type": "PIXEL",
+            "connection_status": connection_status,
             "strength": strength,
             "reason": reason,
             "evidence": evidence,
@@ -1017,6 +1180,28 @@ async def get_catalog_event_source_recommendations(
     )
 
 
+async def _connection_state(
+    client: Any, catalog_id: str,
+) -> tuple[list[dict[str, Any]], list[str], bool, list[str]]:
+    """Read the connected sources; when the read stops early, say so in plain words."""
+    reasons: list[str] = []
+    sources, complete = await _connected_sources(client, catalog_id, reasons)
+    ids = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    gaps: list[str] = []
+    if not complete:
+        gaps.append(
+            f"The connected-source list is partial ({len(ids)} read): "
+            f"{' '.join(reasons) or 'external_event_sources had more pages than were read.'} "
+            "Sources not read are missing from the before and after lists."
+        )
+    return sources, ids, complete, gaps
+
+
+def _with_completeness(response: dict[str, Any], complete: bool, gaps: list[str]) -> dict[str, Any]:
+    response.update({"previous_complete": complete, "missing_signals": gaps})
+    return response
+
+
 @mcp_server.tool()
 async def connect_catalog_event_source(
     catalog_id: str,
@@ -1026,25 +1211,29 @@ async def connect_catalog_event_source(
     catalog_id = _require_id(catalog_id, "catalog_id")
     event_source_id = _require_id(event_source_id, "event_source_id")
     client = get_graph_api_client()
-    sources, _ = await _connected_sources(client, catalog_id)
-    before = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    _, before, complete, gaps = await _connection_state(client, catalog_id)
     target = {"catalog_id": catalog_id, "event_source_id": event_source_id}
     if event_source_id in before:
-        return mutation_response(
+        return _with_completeness(mutation_response(
             action="connect_catalog_event_source",
             target=target,
             previous={"connected_event_source_ids": before},
             current={"connected_event_source_ids": before, "already_connected": True},
+        ), complete, gaps)
+    if not complete:
+        gaps.append(
+            f"Source {event_source_id} was not among the sources read, so it may already have been "
+            "connected; the connect request was sent either way."
         )
     await client.create_edge_object(
         catalog_id, "external_event_sources", data={"external_event_sources": [event_source_id]},
     )
-    return mutation_response(
+    return _with_completeness(mutation_response(
         action="connect_catalog_event_source",
         target=target,
         previous={"connected_event_source_ids": before},
         current={"connected_event_source_ids": [*before, event_source_id]},
-    )
+    ), complete, gaps)
 
 
 @mcp_server.tool()
@@ -1056,19 +1245,25 @@ async def disconnect_catalog_event_source(
     catalog_id = _require_id(catalog_id, "catalog_id")
     event_source_id = _require_id(event_source_id, "event_source_id")
     client = get_graph_api_client()
-    sources, _ = await _connected_sources(client, catalog_id)
-    before = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    sources, before, complete, gaps = await _connection_state(client, catalog_id)
     source = next((s for s in sources if _object_id(s.get("id")) == event_source_id), None)
-    if source is None:
+    if source is None and complete:
         raise ValidationError(
             f"Event source {event_source_id} is not connected to catalog {catalog_id}; nothing was changed."
+        )
+    if source is None:
+        # The list is capped, so absence proves nothing. Disconnecting a source that is not
+        # connected removes nothing else, while refusing would block a request on large catalogs.
+        gaps.append(
+            f"Source {event_source_id} was not among the sources read, so whether it was connected "
+            "before this request is not confirmed; the disconnect request was sent."
         )
     await client.delete_edge_object(
         catalog_id, "external_event_sources", data={"external_event_sources": [event_source_id]},
     )
-    return mutation_response(
+    return _with_completeness(mutation_response(
         action="disconnect_catalog_event_source",
         target={"catalog_id": catalog_id, "event_source_id": event_source_id},
         previous={"connected_event_source_ids": before, "event_source": source},
         current={"connected_event_source_ids": [s for s in before if s != event_source_id]},
-    )
+    ), complete, gaps)
