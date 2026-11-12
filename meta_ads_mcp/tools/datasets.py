@@ -6,8 +6,6 @@ Endpoints (Meta Marketing API reference):
 - GET {pixel_id}/stats: ads-pixel/stats
 - GET dataset_quality?dataset_id=: conversions-api/dataset-quality-api
 - GET act_{id}/customconversions: ad-account/customconversions
-- GET {pixel_id}/event_rules: ads-pixel/event_rules (read only; no create/update/delete)
-- GET {pixel_id}/extractors: ads-pixel/extractors (read only; no create/update/delete)
 """
 
 from __future__ import annotations
@@ -63,26 +61,6 @@ CUSTOM_CONVERSION_FIELDS = [
     "last_fired_time",
 ]
 
-# Field names from facebook_business 26.0.2 CalibratorExistingRule / SignalsIWLExtractor.
-EVENT_RULE_FIELDS = [
-    "id",
-    "event_type",
-    "rule_type",
-    "rule",
-    "status",
-    "creation_source",
-    "creation_time",
-    "transforms",
-]
-
-PIXEL_PARAMETER_FIELDS = [
-    "id",
-    "event_type",
-    "extractor_type",
-    "extractor_config",
-    "domain_uri",
-]
-
 # Aggregations accepted by GET {pixel_id}/stats (AdsPixelStatsResult.Aggregation).
 STATS_AGGREGATIONS = (
     "browser_type",
@@ -106,8 +84,6 @@ STATS_EVENT_SOURCES = ("WEB_ONLY", "SERVER_ONLY")
 MAX_STATS_WINDOW_DAYS = 28
 DEFAULT_STATS_WINDOW_DAYS = 7
 MAX_STATS_PAGES = 50
-MAX_ID_SCAN_PAGES = 10
-ID_SCAN_PAGE_SIZE = 100
 
 DATASET_QUALITY_FIELDS = (
     "web{event_name,"
@@ -172,56 +148,6 @@ def _next_cursor(payload: dict[str, Any]) -> str | None:
     if not paging.get("next"):
         return None
     return (paging.get("cursors") or {}).get("after")
-
-
-async def _find_by_id(
-    client: Any,
-    parent_id: str,
-    edge: str,
-    *,
-    target_id: str,
-    fields: FieldList,
-    params: dict[str, Any],
-) -> dict[str, Any]:
-    """Scan a documented list edge for one id; no by-id node read is documented."""
-    examined = 0
-    pages = 0
-    cursor: str | None = None
-    found: dict[str, Any] | None = None
-    complete = False
-    while pages < MAX_ID_SCAN_PAGES:
-        page_params = {"limit": ID_SCAN_PAGE_SIZE, **params}
-        if cursor:
-            page_params["after"] = cursor
-        payload = await client.list_objects(parent_id, edge, fields=fields, params=page_params)
-        pages += 1
-        for item in payload.get("data") or []:
-            examined += 1
-            if str(item.get("id")) == target_id:
-                found = item
-                break
-        if found is not None:
-            complete = True
-            break
-        cursor = _next_cursor(payload)
-        if cursor is None:
-            complete = True
-            break
-    summary: dict[str, Any] = {
-        "found": found is not None,
-        "count": 1 if found is not None else 0,
-        "examined": examined,
-        "pages_fetched": pages,
-        "complete": complete,
-    }
-    if not complete:
-        summary["note"] = (
-            f"Scan incomplete: stopped after {pages} pages and {examined} items without "
-            f"finding {target_id}; it may exist on a later page."
-        )
-    elif found is None:
-        summary["note"] = f"{target_id} was not among the {examined} items on this pixel."
-    return {"item": found, "summary": summary}
 
 
 def _parse_day(value: str, name: str) -> date:
@@ -529,79 +455,3 @@ async def list_custom_conversions(
         params=_page_params(limit, after),
     )
     return _page_summary(normalize_collection(payload))
-
-
-async def _list_or_find(
-    *,
-    parent_id: str,
-    edge: str,
-    target_id: str | None,
-    target_name: str,
-    limit: int,
-    after: str | None,
-    fields: FieldList,
-    extra_params: dict[str, Any],
-) -> dict[str, Any]:
-    _check_limit(limit)
-    if target_id is not None and blank_to_none(after) is not None:
-        raise ValidationError(f"after cannot be combined with {target_name}; the lookup scans pages itself.")
-    client = get_graph_api_client()
-    if target_id is not None:
-        result = await _find_by_id(
-            client, parent_id, edge, target_id=target_id, fields=fields, params=extra_params,
-        )
-    else:
-        payload = await client.list_objects(
-            parent_id, edge, fields=fields, params={**_page_params(limit, after), **extra_params},
-        )
-        result = _page_summary(normalize_collection(payload))
-    result["summary"]["read_only_surface"] = True
-    return result
-
-
-@mcp_server.tool()
-async def list_pixel_event_rules(
-    pixel_id: str,
-    rule_id: str | None = None,
-    limit: int = 50,
-    after: str | None = None,
-    fields: FieldList | None = None,
-) -> dict[str, Any]:
-    """List the event rules (codeless and URL rules that turn page activity into events) defined on a pixel, or find one rule by rule_id. Meta's public API only reads these rules; creating, editing or deleting them is done in Events Manager."""
-    pixel_id = _required_id(pixel_id, "pixel_id")
-    return await _list_or_find(
-        parent_id=pixel_id,
-        edge="event_rules",
-        target_id=blank_to_none(rule_id),
-        target_name="rule_id",
-        limit=limit,
-        after=after,
-        fields=normalize_field_list(fields) or EVENT_RULE_FIELDS,
-        extra_params={},
-    )
-
-
-@mcp_server.tool()
-async def list_pixel_parameters(
-    pixel_id: str,
-    parameter_id: str | None = None,
-    current_domain: str | None = None,
-    limit: int = 50,
-    after: str | None = None,
-    fields: FieldList | None = None,
-) -> dict[str, Any]:
-    """List the parameter extractors a pixel uses to grab values (such as price or content id) for codeless events, or find one by parameter_id; current_domain filters by site. Meta's public API only reads these; changes are made in Events Manager."""
-    pixel_id = _required_id(pixel_id, "pixel_id")
-    extra: dict[str, Any] = {}
-    if domain := blank_to_none(current_domain):
-        extra["current_domain"] = domain
-    return await _list_or_find(
-        parent_id=pixel_id,
-        edge="extractors",
-        target_id=blank_to_none(parameter_id),
-        target_name="parameter_id",
-        limit=limit,
-        after=after,
-        fields=normalize_field_list(fields) or PIXEL_PARAMETER_FIELDS,
-        extra_params=extra,
-    )
