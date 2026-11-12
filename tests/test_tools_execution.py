@@ -208,3 +208,46 @@ def test_execution_decodes_previous_money_before_mutating(
     with pytest.raises(execution.ValidationError, match=malformed_field):
         asyncio.run(tool(**kwargs))
     assert client.updated_payloads == []
+
+
+class RecordingStatusClient(FakeExecutionClient):
+    """Fake execution client that records every call in order."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.calls: list[tuple] = []
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or []), params))
+        return await super().get_object(object_id, fields=fields, params=params)
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return await super().update_object(object_id, data=data)
+
+
+STATUS_TOOLS = [
+    (execution.set_campaign_status, "campaign_id", "campaign"),
+    (execution.set_adset_status, "adset_id", "adset"),
+    (execution.set_ad_status, "ad_id", "ad"),
+]
+
+
+@pytest.mark.parametrize(("tool", "id_name", "object_type"), STATUS_TOOLS)
+@pytest.mark.parametrize("status", ["ACTIVE", "PAUSED"])
+def test_set_status_active_and_paused_calls_are_unchanged(monkeypatch, tool, id_name, object_type, status) -> None:
+    """ACTIVE and PAUSED read the same fields, send the same request and return the same response as before."""
+    client = RecordingStatusClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(tool(**{id_name: "obj_1", "status": status}))
+    assert client.calls == [
+        ("get", "obj_1", ["id", "status", "effective_status"], None),
+        ("update", "obj_1", {"status": status}),
+    ]
+    assert result == {
+        "ok": True,
+        "action": f"set_{object_type}_status",
+        "target": {id_name: "obj_1"},
+        "previous": {"status": "PAUSED"},
+        "current": {"status": status},
+    }

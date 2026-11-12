@@ -450,3 +450,44 @@ def test_update_ad_validation_errors_make_no_call(monkeypatch, arguments, messag
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(ads.ValidationError, match=message):
         asyncio.run(ads.update_ad(**arguments))
+
+
+class RecordingAdsClient(FakeAdsClient):
+    """Fake ad client that records every call in order."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.calls: list[tuple] = []
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        return await super().get_object(object_id, fields=fields, params=params)
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return {"id": "ad_created"}
+
+
+def test_create_ad_params_only_call_is_unchanged(monkeypatch) -> None:
+    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before."""
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    params = {"conversion_domain": "example.com", "adlabels": [{"name": "Q4"}]}
+    result = asyncio.run(ads.create_ad(
+        account_id="123", name="Old style ad", adset_id="adset_123",
+        creative={"id": "crt_123"}, params=dict(params),
+    ))
+    assert client.calls == [
+        ("create", "act_123", "ads", {
+            "name": "Old style ad",
+            "adset_id": "adset_123",
+            "creative": {"creative_id": "crt_123"},
+            "status": "PAUSED",
+            **params,
+        }),
+    ]
+    assert list(client.calls[0][3]) == ["name", "adset_id", "creative", "status", *params]
+    assert result == {
+        "ok": True, "action": "create_ad", "target": {"account_id": "act_123", "adset_id": "adset_123"},
+        "validation_only": False, "created": {"id": "ad_created"},
+    }

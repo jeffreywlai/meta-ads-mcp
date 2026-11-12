@@ -582,3 +582,104 @@ def test_update_adset_missing_object_sends_no_update(monkeypatch) -> None:
     with pytest.raises(MetaApiError):
         asyncio.run(campaigns.update_adset(adset_id="adset_1", name="x"))
     assert client.calls == []
+
+
+class RecordingCampaignClient(FakeCampaignClient):
+    """Fake campaign client that records every call in order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple] = []
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return await super().create_edge_object(parent_id, edge, data=data, files=files)
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        return await super().get_object(object_id, fields=fields, params=params)
+
+    async def update_object(self, object_id: str, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return await super().update_object(object_id, data=data)
+
+
+def test_create_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
+    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    params = {
+        "spend_cap": 25000,
+        "start_time": "2026-12-01T00:00:00-0500",
+        "stop_time": "2026-12-31T00:00:00-0500",
+        "promoted_object": {"pixel_id": "999", "custom_event_type": "PURCHASE"},
+        "special_ad_category_country": ["US"],
+        "adlabels": [{"name": "Q4"}],
+    }
+    result = asyncio.run(campaigns.create_campaign(
+        account_id="123", name="Old style", objective="OUTCOME_SALES",
+        daily_budget=50.0, params=dict(params),
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "campaigns", {
+            "name": "Old style",
+            "objective": "OUTCOME_SALES",
+            "status": "PAUSED",
+            "special_ad_categories": [],
+            "daily_budget": 5000,
+            **params,
+        }),
+    ]
+    assert list(client.calls[1][3]) == [
+        "name", "objective", "status", "special_ad_categories", "daily_budget", *params,
+    ]
+    assert result == {
+        "ok": True, "action": "create_campaign", "target": {"account_id": "act_123"},
+        "validation_only": False, "created": {"id": "cmp_123"},
+    }
+
+
+def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
+    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    params = {
+        "frequency_control_specs": [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 2}],
+        "attribution_spec": [{"event_type": "CLICK_THROUGH", "window_days": 7}],
+        "adset_schedule": [{"start_minute": 540, "end_minute": 1020, "days": [1, 2, 3]}],
+        "pacing_type": ["day_parting"],
+        "daily_spend_cap": 9000,
+        "lifetime_spend_cap": 90000,
+        "daily_min_spend_target": 1000,
+        "lifetime_min_spend_target": 10000,
+        "dsa_beneficiary": "Acme GmbH",
+        "dsa_payor": "Acme GmbH",
+        "adlabels": [{"name": "Q4"}],
+    }
+    targeting = {"geo_locations": {"countries": ["DE"]}}
+    result = asyncio.run(campaigns.create_ad_set(
+        account_id="act_123", campaign_id="cmp_123", name="Old style set",
+        billing_event="IMPRESSIONS", optimization_goal="REACH", targeting=targeting,
+        lifetime_budget=500.0, end_time="2026-12-31T00:00:00-0500", params=dict(params),
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {
+            "campaign_id": "cmp_123",
+            "name": "Old style set",
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "REACH",
+            "targeting": targeting,
+            "status": "PAUSED",
+            "end_time": "2026-12-31T00:00:00-0500",
+            "lifetime_budget": 50000,
+            **params,
+        }),
+    ]
+    assert list(client.calls[1][3]) == [
+        "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status",
+        "end_time", "lifetime_budget", *params,
+    ]
+    assert result["created"] == {"id": "cmp_123"}
+    assert result["target"] == {"account_id": "act_123", "campaign_id": "cmp_123"}
