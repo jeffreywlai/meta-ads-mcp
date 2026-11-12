@@ -420,6 +420,68 @@ def test_audience_users_normalizes_before_hashing(monkeypatch) -> None:
     ]]
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("PHONE", "1"),
+        ("PHONE", "12345"),
+        ("PHONE", "1234567890123456"),
+        ("PHONE", "+1 555 ٠١٠ 9999"),
+        ("ZIP", "!!!"),
+        ("ZIP", "9"),
+        ("ST", "123"),
+        ("ST", "Москва"),
+        ("CT", "Москва"),
+        ("CT", "123"),
+        ("COUNTRY", "zz"),
+        ("COUNTRY", "usa"),
+        ("DOBM", "²"),
+        ("DOBD", "٣"),
+        ("DOBY", "１９９０"),
+    ],
+)
+def test_audience_users_malformed_values_are_dropped_not_hashed(monkeypatch, key, value) -> None:
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL", key], rows=[["valid@example.invalid", value]],
+    ))
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha("valid@example.invalid"), ""]]
+    assert result["invalid_values"] == 1
+
+
+@pytest.mark.parametrize(
+    ("schema", "row", "expected"),
+    [
+        # Meta's normalization table: CT is a-z only; ST is the 2-letter ANSI code for
+        # US states and lowercase letters without punctuation or spaces elsewhere.
+        (["CT"], ["München"], ["munchen"]),
+        (["CT"], ["St. Louis"], ["stlouis"]),
+        (["ST"], ["California"], ["ca"]),
+        (["ST"], [" NY "], ["ny"]),
+        (["ST"], ["New-York"], ["ny"]),
+        (["COUNTRY", "ST"], ["US", "California"], ["us", "ca"]),
+        (["COUNTRY", "ST"], ["US", "Bavaria"], ["us", ""]),
+        (["COUNTRY", "ST"], ["DE", "Bayern"], ["de", "bayern"]),
+        (["COUNTRY", "ST"], ["FR", "Île-de-France"], ["fr", "iledefrance"]),
+        # ZIP: lowercase without spaces, first 5 digits in the US, Area/District/Sector in the UK.
+        (["ZIP"], ["94025-1234"], ["94025"]),
+        (["COUNTRY", "ZIP"], ["US", "1234"], ["us", ""]),
+        (["COUNTRY", "ZIP"], ["GB", "SW1A 1AA"], ["gb", "sw1a1"]),
+        (["COUNTRY", "ZIP"], ["CA", "K1A 0B1"], ["ca", "k1a0b1"]),
+        (["ZIP"], ["100-0001"], ["100-0001"]),
+        # PHONE: symbols, letters and leading zeros removed; 7 to 15 digits remain.
+        (["PHONE"], ["001 555 010 9999"], ["15550109999"]),
+        (["FN"], ["Zoë-Ann"], ["zoëann"]),
+    ],
+)
+def test_audience_users_values_follow_published_format(monkeypatch, schema, row, expected) -> None:
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=schema, rows=[row]))
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha(value) if value else "" for value in expected]]
+
+
 def test_audience_users_pre_hashed_rejects_non_digests(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(audiences.ValidationError, match="SHA-256") as excinfo:

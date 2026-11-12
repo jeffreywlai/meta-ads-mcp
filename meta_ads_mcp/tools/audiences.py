@@ -289,8 +289,64 @@ _REDACT_PATTERNS = (
 )
 
 
+# Each normalizer below follows Meta's customer-list normalization table
+# ("Hashing and normalization for multi-key", Marketing API custom audiences guide,
+# https://developers.facebook.com/documentation/ads-commerce/marketing-api/audiences/guides/custom-audiences#hash)
+# and returns "" when the normalized value does not have the published format.
+# An empty result is counted as invalid and sent blank; it is never hashed.
+# ST and ZIP also take the row's normalized COUNTRY, when the schema has one,
+# because their published format differs for the US and the UK.
+
+# ISO 3166-1 alpha-2 officially assigned codes (COUNTRY must be one of these).
+_ISO_COUNTRY_CODES = frozenset(
+    """
+    ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz
+    ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr
+    ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp
+    ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt
+    mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw
+    sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug
+    um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw
+    """.split()
+)
+
+# US state and territory names mapped to their 2-letter ANSI codes, keyed by the
+# lowercase a-z form produced by _ascii_letters.
+_US_STATE_CODES = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca",
+    "colorado": "co", "connecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga",
+    "hawaii": "hi", "idaho": "id", "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md", "massachusetts": "ma",
+    "michigan": "mi", "minnesota": "mn", "mississippi": "ms", "missouri": "mo", "montana": "mt",
+    "nebraska": "ne", "nevada": "nv", "newhampshire": "nh", "newjersey": "nj", "newmexico": "nm",
+    "newyork": "ny", "northcarolina": "nc", "northdakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhodeisland": "ri", "southcarolina": "sc",
+    "southdakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut", "vermont": "vt",
+    "virginia": "va", "washington": "wa", "westvirginia": "wv", "wisconsin": "wi", "wyoming": "wy",
+    "districtofcolumbia": "dc", "americansamoa": "as", "guam": "gu", "northernmarianaislands": "mp",
+    "puertorico": "pr", "usvirginislands": "vi", "virginislands": "vi",
+    "unitedstatesminoroutlyingislands": "um",
+}
+_US_STATE_ABBREVIATIONS = frozenset(_US_STATE_CODES.values())
+_UK_POSTCODE = re.compile(r"([a-z]{1,2}[0-9][a-z0-9]?)([0-9])([a-z]{2})?")
+
+
+def _has_non_ascii_digit(value: str) -> bool:
+    return any(character.isdigit() and not "0" <= character <= "9" for character in value)
+
+
 def _letters(value: str) -> str:
+    """FN and LN: lowercase letters only, no punctuation; non-Roman letters stay in UTF-8."""
     return "".join(character for character in unicodedata.normalize("NFC", value).lower() if character.isalpha())
+
+
+def _ascii_letters(value: str) -> str:
+    """CT and non-US ST: a-z only. Accents are removed; any other non-Roman letter makes the value invalid."""
+    decomposed = unicodedata.normalize("NFKD", value.lower())
+    letters = [character for character in decomposed if character.isalpha()]
+    if any(not "a" <= character <= "z" for character in letters):
+        return ""
+    return "".join(letters)
 
 
 def _normalize_email(value: str) -> str:
@@ -299,7 +355,11 @@ def _normalize_email(value: str) -> str:
 
 
 def _normalize_phone(value: str) -> str:
-    return re.sub(r"\D", "", value).lstrip("0")
+    """Remove symbols, letters and leading zeros; a phone number has 7 to 15 digits (E.164 allows 15)."""
+    if _has_non_ascii_digit(value):
+        return ""
+    digits = re.sub(r"[^0-9]", "", value).lstrip("0")
+    return digits if 7 <= len(digits) <= 15 else ""
 
 
 def _normalize_gender(value: str) -> str:
@@ -308,7 +368,8 @@ def _normalize_gender(value: str) -> str:
 
 def _normalize_number(value: str, *, low: int, high: int, width: int) -> str:
     digits = value.strip()
-    if not digits.isdigit() or not low <= int(digits) <= high:
+    # ASCII digits only: str.isdigit() also accepts characters such as "²" that int() rejects.
+    if not re.fullmatch(r"[0-9]{1,4}", digits) or not low <= int(digits) <= high:
         return ""
     return f"{int(digits):0{width}d}"
 
@@ -324,20 +385,32 @@ def _normalize_first_initial(value: str) -> str:
     return _letters(value)[:1]
 
 
-def _normalize_state(value: str) -> str:
-    return "".join(character for character in value.lower() if character.isalnum())
+def _normalize_state(value: str, country: str | None = None) -> str:
+    """US: the 2-letter ANSI code (full names are converted). Elsewhere: lowercase a-z, no punctuation or spaces."""
+    letters = _ascii_letters(value)
+    code = _US_STATE_CODES.get(letters, letters if letters in _US_STATE_ABBREVIATIONS else "")
+    if country == "us" or (country is None and code):
+        return code
+    return letters
 
 
-def _normalize_zip(value: str) -> str:
+def _normalize_zip(value: str, country: str | None = None) -> str:
+    """Lowercase without spaces; US: first 5 digits; UK: Area/District/Sector."""
+    if _has_non_ascii_digit(value):
+        return ""
     compact = "".join(value.lower().split())
-    if re.fullmatch(r"\d{5}(-?\d{4})?", compact):
-        return compact[:5]
-    return compact
+    us_zip = re.fullmatch(r"([0-9]{5})(-?[0-9]{4})?", compact)
+    if country == "us" or (country is None and us_zip):
+        return us_zip.group(1) if us_zip else ""
+    if country == "gb":
+        uk = _UK_POSTCODE.fullmatch(compact)
+        return f"{uk.group(1)}{uk.group(2)}" if uk else ""
+    return compact if re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", compact) and 2 <= len(compact) <= 10 else ""
 
 
 def _normalize_country(value: str) -> str:
     candidate = value.strip().lower()
-    return candidate if re.fullmatch(r"[a-z]{2}", candidate) else ""
+    return candidate if candidate in _ISO_COUNTRY_CODES else ""
 
 
 # Meta customer-list keys and their published normalization rules. Only keys
@@ -352,11 +425,13 @@ _AUDIENCE_KEY_NORMALIZERS = {
     "FN": _letters,
     "LN": _letters,
     "FI": _normalize_first_initial,
-    "CT": _letters,
+    "CT": _ascii_letters,
     "ST": _normalize_state,
     "ZIP": _normalize_zip,
     "COUNTRY": _normalize_country,
 }
+# Keys whose published format depends on the row's COUNTRY.
+_COUNTRY_AWARE_KEYS = frozenset({"ST", "ZIP"})
 
 
 def _audience_schema(schema: Any) -> list[str]:
@@ -432,6 +507,10 @@ def _hash_rows(
         if not isinstance(row, (list, tuple)) or len(row) != len(schema):
             raise ValidationError(f"Row {row_number} must have exactly {len(schema)} values, one per schema key.")
         sent: list[str] = []
+        country: str | None = None
+        if not pre_hashed and "COUNTRY" in schema:
+            raw_country = row[schema.index("COUNTRY")]
+            country = (_normalize_country(raw_country) or None) if isinstance(raw_country, str) else None
         for key, value in zip(schema, row):
             if value is None:
                 value = ""
@@ -453,7 +532,8 @@ def _hash_rows(
                     sent.append("")
                     continue
             else:
-                normalized = _AUDIENCE_KEY_NORMALIZERS[key](value)
+                normalizer = _AUDIENCE_KEY_NORMALIZERS[key]
+                normalized = normalizer(value, country) if key in _COUNTRY_AWARE_KEYS else normalizer(value)
                 if not normalized:
                     invalid += 1
                     sent.append("")
