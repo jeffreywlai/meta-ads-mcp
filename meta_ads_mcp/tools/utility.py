@@ -357,6 +357,25 @@ INTENT_GUIDE = {
         "avoid_unless_needed": [],
         "notes": ["Write operations require ads_management-level permissions and should follow discovery or diagnostics reads."],
     },
+    "run_ab_tests_or_lift_studies": {
+        "description": "Find, inspect, check eligibility for, create, edit or stop A/B tests (split tests) and conversion lift studies, and read a test's winner or lift.",
+        "recommended_order": [
+            "list_ad_studies",
+            "get_ad_study",
+            "check_ab_test_eligibility",
+            "create_ab_test",
+            "create_lift_study",
+            "update_ad_study",
+            "cancel_ad_study",
+        ],
+        "avoid_unless_needed": ["setup_ab_test"],
+        "notes": [
+            "Use get_ad_study with include_results=true for the split test winner and confidence, or lift and confidence per cell; it says plainly when results are not ready.",
+            "check_ab_test_eligibility is a local pre-check, not Meta's verdict; Meta decides when the test is created.",
+            "Meta creates studies on a business; pass business_id when the ad account has no owning business.",
+            "Lift studies are limited by Meta to approved advertisers.",
+        ],
+    },
 }
 
 ROUTING_HINTS = {
@@ -693,6 +712,7 @@ async def list_mutation_tools() -> dict[str, object]:
             "creation": ["create_campaign", "create_ad_set", "create_ad", "create_ad_creative"],
             "deletion": ["delete_campaign", "delete_adset", "delete_ad", "delete_creative"],
             "audiences": ["create_custom_audience", "create_lookalike_audience", "update_custom_audience", "delete_audience"],
+            "experiments": ["create_ab_test", "create_lift_study", "update_ad_study", "cancel_ad_study"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",

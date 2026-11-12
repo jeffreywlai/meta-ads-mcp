@@ -665,3 +665,18 @@ def test_experiment_tools_are_grouped_and_classified() -> None:
     allowed = read_only_tool_names()
     assert reads <= allowed
     assert not writes & allowed
+
+
+def test_experiment_intent_and_mutation_paths() -> None:
+    from meta_ads_mcp.tools import utility
+
+    exact = run(utility.get_capabilities(intent="run_ab_tests_or_lift_studies"))
+    assert exact["selected_intent"]["recommended_order"][:3] == [
+        "list_ad_studies", "get_ad_study", "check_ab_test_eligibility",
+    ]
+    fuzzy = run(utility.get_capabilities(intent="split test winner"))
+    assert fuzzy["closest_intents"][0]["intent"] == "run_ab_tests_or_lift_studies"
+    mutations = run(utility.list_mutation_tools())
+    assert mutations["common_paths"]["experiments"] == [
+        "create_ab_test", "create_lift_study", "update_ad_study", "cancel_ad_study",
+    ]
