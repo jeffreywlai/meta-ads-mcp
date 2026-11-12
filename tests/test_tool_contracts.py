@@ -151,6 +151,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "update_ad": {"name": "Updated Ad"},
     "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
+    "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
 }
 
 

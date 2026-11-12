@@ -5,11 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaApiError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
-from meta_ads_mcp.schemas import mutation_response
+from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList
 
 CREATIVE_FIELDS = [
@@ -302,3 +302,111 @@ async def delete_creative(creative_id: str) -> dict[str, Any]:
         "target": {"creative_id": creative_id},
         "result": result,
     }
+
+
+@mcp_server.tool()
+async def boost_instagram_post(
+    account_id: str,
+    adset_id: str,
+    instagram_media_id: str,
+    instagram_account_id: str,
+    name: str | None = None,
+    call_to_action: dict[str, Any] | None = None,
+    validate_only: bool = False,
+    page_id: str | None = None,
+) -> dict[str, Any]:
+    """Boost an existing Instagram post, reel or story: creates a creative from it and a PAUSED ad in an existing ad set, returning both ids. Check list_instagram_media boost_eligible first. page_id defaults to the ad set's promoted_object page. validate_only checks the ad with Meta and creates nothing."""
+    ids = {
+        "account_id": blank_to_none(account_id),
+        "adset_id": blank_to_none(adset_id),
+        "instagram_media_id": blank_to_none(instagram_media_id),
+        "instagram_account_id": blank_to_none(instagram_account_id),
+    }
+    for field_name, value in ids.items():
+        if value is None:
+            raise ValidationError(f"{field_name} is required.")
+    if call_to_action is not None:
+        if not isinstance(call_to_action, dict) or not blank_to_none(str(call_to_action.get("type") or "")):
+            raise ValidationError("call_to_action must be an object with a type, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}.")
+        _ensure_v25_creative_payload(call_to_action)
+    resolved_account_id = normalize_account_id(ids["account_id"])
+    media_id = ids["instagram_media_id"]
+    ad_name = blank_to_none(name) or f"Instagram post {media_id}"
+    client = get_graph_api_client()
+    resolved_page_id = blank_to_none(page_id)
+    if resolved_page_id is None:
+        adset = await client.get_object(ids["adset_id"], fields=["id", "promoted_object"])
+        promoted_object = adset.get("promoted_object")
+        if isinstance(promoted_object, dict):
+            resolved_page_id = blank_to_none(str(promoted_object.get("page_id") or ""))
+        if resolved_page_id is None:
+            raise ValidationError(
+                "page_id is required: Meta's Instagram post creative needs the Facebook Page id, "
+                "and the ad set's promoted_object has no page_id."
+            )
+    creative_spec: dict[str, Any] = {
+        "object_id": resolved_page_id,
+        "instagram_user_id": ids["instagram_account_id"],
+        "source_instagram_media_id": media_id,
+    }
+    if call_to_action is not None:
+        creative_spec["call_to_action"] = call_to_action
+    target = {
+        "account_id": resolved_account_id,
+        "adset_id": ids["adset_id"],
+        "instagram_media_id": media_id,
+        "instagram_account_id": ids["instagram_account_id"],
+        "page_id": resolved_page_id,
+    }
+    if validate_only:
+        validation = await client.create_edge_object(
+            resolved_account_id,
+            "ads",
+            data={
+                "name": ad_name,
+                "adset_id": ids["adset_id"],
+                "creative": creative_spec,
+                "status": "PAUSED",
+                "execution_options": ["validate_only"],
+            },
+        )
+        response = creation_response(
+            action="boost_instagram_post",
+            target=target,
+            result=validation,
+            validate_only=True,
+        )
+        response.update({"creative_id": None, "ad_id": None, "status": "PAUSED"})
+        return response
+    creative = await client.create_edge_object(
+        resolved_account_id,
+        "adcreatives",
+        data={"name": f"{ad_name} creative", **creative_spec},
+    )
+    creative_id = str(creative.get("id") or "")
+    if not creative_id:
+        raise ValidationError("Meta did not return a creative id, so no ad was created.")
+    try:
+        ad = await client.create_edge_object(
+            resolved_account_id,
+            "ads",
+            data={
+                "name": ad_name,
+                "adset_id": ids["adset_id"],
+                "creative": {"creative_id": creative_id},
+                "status": "PAUSED",
+            },
+        )
+    except MetaApiError as exc:
+        exc.message = (
+            f"Creative {creative_id} was created but the ad was not: {exc.message} "
+            "Delete the creative with delete_creative or retry the ad with create_ad."
+        )
+        raise
+    response = creation_response(
+        action="boost_instagram_post",
+        target=target,
+        result={"creative": creative, "ad": ad},
+    )
+    response.update({"creative_id": creative_id, "ad_id": str(ad.get("id") or "") or None, "status": "PAUSED"})
+    return response

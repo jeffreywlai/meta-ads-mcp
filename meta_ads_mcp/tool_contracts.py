@@ -34,6 +34,7 @@ _WRITE_NAMES = frozenset(
         "setup_ab_test",
         "add_audience_users",
         "remove_audience_users",
+        "boost_instagram_post",
     }
 )
 _READ_TAGS = frozenset({"read", "read-only", "readonly"})

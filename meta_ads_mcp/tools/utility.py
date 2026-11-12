@@ -120,6 +120,7 @@ TOOL_GROUPS = {
         "update_ad",
         "add_audience_users",
         "remove_audience_users",
+        "boost_instagram_post",
     ],
     "creative_ops": [
         "get_ad_image",

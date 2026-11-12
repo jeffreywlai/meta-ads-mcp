@@ -224,3 +224,130 @@ def test_update_ad_creative_validates_ids_before_fetch(monkeypatch, ad_id, creat
 
     with pytest.raises(creatives.ValidationError, match="ad_id and creative_id are required"):
         asyncio.run(creatives.update_ad_creative(ad_id=ad_id, creative_id=creative_id))
+
+
+class FakeBoostClient:
+    """Records creative and ad creation for boost_instagram_post."""
+
+    def __init__(self, *, promoted_object=None, fail_ad: Exception | None = None) -> None:
+        self.calls: list[tuple] = []
+        self.promoted_object = promoted_object
+        self.fail_ad = fail_ad
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        return {"id": object_id, "promoted_object": self.promoted_object}
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, data))
+        if edge == "adcreatives":
+            return {"id": "crt_boost"}
+        if self.fail_ad is not None:
+            raise self.fail_ad
+        return {"id": "ad_boost"}
+
+
+def test_boost_instagram_post_creates_paused_ad(monkeypatch) -> None:
+    client = FakeBoostClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    cta = {"type": "LEARN_MORE", "value": {"link": "https://example.com"}}
+
+    result = asyncio.run(creatives.boost_instagram_post(
+        account_id="123", adset_id="adset_1", instagram_media_id="media_1",
+        instagram_account_id="ig_1", page_id="page_1", name="Boost post", call_to_action=cta,
+    ))
+
+    creative_call, ad_call = client.calls
+    assert creative_call[1:3] == ("act_123", "adcreatives")
+    assert creative_call[3] == {
+        "name": "Boost post creative",
+        "object_id": "page_1",
+        "instagram_user_id": "ig_1",
+        "source_instagram_media_id": "media_1",
+        "call_to_action": cta,
+    }
+    assert ad_call[1:3] == ("act_123", "ads")
+    assert ad_call[3] == {
+        "name": "Boost post",
+        "adset_id": "adset_1",
+        "creative": {"creative_id": "crt_boost"},
+        "status": "PAUSED",
+    }
+    assert result["creative_id"] == "crt_boost"
+    assert result["ad_id"] == "ad_boost"
+    assert result["status"] == "PAUSED"
+    assert result["validation_only"] is False
+    assert result["action"] == "boost_instagram_post"
+
+
+def test_boost_instagram_post_reads_page_from_adset_promoted_object(monkeypatch) -> None:
+    client = FakeBoostClient(promoted_object={"page_id": "page_9"})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    asyncio.run(creatives.boost_instagram_post(
+        account_id="123", adset_id="adset_1", instagram_media_id="media_1", instagram_account_id="ig_1",
+    ))
+    assert client.calls[0] == ("get", "adset_1", ["id", "promoted_object"])
+    assert client.calls[1][3]["object_id"] == "page_9"
+    assert client.calls[2][3]["name"] == "Instagram post media_1"
+
+
+def test_boost_instagram_post_without_page_raises_before_creating(monkeypatch) -> None:
+    client = FakeBoostClient(promoted_object={"pixel_id": "px"})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match="page_id"):
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="123", adset_id="adset_1", instagram_media_id="media_1", instagram_account_id="ig_1",
+        ))
+    assert [call[0] for call in client.calls] == ["get"]
+
+
+def test_boost_instagram_post_validate_only_creates_nothing(monkeypatch) -> None:
+    client = FakeBoostClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        account_id="123", adset_id="adset_1", instagram_media_id="media_1",
+        instagram_account_id="ig_1", page_id="page_1", validate_only=True,
+    ))
+    assert len(client.calls) == 1
+    _, parent, edge, data = client.calls[0]
+    assert (parent, edge) == ("act_123", "ads")
+    assert data["execution_options"] == ["validate_only"]
+    assert data["status"] == "PAUSED"
+    assert data["creative"] == {
+        "object_id": "page_1", "instagram_user_id": "ig_1", "source_instagram_media_id": "media_1",
+    }
+    assert result["validation_only"] is True
+    assert result["creative_id"] is None and result["ad_id"] is None
+
+
+def test_boost_instagram_post_ad_failure_names_the_created_creative(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    client = FakeBoostClient(fail_ad=MetaApiError(message="Invalid ad set", status_code=400, code=100))
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="crt_boost"):
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="123", adset_id="adset_1", instagram_media_id="media_1",
+            instagram_account_id="ig_1", page_id="page_1",
+        ))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"account_id": " "}, "account_id"),
+        ({"adset_id": ""}, "adset_id"),
+        ({"instagram_media_id": " "}, "instagram_media_id"),
+        ({"instagram_account_id": ""}, "instagram_account_id"),
+        ({"call_to_action": {"value": {"link": "https://x"}}}, "call_to_action"),
+        ({"call_to_action": {"type": "LEARN_MORE", "instagram_actor_id": "1"}}, "instagram_actor_id"),
+    ],
+)
+def test_boost_instagram_post_validation_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    base = {
+        "account_id": "123", "adset_id": "adset_1", "instagram_media_id": "media_1",
+        "instagram_account_id": "ig_1", "page_id": "page_1",
+    }
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**base, **arguments}))

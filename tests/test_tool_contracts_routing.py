@@ -169,4 +169,5 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "update_ad",
         "add_audience_users",
         "remove_audience_users",
+        "boost_instagram_post",
     }
