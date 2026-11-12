@@ -41,10 +41,10 @@ class FakeActivityClient:
                     "actor_id": "user_123",
                     "actor_name": "Test User",
                     "application_name": "Meta Ads Manager",
-                    "event_time": "1770000000",
+                    "event_time": params["since"],
                     "event_type": "update_campaign_budget",
                     "extra_data": '{"old_value":"50","new_value":"75"}',
-                    "object_id": "cmp_123",
+                    "object_id": params.get("oid", "cmp_123"),
                     "object_name": "Campaign 123",
                     "object_type": "campaign",
                     "translated_event_type": "Updated campaign budget",
@@ -67,12 +67,13 @@ def test_list_change_history_defaults_to_configured_account(monkeypatch: pytest.
             "parent_id": "act_123",
             "edge": "activities",
             "fields": activity.DEFAULT_ACTIVITY_FIELDS,
-            "params": {"limit": 25},
+            "params": {"limit": 25, "since": result["coverage"]["window"]["since"], "until": result["coverage"]["window"]["until"]},
         }
     ]
     assert result["scope"] == {"level": "account", "object_id": "act_123", "account_id": "act_123"}
     assert result["items"][0]["extra_data_parsed"] == {"old_value": "50", "new_value": "75"}
-    assert result["summary"]["default_window"].startswith("Meta returns one week")
+    assert "seven-day" in result["summary"]["default_window"]
+    assert result["coverage"]["window"]["defaulted_since"] is True
 
 
 def test_list_change_history_routes_campaign_scope_through_account_edge(
@@ -98,12 +99,12 @@ def test_list_change_history_routes_campaign_scope_through_account_edge(
     assert client.calls[0] == {
         "parent_id": "act_123",
         "edge": "activities",
-        "fields": ["event_time", "event_type", "object_id"],
+        "fields": ["event_time", "event_type", "object_id", "object_type"],
         "params": {
             "limit": 50,
             "after": "cursor_1",
-            "since": "2026-06-01",
-            "until": "2026-06-07",
+            "since": "2026-06-01T00:00:00+00:00",
+            "until": "2026-06-08T00:00:00+00:00",
             "category": "AD_SET",
             "business_id": "biz_123",
             "uid": 987654321,
@@ -130,7 +131,8 @@ def test_list_change_history_uses_default_account_for_scoped_object(
     result = asyncio.run(activity.list_change_history(level="adset", object_id="adset_123"))
 
     assert client.calls[0]["parent_id"] == "act_456"
-    assert client.calls[0]["params"] == {"limit": 50, "oid": "adset_123"}
+    assert client.calls[0]["params"]["oid"] == "adset_123"
+    assert client.calls[0]["params"]["limit"] == 50
     assert result["scope"] == {"level": "adset", "object_id": "adset_123", "account_id": "act_456"}
     assert client.object_calls == [
         {"object_id": "adset_123", "fields": ["account_id"], "params": None}
@@ -151,7 +153,8 @@ def test_list_change_history_derives_account_from_scoped_object(
         {"object_id": "cmp_123", "fields": ["account_id"], "params": None}
     ]
     assert client.calls[0]["parent_id"] == "act_20141913"
-    assert client.calls[0]["params"] == {"limit": 50, "oid": "cmp_123"}
+    assert client.calls[0]["params"]["oid"] == "cmp_123"
+    assert client.calls[0]["params"]["limit"] == 50
     assert result["scope"] == {
         "level": "campaign",
         "object_id": "cmp_123",

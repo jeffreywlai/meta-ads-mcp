@@ -53,6 +53,7 @@ TOOL_GROUPS = {
     ],
     "activity": [
         "list_change_history",
+        "export_change_history",
     ],
     "optimization": [
         "get_account_optimization_snapshot",
@@ -202,11 +203,17 @@ INTENT_GUIDE = {
     },
     "read_change_history": {
         "description": "Read account, campaign, ad set, or ad activity logs, changelogs, audit logs, and change history.",
-        "recommended_order": ["list_change_history"],
+        "recommended_order": ["export_change_history", "read_overflow_artifact"],
         "avoid_unless_needed": ["get_insights"],
         "notes": [
             "Use this when the user asks who changed budgets, statuses, bids, names, targeting, or other settings.",
-            "Meta returns one week of activity by default when since/until are omitted.",
+            "export_change_history requires explicit since/until and includes descendants by default. Account scope covers all account activity levels and preserves every API-returned event type.",
+            "Read every artifact page; inline export items are only a preview. Check complete, coverage, has_more, ai_instructions, and next_call. A complete artifact read is not proof that every Meta page was fetched.",
+            "list_change_history returns ONE page, defaults to seven days, and excludes children of object scopes unless include_descendants=true. Follow next_call even when items is empty.",
+            "Date-only until includes that entire day in time_zone (UTC by default); timestamp bounds need explicit offsets. Continuation calls preserve frozen effective bounds.",
+            "Omit category and uid for all change types. Category is not entity scope; category=AD_SET can omit ad set changes. Unknown events and unresolved parent relationships must stay visible.",
+            "Use entity_level for Meta's legacy object_type names. Deletions can be status changes; preserve raw details, old/new availability, actors, and minor currency units.",
+            "Completeness is limited to API-visible history for the stated period/filters. Never claim every real-world change or infer no changes from an empty/incomplete response.",
             "Pass business_id when Meta requires it for ad accounts connected to a Business Manager.",
             "Use uid to filter to changes made by a specific Meta user.",
         ],
@@ -616,7 +623,7 @@ async def get_capabilities(
         "Use get_recommendations once for a broad Meta-native opportunity scan, and use typed opportunity tools only for category-specific follow-up.",
         "Use summarize_actions for appointment, lead, purchase, or custom action counts instead of returning full actions arrays.",
         "Use list_ad_comments for raw ad comments and list_page_recommendations for Page reviews; customer feedback score is not exposed as a stable public Marketing API field.",
-        "Use list_change_history for Meta Ads activity logs, changelogs, or audits of campaign, ad set, and ad changes.",
+        "Use export_change_history for complete account/campaign/adset/ad change history in an explicit period. Read all artifact pages and any next_call export parts. list_change_history is only a single page; always disclose coverage gaps and active filters.",
         "Use list_mutation_tools when the user asks what the MCP can change.",
         "search_ads_archive is public research data and does not depend on an ad account id, but the app still needs Ads Library API access.",
         "Write operations still depend on the token having ads_management-level permissions.",
@@ -693,7 +700,9 @@ async def read_overflow_artifact(
     Follow next_item_offset for item pages or next_offset for byte chunks. Only 0
     and recently issued continuations are accepted; guessed offsets are rejected.
     Both modes preserve the artifact. A single oversized item explains how to
-    retrieve it in byte mode without skipping it.
+    retrieve it in byte mode without skipping it. complete refers only to reading
+    this artifact; inspect context.tool_result.structured_content.coverage and
+    next_call for additional source pages or history export parts.
     """
     if offset is not None and item_offset is not None:
         raise ValidationError("Use offset for bytes or item_offset for items, not both.")

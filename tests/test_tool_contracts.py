@@ -141,6 +141,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_ad_comments": {"object_story_id": "page_123_post_123"},
     "list_page_recommendations": {"page_id": "page_123"},
     "list_change_history": {"account_id": "123"},
+    "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
 }
 
 

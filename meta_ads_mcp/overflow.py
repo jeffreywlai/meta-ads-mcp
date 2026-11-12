@@ -1122,6 +1122,29 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         include_structured: bool,
     ) -> ToolResult:
         """Keep direct dict tools' required object output and the operation's status."""
+        structured = original.structured_content or {}
+        if isinstance(structured.get("coverage"), dict):
+            overflow = {**overflow, "source_complete": structured.get("complete"),
+                        "source_has_more": structured.get("has_more"),
+                        "coverage_note": "This artifact contains one tool response. Read its coverage and next_call before claiming complete source history."}
+            message = (
+                f"History source query complete={structured.get('complete')}; "
+                f"more source pages={structured.get('has_more')}. "
+                "This notice does not contain the events. " + message
+            )
+            delivery = structured.get("delivery")
+            if (
+                isinstance(delivery, dict) and delivery.get("inline_is_preview")
+                and isinstance(structured.get("export_id"), str)
+                and EXPORT_ID_PATTERN.fullmatch(structured["export_id"])
+            ):
+                overflow["full_history_export_id"] = structured["export_id"]
+                if overflow.get("export_id") != structured["export_id"]:
+                    message += (
+                        " The archived response contains only an export preview. "
+                        f"Read every event from full_history_export_id='{structured['export_id']}' "
+                        "with read_overflow_artifact, then inspect its coverage/next_call."
+                    )
         notice = ToolResult(
             content=[TextContent(type="text", text=message)],
             structured_content={"overflow": overflow, "message": message}
@@ -1170,6 +1193,7 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
             f"MCP result limit. The complete JSON is available as export_id "
             f"'{export_id}'{size_hint}. Use call_tool with name='read_overflow_artifact' "
             f"and arguments={arguments} repeatedly using {continuation}. "
+            "Artifact completion covers this saved response only; inspect its coverage/paging for more source data. "
             "Use offset=0 and next_offset for complete original JSON byte chunks. When done, use call_tool with "
             "name='delete_overflow_artifact' and that export_id.]"
         )
@@ -1254,6 +1278,36 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
             if len(serialized) <= self.max_size:
                 return compact
 
+        structured = result.structured_content or {}
+        delivery = structured.get("delivery")
+        history_export_id = structured.get("export_id")
+        if (
+            archive_tool_name == "export_change_history"
+            and isinstance(delivery, dict)
+            and delivery.get("artifact_contains_all_fetched_events") is True
+            and isinstance(history_export_id, str)
+            and EXPORT_ID_PATTERN.fullmatch(history_export_id)
+        ):
+            # Archiving a preview would consume a second quota slot and could
+            # evict the complete export. The full result is already stored.
+            return self._overflow_notice(
+                message=self._retrieval_message(
+                    max_size=self.max_size, export_id=history_export_id,
+                    artifact_bytes=delivery.get("artifact_bytes"),
+                    ttl_seconds=self.artifact_store.ttl_seconds,
+                    row_count=structured.get("record_count"),
+                    response_bytes=len(serialized), item_pages=True,
+                ),
+                overflow={
+                    "archived": True, "export_id": history_export_id,
+                    "artifact_bytes": delivery.get("artifact_bytes"),
+                    "original_response_bytes": len(serialized),
+                    "max_inline_bytes": self.max_size,
+                },
+                original=result,
+                include_structured=not is_proxy and result.structured_content is not None,
+            )
+
         try:
             export_id, artifact_size = self.artifact_store.create(
                 result,
@@ -1271,7 +1325,6 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                 include_structured=not is_proxy and result.structured_content is not None,
             )
 
-        structured = result.structured_content or {}
         collection = _collection(structured)
         message = self._retrieval_message(
             max_size=self.max_size,

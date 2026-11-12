@@ -13,7 +13,7 @@
 
 ## ✨ Features
 
-- 📊 **101 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **102 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, current v26 notes, and historical v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
@@ -22,7 +22,7 @@
 - 🔎 **Tool Search** — FastMCP 3.4.8 tool search lets the LLM discover tools on demand instead of loading the full catalog up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (101)
+## 📋 Available Tools (102)
 
 ### 🔍 Discovery
 
@@ -95,7 +95,8 @@
 
 | Tool | Description |
 |------|-------------|
-| `list_change_history` | Read account, campaign, ad set, or ad activity; object-scoped calls derive the owning account when `account_id` is omitted |
+| `list_change_history` | Read one explicitly bounded activity page, with completeness, active filters, and an executable continuation |
+| `export_change_history` | Export all API-returned changes for explicit dates, including descendants, full raw details, and coverage metadata; retrieve every saved event through `read_overflow_artifact` |
 
 ### 🎯 Planning & Targeting
 
@@ -505,6 +506,76 @@ current object state before deciding whether to retry.
 object-scoped activity history. When a campaign, ad set, or ad ID is supplied,
 the server looks up its owning account and validates any explicit or default
 account against that ownership.
+
+#### Complete change history
+
+Use `export_change_history` when asking for every change in a period:
+
+```json
+{
+  "name": "export_change_history",
+  "arguments": {
+    "account_id": "act_123",
+    "since": "2026-06-01",
+    "until": "2026-06-30",
+    "time_zone": "America/New_York"
+  }
+}
+```
+
+Account scope includes activity at every level and every event type Meta returns.
+Campaign and ad set exports include descendants by default: the server scans
+account activity and resolves parent IDs for observed objects, including readable
+deleted objects. It does not depend on the current active-object inventory or
+Meta's `add_children` flag. Unreadable parents and unknown entity types remain in
+the export as `scope_match.status="unresolved"` candidates; `complete` stays false.
+Use `extra_oids` for known related IDs that can no longer be linked to their parent.
+
+`since` and `until` are required for exports. Date-only `until` includes the whole
+specified day in `time_zone` (UTC by default), including daylight-saving changes.
+Timestamp bounds require an explicit offset, with inclusive `since` and exclusive
+`until`. Unix seconds are also accepted. Future end dates are capped at collection
+time. Every continuation uses the same frozen effective bounds.
+
+The response's `items` are a preview. Follow `delivery.read_call`, then each
+`next_item_offset`, to read and save every artifact event. For oversized single
+events, use `delivery.byte_read_call` and follow `next_offset` to recover the full
+JSON. An artifact reader's `complete=true` means that artifact has been read; it
+does **not** establish that all Meta pages were exported. After saving the current
+artifact, follow the export's `next_call` if present and combine every export part.
+Delete artifacts only after their contents are saved or consumed.
+
+Exports automatically paginate, bounded by `max_pages` (default 100), a 45-second
+retrieval budget, and approximately 32 MiB of collected event JSON. Reaching a
+budget or failing a later API page preserves fetched events and returns explicit
+partial coverage and a continuation. Missing/repeated cursors require a smaller
+date window. Parent lookups are bounded at 200 per call; unresolved candidates
+remain visible when that budget is reached. The final continuation part alone
+is not a complete export: `coverage.api_pages_exhausted` records reaching the end,
+while `coverage.starts_at_beginning` distinguishes a full retrieval from its tail.
+
+For a quick page, `list_change_history` defaults to 50 records and a frozen
+seven-day window. Follow `next_call` even if the current page has no matching
+items. Its campaign/ad set scope is object-only unless
+`include_descendants=true`. `export_call` suggests a full-detail hierarchy export;
+`unfiltered_account_export_call` removes entity/category/actor/source restrictions
+for the same effective period.
+
+Omit `category` and `uid` when asking for every change. A category is a filter,
+not an entity level: `category="AD_SET"` can omit optimization-goal changes on an
+ad set. `category="ALL"` means no category filter. The output normalizes legacy
+`object_type` names into `entity_level`: `CAMPAIGN_GROUP` → campaign, `CAMPAIGN` →
+ad set, and `ADGROUP` → ad. Raw fields, actors, application/tool attribution,
+event types, and `extra_data` are retained; parsed details and old/new availability
+are added. Deletion can be a status-change event. Missing old/new details must not
+be inferred, and payment amounts retain their raw minor currency units.
+
+Always report `coverage`, active filters, effective dates, and `ai_instructions`.
+`complete=true` means all API-returned events for that query were retrieved from
+the beginning, with no unresolved scope candidates. It does not establish parity
+with every Ads Manager action or unlimited retention. Permissions, Meta retention,
+unlogged actions, and delayed events can still limit what the API exposes. An
+empty or partial response is not evidence that no changes occurred.
 
 Don't have a token? Use the built-in auth helper tools (`generate_auth_url` → `exchange_code_for_token` → `refresh_to_long_lived_token`) to create one interactively.
 
