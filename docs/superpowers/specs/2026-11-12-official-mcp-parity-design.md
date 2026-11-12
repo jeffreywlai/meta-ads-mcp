@@ -312,9 +312,13 @@ Same `catalog` read group. Module `meta_ads_mcp/tools/catalog_feeds.py`.
 A new module `meta_ads_mcp/official_parity.py` holds one entry for each of
 Meta's 88 tool names (Appendix A):
 
-- `status`: `covered` or `unavailable`.
-- `verified`: `live` when the orchestrator has run the serving tool against a
-  real account and it returned data, otherwise `mocked`. Write tools stay
+- `status`: `covered` (a tool here does the same job through Meta's public API),
+  `approximate` (a tool here serves the same need by a different method,
+  usually a stated rule applied to public data where Meta's tool gives its own
+  internal answer; the note says what differs), or `unavailable`.
+- `verified`: derived from a recorded set of live-run tools. `live` when every
+  serving tool has been run against a real account and returned data,
+  otherwise `mocked`. Write tools stay
   `mocked` until Jeff approves a specific live write test. Mocked tests cannot
   catch a wrong endpoint or field name, so this flag is what tells a reader how
   far to trust an entry.

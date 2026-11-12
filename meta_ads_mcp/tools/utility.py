@@ -13,6 +13,7 @@ from meta_ads_mcp.coordinator import (
     mcp_server,
 )
 from meta_ads_mcp.graph_api import get_graph_api_client
+from meta_ads_mcp.official_parity import OFFICIAL_TOOLS, parity_summary
 from meta_ads_mcp.overflow import (
     DEFAULT_ARTIFACT_CHUNK_BYTES,
     DEFAULT_ARTIFACT_ITEM_LIMIT,
@@ -800,8 +801,23 @@ async def get_capabilities(
     intent: str | None = None,
     include_full_manifest: bool = False,
     tool_name: str | None = None,
+    official_tool: str | None = None,
 ) -> dict[str, object]:
-    """Get routing guidance or a named tool's complete input schema via tool_name; the full manifest lists workflows, not parameter schemas."""
+    """Get routing guidance or a named tool's complete input schema via tool_name; the full manifest lists workflows, not parameter schemas. Pass official_tool with a tool name from Meta's own Ads MCP server (ads_...) to learn which tool here serves it."""
+    if official_tool is not None:
+        if not official_tool.strip() or intent is not None or include_full_manifest or tool_name is not None:
+            raise ValidationError("Provide official_tool alone to look up one of Meta's official tool names.")
+        entry = OFFICIAL_TOOLS.get(official_tool.strip())
+        if entry is None:
+            raise ValidationError(
+                f"'{official_tool}' is not one of Meta's official Ads MCP tool names. "
+                "Use search_tools to find a tool by what it does."
+            )
+        return {
+            "server": _server_metadata(),
+            "official_tool": entry.to_dict(official_tool.strip()),
+            "official_parity": parity_summary(),
+        }
     if tool_name is not None:
         if not tool_name.strip() or intent is not None or include_full_manifest:
             raise ValidationError("Provide tool_name alone to inspect one tool's input schema.")
@@ -892,6 +908,7 @@ async def get_capabilities(
             "routing_hints": ROUTING_HINTS,
             "intent_guide": INTENT_GUIDE,
             "resources": RESOURCE_URIS,
+            "official_parity": parity_summary(),
             "notes": notes,
         }
 
