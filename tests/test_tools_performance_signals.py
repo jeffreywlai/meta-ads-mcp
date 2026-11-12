@@ -987,17 +987,16 @@ def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -
 
     volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
     conversions = volume["OFFSITE_CONVERSIONS"]
-    assert conversions["threshold_events_per_week"] == 50
-    assert conversions["adsets_meeting_threshold"] == 1 and conversions["adset_count"] == 2
-    assert conversions["adsets_below_threshold"] == 1
-    assert conversions["verdict"] == "some_adsets_meet_threshold"
-    assert conversions["spend"] == 800.0
-    assert "adsets" not in conversions
-    assert [row["adset_id"] for row in conversions["top_meeting_threshold"]] == ["as_a"]
-    assert [row["adset_id"] for row in conversions["top_below_threshold"]] == ["as_b"]
-    assert conversions["top_meeting_threshold"][0]["events_per_week"] == pytest.approx(300 / 28 * 7)
-    assert conversions["top_meeting_threshold"][0]["spend"] == 600.0
-    assert volume["LINK_CLICKS"]["verdict"] == "all_adsets_meet_threshold"
+    assert conversions["verdict"] == "not_assessed"
+    assert conversions["adset_count"] == 2 and conversions["spend"] == 800.0
+    assert "promoted_object" in conversions["reason"]
+    assert [row["adset_id"] for row in conversions["top_adsets_by_spend"]] == ["as_a", "as_b"]
+    clicks = volume["LINK_CLICKS"]
+    assert clicks["threshold_events_per_week"] == 50
+    assert clicks["verdict"] == "all_adsets_meet_threshold"
+    assert clicks["top_meeting_threshold"][0]["events_per_week"] == pytest.approx(1000 / 28 * 7)
+    assert clicks["top_meeting_threshold"][0]["spend"] == 200.0
+    assert "adsets" not in clicks
 
     assert result["datasets"]["items"][0]["id"] == "px_1"
     assert result["custom_conversions"]["count"] == 1
@@ -1032,17 +1031,62 @@ def test_advertiser_context_summarizes_goal_volume_with_top_spenders(monkeypatch
     result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
 
     volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
-    conversions = volume["OFFSITE_CONVERSIONS"]
-    assert conversions["adset_count"] == 60
-    assert conversions["adsets_meeting_threshold"] == 0
-    assert conversions["adsets_below_threshold"] == 60
-    below = conversions["top_below_threshold"]
+    leads = volume["LEAD_GENERATION"]
+    assert leads["adset_count"] == 60
+    assert leads["adsets_meeting_threshold"] == 0
+    assert leads["adsets_below_threshold"] == 60
+    below = leads["top_below_threshold"]
     assert len(below) == performance_signals.GOAL_VOLUME_TOP_ADSETS
     assert [row["spend"] for row in below] == sorted((row["spend"] for row in below), reverse=True)
-    assert below[0]["adset_id"] == "as_0295"
+    assert below[0]["adset_id"] == "as_0298"
     assert volume["LINK_CLICKS"]["adsets_meeting_threshold"] == 60
+    assert volume["OFFSITE_CONVERSIONS"]["verdict"] == "not_assessed"
+    assert len(volume["OFFSITE_CONVERSIONS"]["top_adsets_by_spend"]) == performance_signals.GOAL_VOLUME_TOP_ADSETS
     assert volume["REACH"]["verdict"] == "not_assessed"
     assert len(volume["REACH"]["top_adsets_by_spend"]) <= performance_signals.GOAL_VOLUME_TOP_ADSETS
+
+
+def _goal_row(adset_id: str, goal: str, actions: dict[str, float], spend: float = 100.0) -> dict[str, Any]:
+    return {
+        "adset_id": adset_id, "adset_name": adset_id, "optimization_goal": goal,
+        "metrics": {"spend": spend, "conversions": actions.get("purchase", actions.get("lead"))},
+        "actions_map": actions,
+    }
+
+
+def test_goal_volume_counts_leads_for_lead_generation_not_purchases() -> None:
+    rows = [
+        _goal_row("purchases_only", "LEAD_GENERATION", {"purchase": 100, "lead": 0}, spend=300),
+        _goal_row("pixel_leads", "LEAD_GENERATION", {"offsite_conversion.fb_pixel_lead": 60, "purchase": 5}, spend=200),
+    ]
+
+    volume = performance_signals._goal_volume(rows, 7)
+
+    lead = volume[0]
+    assert lead["optimization_goal"] == "LEAD_GENERATION"
+    assert lead["adsets_meeting_threshold"] == 1 and lead["adsets_below_threshold"] == 1
+    assert lead["top_below_threshold"][0]["adset_id"] == "purchases_only"
+    assert lead["top_below_threshold"][0]["events"] == 0
+    assert lead["top_meeting_threshold"][0]["events"] == 60
+    assert "lead" in lead["event_basis"] and "purchase" not in lead["event_basis"]
+
+
+@pytest.mark.parametrize("goal", ["OFFSITE_CONVERSIONS", "VALUE", "QUALITY_LEAD"])
+def test_goal_volume_does_not_judge_goals_whose_event_is_unidentified(goal) -> None:
+    rows = [_goal_row("as_1", goal, {"purchase": 500, "lead": 500})]
+
+    entry = performance_signals._goal_volume(rows, 7)[0]
+
+    assert entry["verdict"] == "not_assessed"
+    assert "adsets_meeting_threshold" not in entry
+    assert entry["reason"]
+    assert entry["top_adsets_by_spend"][0]["adset_id"] == "as_1"
+
+
+def test_advertiser_context_reports_unassessed_goals_as_missing_signals(monkeypatch) -> None:
+    _patch(monkeypatch, _context_client())
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+    assert any("OFFSITE_CONVERSIONS" in signal and "not assessed" in signal for signal in result["missing_signals"])
 
 
 def test_advertiser_context_response_stays_small_for_300_adsets(monkeypatch) -> None:

@@ -1199,16 +1199,27 @@ FUNNEL_STEPS: list[tuple[str, list[str]]] = [
     ("purchase", PURCHASE_ACTION_TYPES),
 ]
 LEARNING_EVENTS_PER_WEEK = 50
-GOAL_EVENT_BASIS: dict[str, tuple[str, list[str] | None, str]] = {
-    "OFFSITE_CONVERSIONS": (
-        "results", None,
-        "purchase or lead actions; an approximation, because the ad set's promoted event may be a different event",
+# Each optimization goal maps to the action types of the event it optimizes for. In every row the first
+# reported alias is counted. Goals whose event cannot be identified from ad set insights are not assessed.
+GOAL_EVENT_BASIS: dict[str, tuple[list[str], str]] = {
+    "LEAD_GENERATION": (
+        LEAD_ACTION_TYPES,
+        "lead actions (the first of lead, onsite_conversion.lead, offsite_conversion.fb_pixel_lead in each row)",
     ),
-    "VALUE": ("results", None, "purchase or lead actions"),
-    "LEAD_GENERATION": ("results", None, "lead actions (purchase if present)"),
-    "QUALITY_LEAD": ("results", None, "lead actions (purchase if present)"),
-    "LINK_CLICKS": ("actions", ["link_click"], "link_click actions"),
-    "LANDING_PAGE_VIEWS": ("actions", ["landing_page_view", "omni_landing_page_view"], "landing_page_view actions"),
+    "LINK_CLICKS": (["link_click"], "link_click actions"),
+    "LANDING_PAGE_VIEWS": (["landing_page_view", "omni_landing_page_view"], "landing_page_view actions"),
+}
+_PROMOTED_EVENT_REASON = (
+    "The event this goal optimizes for is the conversion event set in each ad set's promoted_object, which ad set "
+    "insights do not report; counting purchases or leads instead would judge a proxy, so the goal is not assessed."
+)
+GOAL_EVENT_UNIDENTIFIED: dict[str, str] = {
+    "OFFSITE_CONVERSIONS": _PROMOTED_EVENT_REASON,
+    "VALUE": _PROMOTED_EVENT_REASON,
+    "QUALITY_LEAD": (
+        "This goal optimizes for leads Meta predicts are higher quality; insights do not report those apart from "
+        "all leads, so the goal is not assessed."
+    ),
 }
 CONTEXT_EDGE_SECTIONS: list[tuple[str, str, list[str]]] = [
     ("datasets", "adspixels", ["id", "name", "last_fired_time", "is_unavailable"]),
@@ -1368,20 +1379,17 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
                 "adset_count": len(goal_rows),
                 "spend": goal_spend,
                 "verdict": "not_assessed",
-                "reason": "No event mapping is defined for this optimization goal.",
+                "reason": GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal."),
                 "top_adsets_by_spend": _top_by_spend([_adset_volume_entry(row, None, None) for row in goal_rows]),
             })
             continue
-        source, action_types, description = basis
+        action_types, description = basis
         meeting: list[dict[str, Any]] = []
         below: list[dict[str, Any]] = []
         for row in goal_rows:
-            if source == "results":
-                events = to_float((row.get("metrics") or {}).get("conversions")) or 0.0
-            else:
-                actions = row.get("actions_map") or {}
-                matched = next((candidate for candidate in action_types or [] if candidate in actions), None)
-                events = (to_float(actions.get(matched)) or 0.0) if matched else 0.0
+            actions = row.get("actions_map") or {}
+            matched = next((candidate for candidate in action_types if candidate in actions), None)
+            events = (to_float(actions.get(matched)) or 0.0) if matched else 0.0
             per_week = events / lookback_days * 7
             entry = _adset_volume_entry(row, events, per_week)
             (meeting if per_week >= LEARNING_EVENTS_PER_WEEK else below).append(entry)
@@ -1451,6 +1459,15 @@ async def get_advertiser_context(
     section_errors = {name: section["error"] for name, section in sections.items() if not section["available"]}
     for name, error in section_errors.items():
         missing_signals.append(f"{name}: Meta returned an error, so this section is unknown ({error.get('message')}).")
+    goal_volume = _goal_volume(rows, lookback_days)
+    unassessed = [entry for entry in goal_volume if entry["verdict"] == "not_assessed"]
+    if unassessed:
+        missing_signals.append(
+            "Weekly optimization event volume was not assessed for "
+            + ", ".join(f"{entry['optimization_goal']} ({entry['adset_count']} ad sets)" for entry in unassessed)
+            + " because the event each optimizes for could not be identified from ad set insights; see each "
+            "goal's reason in optimization_goal_volume."
+        )
 
     return analysis_response(
         scope={"level": "account", "object_id": resolved_account_id},
@@ -1481,7 +1498,7 @@ async def get_advertiser_context(
             "spend_by_objective": _group_spend(rows, "objective", total_spend),
             "spend_by_optimization_goal": _group_spend(rows, "optimization_goal", total_spend),
             "funnel": _funnel(_sum_actions(rows)),
-            "optimization_goal_volume": _goal_volume(rows, lookback_days),
+            "optimization_goal_volume": goal_volume,
             "optimization_goal_volume_rule": (
                 f"An ad set meets the threshold when its events / lookback_days x 7 is at least "
                 f"{LEARNING_EVENTS_PER_WEEK}, following Meta's learning-phase guidance of about 50 optimization "
