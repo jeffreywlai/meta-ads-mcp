@@ -19,6 +19,7 @@ from meta_ads_mcp.tools import (
     audiences,
     auth_tools,
     campaigns,
+    catalogs,
     creatives,
     diagnostics,
     discovery,
@@ -142,6 +143,27 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_page_recommendations": {"page_id": "page_123"},
     "list_change_history": {"account_id": "123"},
     "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
+    "list_catalogs": {"business_id": "biz_123"},
+    "list_dpa_eligible_catalogs": {"business_id": "biz_123"},
+    "get_catalog_diagnostics": {"catalog_id": "cat_123"},
+    "get_catalog_dynamic_ads_health": {"catalog_id": "cat_123"},
+    "list_catalog_data_sources": {"catalog_id": "cat_123"},
+    "create_catalog": {"business_id": "biz_123"},
+    "update_catalog": {"catalog_id": "cat_123", "name": "Updated Catalog"},
+    "list_catalog_products": {"catalog_id": "cat_123"},
+    "create_catalog_product": {
+        "catalog_id": "cat_123", "retailer_id": "sku_123", "price": 12.5, "currency": "USD",
+        "url": "https://example.com/p", "image_url": "https://example.com/p.png",
+    },
+    "update_catalog_product": {"product_id": "prod_123", "price": 9.99},
+    "delete_catalog_product": {"product_id": "prod_123"},
+    "build_product_set_filter": {
+        "catalog_id": "cat_123", "conditions": [{"field": "brand", "operator": "eq", "value": "Acme"}],
+    },
+    "list_product_sets": {"catalog_id": "cat_123"},
+    "create_product_set": {"catalog_id": "cat_123", "filter": {"brand": {"eq": "Acme"}}},
+    "update_product_set": {"product_set_id": "ps_123", "name": "Updated Set"},
+    "delete_product_set": {"product_set_id": "ps_123"},
 }
 
 
@@ -508,6 +530,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         audiences,
         auth_tools,
         campaigns,
+        catalogs,
         creatives,
         diagnostics,
         discovery,

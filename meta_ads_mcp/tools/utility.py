@@ -116,6 +116,14 @@ TOOL_GROUPS = {
         "update_creative",
         "update_ad_creative",
         "delete_creative",
+        "create_catalog",
+        "update_catalog",
+        "create_catalog_product",
+        "update_catalog_product",
+        "delete_catalog_product",
+        "create_product_set",
+        "update_product_set",
+        "delete_product_set",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -133,6 +141,14 @@ TOOL_GROUPS = {
     "experiments": [
     ],
     "catalog": [
+        "list_catalogs",
+        "list_dpa_eligible_catalogs",
+        "get_catalog_diagnostics",
+        "get_catalog_dynamic_ads_health",
+        "list_catalog_data_sources",
+        "list_catalog_products",
+        "build_product_set_filter",
+        "list_product_sets",
     ],
     "auth": [
         "generate_auth_url",
@@ -349,6 +365,38 @@ INTENT_GUIDE = {
         ],
         "avoid_unless_needed": [],
         "notes": ["Write operations require ads_management-level permissions and should follow discovery or diagnostics reads."],
+    },
+    "manage_product_catalogs_and_product_sets": {
+        "description": (
+            "Find Meta product catalogs (Commerce Manager shop/product feeds for dynamic or Advantage+ catalog ads), "
+            "check whether they can run catalog ads, inspect products and product sets, and build product set filters."
+        ),
+        "recommended_order": [
+            "list_catalogs",
+            "list_dpa_eligible_catalogs",
+            "get_catalog_dynamic_ads_health",
+            "get_catalog_diagnostics",
+            "list_catalog_data_sources",
+            "list_catalog_products",
+            "list_product_sets",
+            "build_product_set_filter",
+        ],
+        "avoid_unless_needed": [
+            "create_product_set",
+            "update_product_set",
+            "create_catalog_product",
+            "update_catalog_product",
+            "create_catalog",
+            "update_catalog",
+            "delete_product_set",
+            "delete_catalog_product",
+        ],
+        "notes": [
+            "Catalog reads need the catalog_management permission; a permission error means the token lacks it, not that there are no catalogs.",
+            "Turn a plain-English product selection into conditions and test it with build_product_set_filter before create_product_set.",
+            "Product prices are major units (12.5 means 12.50); new products are created with visibility=staging.",
+            "list_dpa_eligible_catalogs and get_catalog_dynamic_ads_health are derived from documented signals and state the rules they use.",
+        ],
     },
 }
 
@@ -686,6 +734,9 @@ async def list_mutation_tools() -> dict[str, object]:
             "creation": ["create_campaign", "create_ad_set", "create_ad", "create_ad_creative"],
             "deletion": ["delete_campaign", "delete_adset", "delete_ad", "delete_creative"],
             "audiences": ["create_custom_audience", "create_lookalike_audience", "update_custom_audience", "delete_audience"],
+            "product_catalogs": ["create_catalog", "update_catalog"],
+            "catalog_products": ["create_catalog_product", "update_catalog_product", "delete_catalog_product"],
+            "product_sets": ["create_product_set", "update_product_set", "delete_product_set"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",
