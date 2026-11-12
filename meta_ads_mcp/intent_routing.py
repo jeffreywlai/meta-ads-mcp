@@ -100,6 +100,20 @@ _WRITE_VERBS = frozenset(
         "upload",
     }
 )
+# Verbs that also have everyday read meanings ("add up the spend"). A request
+# that starts with one of these offers a write tool only when it also names
+# something the tool acts on, so the verb alone never selects a mutation.
+_SUBJECT_SCOPED_WRITE_VERBS = frozenset(
+    {
+        "add",
+        "boost",
+        "cancel",
+        "connect",
+        "disconnect",
+        "remove",
+    }
+)
+_WRITE_VERBS = _WRITE_VERBS | _SUBJECT_SCOPED_WRITE_VERBS
 _GET_SYNONYMS = frozenset({"fetch", "find", "inspect", "read", "show", "view"})
 _ARTICLES = frozenset({"a", "an", "the"})
 
@@ -696,6 +710,10 @@ class StructuredIntentRouter:
                         name
                         for name in names
                         if name.startswith(f"{direct_verb}_")
+                        and (
+                            direct_verb not in _SUBJECT_SCOPED_WRITE_VERBS
+                            or _names_tool_subject(clause, name)
+                        )
                     )
                 continue
             if negated is not None:
@@ -747,6 +765,21 @@ class StructuredIntentRouter:
                 name in mutation_names for name in compatible
             ),
         )
+
+
+def _singular(word: str) -> str:
+    """Fold simple plurals so "studies" matches "study" and "posts" matches "post"."""
+    if len(word) > 4 and word.endswith("ies"):
+        return f"{word[:-3]}y"
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _names_tool_subject(clause: str, name: str) -> bool:
+    """Return whether a clause mentions something a verb-named tool acts on."""
+    words = {_singular(word) for word in re.findall(r"[a-z0-9]+", clause)}
+    return any(_singular(part) in words for part in name.split("_")[1:])
 
 
 def is_compatible_name(name: str, decision: RouteDecision) -> bool:
