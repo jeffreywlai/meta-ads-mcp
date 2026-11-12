@@ -706,26 +706,65 @@ async def _active_studies(client: Any, parent: str, edge: str, now: datetime) ->
     ]
 
 
-async def _count_account_active_studies(client: Any, account_id: str, now: datetime) -> dict[str, Any]:
-    """Count scheduled or running studies on the account, paging until the documented limit is reached."""
-    active = 0
+async def _scan_active_studies(
+    client: Any,
+    parent: str,
+    edge: str,
+    now: datetime,
+    *,
+    max_pages: int,
+    stop_at: int | None = None,
+) -> dict[str, Any]:
+    """Page a study edge for scheduled or running studies.
+
+    complete is true only when Meta's last page had no next link. A next link without a usable
+    cursor, a repeated cursor, the page cap, or reaching stop_at ends the scan as incomplete with
+    stop_reason saying why.
+    """
+    active: list[dict[str, Any]] = []
     pages = 0
     params: dict[str, Any] = {"limit": 100}
-    complete = False
-    while pages < CONCURRENCY_SCAN_PAGES:
+    seen_cursors: set[str] = set()
+    while True:
         normalized = normalize_collection(
-            await client.list_objects(account_id, "impacting_ad_studies", fields=STUDY_LIST_FIELDS, params=params)
+            await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
         )
         pages += 1
-        active += sum(1 for study in normalized["items"] if _study_state(study, now) in ACTIVE_STATES)
+        active.extend(
+            {"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state}
+            for study in normalized["items"]
+            if isinstance(study, dict) and (state := _study_state(study, now)) in ACTIVE_STATES
+        )
+        if not normalized["paging"].get("next"):
+            return {"active": active, "pages_read": pages, "complete": True, "stop_reason": None}
         cursor = normalized["paging"].get("after")
-        if not normalized["paging"].get("next") or not cursor:
-            complete = True
-            break
-        if active >= MAX_CONCURRENT_STUDIES:
-            break
-        params = {"limit": 100, "after": cursor}
-    return {"active_studies": active, "pages_read": pages, "count_complete": complete}
+        if not cursor:
+            reason = "Meta reported another page but returned no cursor to fetch it."
+        elif cursor in seen_cursors:
+            reason = "Meta returned a cursor already read, so paging stopped to avoid counting a page twice."
+        elif stop_at is not None and len(active) >= stop_at:
+            reason = f"Stopped once {stop_at} scheduled or running studies were found."
+        elif pages >= max_pages:
+            reason = f"Stopped at the {max_pages}-page read cap while Meta reported more pages."
+        else:
+            seen_cursors.add(cursor)
+            params = {"limit": 100, "after": cursor}
+            continue
+        return {"active": active, "pages_read": pages, "complete": False, "stop_reason": reason}
+
+
+async def _count_account_active_studies(client: Any, account_id: str, now: datetime) -> dict[str, Any]:
+    """Count scheduled or running studies on the account, paging until the documented limit is reached."""
+    scan = await _scan_active_studies(
+        client, account_id, "impacting_ad_studies", now,
+        max_pages=CONCURRENCY_SCAN_PAGES, stop_at=MAX_CONCURRENT_STUDIES,
+    )
+    return {
+        "active_studies": len(scan["active"]),
+        "pages_read": scan["pages_read"],
+        "count_complete": scan["complete"],
+        "stop_reason": scan["stop_reason"],
+    }
 
 
 @mcp_server.tool()
@@ -806,7 +845,8 @@ async def check_ab_test_eligibility(
         )
     elif not account_check["count_complete"]:
         missing_signals.append(
-            f"Counted active studies on the first {account_check['pages_read']} pages only."
+            f"Counted active studies on the first {account_check['pages_read']} page(s) only: "
+            f"{account_check['stop_reason']}"
         )
     if len(ids) > 100 // MIN_SPLIT_TREATMENT_PERCENTAGE:
         account_check["warnings"].append(

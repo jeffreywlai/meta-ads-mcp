@@ -355,6 +355,62 @@ def test_eligibility_blocks_at_documented_concurrent_study_limit(monkeypatch) ->
     assert result["account"]["blockers"]
 
 
+class PagedStudyClient(FakeStudyClient):
+    """Serves edge pages keyed by (parent, edge, after cursor)."""
+
+    def __init__(self, pages, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.pages = pages
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        self.calls.append(("list", parent_id, edge, list(fields or []), params))
+        if (parent_id, edge) in self.errors:
+            raise self.errors[(parent_id, edge)]
+        return self.pages.get((parent_id, edge, (params or {}).get("after")), {"data": []})
+
+
+RUNNING = ("2026-11-01T00:00:00+0000", "2026-11-30T00:00:00+0000")
+
+
+def test_study_count_with_next_page_but_no_cursor_is_not_complete() -> None:
+    """F11: a next link without a usable cursor is incomplete, never a completed count."""
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): {
+            "data": [_study("s1", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/?after=unextracted"},
+        },
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["count_complete"] is False
+    assert result["active_studies"] == 1
+    assert "no cursor" in result["stop_reason"]
+
+
+def test_study_count_repeated_cursor_stops_incomplete() -> None:
+    page = {"data": [_study("s1", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/next", "cursors": {"after": "same"}}}
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): page,
+        ("act_10", "impacting_ad_studies", "same"): page,
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["count_complete"] is False
+    assert result["pages_read"] == 2
+    assert "already read" in result["stop_reason"]
+
+
+def test_study_count_pages_to_the_last_page() -> None:
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): {
+            "data": [_study("s1", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/next", "cursors": {"after": "p2"}},
+        },
+        ("act_10", "impacting_ad_studies", "p2"): {"data": [_study("s2", "LIFT", *RUNNING)]},
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result == {"active_studies": 2, "pages_read": 2, "count_complete": True, "stop_reason": None}
+
+
 @pytest.mark.parametrize("kwargs", [
     {"level": "ad", "entity_ids": ["a1"]},
     {"level": "campaign", "entity_ids": []},
