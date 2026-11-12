@@ -647,6 +647,30 @@ def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
     assert all(finding["evidence"] for finding in result["findings"])
 
 
+@pytest.mark.parametrize(
+    ("quality", "engagement"),
+    [("UNKNOWN", "UNKNOWN"), ("UNKNOWN", "AVERAGE"), ("ABOVE_AVERAGE", None)],
+)
+def test_ranking_conversion_path_needs_known_quality_and_engagement(quality, engagement) -> None:
+    rankings = {"quality_ranking": quality, "engagement_rate_ranking": engagement,
+                "conversion_rate_ranking": "BELOW_AVERAGE_10"}
+    metrics = {"spend": 10.0, "results": 1.0, "cost_per_result": 10.0}
+
+    diagnosis, reason, below = performance_signals._ranking_diagnosis(rankings, metrics, metrics)
+
+    assert diagnosis is None
+    assert below == ["conversion_rate_ranking"]
+    assert "unknown" in reason
+
+
+def test_ranking_conversion_path_when_quality_and_engagement_are_known_and_average() -> None:
+    rankings = {"quality_ranking": "AVERAGE", "engagement_rate_ranking": "ABOVE_AVERAGE",
+                "conversion_rate_ranking": "BELOW_AVERAGE_10"}
+    metrics = {"spend": 10.0, "results": 1.0, "cost_per_result": 10.0}
+    diagnosis, _, _ = performance_signals._ranking_diagnosis(rankings, metrics, metrics)
+    assert diagnosis == "conversion_path"
+
+
 def _ad_level_calls(client: RecordingClient) -> list[dict[str, Any]]:
     return [call for call in _calls(client, "get_insights") if call["params"]["level"] == "ad"]
 

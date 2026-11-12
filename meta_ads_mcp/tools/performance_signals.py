@@ -797,7 +797,10 @@ RANKING_RULES = {
         "UNKNOWN": "Meta had too little data to rank the ad",
     },
     "creative_quality": "quality_ranking or engagement_rate_ranking is below average.",
-    "conversion_path": "only conversion_rate_ranking is below average; quality and engagement are average or above.",
+    "conversion_path": (
+        "only conversion_rate_ranking is below average; quality and engagement are both known and average or above. "
+        "When either of them is UNKNOWN, no diagnosis is made."
+    ),
     "bid_and_budget": (
         "all three rankings are average or above, and either cost per result is at least cost_ratio_threshold times "
         "the scope's cost per result, or the ad has no results after spending at least one scope cost per result."
@@ -829,6 +832,14 @@ def _ranking_diagnosis(
             below,
         )
     if below == ["conversion_rate_ranking"]:
+        unknown = [field for field in ("quality_ranking", "engagement_rate_ranking") if points[field] is None]
+        if unknown:
+            return (
+                None,
+                f"The conversion-rate ranking is below average, but {' and '.join(unknown)} is unknown, so the "
+                "evidence cannot tell the post-click path apart from the creative; no diagnosis is made.",
+                below,
+            )
         return (
             "conversion_path",
             "Only the conversion-rate ranking is below average, which points at what happens after the click "
