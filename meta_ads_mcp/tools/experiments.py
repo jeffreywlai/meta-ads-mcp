@@ -99,6 +99,8 @@ MAX_CELLS_PER_STUDY = 150
 MAX_ENTITIES_PER_CELL = 100
 MAX_CONCURRENT_STUDIES = 100
 CONCURRENCY_SCAN_PAGES = 10
+ENTITY_STUDY_SCAN_PAGES = 5
+MEMBERSHIP_EDGES = (("campaigns", "campaign_ids"), ("adsets", "adset_ids"), ("adaccounts", "ad_account_ids"))
 END_EARLY_GRACE_SECONDS = 60
 ACTIVE_STATES = frozenset({"scheduled", "running"})
 NON_DELIVERING_STATUSES = frozenset({"DELETED", "ARCHIVED"})
@@ -500,15 +502,23 @@ async def list_ad_studies(
 
 
 def _normalize_cell(cell: dict[str, Any]) -> dict[str, Any]:
-    return {
+    normalized: dict[str, Any] = {
         "id": cell.get("id"),
         "name": cell.get("name"),
         "treatment_percentage": cell.get("treatment_percentage"),
         "control_percentage": cell.get("control_percentage"),
-        "campaign_ids": _edge_ids(cell.get("campaigns")),
-        "adset_ids": _edge_ids(cell.get("adsets")),
-        "ad_account_ids": _edge_ids(cell.get("adaccounts")),
     }
+    truncated: list[str] = []
+    for edge, key in MEMBERSHIP_EDGES:
+        value = cell.get(edge)
+        normalized[key] = _edge_ids(value)
+        paging = value.get("paging") if isinstance(value, dict) else None
+        if isinstance(paging, dict) and paging.get("next"):
+            truncated.append(key)
+    if truncated:
+        # Meta expanded only the first page of these memberships; the remaining ids were not read.
+        normalized["membership_truncated"] = truncated
+    return normalized
 
 
 def _parse_results(raw: Any) -> list[Any]:
@@ -574,6 +584,11 @@ def _split_results(
                     "cell_name": cell["name"] if cell else None,
                     "confidence": entry.get("winner_confidence"),
                 }
+                if cell is None and any(item.get("membership_truncated") for item in cells):
+                    response["winner"]["cell_mapping_note"] = (
+                        "The winner was not found in the cell memberships read, which are incomplete; "
+                        "it may belong to a cell whose later membership pages were not returned."
+                    )
                 response["message"] = "Meta reported a winning cell."
             else:
                 response["message"] = (
@@ -665,6 +680,8 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             **{key: value for key, value in objective.items() if key != "results"},
             "parsed_results": parsed,
         })
+    cell_nodes_complete = not cells_payload["paging"].get("next")
+    memberships_complete = not any(cell.get("membership_truncated") for cell in cells)
     response: dict[str, Any] = {
         "item": {**study, "state": state},
         "cells": cells,
@@ -676,10 +693,17 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             "count": 1,
             "cell_count": len(cells),
             "objective_count": len(objectives),
-            "cells_complete": not cells_payload["paging"].get("next"),
+            "cells_complete": cell_nodes_complete and memberships_complete,
+            "cell_nodes_complete": cell_nodes_complete,
+            "memberships_complete": memberships_complete,
             "objectives_complete": not objectives_payload["paging"].get("next"),
         },
     }
+    if not memberships_complete:
+        response["summary"]["membership_note"] = (
+            "Meta returned only the first page of some cells' campaigns, ad sets or ad accounts "
+            "(see membership_truncated on those cells); the ids listed for them are incomplete."
+        )
     if not include_results:
         return response
     if not any(objective["parsed_results"] for objective in objectives):
@@ -695,15 +719,6 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
     else:
         response["results"] = _lift_results(objectives, cells)
     return response
-
-
-async def _active_studies(client: Any, parent: str, edge: str, now: datetime) -> list[dict[str, Any]]:
-    payload = await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params={"limit": 100})
-    return [
-        {"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state}
-        for study in payload.get("data", [])
-        if (state := _study_state(study, now)) in ACTIVE_STATES
-    ]
 
 
 async def _scan_active_studies(
@@ -822,12 +837,21 @@ async def check_ab_test_eligibility(
         if status in NON_DELIVERING_STATUSES:
             result["warnings"].append(f"effective_status is {status}, so it cannot deliver.")
         try:
-            active = await _active_studies(client, entity_id, "ad_studies", now)
+            scan = await _scan_active_studies(
+                client, entity_id, "ad_studies", now, max_pages=ENTITY_STUDY_SCAN_PAGES,
+            )
         except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
             result["active_studies"] = None
             missing_signals.append(f"Could not read the studies containing {entity_id}: {exc}")
         else:
+            active = scan["active"]
             result["active_studies"] = active
+            result["active_studies_complete"] = scan["complete"]
+            if not scan["complete"]:
+                missing_signals.append(
+                    f"Read only {scan['pages_read']} page(s) of the studies containing {entity_id}: "
+                    f"{scan['stop_reason']}"
+                )
             if active:
                 result["warnings"].append(
                     f"Already in {len(active)} scheduled or running study(ies): "

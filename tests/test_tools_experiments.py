@@ -272,6 +272,33 @@ def test_get_ad_study_lift_results_report_lift_and_confidence(monkeypatch) -> No
     assert cell["meta_fields"] == row
 
 
+def test_study_nested_membership_paging_is_not_complete(monkeypatch) -> None:
+    """F20: a cell whose expanded ad sets have a next page is not a complete membership."""
+    cells = {"data": [
+        {"id": "cell_a", "name": "Group A",
+         "adsets": {"data": [{"id": "as_1"}], "paging": {"next": "https://graph.invalid/n",
+                                                        "cursors": {"after": "c"}}}},
+        {"id": "cell_b", "name": "Group B", "adsets": {"data": [{"id": "as_2"}]}},
+    ]}
+    results = [json.dumps({"winner_ad_object_id": "as_9", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): cells,
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "results": results}]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    summary = result["summary"]
+    assert summary["cells_complete"] is False
+    assert summary["cell_nodes_complete"] is True
+    assert summary["memberships_complete"] is False
+    assert "incomplete" in summary["membership_note"]
+    assert result["cells"][0]["membership_truncated"] == ["adset_ids"]
+    assert "membership_truncated" not in result["cells"][1]
+    winner = result["results"]["winner"]
+    assert winner["cell_id"] is None
+    assert "incomplete" in winner["cell_mapping_note"]
+
+
 def test_get_ad_study_requires_id(monkeypatch) -> None:
     no_client(monkeypatch)
     with pytest.raises(experiments.ValidationError):
@@ -409,6 +436,38 @@ def test_study_count_pages_to_the_last_page() -> None:
     })
     result = run(experiments._count_account_active_studies(client, "act_10", NOW))
     assert result == {"active_studies": 2, "pages_read": 2, "count_complete": True, "stop_reason": None}
+
+
+def test_eligibility_does_not_miss_entity_study_second_page(monkeypatch) -> None:
+    """F20: the entity's ad_studies edge is paged, so a running study on page two is found."""
+    use(monkeypatch, PagedStudyClient(
+        {("c1", "ad_studies", None): {"data": [], "paging": {"next": "https://graph.invalid/n",
+                                                             "cursors": {"after": "p2"}}},
+         ("c1", "ad_studies", "p2"): {"data": [_study("s50", "SPLIT_TEST", *RUNNING)]}},
+        objects={"c1": _campaign("c1")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    entity = result["entities"][0]
+    assert [study["id"] for study in entity["active_studies"]] == ["s50"]
+    assert entity["active_studies_complete"] is True
+
+
+@pytest.mark.parametrize("paging", [
+    {"next": "https://graph.invalid/?after=unextracted"},
+    {"next": "https://graph.invalid/n", "cursors": {"after": "p1"}},
+])
+def test_eligibility_reports_incomplete_entity_study_read(monkeypatch, paging) -> None:
+    """F20: a missing cursor or the page cap leaves the entity's study list incomplete, and it is said."""
+    monkeypatch.setattr(experiments, "ENTITY_STUDY_SCAN_PAGES", 1)
+    use(monkeypatch, PagedStudyClient(
+        {("c1", "ad_studies", None): {"data": [], "paging": paging}},
+        objects={"c1": _campaign("c1")},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    entity = result["entities"][0]
+    assert entity["active_studies"] == []
+    assert entity["active_studies_complete"] is False
+    assert any("studies containing c1" in signal for signal in result["missing_signals"])
 
 
 @pytest.mark.parametrize("kwargs", [
