@@ -38,6 +38,9 @@ CREATIVE_IMAGE_FIELDS = [
 ]
 
 VALID_AD_STATUSES = {"ACTIVE", "PAUSED"}
+UPDATABLE_AD_STATUSES = {"ACTIVE", "PAUSED", "ARCHIVED"}
+_OMITTED_PREVIOUS = "Meta returned no value for it; it may not have been set."
+_UNREAD_AD_PREVIOUS = "Not a field this server reads back from an ad."
 
 
 def _append_image_candidate(
@@ -334,6 +337,7 @@ async def get_ad_image(ad_id: str | None = None, ad_ids: StrictStringList | None
 
 _AD_PARAMS_REJECTED = {
     "bid_amount": "bid_amount is a money field in minor units and is not supported by update_ad.",
+    "bid_info": "bid_info is a legacy bid field in minor units and is not supported by update_ad.",
     "adset_id": "adset_id cannot be changed on an existing ad; Meta does not allow it.",
     "creative": "Use creative_id instead of params.creative.",
 }
@@ -349,7 +353,7 @@ async def update_ad(
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad's name, creative, tracking specs or status (ACTIVE or PAUSED), with before/after. Use validate_only to have Meta check the change without applying it."""
+    """Edit an ad's name, creative, tracking specs or status (ACTIVE, PAUSED or ARCHIVED), with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
         raise ValidationError("ad_id is required.")
@@ -358,8 +362,8 @@ async def update_ad(
     for key, message in _AD_PARAMS_REJECTED.items():
         if params and key in params:
             raise ValidationError(message)
-    if status is not None and status not in VALID_AD_STATUSES:
-        raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}; delete with delete_ad.")
+    if status is not None and status not in UPDATABLE_AD_STATUSES:
+        raise ValidationError(f"status must be one of {sorted(UPDATABLE_AD_STATUSES)}; delete with delete_ad.")
     resolved_creative_id = blank_to_none(creative_id)
     payload: dict[str, Any] = {
         "name": OMIT if name is None else name,
@@ -383,10 +387,17 @@ async def update_ad(
     previous = await client.get_object(ad_id, fields=["id", *read_fields])
     result = await client.update_object(ad_id, data=payload)
 
+    unavailable: dict[str, str] = {}
+
     def _public(values: dict[str, Any], *, before: bool) -> dict[str, Any]:
         shaped: dict[str, Any] = {}
         for key in changes:
+            public_key = "creative_id" if key == "creative" else key
             if before and key not in readable:
+                unavailable[public_key] = _UNREAD_AD_PREVIOUS
+                continue
+            if before and key not in values:
+                unavailable[public_key] = _OMITTED_PREVIOUS
                 continue
             if key == "creative":
                 creative = values.get("creative")
@@ -410,4 +421,6 @@ async def update_ad(
         "previous_not_read": not_read,
         "result": result,
     })
+    if unavailable:
+        response["previous_unavailable"] = unavailable
     return response

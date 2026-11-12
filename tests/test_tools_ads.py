@@ -452,6 +452,50 @@ def test_update_ad_validation_errors_make_no_call(monkeypatch, arguments, messag
         asyncio.run(ads.update_ad(**arguments))
 
 
+def test_update_ad_accepts_archived(monkeypatch) -> None:
+    client = FakeUpdateAdClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.update_ad(ad_id="ad_1", status="ARCHIVED"))
+    assert client.calls[1] == ("update", "ad_1", {"status": "ARCHIVED"})
+    assert result["previous"] == {"status": "PAUSED"}
+    assert result["current"] == {"status": "ARCHIVED"}
+    assert "cannot be restored to active from this server" in ads.update_ad.__doc__
+
+
+@pytest.mark.parametrize(
+    ("params", "message"),
+    [
+        ({"bid_info": {"ACTIONS": 150}}, "bid_info"),
+    ],
+)
+def test_update_ad_rejects_minor_unit_money_in_params(monkeypatch, params, message) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match=message):
+        asyncio.run(ads.update_ad(ad_id="ad_1", params=params))
+
+
+def test_update_ad_names_a_changed_field_meta_did_not_return(monkeypatch) -> None:
+    class SparseClient(FakeUpdateAdClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            self.calls.append(("get", object_id, list(fields or [])))
+            return {"id": object_id, "name": "Old ad"}
+
+    client = SparseClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.update_ad(
+        ad_id="ad_1", name="New ad", creative_id="crt_new",
+        params={"conversion_domain": "example.com", "not_a_readable_field": 1},
+    ))
+    assert client.calls[0] == ("get", "ad_1", ["id", "name", "creative{id}", "conversion_domain"])
+    assert result["previous"] == {"name": "Old ad"}
+    assert result["previous_unavailable"] == {
+        "creative_id": "Meta returned no value for it; it may not have been set.",
+        "conversion_domain": "Meta returned no value for it; it may not have been set.",
+        "not_a_readable_field": "Not a field this server reads back from an ad.",
+    }
+    assert result["current"]["creative_id"] == "crt_new"
+
+
 class RecordingAdsClient(FakeAdsClient):
     """Fake ad client that records every call in order."""
 
