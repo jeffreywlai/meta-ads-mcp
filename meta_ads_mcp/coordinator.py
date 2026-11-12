@@ -331,7 +331,16 @@ mcp_server = FastMCP(
         "does not prove complete source history. Do not claim every real-world change "
         "when Meta retention or permissions are unknown. When a "
         "response returns an overflow export_id, retrieve it in bounded chunks "
-        "with read_overflow_artifact and delete it when finished."
+        "with read_overflow_artifact and delete it when finished. "
+        "For Meta product catalogs, products, product sets, feeds and catalog "
+        "event sources start with list_catalogs. For pixels, datasets, event "
+        "volume and event match quality start with list_datasets. For A/B tests "
+        "and lift studies use list_ad_studies and get_ad_study. For the account "
+        "opportunity score use get_opportunity_score, for unusual days use "
+        "detect_performance_anomalies, and for delivery-blocking errors use "
+        "get_delivery_errors. If you know a tool name from Meta's own Ads MCP "
+        "server (ads_...), call get_capabilities(official_tool='that name') to "
+        "find the tool here that serves it."
     ),
     transforms=[TOOL_SEARCH_TRANSFORM],
     mask_error_details=False,
