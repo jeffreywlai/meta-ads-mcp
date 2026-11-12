@@ -468,6 +468,37 @@ def test_get_field_reference_validation_errors_make_no_call(monkeypatch, argumen
         asyncio.run(assets.get_field_reference(**arguments))
 
 
+@pytest.mark.parametrize(
+    ("query", "intent"),
+    [
+        ("boostable instagram posts", "find_pages_media_and_asset_usage"),
+        ("which ad sets use this custom audience", "find_pages_media_and_asset_usage"),
+        ("which ads use this creative", "find_pages_media_and_asset_usage"),
+        ("field types allowed values", "find_pages_media_and_asset_usage"),
+        ("boost instagram post", "edit_ad_sets_ads_and_customer_lists"),
+    ],
+)
+def test_stream_a_intents_route_plain_requests(query, intent) -> None:
+    from meta_ads_mcp.tools import utility
+
+    result = asyncio.run(utility.get_capabilities(intent=query))
+    assert result["closest_intents"][0]["intent"] == intent
+
+
+def test_stream_a_writes_appear_in_mutation_common_paths(monkeypatch) -> None:
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.tools import utility
+
+    monkeypatch.delenv("META_READ_ONLY", raising=False)
+    reload_settings()
+    result = asyncio.run(utility.list_mutation_tools())
+    assert result["common_paths"]["general_edits"] == ["update_adset", "update_ad"]
+    assert result["common_paths"]["customer_list_users"] == ["add_audience_users", "remove_audience_users"]
+    assert result["common_paths"]["instagram_boost"] == ["boost_instagram_post"]
+    exact = asyncio.run(utility.get_capabilities(intent="find_pages_media_and_asset_usage"))
+    assert exact["selected_intent"]["recommended_order"][0] == "list_pages"
+
+
 def test_get_field_reference_accepts_ad_set_alias(monkeypatch) -> None:
     _no_client(monkeypatch)
     result = asyncio.run(assets.get_field_reference(level="ad_set", field_names=["billing_event"]))

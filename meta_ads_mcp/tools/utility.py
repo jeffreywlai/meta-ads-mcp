@@ -362,6 +362,47 @@ INTENT_GUIDE = {
         "avoid_unless_needed": [],
         "notes": ["Write operations require ads_management-level permissions and should follow discovery or diagnostics reads."],
     },
+    "find_pages_media_and_asset_usage": {
+        "description": (
+            "List Pages by user, ad account or business; browse the image and video library; find which ads "
+            "use a creative or which ad sets use a custom audience; list boostable Instagram posts; look up "
+            "field types and allowed values."
+        ),
+        "recommended_order": [
+            "list_pages",
+            "list_ad_images",
+            "list_ad_videos",
+            "list_creative_ads",
+            "list_audience_adsets",
+            "list_instagram_media",
+            "get_field_reference",
+        ],
+        "avoid_unless_needed": [],
+        "notes": [
+            "list_creative_ads and list_audience_adsets scan with a page cap; check summary.complete and continue with summary.next_after.",
+            "list_instagram_media marks each post boost_eligible with Meta's reason when it is not; boost with boost_instagram_post.",
+            "get_field_reference comes from Meta's SDK field list because Meta no longer serves live field introspection.",
+        ],
+    },
+    "edit_ad_sets_ads_and_customer_lists": {
+        "description": (
+            "Edit ad set or ad settings with before/after, add or remove people in a customer list audience, "
+            "or boost an Instagram post as a paused ad, after explicit user confirmation."
+        ),
+        "recommended_order": [
+            "update_adset",
+            "update_ad",
+            "add_audience_users",
+            "remove_audience_users",
+            "boost_instagram_post",
+        ],
+        "avoid_unless_needed": [],
+        "notes": [
+            "update_adset rejects budgets and bids; use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy.",
+            "validate_only on update_adset, update_ad and boost_instagram_post has Meta check the change without applying it.",
+            "For customer lists prefer file_path to a local CSV so personal data never passes through the model; inline rows are limited to 1,000.",
+        ],
+    },
 }
 
 ROUTING_HINTS = {
@@ -390,6 +431,7 @@ INTENT_SEARCH_SYNONYMS = {
     "history": "activity changes changelog audit log",
     "audit": "activity changes changelog history",
     "log": "activity changes changelog history",
+    "boost": "boost_instagram_post edit paused ad",
 }
 
 
@@ -698,6 +740,9 @@ async def list_mutation_tools() -> dict[str, object]:
             "creation": ["create_campaign", "create_ad_set", "create_ad", "create_ad_creative"],
             "deletion": ["delete_campaign", "delete_adset", "delete_ad", "delete_creative"],
             "audiences": ["create_custom_audience", "create_lookalike_audience", "update_custom_audience", "delete_audience"],
+            "general_edits": ["update_adset", "update_ad"],
+            "customer_list_users": ["add_audience_users", "remove_audience_users"],
+            "instagram_boost": ["boost_instagram_post"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",
