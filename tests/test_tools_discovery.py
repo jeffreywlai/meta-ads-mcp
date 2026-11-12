@@ -285,6 +285,85 @@ def test_destination_projection_preserves_explicit_creative_selection(monkeypatc
     assert "https://shop.example/asset" in result["item"]["destination_urls"]
 
 
+@pytest.mark.parametrize("tool_name", ["list_ads", "get_ad"])
+@pytest.mark.parametrize("cta_path", [
+    ("call_to_action",),
+    ("object_story_spec", "link_data", "call_to_action"),
+    ("object_story_spec", "template_data", "call_to_action"),
+    ("object_story_spec", "video_data", "call_to_action"),
+    ("object_story_spec", "link_data", "child_attachments", "call_to_action"),
+])
+def test_destination_projection_keeps_app_and_store_cta_links(monkeypatch, tool_name, cta_path) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    expected = [
+        "https://shop.example/product", "myapp://product/123",
+        "https://apps.apple.com/app/id123", "https://play.google.com/store/apps/details?id=example.app",
+        "https://shop.example/catalog/product", "https://store.example/app",
+    ]
+    creative = {"value": {
+        **dict(zip(("link", "app_link", "ios_url", "android_url", "product_link"), expected)),
+        "object_store_urls": [expected[0], expected[-1], None, " "],
+        "link_caption": "display.example", "application": "123", "page": "456",
+    }}
+    for key in reversed(cta_path):
+        creative = {key: [creative] if key == "child_attachments" else creative}
+
+    class DestinationClient:
+        async def get_object(self, object_id, *, fields):
+            return {"id": "ad1", "creative": creative}
+
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            return {"data": [{"id": "ad1", "creative": creative}]}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DestinationClient())
+    scope = {"account_id": "123"} if tool_name == "list_ads" else {"ad_id": "ad1"}
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": tool_name, "arguments": {**scope, "fields": ["id", "destination_urls"]},
+    })).structured_content
+    item = result["items"][0] if tool_name == "list_ads" else result["item"]
+    assert item == {"id": "ad1", "destination_urls": expected}
+
+
+@pytest.mark.parametrize("tool_name", ["list_ads", "get_ad"])
+@pytest.mark.parametrize("story_type", ["link_data", "template_data"])
+def test_destination_projection_keeps_carousel_and_platform_app_links(monkeypatch, tool_name, story_type) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    expected = [
+        "https://shop.example/product", "myapp://android/product", "myapp://ios/product",
+        "myapp://ipad/product", "myapp://iphone/product", "https://shop.example/card",
+        "myapp://ios/card", "myapp://android/card",
+    ]
+    creative = {"object_story_spec": {story_type: {
+        "link": expected[0],
+        "app_link_spec": {
+            platform: [{"url": expected[index], "app_name": "Example", "app_store_id": "123"},
+                       {"url": expected[0]}, {"app_name": "No configured URL"}]
+            for index, platform in enumerate(("android", "ios", "ipad", "iphone"), 1)
+        },
+        "child_attachments": [{
+            "link": expected[5], "ios_url": expected[6], "android_url": expected[7],
+            "caption": "display.example", "picture": "https://cdn.example/card.jpg",
+        }],
+    }}}
+
+    class DestinationClient:
+        async def get_object(self, object_id, *, fields):
+            return {"id": "ad1", "creative": creative}
+
+        async def list_objects(self, parent_id, edge, *, fields, params):
+            return {"data": [{"id": "ad1", "creative": creative}]}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DestinationClient())
+    scope = {"account_id": "123"} if tool_name == "list_ads" else {"ad_id": "ad1"}
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": tool_name, "arguments": {**scope, "fields": ["id", "destination_urls"]},
+    })).structured_content
+    item = result["items"][0] if tool_name == "list_ads" else result["item"]
+    assert item == {"id": "ad1", "destination_urls": expected}
+
+
 def test_destination_urls_are_empty_when_meta_exposes_no_configured_links(monkeypatch) -> None:
     class NoLinkClient:
         async def get_object(self, object_id, *, fields):

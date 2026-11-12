@@ -340,6 +340,11 @@ def _configuration_routes(text: str, *, allow_shorthand: bool) -> tuple[str, ...
     if verb in _STATUS_VERBS and subjects and subjects[0].facet != "status":
         return None
     if read_requested:
+        # A report name can begin with a field, e.g. "budget pacing report".
+        # Only consume a read when its entire subject is a configuration list;
+        # otherwise let canonical read routing retain the requested workflow.
+        if not _CONFIGURATION_SEPARATOR.fullmatch(full_tail[previous_end:end].rstrip(" .!?")):
+            return None
         if verb in _GET_SYNONYMS | {"get"}:
             return tuple(dict.fromkeys(
                 _ENTITY_GETTERS[subject.entity]
@@ -470,7 +475,7 @@ def _strip_articles(words: Iterable[str]) -> str:
 
 def _canonical_surface_route(text: str, names: frozenset[str]) -> str | None:
     """Match the longest direct command against a canonical tool surface."""
-    simplified = _strip_articles(text.replace("-", " ").replace("/", " ").split())
+    simplified = _strip_articles(text.replace("-", " ").replace("/", " ").split()).rstrip(" .!?")
     surfaces = {
         name: tuple(
             dict.fromkeys(

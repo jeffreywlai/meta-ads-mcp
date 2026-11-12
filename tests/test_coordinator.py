@@ -516,6 +516,63 @@ def test_usage_report_compound_queries_return_the_operation_union(query, expecte
     assert names == expected
 
 
+@pytest.mark.parametrize(("read_query", "read_tool"), [
+    ("get budget pacing report", "get_budget_pacing_report"),
+    ("get budget opportunities", "get_budget_opportunities"),
+    ("show budget pacing report", "get_budget_pacing_report"),
+])
+@pytest.mark.parametrize(("sibling", "sibling_tool"), [
+    ("update campaign budget", "update_campaign_budget"),
+    ("get campaign", "get_campaign"),
+])
+@pytest.mark.parametrize("read_first", [True, False])
+@pytest.mark.parametrize("read_only", [True, False])
+@pytest.mark.parametrize("punctuation", ["", "."])
+def test_compound_search_keeps_reports_named_like_configuration_fields(
+    monkeypatch, read_query, read_tool, sibling, sibling_tool, read_first, read_only, punctuation,
+) -> None:
+    monkeypatch.setattr(mcp_server.transforms[0], "_max_results", 1)
+    monkeypatch.setenv("META_READ_ONLY", str(read_only).lower())
+    reload_settings()
+    operations = [(read_query + punctuation, read_tool), (sibling, sibling_tool)]
+    if not read_first:
+        operations.reverse()
+    expected = [
+        name for _, name in operations
+        if not read_only or not name.startswith("update_")
+    ]
+
+    result = asyncio.run(mcp_server.call_tool("search_tools", {
+        "query": "; ".join(query for query, _ in operations),
+    }))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
+@pytest.mark.parametrize("punctuation", [".", "!", "?"])
+@pytest.mark.parametrize("separator", [" and ", ", "])
+@pytest.mark.parametrize("with_sibling", [True, False])
+@pytest.mark.parametrize("read_only", [True, False])
+def test_punctuated_configuration_reads_keep_every_entity(
+    monkeypatch, punctuation, separator, with_sibling, read_only,
+) -> None:
+    monkeypatch.setattr(mcp_server.transforms[0], "_max_results", 1)
+    monkeypatch.setenv("META_READ_ONLY", str(read_only).lower())
+    reload_settings()
+    query = f"show campaign budget{separator}adset status{punctuation}"
+    expected = ["get_campaign", "get_adset"]
+    if with_sibling:
+        query += "; update campaign name; adset bid amount must not change."
+        if not read_only:
+            expected.append("update_campaign")
+
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+
+    names = [line.split("`", 2)[1] for line in result.content[0].text.splitlines() if line.startswith("- `")]
+    assert names == expected
+
+
 @pytest.mark.parametrize("max_results", [1, 6, 12])
 def test_explicit_search_preserves_every_unique_operation_in_order(monkeypatch, max_results) -> None:
     monkeypatch.setattr(mcp_server.transforms[0], "_max_results", max_results)

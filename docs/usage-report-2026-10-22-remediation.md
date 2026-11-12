@@ -16,7 +16,7 @@ automatic mutation-retry system.
 
 ## Validation
 
-The final full suite passed **1,562 tests**, with **32 live tests skipped**,
+The latest full suite passed **1,654 tests**, with **32 live tests skipped**,
 using the project's installed Python environment and this checkout's source.
 The unchanged baseline passed 1,257 tests with the same 32 skips. Installed
 dependencies passed `uv pip check`, and `git diff --check` was clean.
@@ -32,7 +32,50 @@ the original operation's success/error status is preserved in each case.
 These are repository and local transport results. They do not attest Meta's
 live write behavior or the installed server on Nick's computer.
 
-### Follow-up GitHub review
+### November 11 independent review
+
+A fresh GPT-6.1-Sol maximum-reasoning review found three additional defects.
+Each was reproduced locally before correction:
+
+- Configuration parsing consumed read-tool names beginning with a field, so
+  `get budget pacing report; update campaign budget` omitted the requested
+  report. Configuration reads now require a complete field-list subject and
+  leave report names to canonical routing. Sentence-ending punctuation is
+  preserved as a valid command boundary, including coordinated entity reads.
+- `destination_urls` omitted configured app/store destinations before removing
+  the original creative. The projection now includes CTA app/platform/product
+  links and store URL lists, direct carousel platform URLs, and typed platform
+  URLs in `app_link_spec`. Duplicates, labels, identifiers, and image/display
+  URLs are excluded. No extra Graph requests or URL resolution are introduced.
+- Compact Insights rows omitted unknown `metrics.spend`, but budget pacing
+  indexed that key unconditionally. Pacing now retains unknown first/last-day
+  spend as null and preserves observed zero, for compact and full daily rows.
+
+The review also caught a punctuation regression in the first routing fix and
+additional app-link omissions; both were corrected before delivery. The 92
+added regression cases cover actual MCP search with both clause orders,
+read-only mode, one-result caps, punctuation and preservation clauses; both ad
+read tools with nested destination layouts; and the full Insights normalization
+to pacing-diagnostics path. The focused suite passed 587 tests, and the full
+suite passed 1,654 with 32 live tests skipped. Dependencies were installed with
+`uv sync --locked --extra dev`; `.venv/bin/python -m pytest -q`,
+`uv pip check --python .venv/bin/python`, and `git diff --check` passed.
+
+The final independent review found no remaining actionable findings. It
+repeated the full suite and passed 832 actual MCP discovery calls across
+result caps 1/3/6/12 and both read-only modes, plus additional projection,
+unknown-metric, aggregation/resume, overflow, and cache-integrity checks.
+The reviewed production source fingerprint remained
+`de92f92fd6d529401df49f162f02b5d7a60ba34a322ca08dc3155a1865f24781`.
+
+The static destination properties were checked against Meta's generated
+[CTA value schema](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/adcreativelinkdatacalltoactionvalue.py),
+[carousel schema](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/adcreativelinkdatachildattachment.py),
+and [app-link schema](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/adcreativelinkdataapplinkspec.py).
+These checks establish extraction of the configured values, not actual ad
+delivery or eligibility.
+
+### October 22 GitHub review
 
 All three review findings on `327f38d` were reproduced before correction:
 
@@ -68,7 +111,7 @@ measurements, not general latency guarantees. The conservative cache estimate
 was 40,091,515 bytes; it is not process RSS. Oversized decoded artifacts bypass
 the cache and retain the original repeated-parse cost.
 
-### Coordinated discovery and result limits
+### October 22 coordinated discovery and result limits
 
 The two later review findings on `4f59a38` were also reproduced before correction:
 

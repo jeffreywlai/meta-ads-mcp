@@ -505,6 +505,33 @@ def test_budget_pacing_report_handles_no_rows(monkeypatch) -> None:
     assert result["trend_summary"]["first_day_spend"] is None
 
 
+@pytest.mark.parametrize("spend_fields", [{}, {"spend": None}, {"spend": "0"}])
+@pytest.mark.parametrize("include_full_daily_rows", [True, False])
+def test_budget_pacing_keeps_unknown_spend_after_insights_compaction(
+    monkeypatch, spend_fields, include_full_daily_rows,
+) -> None:
+    from meta_ads_mcp.tools import insights
+
+    class InsightsClient:
+        async def get_insights(self, object_id, *, fields, params):
+            assert params["time_increment"] == 1
+            return {"data": [{
+                "date_start": "2026-10-01", "date_stop": "2026-10-01",
+                "impressions": "123", **spend_fields,
+            }]}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: InsightsClient())
+    result = asyncio.run(diagnostics.get_budget_pacing_report(
+        level="campaign", object_id="cmp_123", include_full_daily_rows=include_full_daily_rows,
+    ))
+
+    expected_spend = 0.0 if spend_fields.get("spend") == "0" else None
+    assert result["trend_summary"] == {
+        "days": 1, "first_day_spend": expected_spend, "last_day_spend": expected_spend,
+    }
+    assert result["daily_rows"][0]["metrics"].get("spend") == expected_spend
+
+
 def test_budget_pacing_report_supports_explicit_since_until(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
 

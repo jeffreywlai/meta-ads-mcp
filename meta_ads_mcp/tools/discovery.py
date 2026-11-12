@@ -215,7 +215,13 @@ def _destination_urls(creative: dict[str, Any]) -> list[str]:
 
     def add_call_to_action(value: Any) -> None:
         if isinstance(value, dict) and isinstance(value.get("value"), dict):
-            add(value["value"].get("link"))
+            destinations = value["value"]
+            for field in ("link", "app_link", "ios_url", "android_url", "product_link"):
+                add(destinations.get(field))
+            store_urls = destinations.get("object_store_urls")
+            if isinstance(store_urls, list):
+                for url in store_urls:
+                    add(url)
 
     for field in ("link_url", "object_url", "object_store_url", "template_url", "link_deep_link_url"):
         add(creative.get(field))
@@ -225,8 +231,17 @@ def _destination_urls(creative: dict[str, Any]) -> list[str]:
         data = story.get(field) or {}
         add(data.get("link"))
         add_call_to_action(data.get("call_to_action"))
+        app_links = data.get("app_link_spec")
+        if isinstance(app_links, dict):
+            for platform in ("android", "ios", "ipad", "iphone"):
+                platform_links = app_links.get(platform)
+                if isinstance(platform_links, list):
+                    for app_link in platform_links:
+                        if isinstance(app_link, dict):
+                            add(app_link.get("url"))
         for attachment in data.get("child_attachments") or []:
-            add(attachment.get("link"))
+            for field in ("link", "ios_url", "android_url"):
+                add(attachment.get(field))
             add_call_to_action(attachment.get("call_to_action"))
     asset_feed = creative.get("asset_feed_spec") or {}
     for link in asset_feed.get("link_urls") or []:
