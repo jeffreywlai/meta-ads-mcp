@@ -14,7 +14,7 @@
 ## ✨ Features
 
 - 📊 **163 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, product catalogs, pixels and datasets, experiments, auth helpers, and controlled writes
-- 🤝 **Parity with Meta's official Ads MCP server** — every one of its 88 documented tools is mapped to a tool here or recorded as unavailable with the reason; see [Parity with Meta's official server](#-parity-with-metas-official-server)
+- 🤝 **Parity with Meta's official Ads MCP server** — every one of the 106 tools it serves is mapped to a tool here, or recorded as partial, missing or unavailable with the reason; see [Parity with Meta's official server](#-parity-with-metas-official-server)
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, current v26 notes, and historical v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
@@ -296,38 +296,45 @@ for a small preflight or read-back. The other single-entity reads also accept `f
 
 ## 🤝 Parity with Meta's official server
 
-Meta publishes a hosted Ads MCP server (`https://mcp.facebook.com/ads`) with 88
-documented tools. `meta_ads_mcp/official_parity.py` holds one entry for each of
-those names, and a test fails if any name is missing or points at a tool that is
-not registered.
+Meta publishes a hosted Ads MCP server (`https://mcp.facebook.com/ads`). On
+2026-11-12 it served 106 tools: 87 of the 88 named in Meta's documentation plus
+19 undocumented ones. `meta_ads_mcp/official_parity.py` holds one entry for each
+served name, written from that tool's real description and parameter list. A
+test fails if a served name is missing or an entry points at a tool that is not
+registered.
 
-Each entry has a status:
+| Status | Meaning | Tools |
+|--------|---------|-------|
+| `covered` | A tool here does everything Meta's tool does, or more | 46 |
+| `partial` | A tool here does part of it; the entry says what Meta's tool can do that ours cannot | 35 |
+| `missing` | Nothing here yet, although Meta's public API appears to allow it | 8 |
+| `unavailable` | No public API route is known, so no tool is registered | 12 |
+| `app_internal` | Plumbing for Meta's own app (upload dialogs, telemetry); nothing to match | 6 |
 
-- **covered**: a tool here does the same job through Meta's public API.
-- **approximate**: a tool here serves the same need by a different method,
-  usually a stated rule applied to public data where Meta's tool gives its own
-  internal answer. The entry's note says what differs.
-- **unavailable**: Meta's public API does not expose the capability, so no tool
-  is registered for it.
+The `covered` count includes `ads_update_custom_audience_users`, which Meta
+documents but does not serve.
 
-Each served entry also carries `verified`: `live` when every serving tool has
-been run against a real ad account and returned data, otherwise `mocked`. Mocked
-tests use a fake client that accepts any endpoint name, so they cannot catch a
-wrong endpoint or field name. Write tools stay `mocked` until a live write test
-is explicitly approved.
+Each `covered` or `partial` entry also carries `verified`: `live` when every
+serving tool has been run against a real ad account and Meta accepted the
+request, otherwise `mocked`. Mocked tests use a fake client that accepts any
+endpoint name, so they cannot catch a wrong endpoint or field name. Write tools
+stay `mocked` until a live write test is explicitly approved.
 
 To find the tool for one of Meta's names, call
 `get_capabilities(official_tool="ads_get_opportunity_score")`. A Meta name
 served by exactly one tool here can also be used directly as a tool name. A name
 served by several tools, or by none, returns an explanation instead.
 
-Not available through Meta's public API, and therefore not built:
+No public API route is known for:
 
-- Industry benchmarks from similar advertisers (`ads_insights_industry_benchmark`).
+- Benchmarks against similar advertisers (`ads_insights_industry_benchmark`,
+  `ads_insights_performance_vs_peers`).
 - Business Help Center article search (`ads_get_help_article`).
+- Partner store integration health (`ads_catalog_list_partner_integrations`).
 - Pixel event rules and parameter extractors (the eight `ads_pixel_event_*` and
-  `ads_pixel_parameter_*` tools): Meta's reference marks changes as unsupported,
-  and the live API rejected the documented reads.
+  `ads_pixel_parameter_*` tools): Meta's own server limits them to first-party
+  clients, the public reference marks changes as unsupported, and the live API
+  rejected the documented reads.
 
 ## 📚 MCP Resources
 

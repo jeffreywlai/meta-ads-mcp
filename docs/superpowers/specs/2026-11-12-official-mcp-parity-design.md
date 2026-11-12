@@ -312,10 +312,14 @@ Same `catalog` read group. Module `meta_ads_mcp/tools/catalog_feeds.py`.
 A new module `meta_ads_mcp/official_parity.py` holds one entry for each of
 Meta's 88 tool names (Appendix A):
 
-- `status`: `covered` (a tool here does the same job through Meta's public API),
-  `approximate` (a tool here serves the same need by a different method,
-  usually a stated rule applied to public data where Meta's tool gives its own
-  internal answer; the note says what differs), or `unavailable`.
+- `status`: `covered` (a tool here does everything Meta's tool does, or more),
+  `partial` (a tool here does part of it; the note says what Meta's tool can do
+  that ours cannot), `missing` (nothing here yet, although Meta's public API
+  appears to allow it), `unavailable` (no public API route is known), or
+  `app_internal` (plumbing for Meta's own app, nothing to match). The ledger
+  was first written from Meta's documentation (88 names) and then corrected
+  against the 106 tools Meta's live server returned on 2026-11-12, using their
+  real parameter lists.
 - `verified`: derived from a recorded set of live-run tools. `live` when every
   serving tool has been run against a real account and returned data,
   otherwise `mocked`. Write tools stay
