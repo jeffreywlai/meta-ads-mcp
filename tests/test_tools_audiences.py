@@ -1049,3 +1049,46 @@ def test_update_custom_audience_without_rule_is_unchanged(monkeypatch) -> None:
     assert result["previous"] == {"name": "Existing Audience", "description": "Old", "retention_days": 30,
                                   "customer_file_source": "USER_PROVIDED_ONLY"}
     assert result["current"] == {"rule": WEBSITE_RULE}
+
+
+@pytest.mark.parametrize("rule", [WEBSITE_RULE, json.dumps(WEBSITE_RULE), " " + json.dumps(WEBSITE_RULE) + " "])
+def test_update_custom_audience_named_rule_reads_rule_first_and_sends_it(monkeypatch, rule) -> None:
+    stored_rule = json.dumps({"inclusions": {"operator": "or", "rules": []}})
+    client = RecordingAudienceClient(previous={
+        "id": "aud_1", "name": "Site visitors", "subtype": "WEBSITE", "description": None, "rule": stored_rule,
+    })
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", name="Checkout visitors", rule=rule))
+    assert client.calls == [
+        ("get", "aud_1", [*OLD_AUDIENCE_READ_FIELDS, "rule"], None),
+        ("update", "aud_1", {"name": "Checkout visitors", "rule": WEBSITE_RULE}),
+    ]
+    assert result["previous"]["rule"] == stored_rule
+    assert result["previous"]["name"] == "Site visitors"
+    assert result["current"] == {"name": "Checkout visitors", "rule": WEBSITE_RULE}
+
+
+def test_update_custom_audience_rule_named_and_in_params_raises_before_network(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(audiences.ValidationError, match="rule") as excinfo:
+        asyncio.run(audiences.update_custom_audience(
+            audience_id="aud_1", rule=WEBSITE_RULE, params={"rule": WEBSITE_RULE},
+        ))
+    assert "params" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("rule", ["", "   ", "not json", "[1, 2]", "42", {}, "{}"])
+def test_update_custom_audience_rejects_a_rule_that_is_not_a_json_object(monkeypatch, rule) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(audiences.ValidationError, match="rule"):
+        asyncio.run(audiences.update_custom_audience(audience_id="aud_1", rule=rule))
+
+
+def test_update_custom_audience_rule_failed_pre_read_writes_nothing(monkeypatch) -> None:
+    from meta_ads_mcp.errors import NotFoundError
+
+    client = RecordingAudienceClient(read_error=NotFoundError("Meta object or edge not found: aud_1"))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    with pytest.raises(NotFoundError):
+        asyncio.run(audiences.update_custom_audience(audience_id="aud_1", rule=WEBSITE_RULE))
+    assert [call[0] for call in client.calls] == ["get"]
