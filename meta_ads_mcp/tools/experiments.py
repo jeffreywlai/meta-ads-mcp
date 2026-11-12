@@ -1036,7 +1036,8 @@ async def cancel_ad_study(study_id: str) -> dict[str, Any]:
     """End or cancel an A/B test or lift study. Use only when the user explicitly asks to stop a study.
 
     A study that has not started is deleted. A running study is ended by moving its end_time to
-    one minute from now, which keeps its results. A study already ended or canceled is left alone.
+    one minute from now, which keeps its results; one already ending within that minute is left
+    to finish, so its end never moves later. A study already ended or canceled is left alone.
     Returns the prior state.
     """
     study_id = blank_to_none(study_id)
@@ -1052,6 +1053,22 @@ async def cancel_ad_study(study_id: str) -> dict[str, Any]:
         current: dict[str, Any] = {"operation": "delete", "result": result}
     elif state == "running":
         new_end = int((now + timedelta(seconds=END_EARLY_GRACE_SECONDS)).timestamp())
+        stored_end = _parse_meta_time(previous.get("end_time"))
+        if stored_end is not None and int(stored_end.timestamp()) <= new_end:
+            # Moving end_time to now plus the grace interval would push this end later, not earlier.
+            response = mutation_response(
+                action="cancel_ad_study",
+                target={"study_id": study_id},
+                previous=prior,
+                current={"operation": "none", "end_time": stored_end.isoformat()},
+                ok=False,
+            )
+            response["message"] = (
+                f"Nothing was sent: the study already ends at {stored_end.isoformat()}, within the "
+                f"{END_EARLY_GRACE_SECONDS} seconds this tool would set, so it will finish on its own shortly. "
+                "Changing end_time now would only make it end later."
+            )
+            return response
         result = await client.update_object(study_id, data={"end_time": new_end})
         current = {"operation": "end_early", "end_time": _iso(new_end), "result": result}
     else:

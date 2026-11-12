@@ -684,6 +684,28 @@ def test_cancel_ad_study_finished_study_sends_nothing(monkeypatch, study) -> Non
     assert result["previous"]["state"] in {"ended", "canceled"}
 
 
+@pytest.mark.parametrize("end_time", ["2026-11-12T12:00:30+0000", "2026-11-12T12:01:00+0000"])
+def test_cancel_study_never_extends_running_study(monkeypatch, end_time) -> None:
+    """F4: a running study already ending within the grace interval is left alone, never extended."""
+    study = {**RUNNING_STUDY, "end_time": end_time}
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    result = run(experiments.cancel_ad_study(study_id="study_1"))
+    assert client.kinds() == ["get"]
+    assert result["previous"]["state"] == "running"
+    assert result["current"]["operation"] == "none"
+    assert datetime.fromisoformat(result["current"]["end_time"]) == datetime.fromisoformat(end_time)
+    assert "finish on its own shortly" in result["message"]
+    assert "Nothing was sent" in result["message"]
+
+
+def test_cancel_study_moves_end_earlier_when_it_ends_after_grace(monkeypatch) -> None:
+    study = {**RUNNING_STUDY, "end_time": "2026-11-12T12:01:01+0000"}
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    result = run(experiments.cancel_ad_study(study_id="study_1"))
+    assert client.calls[1] == ("update", "study_1", {"end_time": NOW_TS + 60})
+    assert result["current"]["operation"] == "end_early"
+
+
 def test_cancel_ad_study_failed_pre_read_sends_no_write(monkeypatch) -> None:
     client = use(monkeypatch, FakeStudyClient(errors={"gone": NotFoundError("not found: gone")}))
     with pytest.raises(NotFoundError):
