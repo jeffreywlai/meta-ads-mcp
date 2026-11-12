@@ -1063,7 +1063,7 @@ async def disconnect_catalog_event_source(
         raise ValidationError(
             f"Event source {event_source_id} is not connected to catalog {catalog_id}; nothing was changed."
         )
-    await client.delete_from_edge(
+    await client.delete_edge_object(
         catalog_id, "external_event_sources", data={"external_event_sources": [event_source_id]},
     )
     return mutation_response(

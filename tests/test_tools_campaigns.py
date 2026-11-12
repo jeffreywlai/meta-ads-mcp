@@ -397,3 +397,123 @@ def test_update_campaign_decodes_previous_money_before_mutating(monkeypatch) -> 
             campaigns.update_campaign(campaign_id="cmp_123", daily_budget=75.0)
         )
     assert client.updated_payload is None
+
+
+class FakeUpdateAdsetClient:
+    """Fake client for update_adset that records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, object]] = []
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        return {
+            "id": object_id,
+            "name": "Old set",
+            "status": "PAUSED",
+            "optimization_goal": "LINK_CLICKS",
+            "billing_event": "IMPRESSIONS",
+            "targeting": {"geo_locations": {"countries": ["US"]}},
+            "end_time": "2026-12-01T00:00:00+0000",
+            "frequency_control_specs": [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 2}],
+        }
+
+    async def update_object(self, object_id: str, *, data):
+        self.calls.append(("update", object_id, data))
+        return {"success": True}
+
+
+def test_update_adset_reads_then_updates_with_before_after(monkeypatch) -> None:
+    client = FakeUpdateAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    targeting = {"geo_locations": {"countries": ["US", "CA"]}}
+
+    result = asyncio.run(campaigns.update_adset(
+        adset_id="adset_1", name="New set", targeting=targeting, optimization_goal="OFFSITE_CONVERSIONS",
+        params={"frequency_control_specs": [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 3}],
+                "not_a_readable_field": True},
+    ))
+
+    assert [call[0] for call in client.calls] == ["get", "update"]
+    read_fields = client.calls[0][2]
+    assert {"name", "targeting", "optimization_goal", "frequency_control_specs"} <= set(read_fields)
+    assert "not_a_readable_field" not in read_fields
+    assert client.calls[1][1] == "adset_1"
+    assert client.calls[1][2] == {
+        "name": "New set", "targeting": targeting, "optimization_goal": "OFFSITE_CONVERSIONS",
+        "frequency_control_specs": [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 3}],
+        "not_a_readable_field": True,
+    }
+    assert result["action"] == "update_adset"
+    assert result["target"] == {"adset_id": "adset_1"}
+    assert result["previous"] == {
+        "name": "Old set", "targeting": {"geo_locations": {"countries": ["US"]}},
+        "optimization_goal": "LINK_CLICKS",
+        "frequency_control_specs": [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 2}],
+    }
+    assert result["current"]["name"] == "New set"
+    assert result["previous_not_read"] == ["not_a_readable_field"]
+    assert result["validation_only"] is False
+
+
+def test_update_adset_validate_only_sends_execution_option(monkeypatch) -> None:
+    client = FakeUpdateAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="adset_1", status="ACTIVE", validate_only=True))
+    assert client.calls[1][2] == {"status": "ACTIVE", "execution_options": ["validate_only"]}
+    assert result["validation_only"] is True
+    assert result["previous"] == {"status": "PAUSED"}
+
+
+@pytest.mark.parametrize(
+    ("params", "tool_name"),
+    [
+        ({"daily_budget": 5000}, "update_adset_budget"),
+        ({"lifetime_budget": 5000}, "update_adset_budget"),
+        ({"bid_amount": 150}, "update_adset_bid_amount"),
+        ({"bid_strategy": "COST_CAP"}, "update_adset_bid_strategy"),
+        ({"bid_constraints": {"roas_average_floor": 20000}}, "update_adset_bid_strategy"),
+    ],
+)
+def test_update_adset_rejects_budget_and_bid_fields(monkeypatch, params, tool_name) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(campaigns.ValidationError, match=tool_name):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", params=params))
+
+
+def test_update_adset_requires_a_change(monkeypatch) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(campaigns.ValidationError, match="At least one field"):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1"))
+    with pytest.raises(campaigns.ValidationError, match="At least one field"):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", params={}, validate_only=True))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"adset_id": " ", "name": "x"}, "adset_id is required"),
+        ({"adset_id": "adset_1", "status": "DELETED"}, "status must be"),
+        ({"adset_id": "adset_1", "params": {"daily_spend_cap": 100}}, "minor units"),
+        ({"adset_id": "adset_1", "name": "y", "params": {"name": "x"}}, "name"),
+        ({"adset_id": "adset_1", "params": {"execution_options": ["validate_only"]}}, "execution_options"),
+    ],
+)
+def test_update_adset_validation_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.update_adset(**arguments))
+
+
+def test_update_adset_missing_object_sends_no_update(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    class GoneClient(FakeUpdateAdsetClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            raise MetaApiError(message="Object does not exist", status_code=400, code=100)
+
+    client = GoneClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", name="x"))
+    assert client.calls == []

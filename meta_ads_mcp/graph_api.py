@@ -843,14 +843,14 @@ class GraphAPIClient:
             params["after"] = cursor
         return await self.request("GET", "ads_archive", params=params)
 
-    async def delete_from_edge(
+    async def delete_edge_object(
         self,
         parent_id: str,
         edge: str,
         *,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Send a DELETE with form parameters to an edge, e.g. to dissociate objects."""
+        """Send a DELETE to a collection edge with form-encoded parameters in the body."""
         return await self.request("DELETE", f"{parent_id}/{edge}", data=data)
 
 

@@ -35,6 +35,9 @@ _WRITE_NAMES = frozenset(
         "cancel_ad_study",
         "connect_catalog_event_source",
         "disconnect_catalog_event_source",
+        "add_audience_users",
+        "remove_audience_users",
+        "boost_instagram_post",
     }
 )
 _READ_TAGS = frozenset({"read", "read-only", "readonly"})

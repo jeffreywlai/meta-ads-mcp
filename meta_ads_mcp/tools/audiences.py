@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import csv
+import hashlib
 import math
+import re
+import secrets
+import unicodedata
+from datetime import date
+from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import Field
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
@@ -264,3 +271,381 @@ async def delete_audience(audience_id: str) -> dict[str, Any]:
         "target": {"audience_id": audience_id},
         "result": result,
     }
+
+
+# Customer-list uploads. Values are normalized and SHA-256 hashed here, following
+# Meta's customer list formatting rules, so no raw value is sent to Meta. No value
+# or hash is ever placed in a response, an error message, or a log line.
+
+AUDIENCE_USERS_BATCH_SIZE = 10_000
+AUDIENCE_USERS_INLINE_ROW_LIMIT = 1_000
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+_EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_REDACT_PATTERNS = (
+    re.compile(r"[0-9a-fA-F]{32,}"),
+    re.compile(r"[^\s@'\"<>(),;:]+@[^\s@'\"<>(),;:]+"),
+    re.compile(r"\+?\d[\d\s().-]{5,}\d"),
+)
+
+
+def _letters(value: str) -> str:
+    return "".join(character for character in unicodedata.normalize("NFC", value).lower() if character.isalpha())
+
+
+def _normalize_email(value: str) -> str:
+    candidate = value.strip().lower()
+    return candidate if _EMAIL_SHAPE.fullmatch(candidate) else ""
+
+
+def _normalize_phone(value: str) -> str:
+    return re.sub(r"\D", "", value).lstrip("0")
+
+
+def _normalize_gender(value: str) -> str:
+    return {"m": "m", "male": "m", "f": "f", "female": "f"}.get(value.strip().lower(), "")
+
+
+def _normalize_number(value: str, *, low: int, high: int, width: int) -> str:
+    digits = value.strip()
+    if not digits.isdigit() or not low <= int(digits) <= high:
+        return ""
+    return f"{int(digits):0{width}d}"
+
+
+def _normalize_birth_year(value: str) -> str:
+    digits = value.strip()
+    if len(digits) != 4:
+        return ""
+    return _normalize_number(digits, low=1900, high=date.today().year, width=4)
+
+
+def _normalize_first_initial(value: str) -> str:
+    return _letters(value)[:1]
+
+
+def _normalize_state(value: str) -> str:
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def _normalize_zip(value: str) -> str:
+    compact = "".join(value.lower().split())
+    if re.fullmatch(r"\d{5}(-?\d{4})?", compact):
+        return compact[:5]
+    return compact
+
+
+def _normalize_country(value: str) -> str:
+    candidate = value.strip().lower()
+    return candidate if re.fullmatch(r"[a-z]{2}", candidate) else ""
+
+
+# Meta customer-list keys and their published normalization rules. Only keys
+# Meta requires to be hashed are supported, so every sent value is a SHA-256 digest.
+_AUDIENCE_KEY_NORMALIZERS = {
+    "EMAIL": _normalize_email,
+    "PHONE": _normalize_phone,
+    "GEN": _normalize_gender,
+    "DOBY": _normalize_birth_year,
+    "DOBM": lambda value: _normalize_number(value, low=1, high=12, width=2),
+    "DOBD": lambda value: _normalize_number(value, low=1, high=31, width=2),
+    "FN": _letters,
+    "LN": _letters,
+    "FI": _normalize_first_initial,
+    "CT": _letters,
+    "ST": _normalize_state,
+    "ZIP": _normalize_zip,
+    "COUNTRY": _normalize_country,
+}
+
+
+def _audience_schema(schema: Any) -> list[str]:
+    keys = coerce_csv_string_list(schema)
+    if not isinstance(keys, list) or not keys or any(not isinstance(key, str) or not key.strip() for key in keys):
+        raise ValidationError("schema must list one or more Meta customer-list keys, such as EMAIL or PHONE.")
+    normalized = [key.strip().upper() for key in keys]
+    unsupported = [key for key in normalized if key not in _AUDIENCE_KEY_NORMALIZERS]
+    if unsupported:
+        raise ValidationError(
+            f"Unsupported schema key(s): {', '.join(unsupported)}. "
+            f"Supported keys: {', '.join(_AUDIENCE_KEY_NORMALIZERS)}."
+        )
+    if len(set(normalized)) != len(normalized):
+        raise ValidationError("schema lists a key more than once.")
+    return normalized
+
+
+def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
+    """Read only the schema columns from a local CSV, matched to the header by name."""
+    path = Path(file_path).expanduser()
+    if not path.is_file():
+        raise ValidationError("file_path must point to a readable file.")
+    try:
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if not header:
+                raise ValidationError("file_path has no header row.")
+            columns = [name.strip().upper() for name in header]
+            if len(set(columns)) != len(columns):
+                raise ValidationError("file_path header repeats a column name.")
+            missing = [key for key in schema if key not in columns]
+            if missing:
+                raise ValidationError(
+                    f"file_path header has no column named {', '.join(missing)}; header columns must be named after the schema keys."
+                )
+            positions = [columns.index(key) for key in schema]
+            rows: list[list[Any]] = []
+            for record in reader:
+                if not any(cell.strip() for cell in record):
+                    continue
+                rows.append([record[index] if index < len(record) else "" for index in positions])
+            return rows
+    except UnicodeDecodeError:
+        raise ValidationError("file_path must be a UTF-8 encoded CSV file.") from None
+    except csv.Error:
+        raise ValidationError("file_path could not be parsed as CSV.") from None
+
+
+def _hash_rows(
+    rows: list[Any],
+    schema: list[str],
+    *,
+    pre_hashed: bool,
+) -> tuple[list[list[str]], list[list[str]], int, int]:
+    """Return rows to send, their raw values (for redaction only), invalid value count and dropped rows."""
+    prepared: list[list[str]] = []
+    raw_values: list[list[str]] = []
+    invalid = 0
+    dropped = 0
+    for row_number, row in enumerate(rows, start=1):
+        if not isinstance(row, (list, tuple)) or len(row) != len(schema):
+            raise ValidationError(f"Row {row_number} must have exactly {len(schema)} values, one per schema key.")
+        sent: list[str] = []
+        for key, value in zip(schema, row):
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                raise ValidationError(f"Row {row_number}, {key}: values must be strings.")
+            if not value.strip():
+                invalid += 1
+                sent.append("")
+                continue
+            if pre_hashed:
+                digest = value.strip().lower()
+                if not _SHA256_HEX.fullmatch(digest):
+                    raise ValidationError(
+                        f"Row {row_number}, {key}: with pre_hashed=true every value must be a SHA-256 hex digest. "
+                        "The value is not shown."
+                    )
+                if digest == _EMPTY_SHA256:
+                    invalid += 1
+                    sent.append("")
+                    continue
+            else:
+                normalized = _AUDIENCE_KEY_NORMALIZERS[key](value)
+                if not normalized:
+                    invalid += 1
+                    sent.append("")
+                    continue
+                digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            sent.append(digest)
+        if any(sent):
+            prepared.append(sent)
+            raw_values.append([str(value).strip() for value in row if value])
+        else:
+            dropped += 1
+    return prepared, raw_values, invalid, dropped
+
+
+def _redact(text: Any, secrets_in_batch: list[str]) -> str | None:
+    """Remove anything that could be an uploaded value or hash from upstream error text."""
+    if text is None:
+        return None
+    redacted = str(text)
+    for secret in sorted(secrets_in_batch, key=len, reverse=True):
+        if len(secret) >= 3:
+            redacted = re.sub(re.escape(secret), "[redacted]", redacted, flags=re.IGNORECASE)
+    for pattern in _REDACT_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
+    return redacted
+
+
+def _sanitized_upload_error(
+    exc: Exception,
+    *,
+    action: str,
+    batch_seq: int,
+    total_batches: int,
+    session_id: int,
+    batch_secrets: list[str],
+) -> Exception:
+    """Rebuild an upload failure without any row value, hash, or upstream payload."""
+    accepted = batch_seq - 1
+    progress = (
+        f"{action} failed on batch {batch_seq} of {total_batches} in session {session_id}; "
+        f"{accepted} earlier batch{'es were' if accepted != 1 else ' was'} accepted by Meta. "
+        "Meta closes an unfinished session automatically after 90 minutes."
+    )
+    if isinstance(exc, RateLimitError):
+        return RateLimitError(
+            f"{progress} Meta rate limit: {_redact(exc.message, batch_secrets)}",
+            retry_after_seconds=exc.retry_after_seconds,
+            code=exc.code,
+            subcode=exc.subcode,
+            usage=exc.usage,
+            operation=exc.operation,
+        )
+    if isinstance(exc, MetaApiError):
+        return MetaApiError(
+            message=f"{progress} Meta said: {_redact(exc.message, batch_secrets)}",
+            status_code=exc.status_code,
+            code=exc.code,
+            subcode=exc.subcode,
+            user_title=_redact(exc.user_title, batch_secrets),
+            user_message=_redact(exc.user_message, batch_secrets),
+            is_transient=exc.is_transient,
+            trace_id=exc.trace_id,
+            operation=exc.operation,
+            retry_after_seconds=exc.retry_after_seconds,
+            mutation_outcome_unknown=exc.mutation_outcome_unknown,
+        )
+    return MetaApiError(
+        message=f"{progress} The request failed ({type(exc).__name__}); details are withheld because they can contain uploaded values.",
+        mutation_outcome_unknown=True,
+    )
+
+
+async def _send_audience_users(
+    *,
+    action: str,
+    audience_id: str,
+    schema: StringList,
+    file_path: str | None,
+    rows: list[list[str]] | None,
+    pre_hashed: bool,
+) -> dict[str, Any]:
+    audience_id = blank_to_none(audience_id)
+    if audience_id is None:
+        raise ValidationError("audience_id is required.")
+    file_path = blank_to_none(file_path)
+    if (file_path is None) == (rows is None):
+        raise ValidationError("Provide exactly one of file_path or rows.")
+    keys = _audience_schema(schema)
+    if rows is not None:
+        if not isinstance(rows, list):
+            raise ValidationError("rows must be a list of rows, each a list with one value per schema key.")
+        if len(rows) > AUDIENCE_USERS_INLINE_ROW_LIMIT:
+            raise ValidationError(
+                f"Inline rows are limited to {AUDIENCE_USERS_INLINE_ROW_LIMIT}; pass a local CSV with file_path instead."
+            )
+        source_rows: list[Any] = rows
+    else:
+        source_rows = _read_customer_csv(file_path, keys)
+    prepared, raw_values, invalid, dropped = _hash_rows(source_rows, keys, pre_hashed=pre_hashed)
+    if not prepared:
+        raise ValidationError(
+            f"No valid values to send: all {len(source_rows)} rows were blank or failed normalization."
+        )
+    batches = [
+        (prepared[start:start + AUDIENCE_USERS_BATCH_SIZE], raw_values[start:start + AUDIENCE_USERS_BATCH_SIZE])
+        for start in range(0, len(prepared), AUDIENCE_USERS_BATCH_SIZE)
+    ]
+    session_id = secrets.randbelow(2**62) + 1
+    client = get_graph_api_client()
+    send = client.create_edge_object if action == "add_audience_users" else client.delete_edge_object
+    totals = {"num_received": 0, "num_invalid_entries": 0}
+    batch_results: list[dict[str, Any]] = []
+    for batch_seq, (batch, batch_raw) in enumerate(batches, start=1):
+        data = {
+            "payload": {"schema": keys, "data": batch},
+            "session": {
+                "session_id": session_id,
+                "batch_seq": batch_seq,
+                "last_batch_flag": batch_seq == len(batches),
+                "estimated_num_total": len(prepared),
+            },
+        }
+        failure: Exception | None = None
+        try:
+            result = await send(audience_id, "users", data=data)
+        except Exception as exc:
+            batch_secrets = [value for row in batch_raw for value in row] + [value for row in batch for value in row if value]
+            failure = _sanitized_upload_error(
+                exc,
+                action=action,
+                batch_seq=batch_seq,
+                total_batches=len(batches),
+                session_id=session_id,
+                batch_secrets=batch_secrets,
+            )
+        if failure is not None:
+            # Raised outside the except block so the original error, which can
+            # echo uploaded values, is not chained as __context__.
+            raise failure
+        counts = {
+            key: result.get(key) if isinstance(result.get(key), int) else None
+            for key in ("num_received", "num_invalid_entries")
+        }
+        for key, value in counts.items():
+            if value is not None:
+                totals[key] += value
+        batch_results.append({"batch_seq": batch_seq, "rows_sent": len(batch), **counts})
+    return {
+        "ok": True,
+        "action": action,
+        "target": {"audience_id": audience_id},
+        "source": "file_path" if file_path is not None else "rows",
+        "schema": keys,
+        "hashing": "pre_hashed_by_caller" if pre_hashed else "sha256_by_server",
+        "rows_read": len(source_rows),
+        "rows_sent": len(prepared),
+        "rows_dropped": dropped,
+        "invalid_values": invalid,
+        "session": {
+            "session_id": str(session_id),
+            "batches": len(batches),
+            "last_batch_flag_sent": True,
+        },
+        "meta": totals,
+        "batches": batch_results,
+        "privacy_note": "No row values or hashes are returned; the sample invalid entries Meta sends back are discarded.",
+    }
+
+
+@mcp_server.tool()
+async def add_audience_users(
+    audience_id: str,
+    schema: StringList,
+    file_path: str | None = None,
+    rows: list[list[str]] | None = None,
+    pre_hashed: bool = False,
+) -> dict[str, Any]:
+    """Add people to a customer list audience. schema lists Meta keys (EMAIL, PHONE, FN, LN, FI, GEN, DOBY, DOBM, DOBD, CT, ST, ZIP, COUNTRY). Prefer file_path, a local CSV whose header names those columns, so values never pass through the model; inline rows (max 1,000) have already passed through the calling model and its provider. Values are normalized and SHA-256 hashed locally unless pre_hashed; blank or malformed values are dropped and counted. Returns counts only."""
+    return await _send_audience_users(
+        action="add_audience_users",
+        audience_id=audience_id,
+        schema=schema,
+        file_path=file_path,
+        rows=rows,
+        pre_hashed=pre_hashed,
+    )
+
+
+@mcp_server.tool()
+async def remove_audience_users(
+    audience_id: str,
+    schema: StringList,
+    file_path: str | None = None,
+    rows: list[list[str]] | None = None,
+    pre_hashed: bool = False,
+) -> dict[str, Any]:
+    """Remove people from a customer list audience. Same inputs as add_audience_users: prefer file_path, a local CSV whose header names the schema columns, so values never pass through the model; inline rows (max 1,000) have already passed through the calling model and its provider. Values are normalized and SHA-256 hashed locally unless pre_hashed. Returns counts only."""
+    return await _send_audience_users(
+        action="remove_audience_users",
+        audience_id=audience_id,
+        schema=schema,
+        file_path=file_path,
+        rows=rows,
+        pre_hashed=pre_hashed,
+    )

@@ -16,6 +16,7 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.tools import (
     activity,
     ads,
+    assets,
     audiences,
     auth_tools,
     campaigns,
@@ -209,6 +210,15 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "get_catalog_event_source_recommendations": {"catalog_id": "cat_123"},
     "connect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "px_123"},
     "disconnect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "external_event_sources_123"},
+    "list_pages": {"source": "ad_account", "account_id": "123"},
+    "list_instagram_media": {"instagram_account_id": "ig_123"},
+    "list_creative_ads": {"account_id": "123"},
+    "get_field_reference": {"level": "ad", "field_names": ["name", "status"], "object_id": "ad_123"},
+    "update_adset": {"name": "Updated Ad Set"},
+    "update_ad": {"name": "Updated Ad"},
+    "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
+    "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
+    "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
 }
 
 
@@ -432,7 +442,7 @@ class UniversalFakeClient:
     async def delete_object(self, object_id: str):
         return {"success": True, "id": object_id}
 
-    async def delete_from_edge(self, parent_id: str, edge: str, *, data):
+    async def delete_edge_object(self, parent_id: str, edge: str, *, data):
         return {"success": True, "parent_id": parent_id, "edge": edge}
 
     async def get_insights(self, object_id: str, *, fields, params):
@@ -575,6 +585,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
     for module in [
         activity,
         ads,
+        assets,
         audiences,
         auth_tools,
         campaigns,

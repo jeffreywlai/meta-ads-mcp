@@ -69,8 +69,8 @@ class FakeCatalogFeedClient:
         self.calls.append({"method": "delete_object", "object_id": object_id})
         return {"success": True}
 
-    async def delete_from_edge(self, parent_id: str, edge: str, *, data):
-        self.calls.append({"method": "delete_from_edge", "parent_id": parent_id, "edge": edge, "data": data})
+    async def delete_edge_object(self, parent_id: str, edge: str, *, data):
+        self.calls.append({"method": "delete_edge_object", "parent_id": parent_id, "edge": edge, "data": data})
         return {"success": True}
 
     def methods(self) -> list[str]:
@@ -599,7 +599,7 @@ def test_connect_already_connected_source_sends_no_write(monkeypatch) -> None:
 def test_disconnect_catalog_event_source_reads_then_deletes_with_parameter(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
     result = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
-    assert client.methods() == ["list_objects", "delete_from_edge"]
+    assert client.methods() == ["list_objects", "delete_edge_object"]
     delete = client.calls[1]
     assert (delete["parent_id"], delete["edge"], delete["data"]) == ("cat_1", "external_event_sources", {"external_event_sources": ["px_1"]})
     assert result["previous"]["connected_event_source_ids"] == ["px_1", "app_1"]
@@ -842,7 +842,7 @@ def test_intent_guide_and_mutation_paths_cover_feed_and_event_source_tools(monke
     assert "delete_product_feed" in paths["product_catalog_feeds"]
 
 
-def test_graph_client_delete_from_edge_sends_delete_with_form_data(monkeypatch) -> None:
+def test_graph_client_delete_edge_object_sends_delete_with_form_data(monkeypatch) -> None:
     from meta_ads_mcp.graph_api import GraphAPIClient
 
     sent: list[tuple[str, str, Any]] = []
@@ -853,6 +853,6 @@ def test_graph_client_delete_from_edge_sends_delete_with_form_data(monkeypatch) 
 
     monkeypatch.setattr(GraphAPIClient, "request", fake_request)
     client = GraphAPIClient(reload_settings())
-    result = run(client.delete_from_edge("cat_1", "external_event_sources", data={"external_event_sources": ["px_1"]}))
+    result = run(client.delete_edge_object("cat_1", "external_event_sources", data={"external_event_sources": ["px_1"]}))
     assert sent == [("DELETE", "cat_1/external_event_sources", {"external_event_sources": ["px_1"]})]
     assert result == {"success": True}

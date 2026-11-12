@@ -185,4 +185,9 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "delete_feed_rule",
         "connect_catalog_event_source",
         "disconnect_catalog_event_source",
+        "update_adset",
+        "update_ad",
+        "add_audience_users",
+        "remove_audience_users",
+        "boost_instagram_post",
     }
