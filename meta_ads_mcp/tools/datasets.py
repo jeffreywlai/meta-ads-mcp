@@ -4,12 +4,14 @@ Endpoints (Meta Marketing API reference):
 - GET act_{id}/adspixels and {business_id}/adspixels: ad-account/adspixels, business/adspixels
 - GET {pixel_id}: ads-pixel
 - GET {pixel_id}/stats: ads-pixel/stats
-- GET dataset_quality?dataset_id=: conversions-api/dataset-quality-api
+- GET dataset_quality?dataset_id=: conversions-api/dataset-quality-api (web) and
+  conversions-api/dataset-quality-api/offline-events (offline)
 - GET act_{id}/customconversions: ad-account/customconversions
 """
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
@@ -95,6 +97,21 @@ DATASET_QUALITY_FIELDS = (
     "server_events_with_dedupe_key{percentage}},"
     "data_freshness{upload_frequency,description}}"
 )
+# Offline channel (Meta Dataset Quality API, offline events, v23.0 and later).
+# Each subfield returns Meta's default subfields: a score out of 10 and a
+# recommendation, plus email and phone coverage under match_key.
+OFFLINE_QUALITY_FIELDS = "offline{event_name,composite,match_key,frequency,freshness}"
+DATASET_QUALITY_CHANNELS = ("web", "offline")
+OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST = 8.5
+OFFLINE_THRESHOLD_SOURCE = (
+    "Meta's offline Dataset Quality API documentation: the composite score is out of 10, combining data "
+    "freshness, frequency and attribution over the last 28 days, and a composite score of 8.5 or higher "
+    "allows the use of omnichannel ads."
+)
+OFFLINE_SCORE_NOTE = (
+    "Offline scores are Meta's offline data quality scores (composite, match key, frequency, freshness). "
+    "They are not event match quality (EMQ) scores, which Meta computes only for web events."
+)
 WEAK_EMQ_SCORE_BELOW = 6.0
 DEFAULT_COVERAGE_GOAL_PERCENTAGE = 75
 QUALITY_THRESHOLD_SOURCE = (
@@ -143,11 +160,26 @@ def _page_summary(normalized: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _next_cursor(payload: dict[str, Any]) -> str | None:
+def _page_fingerprint(rows: list[Any]) -> str:
+    return json.dumps(rows, sort_keys=True, default=str)
+
+
+def _next_page(payload: dict[str, Any], seen_cursors: set[str]) -> tuple[bool, str | None, str | None]:
+    """Return (more_pages, next_cursor, stop_reason) for one Graph page.
+
+    A list is exhausted only when Meta's paging has no next link. A next link
+    without a usable cursor, or a cursor already requested, stops the scan with
+    a stated reason instead of claiming completeness or looping.
+    """
     paging = payload.get("paging") or {}
     if not paging.get("next"):
-        return None
-    return (paging.get("cursors") or {}).get("after")
+        return False, None, None
+    cursor = blank_to_none((paging.get("cursors") or {}).get("after"))
+    if cursor is None:
+        return True, None, "Meta reported another page but returned no cursor to read it."
+    if cursor in seen_cursors:
+        return True, None, "Meta returned a page cursor that had already been read."
+    return True, cursor, None
 
 
 def _parse_day(value: str, name: str) -> date:
@@ -270,13 +302,27 @@ async def get_dataset_stats(
     pages = 0
     cursor: str | None = None
     complete = False
-    while pages < MAX_STATS_PAGES:
+    stop_reason: str | None = None
+    seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    while True:
+        if pages >= MAX_STATS_PAGES:
+            stop_reason = f"Stopped after {pages} pages of hourly stats."
+            break
         params = dict(base_params)
         if cursor:
             params["after"] = cursor
+            seen_cursors.add(cursor)
         payload = await client.list_objects(dataset_id, "stats", params=params)
         pages += 1
-        for bucket in payload.get("data") or []:
+        buckets = payload.get("data") or []
+        if buckets:
+            fingerprint = _page_fingerprint(buckets)
+            if fingerprint in seen_pages:
+                stop_reason = "Meta returned a page that had already been read; it was not counted again."
+                break
+            seen_pages.add(fingerprint)
+        for bucket in buckets:
             rows = []
             for row in bucket.get("data") or []:
                 value = str(row.get("value"))
@@ -287,9 +333,11 @@ async def get_dataset_stats(
                 hours.append(str(bucket["start_time"]))
             if include_hourly:
                 hourly.append({"start_time": bucket.get("start_time"), "data": rows})
-        cursor = _next_cursor(payload)
-        if cursor is None:
+        more, cursor, stop_reason = _next_page(payload, seen_cursors)
+        if not more:
             complete = True
+            break
+        if stop_reason is not None:
             break
 
     items = [
@@ -306,9 +354,10 @@ async def get_dataset_stats(
         "complete": complete,
     }
     if not complete:
+        summary["stop_reason"] = stop_reason
         summary["note"] = (
-            f"Incomplete: stopped after {pages} pages of hourly stats; totals cover only the "
-            "hours read. Narrow the window to read the rest."
+            f"Incomplete: {stop_reason} Totals cover only the {pages} pages read, each counted once. "
+            "Narrow the window to read the rest."
         )
     response: dict[str, Any] = {
         "scope": {
@@ -367,22 +416,101 @@ def _quality_event(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _score_node(node: Any) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    return {"score": to_float(node.get("score")), "recommendation": node.get("recommendation")}
+
+
+def _offline_quality_event(row: dict[str, Any]) -> dict[str, Any]:
+    composite = _score_node(row.get("composite")) or {"score": None, "recommendation": None}
+    match_key = row.get("match_key")
+    match_key_node = _score_node(match_key)
+    if match_key_node is not None:
+        coverage = match_key.get("coverage")
+        match_key_node["coverage"] = coverage if isinstance(coverage, dict) else None
+    score = composite["score"]
+    return {
+        "event_name": row.get("event_name"),
+        "composite_score": score,
+        "composite_recommendation": composite["recommendation"],
+        "below_omnichannel_threshold": None if score is None else score < OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST,
+        "match_key": match_key_node,
+        "frequency": _score_node(row.get("frequency")),
+        "freshness": _score_node(row.get("freshness")),
+    }
+
+
+def _offline_quality_response(payload: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("offline") or []
+    events = [_offline_quality_event(row) for row in rows if isinstance(row, dict)]
+    findings: list[dict[str, Any]] = []
+    missing: list[str] = []
+    if not events:
+        missing.append(
+            "Meta returned no offline data quality for this dataset; the offline channel only scores "
+            "datasets that receive offline events."
+        )
+    for event in events:
+        name = event["event_name"]
+        if event["composite_score"] is None:
+            missing.append(f"No offline composite score returned for {name}.")
+        elif event["below_omnichannel_threshold"]:
+            findings.append({
+                "type": "offline_score_below_omnichannel_threshold",
+                "event_name": name,
+                "composite_score": event["composite_score"],
+                "threshold": OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST,
+                "message": (
+                    f"{name} offline composite score is {event['composite_score']} out of 10, below the "
+                    f"{OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST} Meta states is needed for omnichannel ads."
+                ),
+            })
+    findings.sort(key=lambda item: item["composite_score"])
+    return analysis_response(
+        scope=scope,
+        metrics={
+            "events": len(events),
+            "events_with_composite_score": sum(1 for event in events if event["composite_score"] is not None),
+            "below_omnichannel_threshold_events": len(findings),
+        },
+        findings=findings,
+        missing_signals=missing,
+        extra={
+            "events": events,
+            "score_note": OFFLINE_SCORE_NOTE,
+            "thresholds": {
+                "omnichannel_composite_score_at_least": OMNICHANNEL_COMPOSITE_SCORE_AT_LEAST,
+                "source": OFFLINE_THRESHOLD_SOURCE,
+            },
+        },
+    )
+
+
 @mcp_server.tool()
 async def get_dataset_quality(
     dataset_id: str,
     agent_name: str | None = None,
+    channel: str = "web",
 ) -> dict[str, Any]:
-    """Event match quality (score out of 10) per web event for one pixel, with coverage per match key, event coverage, deduplication and data freshness, and plain flags for weak scores stating the threshold used. agent_name limits scoring to events sent by one partner integration."""
+    """Data quality for one pixel by channel. channel=web (default): event match quality (score out of 10) per web event, coverage per match key, event coverage, deduplication and data freshness, with weak-score flags stating the threshold. channel=offline: Meta's offline composite, match key, frequency and freshness scores, which are not event match quality. agent_name limits scoring to one partner integration."""
     dataset_id = _required_id(dataset_id, "dataset_id")
     agent_name = blank_to_none(agent_name)
+    channel = (blank_to_none(channel) or "web").lower()
+    if channel not in DATASET_QUALITY_CHANNELS:
+        raise ValidationError(f"channel must be one of: {', '.join(DATASET_QUALITY_CHANNELS)}.")
     params: dict[str, Any] = {"dataset_id": dataset_id}
     if agent_name is not None:
         params["agent_name"] = agent_name
     payload = await get_graph_api_client().get_object(
         "dataset_quality",
-        fields=[DATASET_QUALITY_FIELDS],
+        fields=[DATASET_QUALITY_FIELDS if channel == "web" else OFFLINE_QUALITY_FIELDS],
         params=params,
     )
+    if channel == "offline":
+        return _offline_quality_response(
+            payload, {"dataset_id": dataset_id, "channel": "offline", "agent_name": agent_name},
+        )
     rows = payload.get("web") or []
     events = [_quality_event(row) for row in rows if isinstance(row, dict)]
     findings: list[dict[str, Any]] = []

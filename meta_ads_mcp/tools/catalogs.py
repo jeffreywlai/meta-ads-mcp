@@ -10,7 +10,9 @@ import json
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Annotated, Any, TypeAlias
+
+from pydantic import BeforeValidator, Field
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import (
@@ -48,6 +50,21 @@ PRODUCT_DETAIL_FIELDS = [
     "retailer_product_group_id", "additional_image_urls", "custom_label_0",
     "custom_label_1", "custom_label_2", "custom_label_3", "custom_label_4",
 ]
+# Product item fields Meta's reference documents both as readable fields and as
+# update parameters. An update that changes one of these through params reads
+# it first, so previous shows its real prior value.
+PRODUCT_READABLE_UPDATE_FIELDS = frozenset({
+    "additional_image_urls", "additional_variant_attributes", "age_group", "availability",
+    "brand", "category", "category_specific_fields", "color", "condition", "currency",
+    "custom_data", "custom_label_0", "custom_label_1", "custom_label_2", "custom_label_3",
+    "custom_label_4", "description", "expiration_date", "fb_product_category", "gender", "gtin",
+    "image_url", "importer_address", "importer_name", "inventory", "live_special_price",
+    "manufacturer_info", "manufacturer_part_number", "marked_for_product_launch", "material",
+    "mobile_link", "name", "ordering_index", "origin_country", "pattern", "price",
+    "product_type", "retailer_id", "sale_price", "sale_price_end_date", "sale_price_start_date",
+    "short_description", "size", "start_date", "url", "visibility", "wa_compliance_category",
+})
+_UNREADABLE_PREVIOUS = "Meta does not document this field as readable, so its prior value could not be read."
 FILTER_SAMPLE_FIELDS = ["id", "retailer_id", "name", "price", "availability"]
 PRODUCT_AVAILABILITY = (
     "in stock", "out of stock", "preorder", "available for order", "discontinued",
@@ -67,6 +84,8 @@ DIAGNOSTIC_FIELDS = [
     "number_of_affected_entities", "diagnostics",
 ]
 DIAGNOSTIC_SEVERITIES = ("MUST_FIX", "OPPORTUNITY")
+# list_dpa_eligible_catalogs only counts must-fix groups and their affected items.
+DPA_DIAGNOSTIC_FIELDS = ["type", "severity", "number_of_affected_items"]
 # Group keys kept in get_catalog_diagnostics' default compact view.
 DIAGNOSTIC_SUMMARY_KEYS = (
     "type", "severity", "title", "subtitle", "affected_entity", "error_code",
@@ -92,6 +111,14 @@ _STRING_OPERATORS = {"contains", "not_contains", "i_contains", "starts_with"}
 
 _DPA_MAX_CATALOGS = 100
 _DPA_PAGE_SIZE = 50
+# Request cap for the catalog listing, independent of how many rows each page holds.
+_DPA_MAX_LIST_PAGES = 4
+# Supporting edges (product sets, event sources, diagnostics) are read to the
+# end within this many pages each; anything left unread is reported as partial.
+_SIGNAL_PAGE_SIZE = 25
+_SIGNAL_MAX_PAGES = 4
+_HEALTH_DIAGNOSTIC_PAGE_SIZE = 100
+_HEALTH_MAX_PAGES = 5
 _SIGNAL_ERRORS = (MetaApiError, UnsupportedFeatureError, NotFoundError)
 _EMPTY_SET_MESSAGE = (
     "Meta documents that ads tied to an empty product set will not deliver."
@@ -190,6 +217,23 @@ def _catalog_price(value: Any, field_name: str) -> int:
     return int(scaled)
 
 
+def _reject_bool_price(value: Any) -> Any:
+    """Refuse true/false before Pydantic's lax float coercion turns them into 1.0 or 0.0."""
+    if isinstance(value, bool):
+        raise ValueError("a price must be a number, not true or false")
+    return value
+
+
+# Every money input on the catalog tools uses this type, so the MCP boundary
+# rejects booleans before numeric coercion; _catalog_price repeats the check
+# for direct Python calls.
+CatalogPrice: TypeAlias = Annotated[
+    float,
+    BeforeValidator(_reject_bool_price),
+    Field(description="Price in major units (12.5 means 12.50); sent to Meta as amount x 100."),
+]
+
+
 def _currency(value: str) -> str:
     normalized = value.strip().upper() if isinstance(value, str) else ""
     if not re.fullmatch(r"[A-Z]{3}", normalized):
@@ -251,8 +295,65 @@ def _error_entry(signal: str, error: Exception) -> dict[str, Any]:
     return entry
 
 
-async def _read_edge(client, parent_id: str, edge: str, *, fields, params) -> dict[str, Any]:
-    return await client.list_objects(parent_id, edge, fields=fields, params=params)
+async def _collect_edge(
+    client,
+    parent_id: str,
+    edge: str,
+    *,
+    fields: list[str],
+    params: dict[str, Any],
+    max_pages: int,
+    max_items: int | None = None,
+    stop_at_total: bool = False,
+) -> dict[str, Any]:
+    """Read an edge page by page until Meta reports no next page, or a cap or paging fault stops it.
+
+    complete is true only when Meta's paging has no next link. A next link with
+    no cursor, a cursor already requested, or a page identical to one already
+    read stops the scan with a stated reason, and that page's rows are not added
+    twice. max_pages caps requests regardless of how many rows came back, so a
+    run of empty pages cannot loop. With stop_at_total, the first summary
+    total_count Meta returns ends the read.
+    """
+    rows: list[Any] = []
+    seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    cursor: str | None = None
+    pages = 0
+    while True:
+        page_params = dict(params)
+        if cursor is not None:
+            page_params["after"] = cursor
+            seen_cursors.add(cursor)
+        payload = await client.list_objects(parent_id, edge, fields=fields, params=page_params)
+        pages += 1
+        data = payload.get("data") or []
+        if data:
+            fingerprint = json.dumps(data, sort_keys=True, default=str)
+            if fingerprint in seen_pages:
+                return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                        "stop_reason": "Meta returned a page that had already been read."}
+            seen_pages.add(fingerprint)
+            rows.extend(data)
+        total = (payload.get("summary") or {}).get("total_count")
+        if stop_at_total and to_int(total) is not None:
+            return {"rows": rows, "complete": True, "total_count": to_int(total), "pages": pages,
+                    "stop_reason": None}
+        paging = payload.get("paging") or {}
+        if not paging.get("next"):
+            return {"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None}
+        cursor = blank_to_none((paging.get("cursors") or {}).get("after"))
+        if cursor is None:
+            reason = "Meta reported another page but returned no cursor to read it."
+        elif cursor in seen_cursors:
+            reason = "Meta returned a page cursor that had already been read."
+        elif max_items is not None and len(rows) >= max_items:
+            reason = f"Stopped at the {max_items}-row cap."
+        elif pages >= max_pages:
+            reason = f"Stopped after {pages} pages."
+        else:
+            continue
+        return {"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason}
 
 
 async def _business_scope(client, business_id: str | None, account_id: str | None) -> dict[str, Any]:
@@ -331,36 +432,75 @@ async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any
         "da_must_fix_affected_items": None,
     }
     unavailable: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
+
+    def note_partial(signal: str, read: dict[str, Any], rows_read: int) -> None:
+        partial.append({
+            "signal": signal,
+            "reason": read["stop_reason"],
+            "rows_read": rows_read,
+            "count_is_lower_bound": rows_read > 0,
+        })
+
     try:
-        sets = await _read_edge(client, catalog_id, "product_sets", fields=["id"],
-                                params={"limit": 1, "summary": "total_count"})
-        total = (sets.get("summary") or {}).get("total_count")
-        signals["product_set_count"] = to_int(total) if total is not None else (
-            len(sets.get("data") or []) or None
-        )
+        sets = await _collect_edge(client, catalog_id, "product_sets", fields=["id"],
+                                   params={"limit": _SIGNAL_PAGE_SIZE, "summary": "total_count"},
+                                   max_pages=_SIGNAL_MAX_PAGES, stop_at_total=True)
+        if sets["total_count"] is not None:
+            signals["product_set_count"] = sets["total_count"]
+        elif sets["complete"]:
+            signals["product_set_count"] = len(sets["rows"])
+        else:
+            note_partial("product_sets", sets, len(sets["rows"]))
+            signals["product_set_count"] = len(sets["rows"]) or None
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("product_sets", error))
     try:
-        sources = await _read_edge(client, catalog_id, "external_event_sources",
-                                   fields=EVENT_SOURCE_FIELDS, params={"limit": 25})
-        signals["event_source_count"] = len(sources.get("data") or [])
+        sources = await _collect_edge(client, catalog_id, "external_event_sources", fields=["id"],
+                                      params={"limit": _SIGNAL_PAGE_SIZE}, max_pages=_SIGNAL_MAX_PAGES)
+        if sources["complete"]:
+            signals["event_source_count"] = len(sources["rows"])
+        else:
+            note_partial("external_event_sources", sources, len(sources["rows"]))
+            signals["event_source_count"] = len(sources["rows"]) or None
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("external_event_sources", error))
     try:
-        diagnostics = await _read_edge(client, catalog_id, "diagnostics", fields=DIAGNOSTIC_FIELDS,
-                                       params={"affected_channels": ["da"], "severities": ["MUST_FIX"], "limit": 25})
-        groups = diagnostics.get("data") or []
-        signals["da_must_fix_groups"] = len(groups)
-        signals["da_must_fix_affected_items"] = sum(
-            to_int(group.get("number_of_affected_items")) or 0 for group in groups
+        diagnostics = await _collect_edge(
+            client, catalog_id, "diagnostics", fields=DPA_DIAGNOSTIC_FIELDS,
+            params={"affected_channels": ["da"], "severities": ["MUST_FIX"], "limit": _SIGNAL_PAGE_SIZE},
+            max_pages=_SIGNAL_MAX_PAGES,
         )
+        groups = [group for group in diagnostics["rows"] if isinstance(group, dict)]
+        affected = sum(to_int(group.get("number_of_affected_items")) or 0 for group in groups)
+        if diagnostics["complete"] or groups:
+            signals["da_must_fix_groups"] = len(groups)
+            signals["da_must_fix_affected_items"] = affected
+        if not diagnostics["complete"]:
+            note_partial("diagnostics", diagnostics, len(groups))
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("diagnostics", error))
-    return {"signals": signals, "unavailable": unavailable}
+    return {"signals": signals, "unavailable": unavailable, "partial": partial}
 
 
-def _assess_catalog(signals: dict[str, Any], unavailable: list[dict[str, Any]]) -> tuple[str, list[str]]:
-    """Apply the stated readiness rules to one catalog's signals."""
+_DPA_REQUIRED_SIGNALS = (
+    ("product_set_count", "product_sets"),
+    ("event_source_count", "external_event_sources"),
+    ("da_must_fix_groups", "diagnostics"),
+)
+
+
+def _assess_catalog(
+    signals: dict[str, Any],
+    unavailable: list[dict[str, Any]],
+    partial: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[str]]:
+    """Apply the stated readiness rules to one catalog's signals.
+
+    A signal that is unknown (not read, or only partly read without a deciding
+    row) can never let a catalog count as ready.
+    """
+    partial = partial or []
     reasons: list[str] = []
     product_count = signals["product_count"]
     if product_count == 0:
@@ -391,10 +531,19 @@ def _assess_catalog(signals: dict[str, Any], unavailable: list[dict[str, Any]]) 
         reasons.append("Catalog has no product sets; catalog ads are run from a product set.")
     elif signals["product_set_count"]:
         reasons.append(f"{signals['product_set_count']} product set(s).")
+    for entry in partial:
+        reasons.append(
+            f"{entry['signal']} was only partly read ({entry['reason']})"
+            + ("; its count is a lower bound." if entry["count_is_lower_bound"] else "; nothing was found before the read stopped.")
+        )
     if unavailable:
         reasons.append(
             "Could not read: " + ", ".join(entry["signal"] for entry in unavailable) + "."
         )
+        return "unknown", reasons
+    unknown = [edge for key, edge in _DPA_REQUIRED_SIGNALS if signals.get(key) is None]
+    if unknown:
+        reasons.append("Not established: " + ", ".join(unknown) + ", so the catalog cannot be called ready.")
         return "unknown", reasons
     if product_count is None:
         return "unknown", reasons
@@ -417,31 +566,29 @@ async def list_dpa_eligible_catalogs(
         scope_value if scope_name == "business_id" else None,
         scope_value if scope_name == "account_id" else None,
     )
-    catalogs: list[dict[str, Any]] = []
-    after: str | None = None
-    complete = True
-    while True:
-        payload = await client.list_objects(
-            scope["business_id"], "owned_product_catalogs",
-            fields=CATALOG_FIELDS, params=_page_params(_DPA_PAGE_SIZE, after),
-        )
-        page = _paged(payload)
-        catalogs.extend(page["items"])
-        if page["summary"]["complete"] or not page["summary"]["next_after"]:
-            break
-        if len(catalogs) >= _DPA_MAX_CATALOGS:
-            complete = False
-            break
-        after = page["summary"]["next_after"]
+    listing = await _collect_edge(
+        client, scope["business_id"], "owned_product_catalogs",
+        fields=CATALOG_FIELDS, params={"limit": _DPA_PAGE_SIZE},
+        max_pages=_DPA_MAX_LIST_PAGES, max_items=_DPA_MAX_CATALOGS,
+    )
+    catalogs = [row for row in listing["rows"] if isinstance(row, dict)]
+    complete = listing["complete"] and len(catalogs) <= _DPA_MAX_CATALOGS
     catalogs = catalogs[:_DPA_MAX_CATALOGS]
 
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
     for catalog in catalogs:
         collected = await _catalog_dpa_signals(client, catalog)
-        assessment, reasons = _assess_catalog(collected["signals"], collected["unavailable"])
+        assessment, reasons = _assess_catalog(
+            collected["signals"], collected["unavailable"], collected["partial"],
+        )
         for entry in collected["unavailable"]:
             missing_signals.append(f"{catalog.get('id')}: {entry['signal']} could not be read ({entry['error']}).")
+        for entry in collected["partial"]:
+            missing_signals.append(
+                f"{catalog.get('id')}: {entry['signal']} was only partly read "
+                f"({entry['rows_read']} row(s) read). {entry['reason']}"
+            )
         findings.append({
             "catalog_id": str(catalog.get("id")),
             "name": catalog.get("name"),
@@ -450,6 +597,7 @@ async def list_dpa_eligible_catalogs(
             "reasons": reasons,
             "signals": collected["signals"],
             "unavailable_signals": collected["unavailable"],
+            "partial_signals": collected["partial"],
         })
     findings.sort(key=lambda item: (
         _ASSESSMENT_RANK[item["assessment"]],
@@ -470,7 +618,10 @@ async def list_dpa_eligible_catalogs(
         recommended = None
         reason = "No catalog passed every readiness rule; see each catalog's reasons."
     if not complete:
-        missing_signals.append(f"Only the first {_DPA_MAX_CATALOGS} catalogs were evaluated.")
+        reason = listing["stop_reason"] or f"Stopped at the {_DPA_MAX_CATALOGS}-catalog cap."
+        missing_signals.append(
+            f"The catalog list is incomplete: only {len(catalogs)} catalog(s) were evaluated. {reason}"
+        )
     return analysis_response(
         scope={**scope, "ownership": "owned"},
         metrics={
@@ -498,7 +649,8 @@ async def list_dpa_eligible_catalogs(
                     "ready": ("Has products, at least one product set, at least one connected event source, "
                               "and no must-fix dynamic-ads diagnostics."),
                     "needs_attention": "Has products but fails one of the ready rules.",
-                    "unknown": "A signal could not be read or Meta omitted product_count.",
+                    "unknown": ("A signal could not be read, was only partly read without a deciding result, "
+                                "or Meta omitted product_count."),
                     "eligible": "ready or needs_attention.",
                 },
                 "ordering": "assessment, then fewest items affected by must-fix diagnostics, then most products.",
@@ -599,13 +751,25 @@ async def get_catalog_diagnostics(
 
 
 async def _health_edge(client, parent_id, edge, fields, params, used, missing, label):
+    """Read a supporting edge to the end within the page cap.
+
+    Returns (rows, complete); rows is None when the edge could not be read at all.
+    A partly read edge is reported in missing, so it cannot support a claim that
+    no blockers exist.
+    """
     try:
-        payload = await _read_edge(client, parent_id, edge, fields=fields, params=params)
+        read = await _collect_edge(client, parent_id, edge, fields=fields, params=params,
+                                   max_pages=_HEALTH_MAX_PAGES)
     except _SIGNAL_ERRORS as error:
         missing.append(f"{label} could not be read ({error}).")
-        return None
+        return None, False
     used.append(label)
-    return payload.get("data") or []
+    rows = [row for row in read["rows"] if isinstance(row, dict)]
+    if not read["complete"]:
+        missing.append(
+            f"{label} was only partly read ({len(rows)} row(s) read; counts are lower bounds). {read['stop_reason']}"
+        )
+    return rows, read["complete"]
 
 
 @mcp_server.tool()
@@ -628,11 +792,13 @@ async def get_catalog_dynamic_ads_health(
             raise ValidationError(f"Product set {product_set_id} belongs to catalog {owner}, not {catalog_id}.")
         used.append("product_set.product_count")
 
-    diagnostics = await _health_edge(client, catalog_id, "diagnostics", list(DIAGNOSTIC_SUMMARY_KEYS),
-                                     {"affected_channels": ["da"], "limit": 100}, used, missing,
-                                     "product_catalog/diagnostics")
-    sources = await _health_edge(client, catalog_id, "external_event_sources", EVENT_SOURCE_FIELDS,
-                                 {"limit": 25}, used, missing, "product_catalog/external_event_sources")
+    diagnostics, _ = await _health_edge(client, catalog_id, "diagnostics", list(DIAGNOSTIC_SUMMARY_KEYS),
+                                        {"affected_channels": ["da"], "limit": _HEALTH_DIAGNOSTIC_PAGE_SIZE},
+                                        used, missing, "product_catalog/diagnostics")
+    sources, sources_complete = await _health_edge(
+        client, catalog_id, "external_event_sources", EVENT_SOURCE_FIELDS,
+        {"limit": _SIGNAL_PAGE_SIZE}, used, missing, "product_catalog/external_event_sources",
+    )
 
     blocking: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
@@ -662,7 +828,7 @@ async def get_catalog_dynamic_ads_health(
             "message": group.get("subtitle") or group.get("title"),
             "affected_items": to_int(group.get("number_of_affected_items")),
         })
-    if sources is not None and not sources:
+    if sources is not None and not sources and sources_complete:
         issues.append({
             "severity": "issue",
             "source": "product_catalog/external_event_sources",
@@ -684,7 +850,7 @@ async def get_catalog_dynamic_ads_health(
         metrics={
             "catalog_product_count": catalog_products,
             "product_set_product_count": set_products,
-            "event_source_count": None if sources is None else len(sources),
+            "event_source_count": None if sources is None or (not sources and not sources_complete) else len(sources),
             "must_fix_groups": len(must_fix),
             "opportunity_groups": opportunity_groups,
         },
@@ -702,7 +868,7 @@ async def get_catalog_dynamic_ads_health(
                 "rules": {
                     "blocked": "The catalog or the product set has no products.",
                     "at_risk": "A must-fix dynamic-ads diagnostic exists, or no event source is connected.",
-                    "inconclusive": "No problem was found but at least one signal could not be read.",
+                    "inconclusive": "No problem was found but at least one signal could not be read or was only partly read.",
                     "no_blockers_found": "Every signal was read and none showed a problem.",
                 },
                 "note": "Derived here from documented Meta signals; Meta has no single catalog-ads health endpoint.",
@@ -760,7 +926,7 @@ async def update_catalog(
     name: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Edit a product catalog's name or other documented settings (params), returning previous and current values."""
+    """Edit a product catalog's name or other documented settings (params), returning previous and current values. A changed setting Meta cannot read back is named in previous_unavailable."""
     catalog_id = _require(catalog_id, "catalog_id")
     payload = merge_graph_payload({"name": name if name is not None else OMIT}, params)
     if not payload:
@@ -770,12 +936,16 @@ async def update_catalog(
     client = get_graph_api_client()
     previous = await client.get_object(catalog_id, fields=CATALOG_UPDATE_READ_FIELDS)
     await client.update_object(catalog_id, data=payload)
-    return mutation_response(
+    response = mutation_response(
         action="update_catalog",
         target={"catalog_id": catalog_id},
         previous={key: previous.get(key) for key in CATALOG_UPDATE_READ_FIELDS if key != "id"},
         current=payload,
     )
+    unreadable = sorted(key for key in payload if key not in CATALOG_UPDATE_READ_FIELDS)
+    if unreadable:
+        response["previous_unavailable"] = {key: _UNREADABLE_PREVIOUS for key in unreadable}
+    return response
 
 
 @mcp_server.tool()
@@ -817,7 +987,7 @@ async def create_catalog_product(
     catalog_id: str,
     retailer_id: str,
     name: str,
-    price: float,
+    price: CatalogPrice,
     currency: str,
     url: str,
     image_url: str,
@@ -825,7 +995,7 @@ async def create_catalog_product(
     description: str | None = None,
     brand: str | None = None,
     condition: str | None = None,
-    sale_price: float | None = None,
+    sale_price: CatalogPrice | None = None,
     visibility: str = "staging",
     allow_upsert: bool = False,
     params: dict[str, Any] | None = None,
@@ -868,9 +1038,9 @@ async def create_catalog_product(
 async def update_catalog_product(
     product_id: str,
     name: str | None = None,
-    price: float | None = None,
+    price: CatalogPrice | None = None,
     currency: str | None = None,
-    sale_price: float | None = None,
+    sale_price: CatalogPrice | None = None,
     availability: str | None = None,
     condition: str | None = None,
     visibility: str | None = None,
@@ -880,7 +1050,7 @@ async def update_catalog_product(
     brand: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Edit a catalog product's fields, returning previous and current values. price and sale_price are major units; previous prices are shown as Meta formats them."""
+    """Edit a catalog product's fields, returning previous and current values. price and sale_price are major units; previous prices are shown as Meta formats them. A changed field Meta cannot read back is named in previous_unavailable."""
     product_id = _require(product_id, "product_id")
     payload, shown = _product_fields(
         name=name, price=price, currency=currency, sale_price=sale_price,
@@ -896,15 +1066,21 @@ async def update_catalog_product(
         raise ValidationError("At least one field must be provided for update_catalog_product.")
     if params:
         shown.update(params)
+    readable = [key for key in payload if key in PRODUCT_READABLE_UPDATE_FIELDS]
+    read_fields = [*PRODUCT_DETAIL_FIELDS, *(key for key in readable if key not in PRODUCT_DETAIL_FIELDS)]
+    unreadable = sorted(key for key in payload if key not in PRODUCT_READABLE_UPDATE_FIELDS)
     client = get_graph_api_client()
-    previous = await client.get_object(product_id, fields=PRODUCT_DETAIL_FIELDS)
+    previous = await client.get_object(product_id, fields=read_fields)
     await client.update_object(product_id, data=payload)
     response = mutation_response(
         action="update_catalog_product",
         target={"product_id": product_id},
-        previous={key: previous.get(key) for key in payload},
+        # Each field here was requested in the pre-read; Meta omits fields that hold no value.
+        previous={key: previous.get(key) for key in readable},
         current=shown,
     )
+    if unreadable:
+        response["previous_unavailable"] = {key: _UNREADABLE_PREVIOUS for key in unreadable}
     response["sent"] = payload
     return response
 

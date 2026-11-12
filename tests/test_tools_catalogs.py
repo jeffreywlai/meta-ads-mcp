@@ -108,7 +108,7 @@ def test_list_catalogs_for_business_reads_owned_edge_with_paging(monkeypatch) ->
     assert kind == "list"
     assert call["parent_id"] == "biz_1"
     assert call["edge"] == "owned_product_catalogs"
-    assert call["fields"] == catalogs.CATALOG_FIELDS
+    assert call["fields"] == ["id", "name", "vertical", "product_count", "feed_count", "is_catalog_segment"]
     assert call["params"] == {"limit": 10, "after": "c1"}
     assert result["items"][0]["id"] == "cat_1"
     assert result["summary"]["complete"] is False
@@ -252,10 +252,167 @@ def test_dpa_eligible_catalogs_reports_unavailable_signal_instead_of_hiding_it(m
     assert any("cat_ready" in entry for entry in result["missing_signals"])
 
 
+def test_dpa_catalog_with_no_product_sets_on_a_fully_read_edge_is_not_ready(monkeypatch) -> None:
+    """An empty, fully read product_sets edge means zero sets, not an unknown that passes."""
+    client = _use(monkeypatch, FakeCatalogClient(edges={
+        ("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1", "product_count": 5}]},
+        ("cat_1", "product_sets"): {"data": []},
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}]},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    finding = result["findings"][0]
+    assert finding["signals"]["product_set_count"] == 0
+    assert finding["assessment"] == "needs_attention"
+    assert result["recommended_catalog_id"] is None
+    assert any("no product sets" in reason for reason in finding["reasons"])
+    assert client.kinds().count("list") == 4
+
+
+def test_dpa_product_set_count_comes_from_total_count_when_meta_returns_it(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", "product_sets"): {"data": [{"id": "ps_1"}], "summary": {"total_count": 3},
+                                        "paging": {"next": "n", "cursors": {"after": "s2"}}},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["signals"]["product_set_count"] == 3
+    assert ready["assessment"] == "ready"
+    set_calls = [call for _, call in client.calls if call.get("edge") == "product_sets" and call["parent_id"] == "cat_ready"]
+    assert len(set_calls) == 1
+
+
+def test_dpa_paged_diagnostics_do_not_pass_readiness(monkeypatch) -> None:
+    """A must-fix group on an unread diagnostics page must not be assumed absent."""
+    client = _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", "diagnostics"): [
+            {"data": [], "paging": {"next": "n", "cursors": {"after": "d2"}}},
+            {"data": [{"type": "MISSING_IMAGE", "severity": "MUST_FIX", "number_of_affected_items": 9}]},
+        ],
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["signals"]["da_must_fix_groups"] == 1
+    assert ready["signals"]["da_must_fix_affected_items"] == 9
+    assert ready["assessment"] == "needs_attention"
+    diag_calls = [call for _, call in client.calls if call.get("edge") == "diagnostics" and call["parent_id"] == "cat_ready"]
+    assert [call["params"].get("after") for call in diag_calls] == [None, "d2"]
+
+
+def test_dpa_partly_read_diagnostics_make_the_catalog_unknown(monkeypatch) -> None:
+    stalled = {"data": [], "paging": {"next": "n", "cursors": {"after": "more"}}}
+    _use(monkeypatch, _dpa_client(edges={("cat_ready", "diagnostics"): [stalled, stalled, stalled]}))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["assessment"] == "unknown"
+    assert ready["signals"]["da_must_fix_groups"] is None
+    assert ready["partial_signals"][0]["signal"] == "diagnostics"
+    assert any("cat_ready: diagnostics was only partly read" in entry for entry in result["missing_signals"])
+    assert result["recommended_catalog_id"] is None
+
+
+@pytest.mark.parametrize("edge", ["product_sets", "external_event_sources"])
+def test_dpa_partly_read_empty_supporting_edge_is_unknown_not_zero(monkeypatch, edge) -> None:
+    _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", edge): {"data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"}},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["assessment"] == "unknown"
+    assert ready["partial_signals"][0]["signal"] == edge
+    assert ready["partial_signals"][0]["count_is_lower_bound"] is False
+    assert any(f"cat_ready: {edge} was only partly read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_partly_read_nonempty_sources_count_as_a_lower_bound(monkeypatch) -> None:
+    _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", "external_event_sources"): [
+            {"data": [{"id": "px_1"}], "paging": {"next": "n", "cursors": {"after": "e2"}}},
+            {"data": [{"id": "px_2"}], "paging": {"next": "n"}},
+        ],
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["signals"]["event_source_count"] == 2
+    assert ready["partial_signals"][0]["count_is_lower_bound"] is True
+    assert ready["assessment"] == "ready"
+    assert any("lower bound" in reason for reason in ready["reasons"])
+    assert any("external_event_sources was only partly read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_requests_only_the_diagnostic_fields_it_counts(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client())
+    _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    diag_calls = [call for kind, call in client.calls if kind == "list" and call["edge"] == "diagnostics"]
+    assert diag_calls
+    for call in diag_calls:
+        assert call["fields"] == ["type", "severity", "number_of_affected_items"]
+        assert call["params"] == {"affected_channels": ["da"], "severities": ["MUST_FIX"], "limit": 25}
+
+
 def test_dpa_eligible_catalogs_listing_permission_error_raises(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogClient(edge_errors={("biz_1", "owned_product_catalogs"): _permission_error()}))
     with pytest.raises(MetaApiError):
         _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+
+
+def test_dpa_catalog_listing_next_page_without_cursor_is_incomplete(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={
+        ("biz_1", "owned_product_catalogs"): {
+            "data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"},
+        },
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert result["metrics"]["complete"] is False
+    assert any("no cursor" in entry for entry in result["missing_signals"])
+    assert client.kinds() == ["list"]
+
+
+def test_dpa_catalog_listing_empty_cursor_cycle_terminates(monkeypatch) -> None:
+    class Cycle(FakeCatalogClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            self.calls.append(("list", {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}))
+            assert len(self.calls) <= 6, "catalog listing loops over an empty A/B cursor cycle"
+            following = "B" if params.get("after") == "A" else "A"
+            return {"data": [], "paging": {"next": "next", "cursors": {"after": following}}}
+
+    client = _use(monkeypatch, Cycle())
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert result["metrics"]["complete"] is False
+    assert [call["params"].get("after") for _, call in client.calls] == [None, "A", "B"]
+    assert any("already been read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_catalog_listing_empty_pages_stop_at_request_cap(monkeypatch) -> None:
+    pages = [{"data": [], "paging": {"next": "next", "cursors": {"after": f"c{index}"}}} for index in range(20)]
+    client = _use(monkeypatch, FakeCatalogClient(edges={("biz_1", "owned_product_catalogs"): pages}))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert len(client.calls) == catalogs._DPA_MAX_LIST_PAGES
+    assert result["metrics"]["complete"] is False
+
+
+def test_dpa_catalog_listing_repeated_page_is_not_added_twice(monkeypatch) -> None:
+    page = {"data": [{"id": "cat_ready", "name": "Ready", "product_count": 500}],
+            "paging": {"next": "next", "cursors": {"after": "x1"}}}
+    again = {"data": [{"id": "cat_ready", "name": "Ready", "product_count": 500}],
+             "paging": {"next": "next", "cursors": {"after": "x2"}}}
+    client = _dpa_client(edges={("biz_1", "owned_product_catalogs"): [page, again]})
+    _use(monkeypatch, client)
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert [finding["catalog_id"] for finding in result["findings"]] == ["cat_ready"]
+    assert result["metrics"]["complete"] is False
+
+
+def test_dpa_catalog_listing_follows_cursors_to_the_last_page(monkeypatch) -> None:
+    client = _dpa_client(edges={("biz_1", "owned_product_catalogs"): [
+        {"data": [{"id": "cat_ready", "product_count": 500}], "paging": {"next": "n", "cursors": {"after": "p2"}}},
+        {"data": [{"id": "cat_nosrc", "product_count": 900}], "paging": {"cursors": {"after": "p3"}}},
+    ]})
+    _use(monkeypatch, client)
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert result["metrics"]["complete"] is True
+    assert {finding["catalog_id"] for finding in result["findings"]} == {"cat_ready", "cat_nosrc"}
+    listing_calls = [call for _, call in client.calls if call.get("edge") == "owned_product_catalogs"]
+    assert [call["params"] for call in listing_calls] == [{"limit": 50}, {"limit": 50, "after": "p2"}]
 
 
 def test_dpa_eligible_catalogs_requires_one_scope(monkeypatch) -> None:
@@ -282,7 +439,11 @@ def test_diagnostics_ordered_by_products_affected(monkeypatch) -> None:
     assert result["summary"]["by_severity"] == {"MUST_FIX": 2, "OPPORTUNITY": 1, "UNKNOWN": 1}
     call = client.calls[0][1]
     assert (call["parent_id"], call["edge"]) == ("cat_1", "diagnostics")
-    assert call["fields"] == catalogs.DIAGNOSTIC_FIELDS
+    assert call["fields"] == [
+        "type", "severity", "title", "subtitle", "affected_channels", "affected_entity",
+        "affected_features", "error_code", "number_of_affected_items",
+        "number_of_affected_entities", "diagnostics",
+    ]
     assert call["params"] == {"limit": 100}
 
 
@@ -459,6 +620,38 @@ def test_dynamic_ads_health_unavailable_signal_is_inconclusive(monkeypatch) -> N
     _assert_no_da_checks(client, result)
 
 
+def test_dynamic_ads_health_partly_read_diagnostics_is_inconclusive(monkeypatch) -> None:
+    stalled = {"data": [], "paging": {"next": "n", "cursors": {"after": "more"}}}
+    client = _use(monkeypatch, _health_client(edges={("cat_1", "diagnostics"): [stalled, stalled]}))
+    result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+    assert result["status"] == "inconclusive"
+    assert any("product_catalog/diagnostics was only partly read" in entry for entry in result["missing_signals"])
+    diag_calls = [call for _, call in client.calls if call.get("edge") == "diagnostics"]
+    assert [call["params"].get("after") for call in diag_calls] == [None, "more"]
+
+
+def test_dynamic_ads_health_reads_must_fix_groups_on_later_pages(monkeypatch) -> None:
+    _use(monkeypatch, _health_client(edges={("cat_1", "diagnostics"): [
+        {"data": [], "paging": {"next": "n", "cursors": {"after": "d2"}}},
+        {"data": [{"title": "Images missing", "severity": "MUST_FIX", "number_of_affected_items": 7}]},
+    ]}))
+    result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+    assert result["status"] == "at_risk"
+    assert result["metrics"]["must_fix_groups"] == 1
+    assert result["missing_signals"] == []
+
+
+def test_dynamic_ads_health_partly_read_empty_sources_are_not_reported_as_none(monkeypatch) -> None:
+    _use(monkeypatch, _health_client(edges={
+        ("cat_1", "external_event_sources"): {"data": [], "paging": {"next": "https://graph.invalid/?after=x"}},
+    }))
+    result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+    assert result["status"] == "inconclusive"
+    assert result["metrics"]["event_source_count"] is None
+    assert not any(finding["source"] == "product_catalog/external_event_sources" for finding in result["findings"])
+    assert any("external_event_sources was only partly read" in entry for entry in result["missing_signals"])
+
+
 def test_dynamic_ads_health_rejects_product_set_from_other_catalog(monkeypatch) -> None:
     client = _use(monkeypatch, _health_client(objects={
         "ps_1": {"id": "ps_1", "product_count": 4, "product_catalog": {"id": "cat_other"}},
@@ -493,7 +686,7 @@ def test_list_catalog_data_sources_requests_all_sources(monkeypatch) -> None:
     result = _run(catalogs.list_catalog_data_sources(catalog_id="cat_1"))
     call = client.calls[0][1]
     assert (call["parent_id"], call["edge"]) == ("cat_1", "data_sources")
-    assert call["fields"] == catalogs.DATA_SOURCE_FIELDS
+    assert call["fields"] == ["id", "name", "ingestion_source_type", "upload_type", "app_id"]
     assert call["params"] == {"limit": 100, "ingestion_source_type": "ALL"}
     assert result["summary"]["by_upload_type"] == {"SCHEDULED": 2, "API": 1}
     assert result["summary"]["complete"] is True
@@ -561,7 +754,10 @@ def test_list_catalog_products_by_catalog_with_filter(monkeypatch) -> None:
     ))
     call = client.calls[0][1]
     assert (call["parent_id"], call["edge"]) == ("cat_1", "products")
-    assert call["fields"] == catalogs.PRODUCT_FIELDS
+    assert call["fields"] == [
+        "id", "retailer_id", "name", "availability", "price", "currency", "sale_price",
+        "url", "image_url", "brand", "visibility", "review_status",
+    ]
     assert call["params"] == {"limit": 10, "summary": "total_count", "filter": {"brand": {"eq": "Acme"}}}
     assert result["summary"]["total_count"] == 41
 
@@ -640,6 +836,56 @@ def test_create_catalog_product_validates_before_network(monkeypatch, kwargs, ma
         _run(catalogs.create_catalog_product(**arguments))
 
 
+_CREATE_PRODUCT_ARGUMENTS = {
+    "catalog_id": "cat_1", "retailer_id": "SKU-1", "name": "Shoe", "price": 10, "currency": "USD",
+    "url": "https://shop/x", "image_url": "https://shop/x.png",
+}
+
+
+def _call_mcp(tool: str, arguments: dict[str, Any], *, routed: bool):
+    from meta_ads_mcp.coordinator import mcp_server
+
+    if routed:
+        return asyncio.run(mcp_server.call_tool("call_tool", {"name": tool, "arguments": arguments}))
+    return asyncio.run(mcp_server.call_tool(tool, arguments))
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize(("tool", "arguments"), [
+    ("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "price": True}),
+    ("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "price": False}),
+    ("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "sale_price": True}),
+    ("update_catalog_product", {"product_id": "p_1", "price": True}),
+    ("update_catalog_product", {"product_id": "p_1", "sale_price": False}),
+])
+def test_boolean_price_is_rejected_at_the_mcp_boundary(monkeypatch, tool, arguments, routed) -> None:
+    """Pydantic would coerce true to 1.0; every catalog money input must refuse it before any call."""
+    from fastmcp.exceptions import ToolError
+    from fastmcp.exceptions import ValidationError as MCPValidationError
+
+    client = _use(monkeypatch, FakeCatalogClient())
+    with pytest.raises((ToolError, MCPValidationError)):
+        _call_mcp(tool, arguments, routed=routed)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_numeric_price_still_passes_the_mcp_boundary(monkeypatch, routed) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    _call_mcp("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "price": 12.5, "sale_price": "9.99"},
+              routed=routed)
+    assert client.calls[0][1]["data"]["price"] == 1250
+    assert client.calls[0][1]["data"]["sale_price"] == 999
+
+
+def test_boolean_price_is_rejected_on_direct_calls(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="price"):
+        _run(catalogs.create_catalog_product(**{**_CREATE_PRODUCT_ARGUMENTS, "price": True}))
+    with pytest.raises(ValidationError, match="sale_price"):
+        _run(catalogs.update_catalog_product(product_id="p_1", sale_price=True))
+
+
 def test_update_catalog_product_reads_then_updates(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogClient(objects={
         "p_1": {"id": "p_1", "name": "Old", "price": "$10.00", "currency": "USD", "availability": "in stock"},
@@ -651,6 +897,43 @@ def test_update_catalog_product_reads_then_updates(monkeypatch) -> None:
     assert result["previous"]["availability"] == "in stock"
     assert result["current"] == {"price": 8, "availability": "out of stock"}
     assert result["sent"] == {"price": 800, "availability": "out of stock"}
+
+
+class _ProjectingCatalogClient(FakeCatalogClient):
+    """Returns only the requested fields, as the Graph API does."""
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        source = await super().get_object(object_id, fields=fields, params=params)
+        return {key: value for key, value in source.items() if key in (fields or [])}
+
+
+def test_update_catalog_product_params_field_is_read_before_the_update(monkeypatch) -> None:
+    client = _use(monkeypatch, _ProjectingCatalogClient(objects={"p_1": {"id": "p_1", "inventory": 100}}))
+    result = _run(catalogs.update_catalog_product(product_id="p_1", params={"inventory": 5}))
+    assert client.kinds() == ["get", "update"]
+    assert "inventory" in client.calls[0][1]["fields"]
+    assert result["previous"] == {"inventory": 100}
+    assert result["current"] == {"inventory": 5}
+    assert "previous_unavailable" not in result
+
+
+def test_update_catalog_product_unreadable_params_field_is_marked_unavailable(monkeypatch) -> None:
+    client = _use(monkeypatch, _ProjectingCatalogClient(objects={"p_1": {"id": "p_1", "name": "Old"}}))
+    result = _run(catalogs.update_catalog_product(
+        product_id="p_1", name="New", params={"return_policy_days": 30},
+    ))
+    assert "return_policy_days" not in client.calls[0][1]["fields"]
+    assert result["previous"] == {"name": "Old"}
+    assert "return_policy_days" not in result["previous"]
+    assert set(result["previous_unavailable"]) == {"return_policy_days"}
+    assert result["sent"] == {"name": "New", "return_policy_days": 30}
+
+
+def test_update_catalog_unreadable_params_setting_is_marked_unavailable(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(objects={"cat_1": {"id": "cat_1", "name": "Old"}}))
+    result = _run(catalogs.update_catalog(catalog_id="cat_1", params={"checkout_url": "https://x/checkout"}))
+    assert "checkout_url" not in result["previous"]
+    assert set(result["previous_unavailable"]) == {"checkout_url"}
 
 
 def test_update_catalog_product_requires_a_change(monkeypatch) -> None:
@@ -666,7 +949,12 @@ def test_delete_product_reads_then_deletes_and_returns_previous(monkeypatch) -> 
     client = _use(monkeypatch, FakeCatalogClient(objects={"p_1": product}))
     result = _run(catalogs.delete_catalog_product(product_id="p_1"))
     assert client.kinds() == ["get", "delete"]
-    assert client.calls[0][1]["fields"] == catalogs.PRODUCT_DETAIL_FIELDS
+    assert client.calls[0][1]["fields"] == [
+        "id", "retailer_id", "name", "availability", "price", "currency", "sale_price",
+        "url", "image_url", "brand", "visibility", "review_status", "description", "condition",
+        "product_type", "category", "retailer_product_group_id", "additional_image_urls",
+        "custom_label_0", "custom_label_1", "custom_label_2", "custom_label_3", "custom_label_4",
+    ]
     assert client.calls[1][1] == {"object_id": "p_1"}
     assert result["action"] == "delete_catalog_product"
     assert result["previous"] == product
@@ -725,7 +1013,7 @@ def test_filter_builder_returns_match_count_and_sample(monkeypatch) -> None:
     assert call["params"] == {
         "filter": {"retailer_id": {"is_any": ["a", "b"]}}, "summary": "total_count", "limit": 5,
     }
-    assert call["fields"] == catalogs.FILTER_SAMPLE_FIELDS
+    assert call["fields"] == ["id", "retailer_id", "name", "price", "availability"]
     assert result["match_count"] == 123
     assert len(result["sample"]) == 5
     assert client.kinds() == ["list"]
@@ -813,7 +1101,7 @@ def test_list_product_sets_three_scopes(monkeypatch) -> None:
     by_catalog = _run(catalogs.list_product_sets(catalog_id="cat_1", limit=5))
     assert client.calls[0][1]["edge"] == "product_sets"
     assert client.calls[0][1]["params"] == {"limit": 5, "summary": "total_count"}
-    assert client.calls[0][1]["fields"] == catalogs.PRODUCT_SET_FIELDS
+    assert client.calls[0][1]["fields"] == ["id", "name", "filter", "product_count", "retailer_id"]
     assert by_catalog["summary"]["total_count"] == 1
     one = _run(catalogs.list_product_sets(product_set_id="ps_1"))
     assert client.calls[1][0] == "get"
