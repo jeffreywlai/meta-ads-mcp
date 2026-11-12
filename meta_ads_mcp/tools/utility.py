@@ -116,6 +116,10 @@ TOOL_GROUPS = {
         "update_creative",
         "update_ad_creative",
         "delete_creative",
+        "create_ab_test",
+        "create_lift_study",
+        "update_ad_study",
+        "cancel_ad_study",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -131,6 +135,9 @@ TOOL_GROUPS = {
     "signals": [
     ],
     "experiments": [
+        "list_ad_studies",
+        "get_ad_study",
+        "check_ab_test_eligibility",
     ],
     "catalog": [
     ],

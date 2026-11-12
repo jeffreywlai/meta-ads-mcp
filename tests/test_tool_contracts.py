@@ -23,6 +23,7 @@ from meta_ads_mcp.tools import (
     diagnostics,
     discovery,
     execution,
+    experiments,
     insights,
     recommendations,
     research,
@@ -142,6 +143,27 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_page_recommendations": {"page_id": "page_123"},
     "list_change_history": {"account_id": "123"},
     "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
+    "list_ad_studies": {"account_id": "123"},
+    "get_ad_study": {"study_id": "study_123", "include_results": True},
+    "check_ab_test_eligibility": {"entity_ids": ["cmp_123", "cmp_456"]},
+    "create_ab_test": {
+        "business_id": "biz_123",
+        "cells": [
+            {"name": "A", "treatment_percentage": 50, "adset_ids": ["adset_123"]},
+            {"name": "B", "treatment_percentage": 50, "adset_ids": ["adset_456"]},
+        ],
+        "start_time": "2099-01-01T00:00:00Z",
+        "end_time": "2099-01-15T00:00:00Z",
+    },
+    "create_lift_study": {
+        "business_id": "biz_123",
+        "cells": [{"name": "Test", "treatment_percentage": 90, "control_percentage": 10}],
+        "objectives": [{"name": "Purchases", "adspixels": [{"id": "px_123", "event_names": ["fb_pixel_purchase"]}]}],
+        "start_time": "2099-01-01T00:00:00Z",
+        "end_time": "2099-01-15T00:00:00Z",
+    },
+    "update_ad_study": {"study_id": "study_123", "name": "Updated Study"},
+    "cancel_ad_study": {"study_id": "study_123"},
 }
 
 
@@ -512,6 +534,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         diagnostics,
         discovery,
         execution,
+        experiments,
         insights,
         recommendations,
         research,

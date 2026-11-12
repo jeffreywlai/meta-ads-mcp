@@ -165,4 +165,8 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "update_creative",
         "update_custom_audience",
         "upload_creative_asset",
+        "create_ab_test",
+        "create_lift_study",
+        "update_ad_study",
+        "cancel_ad_study",
     }
