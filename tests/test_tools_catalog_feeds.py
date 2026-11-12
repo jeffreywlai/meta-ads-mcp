@@ -96,6 +96,46 @@ def run(coro):
 
 SCHEDULE = {"url": "https://example.com/feed.csv", "interval": "daily", "hour": 22}
 
+# Field lists written out here rather than taken from the module, so a field
+# added to or dropped from a request is caught. Each is a ProductFeed,
+# ProductFeedUpload, ProductFeedUploadError, ProductFeedRule, ExternalEventSource,
+# ProductCatalog, ProductEventStat, DACheck or AdsPixel field.
+EXPECTED_UPLOAD_FIELDS = [
+    "id", "start_time", "end_time", "input_method", "filename", "url",
+    "error_count", "warning_count", "num_detected_items", "num_persisted_items",
+    "num_invalid_items", "num_deleted_items",
+]
+EXPECTED_UPLOAD_ERROR_FIELDS = [
+    "id", "summary", "description", "severity", "error_type", "affected_surfaces", "total_count",
+]
+EXPECTED_FEED_FIELDS = [
+    "id", "name", "file_name", "country", "default_currency", "deletion_enabled",
+    "delimiter", "encoding", "quoted_fields_mode", "ingestion_source_type",
+    "item_sub_type", "override_type", "primary_feeds", "migrated_from_feed_id",
+    "product_count", "created_time", "schedule", "update_schedule",
+    "latest_upload{id,start_time,end_time,input_method,filename,url,error_count,"
+    "warning_count,num_detected_items,num_persisted_items,num_invalid_items,num_deleted_items}",
+]
+EXPECTED_FEED_LIST_FIELDS = [
+    "id", "name", "file_name", "ingestion_source_type", "product_count", "schedule",
+    "update_schedule", "latest_upload{id,start_time,end_time,error_count,warning_count}",
+]
+EXPECTED_FEED_UPDATE_READ_FIELDS = [
+    "id", "name", "default_currency", "deletion_enabled", "delimiter", "encoding",
+    "quoted_fields_mode", "schedule", "update_schedule", "migrated_from_feed_id",
+]
+EXPECTED_RULE_FIELDS = ["id", "attribute", "rule_type", "params"]
+EXPECTED_EVENT_SOURCE_FIELDS = ["id", "name", "source_type"]
+EXPECTED_EVENT_STAT_FIELDS = [
+    "date_start", "date_stop", "event", "event_source",
+    "total_matched_content_ids", "total_unmatched_content_ids",
+    "unique_matched_content_ids", "unique_unmatched_content_ids",
+    "total_content_ids_matched_other_catalogs", "unique_content_ids_matched_other_catalogs",
+]
+EXPECTED_DA_CHECK_FIELDS = ["key", "title", "description", "result", "user_message", "action_uri"]
+EXPECTED_CATALOG_SCAN_FIELDS = ["id", "name"]
+EXPECTED_PIXEL_CANDIDATE_FIELDS = ["id", "name", "last_fired_time", "is_unavailable"]
+
 
 # list_product_feeds -----------------------------------------------------------------
 
@@ -112,7 +152,7 @@ def test_list_product_feeds_lists_catalog_edge_with_paging(monkeypatch) -> None:
     assert call["method"] == "list_objects"
     assert (call["parent_id"], call["edge"]) == ("cat_1", "product_feeds")
     assert call["params"] == {"limit": 10, "after": "c1"}
-    assert call["fields"] == catalog_feeds.FEED_LIST_FIELDS
+    assert call["fields"] == EXPECTED_FEED_LIST_FIELDS
     assert result["items"] == [{"id": "feed_1", "name": "Main"}]
     assert result["summary"] == {"count": 1, "complete": False, "truncated": True, "next_after": "c2"}
 
@@ -125,7 +165,7 @@ def test_list_product_feeds_one_feed_returns_settings_schedule_and_latest_upload
     call = client.calls[0]
     assert call["method"] == "get_object"
     assert call["object_id"] == "feed_1"
-    assert call["fields"] == catalog_feeds.FEED_FIELDS
+    assert call["fields"] == EXPECTED_FEED_FIELDS
     assert "schedule" in call["fields"] and "update_schedule" in call["fields"]
     assert any(field.startswith("latest_upload{") for field in call["fields"])
     assert result["item"]["latest_upload"] == {"id": "up_1"}
@@ -240,7 +280,7 @@ def test_update_product_feed_reads_first_and_returns_previous(monkeypatch) -> No
     }))
     result = run(catalog_feeds.update_product_feed(feed_id="feed_1", name="New", schedule=SCHEDULE))
     assert client.methods() == ["get_object", "update_object"]
-    assert client.calls[0]["fields"] == catalog_feeds.FEED_UPDATE_READ_FIELDS
+    assert client.calls[0]["fields"] == EXPECTED_FEED_UPDATE_READ_FIELDS
     assert client.calls[1]["object_id"] == "feed_1"
     assert client.calls[1]["data"] == {
         "name": "New",
@@ -317,7 +357,7 @@ def test_delete_product_feed_reads_then_deletes_and_returns_previous(monkeypatch
     client = _use(monkeypatch, FakeCatalogFeedClient(objects={"feed_1": feed}))
     result = run(catalog_feeds.delete_product_feed(feed_id="feed_1"))
     assert client.methods() == ["get_object", "delete_object"]
-    assert client.calls[0]["fields"] == catalog_feeds.FEED_FIELDS
+    assert client.calls[0]["fields"] == EXPECTED_FEED_FIELDS
     assert client.calls[1]["object_id"] == "feed_1"
     assert result["action"] == "delete_product_feed"
     assert result["previous"] == feed
@@ -394,9 +434,9 @@ def test_feed_uploads_errors_ordered_by_rows_affected(monkeypatch) -> None:
     ))
     result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1"))
     assert [call["method"] for call in client.calls] == ["get_object", "list_objects"]
-    assert client.calls[0]["fields"] == catalog_feeds.UPLOAD_FIELDS
+    assert client.calls[0]["fields"] == EXPECTED_UPLOAD_FIELDS
     assert (client.calls[1]["parent_id"], client.calls[1]["edge"]) == ("up_1", "errors")
-    assert client.calls[1]["fields"] == catalog_feeds.UPLOAD_ERROR_FIELDS
+    assert client.calls[1]["fields"] == EXPECTED_UPLOAD_ERROR_FIELDS
     item = result["item"]
     assert [error["id"] for error in item["errors"]] == ["e2", "e3", "e1", "e4"]
     assert item["status"] == "finished"
@@ -416,7 +456,7 @@ def test_list_product_feed_uploads_lists_feed_edge_and_fetches_errors_only_when_
     result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", limit=3))
     first = client.calls[0]
     assert (first["parent_id"], first["edge"], first["params"]) == ("feed_1", "uploads", {"limit": 3})
-    assert first["fields"] == catalog_feeds.UPLOAD_FIELDS
+    assert first["fields"] == EXPECTED_UPLOAD_FIELDS
     error_parents = [call["parent_id"] for call in client.calls if call.get("edge") == "errors"]
     assert error_parents == ["up_2", "up_0"]
     items = {item["id"]: item for item in result["items"]}
@@ -452,7 +492,7 @@ def test_list_feed_rules_reads_rules_edge(monkeypatch) -> None:
     result = run(catalog_feeds.list_feed_rules(feed_id="feed_1"))
     call = client.calls[0]
     assert (call["parent_id"], call["edge"], call["fields"], call["params"]) == (
-        "feed_1", "rules", catalog_feeds.RULE_FIELDS, {"limit": 100},
+        "feed_1", "rules", EXPECTED_RULE_FIELDS, {"limit": 100},
     )
     assert result["items"][0]["id"] == "rule_1"
     assert result["summary"]["complete"] is True
@@ -511,7 +551,7 @@ def test_delete_feed_rule_reads_then_deletes_and_returns_previous(monkeypatch) -
     client = _use(monkeypatch, FakeCatalogFeedClient(objects={"rule_1": rule}))
     result = run(catalog_feeds.delete_feed_rule(rule_id="rule_1"))
     assert client.methods() == ["get_object", "delete_object"]
-    assert client.calls[0]["fields"] == catalog_feeds.RULE_FIELDS
+    assert client.calls[0]["fields"] == EXPECTED_RULE_FIELDS
     assert client.calls[1]["object_id"] == "rule_1"
     assert result["action"] == "delete_feed_rule"
     assert result["target"] == {"rule_id": "rule_1"}
@@ -543,7 +583,7 @@ def test_list_catalog_event_sources_reads_external_event_sources_edge(monkeypatc
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
     result = run(catalog_feeds.list_catalog_event_sources(catalog_id="cat_1"))
     call = client.calls[0]
-    assert (call["parent_id"], call["edge"], call["fields"]) == ("cat_1", "external_event_sources", catalog_feeds.EVENT_SOURCE_FIELDS)
+    assert (call["parent_id"], call["edge"], call["fields"]) == ("cat_1", "external_event_sources", EXPECTED_EVENT_SOURCE_FIELDS)
     assert call["params"] == {"limit": 100}
     assert [item["id"] for item in result["items"]] == ["px_1", "app_1"]
 
@@ -563,7 +603,7 @@ def test_list_event_source_catalogs_scans_business_catalogs(monkeypatch) -> None
     result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
     first = client.calls[0]
     assert (first["parent_id"], first["edge"]) == ("biz_1", "owned_product_catalogs")
-    assert first["fields"] == catalog_feeds.CATALOG_SCAN_FIELDS
+    assert first["fields"] == EXPECTED_CATALOG_SCAN_FIELDS
     assert [item["id"] for item in result["items"]] == ["cat_1"]
     assert result["summary"]["catalogs_scanned"] == 2
     assert result["summary"]["complete"] is True
@@ -602,7 +642,7 @@ def test_list_event_source_catalogs_reports_incomplete_scan(monkeypatch) -> None
     _use(monkeypatch, client)
     result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
     assert result["summary"]["complete"] is False
-    assert result["summary"]["catalogs_scanned"] == catalog_feeds.MAX_CATALOGS_SCANNED
+    assert result["summary"]["catalogs_scanned"] == 50
     assert "incomplete" in result["summary"]["note"]
     assert any("50-item cap" in reason for reason in result["summary"]["stop_reasons"])
 
@@ -819,7 +859,9 @@ def test_event_source_health_includes_28_day_history_when_present_and_says_when_
     }))
     result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
     stats_call = next(call for call in client.calls if call.get("edge") == "event_stats")
-    assert stats_call["fields"] == catalog_feeds.EVENT_STAT_FIELDS
+    assert stats_call["fields"] == EXPECTED_EVENT_STAT_FIELDS
+    check_calls = [call for call in client.calls if call.get("edge") == "da_checks"]
+    assert check_calls and all(call["fields"] == EXPECTED_DA_CHECK_FIELDS for call in check_calls)
     sources = {source["id"]: source for source in result["sources"]}
 
     pixel = sources["px_1"]
@@ -982,9 +1024,12 @@ def test_recommendations_rank_unconnected_pixels_with_evidence(monkeypatch) -> N
     result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
     pixel_call = next(call for call in client.calls if call.get("edge") == "adspixels")
     assert pixel_call["parent_id"] == "biz_1"
-    assert pixel_call["fields"] == catalog_feeds.PIXEL_CANDIDATE_FIELDS
+    assert pixel_call["fields"] == EXPECTED_PIXEL_CANDIDATE_FIELDS
     checked = [call["parent_id"] for call in client.calls if call.get("edge") == "da_checks"]
     assert checked == ["px_2", "px_3"]
+    assert all(
+        call["fields"] == EXPECTED_DA_CHECK_FIELDS for call in client.calls if call.get("edge") == "da_checks"
+    )
     recommendations = result["recommendations"]
     assert [item["event_source_id"] for item in recommendations] == ["px_2", "px_3"]
     assert recommendations[0]["strength"] == "strong"
