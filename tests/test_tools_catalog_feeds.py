@@ -1168,3 +1168,26 @@ def test_graph_client_delete_edge_object_sends_delete_with_form_data(monkeypatch
     result = run(client.delete_edge_object("cat_1", "external_event_sources", data={"external_event_sources": ["px_1"]}))
     assert sent == [("DELETE", "cat_1/external_event_sources", {"external_event_sources": ["px_1"]})]
     assert result == {"success": True}
+
+
+def test_create_product_feed_redacts_a_password_meta_echoes_back(monkeypatch) -> None:
+    """If Meta returns the schedule it was sent, the password must still not come back."""
+
+    class EchoingClient(FakeCatalogFeedClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            return {"id": "feed_new", "schedule": data["schedule"], "update_schedule": data.get("update_schedule")}
+
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", EchoingClient)
+    secret = "synthetic-feed-secret"
+    result = run(
+        catalog_feeds.create_product_feed(
+            "cat_1",
+            "Feed",
+            schedule={"url": "https://example.invalid/feed.csv", "interval": "DAILY", "password": secret},
+            update_schedule={"url": "https://example.invalid/delta.csv", "interval": "HOURLY", "password": secret},
+        )
+    )
+    assert secret not in repr(result)
+    assert result["created"]["id"] == "feed_new"
+    assert result["created"]["schedule"]["password"] == "[redacted]"
+    assert result["created"]["update_schedule"]["password"] == "[redacted]"

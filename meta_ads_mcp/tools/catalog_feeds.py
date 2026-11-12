@@ -595,7 +595,8 @@ async def create_product_feed(
     return creation_response(
         action="create_product_feed",
         target={"catalog_id": catalog_id},
-        result=created,
+        # Meta may return the schedule it was sent; never hand a password back.
+        result=_redact_schedules(created) if isinstance(created, dict) else created,
     )
 
 
