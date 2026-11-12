@@ -582,3 +582,11 @@ def test_unbuilt_pixel_write_tools_are_not_registered() -> None:
 def test_dataset_quality_response_is_json_serializable(monkeypatch) -> None:
     _use(monkeypatch, FakeDatasetClient(object_payloads={"dataset_quality": QUALITY_PAYLOAD}))
     json.dumps(asyncio.run(datasets.get_dataset_quality(dataset_id="px1")))
+
+
+def test_intent_guide_routes_pixel_questions_to_signal_tools() -> None:
+    route = utility.INTENT_GUIDE["inspect_pixels_datasets_or_tracking"]
+    routed = set(route["recommended_order"]) | set(route["avoid_unless_needed"])
+    assert routed == SIGNAL_TOOLS
+    closest = utility._closest_intents("check pixel event match quality")
+    assert closest[0]["intent"] == "inspect_pixels_datasets_or_tracking"

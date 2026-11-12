@@ -338,6 +338,25 @@ INTENT_GUIDE = {
         "avoid_unless_needed": [],
         "notes": ["This still requires Ads Library API app access even though it does not depend on an ad account id."],
     },
+    "inspect_pixels_datasets_or_tracking": {
+        "description": (
+            "Check pixels, datasets, Conversions API setup, event volume, event match quality, "
+            "custom conversions, and pixel event rules or parameter extractors."
+        ),
+        "recommended_order": [
+            "list_datasets",
+            "get_dataset",
+            "get_dataset_stats",
+            "get_dataset_quality",
+            "list_custom_conversions",
+        ],
+        "avoid_unless_needed": ["list_pixel_event_rules", "list_pixel_parameters"],
+        "notes": [
+            "Use get_dataset_quality for event match quality and match-key coverage; it flags weak scores and states the threshold used.",
+            "get_dataset_stats covers at most 28 days per call and totals hourly counts per event, device, source, or other aggregation.",
+            "Pixel event rules and parameter extractors are read-only through Meta's public API; changes are made in Events Manager.",
+        ],
+    },
     "writes_after_confirmation": {
         "description": "Mutate campaign, ad set, ad, creative, or audience state after explicit user confirmation.",
         "recommended_order": [
