@@ -829,6 +829,56 @@ def test_create_catalog_product_validates_before_network(monkeypatch, kwargs, ma
         _run(catalogs.create_catalog_product(**arguments))
 
 
+_CREATE_PRODUCT_ARGUMENTS = {
+    "catalog_id": "cat_1", "retailer_id": "SKU-1", "name": "Shoe", "price": 10, "currency": "USD",
+    "url": "https://shop/x", "image_url": "https://shop/x.png",
+}
+
+
+def _call_mcp(tool: str, arguments: dict[str, Any], *, routed: bool):
+    from meta_ads_mcp.coordinator import mcp_server
+
+    if routed:
+        return asyncio.run(mcp_server.call_tool("call_tool", {"name": tool, "arguments": arguments}))
+    return asyncio.run(mcp_server.call_tool(tool, arguments))
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize(("tool", "arguments"), [
+    ("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "price": True}),
+    ("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "price": False}),
+    ("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "sale_price": True}),
+    ("update_catalog_product", {"product_id": "p_1", "price": True}),
+    ("update_catalog_product", {"product_id": "p_1", "sale_price": False}),
+])
+def test_boolean_price_is_rejected_at_the_mcp_boundary(monkeypatch, tool, arguments, routed) -> None:
+    """Pydantic would coerce true to 1.0; every catalog money input must refuse it before any call."""
+    from fastmcp.exceptions import ToolError
+    from fastmcp.exceptions import ValidationError as MCPValidationError
+
+    client = _use(monkeypatch, FakeCatalogClient())
+    with pytest.raises((ToolError, MCPValidationError)):
+        _call_mcp(tool, arguments, routed=routed)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_numeric_price_still_passes_the_mcp_boundary(monkeypatch, routed) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    _call_mcp("create_catalog_product", {**_CREATE_PRODUCT_ARGUMENTS, "price": 12.5, "sale_price": "9.99"},
+              routed=routed)
+    assert client.calls[0][1]["data"]["price"] == 1250
+    assert client.calls[0][1]["data"]["sale_price"] == 999
+
+
+def test_boolean_price_is_rejected_on_direct_calls(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="price"):
+        _run(catalogs.create_catalog_product(**{**_CREATE_PRODUCT_ARGUMENTS, "price": True}))
+    with pytest.raises(ValidationError, match="sale_price"):
+        _run(catalogs.update_catalog_product(product_id="p_1", sale_price=True))
+
+
 def test_update_catalog_product_reads_then_updates(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogClient(objects={
         "p_1": {"id": "p_1", "name": "Old", "price": "$10.00", "currency": "USD", "availability": "in stock"},

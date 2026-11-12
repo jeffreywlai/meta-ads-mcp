@@ -10,7 +10,9 @@ import json
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Annotated, Any, TypeAlias
+
+from pydantic import BeforeValidator, Field
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import (
@@ -198,6 +200,23 @@ def _catalog_price(value: Any, field_name: str) -> int:
     if scaled != scaled.to_integral_value():
         raise ValidationError(f"{field_name} accepts at most 2 decimal places (Meta sends prices as amount x 100).")
     return int(scaled)
+
+
+def _reject_bool_price(value: Any) -> Any:
+    """Refuse true/false before Pydantic's lax float coercion turns them into 1.0 or 0.0."""
+    if isinstance(value, bool):
+        raise ValueError("a price must be a number, not true or false")
+    return value
+
+
+# Every money input on the catalog tools uses this type, so the MCP boundary
+# rejects booleans before numeric coercion; _catalog_price repeats the check
+# for direct Python calls.
+CatalogPrice: TypeAlias = Annotated[
+    float,
+    BeforeValidator(_reject_bool_price),
+    Field(description="Price in major units (12.5 means 12.50); sent to Meta as amount x 100."),
+]
 
 
 def _currency(value: str) -> str:
@@ -949,7 +968,7 @@ async def create_catalog_product(
     catalog_id: str,
     retailer_id: str,
     name: str,
-    price: float,
+    price: CatalogPrice,
     currency: str,
     url: str,
     image_url: str,
@@ -957,7 +976,7 @@ async def create_catalog_product(
     description: str | None = None,
     brand: str | None = None,
     condition: str | None = None,
-    sale_price: float | None = None,
+    sale_price: CatalogPrice | None = None,
     visibility: str = "staging",
     allow_upsert: bool = False,
     params: dict[str, Any] | None = None,
@@ -1000,9 +1019,9 @@ async def create_catalog_product(
 async def update_catalog_product(
     product_id: str,
     name: str | None = None,
-    price: float | None = None,
+    price: CatalogPrice | None = None,
     currency: str | None = None,
-    sale_price: float | None = None,
+    sale_price: CatalogPrice | None = None,
     availability: str | None = None,
     condition: str | None = None,
     visibility: str | None = None,
