@@ -489,3 +489,276 @@ async def get_performance_trend(
             "daily_rows_returned": len(rows),
         },
     )
+
+
+ANOMALY_DEFAULT_METRICS = ("spend", "cpc", "cpm", "ctr", "cost_per_result", "roas")
+SENSITIVITY_MULTIPLIERS = {"low": 5.0, "medium": 3.5, "high": 2.5}
+MAD_SCALE = 1.4826
+MIN_SAME_WEEKDAY_POINTS = 4
+MIN_BASELINE_VALUES = 7
+MAX_LOOKBACK_DAYS = 31
+MIN_BASELINE_DAYS = 7
+MAX_BASELINE_DAYS = 90
+
+
+def _median(values: list[float]) -> float:
+    """Return the median of a non-empty list."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _median_and_mad(values: list[float]) -> tuple[float, float]:
+    """Return the median and the median absolute deviation from it."""
+    median = _median(values)
+    return median, _median([abs(value - median) for value in values])
+
+
+def _anomaly_rule(sensitivity: str, multiplier: float) -> dict[str, Any]:
+    """Describe the exact flagging rule applied."""
+    return {
+        "description": (
+            "A day is flagged when |value - baseline median| is greater than multiplier x 1.4826 x the baseline's "
+            "median absolute deviation (MAD). The baseline is the baseline_days days just before the lookback window. "
+            f"When the baseline has at least {MIN_SAME_WEEKDAY_POINTS} values on the same weekday as the day examined "
+            "and those values vary, only same-weekday values are used; otherwise all baseline days are used. "
+            "Days are not scored when the baseline has no variation (MAD of 0)."
+        ),
+        "sensitivity": sensitivity,
+        "multiplier": multiplier,
+        "sensitivity_multipliers": dict(SENSITIVITY_MULTIPLIERS),
+        "mad_scale": MAD_SCALE,
+        "min_same_weekday_points": MIN_SAME_WEEKDAY_POINTS,
+        "min_baseline_values_per_metric": MIN_BASELINE_VALUES,
+        "baseline_coverage_required": "a daily insights row for every baseline day",
+        "severity_policy": "high when |robust_score| is at least twice the multiplier, otherwise medium",
+        "note": (
+            "This is a rule-based screen against the object's own recent history. It is not a statistical test "
+            "and gives no probability or confidence."
+        ),
+    }
+
+
+@mcp_server.tool()
+async def detect_performance_anomalies(
+    level: str,
+    object_id: str,
+    metrics: StringList | None = None,
+    lookback_days: int = 7,
+    baseline_days: int = 28,
+    sensitivity: str = "medium",
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Flag days in the last lookback_days whose spend, CPC, CPM, CTR, cost per result or ROAS is far from the object's own baseline (the baseline_days before), using median and median absolute deviation, with same-weekday baselines when four or more exist. Returns the rule, baseline values and thresholds. Rule-based screen, not a statistical test. end_date defaults to yesterday."""
+    resolved_level = _require_level(level, REPORTING_LEVELS)
+    resolved_object_id = _require_object_id(resolved_level, object_id)
+    metric_names = _normalize_metric_names(metrics, ANOMALY_DEFAULT_METRICS)
+    if not 1 <= lookback_days <= MAX_LOOKBACK_DAYS:
+        raise ValidationError(f"lookback_days must be between 1 and {MAX_LOOKBACK_DAYS}.")
+    if not MIN_BASELINE_DAYS <= baseline_days <= MAX_BASELINE_DAYS:
+        raise ValidationError(f"baseline_days must be between {MIN_BASELINE_DAYS} and {MAX_BASELINE_DAYS}.")
+    resolved_sensitivity = (sensitivity or "").strip().lower()
+    if resolved_sensitivity not in SENSITIVITY_MULTIPLIERS:
+        raise ValidationError(f"sensitivity must be one of {list(SENSITIVITY_MULTIPLIERS)}.")
+    multiplier = SENSITIVITY_MULTIPLIERS[resolved_sensitivity]
+    end_text = blank_to_none(end_date)
+    end = _parse_date(end_text, field="end_date") if end_text else _today() - timedelta(days=1)
+    lookback_start = end - timedelta(days=lookback_days - 1)
+    baseline_end = lookback_start - timedelta(days=1)
+    baseline_start = baseline_end - timedelta(days=baseline_days - 1)
+
+    rows = await _daily_rows(resolved_level, resolved_object_id, baseline_start, end)
+    known = _known_inputs(rows)
+    daily: dict[date, dict[str, float | None]] = {}
+    for row in rows:
+        day = _parse_date(str(row["date_start"]), field="date_start")
+        daily[day] = _derived_metrics(_period_inputs([row], known))
+    baseline_dates = sorted(day for day in daily if baseline_start <= day <= baseline_end)
+    lookback_dates = [lookback_start + timedelta(days=offset) for offset in range(lookback_days)]
+    rule = _anomaly_rule(resolved_sensitivity, multiplier)
+    scope = {"level": resolved_level, "object_id": resolved_object_id}
+    windows = {
+        "baseline_window": {"since": baseline_start.isoformat(), "until": baseline_end.isoformat()},
+        "lookback_window": {"since": lookback_start.isoformat(), "until": end.isoformat()},
+    }
+
+    if len(baseline_dates) < baseline_days:
+        return analysis_response(
+            scope=scope,
+            metrics={},
+            findings=[{
+                **build_finding(
+                    "insufficient_data",
+                    f"Only {len(baseline_dates)} of {baseline_days} baseline days have data, so no day was judged.",
+                    severity="low",
+                    confidence=None,
+                    next_actions=["Use a shorter baseline_days or an object with a longer delivery history."],
+                ),
+                "confidence_status": "uncalibrated",
+            }],
+            missing_signals=[
+                f"Not enough history: {len(baseline_dates)} of {baseline_days} baseline days returned insights rows."
+            ],
+            extra={
+                **windows,
+                "rule": rule,
+                "anomalies": [],
+                "metric_status": {},
+                "baseline_rows": len(baseline_dates),
+                "lookback_rows": sum(1 for day in lookback_dates if day in daily),
+                "results_definition": RESULTS_DEFINITION,
+            },
+        )
+
+    anomalies: list[dict[str, Any]] = []
+    metric_status: dict[str, dict[str, Any]] = {}
+    missing_signals: list[str] = []
+    for metric in metric_names:
+        baseline_points = [(day, daily[day][metric]) for day in baseline_dates if daily[day][metric] is not None]
+        status: dict[str, Any] = {
+            "baseline_values_count": len(baseline_points),
+            "days_examined": 0,
+            "days_without_data": 0,
+            "days_with_no_baseline_variation": 0,
+            "days_differing_from_flat_baseline": 0,
+            "baseline_types_used": [],
+            "flagged_days": 0,
+        }
+        metric_status[metric] = status
+        if len(baseline_points) < MIN_BASELINE_VALUES:
+            status["status"] = "not_enough_values"
+            missing_signals.append(
+                f"{metric}: only {len(baseline_points)} baseline days have a value; at least {MIN_BASELINE_VALUES} are needed."
+            )
+            continue
+        all_values = [value for _, value in baseline_points]
+        overall_median, overall_mad = _median_and_mad(all_values)
+        status.update({"baseline_median": overall_median, "baseline_mad": overall_mad})
+        for day in lookback_dates:
+            value = daily.get(day, {}).get(metric)
+            if value is None:
+                status["days_without_data"] += 1
+                continue
+            status["days_examined"] += 1
+            candidates: list[tuple[str, list[tuple[date, float]]]] = []
+            same_weekday = [(point_day, point) for point_day, point in baseline_points if point_day.weekday() == day.weekday()]
+            if len(same_weekday) >= MIN_SAME_WEEKDAY_POINTS:
+                candidates.append(("same_weekday", same_weekday))
+            candidates.append(("all_days", baseline_points))
+            chosen: tuple[str, list[tuple[date, float]], float, float] | None = None
+            for baseline_type, points in candidates:
+                median, mad = _median_and_mad([point for _, point in points])
+                if mad > 0:
+                    chosen = (baseline_type, points, median, mad)
+                    break
+            if chosen is None:
+                status["days_with_no_baseline_variation"] += 1
+                if value != overall_median:
+                    status["days_differing_from_flat_baseline"] += 1
+                continue
+            baseline_type, points, median, mad = chosen
+            if baseline_type not in status["baseline_types_used"]:
+                status["baseline_types_used"].append(baseline_type)
+            scaled_mad = MAD_SCALE * mad
+            robust_score = (value - median) / scaled_mad
+            if abs(robust_score) <= multiplier:
+                continue
+            status["flagged_days"] += 1
+            direction = "above" if robust_score > 0 else "below"
+            anomalies.append({
+                "day": day.isoformat(),
+                "metric": metric,
+                "value": value,
+                "baseline_median": median,
+                "baseline_mad": mad,
+                "scaled_mad": scaled_mad,
+                "threshold_multiplier": multiplier,
+                "threshold_low": median - multiplier * scaled_mad,
+                "threshold_high": median + multiplier * scaled_mad,
+                "robust_score": robust_score,
+                "direction": direction,
+                "assessment": _assessment(metric, "up" if direction == "above" else "down"),
+                "baseline_type": baseline_type,
+                "baseline_points": len(points),
+                "baseline_days": [point_day.isoformat() for point_day, _ in points],
+                "baseline_values": [point for _, point in points],
+            })
+        if status["days_examined"] and status["days_with_no_baseline_variation"] == status["days_examined"]:
+            status["status"] = "no_variation"
+            missing_signals.append(
+                f"{metric}: the baseline had no variation (median absolute deviation of 0), so days could not be scored; "
+                f"{status['days_differing_from_flat_baseline']} examined day(s) differ from the flat baseline value."
+            )
+        elif status["days_examined"]:
+            status["status"] = "analyzed"
+        else:
+            status["status"] = "no_lookback_data"
+            missing_signals.append(f"{metric}: no lookback day has a value.")
+
+    anomalies.sort(key=lambda anomaly: (-abs(anomaly["robust_score"]), anomaly["day"], anomaly["metric"]))
+    findings: list[dict[str, Any]] = []
+    for anomaly in anomalies:
+        finding = build_finding(
+            "performance_anomaly",
+            (
+                f"{anomaly['metric']} on {anomaly['day']} was {anomaly['value']:.4g}, {anomaly['direction']} the "
+                f"baseline median {anomaly['baseline_median']:.4g} (flag range outside "
+                f"{anomaly['threshold_low']:.4g} to {anomaly['threshold_high']:.4g})."
+            ),
+            severity="high" if abs(anomaly["robust_score"]) >= 2 * multiplier else "medium",
+            confidence=None,
+            evidence=[
+                metric_evidence(
+                    anomaly["metric"],
+                    anomaly["value"],
+                    "(value - baseline_median) / (1.4826 * baseline_mad)",
+                    {
+                        "day": anomaly["day"],
+                        "baseline_median": anomaly["baseline_median"],
+                        "baseline_mad": anomaly["baseline_mad"],
+                        "robust_score": anomaly["robust_score"],
+                        "threshold_multiplier": multiplier,
+                        "threshold_low": anomaly["threshold_low"],
+                        "threshold_high": anomaly["threshold_high"],
+                        "baseline_type": anomaly["baseline_type"],
+                        "baseline_values": anomaly["baseline_values"],
+                    },
+                )
+            ],
+            affected_entities=[dict(scope)],
+            next_actions=[
+                "Check the change history and delivery settings for that day before acting.",
+                "Compare with get_performance_trend to see whether the change persisted.",
+            ],
+        )
+        finding["confidence_status"] = "uncalibrated"
+        findings.append(finding)
+    if not findings:
+        findings.append({
+            **build_finding(
+                "no_anomalies_detected",
+                "No examined day fell outside the flag range for the selected metrics.",
+                severity="low",
+                confidence=None,
+            ),
+            "confidence_status": "uncalibrated",
+        })
+
+    return analysis_response(
+        scope=scope,
+        metrics={},
+        findings=findings,
+        missing_signals=missing_signals,
+        extra={
+            **windows,
+            "rule": rule,
+            "anomalies": anomalies,
+            "metric_status": metric_status,
+            "baseline_rows": len(baseline_dates),
+            "lookback_rows": sum(1 for day in lookback_dates if day in daily),
+            "metric_definitions": {name: METRIC_DEFINITIONS[name] for name in metric_names},
+            "results_definition": RESULTS_DEFINITION,
+        },
+    )

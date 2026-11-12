@@ -400,3 +400,157 @@ def test_trend_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.get_performance_trend(**kwargs))
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# detect_performance_anomalies
+# ---------------------------------------------------------------------------
+
+
+def _days(end: date, count: int) -> list[str]:
+    return [(end - timedelta(days=count - 1 - index)).isoformat() for index in range(count)]
+
+
+SPIKE_BASELINE_SPEND = [100, 102, 98, 101, 99, 103, 97, 100, 102, 98, 101, 99, 103, 97]
+
+
+def _spike_rows() -> list[dict[str, Any]]:
+    days = _days(date(2026, 11, 15), 15)
+    rows = [
+        _day_row(day, spend=spend, impressions=10000, clicks=100, purchases=5, purchase_value=500)
+        for day, spend in zip(days[:-1], SPIKE_BASELINE_SPEND, strict=True)
+    ]
+    rows.append(_day_row(days[-1], spend=1000, impressions=10000, clicks=100, purchases=5, purchase_value=500))
+    return rows
+
+
+def test_anomalies_flat_baseline_does_not_flag_or_divide_by_zero(monkeypatch) -> None:
+    rows = [
+        _day_row(day, spend=100, impressions=10000, clicks=100, purchases=5, purchase_value=500)
+        for day in _days(date(2026, 11, 15), 15)
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(
+        performance_signals.detect_performance_anomalies(
+            level="campaign", object_id="cmp_1", lookback_days=1, baseline_days=14, end_date="2026-11-15",
+        )
+    )
+
+    assert result["anomalies"] == []
+    assert not any(finding["type"] == "performance_anomaly" for finding in result["findings"])
+    assert any("no variation" in signal for signal in result["missing_signals"])
+    assert result["metric_status"]["spend"]["status"] == "no_variation"
+    assert result["metric_status"]["spend"]["days_differing_from_flat_baseline"] == 0
+
+
+def test_anomalies_short_history_says_so(monkeypatch) -> None:
+    rows = [
+        _day_row(day, spend=100 + index, impressions=10000, clicks=100)
+        for index, day in enumerate(_days(date(2026, 11, 15), 10))
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(
+        performance_signals.detect_performance_anomalies(
+            level="ad", object_id="ad_1", lookback_days=1, baseline_days=14, end_date="2026-11-15",
+        )
+    )
+
+    assert result["anomalies"] == []
+    assert any("history" in signal for signal in result["missing_signals"])
+    assert result["findings"][0]["type"] == "insufficient_data"
+    assert result["baseline_rows"] == 9
+
+
+def test_anomalies_flags_a_clear_spike_with_evidence(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(_spike_rows())))
+
+    result = asyncio.run(
+        performance_signals.detect_performance_anomalies(
+            level="campaign", object_id="cmp_1", metrics=["spend"], lookback_days=1, baseline_days=14,
+            end_date="2026-11-15",
+        )
+    )
+
+    call = _calls(client, "get_insights")[0]
+    assert json.loads(call["params"]["time_range"]) == {"since": "2026-11-01", "until": "2026-11-15"}
+    assert call["params"]["time_increment"] == 1
+    assert len(result["anomalies"]) == 1
+    anomaly = result["anomalies"][0]
+    assert anomaly["day"] == "2026-11-15"
+    assert anomaly["metric"] == "spend"
+    assert anomaly["value"] == 1000.0
+    assert anomaly["baseline_median"] == 100.0
+    assert anomaly["baseline_mad"] == 2.0
+    assert anomaly["threshold_multiplier"] == 3.5
+    assert anomaly["threshold_high"] == pytest.approx(100 + 3.5 * 1.4826 * 2.0)
+    assert anomaly["direction"] == "above"
+    assert anomaly["baseline_type"] == "all_days"
+    assert anomaly["baseline_values"] == [float(value) for value in SPIKE_BASELINE_SPEND]
+    finding = next(finding for finding in result["findings"] if finding["type"] == "performance_anomaly")
+    assert finding["severity"] == "high"
+    assert finding["confidence"] is None
+    assert finding["evidence"][0]["inputs"]["baseline_median"] == 100.0
+    assert "median" in result["rule"]["description"]
+
+
+def test_anomalies_never_claims_significance(monkeypatch) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(_spike_rows())))
+    flagged = asyncio.run(
+        performance_signals.detect_performance_anomalies(
+            level="campaign", object_id="cmp_1", lookback_days=1, baseline_days=14, end_date="2026-11-15",
+        )
+    )
+    assert flagged["anomalies"]
+    rows = [_day_row(day, spend=100, impressions=10, clicks=1) for day in _days(date(2026, 11, 15), 15)]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    flat = asyncio.run(
+        performance_signals.detect_performance_anomalies(
+            level="campaign", object_id="cmp_1", lookback_days=1, baseline_days=14, end_date="2026-11-15",
+        )
+    )
+    for payload in (flagged, flat):
+        assert "significan" not in json.dumps(payload).lower()
+
+
+def test_anomalies_use_same_weekday_baseline_when_four_or_more_exist(monkeypatch) -> None:
+    end = date(2026, 11, 29)
+    days = _days(end, 29)
+    rows = []
+    for day in days[:-1]:
+        weekday_spend = 300 if date.fromisoformat(day).weekday() == end.weekday() else 100
+        rows.append(_day_row(day, spend=weekday_spend + (len(rows) % 3), impressions=1000, clicks=10))
+    rows.append(_day_row(days[-1], spend=301, impressions=1000, clicks=10))
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(
+        performance_signals.detect_performance_anomalies(
+            level="campaign", object_id="cmp_1", metrics=["spend"], lookback_days=1, baseline_days=28,
+            end_date=end.isoformat(),
+        )
+    )
+
+    assert result["anomalies"] == []
+    assert result["metric_status"]["spend"]["baseline_types_used"] == ["same_weekday"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"level": "creative", "object_id": "x"},
+        {"level": "ad", "object_id": ""},
+        {"level": "ad", "object_id": "x", "lookback_days": 0},
+        {"level": "ad", "object_id": "x", "lookback_days": 32},
+        {"level": "ad", "object_id": "x", "baseline_days": 6},
+        {"level": "ad", "object_id": "x", "baseline_days": 91},
+        {"level": "ad", "object_id": "x", "sensitivity": "extreme"},
+        {"level": "ad", "object_id": "x", "metrics": ["bogus"]},
+        {"level": "ad", "object_id": "x", "end_date": "yesterday"},
+    ],
+)
+def test_anomalies_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.detect_performance_anomalies(**kwargs))
+    assert client.calls == []
