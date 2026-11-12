@@ -1253,8 +1253,28 @@ def _funnel(action_totals: dict[str, float]) -> dict[str, Any]:
     }
 
 
+GOAL_VOLUME_TOP_ADSETS = 3
+
+
+def _adset_volume_entry(row: dict[str, Any], events: float | None, per_week: float | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "adset_id": row.get("adset_id"),
+        "adset_name": row.get("adset_name"),
+        "spend": to_float((row.get("metrics") or {}).get("spend")) or 0.0,
+    }
+    if events is not None:
+        entry["events"] = events
+        entry["events_per_week"] = per_week
+    return entry
+
+
+def _top_by_spend(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(entries, key=lambda entry: (-entry["spend"], str(entry["adset_id"] or "")))
+    return ordered[:GOAL_VOLUME_TOP_ADSETS]
+
+
 def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[str, Any]]:
-    """Compare each optimization goal's weekly events per ad set with the learning-phase guidance."""
+    """Summarize, per optimization goal, how many ad sets reach the learning-phase weekly volume, with the top spenders."""
     by_goal: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if (to_float((row.get("metrics") or {}).get("spend")) or 0.0) <= 0:
@@ -1263,17 +1283,21 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
     output = []
     for goal in sorted(by_goal):
         goal_rows = by_goal[goal]
+        goal_spend = sum(to_float((row.get("metrics") or {}).get("spend")) or 0.0 for row in goal_rows)
         basis = GOAL_EVENT_BASIS.get(goal)
         if basis is None:
             output.append({
                 "optimization_goal": goal,
                 "adset_count": len(goal_rows),
+                "spend": goal_spend,
                 "verdict": "not_assessed",
                 "reason": "No event mapping is defined for this optimization goal.",
+                "top_adsets_by_spend": _top_by_spend([_adset_volume_entry(row, None, None) for row in goal_rows]),
             })
             continue
         source, action_types, description = basis
-        adsets = []
+        meeting: list[dict[str, Any]] = []
+        below: list[dict[str, Any]] = []
         for row in goal_rows:
             if source == "results":
                 events = to_float((row.get("metrics") or {}).get("conversions")) or 0.0
@@ -1282,16 +1306,10 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
                 matched = next((candidate for candidate in action_types or [] if candidate in actions), None)
                 events = (to_float(actions.get(matched)) or 0.0) if matched else 0.0
             per_week = events / lookback_days * 7
-            adsets.append({
-                "adset_id": row.get("adset_id"),
-                "adset_name": row.get("adset_name"),
-                "events": events,
-                "events_per_week": per_week,
-                "meets_threshold": per_week >= LEARNING_EVENTS_PER_WEEK,
-            })
-        meeting = sum(1 for adset in adsets if adset["meets_threshold"])
+            entry = _adset_volume_entry(row, events, per_week)
+            (meeting if per_week >= LEARNING_EVENTS_PER_WEEK else below).append(entry)
         verdict = (
-            "all_adsets_meet_threshold" if meeting == len(adsets)
+            "all_adsets_meet_threshold" if not below
             else "some_adsets_meet_threshold" if meeting
             else "no_adsets_meet_threshold"
         )
@@ -1299,10 +1317,13 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
             "optimization_goal": goal,
             "event_basis": description,
             "threshold_events_per_week": LEARNING_EVENTS_PER_WEEK,
-            "adset_count": len(adsets),
-            "adsets_meeting_threshold": meeting,
+            "adset_count": len(goal_rows),
+            "spend": goal_spend,
+            "adsets_meeting_threshold": len(meeting),
+            "adsets_below_threshold": len(below),
             "verdict": verdict,
-            "adsets": sorted(adsets, key=lambda adset: -adset["events_per_week"]),
+            "top_meeting_threshold": _top_by_spend(meeting),
+            "top_below_threshold": _top_by_spend(below),
         })
     return output
 
@@ -1387,7 +1408,9 @@ async def get_advertiser_context(
             "optimization_goal_volume_rule": (
                 f"An ad set meets the threshold when its events / lookback_days x 7 is at least "
                 f"{LEARNING_EVENTS_PER_WEEK}, following Meta's learning-phase guidance of about 50 optimization "
-                "events per ad set in a 7-day period. Only ad sets with spend in the window are counted."
+                "events per ad set in a 7-day period. Only ad sets with spend in the window are counted. Each goal "
+                f"lists counts and the {GOAL_VOLUME_TOP_ADSETS} highest-spending ad sets that meet and that miss "
+                "the threshold, not every ad set."
             ),
             **sections,
             "section_errors": section_errors,

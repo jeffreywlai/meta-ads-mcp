@@ -894,9 +894,14 @@ def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -
     conversions = volume["OFFSITE_CONVERSIONS"]
     assert conversions["threshold_events_per_week"] == 50
     assert conversions["adsets_meeting_threshold"] == 1 and conversions["adset_count"] == 2
+    assert conversions["adsets_below_threshold"] == 1
     assert conversions["verdict"] == "some_adsets_meet_threshold"
-    weekly = {row["adset_id"]: row["events_per_week"] for row in conversions["adsets"]}
-    assert weekly["as_a"] == pytest.approx(300 / 28 * 7)
+    assert conversions["spend"] == 800.0
+    assert "adsets" not in conversions
+    assert [row["adset_id"] for row in conversions["top_meeting_threshold"]] == ["as_a"]
+    assert [row["adset_id"] for row in conversions["top_below_threshold"]] == ["as_b"]
+    assert conversions["top_meeting_threshold"][0]["events_per_week"] == pytest.approx(300 / 28 * 7)
+    assert conversions["top_meeting_threshold"][0]["spend"] == 600.0
     assert volume["LINK_CLICKS"]["verdict"] == "all_adsets_meet_threshold"
 
     assert result["datasets"]["items"][0]["id"] == "px_1"
@@ -904,6 +909,57 @@ def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -
     assert result["pages"]["items"][0]["name"] == "Shop Page"
     assert result["instagram_accounts"]["complete"] is False
     assert result["section_errors"] == {}
+
+
+def _large_context_rows(count: int) -> list[dict[str, Any]]:
+    goals = [
+        ("OUTCOME_SALES", "OFFSITE_CONVERSIONS", {"purchase": 10}),
+        ("OUTCOME_SALES", "VALUE", {"purchase": 400}),
+        ("OUTCOME_TRAFFIC", "LINK_CLICKS", {"link_click": 900}),
+        ("OUTCOME_LEADS", "LEAD_GENERATION", {"lead": 5}),
+        ("OUTCOME_AWARENESS", "REACH", {}),
+    ]
+    rows = []
+    for index in range(count):
+        objective, goal, actions = goals[index % len(goals)]
+        row = _adset_row(f"as_{index:04d}", objective=objective, goal=goal, spend=100 + index, actions=actions)
+        row["adset_name"] = f"Prospecting broad lookalike ad set number {index} with a long descriptive name"
+        rows.append(row)
+    return rows
+
+
+def test_advertiser_context_summarizes_goal_volume_with_top_spenders(monkeypatch) -> None:
+    client = _context_client()
+    rows = _large_context_rows(300)
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
+
+    volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
+    conversions = volume["OFFSITE_CONVERSIONS"]
+    assert conversions["adset_count"] == 60
+    assert conversions["adsets_meeting_threshold"] == 0
+    assert conversions["adsets_below_threshold"] == 60
+    below = conversions["top_below_threshold"]
+    assert len(below) == performance_signals.GOAL_VOLUME_TOP_ADSETS
+    assert [row["spend"] for row in below] == sorted((row["spend"] for row in below), reverse=True)
+    assert below[0]["adset_id"] == "as_0295"
+    assert volume["LINK_CLICKS"]["adsets_meeting_threshold"] == 60
+    assert volume["REACH"]["verdict"] == "not_assessed"
+    assert len(volume["REACH"]["top_adsets_by_spend"]) <= performance_signals.GOAL_VOLUME_TOP_ADSETS
+
+
+def test_advertiser_context_response_stays_small_for_300_adsets(monkeypatch) -> None:
+    client = _context_client()
+    rows = _large_context_rows(300)
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+
+    assert result["metrics"]["adset_rows"] == 300
+    assert len(json.dumps(result).encode()) < 20_000
 
 
 def test_advertiser_context_section_permission_error_is_reported_not_empty(monkeypatch) -> None:
