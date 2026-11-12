@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import build_finding, metric_evidence
@@ -63,8 +64,66 @@ TREND_DEFAULT_WINDOW_DAYS = {"day": 30, "week": 84, "month": 180}
 
 
 def _today() -> date:
-    """Return today's date; isolated so tests can pin it."""
+    """Return the server's date, used only when the ad account's time zone cannot be read."""
     return date.today()
+
+
+def _now() -> datetime:
+    """Return the current instant in UTC; isolated so tests can pin it."""
+    return datetime.now(timezone.utc)
+
+
+async def _reporting_today(
+    level: str, object_id: str, *, account: dict[str, Any] | None = None,
+) -> tuple[date, dict[str, Any], str | None]:
+    """Return today's date in the ad account's time zone, a descriptor of it, and a missing signal on fallback.
+
+    An account scope needs one read of the account (none when the caller already has it); a campaign,
+    ad set or ad scope reads the object's account_id and then the account.
+    """
+    error: str | None = None
+    zone: ZoneInfo | None = None
+    try:
+        if account is None:
+            client = get_graph_api_client()
+            account_id = object_id
+            if level != "account":
+                owner = await client.get_object(object_id, fields=["account_id"])
+                raw_account_id = blank_to_none(str(owner.get("account_id") or ""))
+                if raw_account_id is None:
+                    raise ValueError("the object did not report its account_id")
+                account_id = normalize_account_id(raw_account_id)
+            account = await client.get_object(account_id, fields=["timezone_name"])
+        timezone_name = blank_to_none(str(account.get("timezone_name") or ""))
+        if timezone_name is None:
+            raise ValueError("the ad account did not report timezone_name")
+        try:
+            zone = ZoneInfo(timezone_name)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"unrecognized time zone {timezone_name!r}") from exc
+    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+        error = str(_public_error(exc).get("message"))
+    except ValueError as exc:
+        error = str(exc)
+    if zone is None:
+        today = _today()
+        return (
+            today,
+            {"timezone": None, "source": "server_date", "today": today.isoformat()},
+            (
+                f"The ad account's time zone could not be read ({error}), so default dates use the server's date "
+                "and may be one day off the account's reporting day."
+            ),
+        )
+    today = _now().astimezone(zone).date()
+    return today, {"timezone": zone.key, "source": "ad_account", "today": today.isoformat()}, None
+
+
+EXPLICIT_DATES_TIMEZONE = {
+    "timezone": None,
+    "source": "explicit_dates",
+    "note": "The dates given were sent as is; Meta reports them in the ad account's time zone.",
+}
 
 
 def _require_account_id(account_id: str | None) -> str:
@@ -260,20 +319,18 @@ def _parse_date(value: str, *, field: str) -> date:
         raise ValidationError(f"{field} must be a valid ISO date in YYYY-MM-DD format.") from exc
 
 
-def _resolve_window(since: str | None, until: str | None, *, default_days: int) -> tuple[date, date]:
-    """Resolve an explicit or default trailing window ending yesterday."""
+def _explicit_window(since: str | None, until: str | None) -> tuple[date, date] | None:
+    """Validate an explicit window before any network call; None means the default window applies."""
     since = blank_to_none(since)
     until = blank_to_none(until)
     if bool(since) != bool(until):
         raise ValidationError("Provide both since and until, or neither.")
-    if since and until:
-        start = _parse_date(since, field="since")
-        end = _parse_date(until, field="until")
-        if end < start:
-            raise ValidationError("until must be on or after since.")
-    else:
-        end = _today() - timedelta(days=1)
-        start = end - timedelta(days=default_days - 1)
+    if not (since and until):
+        return None
+    start = _parse_date(since, field="since")
+    end = _parse_date(until, field="until")
+    if end < start:
+        raise ValidationError("until must be on or after since.")
     if (end - start).days + 1 > MAX_DAILY_WINDOW_DAYS:
         raise ValidationError(f"The date window may cover at most {MAX_DAILY_WINDOW_DAYS} days.")
     return start, end
@@ -314,12 +371,30 @@ async def _daily_rows(level: str, object_id: str, start: date, end: date) -> lis
     return rows
 
 
-_INPUT_SOURCES = {
+# Two separate rules govern a value a row does not report:
+# - Delivery inputs (spend, impressions, clicks) are reported by Meta on every row it returns. A row
+#   that lacks one is missing data, so the period's total, and every ratio built on it, is unknown.
+# - Action inputs (results, conversion value) are deliberately different: Meta omits an action that
+#   did not happen, so once any row in the window reports the action, a row without it counts as zero.
+_DELIVERY_INPUT_SOURCES = {
     "spend": "spend",
     "impressions": "impressions",
     "clicks": "clicks",
+}
+_ACTION_INPUT_SOURCES = {
     "results": "conversions",
     "conversion_value": "conversion_value",
+}
+_INPUT_SOURCES = {**_DELIVERY_INPUT_SOURCES, **_ACTION_INPUT_SOURCES}
+INPUT_POLICY = {
+    "delivery_inputs": (
+        "spend, impressions and clicks: when any row in a period lacks the value, the period's total is null and "
+        "every metric that needs it (CPC, CPM, CTR, cost per result, ROAS, conversion rate) is null for that period."
+    ),
+    "action_inputs": (
+        "results and conversion value: Meta omits actions that did not happen, so once any row in the window reports "
+        "the action, a row without it counts as zero; when no row reports it, it is null."
+    ),
 }
 
 
@@ -335,14 +410,32 @@ def _known_inputs(rows: list[dict[str, Any]]) -> set[str]:
 
 
 def _period_inputs(rows: list[dict[str, Any]], known: set[str]) -> dict[str, float | None]:
-    """Sum additive inputs; inputs no row in the window reports stay unknown."""
+    """Sum additive inputs under INPUT_POLICY: a missing delivery input makes the total unknown;
+    a missing action input counts as zero only when some row in the window reports that action."""
     totals: dict[str, float | None] = {}
-    for name, source in _INPUT_SOURCES.items():
+    for name, source in _DELIVERY_INPUT_SOURCES.items():
+        values = [to_float((row.get("metrics") or {}).get(source)) for row in rows]
+        totals[name] = None if not values or any(value is None for value in values) else sum(values)
+    for name, source in _ACTION_INPUT_SOURCES.items():
         if name not in known:
             totals[name] = None
             continue
         totals[name] = sum(to_float((row.get("metrics") or {}).get(source)) or 0.0 for row in rows)
     return totals
+
+
+def _missing_delivery_signal(periods: list[tuple[str, dict[str, float | None]]], unit: str) -> list[str]:
+    """Describe periods whose delivery inputs were missing from Meta's rows."""
+    affected: dict[str, list[str]] = {}
+    for label, inputs in periods:
+        for name in _DELIVERY_INPUT_SOURCES:
+            if inputs.get(name) is None:
+                affected.setdefault(name, []).append(label)
+    return [
+        f"{name}: {len(labels)} {unit}(s) had a row without {name} (first {labels[0]}), so metrics that need it are "
+        "null there rather than computed from zero."
+        for name, labels in affected.items()
+    ]
 
 
 def _ratio(numerator: float | None, denominator: float | None, scale: float = 1.0) -> float | None:
@@ -435,14 +528,24 @@ async def get_performance_trend(
     until: str | None = None,
     granularity: str = "day",
 ) -> dict[str, Any]:
-    """Trend CPC, CPM, cost per result, ROAS, CTR and conversion rate for one account, campaign, ad set or ad by day, week (Monday start) or month, with first-to-last change and direction. Periods are summed from daily rows, then divided; zero denominators give null. Default window ends yesterday (30/84/180 days)."""
+    """Trend CPC, CPM, cost per result, ROAS, CTR and conversion rate for one account, campaign, ad set or ad by day, week (Monday start) or month, with first-to-last change and direction. Periods are summed from daily rows, then divided; zero denominators give null. Default window ends yesterday in the ad account's time zone (30/84/180 days)."""
     resolved_level = _require_level(level, REPORTING_LEVELS)
     resolved_object_id = _require_object_id(resolved_level, object_id)
     resolved_granularity = (granularity or "").strip().lower()
     if resolved_granularity not in TREND_DEFAULT_WINDOW_DAYS:
         raise ValidationError("granularity must be day, week or month.")
     metric_names = _normalize_metric_names(metrics, TREND_DEFAULT_METRICS)
-    start, end = _resolve_window(since, until, default_days=TREND_DEFAULT_WINDOW_DAYS[resolved_granularity])
+    explicit = _explicit_window(since, until)
+    missing_signals: list[str] = []
+    if explicit is None:
+        today, reporting_timezone, timezone_signal = await _reporting_today(resolved_level, resolved_object_id)
+        if timezone_signal:
+            missing_signals.append(timezone_signal)
+        end = today - timedelta(days=1)
+        start = end - timedelta(days=TREND_DEFAULT_WINDOW_DAYS[resolved_granularity] - 1)
+    else:
+        start, end = explicit
+        reporting_timezone = dict(EXPLICIT_DATES_TIMEZONE)
 
     rows = await _daily_rows(resolved_level, resolved_object_id, start, end)
     known = _known_inputs(rows)
@@ -465,7 +568,6 @@ async def get_performance_trend(
             "metrics": {name: derived[name] for name in metric_names},
         })
 
-    missing_signals: list[str] = []
     if not rows:
         missing_signals.append("Meta returned no insights rows for this object and window.")
     elif "results" not in known:
@@ -474,6 +576,9 @@ async def get_performance_trend(
         )
     if rows and "conversion_value" not in known:
         missing_signals.append("No purchase value was reported, so ROAS is null.")
+    missing_signals.extend(
+        _missing_delivery_signal([(period["period_start"], period["inputs"]) for period in periods], "period")
+    )
 
     return analysis_response(
         scope={"level": resolved_level, "object_id": resolved_object_id},
@@ -481,16 +586,18 @@ async def get_performance_trend(
         missing_signals=missing_signals,
         extra={
             "window": {"since": start.isoformat(), "until": end.isoformat()},
+            "reporting_timezone": reporting_timezone,
             "granularity": resolved_granularity,
             "metrics_requested": metric_names,
             "periods": periods,
             "changes": {name: _first_to_last(name, periods) for name in metric_names},
             "metric_definitions": {name: METRIC_DEFINITIONS[name] for name in metric_names},
             "results_definition": RESULTS_DEFINITION,
+            "input_policy": INPUT_POLICY,
             "method": (
-                "Daily rows are read with time_increment=1, additive inputs are summed per period, and each metric is "
-                "divided from those sums. Direction compares the first and last periods with a value; partial periods "
-                "are flagged and are not scaled."
+                "Daily rows are read with time_increment=1, additive inputs are summed per period under input_policy, "
+                "and each metric is divided from those sums. Direction compares the first and last periods with a "
+                "value; partial periods are flagged and are not scaled."
             ),
             "daily_rows_returned": len(rows),
         },
@@ -557,7 +664,7 @@ async def detect_performance_anomalies(
     sensitivity: str = "medium",
     end_date: str | None = None,
 ) -> dict[str, Any]:
-    """Flag days in the last lookback_days whose spend, CPC, CPM, CTR, cost per result or ROAS is far from the object's own baseline (the baseline_days before), using median and median absolute deviation, with same-weekday baselines when four or more exist. Returns the rule, baseline values and thresholds. Rule-based screen, not a statistical test. end_date defaults to yesterday."""
+    """Flag days in the last lookback_days whose spend, CPC, CPM, CTR, cost per result or ROAS is far from the object's own baseline (the baseline_days before), using median and median absolute deviation, with same-weekday baselines when four or more exist. Returns the rule, baseline values and thresholds. Rule-based screen, not a statistical test. end_date defaults to yesterday in the ad account's time zone."""
     resolved_level = _require_level(level, REPORTING_LEVELS)
     resolved_object_id = _require_object_id(resolved_level, object_id)
     metric_names = _normalize_metric_names(metrics, ANOMALY_DEFAULT_METRICS)
@@ -570,7 +677,14 @@ async def detect_performance_anomalies(
         raise ValidationError(f"sensitivity must be one of {list(SENSITIVITY_MULTIPLIERS)}.")
     multiplier = SENSITIVITY_MULTIPLIERS[resolved_sensitivity]
     end_text = blank_to_none(end_date)
-    end = _parse_date(end_text, field="end_date") if end_text else _today() - timedelta(days=1)
+    timezone_signals: list[str] = []
+    if end_text:
+        end = _parse_date(end_text, field="end_date")
+        reporting_timezone = dict(EXPLICIT_DATES_TIMEZONE)
+    else:
+        today, reporting_timezone, timezone_signal = await _reporting_today(resolved_level, resolved_object_id)
+        timezone_signals = [timezone_signal] if timezone_signal else []
+        end = today - timedelta(days=1)
     lookback_start = end - timedelta(days=lookback_days - 1)
     baseline_end = lookback_start - timedelta(days=1)
     baseline_start = baseline_end - timedelta(days=baseline_days - 1)
@@ -578,9 +692,12 @@ async def detect_performance_anomalies(
     rows = await _daily_rows(resolved_level, resolved_object_id, baseline_start, end)
     known = _known_inputs(rows)
     daily: dict[date, dict[str, float | None]] = {}
+    daily_inputs: list[tuple[str, dict[str, float | None]]] = []
     for row in rows:
         day = _parse_date(str(row["date_start"]), field="date_start")
-        daily[day] = _derived_metrics(_period_inputs([row], known))
+        inputs = _period_inputs([row], known)
+        daily_inputs.append((day.isoformat(), inputs))
+        daily[day] = _derived_metrics(inputs)
     baseline_dates = sorted(day for day in daily if baseline_start <= day <= baseline_end)
     lookback_dates = [lookback_start + timedelta(days=offset) for offset in range(lookback_days)]
     rule = _anomaly_rule(resolved_sensitivity, multiplier)
@@ -588,6 +705,7 @@ async def detect_performance_anomalies(
     windows = {
         "baseline_window": {"since": baseline_start.isoformat(), "until": baseline_end.isoformat()},
         "lookback_window": {"since": lookback_start.isoformat(), "until": end.isoformat()},
+        "reporting_timezone": reporting_timezone,
     }
 
     if len(baseline_dates) < baseline_days:
@@ -605,7 +723,8 @@ async def detect_performance_anomalies(
                 "confidence_status": "uncalibrated",
             }],
             missing_signals=[
-                f"Not enough history: {len(baseline_dates)} of {baseline_days} baseline days returned insights rows."
+                *timezone_signals,
+                f"Not enough history: {len(baseline_dates)} of {baseline_days} baseline days returned insights rows.",
             ],
             extra={
                 **windows,
@@ -615,12 +734,13 @@ async def detect_performance_anomalies(
                 "baseline_rows": len(baseline_dates),
                 "lookback_rows": sum(1 for day in lookback_dates if day in daily),
                 "results_definition": RESULTS_DEFINITION,
+                "input_policy": INPUT_POLICY,
             },
         )
 
     anomalies: list[dict[str, Any]] = []
     metric_status: dict[str, dict[str, Any]] = {}
-    missing_signals: list[str] = []
+    missing_signals: list[str] = list(timezone_signals)
     for metric in metric_names:
         baseline_points = [(day, daily[day][metric]) for day in baseline_dates if daily[day][metric] is not None]
         status: dict[str, Any] = {
@@ -703,6 +823,7 @@ async def detect_performance_anomalies(
             status["status"] = "no_lookback_data"
             missing_signals.append(f"{metric}: no lookback day has a value.")
 
+    missing_signals.extend(_missing_delivery_signal(daily_inputs, "day"))
     anomalies.sort(key=lambda anomaly: (-abs(anomaly["robust_score"]), anomaly["day"], anomaly["metric"]))
     findings: list[dict[str, Any]] = []
     for anomaly in anomalies:
@@ -766,6 +887,7 @@ async def detect_performance_anomalies(
             "lookback_rows": sum(1 for day in lookback_dates if day in daily),
             "metric_definitions": {name: METRIC_DEFINITIONS[name] for name in metric_names},
             "results_definition": RESULTS_DEFINITION,
+            "input_policy": INPUT_POLICY,
         },
     )
 
@@ -783,10 +905,24 @@ COST_RATIO_THRESHOLD = 1.5
 RANKING_REPORT_LEVELS = ("account", "campaign", "adset", "ad")
 # The ad-level read is one bounded page ordered by spend, highest first, using the
 # Insights API's documented sort parameter ("reach_descending" style, one element).
+# On a live account with more than 2,000 ads the sorted read failed ("An unknown error
+# occurred") whenever it carried the action fields, and succeeded with identifiers, spend,
+# impressions and the rankings only. So the sorted read is always lean, and results come
+# from one further request restricted to the selected ads.
 RANKING_DEFAULT_MAX_ADS = 200
 RANKING_MAX_ADS_LIMIT = 500
 RANKING_SORT = ["spend_descending"]
+RANKING_LEAN_FIELDS = [
+    "ad_id", "ad_name", "campaign_id", "adset_id", "spend", "impressions", *RANKING_FIELDS,
+]
+# Cost evidence: one unsorted request filtered with the documented `filtering` parameter
+# (dot notation for the object's fields, IN operator) to the selected ads' ids.
+RANKING_COST_FIELDS = ["ad_id", "clicks", "actions", "action_values"]
+RANKING_COST_MAX_ADS = 100
 RANKING_SCOPE_FIELDS = ["spend", "impressions", "clicks", "actions", "action_values"]
+RANKING_SCOPE_LEAN_FIELDS = ["spend", "impressions"]
+# Below this share of examined ads with all three rankings known, the report says it rests on little evidence.
+RANKING_EVIDENCE_MIN_SHARE = 0.5
 RANKING_RULES = {
     "ranking_values": {
         "ABOVE_AVERAGE": "above average",
@@ -797,10 +933,14 @@ RANKING_RULES = {
         "UNKNOWN": "Meta had too little data to rank the ad",
     },
     "creative_quality": "quality_ranking or engagement_rate_ranking is below average.",
-    "conversion_path": "only conversion_rate_ranking is below average; quality and engagement are average or above.",
+    "conversion_path": (
+        "only conversion_rate_ranking is below average; quality and engagement are both known and average or above. "
+        "When either of them is UNKNOWN, no diagnosis is made."
+    ),
     "bid_and_budget": (
         "all three rankings are average or above, and either cost per result is at least cost_ratio_threshold times "
-        "the scope's cost per result, or the ad has no results after spending at least one scope cost per result."
+        "the scope's cost per result, or the ad has no results after spending at least one scope cost per result. "
+        "Needs the ad's results from the cost-evidence read; without them this diagnosis is not made."
     ),
     "cost_ratio_threshold": COST_RATIO_THRESHOLD,
     "weak_ad_order": "spend descending",
@@ -829,6 +969,14 @@ def _ranking_diagnosis(
             below,
         )
     if below == ["conversion_rate_ranking"]:
+        unknown = [field for field in ("quality_ranking", "engagement_rate_ranking") if points[field] is None]
+        if unknown:
+            return (
+                None,
+                f"The conversion-rate ranking is below average, but {' and '.join(unknown)} is unknown, so the "
+                "evidence cannot tell the post-click path apart from the creative; no diagnosis is made.",
+                below,
+            )
         return (
             "conversion_path",
             "Only the conversion-rate ranking is below average, which points at what happens after the click "
@@ -846,7 +994,7 @@ def _ranking_diagnosis(
             below,
         )
     scope_cost = scope_metrics["cost_per_result"]
-    if (metrics["results"] or 0) == 0 and scope_cost and (metrics["spend"] or 0) >= scope_cost:
+    if metrics["results"] == 0 and scope_cost and (metrics["spend"] or 0) >= scope_cost:
         return (
             "bid_and_budget",
             "All three rankings are average or above, yet the ad has no results after spending at least one scope "
@@ -856,14 +1004,49 @@ def _ranking_diagnosis(
     return None, None, below
 
 
-async def _ranking_scope_rows(level: str, object_id: str, window: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, str | None]:
-    """Read the scope's own insights total for spend coverage; report failure instead of raising."""
+async def _ranking_scope_rows(
+    level: str, object_id: str, window: dict[str, Any],
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Read the scope's own insights total; if the read with results fails, retry with spend and impressions only.
+
+    Failures are reported, never raised.
+    """
     params = insights_tools._insights_params(level=level, default_date_preset="last_30d", limit=25, **window)
+    errors: list[str] = []
+    for fields in (RANKING_SCOPE_FIELDS, RANKING_SCOPE_LEAN_FIELDS):
+        try:
+            payload = await get_graph_api_client().get_insights(object_id, fields=fields, params=params)
+        except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+            errors.append(str(_public_error(exc).get("message")))
+            continue
+        return insights_tools._normalize_rows(payload), ("; ".join(errors) or None)
+    return None, "; ".join(errors)
+
+
+async def _ranking_cost_rows(
+    object_id: str, ad_ids: list[str], window: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Read results for the selected ads in one request filtered to their ids. Never raises."""
+    if not ad_ids:
+        return {}, None
+    params = insights_tools._insights_params(
+        level="ad", default_date_preset="last_30d", limit=len(ad_ids),
+        filtering=[{"field": "ad.id", "operator": "IN", "value": list(ad_ids)}], **window,
+    )
     try:
-        payload = await get_graph_api_client().get_insights(object_id, fields=RANKING_SCOPE_FIELDS, params=params)
-    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
-        return None, str(_public_error(exc).get("message"))
-    return insights_tools._normalize_rows(payload), None
+        payload = await get_graph_api_client().get_insights(object_id, fields=RANKING_COST_FIELDS, params=params)
+    except Exception as exc:  # an enrichment failure must not fail the rankings report
+        return {}, str(_public_error(exc).get("message"))
+    wanted = set(ad_ids)
+    rows: dict[str, dict[str, Any]] = {}
+    for row in payload.get("data", []) or []:
+        if isinstance(row, dict) and str(row.get("ad_id") or "") in wanted:
+            rows[str(row["ad_id"])] = row
+    return rows, None
+
+
+def _known_ranking(value: Any) -> bool:
+    return RANKING_POINTS.get(str(value or "").upper()) is not None
 
 
 def _row_spend(row: dict[str, Any]) -> float:
@@ -897,7 +1080,7 @@ async def get_auction_ranking_report(
 
     async def read_ads() -> dict[str, Any]:
         return await get_graph_api_client().get_insights(
-            resolved_object_id, fields=diagnostics_tools.AD_QUALITY_FIELDS, params=ad_params,
+            resolved_object_id, fields=RANKING_LEAN_FIELDS, params=ad_params,
         )
 
     async def read_scope() -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -906,8 +1089,19 @@ async def get_auction_ranking_report(
         return await _ranking_scope_rows(resolved_level, resolved_object_id, window)
 
     ad_payload, (scope_rows, scope_error) = await asyncio.gather(read_ads(), read_scope())
-    rows = insights_tools._normalize_rows(ad_payload)[:max_ads]
+    lean_rows = [row for row in (ad_payload.get("data", []) or []) if isinstance(row, dict)][:max_ads]
     more_ads_exist = bool(extract_paging(ad_payload).get("next"))
+
+    cost_ids = list(dict.fromkeys(
+        str(row["ad_id"]) for row in lean_rows
+        if row.get("ad_id") and any(_known_ranking(row.get(field)) for field in RANKING_FIELDS)
+    ))
+    cost_ids_capped = cost_ids[:RANKING_COST_MAX_ADS]
+    cost_rows, cost_error = await _ranking_cost_rows(resolved_object_id, cost_ids_capped, window)
+    rows = insights_tools._normalize_rows({"data": [
+        {**cost_rows[str(row.get("ad_id"))], **row} if str(row.get("ad_id")) in cost_rows else row
+        for row in lean_rows
+    ]})
     spends = [_row_spend(row) for row in rows]
     order_confirmed = all(earlier >= later for earlier, later in zip(spends, spends[1:]))
 
@@ -939,17 +1133,60 @@ async def get_auction_ranking_report(
             "Meta returned the ad rows not ordered by spend, so the examined ads may not be the highest-spending ones."
         )
 
-    known = _known_inputs(rows)
-    if scope_rows:
-        scope_known = _known_inputs(scope_rows)
-        scope_metrics = _derived_metrics(_period_inputs(scope_rows, scope_known))
+    if cost_error is not None:
+        cost_status = "failed"
+        missing_signals.append(
+            f"Cost-per-result evidence was not available ({cost_error}); diagnoses rest on the rankings only, so "
+            "no ad can be diagnosed as bid_and_budget and results are null."
+        )
+    elif cost_ids_capped:
+        cost_status = "read"
+    else:
+        cost_status = "not_requested"
+        if rows:
+            missing_signals.append(
+                "No examined ad has a known ranking, so results and cost per result were not read and are null."
+            )
+    without_cost = len(rows) - len(cost_rows)
+    if cost_status == "read" and without_cost:
+        missing_signals.append(
+            f"Results and cost per result were read for {len(cost_rows)} of {len(rows)} examined ads: those with at "
+            f"least one known ranking (at most {RANKING_COST_MAX_ADS}, highest spend first). The others show them as null."
+        )
+    cost_evidence = {
+        "status": cost_status,
+        "method": (
+            "one insights request at ad level for the same window, filtered to the selected ad ids "
+            "(filtering ad.id IN), unsorted"
+        ),
+        "selection": f"examined ads with at least one known ranking, highest spend first, at most {RANKING_COST_MAX_ADS}",
+        "ads_requested": len(cost_ids_capped),
+        "ads_returned": len(cost_rows),
+        "ads_eligible_not_requested": len(cost_ids) - len(cost_ids_capped),
+        "error": cost_error,
+    }
+
+    cost_known_rows = [row for row in rows if str(row.get("ad_id")) in cost_rows]
+    known = _known_inputs(cost_known_rows)
+    if scope_rows and "results" in _known_inputs(scope_rows):
+        scope_metrics = _derived_metrics(_period_inputs(scope_rows, _known_inputs(scope_rows)))
+        scope_metrics_basis = "scope_total"
+    elif cost_known_rows:
+        scope_metrics = _derived_metrics(_period_inputs(cost_known_rows, known))
+        scope_metrics_basis = "examined_ads_with_cost_evidence"
+    elif scope_rows:
+        scope_metrics = _derived_metrics(_period_inputs(scope_rows, _known_inputs(scope_rows)))
         scope_metrics_basis = "scope_total"
     else:
-        scope_metrics = _derived_metrics(_period_inputs(rows, known))
+        scope_metrics = _derived_metrics(_period_inputs(rows, _known_inputs(rows)))
         scope_metrics_basis = "examined_ads"
     ads: list[dict[str, Any]] = []
     for row in rows:
-        metrics = _derived_metrics(_period_inputs([row], known))
+        inputs = _period_inputs([row], known)
+        if str(row.get("ad_id")) not in cost_rows:
+            inputs["results"] = None
+            inputs["conversion_value"] = None
+        metrics = _derived_metrics(inputs)
         rankings = {field: row.get(field) for field in RANKING_FIELDS}
         diagnosis, reason, below = _ranking_diagnosis(rankings, metrics, scope_metrics)
         points = [RANKING_POINTS.get(str(value or "").upper()) for value in rankings.values()]
@@ -973,6 +1210,11 @@ async def get_auction_ranking_report(
             "reason": reason,
         })
 
+    ranking_coverage: dict[str, int] = {"ads_examined": len(ads)}
+    for field in RANKING_FIELDS:
+        ranking_coverage[f"{field}_known"] = sum(1 for ad in ads if _known_ranking(ad["rankings"][field]))
+    ranking_coverage["all_three_known"] = sum(1 for ad in ads if ad["ranking_points"] is not None)
+
     ranked = sorted(
         ads,
         key=lambda ad: (ad["ranking_points"] is None, ad["ranking_points"] or 0, -(ad["spend"] or 0.0), ad["ad_id"] or ""),
@@ -982,6 +1224,28 @@ async def get_auction_ranking_report(
         key=lambda ad: (-(ad["spend"] or 0.0), ad["ad_id"] or ""),
     )
     findings: list[dict[str, Any]] = []
+    if ads and ranking_coverage["all_three_known"] < RANKING_EVIDENCE_MIN_SHARE * len(ads):
+        limited = build_finding(
+            "limited_ranking_evidence",
+            (
+                f"Only {ranking_coverage['quality_ranking_known']} of {len(ads)} examined ads have a known quality "
+                f"ranking ({ranking_coverage['engagement_rate_ranking_known']} engagement-rate, "
+                f"{ranking_coverage['conversion_rate_ranking_known']} conversion-rate; "
+                f"{ranking_coverage['all_three_known']} have all three). Meta reports UNKNOWN when an ad has too "
+                "little data, so this report rests on little evidence."
+            ),
+            severity="medium",
+            confidence=None,
+            evidence=[metric_evidence(
+                "all_three_rankings_known_share",
+                _ratio(ranking_coverage["all_three_known"], len(ads)),
+                "ads with all three rankings known / ads examined",
+                dict(ranking_coverage),
+            )],
+            next_actions=["Treat the diagnoses below as indicative only; widen the window for more ranked ads."],
+        )
+        limited["confidence_status"] = "uncalibrated"
+        findings.append(limited)
     for ad in weak[:top_n]:
         finding = build_finding(
             "weak_auction_ranking",
@@ -1017,7 +1281,7 @@ async def get_auction_ranking_report(
         )
         finding["confidence_status"] = "uncalibrated"
         findings.append(finding)
-    if not findings:
+    if not weak:
         has_ranked = any(ad["ranking_points"] is not None for ad in ads)
         findings.append({
             **build_finding(
@@ -1047,6 +1311,7 @@ async def get_auction_ranking_report(
                 "max_ads": max_ads,
                 "selection": "highest_spend_first",
                 "request_sort": list(RANKING_SORT),
+                "request_fields": list(RANKING_LEAN_FIELDS),
                 "meta_order_confirmed": order_confirmed,
                 "more_ads_exist": more_ads_exist,
                 "examined_spend": examined_spend,
@@ -1054,6 +1319,8 @@ async def get_auction_ranking_report(
                 "share_of_scope_spend": share,
                 "note": note,
             },
+            "ranking_coverage": ranking_coverage,
+            "cost_evidence": cost_evidence,
             "scope_metrics": scope_metrics,
             "scope_metrics_basis": scope_metrics_basis,
             "ranked_ads": ranked[:top_n],
@@ -1142,16 +1409,27 @@ FUNNEL_STEPS: list[tuple[str, list[str]]] = [
     ("purchase", PURCHASE_ACTION_TYPES),
 ]
 LEARNING_EVENTS_PER_WEEK = 50
-GOAL_EVENT_BASIS: dict[str, tuple[str, list[str] | None, str]] = {
-    "OFFSITE_CONVERSIONS": (
-        "results", None,
-        "purchase or lead actions; an approximation, because the ad set's promoted event may be a different event",
+# Each optimization goal maps to the action types of the event it optimizes for. In every row the first
+# reported alias is counted. Goals whose event cannot be identified from ad set insights are not assessed.
+GOAL_EVENT_BASIS: dict[str, tuple[list[str], str]] = {
+    "LEAD_GENERATION": (
+        LEAD_ACTION_TYPES,
+        "lead actions (the first of lead, onsite_conversion.lead, offsite_conversion.fb_pixel_lead in each row)",
     ),
-    "VALUE": ("results", None, "purchase or lead actions"),
-    "LEAD_GENERATION": ("results", None, "lead actions (purchase if present)"),
-    "QUALITY_LEAD": ("results", None, "lead actions (purchase if present)"),
-    "LINK_CLICKS": ("actions", ["link_click"], "link_click actions"),
-    "LANDING_PAGE_VIEWS": ("actions", ["landing_page_view", "omni_landing_page_view"], "landing_page_view actions"),
+    "LINK_CLICKS": (["link_click"], "link_click actions"),
+    "LANDING_PAGE_VIEWS": (["landing_page_view", "omni_landing_page_view"], "landing_page_view actions"),
+}
+_PROMOTED_EVENT_REASON = (
+    "The event this goal optimizes for is the conversion event set in each ad set's promoted_object, which ad set "
+    "insights do not report; counting purchases or leads instead would judge a proxy, so the goal is not assessed."
+)
+GOAL_EVENT_UNIDENTIFIED: dict[str, str] = {
+    "OFFSITE_CONVERSIONS": _PROMOTED_EVENT_REASON,
+    "VALUE": _PROMOTED_EVENT_REASON,
+    "QUALITY_LEAD": (
+        "This goal optimizes for leads Meta predicts are higher quality; insights do not report those apart from "
+        "all leads, so the goal is not assessed."
+    ),
 }
 CONTEXT_EDGE_SECTIONS: list[tuple[str, str, list[str]]] = [
     ("datasets", "adspixels", ["id", "name", "last_fired_time", "is_unavailable"]),
@@ -1210,24 +1488,42 @@ def _group_spend(rows: list[dict[str, Any]], key: str, total_spend: float) -> li
     return sorted(groups.values(), key=lambda group: (-group["spend"], group[key]))
 
 
-def _sum_actions(rows: list[dict[str, Any]]) -> dict[str, float]:
-    """Sum parsed action maps across rows."""
-    totals: dict[str, float] = {}
+FUNNEL_EVENT_FAMILIES: list[tuple[str, list[str]]] = [*FUNNEL_STEPS, ("lead", LEAD_ACTION_TYPES)]
+
+
+def _sum_actions(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Total each funnel event family: per row take the first alias Meta reports, then sum across rows.
+
+    Choosing the alias per row keeps rows that report a different alias of the same event, and
+    still counts an event only once in a row that reports several aliases of it.
+    """
+    totals: dict[str, dict[str, Any]] = {
+        family: {"count": None, "action_types_used": []} for family, _ in FUNNEL_EVENT_FAMILIES
+    }
     for row in rows:
-        for action_type, value in (row.get("actions_map") or {}).items():
-            totals[action_type] = totals.get(action_type, 0.0) + (to_float(value) or 0.0)
+        actions = row.get("actions_map") or {}
+        for family, candidates in FUNNEL_EVENT_FAMILIES:
+            matched = next((candidate for candidate in candidates if candidate in actions), None)
+            if matched is None:
+                continue
+            total = totals[family]
+            total["count"] = (total["count"] or 0.0) + (to_float(actions[matched]) or 0.0)
+            if matched not in total["action_types_used"]:
+                total["action_types_used"].append(matched)
+    for family, candidates in FUNNEL_EVENT_FAMILIES:
+        totals[family]["action_types_used"].sort(key=candidates.index)
     return totals
 
 
-def _funnel(action_totals: dict[str, float]) -> dict[str, Any]:
+def _funnel(family_totals: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Build funnel step counts and drop-off between adjacent steps that have data."""
     steps = []
     for step, candidates in FUNNEL_STEPS:
-        matched = next((candidate for candidate in candidates if candidate in action_totals), None)
+        total = family_totals[step]
         steps.append({
             "step": step,
-            "count": _number(action_totals[matched]) if matched else None,
-            "action_type": matched,
+            "count": _number(total["count"]),
+            "action_types_used": list(total["action_types_used"]),
             "action_types_checked": candidates,
         })
     present = [step for step in steps if step["count"] is not None]
@@ -1242,14 +1538,15 @@ def _funnel(action_totals: dict[str, float]) -> dict[str, Any]:
             "drop_off": None if rate is None else 1 - rate,
             "formula": "1 - to_count / from_count",
         })
-    lead = next((candidate for candidate in LEAD_ACTION_TYPES if candidate in action_totals), None)
+    lead = family_totals["lead"]
     return {
         "steps": steps,
         "drop_off": drop_off,
-        "lead_events": {"count": _number(action_totals[lead]) if lead else None, "action_type": lead},
+        "lead_events": {"count": _number(lead["count"]), "action_types_used": list(lead["action_types_used"])},
         "note": (
-            "Each step uses the first matching action type Meta reports, so the same event is not counted twice. "
-            "Steps with no data are skipped when computing drop-off. Counts use Meta attribution."
+            "In each ad set row, a step uses the first matching action type Meta reports, so the same event is not "
+            "counted twice; the chosen counts are then summed across rows, so rows reporting different aliases of "
+            "one event all count. Steps with no data are skipped when computing drop-off. Counts use Meta attribution."
         ),
     }
 
@@ -1292,20 +1589,17 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
                 "adset_count": len(goal_rows),
                 "spend": goal_spend,
                 "verdict": "not_assessed",
-                "reason": "No event mapping is defined for this optimization goal.",
+                "reason": GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal."),
                 "top_adsets_by_spend": _top_by_spend([_adset_volume_entry(row, None, None) for row in goal_rows]),
             })
             continue
-        source, action_types, description = basis
+        action_types, description = basis
         meeting: list[dict[str, Any]] = []
         below: list[dict[str, Any]] = []
         for row in goal_rows:
-            if source == "results":
-                events = to_float((row.get("metrics") or {}).get("conversions")) or 0.0
-            else:
-                actions = row.get("actions_map") or {}
-                matched = next((candidate for candidate in action_types or [] if candidate in actions), None)
-                events = (to_float(actions.get(matched)) or 0.0) if matched else 0.0
+            actions = row.get("actions_map") or {}
+            matched = next((candidate for candidate in action_types if candidate in actions), None)
+            events = (to_float(actions.get(matched)) or 0.0) if matched else 0.0
             per_week = events / lookback_days * 7
             entry = _adset_volume_entry(row, events, per_week)
             (meeting if per_week >= LEARNING_EVENTS_PER_WEEK else below).append(entry)
@@ -1338,11 +1632,14 @@ async def get_advertiser_context(
     resolved_account_id = _require_account_id(account_id)
     if not 7 <= lookback_days <= 90:
         raise ValidationError("lookback_days must be between 7 and 90.")
-    end = _today() - timedelta(days=1)
-    start = end - timedelta(days=lookback_days - 1)
     client = get_graph_api_client()
-    account, rows, *edge_sections = await asyncio.gather(
-        client.get_object(resolved_account_id, fields=CONTEXT_ACCOUNT_FIELDS),
+    account = await client.get_object(resolved_account_id, fields=CONTEXT_ACCOUNT_FIELDS)
+    today, reporting_timezone, timezone_signal = await _reporting_today(
+        "account", resolved_account_id, account=account,
+    )
+    end = today - timedelta(days=1)
+    start = end - timedelta(days=lookback_days - 1)
+    rows, *edge_sections = await asyncio.gather(
         diagnostics_tools._child_insights(
             resolved_account_id,
             level="adset",
@@ -1356,7 +1653,7 @@ async def get_advertiser_context(
             for _, edge, fields in CONTEXT_EDGE_SECTIONS
         ),
     )
-    missing_signals: list[str] = []
+    missing_signals: list[str] = [timezone_signal] if timezone_signal else []
     currency = _supported_currency(account.get("currency"))
     money: dict[str, float | None] = {}
     for field in ("amount_spent", "spend_cap"):
@@ -1375,6 +1672,15 @@ async def get_advertiser_context(
     section_errors = {name: section["error"] for name, section in sections.items() if not section["available"]}
     for name, error in section_errors.items():
         missing_signals.append(f"{name}: Meta returned an error, so this section is unknown ({error.get('message')}).")
+    goal_volume = _goal_volume(rows, lookback_days)
+    unassessed = [entry for entry in goal_volume if entry["verdict"] == "not_assessed"]
+    if unassessed:
+        missing_signals.append(
+            "Weekly optimization event volume was not assessed for "
+            + ", ".join(f"{entry['optimization_goal']} ({entry['adset_count']} ad sets)" for entry in unassessed)
+            + " because the event each optimizes for could not be identified from ad set insights; see each "
+            "goal's reason in optimization_goal_volume."
+        )
 
     return analysis_response(
         scope={"level": "account", "object_id": resolved_account_id},
@@ -1386,6 +1692,7 @@ async def get_advertiser_context(
                 "Built by this server from the account's own data. This is not Meta's own advertiser summary."
             ),
             "window": {"since": start.isoformat(), "until": end.isoformat(), "days": lookback_days},
+            "reporting_timezone": reporting_timezone,
             "account": {
                 "id": str(account.get("id") or resolved_account_id),
                 "name": account.get("name"),
@@ -1405,7 +1712,7 @@ async def get_advertiser_context(
             "spend_by_objective": _group_spend(rows, "objective", total_spend),
             "spend_by_optimization_goal": _group_spend(rows, "optimization_goal", total_spend),
             "funnel": _funnel(_sum_actions(rows)),
-            "optimization_goal_volume": _goal_volume(rows, lookback_days),
+            "optimization_goal_volume": goal_volume,
             "optimization_goal_volume_rule": (
                 f"An ad set meets the threshold when its events / lookback_days x 7 is at least "
                 f"{LEARNING_EVENTS_PER_WEEK}, following Meta's learning-phase guidance of about 50 optimization "
@@ -1423,10 +1730,10 @@ async def get_advertiser_context(
 DELIVERY_LEVELS = ("account", "campaign", "adset", "ad")
 DELIVERY_EDGES = {"campaign": "campaigns", "adset": "adsets", "ad": "ads"}
 DELIVERY_OBJECT_FIELDS = {
-    "campaign": ["id", "name", "status", "effective_status", "issues_info"],
-    "adset": ["id", "name", "status", "effective_status", "campaign_id", "issues_info"],
+    "campaign": ["id", "name", "status", "effective_status", "updated_time", "issues_info"],
+    "adset": ["id", "name", "status", "effective_status", "updated_time", "campaign_id", "issues_info"],
     "ad": [
-        "id", "name", "status", "effective_status", "campaign_id", "adset_id",
+        "id", "name", "status", "effective_status", "updated_time", "campaign_id", "adset_id",
         "issues_info", "failed_delivery_checks", "ad_review_feedback",
     ],
 }
@@ -1454,13 +1761,20 @@ PAUSED_EFFECTIVE_STATUSES = {"PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"}
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 MAX_DELIVERY_SCAN = 2000
 MAX_DELIVERY_PAGE = 100
+# Pages are capped separately from records, so pages that return no records cannot keep the scan going.
+MAX_DELIVERY_PAGES = 25
 MAX_NAMED_OBJECTS = 50
 DEFAULT_MAX_PROBLEMS = 15
 MAX_PROBLEMS_LIMIT = 200
 MAX_REASONS_PER_PROBLEM = 2
 DELIVERY_TEXT_LIMIT = 160
-SPEND_LOOKUP_CAP = 50
-SPEND_LOOKUP_CONCURRENCY = 5
+# Recent spend comes from at most DELIVERY_SPEND_MAX_REQUESTS account-level insights pages at the
+# scanned level, each lean (id and spend only) and sorted by spend, highest first; a per-object
+# lookup cost one request per problem and hit Meta's rate limit on a large account.
+DELIVERY_SPEND_PAGE = 200
+DELIVERY_SPEND_MAX_REQUESTS = 2
+DELIVERY_ID_FIELDS = {"campaign": "campaign_id", "adset": "adset_id", "ad": "ad_id"}
+DELIVERY_SPEND_GROUPS = {"account": 0, "read": 1, "not_in_top_spenders": 2, "no_spend_in_window": 3, "spend_unavailable": 3}
 DELIVERY_SEVERITY_POLICY = {
     "critical": "the ad account is not active (account_status other than ACTIVE or IN_GRACE_PERIOD), which stops all delivery",
     "high": (
@@ -1547,6 +1861,64 @@ def _compact_reasons(reasons: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
     return compact, max(0, len(reasons) - MAX_REASONS_PER_PROBLEM)
 
 
+def _updated_timestamp(value: Any) -> float:
+    """Parse Meta's updated_time (2026-11-01T10:00:00+0000); unknown values sort as oldest."""
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+async def _delivery_spend(
+    client: Any, account_id: str, level: str, params: dict[str, Any], wanted: set[str],
+) -> dict[str, Any]:
+    """Read recent spend per object at one level with at most two lean, spend-sorted insights pages. Never raises."""
+    id_field = DELIVERY_ID_FIELDS[level]
+    spend: dict[str, float] = {}
+    requests = 0
+    complete = False
+    error: str | None = None
+    after: str | None = None
+    lowest: float | None = None
+    order_confirmed = True
+    while requests < DELIVERY_SPEND_MAX_REQUESTS:
+        page_params = {**params, "limit": DELIVERY_SPEND_PAGE, "sort": ["spend_descending"]}
+        if after:
+            page_params["after"] = after
+        requests += 1
+        try:
+            payload = await client.get_insights(account_id, fields=[id_field, "spend"], params=page_params)
+        except Exception as exc:  # a spend failure must not hide the problems found
+            error = str(_public_error(exc).get("message"))
+            break
+        for row in payload.get("data", []) or []:
+            if not isinstance(row, dict) or row.get(id_field) is None:
+                continue
+            value = to_float(row.get("spend")) or 0.0
+            if lowest is not None and value > lowest:
+                order_confirmed = False
+            lowest = value if lowest is None else min(lowest, value)
+            object_id = str(row[id_field])
+            spend[object_id] = spend.get(object_id, 0.0) + value
+        paging = extract_paging(payload)
+        if not paging.get("next"):
+            complete = True
+            break
+        following = paging.get("after")
+        if not following or following == after or wanted <= set(spend):
+            break
+        after = following
+    return {
+        "spend": spend,
+        "requests": requests,
+        "status": "failed" if error and not spend else "read",
+        "complete": complete and error is None,
+        "lowest_spend_read": lowest,
+        "order_confirmed": order_confirmed,
+        "error": error,
+    }
+
+
 def _account_problem(account: dict[str, Any], account_id: str) -> dict[str, Any] | None:
     """Turn account status and disable reason into a problem entry when delivery is affected."""
     status = _code_label(account.get("account_status"), ACCOUNT_STATUS_LABELS)
@@ -1583,7 +1955,7 @@ async def get_delivery_errors(
     include_paused: bool = False,
     max_problems: int = DEFAULT_MAX_PROBLEMS,
 ) -> dict[str, Any]:
-    """List delivery-blocking problems: account status and disable reason, plus issues_info, failed delivery checks and ad review feedback on campaigns, ad sets or ads, ordered by severity then spend in spend_date_preset. By default the scan asks Meta only for objects in problem states (disapproved, with issues, pending billing); include_active also scans active objects for warnings, include_paused reports paused ones. object_ids (up to 50) reads named objects instead. Returns up to max_problems problems with the total found."""
+    """List delivery-blocking problems: account status and disable reason, plus issues_info, failed delivery checks and ad review feedback on campaigns, ad sets or ads, ordered by severity, then spend in spend_date_preset (one or two spend-sorted insights reads), then most recently updated. By default the scan asks Meta only for objects in problem states (disapproved, with issues, pending billing); include_active also scans active objects for warnings, include_paused reports paused ones. object_ids (up to 50) reads named objects instead. Returns up to max_problems problems with the total found."""
     resolved_account_id = _require_account_id(account_id)
     resolved_level = _require_level(level, DELIVERY_LEVELS)
     named_ids = [
@@ -1602,10 +1974,9 @@ async def get_delivery_errors(
         raise ValidationError(f"limit must be between 1 and {MAX_DELIVERY_SCAN}.")
     if not 1 <= max_problems <= MAX_PROBLEMS_LIMIT:
         raise ValidationError(f"max_problems must be between 1 and {MAX_PROBLEMS_LIMIT}.")
-    spend_params_by_level = {
-        spend_level: insights_tools._insights_params(level=spend_level, date_preset=spend_date_preset)
-        for spend_level in DELIVERY_LEVELS
-    }
+    spend_params = insights_tools._insights_params(
+        level=resolved_level, date_preset=spend_date_preset, limit=DELIVERY_SPEND_PAGE,
+    )
 
     client = get_graph_api_client()
     account = await client.get_object(resolved_account_id, fields=DELIVERY_ACCOUNT_FIELDS)
@@ -1639,6 +2010,7 @@ async def get_delivery_errors(
         complete = False
         next_after: str | None = None
         stop_reason: str | None = None
+        seen_cursors: set[str] = {cursor} if cursor else set()
         while True:
             params: dict[str, Any] = {
                 "limit": min(MAX_DELIVERY_PAGE, limit - len(scanned)),
@@ -1657,13 +2029,18 @@ async def get_delivery_errors(
                 complete = True
                 break
             following = paging.get("after")
-            if not following or following == cursor:
+            if not following or following in seen_cursors:
                 stop_reason = "pagination_cursor_missing_or_repeated"
                 break
             if len(scanned) >= limit:
                 stop_reason = "limit_reached"
                 next_after = following
                 break
+            if pages >= MAX_DELIVERY_PAGES:
+                stop_reason = "page_cap_reached"
+                next_after = following
+                break
+            seen_cursors.add(following)
             cursor = following
         scan = {"mode": "account_scan", "level": resolved_level, "objects_examined": len(scanned),
                 "complete": complete, "next_after": next_after, "stop_reason": stop_reason,
@@ -1689,6 +2066,7 @@ async def get_delivery_errors(
             "name": item.get("name"),
             "effective_status": item.get("effective_status"),
             "severity": _object_severity(item, reasons),
+            "updated_time": item.get("updated_time"),
             "reasons": reasons,
         }
         for key in ("campaign_id", "adset_id"):
@@ -1698,37 +2076,71 @@ async def get_delivery_errors(
     scan["paused_objects_skipped"] = paused_skipped
     scan["not_scanned"] = not_scanned
 
-    problems.sort(key=lambda problem: (SEVERITY_RANK[problem["severity"]], problem["object_id"] or ""))
-    to_lookup = [problem for problem in problems if problem["object_id"]][:SPEND_LOOKUP_CAP]
-    semaphore = asyncio.Semaphore(SPEND_LOOKUP_CONCURRENCY)
-    failed_lookups = 0
-
-    async def lookup_spend(problem: dict[str, Any]) -> None:
-        nonlocal failed_lookups
-        async with semaphore:
-            try:
-                payload = await client.get_insights(
-                    problem["object_id"], fields=["spend"], params=spend_params_by_level[problem["level"]],
-                )
-            except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
-                failed_lookups += 1
-                problem["spend"] = None
-                problem["spend_status"] = "lookup_failed"
-                problem["spend_error"] = _short(_public_error(exc).get("message"))
-                return
-        problem["spend"] = sum(to_float(row.get("spend")) or 0.0 for row in payload.get("data", []) or [])
-        problem["spend_status"] = "read"
-
-    await asyncio.gather(*(lookup_spend(problem) for problem in to_lookup))
+    object_problems = [problem for problem in problems if problem["level"] != "account"]
+    spend_lookup: dict[str, Any] = {
+        "method": (
+            f"account-level insights at {resolved_level} level for {spend_params['date_preset']}, fields "
+            f"{DELIVERY_ID_FIELDS.get(resolved_level, 'id')} and spend only, sorted by spend highest first, "
+            f"{DELIVERY_SPEND_PAGE} rows per request, at most {DELIVERY_SPEND_MAX_REQUESTS} requests; "
+            "objects without a row had no delivery in the window"
+        ),
+        "status": "not_needed",
+        "requests": 0,
+        "objects_with_spend_read": 0,
+        "all_spending_objects_read": None,
+        "lowest_spend_read": None,
+        "meta_order_confirmed": None,
+        "error": None,
+    }
+    if object_problems:
+        read = await _delivery_spend(
+            client, resolved_account_id, resolved_level, spend_params,
+            {problem["object_id"] for problem in object_problems if problem["object_id"]},
+        )
+        spend_lookup.update({
+            "status": read["status"],
+            "requests": read["requests"],
+            "objects_with_spend_read": len(read["spend"]),
+            "all_spending_objects_read": read["complete"],
+            "lowest_spend_read": read["lowest_spend_read"],
+            "meta_order_confirmed": read["order_confirmed"],
+            "error": _short(read["error"]),
+        })
+        for problem in object_problems:
+            value = read["spend"].get(problem["object_id"] or "")
+            if read["status"] == "failed":
+                problem["spend"], problem["spend_status"] = None, "spend_unavailable"
+            elif value:
+                problem["spend"], problem["spend_status"] = value, "read"
+            elif value is not None or read["complete"]:
+                problem["spend"], problem["spend_status"] = 0.0, "no_spend_in_window"
+            else:
+                problem["spend"], problem["spend_status"] = None, "not_in_top_spenders"
     for problem in problems:
-        problem.setdefault("spend", None)
-        problem.setdefault("spend_status", "not_looked_up")
+        if problem["level"] == "account":
+            problem["spend"], problem["spend_status"] = None, "account"
+    spend_failed = spend_lookup["status"] == "failed"
     problems.sort(key=lambda problem: (
         SEVERITY_RANK[problem["severity"]],
-        problem["spend"] is None,
+        DELIVERY_SPEND_GROUPS[problem["spend_status"]],
         -(problem["spend"] or 0.0),
+        -_updated_timestamp(problem.get("updated_time")),
         problem["object_id"] or "",
     ))
+    ordering = (
+        ["severity", "account_first", "updated_time_desc", "object_id"] if spend_failed
+        else ["severity", "account_first", "recent_spend_desc", "updated_time_desc", "object_id"]
+    )
+    ordering_note = (
+        "Within each severity, an account problem comes first (it stops all delivery); then objects by most "
+        "recently updated, because recent spend could not be read."
+        if spend_failed else
+        "Within each severity, an account problem comes first (it stops all delivery); then objects with recent "
+        "spend, highest first; then objects whose spend was not among those read; then objects with no spend in "
+        "the window; ties by most recently updated."
+    )
+    no_spend = sum(1 for problem in object_problems if problem["spend_status"] == "no_spend_in_window")
+    beyond = sum(1 for problem in object_problems if problem["spend_status"] == "not_in_top_spenders")
     by_severity: dict[str, int] = {}
     for problem in problems:
         by_severity[problem["severity"]] = by_severity.get(problem["severity"], 0) + 1
@@ -1744,23 +2156,39 @@ async def get_delivery_errors(
     if not scan["complete"]:
         detail = (
             f"pass after={scan['next_after']!r} to continue" if scan["next_after"]
-            else "Meta's pagination cursor was missing or repeated"
+            else "Meta's pagination cursor was missing or repeated an earlier one, so the scan cannot continue"
         )
+        cap = f" after the {MAX_DELIVERY_PAGES}-page cap" if scan["stop_reason"] == "page_cap_reached" else ""
         missing_signals.append(
-            f"Scan incomplete: examined {scan['objects_examined']} {resolved_level}(s) and more exist; {detail}. "
-            "Problems on objects not yet examined are not listed."
+            f"Scan incomplete: examined {scan['objects_examined']} {resolved_level}(s) in {scan['pages_fetched']} "
+            f"page(s){cap} and more may exist; {detail}. Problems on objects not yet examined are not listed."
         )
     if len(problems) > max_problems:
         missing_signals.append(
-            f"{len(problems)} problems were found; only the first {max_problems} by severity and spend are listed. "
+            f"{len(problems)} problems were found; only the first {max_problems} in the stated ordering are listed. "
             f"Raise max_problems (up to {MAX_PROBLEMS_LIMIT}) or narrow with object_ids to see more."
         )
-    if len(problems) > SPEND_LOOKUP_CAP:
+    if spend_failed:
         missing_signals.append(
-            f"Spend was looked up for the first {SPEND_LOOKUP_CAP} problems by severity only; the rest have spend null."
+            f"Recent spend could not be read ({spend_lookup['error']}), so problems are ordered by severity, then "
+            "most recently updated, and their spend is null."
         )
-    if failed_lookups:
-        missing_signals.append(f"Spend lookup failed for {failed_lookups} problem(s); their spend is null.")
+    elif spend_lookup["error"]:
+        missing_signals.append(
+            f"The second spend page failed ({spend_lookup['error']}); spend beyond the first page is unknown."
+        )
+    if no_spend:
+        missing_signals.append(
+            f"{no_spend} of {len(object_problems)} problems had no spend in {spend_params['date_preset']}; "
+            "they are listed after the problems with recent spend."
+        )
+    if beyond:
+        missing_signals.append(
+            f"{beyond} problem(s) were not among the {spend_lookup['objects_with_spend_read']} highest-spending "
+            f"{resolved_level}s read; their spend is at most {spend_lookup['lowest_spend_read']} and is shown as null."
+        )
+    if spend_lookup["meta_order_confirmed"] is False:
+        missing_signals.append("Meta returned the spend rows not ordered by spend, so spend coverage may be uneven.")
 
     if problems:
         counts = ", ".join(f"{by_severity[name]} {name}" for name in SEVERITY_RANK if name in by_severity)
@@ -1769,7 +2197,11 @@ async def get_delivery_errors(
             **build_finding(
                 "delivery_problems_found",
                 f"{len(problems)} delivery problem(s) found ({counts}); each is listed once in problems, "
-                "ordered by severity then spend.",
+                + (
+                    "ordered by severity, then most recently updated (spend could not be read)."
+                    if spend_failed else
+                    "ordered by severity, then recent spend, then most recently updated."
+                ),
                 severity=worst,
                 confidence=None,
             ),
@@ -1793,6 +2225,7 @@ async def get_delivery_errors(
             "problems_returned": len(returned),
             "problems_truncated": len(problems) > len(returned),
             "by_severity": by_severity,
+            "problems_without_recent_spend": no_spend,
         },
         findings=findings,
         missing_signals=missing_signals,
@@ -1805,9 +2238,10 @@ async def get_delivery_errors(
             },
             "problems": returned,
             "scan": scan,
-            "spend_window": {"date_preset": spend_params_by_level["account"]["date_preset"]},
-            "spend_lookups": {"attempted": len(to_lookup), "failed": failed_lookups, "cap": SPEND_LOOKUP_CAP},
-            "ordering": ["severity", "spend_desc", "object_id"],
+            "spend_window": {"date_preset": spend_params["date_preset"]},
+            "spend_lookup": spend_lookup,
+            "ordering": ordering,
+            "ordering_note": ordering_note,
             "severity_policy": DELIVERY_SEVERITY_POLICY,
         },
     )
