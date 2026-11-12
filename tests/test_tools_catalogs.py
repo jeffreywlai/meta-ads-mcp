@@ -892,6 +892,43 @@ def test_update_catalog_product_reads_then_updates(monkeypatch) -> None:
     assert result["sent"] == {"price": 800, "availability": "out of stock"}
 
 
+class _ProjectingCatalogClient(FakeCatalogClient):
+    """Returns only the requested fields, as the Graph API does."""
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        source = await super().get_object(object_id, fields=fields, params=params)
+        return {key: value for key, value in source.items() if key in (fields or [])}
+
+
+def test_update_catalog_product_params_field_is_read_before_the_update(monkeypatch) -> None:
+    client = _use(monkeypatch, _ProjectingCatalogClient(objects={"p_1": {"id": "p_1", "inventory": 100}}))
+    result = _run(catalogs.update_catalog_product(product_id="p_1", params={"inventory": 5}))
+    assert client.kinds() == ["get", "update"]
+    assert "inventory" in client.calls[0][1]["fields"]
+    assert result["previous"] == {"inventory": 100}
+    assert result["current"] == {"inventory": 5}
+    assert "previous_unavailable" not in result
+
+
+def test_update_catalog_product_unreadable_params_field_is_marked_unavailable(monkeypatch) -> None:
+    client = _use(monkeypatch, _ProjectingCatalogClient(objects={"p_1": {"id": "p_1", "name": "Old"}}))
+    result = _run(catalogs.update_catalog_product(
+        product_id="p_1", name="New", params={"return_policy_days": 30},
+    ))
+    assert "return_policy_days" not in client.calls[0][1]["fields"]
+    assert result["previous"] == {"name": "Old"}
+    assert "return_policy_days" not in result["previous"]
+    assert set(result["previous_unavailable"]) == {"return_policy_days"}
+    assert result["sent"] == {"name": "New", "return_policy_days": 30}
+
+
+def test_update_catalog_unreadable_params_setting_is_marked_unavailable(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(objects={"cat_1": {"id": "cat_1", "name": "Old"}}))
+    result = _run(catalogs.update_catalog(catalog_id="cat_1", params={"checkout_url": "https://x/checkout"}))
+    assert "checkout_url" not in result["previous"]
+    assert set(result["previous_unavailable"]) == {"checkout_url"}
+
+
 def test_update_catalog_product_requires_a_change(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="At least one"):

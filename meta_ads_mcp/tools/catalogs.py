@@ -50,6 +50,21 @@ PRODUCT_DETAIL_FIELDS = [
     "retailer_product_group_id", "additional_image_urls", "custom_label_0",
     "custom_label_1", "custom_label_2", "custom_label_3", "custom_label_4",
 ]
+# Product item fields Meta's reference documents both as readable fields and as
+# update parameters. An update that changes one of these through params reads
+# it first, so previous shows its real prior value.
+PRODUCT_READABLE_UPDATE_FIELDS = frozenset({
+    "additional_image_urls", "additional_variant_attributes", "age_group", "availability",
+    "brand", "category", "category_specific_fields", "color", "condition", "currency",
+    "custom_data", "custom_label_0", "custom_label_1", "custom_label_2", "custom_label_3",
+    "custom_label_4", "description", "expiration_date", "fb_product_category", "gender", "gtin",
+    "image_url", "importer_address", "importer_name", "inventory", "live_special_price",
+    "manufacturer_info", "manufacturer_part_number", "marked_for_product_launch", "material",
+    "mobile_link", "name", "ordering_index", "origin_country", "pattern", "price",
+    "product_type", "retailer_id", "sale_price", "sale_price_end_date", "sale_price_start_date",
+    "short_description", "size", "start_date", "url", "visibility", "wa_compliance_category",
+})
+_UNREADABLE_PREVIOUS = "Meta does not document this field as readable, so its prior value could not be read."
 FILTER_SAMPLE_FIELDS = ["id", "retailer_id", "name", "price", "availability"]
 PRODUCT_AVAILABILITY = (
     "in stock", "out of stock", "preorder", "available for order", "discontinued",
@@ -911,7 +926,7 @@ async def update_catalog(
     name: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Edit a product catalog's name or other documented settings (params), returning previous and current values."""
+    """Edit a product catalog's name or other documented settings (params), returning previous and current values. A changed setting Meta cannot read back is named in previous_unavailable."""
     catalog_id = _require(catalog_id, "catalog_id")
     payload = merge_graph_payload({"name": name if name is not None else OMIT}, params)
     if not payload:
@@ -921,12 +936,16 @@ async def update_catalog(
     client = get_graph_api_client()
     previous = await client.get_object(catalog_id, fields=CATALOG_UPDATE_READ_FIELDS)
     await client.update_object(catalog_id, data=payload)
-    return mutation_response(
+    response = mutation_response(
         action="update_catalog",
         target={"catalog_id": catalog_id},
         previous={key: previous.get(key) for key in CATALOG_UPDATE_READ_FIELDS if key != "id"},
         current=payload,
     )
+    unreadable = sorted(key for key in payload if key not in CATALOG_UPDATE_READ_FIELDS)
+    if unreadable:
+        response["previous_unavailable"] = {key: _UNREADABLE_PREVIOUS for key in unreadable}
+    return response
 
 
 @mcp_server.tool()
@@ -1031,7 +1050,7 @@ async def update_catalog_product(
     brand: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Edit a catalog product's fields, returning previous and current values. price and sale_price are major units; previous prices are shown as Meta formats them."""
+    """Edit a catalog product's fields, returning previous and current values. price and sale_price are major units; previous prices are shown as Meta formats them. A changed field Meta cannot read back is named in previous_unavailable."""
     product_id = _require(product_id, "product_id")
     payload, shown = _product_fields(
         name=name, price=price, currency=currency, sale_price=sale_price,
@@ -1047,15 +1066,21 @@ async def update_catalog_product(
         raise ValidationError("At least one field must be provided for update_catalog_product.")
     if params:
         shown.update(params)
+    readable = [key for key in payload if key in PRODUCT_READABLE_UPDATE_FIELDS]
+    read_fields = [*PRODUCT_DETAIL_FIELDS, *(key for key in readable if key not in PRODUCT_DETAIL_FIELDS)]
+    unreadable = sorted(key for key in payload if key not in PRODUCT_READABLE_UPDATE_FIELDS)
     client = get_graph_api_client()
-    previous = await client.get_object(product_id, fields=PRODUCT_DETAIL_FIELDS)
+    previous = await client.get_object(product_id, fields=read_fields)
     await client.update_object(product_id, data=payload)
     response = mutation_response(
         action="update_catalog_product",
         target={"product_id": product_id},
-        previous={key: previous.get(key) for key in payload},
+        # Each field here was requested in the pre-read; Meta omits fields that hold no value.
+        previous={key: previous.get(key) for key in readable},
         current=shown,
     )
+    if unreadable:
+        response["previous_unavailable"] = {key: _UNREADABLE_PREVIOUS for key in unreadable}
     response["sent"] = payload
     return response
 
