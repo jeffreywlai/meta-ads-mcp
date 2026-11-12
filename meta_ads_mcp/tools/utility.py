@@ -128,6 +128,14 @@ TOOL_GROUPS = {
         "create_product_set",
         "update_product_set",
         "delete_product_set",
+        "create_product_feed",
+        "update_product_feed",
+        "delete_product_feed",
+        "create_product_feed_upload",
+        "create_feed_rule",
+        "delete_feed_rule",
+        "connect_catalog_event_source",
+        "disconnect_catalog_event_source",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -163,6 +171,13 @@ TOOL_GROUPS = {
         "list_catalog_products",
         "build_product_set_filter",
         "list_product_sets",
+        "list_product_feeds",
+        "list_product_feed_uploads",
+        "list_feed_rules",
+        "list_catalog_event_sources",
+        "list_event_source_catalogs",
+        "get_catalog_event_source_health",
+        "get_catalog_event_source_recommendations",
     ],
     "auth": [
         "generate_auth_url",
@@ -448,6 +463,36 @@ INTENT_GUIDE = {
             "Turn a plain-English product selection into conditions and test it with build_product_set_filter before create_product_set.",
             "Product prices are major units (12.5 means 12.50); new products are created with visibility=staging.",
             "list_dpa_eligible_catalogs and get_catalog_dynamic_ads_health are derived from documented signals and state the rules they use.",
+        ],
+    },
+    "manage_product_catalog_feeds_and_event_sources": {
+        "description": (
+            "Inspect or change product catalog data feeds, feed uploads and upload errors, feed rules, "
+            "and the pixels or apps connected to a product catalog, including match-rate health."
+        ),
+        "recommended_order": [
+            "list_product_feeds",
+            "list_product_feed_uploads",
+            "list_feed_rules",
+            "list_catalog_event_sources",
+            "get_catalog_event_source_health",
+            "get_catalog_event_source_recommendations",
+            "list_event_source_catalogs",
+        ],
+        "avoid_unless_needed": [
+            "create_product_feed",
+            "update_product_feed",
+            "create_product_feed_upload",
+            "create_feed_rule",
+            "connect_catalog_event_source",
+            "delete_feed_rule",
+            "delete_product_feed",
+            "disconnect_catalog_event_source",
+        ],
+        "notes": [
+            "These tools work on Meta product catalogs and need the catalog_management permission.",
+            "Deleting a feed removes the products it supplied unless another source also supplies them.",
+            "Health and recommendations are derived here from event_stats, connected sources and Meta's Dynamic Ads checks.",
         ],
     },
 }
@@ -790,6 +835,11 @@ async def list_mutation_tools() -> dict[str, object]:
             "product_catalogs": ["create_catalog", "update_catalog"],
             "catalog_products": ["create_catalog_product", "update_catalog_product", "delete_catalog_product"],
             "product_sets": ["create_product_set", "update_product_set", "delete_product_set"],
+            "product_catalog_feeds": [
+                "create_product_feed", "update_product_feed", "delete_product_feed",
+                "create_product_feed_upload", "create_feed_rule", "delete_feed_rule",
+            ],
+            "product_catalog_event_sources": ["connect_catalog_event_source", "disconnect_catalog_event_source"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",
