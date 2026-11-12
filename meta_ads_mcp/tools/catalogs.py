@@ -92,6 +92,8 @@ _STRING_OPERATORS = {"contains", "not_contains", "i_contains", "starts_with"}
 
 _DPA_MAX_CATALOGS = 100
 _DPA_PAGE_SIZE = 50
+# Request cap for the catalog listing, independent of how many rows each page holds.
+_DPA_MAX_LIST_PAGES = 4
 _SIGNAL_ERRORS = (MetaApiError, UnsupportedFeatureError, NotFoundError)
 _EMPTY_SET_MESSAGE = (
     "Meta documents that ads tied to an empty product set will not deliver."
@@ -253,6 +255,67 @@ def _error_entry(signal: str, error: Exception) -> dict[str, Any]:
 
 async def _read_edge(client, parent_id: str, edge: str, *, fields, params) -> dict[str, Any]:
     return await client.list_objects(parent_id, edge, fields=fields, params=params)
+
+
+async def _collect_edge(
+    client,
+    parent_id: str,
+    edge: str,
+    *,
+    fields: list[str],
+    params: dict[str, Any],
+    max_pages: int,
+    max_items: int | None = None,
+    stop_at_total: bool = False,
+) -> dict[str, Any]:
+    """Read an edge page by page until Meta reports no next page, or a cap or paging fault stops it.
+
+    complete is true only when Meta's paging has no next link. A next link with
+    no cursor, a cursor already requested, or a page identical to one already
+    read stops the scan with a stated reason, and that page's rows are not added
+    twice. max_pages caps requests regardless of how many rows came back, so a
+    run of empty pages cannot loop. With stop_at_total, the first summary
+    total_count Meta returns ends the read.
+    """
+    rows: list[Any] = []
+    seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    cursor: str | None = None
+    pages = 0
+    while True:
+        page_params = dict(params)
+        if cursor is not None:
+            page_params["after"] = cursor
+            seen_cursors.add(cursor)
+        payload = await client.list_objects(parent_id, edge, fields=fields, params=page_params)
+        pages += 1
+        data = payload.get("data") or []
+        if data:
+            fingerprint = json.dumps(data, sort_keys=True, default=str)
+            if fingerprint in seen_pages:
+                return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                        "stop_reason": "Meta returned a page that had already been read."}
+            seen_pages.add(fingerprint)
+            rows.extend(data)
+        total = (payload.get("summary") or {}).get("total_count")
+        if stop_at_total and to_int(total) is not None:
+            return {"rows": rows, "complete": True, "total_count": to_int(total), "pages": pages,
+                    "stop_reason": None}
+        paging = payload.get("paging") or {}
+        if not paging.get("next"):
+            return {"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None}
+        cursor = blank_to_none((paging.get("cursors") or {}).get("after"))
+        if cursor is None:
+            reason = "Meta reported another page but returned no cursor to read it."
+        elif cursor in seen_cursors:
+            reason = "Meta returned a page cursor that had already been read."
+        elif max_items is not None and len(rows) >= max_items:
+            reason = f"Stopped at the {max_items}-row cap."
+        elif pages >= max_pages:
+            reason = f"Stopped after {pages} pages."
+        else:
+            continue
+        return {"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason}
 
 
 async def _business_scope(client, business_id: str | None, account_id: str | None) -> dict[str, Any]:
@@ -417,22 +480,13 @@ async def list_dpa_eligible_catalogs(
         scope_value if scope_name == "business_id" else None,
         scope_value if scope_name == "account_id" else None,
     )
-    catalogs: list[dict[str, Any]] = []
-    after: str | None = None
-    complete = True
-    while True:
-        payload = await client.list_objects(
-            scope["business_id"], "owned_product_catalogs",
-            fields=CATALOG_FIELDS, params=_page_params(_DPA_PAGE_SIZE, after),
-        )
-        page = _paged(payload)
-        catalogs.extend(page["items"])
-        if page["summary"]["complete"] or not page["summary"]["next_after"]:
-            break
-        if len(catalogs) >= _DPA_MAX_CATALOGS:
-            complete = False
-            break
-        after = page["summary"]["next_after"]
+    listing = await _collect_edge(
+        client, scope["business_id"], "owned_product_catalogs",
+        fields=CATALOG_FIELDS, params={"limit": _DPA_PAGE_SIZE},
+        max_pages=_DPA_MAX_LIST_PAGES, max_items=_DPA_MAX_CATALOGS,
+    )
+    catalogs = [row for row in listing["rows"] if isinstance(row, dict)]
+    complete = listing["complete"] and len(catalogs) <= _DPA_MAX_CATALOGS
     catalogs = catalogs[:_DPA_MAX_CATALOGS]
 
     findings: list[dict[str, Any]] = []
@@ -470,7 +524,10 @@ async def list_dpa_eligible_catalogs(
         recommended = None
         reason = "No catalog passed every readiness rule; see each catalog's reasons."
     if not complete:
-        missing_signals.append(f"Only the first {_DPA_MAX_CATALOGS} catalogs were evaluated.")
+        reason = listing["stop_reason"] or f"Stopped at the {_DPA_MAX_CATALOGS}-catalog cap."
+        missing_signals.append(
+            f"The catalog list is incomplete: only {len(catalogs)} catalog(s) were evaluated. {reason}"
+        )
     return analysis_response(
         scope={**scope, "ownership": "owned"},
         metrics={

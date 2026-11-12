@@ -258,6 +258,66 @@ def test_dpa_eligible_catalogs_listing_permission_error_raises(monkeypatch) -> N
         _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
 
 
+def test_dpa_catalog_listing_next_page_without_cursor_is_incomplete(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={
+        ("biz_1", "owned_product_catalogs"): {
+            "data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"},
+        },
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert result["metrics"]["complete"] is False
+    assert any("no cursor" in entry for entry in result["missing_signals"])
+    assert client.kinds() == ["list"]
+
+
+def test_dpa_catalog_listing_empty_cursor_cycle_terminates(monkeypatch) -> None:
+    class Cycle(FakeCatalogClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            self.calls.append(("list", {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}))
+            assert len(self.calls) <= 6, "catalog listing loops over an empty A/B cursor cycle"
+            following = "B" if params.get("after") == "A" else "A"
+            return {"data": [], "paging": {"next": "next", "cursors": {"after": following}}}
+
+    client = _use(monkeypatch, Cycle())
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert result["metrics"]["complete"] is False
+    assert [call["params"].get("after") for _, call in client.calls] == [None, "A", "B"]
+    assert any("already been read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_catalog_listing_empty_pages_stop_at_request_cap(monkeypatch) -> None:
+    pages = [{"data": [], "paging": {"next": "next", "cursors": {"after": f"c{index}"}}} for index in range(20)]
+    client = _use(monkeypatch, FakeCatalogClient(edges={("biz_1", "owned_product_catalogs"): pages}))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert len(client.calls) == catalogs._DPA_MAX_LIST_PAGES
+    assert result["metrics"]["complete"] is False
+
+
+def test_dpa_catalog_listing_repeated_page_is_not_added_twice(monkeypatch) -> None:
+    page = {"data": [{"id": "cat_ready", "name": "Ready", "product_count": 500}],
+            "paging": {"next": "next", "cursors": {"after": "x1"}}}
+    again = {"data": [{"id": "cat_ready", "name": "Ready", "product_count": 500}],
+             "paging": {"next": "next", "cursors": {"after": "x2"}}}
+    client = _dpa_client(edges={("biz_1", "owned_product_catalogs"): [page, again]})
+    _use(monkeypatch, client)
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert [finding["catalog_id"] for finding in result["findings"]] == ["cat_ready"]
+    assert result["metrics"]["complete"] is False
+
+
+def test_dpa_catalog_listing_follows_cursors_to_the_last_page(monkeypatch) -> None:
+    client = _dpa_client(edges={("biz_1", "owned_product_catalogs"): [
+        {"data": [{"id": "cat_ready", "product_count": 500}], "paging": {"next": "n", "cursors": {"after": "p2"}}},
+        {"data": [{"id": "cat_nosrc", "product_count": 900}], "paging": {"cursors": {"after": "p3"}}},
+    ]})
+    _use(monkeypatch, client)
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert result["metrics"]["complete"] is True
+    assert {finding["catalog_id"] for finding in result["findings"]} == {"cat_ready", "cat_nosrc"}
+    listing_calls = [call for _, call in client.calls if call.get("edge") == "owned_product_catalogs"]
+    assert [call["params"] for call in listing_calls] == [{"limit": 50}, {"limit": 50, "after": "p2"}]
+
+
 def test_dpa_eligible_catalogs_requires_one_scope(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="exactly one of business_id or account_id"):
