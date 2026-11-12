@@ -252,6 +252,103 @@ def test_dpa_eligible_catalogs_reports_unavailable_signal_instead_of_hiding_it(m
     assert any("cat_ready" in entry for entry in result["missing_signals"])
 
 
+def test_dpa_catalog_with_no_product_sets_on_a_fully_read_edge_is_not_ready(monkeypatch) -> None:
+    """An empty, fully read product_sets edge means zero sets, not an unknown that passes."""
+    client = _use(monkeypatch, FakeCatalogClient(edges={
+        ("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1", "product_count": 5}]},
+        ("cat_1", "product_sets"): {"data": []},
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}]},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    finding = result["findings"][0]
+    assert finding["signals"]["product_set_count"] == 0
+    assert finding["assessment"] == "needs_attention"
+    assert result["recommended_catalog_id"] is None
+    assert any("no product sets" in reason for reason in finding["reasons"])
+    assert client.kinds().count("list") == 4
+
+
+def test_dpa_product_set_count_comes_from_total_count_when_meta_returns_it(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", "product_sets"): {"data": [{"id": "ps_1"}], "summary": {"total_count": 3},
+                                        "paging": {"next": "n", "cursors": {"after": "s2"}}},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["signals"]["product_set_count"] == 3
+    assert ready["assessment"] == "ready"
+    set_calls = [call for _, call in client.calls if call.get("edge") == "product_sets" and call["parent_id"] == "cat_ready"]
+    assert len(set_calls) == 1
+
+
+def test_dpa_paged_diagnostics_do_not_pass_readiness(monkeypatch) -> None:
+    """A must-fix group on an unread diagnostics page must not be assumed absent."""
+    client = _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", "diagnostics"): [
+            {"data": [], "paging": {"next": "n", "cursors": {"after": "d2"}}},
+            {"data": [{"type": "MISSING_IMAGE", "severity": "MUST_FIX", "number_of_affected_items": 9}]},
+        ],
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["signals"]["da_must_fix_groups"] == 1
+    assert ready["signals"]["da_must_fix_affected_items"] == 9
+    assert ready["assessment"] == "needs_attention"
+    diag_calls = [call for _, call in client.calls if call.get("edge") == "diagnostics" and call["parent_id"] == "cat_ready"]
+    assert [call["params"].get("after") for call in diag_calls] == [None, "d2"]
+
+
+def test_dpa_partly_read_diagnostics_make_the_catalog_unknown(monkeypatch) -> None:
+    stalled = {"data": [], "paging": {"next": "n", "cursors": {"after": "more"}}}
+    _use(monkeypatch, _dpa_client(edges={("cat_ready", "diagnostics"): [stalled, stalled, stalled]}))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["assessment"] == "unknown"
+    assert ready["signals"]["da_must_fix_groups"] is None
+    assert ready["partial_signals"][0]["signal"] == "diagnostics"
+    assert any("cat_ready: diagnostics was only partly read" in entry for entry in result["missing_signals"])
+    assert result["recommended_catalog_id"] is None
+
+
+@pytest.mark.parametrize("edge", ["product_sets", "external_event_sources"])
+def test_dpa_partly_read_empty_supporting_edge_is_unknown_not_zero(monkeypatch, edge) -> None:
+    _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", edge): {"data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"}},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["assessment"] == "unknown"
+    assert ready["partial_signals"][0]["signal"] == edge
+    assert ready["partial_signals"][0]["count_is_lower_bound"] is False
+    assert any(f"cat_ready: {edge} was only partly read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_partly_read_nonempty_sources_count_as_a_lower_bound(monkeypatch) -> None:
+    _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", "external_event_sources"): [
+            {"data": [{"id": "px_1"}], "paging": {"next": "n", "cursors": {"after": "e2"}}},
+            {"data": [{"id": "px_2"}], "paging": {"next": "n"}},
+        ],
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["signals"]["event_source_count"] == 2
+    assert ready["partial_signals"][0]["count_is_lower_bound"] is True
+    assert ready["assessment"] == "ready"
+    assert any("lower bound" in reason for reason in ready["reasons"])
+    assert any("external_event_sources was only partly read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_requests_only_the_diagnostic_fields_it_counts(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client())
+    _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    diag_calls = [call for kind, call in client.calls if kind == "list" and call["edge"] == "diagnostics"]
+    assert diag_calls
+    for call in diag_calls:
+        assert call["fields"] == ["type", "severity", "number_of_affected_items"]
+        assert call["params"] == {"affected_channels": ["da"], "severities": ["MUST_FIX"], "limit": 25}
+
+
 def test_dpa_eligible_catalogs_listing_permission_error_raises(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogClient(edge_errors={("biz_1", "owned_product_catalogs"): _permission_error()}))
     with pytest.raises(MetaApiError):
@@ -517,6 +614,38 @@ def test_dynamic_ads_health_unavailable_signal_is_inconclusive(monkeypatch) -> N
     assert any("product_catalog/diagnostics" in entry for entry in result["missing_signals"])
     assert "product_catalog/diagnostics" not in result["basis"]["signals_used"]
     _assert_no_da_checks(client, result)
+
+
+def test_dynamic_ads_health_partly_read_diagnostics_is_inconclusive(monkeypatch) -> None:
+    stalled = {"data": [], "paging": {"next": "n", "cursors": {"after": "more"}}}
+    client = _use(monkeypatch, _health_client(edges={("cat_1", "diagnostics"): [stalled, stalled]}))
+    result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+    assert result["status"] == "inconclusive"
+    assert any("product_catalog/diagnostics was only partly read" in entry for entry in result["missing_signals"])
+    diag_calls = [call for _, call in client.calls if call.get("edge") == "diagnostics"]
+    assert [call["params"].get("after") for call in diag_calls] == [None, "more"]
+
+
+def test_dynamic_ads_health_reads_must_fix_groups_on_later_pages(monkeypatch) -> None:
+    _use(monkeypatch, _health_client(edges={("cat_1", "diagnostics"): [
+        {"data": [], "paging": {"next": "n", "cursors": {"after": "d2"}}},
+        {"data": [{"title": "Images missing", "severity": "MUST_FIX", "number_of_affected_items": 7}]},
+    ]}))
+    result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+    assert result["status"] == "at_risk"
+    assert result["metrics"]["must_fix_groups"] == 1
+    assert result["missing_signals"] == []
+
+
+def test_dynamic_ads_health_partly_read_empty_sources_are_not_reported_as_none(monkeypatch) -> None:
+    _use(monkeypatch, _health_client(edges={
+        ("cat_1", "external_event_sources"): {"data": [], "paging": {"next": "https://graph.invalid/?after=x"}},
+    }))
+    result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+    assert result["status"] == "inconclusive"
+    assert result["metrics"]["event_source_count"] is None
+    assert not any(finding["source"] == "product_catalog/external_event_sources" for finding in result["findings"])
+    assert any("external_event_sources was only partly read" in entry for entry in result["missing_signals"])
 
 
 def test_dynamic_ads_health_rejects_product_set_from_other_catalog(monkeypatch) -> None:
