@@ -523,45 +523,52 @@ def test_audience_users_never_echo_rows(monkeypatch, caplog, tool) -> None:
     digest = _sha(raw)
     caplog.set_level(logging.DEBUG)
 
-    client = FakeUsersClient()
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    class EchoingSuccess(FakeUsersClient):
+        """Answers like Meta but also echoes everything it was sent, so a leak would show."""
+
+        def _record(self, method, parent_id, edge, data):
+            response = super()._record(method, parent_id, edge, data)
+            return {**response, "echo": data, "note": f"received {raw}"}
+
+    client = EchoingSuccess()
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL"], rows=[[raw]]))
+    assert digest in json.dumps(client.requests)
     serialized = json.dumps(result)
     assert raw not in serialized and digest not in serialized
 
-    for error in (
-        audiences.MetaApiError(
-            message=f"Invalid entry {raw} with hash {digest}",
-            status_code=400, code=100, user_message=f"Bad {digest}",
-            error_data={"sample": digest}, details={"error": {"message": raw}},
-        ),
-        RuntimeError(f"transport failed while sending {raw} {digest}"),
-    ):
+    errors: list[tuple[Exception, type[Exception]]] = [
+        (_echoing_errors([raw, raw.upper(), digest])[0], audiences.MetaApiError),
+        (_echoing_errors([raw, raw.upper(), digest])[1], audiences.RateLimitError),
+        (RuntimeError(f"transport failed while sending {raw} {digest}"), audiences.MetaApiError),
+    ]
+    for error, expected in errors:
+        # The fake really carries the values, so the assertions below can fail.
+        assert raw in str(error) and digest in str(error)
         failing = FakeUsersClient(fail_on_batch=1, error=error)
         monkeypatch.setattr(audiences, "get_graph_api_client", lambda failing=failing: failing)
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(expected) as excinfo:
             asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL"], rows=[[raw]]))
-        rendered = " ".join([
-            str(excinfo.value), repr(excinfo.value),
-            json.dumps(getattr(excinfo.value, "to_public_dict", lambda: {})()),
-        ])
-        assert raw not in rendered and digest not in rendered
+        assert type(excinfo.value) is expected
+        rendered = _rendered_chain(excinfo.value)
+        assert raw not in rendered.lower() and digest not in rendered
         assert excinfo.value.__cause__ is None
         assert excinfo.value.__context__ is None
 
-        from fastmcp.exceptions import ToolError
-
-        from meta_ads_mcp.coordinator import mcp_server
-
         fresh = FakeUsersClient(fail_on_batch=1, error=error)
         monkeypatch.setattr(audiences, "get_graph_api_client", lambda fresh=fresh: fresh)
+        caplog.clear()
         with pytest.raises(ToolError) as tool_error:
             asyncio.run(mcp_server.call_tool(tool, {
                 "audience_id": "aud_1", "schema": "EMAIL", "rows": [[raw]],
             }))
-        assert raw not in str(tool_error.value) and digest not in str(tool_error.value)
-
-    assert raw not in caplog.text and digest not in caplog.text
+        assert json.loads(str(tool_error.value))["error"]["type"] in {"meta_api", "rate_limit"}
+        _assert_nothing_echoed(tool_error.value, caplog, raw)
+        _assert_nothing_echoed(tool_error.value, caplog, digest)
 
 
 def _rendered_chain(error: BaseException) -> str:
