@@ -683,3 +683,179 @@ def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
     ]
     assert result["created"] == {"id": "cmp_123"}
     assert result["target"] == {"account_id": "act_123", "campaign_id": "cmp_123"}
+
+
+class MoneyAdsetClient:
+    """Fake client for update_adset money fields: an ad set on an account with a currency."""
+
+    def __init__(self, *, currency: str = "USD", stored: dict | None = None, currency_error: Exception | None = None) -> None:
+        self.currency = currency
+        self.currency_error = currency_error
+        self.stored = {
+            "account_id": "123",
+            "status": "ACTIVE",
+            "daily_spend_cap": "5000",
+            "lifetime_spend_cap": "200000",
+            "daily_min_spend_target": "1000",
+        } if stored is None else stored
+        self.calls: list[tuple] = []
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        if object_id == "act_123":
+            if self.currency_error is not None:
+                raise self.currency_error
+            return {"id": object_id, "currency": self.currency}
+        return {"id": object_id, **{key: value for key, value in self.stored.items() if key in (fields or [])}}
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+
+def test_update_adset_spend_caps_use_major_units(monkeypatch) -> None:
+    client = MoneyAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(
+        adset_id="adset_1",
+        daily_spend_cap=90.5,
+        lifetime_spend_cap=2500,
+        daily_min_spend_target=12.25,
+        lifetime_min_spend_target=1000,
+    ))
+    assert client.calls == [
+        ("get", "adset_1", [
+            "id", "daily_spend_cap", "lifetime_spend_cap", "daily_min_spend_target",
+            "lifetime_min_spend_target", "account_id",
+        ]),
+        ("get", "act_123", ["currency"]),
+        ("update", "adset_1", {
+            "daily_spend_cap": 9050,
+            "lifetime_spend_cap": 250000,
+            "daily_min_spend_target": 1225,
+            "lifetime_min_spend_target": 100000,
+        }),
+    ]
+    assert result["current"] == {
+        "daily_spend_cap": 90.5,
+        "lifetime_spend_cap": 2500,
+        "daily_min_spend_target": 12.25,
+        "lifetime_min_spend_target": 1000,
+    }
+    assert result["previous"] == {
+        "daily_spend_cap": 50.0,
+        "lifetime_spend_cap": 2000.0,
+        "daily_min_spend_target": 10.0,
+    }
+    assert result["previous_unavailable"] == {
+        "lifetime_min_spend_target": "Meta returned no value for it; it may not have been set.",
+    }
+    assert result["money_units"] == "major units of the ad account currency (USD)"
+
+
+def test_update_adset_spend_caps_zero_decimal_currency(monkeypatch) -> None:
+    client = MoneyAdsetClient(currency="JPY", stored={"account_id": "act_123", "daily_spend_cap": "5000"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="adset_1", daily_spend_cap=7000))
+    assert client.calls[-1] == ("update", "adset_1", {"daily_spend_cap": 7000})
+    assert result["previous"] == {"daily_spend_cap": 5000.0}
+
+
+def test_update_adset_spend_cap_with_other_fields_and_validate_only(monkeypatch) -> None:
+    client = MoneyAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(
+        adset_id="adset_1", status="PAUSED", daily_spend_cap=75, validate_only=True,
+    ))
+    assert client.calls[-1] == ("update", "adset_1", {
+        "status": "PAUSED", "daily_spend_cap": 7500, "execution_options": ["validate_only"],
+    })
+    assert result["previous"] == {"status": "ACTIVE", "daily_spend_cap": 50.0}
+    assert result["validation_only"] is True
+    assert result["applied"] is False
+
+
+def test_update_adset_without_money_does_not_read_currency(monkeypatch) -> None:
+    client = MoneyAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="adset_1", status="PAUSED"))
+    assert client.calls == [
+        ("get", "adset_1", ["id", "status"]),
+        ("update", "adset_1", {"status": "PAUSED"}),
+    ]
+    assert "money_units" not in result
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        MoneyAdsetClient(stored={"daily_spend_cap": "5000"}),
+        MoneyAdsetClient(currency_error=RuntimeError("currency read failed")),
+        MoneyAdsetClient(currency="XXX"),
+        MoneyAdsetClient(stored={"account_id": "123", "daily_spend_cap": "not-a-number"}),
+    ],
+)
+def test_update_adset_money_writes_nothing_when_conversion_cannot_be_trusted(monkeypatch, client) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(Exception):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", daily_spend_cap=20))
+    assert not [call for call in client.calls if call[0] == "update"]
+
+
+def test_update_adset_rejects_too_many_decimals_before_writing(monkeypatch) -> None:
+    client = MoneyAdsetClient(currency="JPY")
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="decimal places"):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", daily_spend_cap=10.5))
+    assert not [call for call in client.calls if call[0] == "update"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"daily_spend_cap": 0}, "daily_spend_cap must be greater than 0"),
+        ({"lifetime_min_spend_target": -5}, "lifetime_min_spend_target must be greater than 0"),
+        ({"daily_spend_cap": float("nan")}, "daily_spend_cap"),
+        ({"params": {"daily_spend_cap": 9000}}, "named daily_spend_cap parameter"),
+        ({"params": {"lifetime_spend_cap": 9000}}, "named lifetime_spend_cap parameter"),
+        ({"params": {"daily_min_spend_target": 9000}}, "named daily_min_spend_target parameter"),
+        ({"params": {"lifetime_min_spend_target": 9000}}, "named lifetime_min_spend_target parameter"),
+        ({"daily_spend_cap": 90, "params": {"daily_spend_cap": 9000}}, "daily_spend_cap"),
+        ({"params": {"bid_info": {"ACTIONS": 150}}}, "update_adset_bid_amount"),
+        ({"params": {"budget_schedule_specs": [{"budget_value": 100}]}}, "budget_schedule_specs"),
+        ({"status": "DELETED"}, "delete_adset"),
+        ({"status": "archived"}, "status must be"),
+    ],
+)
+def test_update_adset_money_and_status_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", **arguments))
+
+
+def test_update_adset_accepts_archived(monkeypatch) -> None:
+    client = FakeUpdateAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="adset_1", status="ARCHIVED"))
+    assert client.calls[1] == ("update", "adset_1", {"status": "ARCHIVED"})
+    assert result["previous"] == {"status": "PAUSED"}
+    assert result["current"] == {"status": "ARCHIVED"}
+    assert "cannot be restored to active from this server" in campaigns.update_adset.__doc__
+
+
+def test_update_adset_names_a_params_field_meta_did_not_return(monkeypatch) -> None:
+    """A changed field Meta omits from the pre-read is named, not reported as a null prior value."""
+    client = MoneyAdsetClient(stored={"name": "Old"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(
+        adset_id="adset_1", name="New",
+        params={"attribution_spec": [{"event_type": "CLICK_THROUGH", "window_days": 1}], "not_a_readable_field": 1},
+    ))
+    assert client.calls[0] == ("get", "adset_1", ["id", "name", "attribution_spec"])
+    assert result["previous"] == {"name": "Old"}
+    assert "attribution_spec" not in result["previous"]
+    assert result["previous_unavailable"] == {
+        "attribution_spec": "Meta returned no value for it; it may not have been set.",
+        "not_a_readable_field": "Not a field this server reads back from an ad set.",
+    }
+    assert result["previous_not_read"] == ["not_a_readable_field"]

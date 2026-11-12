@@ -281,16 +281,27 @@ _ADSET_MONEY_FIELD_TOOLS = {
     "daily_budget": "update_adset_budget",
     "lifetime_budget": "update_adset_budget",
     "bid_amount": "update_adset_bid_amount",
+    "bid_info": "update_adset_bid_amount",
     "bid_strategy": "update_adset_bid_strategy",
     "bid_constraints": "update_adset_bid_strategy",
 }
-_ADSET_MINOR_UNIT_FIELDS = {
+# Ad set spend caps and minimum spend targets: Meta stores them in the account
+# currency's minor units, like budgets. update_adset takes them as named
+# parameters in major units; inside params they would bypass that conversion.
+_ADSET_SPEND_FIELDS = (
     "daily_spend_cap",
     "lifetime_spend_cap",
     "daily_min_spend_target",
     "lifetime_min_spend_target",
+)
+_ADSET_UNSUPPORTED_MONEY_PARAMS = {
+    "budget_schedule_specs": (
+        "budget_schedule_specs carries budget amounts in minor units and is not supported by update_adset."
+    ),
 }
-_UPDATABLE_ADSET_STATUSES = {"ACTIVE", "PAUSED"}
+_UPDATABLE_ADSET_STATUSES = {"ACTIVE", "PAUSED", "ARCHIVED"}
+_OMITTED_PREVIOUS = "Meta returned no value for it; it may not have been set."
+_UNREAD_ADSET_PREVIOUS = "Not a field this server reads back from an ad set."
 _ADSET_TIME_FORMAT = "an ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00) or Unix seconds"
 
 
@@ -344,19 +355,36 @@ async def update_adset(
     status: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    daily_spend_cap: CurrencyAmount | None = None,
+    lifetime_spend_cap: CurrencyAmount | None = None,
+    daily_min_spend_target: CurrencyAmount | None = None,
+    lifetime_min_spend_target: CurrencyAmount | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object or status, with before/after. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec."""
+    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps or minimum spend targets, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     adset_id = blank_to_none(adset_id)
     if adset_id is None:
         raise ValidationError("adset_id is required.")
     for field_name, tool_name in _ADSET_MONEY_FIELD_TOOLS.items():
         if params and field_name in params:
             raise ValidationError(f"{field_name} cannot be changed with update_adset; use {tool_name}.")
-    blocked = sorted(_ADSET_MINOR_UNIT_FIELDS.intersection(params or {}))
-    if blocked:
-        raise ValidationError(
-            f"{', '.join(blocked)}: money fields in minor units are not supported by update_adset."
-        )
+    for field_name in _ADSET_SPEND_FIELDS:
+        if params and field_name in params:
+            raise ValidationError(
+                f"{field_name} in params would be read as minor units; use the named {field_name} "
+                "parameter, which takes major units of the account currency."
+            )
+    for field_name, message in _ADSET_UNSUPPORTED_MONEY_PARAMS.items():
+        if params and field_name in params:
+            raise ValidationError(message)
+    spend = {
+        "daily_spend_cap": daily_spend_cap,
+        "lifetime_spend_cap": lifetime_spend_cap,
+        "daily_min_spend_target": daily_min_spend_target,
+        "lifetime_min_spend_target": lifetime_min_spend_target,
+    }
+    spend = {key: value for key, value in spend.items() if value is not None}
+    for field_name, value in spend.items():
+        validate_positive_amount(value, field_name=field_name)
     if status is not None and status not in _UPDATABLE_ADSET_STATUSES:
         raise ValidationError(
             f"status must be one of {sorted(_UPDATABLE_ADSET_STATUSES)}; delete with delete_adset."
@@ -376,6 +404,7 @@ async def update_adset(
         "billing_event": billing_event,
         "promoted_object": promoted_object,
         "status": status,
+        **{field_name: spend.get(field_name) for field_name in _ADSET_SPEND_FIELDS},
     }
     payload: dict[str, Any] = {key: OMIT if value is None else value for key, value in typed.items()}
     add_validate_only(payload, validate_only=validate_only)
@@ -393,8 +422,20 @@ async def update_adset(
     elif new_end is not None and start_time is None:
         other_bound = "start_time"
     bound_reads = [other_bound] if other_bound and other_bound not in read_fields else []
+    account_read = ["account_id"] if spend else []
     client = get_graph_api_client()
-    previous = await client.get_object(adset_id, fields=["id", *read_fields, *bound_reads])
+    previous = await client.get_object(adset_id, fields=["id", *read_fields, *bound_reads, *account_read])
+    currency = await resolve_account_currency(client, previous.get("account_id")) if spend else None
+    for field_name, value in spend.items():
+        payload[field_name] = to_minor_units(value, currency, field_name=field_name)
+    previous_values = {key: previous[key] for key in read_fields if key in previous}
+    for field_name in _ADSET_SPEND_FIELDS:
+        if field_name in previous_values:
+            previous_values[field_name] = from_minor_units(
+                previous_values[field_name], currency, field_name=field_name
+            )
+    unavailable = {key: _OMITTED_PREVIOUS for key in read_fields if key not in previous}
+    unavailable.update({key: _UNREAD_ADSET_PREVIOUS for key in not_read})
     stored = _stored_adset_time(previous.get(other_bound)) if other_bound else None
     if stored is not None and other_bound == "end_time" and new_start is not None and new_start >= stored:
         raise ValidationError(
@@ -410,7 +451,7 @@ async def update_adset(
     response = mutation_response(
         action="update_adset",
         target={"adset_id": adset_id},
-        previous={key: previous.get(key) for key in read_fields},
+        previous=previous_values,
         current=changes,
     )
     response.update({
@@ -419,4 +460,8 @@ async def update_adset(
         "previous_not_read": not_read,
         "result": result,
     })
+    if unavailable:
+        response["previous_unavailable"] = unavailable
+    if spend:
+        response["money_units"] = f"major units of the ad account currency ({currency})"
     return response
