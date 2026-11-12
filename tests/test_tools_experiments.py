@@ -552,6 +552,29 @@ def test_create_lift_study_uses_campaign_cells_when_given(monkeypatch) -> None:
     assert payload["observation_end_time"] == FUTURE_END_TS + 7 * 86400
 
 
+def test_lift_cell_allocations_cannot_exceed_population(monkeypatch) -> None:
+    """F24: percentages are shares of the whole population, so two 90/10 cells (200%) are rejected."""
+    no_client(monkeypatch)
+    cells = [{"name": "A", "treatment_percentage": 90, "control_percentage": 10, "campaign_ids": ["c1"]},
+             {"name": "B", "treatment_percentage": 90, "control_percentage": 10, "campaign_ids": ["c2"]}]
+    with pytest.raises(experiments.ValidationError, match="total 200"):
+        run(_lift(cells=cells))
+
+
+@pytest.mark.parametrize("cells", [
+    # Meta's multi-cell example: A 50/20 and B 20/10, totalling 100.
+    [{"name": "A", "treatment_percentage": 50, "control_percentage": 20, "campaign_ids": ["c1"]},
+     {"name": "B", "treatment_percentage": 20, "control_percentage": 10, "campaign_ids": ["c2"]}],
+    # Documented under-allocation: three evenly split groups totalling 99.
+    [{"name": n, "treatment_percentage": 30, "control_percentage": 3, "campaign_ids": [f"c{n}"]}
+     for n in ("A", "B", "C")],
+])
+def test_lift_cell_allocations_at_or_under_population_are_sent(monkeypatch, cells) -> None:
+    client = use(monkeypatch, FakeStudyClient())
+    run(_lift(cells=cells))
+    assert client.kinds() == ["create"]
+
+
 @pytest.mark.parametrize("overrides", [
     {"start_time": "2026-11-01T00:00:00Z"},
     {"cells": [{"name": "T", "treatment_percentage": 80, "control_percentage": 10}]},

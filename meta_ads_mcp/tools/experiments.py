@@ -305,11 +305,13 @@ def _build_lift_cells(cells: list[dict[str, Any]], account_id: str) -> list[dict
     if len(cells) > MAX_CELLS_PER_STUDY:
         raise ValidationError(f"Meta allows at most {MAX_CELLS_PER_STUDY} cells per study.")
     built: list[dict[str, Any]] = []
+    population = 0.0
     for index, raw in enumerate(cells):
         cell = _check_cell_keys(raw, index, LIFT_CELL_KEYS)
         treatment = _percentage(cell.get("treatment_percentage"), label=f"cells[{index}].treatment_percentage")
         control = _percentage(cell.get("control_percentage"), label=f"cells[{index}].control_percentage")
         combined = round(treatment + control, 2)
+        population += treatment + control
         if combined > 100:
             raise ValidationError(
                 f"cells[{index}] treatment_percentage plus control_percentage is {combined:g}; it cannot exceed 100."
@@ -336,6 +338,11 @@ def _build_lift_cells(cells: list[dict[str, Any]], account_id: str) -> list[dict
         if cell.get("description"):
             payload["description"] = cell["description"]
         built.append(payload)
+    if round(population, 2) > 100:
+        raise ValidationError(
+            "Lift study percentages are shares of the whole study population: treatment_percentage plus "
+            f"control_percentage across all cells can total at most 100; these cells total {round(population, 2):g}."
+        )
     return built
 
 
@@ -910,7 +917,8 @@ async def create_lift_study(
     """Create a conversion lift study (holdout test). Meta limits lift studies to approved advertisers.
 
     cells: each {name, treatment_percentage, control_percentage, campaign_ids or ad_account_ids?};
-    a cell without ids measures the whole account. objectives: each {name, type (default
+    a cell without ids measures the whole account. Percentages are shares of the whole population,
+    so all cells' treatment and control together total at most 100. objectives: each {name, type (default
     CONVERSIONS), is_primary, adspixels or applications [{id, event_names}], ...}; one primary.
     start_time must be in the future. observation_end_time defaults to end_time.
     """
