@@ -592,3 +592,41 @@ def test_audience_users_file_errors_make_no_call(monkeypatch, tmp_path) -> None:
     with pytest.raises(audiences.ValidationError, match="EMAIL") as excinfo:
         asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=["EMAIL"], file_path=str(csv_path)))
     assert "secret@example.com" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("content", "line"),
+    [
+        # An unterminated quote would otherwise swallow the following records.
+        ('email,fn\n"valid@example.invalid,Alice\nnext@example.invalid,Bob\n', 2),
+        ('email,fn\nfirst@example.invalid,Ann\n"second@example.invalid"x,Bob\n', 3),
+    ],
+)
+@pytest.mark.parametrize("tool", USER_TOOLS)
+def test_audience_users_malformed_csv_is_rejected_before_upload(monkeypatch, tmp_path, tool, content, line) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    csv_path = tmp_path / "ragged.csv"
+    csv_path.write_text(content)
+    with pytest.raises(audiences.ValidationError, match=f"line {line}") as excinfo:
+        asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL", "FN"], file_path=str(csv_path)))
+    message = str(excinfo.value)
+    for value in ("valid@example.invalid", "next@example.invalid", "second@example.invalid", "Alice", "Bob", "Ann"):
+        assert value not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__
+
+
+def test_audience_users_csv_keeps_bom_header_matching_and_blank_columns(monkeypatch, tmp_path) -> None:
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    csv_path = tmp_path / "bom.csv"
+    csv_path.write_bytes('﻿Email,"First, Name",fn\n"a@example.com","x",Ann\nb@example.com,,\n\n'.encode("utf-8"))
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL", "FN"], file_path=str(csv_path),
+    ))
+    assert client.requests[0]["data"]["payload"]["data"] == [
+        [_sha("a@example.com"), _sha("ann")],
+        [_sha("b@example.com"), ""],
+    ]
+    assert result["rows_read"] == 2
+    assert result["invalid_values"] == 1

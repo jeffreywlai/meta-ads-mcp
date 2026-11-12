@@ -380,9 +380,12 @@ def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
     path = Path(file_path).expanduser()
     if not path.is_file():
         raise ValidationError("file_path must point to a readable file.")
+    lines_read = 0
     try:
         with path.open(newline="", encoding="utf-8-sig") as handle:
-            reader = csv.reader(handle)
+            # strict rejects malformed quoting (such as an unclosed quote) instead of
+            # silently merging the following lines into one different record.
+            reader = csv.reader(handle, strict=True)
             header = next(reader, None)
             if not header:
                 raise ValidationError("file_path has no header row.")
@@ -396,7 +399,9 @@ def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
                 )
             positions = [columns.index(key) for key in schema]
             rows: list[list[Any]] = []
+            lines_read = reader.line_num
             for record in reader:
+                lines_read = reader.line_num
                 if not any(cell.strip() for cell in record):
                     continue
                 rows.append([record[index] if index < len(record) else "" for index in positions])
@@ -404,7 +409,12 @@ def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
     except UnicodeDecodeError:
         raise ValidationError("file_path must be a UTF-8 encoded CSV file.") from None
     except csv.Error:
-        raise ValidationError("file_path could not be parsed as CSV.") from None
+        # Report only where the bad record starts; the parser's own message and the
+        # record's content are withheld because they can contain customer values.
+        raise ValidationError(
+            f"file_path is not valid CSV: the record starting on line {lines_read + 1} is malformed "
+            "(for example an unclosed or misplaced quote). Nothing was uploaded."
+        ) from None
 
 
 def _hash_rows(
