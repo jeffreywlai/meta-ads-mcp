@@ -972,6 +972,51 @@ def _previous_study(previous: dict[str, Any], state: str) -> dict[str, Any]:
     }
 
 
+def _stored_unix(study: dict[str, Any], key: str) -> int | None:
+    parsed = _parse_meta_time(study.get(key))
+    return None if parsed is None else int(parsed.timestamp())
+
+
+def _check_effective_times(
+    previous: dict[str, Any],
+    start: int | None,
+    end: int | None,
+    observation_end: int | None,
+) -> None:
+    """Validate the times the study would have after the edit, filling unchanged bounds from the pre-read."""
+    if start is None and end is None and observation_end is None:
+        return
+    effective_start = start if start is not None else _stored_unix(previous, "start_time")
+    effective_end = end if end is not None else _stored_unix(previous, "end_time")
+    if (
+        (start is not None or end is not None)
+        and effective_start is not None
+        and effective_end is not None
+        and effective_end <= effective_start
+    ):
+        raise ValidationError(
+            f"After this edit the study would start at {_iso(effective_start)} and end at "
+            f"{_iso(effective_end)}; end_time must be after start_time. Unchanged times are "
+            "taken from the study's current values."
+        )
+    stored_observation = _stored_unix(previous, "observation_end_time")
+    is_lift = str(previous.get("type") or "").upper() == "LIFT"
+    effective_observation = (
+        observation_end if observation_end is not None else (stored_observation if is_lift else None)
+    )
+    if (
+        (end is not None or observation_end is not None)
+        and effective_observation is not None
+        and effective_end is not None
+        and effective_observation < effective_end
+    ):
+        raise ValidationError(
+            f"After this edit observation_end_time ({_iso(effective_observation)}) would be before "
+            f"end_time ({_iso(effective_end)}); Meta's lift guide sets observation_end_time at or after "
+            "end_time. Pass a later observation_end_time in params as well."
+        )
+
+
 @mcp_server.tool()
 async def update_ad_study(
     study_id: str,
@@ -1006,6 +1051,11 @@ async def update_ad_study(
         raise ValidationError("At least one field must be provided for update_ad_study.")
     if start is not None and end is not None and end <= start:
         raise ValidationError("end_time must be after start_time.")
+    observation_end = (
+        _to_unix(payload["observation_end_time"], "params.observation_end_time")
+        if payload.get("observation_end_time") is not None
+        else None
+    )
     client = get_graph_api_client()
     previous = await client.get_object(study_id, fields=STUDY_WRITE_READ_FIELDS)
     now = _now()
@@ -1018,6 +1068,7 @@ async def update_ad_study(
             raise ValidationError(f"end_time can only change before a study ends; this study is {state}.")
         if end <= int(now.timestamp()):
             raise ValidationError("end_time must be in the future; use cancel_ad_study to end a study now.")
+    _check_effective_times(previous, start, end, observation_end)
     await client.update_object(study_id, data=payload)
     current = {
         key: _iso(value) if key in {"start_time", "end_time"} and isinstance(value, int) else value

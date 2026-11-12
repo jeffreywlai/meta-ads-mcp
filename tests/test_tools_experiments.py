@@ -638,6 +638,51 @@ def test_update_ad_study_rejects_past_end_time(monkeypatch) -> None:
     assert client.kinds() == ["get"]
 
 
+SCHEDULED_STUDY = {
+    "id": "study_1", "name": "Planned", "type": "SPLIT_TEST",
+    "start_time": "2026-12-01T00:00:00+0000", "end_time": "2026-12-15T00:00:00+0000",
+}
+SCHEDULED_LIFT = {
+    **SCHEDULED_STUDY, "type": "LIFT", "observation_end_time": "2026-12-15T00:00:00+0000",
+}
+
+
+@pytest.mark.parametrize(("study", "kwargs"), [
+    # F23: new start after the stored end.
+    (SCHEDULED_STUDY, {"start_time": "2026-12-20T00:00:00Z"}),
+    # F23: new end before the stored (future) start.
+    (SCHEDULED_STUDY, {"end_time": "2026-11-20T00:00:00Z"}),
+    # Lift study: new end past the stored observation end with no new observation end.
+    (SCHEDULED_LIFT, {"end_time": "2026-12-20T00:00:00Z"}),
+    # Lift study: an observation end supplied in params that is before the new end.
+    (SCHEDULED_LIFT, {"end_time": "2026-12-20T00:00:00Z",
+                      "params": {"observation_end_time": "2026-12-18T00:00:00Z"}}),
+])
+def test_update_study_one_sided_edit_is_checked_against_stored_values(monkeypatch, study, kwargs) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    with pytest.raises(experiments.ValidationError):
+        run(experiments.update_ad_study(study_id="study_1", **kwargs))
+    assert client.kinds() == ["get"]
+
+
+@pytest.mark.parametrize(("study", "kwargs"), [
+    (SCHEDULED_STUDY, {"start_time": "2026-12-10T00:00:00Z"}),
+    (SCHEDULED_STUDY, {"end_time": "2026-12-20T00:00:00Z"}),
+    (SCHEDULED_LIFT, {"end_time": "2026-12-20T00:00:00Z",
+                      "params": {"observation_end_time": "2026-12-27T00:00:00Z"}}),
+])
+def test_update_study_valid_one_sided_edit_is_sent(monkeypatch, study, kwargs) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": study}))
+    run(experiments.update_ad_study(study_id="study_1", **kwargs))
+    assert client.kinds() == ["get", "update"]
+
+
+def test_update_study_bad_params_observation_end_fails_before_network(monkeypatch) -> None:
+    no_client(monkeypatch)
+    with pytest.raises(experiments.ValidationError, match="observation_end_time"):
+        run(experiments.update_ad_study(study_id="study_1", params={"observation_end_time": "soon"}))
+
+
 def test_update_ad_study_passes_params_and_reports_them(monkeypatch) -> None:
     client = use(monkeypatch, FakeStudyClient(objects={"study_1": RUNNING_STUDY}))
     result = run(experiments.update_ad_study(study_id="study_1", params={"confidence_level": 0.8}))
