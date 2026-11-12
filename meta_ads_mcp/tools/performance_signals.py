@@ -314,12 +314,30 @@ async def _daily_rows(level: str, object_id: str, start: date, end: date) -> lis
     return rows
 
 
-_INPUT_SOURCES = {
+# Two separate rules govern a value a row does not report:
+# - Delivery inputs (spend, impressions, clicks) are reported by Meta on every row it returns. A row
+#   that lacks one is missing data, so the period's total, and every ratio built on it, is unknown.
+# - Action inputs (results, conversion value) are deliberately different: Meta omits an action that
+#   did not happen, so once any row in the window reports the action, a row without it counts as zero.
+_DELIVERY_INPUT_SOURCES = {
     "spend": "spend",
     "impressions": "impressions",
     "clicks": "clicks",
+}
+_ACTION_INPUT_SOURCES = {
     "results": "conversions",
     "conversion_value": "conversion_value",
+}
+_INPUT_SOURCES = {**_DELIVERY_INPUT_SOURCES, **_ACTION_INPUT_SOURCES}
+INPUT_POLICY = {
+    "delivery_inputs": (
+        "spend, impressions and clicks: when any row in a period lacks the value, the period's total is null and "
+        "every metric that needs it (CPC, CPM, CTR, cost per result, ROAS, conversion rate) is null for that period."
+    ),
+    "action_inputs": (
+        "results and conversion value: Meta omits actions that did not happen, so once any row in the window reports "
+        "the action, a row without it counts as zero; when no row reports it, it is null."
+    ),
 }
 
 
@@ -335,14 +353,32 @@ def _known_inputs(rows: list[dict[str, Any]]) -> set[str]:
 
 
 def _period_inputs(rows: list[dict[str, Any]], known: set[str]) -> dict[str, float | None]:
-    """Sum additive inputs; inputs no row in the window reports stay unknown."""
+    """Sum additive inputs under INPUT_POLICY: a missing delivery input makes the total unknown;
+    a missing action input counts as zero only when some row in the window reports that action."""
     totals: dict[str, float | None] = {}
-    for name, source in _INPUT_SOURCES.items():
+    for name, source in _DELIVERY_INPUT_SOURCES.items():
+        values = [to_float((row.get("metrics") or {}).get(source)) for row in rows]
+        totals[name] = None if not values or any(value is None for value in values) else sum(values)
+    for name, source in _ACTION_INPUT_SOURCES.items():
         if name not in known:
             totals[name] = None
             continue
         totals[name] = sum(to_float((row.get("metrics") or {}).get(source)) or 0.0 for row in rows)
     return totals
+
+
+def _missing_delivery_signal(periods: list[tuple[str, dict[str, float | None]]], unit: str) -> list[str]:
+    """Describe periods whose delivery inputs were missing from Meta's rows."""
+    affected: dict[str, list[str]] = {}
+    for label, inputs in periods:
+        for name in _DELIVERY_INPUT_SOURCES:
+            if inputs.get(name) is None:
+                affected.setdefault(name, []).append(label)
+    return [
+        f"{name}: {len(labels)} {unit}(s) had a row without {name} (first {labels[0]}), so metrics that need it are "
+        "null there rather than computed from zero."
+        for name, labels in affected.items()
+    ]
 
 
 def _ratio(numerator: float | None, denominator: float | None, scale: float = 1.0) -> float | None:
@@ -474,6 +510,9 @@ async def get_performance_trend(
         )
     if rows and "conversion_value" not in known:
         missing_signals.append("No purchase value was reported, so ROAS is null.")
+    missing_signals.extend(
+        _missing_delivery_signal([(period["period_start"], period["inputs"]) for period in periods], "period")
+    )
 
     return analysis_response(
         scope={"level": resolved_level, "object_id": resolved_object_id},
@@ -487,10 +526,11 @@ async def get_performance_trend(
             "changes": {name: _first_to_last(name, periods) for name in metric_names},
             "metric_definitions": {name: METRIC_DEFINITIONS[name] for name in metric_names},
             "results_definition": RESULTS_DEFINITION,
+            "input_policy": INPUT_POLICY,
             "method": (
-                "Daily rows are read with time_increment=1, additive inputs are summed per period, and each metric is "
-                "divided from those sums. Direction compares the first and last periods with a value; partial periods "
-                "are flagged and are not scaled."
+                "Daily rows are read with time_increment=1, additive inputs are summed per period under input_policy, "
+                "and each metric is divided from those sums. Direction compares the first and last periods with a "
+                "value; partial periods are flagged and are not scaled."
             ),
             "daily_rows_returned": len(rows),
         },
@@ -578,9 +618,12 @@ async def detect_performance_anomalies(
     rows = await _daily_rows(resolved_level, resolved_object_id, baseline_start, end)
     known = _known_inputs(rows)
     daily: dict[date, dict[str, float | None]] = {}
+    daily_inputs: list[tuple[str, dict[str, float | None]]] = []
     for row in rows:
         day = _parse_date(str(row["date_start"]), field="date_start")
-        daily[day] = _derived_metrics(_period_inputs([row], known))
+        inputs = _period_inputs([row], known)
+        daily_inputs.append((day.isoformat(), inputs))
+        daily[day] = _derived_metrics(inputs)
     baseline_dates = sorted(day for day in daily if baseline_start <= day <= baseline_end)
     lookback_dates = [lookback_start + timedelta(days=offset) for offset in range(lookback_days)]
     rule = _anomaly_rule(resolved_sensitivity, multiplier)
@@ -615,6 +658,7 @@ async def detect_performance_anomalies(
                 "baseline_rows": len(baseline_dates),
                 "lookback_rows": sum(1 for day in lookback_dates if day in daily),
                 "results_definition": RESULTS_DEFINITION,
+                "input_policy": INPUT_POLICY,
             },
         )
 
@@ -703,6 +747,7 @@ async def detect_performance_anomalies(
             status["status"] = "no_lookback_data"
             missing_signals.append(f"{metric}: no lookback day has a value.")
 
+    missing_signals.extend(_missing_delivery_signal(daily_inputs, "day"))
     anomalies.sort(key=lambda anomaly: (-abs(anomaly["robust_score"]), anomaly["day"], anomaly["metric"]))
     findings: list[dict[str, Any]] = []
     for anomaly in anomalies:
@@ -766,6 +811,7 @@ async def detect_performance_anomalies(
             "lookback_rows": sum(1 for day in lookback_dates if day in daily),
             "metric_definitions": {name: METRIC_DEFINITIONS[name] for name in metric_names},
             "results_definition": RESULTS_DEFINITION,
+            "input_policy": INPUT_POLICY,
         },
     )
 

@@ -361,6 +361,77 @@ def test_trend_zero_denominators_yield_null_not_error(monkeypatch) -> None:
     assert no_click_day["conversion_rate"] is None
 
 
+def test_trend_missing_delivery_input_makes_ratios_unknown_not_zero(monkeypatch) -> None:
+    no_spend = _day_row("2026-11-02", spend=0, impressions=1000, clicks=10, purchases=1, purchase_value=40)
+    del no_spend["spend"]
+    no_impressions = _day_row("2026-11-03", spend=30, impressions=0, clicks=10)
+    del no_impressions["impressions"]
+    rows = [
+        _day_row("2026-11-01", spend=100, impressions=1000, clicks=10, purchases=2, purchase_value=200),
+        no_spend,
+        no_impressions,
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(
+        performance_signals.get_performance_trend(
+            level="campaign", object_id="cmp_1", since="2026-11-01", until="2026-11-03",
+            metrics=["cpc", "cpm", "ctr", "cost_per_result", "roas", "conversion_rate"],
+        )
+    )
+
+    day2 = result["periods"][1]
+    assert day2["inputs"]["spend"] is None
+    assert day2["metrics"]["cpc"] is None
+    assert day2["metrics"]["cpm"] is None
+    assert day2["metrics"]["cost_per_result"] is None
+    assert day2["metrics"]["roas"] is None
+    assert day2["metrics"]["ctr"] == pytest.approx(0.01)
+    day3 = result["periods"][2]
+    assert day3["inputs"]["impressions"] is None
+    assert day3["metrics"]["cpm"] is None and day3["metrics"]["ctr"] is None
+    assert day3["metrics"]["cpc"] == pytest.approx(3.0)
+    # The absent-action rule is separate: day 3 reports no purchase, so results count as zero.
+    assert day3["inputs"]["results"] == 0.0
+    assert day3["metrics"]["conversion_rate"] == 0.0
+    assert result["changes"]["cpc"]["last_period"] == "2026-11-03"
+    policy = result["input_policy"]
+    assert "spend" in policy["delivery_inputs"] and "null" in policy["delivery_inputs"]
+    assert "zero" in policy["action_inputs"]
+    assert any(signal.startswith("spend: 1 period(s)") for signal in result["missing_signals"])
+    assert any(signal.startswith("impressions: 1 period(s)") for signal in result["missing_signals"])
+
+
+def test_weekly_period_with_one_day_missing_spend_is_unknown(monkeypatch) -> None:
+    no_spend = _day_row("2026-11-05", spend=0, impressions=1000, clicks=10)
+    del no_spend["spend"]
+    rows = [_day_row("2026-11-04", spend=10, impressions=1000, clicks=10), no_spend]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(
+        performance_signals.get_performance_trend(
+            level="adset", object_id="as_1", since="2026-11-04", until="2026-11-05", granularity="week",
+            metrics=["cpc"],
+        )
+    )
+    assert result["periods"][0]["inputs"]["spend"] is None
+    assert result["periods"][0]["metrics"]["cpc"] is None
+
+
+def test_anomalies_day_missing_spend_is_not_scored(monkeypatch) -> None:
+    rows = _spike_rows()
+    del rows[-1]["spend"]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(
+        performance_signals.detect_performance_anomalies(
+            level="campaign", object_id="cmp_1", metrics=["spend", "cpc"], lookback_days=1, baseline_days=14,
+            end_date="2026-11-15",
+        )
+    )
+    assert result["anomalies"] == []
+    assert result["metric_status"]["cpc"]["days_without_data"] == 1
+    assert "delivery_inputs" in result["input_policy"]
+
+
 def test_trend_weekly_buckets_are_derived_from_sums_and_marked_partial(monkeypatch) -> None:
     rows = [
         _day_row("2026-11-04", spend=10, impressions=1000, clicks=10, purchases=1, purchase_value=30),
