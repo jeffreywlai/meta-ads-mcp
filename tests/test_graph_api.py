@@ -886,3 +886,65 @@ def test_close_graph_api_clients_closes_pooled_clients(monkeypatch: pytest.Monke
     asyncio.run(close_graph_api_clients())
     assert FakeAsyncClient.instances[0].is_closed is True
     assert _CLIENT_POOL == {}
+
+
+class _RecordingClient(FakeAsyncClient):
+    """Records every outbound request so tests can prove none was sent."""
+
+    sent: list[dict[str, object]] = []
+
+    async def request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        _RecordingClient.sent.append(kwargs)
+        return FakeResponse(200, {"id": "1"})
+
+
+@pytest.fixture
+def recording_client(monkeypatch):
+    _RecordingClient.sent = []
+    asyncio.run(close_graph_api_clients())
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", _RecordingClient)
+    yield _RecordingClient
+    asyncio.run(close_graph_api_clients())
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "123?method=delete",
+        "123/products?method=delete",
+        "123#fragment",
+        "123/../456",
+        "123/./456",
+        "123 456",
+        "123%3Fmethod%3Ddelete",
+        "123//products",
+        "123\\products",
+        "123&method=delete",
+        "123;method=delete",
+        "",
+    ],
+)
+def test_request_rejects_endpoints_that_could_change_the_request(recording_client, endpoint) -> None:
+    """A caller-supplied id must never be able to add a query string or change the path."""
+    with pytest.raises(ValidationError):
+        asyncio.run(_client().request("GET", endpoint))
+    assert recording_client.sent == []
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["me", "act_123", "act_123/insights", "123_456/comments", "oauth/access_token",
+     "debug_token", "/act_123/adimages", "17841400000000000/media", "dataset_quality"],
+)
+def test_request_accepts_ordinary_graph_endpoints(recording_client, endpoint) -> None:
+    asyncio.run(_client().request("GET", endpoint))
+    assert len(recording_client.sent) == 1
+
+
+@pytest.mark.parametrize("key", ["method", "METHOD", " Method "])
+@pytest.mark.parametrize("http_method,kind", [("GET", "params"), ("POST", "data"), ("POST", "params"), ("DELETE", "params")])
+def test_request_rejects_http_method_override(recording_client, key, http_method, kind) -> None:
+    """Graph honors a `method` parameter that turns a read into a delete; never send one."""
+    with pytest.raises(ValidationError, match="method"):
+        asyncio.run(_client().request(http_method, "123", **{kind: {key: "delete"}}))
+    assert recording_client.sent == []

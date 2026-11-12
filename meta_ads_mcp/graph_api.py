@@ -43,6 +43,39 @@ USAGE_HEADER_NAMES = (
 )
 
 
+# One Graph path segment: an object id, "me", "act_<id>", or an edge name.
+_ENDPOINT_SEGMENT = re.compile(r"[A-Za-z0-9_.:\-]+")
+
+
+def _validate_endpoint(endpoint: str) -> None:
+    """Refuse an endpoint that could add a query string or change the path.
+
+    Object ids come from tool callers. An id such as ``123?method=delete``
+    would otherwise turn a read into a delete, because Graph honors a
+    ``method`` query parameter as an HTTP method override.
+    """
+    segments = endpoint.strip("/").split("/") if isinstance(endpoint, str) else [""]
+    if any(
+        segment in {".", ".."} or _ENDPOINT_SEGMENT.fullmatch(segment) is None
+        for segment in segments
+    ):
+        raise ValidationError(
+            "Graph object ids and edge names may contain only letters, digits, "
+            "'_', '-', '.' and ':'."
+        )
+
+
+def _reject_method_override(mapping: dict[str, Any] | None, kind: str) -> None:
+    """Refuse a ``method`` parameter, which Graph treats as an HTTP method override."""
+    if not mapping:
+        return
+    if any(isinstance(key, str) and key.strip().casefold() == "method" for key in mapping):
+        raise ValidationError(
+            f"A 'method' entry is not allowed in request {kind}: Graph would treat it "
+            "as an HTTP method override."
+        )
+
+
 def normalize_account_id(account_id: str) -> str:
     """Ensure account ids use the Graph API act_ prefix."""
     return account_id if account_id.startswith("act_") else f"act_{account_id}"
@@ -232,6 +265,9 @@ class GraphAPIClient:
         use_auth_header: bool = True,
     ) -> dict[str, Any]:
         """Make a Graph API request with basic retries."""
+        _validate_endpoint(endpoint)
+        _reject_method_override(params, "params")
+        _reject_method_override(data, "data")
         headers = {"User-Agent": USER_AGENT}
         effective_access_token: str | None = None
         if use_auth_header:
