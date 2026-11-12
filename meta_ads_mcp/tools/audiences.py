@@ -282,11 +282,6 @@ AUDIENCE_USERS_INLINE_ROW_LIMIT = 1_000
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-_REDACT_PATTERNS = (
-    re.compile(r"[0-9a-fA-F]{32,}"),
-    re.compile(r"[^\s@'\"<>(),;:]+@[^\s@'\"<>(),;:]+"),
-    re.compile(r"\+?\d[\d\s().-]{5,}\d"),
-)
 
 
 # Each normalizer below follows Meta's customer-list normalization table
@@ -497,10 +492,9 @@ def _hash_rows(
     schema: list[str],
     *,
     pre_hashed: bool,
-) -> tuple[list[list[str]], list[list[str]], int, int]:
-    """Return rows to send, their raw values (for redaction only), invalid value count and dropped rows."""
+) -> tuple[list[list[str]], int, int]:
+    """Return rows to send, the invalid value count and the number of dropped rows."""
     prepared: list[list[str]] = []
-    raw_values: list[list[str]] = []
     invalid = 0
     dropped = 0
     for row_number, row in enumerate(rows, start=1):
@@ -542,23 +536,13 @@ def _hash_rows(
             sent.append(digest)
         if any(sent):
             prepared.append(sent)
-            raw_values.append([str(value).strip() for value in row if value])
         else:
             dropped += 1
-    return prepared, raw_values, invalid, dropped
+    return prepared, invalid, dropped
 
 
-def _redact(text: Any, secrets_in_batch: list[str]) -> str | None:
-    """Remove anything that could be an uploaded value or hash from upstream error text."""
-    if text is None:
-        return None
-    redacted = str(text)
-    for secret in sorted(secrets_in_batch, key=len, reverse=True):
-        if len(secret) >= 3:
-            redacted = re.sub(re.escape(secret), "[redacted]", redacted, flags=re.IGNORECASE)
-    for pattern in _REDACT_PATTERNS:
-        redacted = pattern.sub("[redacted]", redacted)
-    return redacted
+def _safe_int(value: Any) -> int | None:
+    return value if _is_count(value) else None
 
 
 def _sanitized_upload_error(
@@ -567,38 +551,47 @@ def _sanitized_upload_error(
     action: str,
     batch_seq: int,
     total_batches: int,
+    rows_accepted: int,
     session_id: int,
-    batch_secrets: list[str],
 ) -> Exception:
-    """Rebuild an upload failure without any row value, hash, or upstream payload."""
+    """Rebuild an upload failure from structured facts only.
+
+    Meta's free-text fields (message, user title and message, error data, trace
+    and operation) can quote any uploaded value, raw, normalized or hashed, from
+    this batch or an earlier one, and no text scrubbing can be shown to catch
+    them all. They are withheld; only Meta's numeric code and subcode, the HTTP
+    status, whether a retry is safe, and the upload progress are kept.
+    """
     accepted = batch_seq - 1
     progress = (
         f"{action} failed on batch {batch_seq} of {total_batches} in session {session_id}; "
-        f"{accepted} earlier batch{'es were' if accepted != 1 else ' was'} accepted by Meta. "
+        f"{accepted} earlier batch{'es' if accepted != 1 else ''} with {rows_accepted} "
+        f"row{'s' if rows_accepted != 1 else ''} {'were' if accepted != 1 else 'was'} accepted by Meta. "
         "Meta closes an unfinished session automatically after 90 minutes."
     )
+    withheld = "Meta's error text is withheld because it can quote uploaded customer values."
     if isinstance(exc, RateLimitError):
+        retry_after = exc.retry_after_seconds
         return RateLimitError(
-            f"{progress} Meta rate limit: {_redact(exc.message, batch_secrets)}",
-            retry_after_seconds=exc.retry_after_seconds,
-            code=exc.code,
-            subcode=exc.subcode,
-            usage=exc.usage,
-            operation=exc.operation,
+            f"{progress} Meta rate limit. {withheld}",
+            retry_after_seconds=float(retry_after)
+            if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+            else None,
+            code=_safe_int(exc.code),
+            subcode=_safe_int(exc.subcode),
         )
     if isinstance(exc, MetaApiError):
+        retry_after = exc.retry_after_seconds
         return MetaApiError(
-            message=f"{progress} Meta said: {_redact(exc.message, batch_secrets)}",
-            status_code=exc.status_code,
-            code=exc.code,
-            subcode=exc.subcode,
-            user_title=_redact(exc.user_title, batch_secrets),
-            user_message=_redact(exc.user_message, batch_secrets),
-            is_transient=exc.is_transient,
-            trace_id=exc.trace_id,
-            operation=exc.operation,
-            retry_after_seconds=exc.retry_after_seconds,
-            mutation_outcome_unknown=exc.mutation_outcome_unknown,
+            message=f"{progress} {withheld}",
+            status_code=_safe_int(exc.status_code),
+            code=_safe_int(exc.code),
+            subcode=_safe_int(exc.subcode),
+            is_transient=exc.is_transient if isinstance(exc.is_transient, bool) else None,
+            retry_after_seconds=float(retry_after)
+            if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+            else None,
+            mutation_outcome_unknown=exc.mutation_outcome_unknown is True,
         )
     return MetaApiError(
         message=f"{progress} The request failed ({type(exc).__name__}); details are withheld because they can contain uploaded values.",
@@ -659,20 +652,21 @@ async def _send_audience_users(
         source_rows: list[Any] = rows
     else:
         source_rows = _read_customer_csv(file_path, keys)
-    prepared, raw_values, invalid, dropped = _hash_rows(source_rows, keys, pre_hashed=pre_hashed)
+    prepared, invalid, dropped = _hash_rows(source_rows, keys, pre_hashed=pre_hashed)
     if not prepared:
         raise ValidationError(
             f"No valid values to send: all {len(source_rows)} rows were blank or failed normalization."
         )
     batches = [
-        (prepared[start:start + AUDIENCE_USERS_BATCH_SIZE], raw_values[start:start + AUDIENCE_USERS_BATCH_SIZE])
+        prepared[start:start + AUDIENCE_USERS_BATCH_SIZE]
         for start in range(0, len(prepared), AUDIENCE_USERS_BATCH_SIZE)
     ]
     session_id = secrets.randbelow(2**62) + 1
     client = get_graph_api_client()
     send = client.create_edge_object if action == "add_audience_users" else client.delete_edge_object
     batch_results: list[dict[str, Any]] = []
-    for batch_seq, (batch, batch_raw) in enumerate(batches, start=1):
+    rows_accepted = 0
+    for batch_seq, batch in enumerate(batches, start=1):
         data = {
             "payload": {"schema": keys, "data": batch},
             "session": {
@@ -686,14 +680,13 @@ async def _send_audience_users(
         try:
             result = await send(audience_id, "users", data=data)
         except Exception as exc:
-            batch_secrets = [value for row in batch_raw for value in row] + [value for row in batch for value in row if value]
             failure = _sanitized_upload_error(
                 exc,
                 action=action,
                 batch_seq=batch_seq,
                 total_batches=len(batches),
+                rows_accepted=rows_accepted,
                 session_id=session_id,
-                batch_secrets=batch_secrets,
             )
         if failure is not None:
             # Raised outside the except block so the original error, which can
@@ -704,6 +697,7 @@ async def _send_audience_users(
             for key in ("num_received", "num_invalid_entries")
         }
         batch_results.append({"batch_seq": batch_seq, "rows_sent": len(batch), **counts})
+        rows_accepted += len(batch)
     return {
         "ok": True,
         "action": action,

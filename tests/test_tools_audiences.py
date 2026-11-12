@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
+
 import pytest
 
 from meta_ads_mcp.tools import audiences
@@ -560,6 +562,104 @@ def test_audience_users_never_echo_rows(monkeypatch, caplog, tool) -> None:
         assert raw not in str(tool_error.value) and digest not in str(tool_error.value)
 
     assert raw not in caplog.text and digest not in caplog.text
+
+
+def _rendered_chain(error: BaseException) -> str:
+    """Render an exception, its public payload and every chained cause and context."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts += [str(current), repr(current), json.dumps(getattr(current, "to_public_dict", lambda: {})())]
+        pending += [current.__cause__, current.__context__]
+    return "\n".join(parts)
+
+
+def _contains_value(text: str, value: str) -> bool:
+    """True when value appears in text as a whole token, ignoring case (short values such as "m" included)."""
+    return re.search(rf"(?<![^\W_]){re.escape(value)}(?![^\W_])", text, flags=re.IGNORECASE) is not None
+
+
+def _echoing_errors(values: list[str]) -> list[Exception]:
+    text = " ".join(f"'{value}'" for value in values)
+    return [
+        audiences.MetaApiError(
+            message=f"Invalid customer value: {text}", status_code=400, code=100, subcode=1870053,
+            user_title=f"Bad {text}", user_message=f"Check {text}", trace_id=f"trace {text}",
+            error_data={"sample": text}, details={"error": {"message": text}}, operation=f"op {text}",
+            is_transient=False,
+        ),
+        audiences.RateLimitError(
+            message=f"Too many calls for {text}", retry_after_seconds=60.0, code=17, subcode=2446079,
+            usage={"echo": text}, operation=f"op {text}",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize(
+    ("schema", "raw", "normalized"),
+    [
+        (["FN"], "Li", "li"),
+        (["GEN"], "m", "m"),
+        (["DOBM"], "3", "03"),
+        (["FN"], "Zoë-Ann", "zoëann"),
+        (["CT"], "Saint-Étienne", "saintetienne"),
+    ],
+)
+def test_audience_users_upload_errors_withhold_meta_text(monkeypatch, caplog, tool, schema, raw, normalized) -> None:
+    caplog.set_level(logging.DEBUG)
+    for error, expected_type in zip(_echoing_errors([raw, normalized, _sha(normalized)]), ["meta_api", "rate_limit"]):
+        client = FakeUsersClient(fail_on_batch=1, error=error)
+        monkeypatch.setattr(audiences, "get_graph_api_client", lambda client=client: client)
+        with pytest.raises((audiences.MetaApiError, audiences.RateLimitError)) as excinfo:
+            asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=schema, rows=[[raw]]))
+        rendered = _rendered_chain(excinfo.value)
+        for value in (raw, normalized, _sha(normalized)):
+            assert not _contains_value(rendered, value)
+        public = excinfo.value.to_public_dict()
+        assert public["type"] == expected_type
+        assert (public["code"], public["subcode"]) == ((100, 1870053) if expected_type == "meta_api" else (17, 2446079))
+        assert {"user_title", "user_message", "trace_id", "error_data", "usage", "operation"}.isdisjoint(public)
+        assert "batch 1 of 1" in public["message"] and "0 rows" in public["message"]
+    assert not _contains_value(caplog.text, raw) and not _contains_value(caplog.text, normalized)
+
+
+def test_audience_users_error_withholds_values_from_earlier_batches(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+    error = audiences.MetaApiError(
+        message="Session failed for customer Rosalind and rosalind", code=2650, subcode=1870148,
+        status_code=400, is_transient=True,
+    )
+    client = FakeUsersClient(fail_on_batch=2, error=error)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    with pytest.raises(audiences.MetaApiError) as excinfo:
+        asyncio.run(audiences.add_audience_users(
+            audience_id="aud_1", schema=["FN"], rows=[["Rosalind"], ["Maxwell"]],
+        ))
+    rendered = _rendered_chain(excinfo.value)
+    assert "rosalind" not in rendered.lower() and "maxwell" not in rendered.lower()
+    public = excinfo.value.to_public_dict()
+    assert public["retryable"] is True
+    assert (public["code"], public["subcode"], public["status_code"]) == (2650, 1870148, 400)
+    assert "batch 2 of 2" in public["message"] and "1 earlier batch" in public["message"]
+    assert "1 rows" in public["message"] or "1 row " in public["message"]
+
+
+def test_audience_users_transport_error_is_withheld(monkeypatch) -> None:
+    raw = "ab@example.com"
+    client = FakeUsersClient(fail_on_batch=1, error=RuntimeError(f"connection reset while sending {raw} {_sha(raw)}"))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    with pytest.raises(audiences.MetaApiError) as excinfo:
+        asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=["EMAIL"], rows=[[raw]]))
+    rendered = _rendered_chain(excinfo.value)
+    assert raw not in rendered and _sha(raw) not in rendered
+    assert excinfo.value.mutation_outcome_unknown is True
+    assert "RuntimeError" in str(excinfo.value)
 
 
 def test_audience_users_error_mid_upload_reports_progress(monkeypatch) -> None:
