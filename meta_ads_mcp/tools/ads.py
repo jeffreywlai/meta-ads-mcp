@@ -17,6 +17,7 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
+from meta_ads_mcp.tools.campaigns import reject_named_and_params, validate_adlabels
 from meta_ads_mcp.tool_types import CurrencyAmount, StrictStringList, coerce_strict_csv_string_list
 
 AD_IMAGE_FIELDS = [
@@ -167,12 +168,34 @@ async def create_ad(
     tracking_specs: list[dict[str, Any]] | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    conversion_domain: str | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
+    creative_spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad from a top-level or nested creative id."""
+    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. A named parameter and the same key inside params cannot both be given."""
+    reject_named_and_params({"conversion_domain": conversion_domain, "adlabels": adlabels}, params)
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
     if bid_amount is not None:
         validate_positive_amount(bid_amount, field_name="bid_amount")
+    if conversion_domain is not None:
+        if not isinstance(conversion_domain, str) or not conversion_domain.strip():
+            raise ValidationError("conversion_domain must not be blank.")
+        if any(character in conversion_domain for character in ":/?# "):
+            raise ValidationError("conversion_domain takes the domain only, such as example.com, not a URL.")
+    if adlabels is not None:
+        validate_adlabels(adlabels)
+    if creative_spec is not None:
+        if creative_id is not None or creative is not None:
+            raise ValidationError("Provide exactly one of creative_id, creative or creative_spec.")
+        if not isinstance(creative_spec, dict) or not creative_spec:
+            raise ValidationError("creative_spec must not be empty.")
+        if {"creative_id", "id"} & set(creative_spec):
+            raise ValidationError("creative_spec is for a new creative; to use an existing one, use creative_id.")
+        return await _create_ad(
+            account_id, name, adset_id, creative_spec, status, bid_amount, tracking_specs,
+            conversion_domain, adlabels, validate_only, params,
+        )
     nested_creative_id: str | None = None
     if creative is not None:
         unknown_keys = sorted(set(creative) - {"creative_id", "id"})
@@ -201,14 +224,39 @@ async def create_ad(
         alias_name="creative.creative_id",
         required=True,
     )
+    return await _create_ad(
+        account_id, name, adset_id, {"creative_id": resolved_creative_id}, status, bid_amount,
+        tracking_specs, conversion_domain, adlabels, validate_only, params,
+    )
+
+
+async def _create_ad(
+    account_id: str,
+    name: str,
+    adset_id: str,
+    creative: dict[str, Any],
+    status: str,
+    bid_amount: float | None,
+    tracking_specs: list[dict[str, Any]] | None,
+    conversion_domain: str | None,
+    adlabels: list[dict[str, Any]] | None,
+    validate_only: bool,
+    params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Send one validated ad creation."""
     payload: dict[str, Any] = {
         "name": name,
         "adset_id": adset_id,
-        "creative": {"creative_id": resolved_creative_id},
+        "creative": creative,
         "status": status,
         "bid_amount": OMIT,
         "tracking_specs": tracking_specs or OMIT,
     }
+    # New named fields join the payload only when given, so a call that puts
+    # them in params (as callers did before they existed) is sent unchanged.
+    for key, value in (("conversion_domain", conversion_domain), ("adlabels", adlabels)):
+        if value is not None:
+            payload[key] = value
     add_validate_only(payload, validate_only=validate_only)
     merge_graph_payload(payload, params)
     client = get_graph_api_client()

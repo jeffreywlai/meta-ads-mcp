@@ -535,3 +535,107 @@ def test_create_ad_params_only_call_is_unchanged(monkeypatch) -> None:
         "ok": True, "action": "create_ad", "target": {"account_id": "act_123", "adset_id": "adset_123"},
         "validation_only": False, "created": {"id": "ad_created"},
     }
+
+
+AD_BASE = {"account_id": "123", "name": "Ad", "adset_id": "adset_123"}
+INLINE_SPEC = {
+    "name": "Inline creative",
+    "object_story_spec": {
+        "page_id": "111",
+        "link_data": {"link": "https://example.com", "message": "Hello", "image_hash": "abc"},
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("named", "params_value"),
+    [
+        ({"conversion_domain": "example.com"}, "example.org"),
+        ({"adlabels": [{"name": "Q4"}]}, [{"name": "Q4"}]),
+    ],
+)
+def test_create_ad_named_parameter_and_same_params_key_together_raise(monkeypatch, named, params_value) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    (key, _value), = named.items()
+    with pytest.raises(ads.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", **named, params={key: params_value}))
+
+
+def test_create_ad_named_parameters_are_sent(monkeypatch) -> None:
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(ads.create_ad(
+        **AD_BASE, creative_id="crt_123", conversion_domain="shop.example.co.uk",
+        adlabels=[{"name": "Q4"}], validate_only=True, params={"ad_schedule_start_time": "1795000000"},
+    ))
+    assert client.calls == [
+        ("create", "act_123", "ads", {
+            "name": "Ad",
+            "adset_id": "adset_123",
+            "creative": {"creative_id": "crt_123"},
+            "status": "PAUSED",
+            "conversion_domain": "shop.example.co.uk",
+            "adlabels": [{"name": "Q4"}],
+            "execution_options": ["validate_only"],
+            "ad_schedule_start_time": "1795000000",
+        }),
+    ]
+
+
+def test_create_ad_sends_inline_creative_spec(monkeypatch) -> None:
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.create_ad(**AD_BASE, creative_spec=INLINE_SPEC))
+    assert client.calls == [
+        ("create", "act_123", "ads", {
+            "name": "Ad", "adset_id": "adset_123", "creative": INLINE_SPEC, "status": "PAUSED",
+        }),
+    ]
+    assert result["created"] == {"id": "ad_created"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"creative_spec": INLINE_SPEC, "creative_id": "crt_1"}, "exactly one of creative_id, creative or creative_spec"),
+        ({"creative_spec": INLINE_SPEC, "creative": {"id": "crt_1"}}, "exactly one of creative_id, creative or creative_spec"),
+        ({"creative_spec": {}}, "creative_spec must not be empty"),
+        ({"creative_spec": {"creative_id": "crt_1"}}, "use creative_id"),
+        ({"creative_spec": {"id": "crt_1", "name": "x"}}, "use creative_id"),
+        ({"creative_id": "crt_1", "conversion_domain": "https://example.com/path"}, "domain only"),
+        ({"creative_id": "crt_1", "conversion_domain": " "}, "conversion_domain"),
+        ({"creative_id": "crt_1", "adlabels": [{}]}, "adlabels"),
+        ({"creative_id": "crt_1", "params": {"creative": INLINE_SPEC}}, "creative"),
+    ],
+)
+def test_create_ad_new_input_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match=message):
+        asyncio.run(ads.create_ad(**AD_BASE, **arguments))
+
+
+def test_create_ad_without_any_creative_keeps_its_error(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match="creative_id"):
+        asyncio.run(ads.create_ad(**AD_BASE))
+
+
+def test_create_ad_old_style_creative_id_call_is_unchanged(monkeypatch) -> None:
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.create_ad(
+        **AD_BASE, creative_id="crt_123", bid_amount=12.34,
+        tracking_specs=[{"action.type": ["offsite_conversion"], "fb_pixel": ["1"]}],
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "ads", {
+            "name": "Ad", "adset_id": "adset_123", "creative": {"creative_id": "crt_123"},
+            "status": "PAUSED", "bid_amount": 1234,
+            "tracking_specs": [{"action.type": ["offsite_conversion"], "fb_pixel": ["1"]}],
+        }),
+    ]
+    assert result == {
+        "ok": True, "action": "create_ad", "target": {"account_id": "act_123", "adset_id": "adset_123"},
+        "validation_only": False, "created": {"id": "ad_created"},
+    }
