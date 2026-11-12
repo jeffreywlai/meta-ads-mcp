@@ -1730,10 +1730,10 @@ async def get_advertiser_context(
 DELIVERY_LEVELS = ("account", "campaign", "adset", "ad")
 DELIVERY_EDGES = {"campaign": "campaigns", "adset": "adsets", "ad": "ads"}
 DELIVERY_OBJECT_FIELDS = {
-    "campaign": ["id", "name", "status", "effective_status", "issues_info"],
-    "adset": ["id", "name", "status", "effective_status", "campaign_id", "issues_info"],
+    "campaign": ["id", "name", "status", "effective_status", "updated_time", "issues_info"],
+    "adset": ["id", "name", "status", "effective_status", "updated_time", "campaign_id", "issues_info"],
     "ad": [
-        "id", "name", "status", "effective_status", "campaign_id", "adset_id",
+        "id", "name", "status", "effective_status", "updated_time", "campaign_id", "adset_id",
         "issues_info", "failed_delivery_checks", "ad_review_feedback",
     ],
 }
@@ -1768,8 +1768,13 @@ DEFAULT_MAX_PROBLEMS = 15
 MAX_PROBLEMS_LIMIT = 200
 MAX_REASONS_PER_PROBLEM = 2
 DELIVERY_TEXT_LIMIT = 160
-SPEND_LOOKUP_CAP = 50
-SPEND_LOOKUP_CONCURRENCY = 5
+# Recent spend comes from at most DELIVERY_SPEND_MAX_REQUESTS account-level insights pages at the
+# scanned level, each lean (id and spend only) and sorted by spend, highest first; a per-object
+# lookup cost one request per problem and hit Meta's rate limit on a large account.
+DELIVERY_SPEND_PAGE = 200
+DELIVERY_SPEND_MAX_REQUESTS = 2
+DELIVERY_ID_FIELDS = {"campaign": "campaign_id", "adset": "adset_id", "ad": "ad_id"}
+DELIVERY_SPEND_GROUPS = {"account": 0, "read": 1, "not_in_top_spenders": 2, "no_spend_in_window": 3, "spend_unavailable": 3}
 DELIVERY_SEVERITY_POLICY = {
     "critical": "the ad account is not active (account_status other than ACTIVE or IN_GRACE_PERIOD), which stops all delivery",
     "high": (
@@ -1856,6 +1861,64 @@ def _compact_reasons(reasons: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
     return compact, max(0, len(reasons) - MAX_REASONS_PER_PROBLEM)
 
 
+def _updated_timestamp(value: Any) -> float:
+    """Parse Meta's updated_time (2026-11-01T10:00:00+0000); unknown values sort as oldest."""
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+async def _delivery_spend(
+    client: Any, account_id: str, level: str, params: dict[str, Any], wanted: set[str],
+) -> dict[str, Any]:
+    """Read recent spend per object at one level with at most two lean, spend-sorted insights pages. Never raises."""
+    id_field = DELIVERY_ID_FIELDS[level]
+    spend: dict[str, float] = {}
+    requests = 0
+    complete = False
+    error: str | None = None
+    after: str | None = None
+    lowest: float | None = None
+    order_confirmed = True
+    while requests < DELIVERY_SPEND_MAX_REQUESTS:
+        page_params = {**params, "limit": DELIVERY_SPEND_PAGE, "sort": ["spend_descending"]}
+        if after:
+            page_params["after"] = after
+        requests += 1
+        try:
+            payload = await client.get_insights(account_id, fields=[id_field, "spend"], params=page_params)
+        except Exception as exc:  # a spend failure must not hide the problems found
+            error = str(_public_error(exc).get("message"))
+            break
+        for row in payload.get("data", []) or []:
+            if not isinstance(row, dict) or row.get(id_field) is None:
+                continue
+            value = to_float(row.get("spend")) or 0.0
+            if lowest is not None and value > lowest:
+                order_confirmed = False
+            lowest = value if lowest is None else min(lowest, value)
+            object_id = str(row[id_field])
+            spend[object_id] = spend.get(object_id, 0.0) + value
+        paging = extract_paging(payload)
+        if not paging.get("next"):
+            complete = True
+            break
+        following = paging.get("after")
+        if not following or following == after or wanted <= set(spend):
+            break
+        after = following
+    return {
+        "spend": spend,
+        "requests": requests,
+        "status": "failed" if error and not spend else "read",
+        "complete": complete and error is None,
+        "lowest_spend_read": lowest,
+        "order_confirmed": order_confirmed,
+        "error": error,
+    }
+
+
 def _account_problem(account: dict[str, Any], account_id: str) -> dict[str, Any] | None:
     """Turn account status and disable reason into a problem entry when delivery is affected."""
     status = _code_label(account.get("account_status"), ACCOUNT_STATUS_LABELS)
@@ -1892,7 +1955,7 @@ async def get_delivery_errors(
     include_paused: bool = False,
     max_problems: int = DEFAULT_MAX_PROBLEMS,
 ) -> dict[str, Any]:
-    """List delivery-blocking problems: account status and disable reason, plus issues_info, failed delivery checks and ad review feedback on campaigns, ad sets or ads, ordered by severity then spend in spend_date_preset. By default the scan asks Meta only for objects in problem states (disapproved, with issues, pending billing); include_active also scans active objects for warnings, include_paused reports paused ones. object_ids (up to 50) reads named objects instead. Returns up to max_problems problems with the total found."""
+    """List delivery-blocking problems: account status and disable reason, plus issues_info, failed delivery checks and ad review feedback on campaigns, ad sets or ads, ordered by severity, then spend in spend_date_preset (one or two spend-sorted insights reads), then most recently updated. By default the scan asks Meta only for objects in problem states (disapproved, with issues, pending billing); include_active also scans active objects for warnings, include_paused reports paused ones. object_ids (up to 50) reads named objects instead. Returns up to max_problems problems with the total found."""
     resolved_account_id = _require_account_id(account_id)
     resolved_level = _require_level(level, DELIVERY_LEVELS)
     named_ids = [
@@ -1911,10 +1974,9 @@ async def get_delivery_errors(
         raise ValidationError(f"limit must be between 1 and {MAX_DELIVERY_SCAN}.")
     if not 1 <= max_problems <= MAX_PROBLEMS_LIMIT:
         raise ValidationError(f"max_problems must be between 1 and {MAX_PROBLEMS_LIMIT}.")
-    spend_params_by_level = {
-        spend_level: insights_tools._insights_params(level=spend_level, date_preset=spend_date_preset)
-        for spend_level in DELIVERY_LEVELS
-    }
+    spend_params = insights_tools._insights_params(
+        level=resolved_level, date_preset=spend_date_preset, limit=DELIVERY_SPEND_PAGE,
+    )
 
     client = get_graph_api_client()
     account = await client.get_object(resolved_account_id, fields=DELIVERY_ACCOUNT_FIELDS)
@@ -2004,6 +2066,7 @@ async def get_delivery_errors(
             "name": item.get("name"),
             "effective_status": item.get("effective_status"),
             "severity": _object_severity(item, reasons),
+            "updated_time": item.get("updated_time"),
             "reasons": reasons,
         }
         for key in ("campaign_id", "adset_id"):
@@ -2013,37 +2076,71 @@ async def get_delivery_errors(
     scan["paused_objects_skipped"] = paused_skipped
     scan["not_scanned"] = not_scanned
 
-    problems.sort(key=lambda problem: (SEVERITY_RANK[problem["severity"]], problem["object_id"] or ""))
-    to_lookup = [problem for problem in problems if problem["object_id"]][:SPEND_LOOKUP_CAP]
-    semaphore = asyncio.Semaphore(SPEND_LOOKUP_CONCURRENCY)
-    failed_lookups = 0
-
-    async def lookup_spend(problem: dict[str, Any]) -> None:
-        nonlocal failed_lookups
-        async with semaphore:
-            try:
-                payload = await client.get_insights(
-                    problem["object_id"], fields=["spend"], params=spend_params_by_level[problem["level"]],
-                )
-            except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
-                failed_lookups += 1
-                problem["spend"] = None
-                problem["spend_status"] = "lookup_failed"
-                problem["spend_error"] = _short(_public_error(exc).get("message"))
-                return
-        problem["spend"] = sum(to_float(row.get("spend")) or 0.0 for row in payload.get("data", []) or [])
-        problem["spend_status"] = "read"
-
-    await asyncio.gather(*(lookup_spend(problem) for problem in to_lookup))
+    object_problems = [problem for problem in problems if problem["level"] != "account"]
+    spend_lookup: dict[str, Any] = {
+        "method": (
+            f"account-level insights at {resolved_level} level for {spend_params['date_preset']}, fields "
+            f"{DELIVERY_ID_FIELDS.get(resolved_level, 'id')} and spend only, sorted by spend highest first, "
+            f"{DELIVERY_SPEND_PAGE} rows per request, at most {DELIVERY_SPEND_MAX_REQUESTS} requests; "
+            "objects without a row had no delivery in the window"
+        ),
+        "status": "not_needed",
+        "requests": 0,
+        "objects_with_spend_read": 0,
+        "all_spending_objects_read": None,
+        "lowest_spend_read": None,
+        "meta_order_confirmed": None,
+        "error": None,
+    }
+    if object_problems:
+        read = await _delivery_spend(
+            client, resolved_account_id, resolved_level, spend_params,
+            {problem["object_id"] for problem in object_problems if problem["object_id"]},
+        )
+        spend_lookup.update({
+            "status": read["status"],
+            "requests": read["requests"],
+            "objects_with_spend_read": len(read["spend"]),
+            "all_spending_objects_read": read["complete"],
+            "lowest_spend_read": read["lowest_spend_read"],
+            "meta_order_confirmed": read["order_confirmed"],
+            "error": _short(read["error"]),
+        })
+        for problem in object_problems:
+            value = read["spend"].get(problem["object_id"] or "")
+            if read["status"] == "failed":
+                problem["spend"], problem["spend_status"] = None, "spend_unavailable"
+            elif value:
+                problem["spend"], problem["spend_status"] = value, "read"
+            elif value is not None or read["complete"]:
+                problem["spend"], problem["spend_status"] = 0.0, "no_spend_in_window"
+            else:
+                problem["spend"], problem["spend_status"] = None, "not_in_top_spenders"
     for problem in problems:
-        problem.setdefault("spend", None)
-        problem.setdefault("spend_status", "not_looked_up")
+        if problem["level"] == "account":
+            problem["spend"], problem["spend_status"] = None, "account"
+    spend_failed = spend_lookup["status"] == "failed"
     problems.sort(key=lambda problem: (
         SEVERITY_RANK[problem["severity"]],
-        problem["spend"] is None,
+        DELIVERY_SPEND_GROUPS[problem["spend_status"]],
         -(problem["spend"] or 0.0),
+        -_updated_timestamp(problem.get("updated_time")),
         problem["object_id"] or "",
     ))
+    ordering = (
+        ["severity", "account_first", "updated_time_desc", "object_id"] if spend_failed
+        else ["severity", "account_first", "recent_spend_desc", "updated_time_desc", "object_id"]
+    )
+    ordering_note = (
+        "Within each severity, an account problem comes first (it stops all delivery); then objects by most "
+        "recently updated, because recent spend could not be read."
+        if spend_failed else
+        "Within each severity, an account problem comes first (it stops all delivery); then objects with recent "
+        "spend, highest first; then objects whose spend was not among those read; then objects with no spend in "
+        "the window; ties by most recently updated."
+    )
+    no_spend = sum(1 for problem in object_problems if problem["spend_status"] == "no_spend_in_window")
+    beyond = sum(1 for problem in object_problems if problem["spend_status"] == "not_in_top_spenders")
     by_severity: dict[str, int] = {}
     for problem in problems:
         by_severity[problem["severity"]] = by_severity.get(problem["severity"], 0) + 1
@@ -2068,15 +2165,30 @@ async def get_delivery_errors(
         )
     if len(problems) > max_problems:
         missing_signals.append(
-            f"{len(problems)} problems were found; only the first {max_problems} by severity and spend are listed. "
+            f"{len(problems)} problems were found; only the first {max_problems} in the stated ordering are listed. "
             f"Raise max_problems (up to {MAX_PROBLEMS_LIMIT}) or narrow with object_ids to see more."
         )
-    if len(problems) > SPEND_LOOKUP_CAP:
+    if spend_failed:
         missing_signals.append(
-            f"Spend was looked up for the first {SPEND_LOOKUP_CAP} problems by severity only; the rest have spend null."
+            f"Recent spend could not be read ({spend_lookup['error']}), so problems are ordered by severity, then "
+            "most recently updated, and their spend is null."
         )
-    if failed_lookups:
-        missing_signals.append(f"Spend lookup failed for {failed_lookups} problem(s); their spend is null.")
+    elif spend_lookup["error"]:
+        missing_signals.append(
+            f"The second spend page failed ({spend_lookup['error']}); spend beyond the first page is unknown."
+        )
+    if no_spend:
+        missing_signals.append(
+            f"{no_spend} of {len(object_problems)} problems had no spend in {spend_params['date_preset']}; "
+            "they are listed after the problems with recent spend."
+        )
+    if beyond:
+        missing_signals.append(
+            f"{beyond} problem(s) were not among the {spend_lookup['objects_with_spend_read']} highest-spending "
+            f"{resolved_level}s read; their spend is at most {spend_lookup['lowest_spend_read']} and is shown as null."
+        )
+    if spend_lookup["meta_order_confirmed"] is False:
+        missing_signals.append("Meta returned the spend rows not ordered by spend, so spend coverage may be uneven.")
 
     if problems:
         counts = ", ".join(f"{by_severity[name]} {name}" for name in SEVERITY_RANK if name in by_severity)
@@ -2085,7 +2197,11 @@ async def get_delivery_errors(
             **build_finding(
                 "delivery_problems_found",
                 f"{len(problems)} delivery problem(s) found ({counts}); each is listed once in problems, "
-                "ordered by severity then spend.",
+                + (
+                    "ordered by severity, then most recently updated (spend could not be read)."
+                    if spend_failed else
+                    "ordered by severity, then recent spend, then most recently updated."
+                ),
                 severity=worst,
                 confidence=None,
             ),
@@ -2109,6 +2225,7 @@ async def get_delivery_errors(
             "problems_returned": len(returned),
             "problems_truncated": len(problems) > len(returned),
             "by_severity": by_severity,
+            "problems_without_recent_spend": no_spend,
         },
         findings=findings,
         missing_signals=missing_signals,
@@ -2121,9 +2238,10 @@ async def get_delivery_errors(
             },
             "problems": returned,
             "scan": scan,
-            "spend_window": {"date_preset": spend_params_by_level["account"]["date_preset"]},
-            "spend_lookups": {"attempted": len(to_lookup), "failed": failed_lookups, "cap": SPEND_LOOKUP_CAP},
-            "ordering": ["severity", "spend_desc", "object_id"],
+            "spend_window": {"date_preset": spend_params["date_preset"]},
+            "spend_lookup": spend_lookup,
+            "ordering": ordering,
+            "ordering_note": ordering_note,
             "severity_policy": DELIVERY_SEVERITY_POLICY,
         },
     )

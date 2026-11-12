@@ -1398,11 +1398,30 @@ def test_advertiser_context_validation_errors_make_no_calls(monkeypatch, kwargs)
 # ---------------------------------------------------------------------------
 
 
-def _spend_handler(spend_by_object: dict[str, float]):
+def _spend_handler(spend_by_object: dict[str, float], *, page_size: int | None = None, more_pages: bool = False,
+                   error: Exception | None = None):
+    """Models the account-level spend read: one lean, spend-sorted insights request per page.
+
+    Like Meta, it fails when the sorted read carries action fields, and only objects with delivery have rows.
+    """
+    ordered = sorted(spend_by_object.items(), key=lambda item: -item[1])
+
     def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
-        if object_id not in spend_by_object:
-            return {"data": []}
-        return {"data": [{"spend": str(spend_by_object[object_id])}]}
+        id_field = f"{params['level']}_id"
+        assert object_id == "act_42"
+        assert params["sort"] == ["spend_descending"]
+        if {"actions", "action_values"} & set(fields):
+            raise _unknown_error()
+        assert fields == [id_field, "spend"]
+        if error is not None:
+            raise error
+        size = page_size or params["limit"]
+        offset = int(params.get("after", "0"))
+        rows = [{id_field: key, "spend": str(value)} for key, value in ordered[offset: offset + size]]
+        payload: dict[str, Any] = {"data": rows}
+        if more_pages or offset + size < len(ordered):
+            payload["paging"] = {"cursors": {"after": str(offset + size)}, "next": "https://graph.example/next"}
+        return payload
 
     return handler
 
@@ -1447,9 +1466,13 @@ def test_delivery_errors_scans_account_and_reads_problem_fields(monkeypatch) -> 
     assert scan["edge"] == "ads"
     assert {"issues_info", "failed_delivery_checks", "ad_review_feedback", "effective_status"} <= set(scan["fields"])
     assert scan["params"]["effective_status"] == ["DISAPPROVED", "PENDING_BILLING_INFO", "WITH_ISSUES"]
-    spend_calls = _calls(client, "get_insights")
-    assert {call["object_id"] for call in spend_calls} == {"ad_medium", "ad_disapproved", "ad_with_issues"}
-    assert all(call["params"]["date_preset"] == "last_7d" and call["fields"] == ["spend"] for call in spend_calls)
+    (spend_call,) = _calls(client, "get_insights")
+    assert spend_call["object_id"] == "act_42"
+    assert spend_call["fields"] == ["ad_id", "spend"]
+    assert spend_call["params"]["level"] == "ad"
+    assert spend_call["params"]["date_preset"] == "last_7d"
+    assert spend_call["params"]["sort"] == ["spend_descending"]
+    assert "updated_time" in scan["fields"]
 
     problems = {problem["object_id"]: problem for problem in result["problems"]}
     assert "ad_clean" not in problems and "act_42" not in problems
@@ -1469,7 +1492,11 @@ def test_delivery_errors_scans_account_and_reads_problem_fields(monkeypatch) -> 
     assert result["scan"]["paused_included"] is False
     assert result["scan"]["active_included"] is False
     assert any("include_active" in note for note in result["scan"]["not_scanned"])
-    assert result["missing_signals"] == []
+    assert result["missing_signals"] == [
+        "2 of 3 problems had no spend in last_7d; they are listed after the problems with recent spend."
+    ]
+    assert [problem["object_id"] for problem in result["problems"]] == ["ad_disapproved", "ad_with_issues", "ad_medium"]
+    assert problems["ad_disapproved"]["spend_status"] == "no_spend_in_window"
 
 
 def test_delivery_errors_orders_by_severity_then_spend(monkeypatch) -> None:
@@ -1480,7 +1507,7 @@ def test_delivery_errors_orders_by_severity_then_spend(monkeypatch) -> None:
             objects={"act_42": account},
             edges={("act_42", "ads"): {"data": PROBLEM_ADS}},
             insights_handler=_spend_handler(
-                {"act_42": 1000.0, "ad_with_issues": 100.0, "ad_disapproved": 10.0, "ad_medium": 500.0, "ad_paused": 0.0}
+                {"ad_with_issues": 100.0, "ad_disapproved": 10.0, "ad_medium": 500.0, "ad_paused": 0.0}
             ),
         ),
     )
@@ -1497,7 +1524,7 @@ def test_delivery_errors_orders_by_severity_then_spend(monkeypatch) -> None:
         ("ad_paused", "low"),
     ]
     assert result["metrics"]["by_severity"] == {"high": 3, "medium": 1, "low": 1}
-    assert result["ordering"] == ["severity", "spend_desc", "object_id"]
+    assert result["ordering"] == ["severity", "account_first", "recent_spend_desc", "updated_time_desc", "object_id"]
     sent = _calls(client, "list_objects")[0]["params"]["effective_status"]
     assert {"DISAPPROVED", "WITH_ISSUES", "ACTIVE", "PAUSED", "ADSET_PAUSED", "CAMPAIGN_PAUSED"} <= set(sent)
     assert result["scan"]["not_scanned"] == []
@@ -1612,6 +1639,83 @@ def test_delivery_errors_named_objects_read_each_object(monkeypatch) -> None:
     }
 
 
+def _old_problem_ad(index: int, *, updated_day: int) -> dict[str, Any]:
+    return {
+        "id": f"ad_{index:04d}", "name": f"Ad {index}", "effective_status": "DISAPPROVED", "status": "ACTIVE",
+        "updated_time": f"2026-{1 + updated_day // 28:02d}-{1 + updated_day % 28:02d}T10:00:00+0000",
+        "ad_review_feedback": {"global": {"Policy": "Rejected."}},
+    }
+
+
+def test_delivery_errors_ranks_many_problems_by_spend_from_one_sorted_read(monkeypatch) -> None:
+    ads = [_old_problem_ad(index, updated_day=index % 250) for index in range(274)]
+    spend = {f"other_{index}": 1000.0 - index for index in range(150)}
+    spend.update({"ad_0200": 5.0, "ad_0007": 950.5, "ad_0100": 80.0})
+    client = _patch(monkeypatch, RecordingClient(
+        objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): {"data": ads}},
+        insights_handler=_spend_handler(spend),
+    ))
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+
+    calls = _calls(client, "get_insights")
+    assert len(calls) == 1
+    assert [problem["object_id"] for problem in result["problems"][:3]] == ["ad_0007", "ad_0100", "ad_0200"]
+    assert [problem["spend"] for problem in result["problems"][:3]] == [950.5, 80.0, 5.0]
+    rest = result["problems"][3:]
+    assert all(problem["spend_status"] == "no_spend_in_window" for problem in rest)
+    stamps = [problem["updated_time"] for problem in rest]
+    assert stamps == sorted(stamps, reverse=True)
+    assert result["metrics"]["problems_without_recent_spend"] == 271
+    assert any("271 of 274" in signal and "no spend" in signal for signal in result["missing_signals"])
+    assert result["spend_lookup"]["status"] == "read"
+    assert result["spend_lookup"]["requests"] == 1
+    assert result["spend_lookup"]["all_spending_objects_read"] is True
+    assert "sorted by spend" in result["spend_lookup"]["method"]
+    assert result["ordering"][2:4] == ["recent_spend_desc", "updated_time_desc"]
+    assert len(json.dumps(result).encode()) < 20_000
+
+
+def test_delivery_errors_reads_a_second_spend_page_at_most(monkeypatch) -> None:
+    ads = [_old_problem_ad(index, updated_day=index) for index in range(3)]
+    spend = {f"other_{index}": 10_000.0 - index for index in range(450)}
+    spend.update({"ad_0001": 9_700.0, "ad_0002": 1.0})
+    client = _patch(monkeypatch, RecordingClient(
+        objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): {"data": ads}},
+        insights_handler=_spend_handler(spend),
+    ))
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+
+    calls = _calls(client, "get_insights")
+    assert len(calls) == 2
+    assert calls[1]["params"]["after"] == str(performance_signals.DELIVERY_SPEND_PAGE)
+    problems = {problem["object_id"]: problem for problem in result["problems"]}
+    assert problems["ad_0001"]["spend"] == 9_700.0
+    assert problems["ad_0002"]["spend"] is None
+    assert problems["ad_0002"]["spend_status"] == "not_in_top_spenders"
+    assert [problem["object_id"] for problem in result["problems"]] == ["ad_0001", "ad_0002", "ad_0000"]
+    assert result["spend_lookup"]["all_spending_objects_read"] is False
+    assert any("not among the" in signal for signal in result["missing_signals"])
+
+
+def test_delivery_errors_spend_read_failure_falls_back_to_most_recently_updated(monkeypatch) -> None:
+    ads = [_old_problem_ad(index, updated_day=day) for index, day in enumerate([3, 40, 12])]
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): {"data": ads}},
+        insights_handler=_spend_handler({}, error=_unknown_error()),
+    ))
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+
+    assert [problem["object_id"] for problem in result["problems"]] == ["ad_0001", "ad_0002", "ad_0000"]
+    assert all(problem["spend"] is None and problem["spend_status"] == "spend_unavailable"
+               for problem in result["problems"])
+    assert result["ordering"] == ["severity", "account_first", "updated_time_desc", "object_id"]
+    assert result["spend_lookup"]["status"] == "failed"
+    assert any("most recently updated" in signal and "unknown error" in signal for signal in result["missing_signals"])
+
+
 def _problem_ad(index: int) -> dict[str, Any]:
     long_text = "This ad was rejected because it does not follow our Advertising Standards on several points. " * 6
     return {
@@ -1690,6 +1794,7 @@ def test_delivery_errors_healthy_account_scan_completes_in_one_page(monkeypatch)
     )
     result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
     assert len(_calls(client, "list_objects")) == 1
+    assert _calls(client, "get_insights") == []
     assert result["scan"]["complete"] is True
     assert result["metrics"]["problem_count"] == 0
     assert result["problems"] == []
