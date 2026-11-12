@@ -75,11 +75,15 @@ In practice, for the 102 tools recorded in
 
 Tools added in phase one (not on `master`) may be changed freely.
 
-Still on hold from Jeff's earlier decision, until he says otherwise: MCP
-annotations on tools, and confirmation steps added to existing tools. A new tool
-may offer a plan-only or dry-run mode as an option, never as a required first
-call. The one exception is catalog access changes (stream P7), where a separate
-read-only preview tool exists because Meta's server has that capability.
+Deferred to the next pull request, by Jeff's decision on 2026-11-12: three of
+Meta's design habits are approved for this project but are not part of this
+work. They are MCP annotations marking each tool read-only or destructive,
+preview-then-confirm for deletes and anything that starts spending, and stricter
+input formats on existing tools. In this phase no tool gets annotations and no
+existing tool gets a confirmation step. A new tool may offer a plan-only or
+dry-run mode as an option, never as a required first call. The one exception is
+catalog access changes (stream P7), where a separate read-only preview tool
+exists because Meta's server has that capability.
 
 Stricter input formats: new tools and new parameters use the shared types
 `GraphId` and `AccountId` from `meta_ads_mcp/tool_types.py` for ids Meta
