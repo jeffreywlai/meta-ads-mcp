@@ -15,16 +15,18 @@
 - All Graph API traffic goes through `GraphAPIClient` in `meta_ads_mcp/graph_api.py`.
 - Return dicts and lists, never serialized JSON strings. Keep ids as strings.
 - Tool names in the spec are final.
-- Every Graph endpoint, field and parameter is confirmed in Meta's reference documentation or the `facebook_business` SDK source at 26.0.x before it is used. Nothing is guessed. Anything unconfirmed is reported, not built.
+- Evidence rule: an endpoint (object type or edge) is built on only if Meta's public reference documentation describes it; SDK presence alone is not enough. On a documented endpoint, a field or parameter may come from the documentation or the SDK source at tag `26.0.2`. Anything unconfirmed is reported, not guessed and not built.
 - No tool is registered that can only answer "not supported".
 - No live calls to Meta. Do not read `~/.claude.json` or any real access token. Tests use fake clients.
 - No customer personal data, raw or hashed, in any response, log line, error message or overflow artifact.
-- Every write tool is classified as a write by `meta_ads_mcp/tool_contracts.py` and listed in `TOOL_GROUPS["writes"]`.
+- Every write tool is classified as a write by `meta_ads_mcp/tool_contracts.py`, listed in `TOOL_GROUPS["writes"]` and in no other group, and added to the hard-coded set in `test_live_catalog_classifies_every_current_mutation` in `tests/test_tool_contracts_routing.py`.
 - Creates default to paused or inactive where the object has such a state.
 - Updates and deletes read the object first and return it as `previous`.
 - Edits to shared files are additive: add lines, never reorder or reformat existing ones.
-- Streams do not edit `README.md`, `meta_ads_mcp/official_parity.py`, `meta_ads_mcp/input_compat.py`, `meta_ads_mcp/coordinator.py`, `SPEC.md`, `CLAUDE.md`, or anything under `docs/`.
-- `uv run --extra dev pytest` passes in full before a task is reported done. Baseline on the foundation commit: 1744 passed, 32 skipped.
+- Streams do not edit `README.md`, `meta_ads_mcp/official_parity.py`, `meta_ads_mcp/input_compat.py`, `meta_ads_mcp/intent_routing.py`, `meta_ads_mcp/coordinator.py`, `SPEC.md`, `CLAUDE.md`, or anything under `docs/`.
+- New updates and deletes return `mutation_response`; new creates return `creation_response`. The five existing delete tools and some older creates do not; do not copy or change them.
+- When the generic client methods do not fit, call `client.request(...)` from the tool or append a named method at the very end of `GraphAPIClient`.
+- `uv run --extra dev pytest` passes in full before a task is reported done. Baseline on the foundation commit: 1746 passed, 32 skipped.
 
 ## Review Focus
 
@@ -52,7 +54,8 @@
 | `meta_ads_mcp/tools/catalogs.py` | Stream E tools | Task E |
 | `meta_ads_mcp/tools/catalog_feeds.py` | Stream F tools | Task F |
 | `tests/test_tools_assets.py`, `test_tools_performance_signals.py`, `test_tools_experiments.py`, `test_tools_datasets.py`, `test_tools_catalogs.py`, `test_tools_catalog_feeds.py` | Per-module tests | Matching task |
-| `tests/test_tool_contracts.py`, `tests/test_read_only.py` | Catalog-wide tables | Every stream appends entries its tools need |
+| `tests/test_tool_contracts.py`, `tests/test_tool_contracts_routing.py`, `tests/test_read_only.py` | Catalog-wide tables | Every stream appends entries its tools need |
+| `meta_ads_mcp/intent_routing.py` | Search router write verbs | Task G only |
 | `meta_ads_mcp/official_parity.py`, `tests/test_official_parity.py` | Parity ledger | Task G |
 | `meta_ads_mcp/input_compat.py`, `meta_ads_mcp/coordinator.py`, `README.md` | Alias resolution, routing text, tool list | Task G |
 
@@ -72,7 +75,8 @@
 - [ ] **Step 1:** Add a test `test_new_read_groups_are_read_only_groups` in `tests/test_read_only.py` asserting that all four keys exist in `utility.TOOL_GROUPS` and that a name placed in any of them is returned by `read_only_tool_names()` (monkeypatch one name into each group).
 - [ ] **Step 2:** Run it; expect `KeyError: 'assets'`.
 - [ ] **Step 3:** Add the four empty groups after `"research"` in `TOOL_GROUPS`, and the four names to the `groups` tuple in `read_only_tool_names()`.
-- [ ] **Step 4:** Run `uv run --extra dev pytest -q`; expect 1744 passed, 32 skipped.
+- [ ] **Step 4:** Add guard tests `test_no_write_classified_tool_is_allowed_in_read_only` and `test_every_write_classified_tool_is_in_the_writes_or_blocked_set` to `tests/test_read_only.py`.
+- [ ] **Step 4b:** Run `uv run --extra dev pytest -q`; expect 1746 passed, 32 skipped.
 - [ ] **Step 5:** Update `SPEC.md` (Non-Goals, Thin Execution Layer) and `CLAUDE.md` (first project note) to state that parity with Meta's official Ads MCP server is in scope and point at the spec.
 - [ ] **Step 6:** Commit spec, plan and foundation together.
 
@@ -85,7 +89,7 @@ Each of Tasks A to F repeats this loop per tool, in the order the spec lists the
 - [ ] Confirm the Graph endpoint, fields and parameters in Meta's reference documentation or the SDK source. Record the page or file.
 - [ ] Write failing tests in the task's test file with a fake client modeled on `FakeAudienceClient` in `tests/test_tools_audiences.py`. For each tool assert: the object id and edge requested; the exact parameters or payload sent; the response keys; each `ValidationError` the tool can raise, with no client call recorded when it is raised.
 - [ ] Run the new tests and confirm they fail because the tool does not exist.
-- [ ] Implement the tool. Register its name in the right `TOOL_GROUPS` list. For a write with a name not starting `create_`, `update_`, `delete_`, `set_` or `upload_`, add it to `_WRITE_NAMES`.
+- [ ] Implement the tool. Register its name in the right `TOOL_GROUPS` list. For a write with a name not starting `create_`, `update_`, `delete_`, `set_` or `upload_`, add it to `_WRITE_NAMES`. For every write, add the name to the set in `test_live_catalog_classifies_every_current_mutation`.
 - [ ] Run the task's test file, then `tests/test_tool_contracts.py`, `tests/test_coordinator.py` and `tests/test_read_only.py`. Add sample arguments to `TOOL_OVERRIDES` in `tests/test_tool_contracts.py` when the smoke run needs them.
 - [ ] Commit.
 
@@ -110,6 +114,9 @@ When the last tool is done:
 
 Tests this task must include beyond the loop:
 
+- `test_audience_users_requires_exactly_one_of_file_path_or_rows`.
+- `test_audience_users_file_path_reads_csv_by_header`: a CSV at `tmp_path` with header `email,phone,notes` and schema `["EMAIL", "PHONE"]` sends two hashed columns per row and never the `notes` column.
+- `test_audience_users_inline_rows_capped_at_1000`: 1,001 inline rows raise `ValidationError` naming `file_path`, with no client call.
 - `test_audience_users_blank_and_malformed_values_are_dropped_not_hashed`: rows `[["a@example.com"], [""], ["   "]]` with schema `["EMAIL"]` send exactly one hashed value, and the response reports two invalid values.
 - `test_audience_users_normalizes_before_hashing`: `" A@Example.COM "` produces the SHA-256 of `a@example.com`.
 - `test_audience_users_pre_hashed_rejects_non_digests`: `pre_hashed=True` with `"a@example.com"` raises `ValidationError` and records no client call.
@@ -245,18 +252,19 @@ Tests this task must include beyond the loop:
 
 **Interfaces:**
 - Consumes: every tool name produced by Tasks A to F as actually built.
-- Produces: `OFFICIAL_TOOLS: dict[str, OfficialToolEntry]` with fields `status` (`"covered"` or `"unavailable"`), `tools: tuple[str, ...]`, `note: str`; `resolve_official_tool(name: str) -> str | None` returning the single target when an entry has exactly one tool.
+- Produces: `OFFICIAL_TOOLS: dict[str, OfficialToolEntry]` with fields `status` (`"covered"` or `"unavailable"`), `verified` (`"live"` or `"mocked"`), `tools: tuple[str, ...]`, `note: str`; `resolve_official_tool(name: str) -> str | None` returning the single target when an entry has exactly one tool.
 
 - [ ] **Step 1:** Merge the six stream branches into `feature/official-mcp-parity` in the order A, B, C, D, E, F. Resolve shared-file overlaps by keeping both sides. Run the full suite after each merge.
 - [ ] **Step 2:** Write `tests/test_official_parity.py`: `test_all_88_official_names_present` (the names from the spec's Appendix A, as a literal list in the test), `test_covered_entries_name_registered_tools`, `test_unavailable_entries_have_a_reason`, `test_single_target_names_resolve_through_call_tool`, `test_multi_target_name_error_lists_options`, `test_get_capabilities_official_tool_lookup`.
 - [ ] **Step 3:** Run; expect import failure.
 - [ ] **Step 4:** Implement the ledger, wire `resolve_official_tool` into `canonical_tool_name`, add the `official_tool` argument to `get_capabilities`.
-- [ ] **Step 5:** Update the routing instructions in `coordinator.py` and the tool list and count in `README.md`.
+- [ ] **Step 5:** Extend `_WRITE_VERBS` in `intent_routing.py` with `add`, `remove`, `boost`, `cancel`, `connect`, `disconnect`. First capture the router's decisions for every existing query in `tests/test_intent_routing.py` and `tests/test_tool_contracts_routing.py` (they must stay green unchanged), then add tests that "add users to a custom audience", "boost instagram post", "cancel ad study" and "connect catalog event source" offer the matching write tool, and that read-phrased requests containing those words ("show ads I could boost") stay read-only.
+- [ ] **Step 5b:** Update the routing instructions in `coordinator.py` and the tool list and count in `README.md`.
 - [ ] **Step 6:** Run the full suite. Commit.
 
 ### Task H: Verification and review (orchestrator)
 
-- [ ] **Step 1:** Run each new read tool read-only against the real account with the working token. Record which returned data, which failed and why.
+- [ ] **Step 1:** Run each new read tool read-only against the real account with the working token (catalog reads included). Record which returned data, which failed and why, and set `verified` in the ledger from the results.
 - [ ] **Step 2:** Launch the Codex `gpt-6.1-sol` max-effort review of the branch against the spec.
 - [ ] **Step 3:** Check every finding against the code or a test before acting on it. Fix confirmed ones with a failing test first.
 - [ ] **Step 4:** Full suite, then report.

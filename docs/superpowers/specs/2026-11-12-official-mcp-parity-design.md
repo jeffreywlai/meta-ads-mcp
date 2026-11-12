@@ -68,31 +68,44 @@ not publish parameters. The full list of the 88 names is in Appendix A.
 - A tool that exists only to say "not supported". If Meta has no public API for
   a capability, no tool is registered for it. The parity ledger records it as
   unavailable and names the nearest real tool, if there is one.
-- Invented endpoints, fields or parameters. Every Graph API endpoint, field and
-  parameter used by a new tool must be confirmed in Meta's reference
-  documentation or in the `facebook_business` SDK source at 26.0.x. Anything
-  that cannot be confirmed is reported back, not guessed.
+- Invented endpoints, fields or parameters. The evidence rule is:
+  - An endpoint (an object type or an edge) is built on only if Meta's public
+    reference documentation describes it. Presence in the `facebook_business`
+    SDK alone is not enough: this repo's own audit
+    (`docs/v26_compatibility_audit.md`) found SDK-listed fields that the live
+    API rejected.
+  - On a documented endpoint, a field or parameter may be used if it appears in
+    the documentation or in the SDK source at 26.0.x
+    (`github.com/facebook/facebook-python-business-sdk`, tag `26.0.2`).
+  - Anything that cannot be confirmed this way is reported back, not guessed and
+    not built.
 - Live writes to a real ad account during development or testing.
 - Customer personal data appearing in any tool response, log line, error
   message or overflow artifact.
 
 ## Conventions every new tool follows
 
-These are existing rules of the codebase. They are restated because every work
-stream depends on them.
+Most of these are existing rules of the codebase, restated because every work
+stream depends on them. Where an older tool does something different (noted
+below), new tools follow this document and the older tool is left alone.
 
 - Tools are `async def` functions decorated with `@mcp_server.tool()` in a
   module under `meta_ads_mcp/tools/`, and the module is listed in
   `meta_ads_mcp/tools/__init__.py`.
 - All Graph API traffic goes through `GraphAPIClient` in
   `meta_ads_mcp/graph_api.py`. Prefer the generic methods (`get_object`,
-  `list_objects`, `create_edge_object`, `update_object`, `delete_object`). Add a
-  named client method only when a call does not fit them.
+  `list_objects`, `create_edge_object`, `update_object`, `delete_object`). When
+  a call does not fit them (for example a `DELETE` that carries parameters),
+  call `client.request(...)` from the tool, or add a named method at the very
+  end of the `GraphAPIClient` class without touching existing methods.
 - Return dicts and lists, never serialized JSON strings. Keep ids as strings.
-- Use the builders in `meta_ads_mcp/schemas.py`: `collection_response` shapes via
-  `normalize_collection` for lists, `mutation_response` for updates and deletes
-  (with `previous` and `current`), `creation_response` for creates,
-  `analysis_response` for derived reports.
+- Lists are shaped with `normalize_collection` from `meta_ads_mcp/normalize.py`.
+  New updates and deletes return `mutation_response` from
+  `meta_ads_mcp/schemas.py` with `previous` and `current`. New creates return
+  `creation_response`. Derived reports return `analysis_response`. Some older
+  tools predate these builders: the five existing delete tools do not read the
+  object first and return a hand-built dict, and several older creates do not
+  use `creation_response`. Do not copy those and do not change them.
 - List tools take `limit` and `after`, and report whether more pages exist the
   same way `list_audiences` does.
 - Tools that accept `fields` use the `FieldList` type. Tools that accept lists of
@@ -117,8 +130,17 @@ stream depends on them.
   classified automatically. Any other write name (for example
   `add_audience_users`, `cancel_ad_study`, `connect_catalog_event_source`) is
   added to `_WRITE_NAMES` there.
-- Every write tool is listed in `TOOL_GROUPS["writes"]`. That list drives the
-  read-only block and `list_mutation_tools`.
+- Every write tool is listed in `TOOL_GROUPS["writes"]` and in no other group.
+  Read-only mode is an allowlist of read groups (`meta_ads_mcp/read_only.py`):
+  it allows everything in those groups and blocks the rest. A write tool placed
+  in `assets`, `signals`, `experiments` or `catalog` by mistake would therefore
+  run in read-only mode. Two tests in `tests/test_read_only.py` guard this:
+  `test_no_write_classified_tool_is_allowed_in_read_only` and
+  `test_every_write_classified_tool_is_in_the_writes_or_blocked_set`.
+- `tests/test_tool_contracts_routing.py` hard-codes the full set of
+  write-classified tool names in
+  `test_live_catalog_classifies_every_current_mutation`. Each stream adds its
+  write tool names to that set.
 - Creates default to a paused or inactive state wherever the object has one.
 - Updates read the current values first and return them as `previous`.
 - Deletes read the object first and return enough of it in `previous` to
@@ -148,15 +170,29 @@ tools. New writes go in the module that already owns the object.
 | `get_field_reference(level, field_names, object_id)` | Field metadata for campaigns, ad sets and ads: type, description, and where known the allowed values and whether the field can be used as a filter. Use Meta's live field metadata (`metadata=1`) as the source for types and descriptions. |
 | `update_adset(adset_id, name, targeting, start_time, end_time, optimization_goal, billing_event, promoted_object, status, validate_only, params)` | General ad set edit with before/after. Budget and bid changes stay in the existing dedicated tools; reject those fields here with a message naming the right tool. |
 | `update_ad(ad_id, name, creative_id, tracking_specs, status, validate_only, params)` | General ad edit with before/after. |
-| `add_audience_users(audience_id, schema, rows, pre_hashed)` | Adds people to a customer list audience. See the personal-data rules below. |
-| `remove_audience_users(audience_id, schema, rows, pre_hashed)` | Removes people from a customer list audience. |
+| `add_audience_users(audience_id, schema, file_path, rows, pre_hashed)` | Adds people to a customer list audience. See the personal-data rules below. |
+| `remove_audience_users(audience_id, schema, file_path, rows, pre_hashed)` | Removes people from a customer list audience. |
 | `boost_instagram_post(account_id, adset_id, instagram_media_id, instagram_account_id, name, call_to_action, validate_only)` | Creates a creative from an existing Instagram post and a paused ad under an existing ad set. Returns both ids. |
 
 Personal-data rules for the two audience tools:
 
+- Exactly one of `file_path` or `rows` is given.
+  - `file_path` is a local CSV file whose header row names the columns. `schema`
+    lists Meta's key for each column to send, matched to the header by name;
+    columns not in `schema` are ignored. This is the route for real customer
+    lists: the values are read from disk by the server and never pass through
+    the calling model. Follow `upload_creative_asset(file_path=...)` in
+    `meta_ads_mcp/tools/creatives.py` for how a local path is accepted.
+  - `rows` is an inline list of rows, for small lists. The docstring states
+    plainly that inline values have already passed through the calling model and
+    its provider, and that `file_path` avoids this. Inline `rows` are capped at
+    1,000 rows; above that the call is rejected with a message pointing at
+    `file_path`.
 - `pre_hashed` defaults to false. When false, the server normalizes each value by
   Meta's published rules for that key (trim, lowercase, phone digits only, and so
-  on) and hashes it with SHA-256 locally. Raw values never leave the machine.
+  on) and hashes it with SHA-256 locally, so Meta never receives a raw value.
+- A value that is blank, or that normalizes to nothing, is dropped and counted
+  as invalid. It is never hashed and sent.
 - When `pre_hashed` is true, each value must look like a SHA-256 hex digest, or
   the call is rejected.
 - Rows are sent in batches within Meta's per-request limit, using Meta's session
@@ -277,6 +313,11 @@ A new module `meta_ads_mcp/official_parity.py` holds one entry for each of
 Meta's 88 tool names (Appendix A):
 
 - `status`: `covered` or `unavailable`.
+- `verified`: `live` when the orchestrator has run the serving tool against a
+  real account and it returned data, otherwise `mocked`. Write tools stay
+  `mocked` until Jeff approves a specific live write test. Mocked tests cannot
+  catch a wrong endpoint or field name, so this flag is what tells a reader how
+  far to trust an entry.
 - `tools`: the tool names here that serve it, most direct first.
 - `note`: one plain sentence, for example which argument selects the equivalent
   behaviour, or why it is unavailable.
@@ -310,14 +351,25 @@ Each stream then:
 - owns its new module and its new test file outright;
 - makes only additive edits to shared files (`tools/__init__.py`,
   `TOOL_GROUPS`, `INTENT_GUIDE`, `_WRITE_NAMES`, `list_mutation_tools`,
-  `tests/test_tool_contracts.py`, `tests/test_read_only.py`), adding its lines
-  without reordering or reformatting anything already there;
-- does not edit `README.md`, `official_parity.py`, `input_compat.py`, or this
-  document.
+  `tests/test_tool_contracts.py`, `tests/test_tool_contracts_routing.py`,
+  `tests/test_read_only.py`, and the end of the `GraphAPIClient` class), adding
+  its lines without reordering or reformatting anything already there;
+- does not edit `README.md`, `official_parity.py`, `input_compat.py`,
+  `intent_routing.py`, `coordinator.py`, or this document.
 
 The orchestrator merges the streams one at a time, resolves the additive
 overlaps, then writes the ledger, the README tool list, and the routing text in
 `meta_ads_mcp/coordinator.py`.
+
+The search router (`meta_ads_mcp/intent_routing.py`) only offers write tools for
+requests that start with one of a fixed set of verbs: create, delete, disable,
+enable, pause, resume, set, setup, update, upload. Six new write tools start
+with other verbs: `add_audience_users`, `remove_audience_users`,
+`boost_instagram_post`, `cancel_ad_study`, `connect_catalog_event_source`,
+`disconnect_catalog_event_source`. Until the router learns those verbs, these
+tools are found only by exact name. The orchestrator extends the router after
+the merge, with tests proving that existing routing results do not change.
+Streams leave the router alone.
 
 ## Testing and verification
 
@@ -340,8 +392,9 @@ Per stream:
 By the orchestrator after integration:
 
 - Full test suite.
-- Each new read tool is run read-only against the real account where the current
-  token allows. Catalog tools wait for a token with `catalog_management`.
+- Each new read tool is run read-only against the real account. The token gained
+  `catalog_management` on 2026-11-12, so catalog reads are included. Results set
+  the `verified` flag in the ledger.
 - No write tool is run against a real account without Jeff's explicit go-ahead
   for that specific action.
 - A Codex `gpt-6.1-sol` max-effort review of the full branch. Every finding is
