@@ -383,16 +383,18 @@ def _health_client(**overrides) -> FakeCatalogClient:
         "ps_1": {"id": "ps_1", "name": "Shoes", "product_count": 0, "product_catalog": {"id": "cat_1"}},
     }
     edges = {
-        ("cat_1", "da_checks"): {"data": [
-            {"key": "catalog_has_feed_upload_errors", "result": "passed", "title": "Feed errors"},
-        ]},
         ("cat_1", "diagnostics"): {"data": []},
         ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("ps_1", "da_checks"): {"data": []},
     }
     objects.update(overrides.pop("objects", {}))
     edges.update(overrides.pop("edges", {}))
     return FakeCatalogClient(objects=objects, edges=edges, **overrides)
+
+
+def _assert_no_da_checks(client: FakeCatalogClient, result: dict[str, Any]) -> None:
+    """Meta rejects catalog and product set da_checks live, so the tool must neither read nor mention them."""
+    assert not any(call.get("edge") == "da_checks" for _, call in client.calls)
+    assert "da_checks" not in json.dumps(result)
 
 
 def test_dynamic_ads_health_no_blockers(monkeypatch) -> None:
@@ -400,29 +402,28 @@ def test_dynamic_ads_health_no_blockers(monkeypatch) -> None:
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
     assert result["status"] == "no_blockers_found"
     assert result["findings"] == []
-    assert "product_catalog/da_checks" in result["basis"]["signals_used"]
-    da_call = next(call for kind, call in client.calls if kind == "list" and call["edge"] == "da_checks")
-    assert da_call["fields"] == catalogs.DA_CHECK_FIELDS
+    assert result["basis"]["signals_used"] == [
+        "product_catalog.product_count", "product_catalog/diagnostics", "product_catalog/external_event_sources",
+    ]
+    assert "failed_checks" not in result["metrics"]
     diag_call = next(call for kind, call in client.calls if kind == "list" and call["edge"] == "diagnostics")
     assert diag_call["params"]["affected_channels"] == ["da"]
+    assert "diagnostics" not in diag_call["fields"]
+    _assert_no_da_checks(client, result)
 
 
 def test_dynamic_ads_health_empty_product_set_blocks(monkeypatch) -> None:
-    _use(monkeypatch, _health_client())
+    client = _use(monkeypatch, _health_client())
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1", product_set_id="ps_1"))
     assert result["status"] == "blocked"
     assert result["findings"][0]["severity"] == "blocking"
     assert "will not deliver" in result["findings"][0]["message"]
     assert result["metrics"]["product_set_product_count"] == 0
+    _assert_no_da_checks(client, result)
 
 
-def test_dynamic_ads_health_failed_checks_and_must_fix_are_at_risk(monkeypatch) -> None:
-    _use(monkeypatch, _health_client(edges={
-        ("cat_1", "da_checks"): {"data": [
-            {"key": "catalog_has_feed_upload_errors", "result": "failed", "title": "Feed errors",
-             "user_message": "Your last upload had errors", "action_uri": "https://example.com"},
-            {"key": "other", "result": "unavailable", "title": "Other"},
-        ]},
+def test_dynamic_ads_health_must_fix_diagnostics_are_at_risk(monkeypatch) -> None:
+    client = _use(monkeypatch, _health_client(edges={
         ("cat_1", "diagnostics"): {"data": [
             {"title": "Images missing", "severity": "MUST_FIX", "number_of_affected_items": 7},
             {"title": "Better titles", "severity": "OPPORTUNITY", "number_of_affected_items": 70},
@@ -430,11 +431,11 @@ def test_dynamic_ads_health_failed_checks_and_must_fix_are_at_risk(monkeypatch) 
     }))
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
     assert result["status"] == "at_risk"
-    kinds = [finding["source"] for finding in result["findings"]]
-    assert kinds == ["product_catalog/da_checks", "product_catalog/diagnostics"]
-    assert result["findings"][0]["message"] == "Your last upload had errors"
+    assert [finding["source"] for finding in result["findings"]] == ["product_catalog/diagnostics"]
+    assert result["findings"][0]["affected_items"] == 7
+    assert result["metrics"]["must_fix_groups"] == 1
     assert result["metrics"]["opportunity_groups"] == 1
-    assert any("other" in entry for entry in result["missing_signals"])
+    _assert_no_da_checks(client, result)
 
 
 def test_dynamic_ads_health_no_products_and_no_event_source(monkeypatch) -> None:
@@ -450,10 +451,12 @@ def test_dynamic_ads_health_no_products_and_no_event_source(monkeypatch) -> None
 
 
 def test_dynamic_ads_health_unavailable_signal_is_inconclusive(monkeypatch) -> None:
-    _use(monkeypatch, _health_client(edge_errors={("cat_1", "da_checks"): _permission_error()}))
+    client = _use(monkeypatch, _health_client(edge_errors={("cat_1", "diagnostics"): _permission_error()}))
     result = _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
     assert result["status"] == "inconclusive"
-    assert any("da_checks" in entry for entry in result["missing_signals"])
+    assert any("product_catalog/diagnostics" in entry for entry in result["missing_signals"])
+    assert "product_catalog/diagnostics" not in result["basis"]["signals_used"]
+    _assert_no_da_checks(client, result)
 
 
 def test_dynamic_ads_health_rejects_product_set_from_other_catalog(monkeypatch) -> None:
@@ -469,6 +472,13 @@ def test_dynamic_ads_health_catalog_read_error_raises(monkeypatch) -> None:
     _use(monkeypatch, _health_client(get_errors={"cat_1": _permission_error()}))
     with pytest.raises(MetaApiError):
         _run(catalogs.get_catalog_dynamic_ads_health(catalog_id="cat_1"))
+
+
+def test_catalogs_module_never_reads_da_checks() -> None:
+    import inspect
+
+    assert "da_checks" not in inspect.getsource(catalogs)
+    assert not hasattr(catalogs, "DA_CHECK_FIELDS")
 
 
 # ------------------------------------------------------- list_catalog_data_sources

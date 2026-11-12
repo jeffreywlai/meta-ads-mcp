@@ -79,7 +79,6 @@ DIAGNOSTIC_DETAIL_SAMPLE_SIZE = 1
 DIAGNOSTIC_DETAIL_SAMPLE_GROUPS = 5
 DIAGNOSTIC_DETAIL_TEXT_LIMIT = 160
 EVENT_SOURCE_FIELDS = ["id", "name", "source_type"]
-DA_CHECK_FIELDS = ["key", "title", "description", "result", "user_message", "action_uri"]
 
 # Operators named in Meta's product set filter documentation. starts_with is
 # documented as available only for the category field.
@@ -609,30 +608,12 @@ async def _health_edge(client, parent_id, edge, fields, params, used, missing, l
     return payload.get("data") or []
 
 
-def _check_findings(checks: list[dict[str, Any]], source: str, missing: list[str]) -> list[dict[str, Any]]:
-    findings = []
-    for check in checks:
-        result = str(check.get("result") or "").lower()
-        if result == "failed":
-            findings.append({
-                "severity": "issue",
-                "source": source,
-                "key": check.get("key"),
-                "title": check.get("title"),
-                "message": check.get("user_message") or check.get("description") or check.get("title"),
-                "action_uri": check.get("action_uri"),
-            })
-        elif result == "unavailable":
-            missing.append(f"{source} check {check.get('key')} was unavailable; Meta says to try again later.")
-    return findings
-
-
 @mcp_server.tool()
 async def get_catalog_dynamic_ads_health(
     catalog_id: str,
     product_set_id: str | None = None,
 ) -> dict[str, Any]:
-    """Whether a product catalog, or one product set in it, can serve catalog (dynamic) ads, and what blocks it. Combines Meta's dynamic-ads checks, diagnostics, product counts and connected event sources; lists the signals used."""
+    """Whether a product catalog, or one product set in it, can serve catalog (dynamic) ads, and what blocks it. Combines the catalog's dynamic-ads diagnostics, product counts and connected event sources; lists the signals used."""
     catalog_id = _require(catalog_id, "catalog_id")
     product_set_id = blank_to_none(product_set_id)
     client = get_graph_api_client()
@@ -647,17 +628,11 @@ async def get_catalog_dynamic_ads_health(
             raise ValidationError(f"Product set {product_set_id} belongs to catalog {owner}, not {catalog_id}.")
         used.append("product_set.product_count")
 
-    checks = await _health_edge(client, catalog_id, "da_checks", DA_CHECK_FIELDS, None,
-                                used, missing, "product_catalog/da_checks")
-    diagnostics = await _health_edge(client, catalog_id, "diagnostics", DIAGNOSTIC_FIELDS,
+    diagnostics = await _health_edge(client, catalog_id, "diagnostics", list(DIAGNOSTIC_SUMMARY_KEYS),
                                      {"affected_channels": ["da"], "limit": 100}, used, missing,
                                      "product_catalog/diagnostics")
     sources = await _health_edge(client, catalog_id, "external_event_sources", EVENT_SOURCE_FIELDS,
                                  {"limit": 25}, used, missing, "product_catalog/external_event_sources")
-    set_checks = None
-    if product_set_id:
-        set_checks = await _health_edge(client, product_set_id, "da_checks", DA_CHECK_FIELDS, None,
-                                        used, missing, "product_set/da_checks")
 
     blocking: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
@@ -674,8 +649,6 @@ async def get_catalog_dynamic_ads_health(
                              "message": f"Product set {product_set_id} contains no products. {_EMPTY_SET_MESSAGE}"})
         elif set_products is None:
             missing.append("Meta did not return the product set's product_count.")
-    issues.extend(_check_findings(checks or [], "product_catalog/da_checks", missing))
-    issues.extend(_check_findings(set_checks or [], "product_set/da_checks", missing))
     must_fix = sorted(
         (group for group in diagnostics or [] if group.get("severity") == "MUST_FIX"),
         key=_diagnostic_sort_key,
@@ -712,7 +685,6 @@ async def get_catalog_dynamic_ads_health(
             "catalog_product_count": catalog_products,
             "product_set_product_count": set_products,
             "event_source_count": None if sources is None else len(sources),
-            "failed_checks": sum(1 for item in issues if item["source"].endswith("da_checks")),
             "must_fix_groups": len(must_fix),
             "opportunity_groups": opportunity_groups,
         },
@@ -729,8 +701,7 @@ async def get_catalog_dynamic_ads_health(
                 "signals_used": used,
                 "rules": {
                     "blocked": "The catalog or the product set has no products.",
-                    "at_risk": ("A Meta dynamic-ads check failed, a must-fix dynamic-ads diagnostic exists, "
-                                "or no event source is connected."),
+                    "at_risk": "A must-fix dynamic-ads diagnostic exists, or no event source is connected.",
                     "inconclusive": "No problem was found but at least one signal could not be read.",
                     "no_blockers_found": "Every signal was read and none showed a problem.",
                 },
