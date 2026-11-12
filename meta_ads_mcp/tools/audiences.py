@@ -12,7 +12,8 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import Field
+from fastmcp.tools import Tool
+from pydantic import Field, WithJsonSchema
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
@@ -282,15 +283,66 @@ AUDIENCE_USERS_INLINE_ROW_LIMIT = 1_000
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-_REDACT_PATTERNS = (
-    re.compile(r"[0-9a-fA-F]{32,}"),
-    re.compile(r"[^\s@'\"<>(),;:]+@[^\s@'\"<>(),;:]+"),
-    re.compile(r"\+?\d[\d\s().-]{5,}\d"),
+
+
+# Each normalizer below follows Meta's customer-list normalization table
+# ("Hashing and normalization for multi-key", Marketing API custom audiences guide,
+# https://developers.facebook.com/documentation/ads-commerce/marketing-api/audiences/guides/custom-audiences#hash)
+# and returns "" when the normalized value does not have the published format.
+# An empty result is counted as invalid and sent blank; it is never hashed.
+# ST and ZIP also take the row's normalized COUNTRY, when the schema has one,
+# because their published format differs for the US and the UK.
+
+# ISO 3166-1 alpha-2 officially assigned codes (COUNTRY must be one of these).
+_ISO_COUNTRY_CODES = frozenset(
+    """
+    ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz
+    ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr
+    ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp
+    ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt
+    mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw
+    sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug
+    um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw
+    """.split()
 )
+
+# US state and territory names mapped to their 2-letter ANSI codes, keyed by the
+# lowercase a-z form produced by _ascii_letters.
+_US_STATE_CODES = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca",
+    "colorado": "co", "connecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga",
+    "hawaii": "hi", "idaho": "id", "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md", "massachusetts": "ma",
+    "michigan": "mi", "minnesota": "mn", "mississippi": "ms", "missouri": "mo", "montana": "mt",
+    "nebraska": "ne", "nevada": "nv", "newhampshire": "nh", "newjersey": "nj", "newmexico": "nm",
+    "newyork": "ny", "northcarolina": "nc", "northdakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhodeisland": "ri", "southcarolina": "sc",
+    "southdakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut", "vermont": "vt",
+    "virginia": "va", "washington": "wa", "westvirginia": "wv", "wisconsin": "wi", "wyoming": "wy",
+    "districtofcolumbia": "dc", "americansamoa": "as", "guam": "gu", "northernmarianaislands": "mp",
+    "puertorico": "pr", "usvirginislands": "vi", "virginislands": "vi",
+    "unitedstatesminoroutlyingislands": "um",
+}
+_US_STATE_ABBREVIATIONS = frozenset(_US_STATE_CODES.values())
+_UK_POSTCODE = re.compile(r"([a-z]{1,2}[0-9][a-z0-9]?)([0-9])([a-z]{2})?")
+
+
+def _has_non_ascii_digit(value: str) -> bool:
+    return any(character.isdigit() and not "0" <= character <= "9" for character in value)
 
 
 def _letters(value: str) -> str:
+    """FN and LN: lowercase letters only, no punctuation; non-Roman letters stay in UTF-8."""
     return "".join(character for character in unicodedata.normalize("NFC", value).lower() if character.isalpha())
+
+
+def _ascii_letters(value: str) -> str:
+    """CT and non-US ST: a-z only. Accents are removed; any other non-Roman letter makes the value invalid."""
+    decomposed = unicodedata.normalize("NFKD", value.lower())
+    letters = [character for character in decomposed if character.isalpha()]
+    if any(not "a" <= character <= "z" for character in letters):
+        return ""
+    return "".join(letters)
 
 
 def _normalize_email(value: str) -> str:
@@ -299,7 +351,11 @@ def _normalize_email(value: str) -> str:
 
 
 def _normalize_phone(value: str) -> str:
-    return re.sub(r"\D", "", value).lstrip("0")
+    """Remove symbols, letters and leading zeros; a phone number has 7 to 15 digits (E.164 allows 15)."""
+    if _has_non_ascii_digit(value):
+        return ""
+    digits = re.sub(r"[^0-9]", "", value).lstrip("0")
+    return digits if 7 <= len(digits) <= 15 else ""
 
 
 def _normalize_gender(value: str) -> str:
@@ -308,7 +364,8 @@ def _normalize_gender(value: str) -> str:
 
 def _normalize_number(value: str, *, low: int, high: int, width: int) -> str:
     digits = value.strip()
-    if not digits.isdigit() or not low <= int(digits) <= high:
+    # ASCII digits only: str.isdigit() also accepts characters such as "²" that int() rejects.
+    if not re.fullmatch(r"[0-9]{1,4}", digits) or not low <= int(digits) <= high:
         return ""
     return f"{int(digits):0{width}d}"
 
@@ -324,20 +381,32 @@ def _normalize_first_initial(value: str) -> str:
     return _letters(value)[:1]
 
 
-def _normalize_state(value: str) -> str:
-    return "".join(character for character in value.lower() if character.isalnum())
+def _normalize_state(value: str, country: str | None = None) -> str:
+    """US: the 2-letter ANSI code (full names are converted). Elsewhere: lowercase a-z, no punctuation or spaces."""
+    letters = _ascii_letters(value)
+    code = _US_STATE_CODES.get(letters, letters if letters in _US_STATE_ABBREVIATIONS else "")
+    if country == "us" or (country is None and code):
+        return code
+    return letters
 
 
-def _normalize_zip(value: str) -> str:
+def _normalize_zip(value: str, country: str | None = None) -> str:
+    """Lowercase without spaces; US: first 5 digits; UK: Area/District/Sector."""
+    if _has_non_ascii_digit(value):
+        return ""
     compact = "".join(value.lower().split())
-    if re.fullmatch(r"\d{5}(-?\d{4})?", compact):
-        return compact[:5]
-    return compact
+    us_zip = re.fullmatch(r"([0-9]{5})(-?[0-9]{4})?", compact)
+    if country == "us" or (country is None and us_zip):
+        return us_zip.group(1) if us_zip else ""
+    if country == "gb":
+        uk = _UK_POSTCODE.fullmatch(compact)
+        return f"{uk.group(1)}{uk.group(2)}" if uk else ""
+    return compact if re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", compact) and 2 <= len(compact) <= 10 else ""
 
 
 def _normalize_country(value: str) -> str:
     candidate = value.strip().lower()
-    return candidate if re.fullmatch(r"[a-z]{2}", candidate) else ""
+    return candidate if candidate in _ISO_COUNTRY_CODES else ""
 
 
 # Meta customer-list keys and their published normalization rules. Only keys
@@ -352,11 +421,13 @@ _AUDIENCE_KEY_NORMALIZERS = {
     "FN": _letters,
     "LN": _letters,
     "FI": _normalize_first_initial,
-    "CT": _letters,
+    "CT": _ascii_letters,
     "ST": _normalize_state,
     "ZIP": _normalize_zip,
     "COUNTRY": _normalize_country,
 }
+# Keys whose published format depends on the row's COUNTRY.
+_COUNTRY_AWARE_KEYS = frozenset({"ST", "ZIP"})
 
 
 def _audience_schema(schema: Any) -> list[str]:
@@ -364,10 +435,11 @@ def _audience_schema(schema: Any) -> list[str]:
     if not isinstance(keys, list) or not keys or any(not isinstance(key, str) or not key.strip() for key in keys):
         raise ValidationError("schema must list one or more Meta customer-list keys, such as EMAIL or PHONE.")
     normalized = [key.strip().upper() for key in keys]
-    unsupported = [key for key in normalized if key not in _AUDIENCE_KEY_NORMALIZERS]
+    # Positions, not the keys themselves: a misplaced customer value can arrive here.
+    unsupported = [str(position) for position, key in enumerate(normalized, start=1) if key not in _AUDIENCE_KEY_NORMALIZERS]
     if unsupported:
         raise ValidationError(
-            f"Unsupported schema key(s): {', '.join(unsupported)}. "
+            f"schema position {', '.join(unsupported)} is not a supported key (the value is not shown). "
             f"Supported keys: {', '.join(_AUDIENCE_KEY_NORMALIZERS)}."
         )
     if len(set(normalized)) != len(normalized):
@@ -380,9 +452,12 @@ def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
     path = Path(file_path).expanduser()
     if not path.is_file():
         raise ValidationError("file_path must point to a readable file.")
+    lines_read = 0
     try:
         with path.open(newline="", encoding="utf-8-sig") as handle:
-            reader = csv.reader(handle)
+            # strict rejects malformed quoting (such as an unclosed quote) instead of
+            # silently merging the following lines into one different record.
+            reader = csv.reader(handle, strict=True)
             header = next(reader, None)
             if not header:
                 raise ValidationError("file_path has no header row.")
@@ -396,7 +471,9 @@ def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
                 )
             positions = [columns.index(key) for key in schema]
             rows: list[list[Any]] = []
+            lines_read = reader.line_num
             for record in reader:
+                lines_read = reader.line_num
                 if not any(cell.strip() for cell in record):
                     continue
                 rows.append([record[index] if index < len(record) else "" for index in positions])
@@ -404,7 +481,12 @@ def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
     except UnicodeDecodeError:
         raise ValidationError("file_path must be a UTF-8 encoded CSV file.") from None
     except csv.Error:
-        raise ValidationError("file_path could not be parsed as CSV.") from None
+        # Report only where the bad record starts; the parser's own message and the
+        # record's content are withheld because they can contain customer values.
+        raise ValidationError(
+            f"file_path is not valid CSV: the record starting on line {lines_read + 1} is malformed "
+            "(for example an unclosed or misplaced quote). Nothing was uploaded."
+        ) from None
 
 
 def _hash_rows(
@@ -412,16 +494,23 @@ def _hash_rows(
     schema: list[str],
     *,
     pre_hashed: bool,
-) -> tuple[list[list[str]], list[list[str]], int, int]:
-    """Return rows to send, their raw values (for redaction only), invalid value count and dropped rows."""
+) -> tuple[list[list[str]], int, int]:
+    """Return rows to send, the invalid value count and the number of dropped rows."""
     prepared: list[list[str]] = []
-    raw_values: list[list[str]] = []
     invalid = 0
     dropped = 0
     for row_number, row in enumerate(rows, start=1):
-        if not isinstance(row, (list, tuple)) or len(row) != len(schema):
-            raise ValidationError(f"Row {row_number} must have exactly {len(schema)} values, one per schema key.")
+        if not isinstance(row, (list, tuple)):
+            raise ValidationError(f"Row {row_number} must be a list with one value per schema key.")
+        if len(row) != len(schema):
+            raise ValidationError(
+                f"Row {row_number} must have exactly {len(schema)} values, one per schema key; it has {len(row)}."
+            )
         sent: list[str] = []
+        country: str | None = None
+        if not pre_hashed and "COUNTRY" in schema:
+            raw_country = row[schema.index("COUNTRY")]
+            country = (_normalize_country(raw_country) or None) if isinstance(raw_country, str) else None
         for key, value in zip(schema, row):
             if value is None:
                 value = ""
@@ -443,7 +532,8 @@ def _hash_rows(
                     sent.append("")
                     continue
             else:
-                normalized = _AUDIENCE_KEY_NORMALIZERS[key](value)
+                normalizer = _AUDIENCE_KEY_NORMALIZERS[key]
+                normalized = normalizer(value, country) if key in _COUNTRY_AWARE_KEYS else normalizer(value)
                 if not normalized:
                     invalid += 1
                     sent.append("")
@@ -452,23 +542,13 @@ def _hash_rows(
             sent.append(digest)
         if any(sent):
             prepared.append(sent)
-            raw_values.append([str(value).strip() for value in row if value])
         else:
             dropped += 1
-    return prepared, raw_values, invalid, dropped
+    return prepared, invalid, dropped
 
 
-def _redact(text: Any, secrets_in_batch: list[str]) -> str | None:
-    """Remove anything that could be an uploaded value or hash from upstream error text."""
-    if text is None:
-        return None
-    redacted = str(text)
-    for secret in sorted(secrets_in_batch, key=len, reverse=True):
-        if len(secret) >= 3:
-            redacted = re.sub(re.escape(secret), "[redacted]", redacted, flags=re.IGNORECASE)
-    for pattern in _REDACT_PATTERNS:
-        redacted = pattern.sub("[redacted]", redacted)
-    return redacted
+def _safe_int(value: Any) -> int | None:
+    return value if _is_count(value) else None
 
 
 def _sanitized_upload_error(
@@ -477,38 +557,47 @@ def _sanitized_upload_error(
     action: str,
     batch_seq: int,
     total_batches: int,
+    rows_accepted: int,
     session_id: int,
-    batch_secrets: list[str],
 ) -> Exception:
-    """Rebuild an upload failure without any row value, hash, or upstream payload."""
+    """Rebuild an upload failure from structured facts only.
+
+    Meta's free-text fields (message, user title and message, error data, trace
+    and operation) can quote any uploaded value, raw, normalized or hashed, from
+    this batch or an earlier one, and no text scrubbing can be shown to catch
+    them all. They are withheld; only Meta's numeric code and subcode, the HTTP
+    status, whether a retry is safe, and the upload progress are kept.
+    """
     accepted = batch_seq - 1
     progress = (
         f"{action} failed on batch {batch_seq} of {total_batches} in session {session_id}; "
-        f"{accepted} earlier batch{'es were' if accepted != 1 else ' was'} accepted by Meta. "
+        f"{accepted} earlier batch{'es' if accepted != 1 else ''} with {rows_accepted} "
+        f"row{'s' if rows_accepted != 1 else ''} {'were' if accepted != 1 else 'was'} accepted by Meta. "
         "Meta closes an unfinished session automatically after 90 minutes."
     )
+    withheld = "Meta's error text is withheld because it can quote uploaded customer values."
     if isinstance(exc, RateLimitError):
+        retry_after = exc.retry_after_seconds
         return RateLimitError(
-            f"{progress} Meta rate limit: {_redact(exc.message, batch_secrets)}",
-            retry_after_seconds=exc.retry_after_seconds,
-            code=exc.code,
-            subcode=exc.subcode,
-            usage=exc.usage,
-            operation=exc.operation,
+            f"{progress} Meta rate limit. {withheld}",
+            retry_after_seconds=float(retry_after)
+            if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+            else None,
+            code=_safe_int(exc.code),
+            subcode=_safe_int(exc.subcode),
         )
     if isinstance(exc, MetaApiError):
+        retry_after = exc.retry_after_seconds
         return MetaApiError(
-            message=f"{progress} Meta said: {_redact(exc.message, batch_secrets)}",
-            status_code=exc.status_code,
-            code=exc.code,
-            subcode=exc.subcode,
-            user_title=_redact(exc.user_title, batch_secrets),
-            user_message=_redact(exc.user_message, batch_secrets),
-            is_transient=exc.is_transient,
-            trace_id=exc.trace_id,
-            operation=exc.operation,
-            retry_after_seconds=exc.retry_after_seconds,
-            mutation_outcome_unknown=exc.mutation_outcome_unknown,
+            message=f"{progress} {withheld}",
+            status_code=_safe_int(exc.status_code),
+            code=_safe_int(exc.code),
+            subcode=_safe_int(exc.subcode),
+            is_transient=exc.is_transient if isinstance(exc.is_transient, bool) else None,
+            retry_after_seconds=float(retry_after)
+            if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+            else None,
+            mutation_outcome_unknown=exc.mutation_outcome_unknown is True,
         )
     return MetaApiError(
         message=f"{progress} The request failed ({type(exc).__name__}); details are withheld because they can contain uploaded values.",
@@ -516,25 +605,70 @@ def _sanitized_upload_error(
     )
 
 
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _session_counters(batch_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize Meta's per-response counters without adding them up.
+
+    Meta's add-members guide defines num_received as the total received in the
+    session so far, so the latest reported value is the session total. It calls
+    num_invalid_entries approximate and does not say whether it covers the request
+    or the session, so it is reported as a total only when there was one batch.
+    """
+    reported = [batch for batch in batch_results if batch["num_received"] is not None]
+    counters: dict[str, Any] = {
+        "num_received": reported[-1]["num_received"] if reported else None,
+        "num_received_as_of_batch": reported[-1]["batch_seq"] if reported else None,
+        "num_invalid_entries": batch_results[0]["num_invalid_entries"] if len(batch_results) == 1 else None,
+    }
+    if len(batch_results) > 1:
+        counters["counter_note"] = (
+            "num_received is Meta's session-to-date count from the latest batch that reported it. "
+            "Meta does not say whether num_invalid_entries covers one request or the session, so no "
+            "total is given; see batches for each reported value."
+        )
+    return counters
+
+
+def _upload_flag(value: Any) -> bool:
+    """Read pre_hashed the way MCP clients send booleans, without quoting a bad value."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise ValidationError("pre_hashed must be true or false (the value is not shown).")
+
+
 async def _send_audience_users(
     *,
     action: str,
-    audience_id: str,
-    schema: StringList,
-    file_path: str | None,
-    rows: list[list[str]] | None,
-    pre_hashed: bool,
+    audience_id: Any,
+    schema: Any,
+    file_path: Any,
+    rows: Any,
+    pre_hashed: Any,
 ) -> dict[str, Any]:
+    # Every argument is checked here rather than by the MCP framework (see the
+    # note above _AudienceIdArgument). Messages describe position and shape only.
+    if audience_id is not None and not isinstance(audience_id, str):
+        raise ValidationError("audience_id must be a string (the value is not shown).")
     audience_id = blank_to_none(audience_id)
     if audience_id is None:
         raise ValidationError("audience_id is required.")
+    if file_path is not None and not isinstance(file_path, str):
+        raise ValidationError("file_path must be a string path to a local CSV file (the value is not shown).")
     file_path = blank_to_none(file_path)
+    pre_hashed = _upload_flag(pre_hashed)
     if (file_path is None) == (rows is None):
         raise ValidationError("Provide exactly one of file_path or rows.")
     keys = _audience_schema(schema)
     if rows is not None:
         if not isinstance(rows, list):
-            raise ValidationError("rows must be a list of rows, each a list with one value per schema key.")
+            raise ValidationError(
+                "rows must be a list of rows, each a list with one value per schema key (the value is not shown)."
+            )
         if len(rows) > AUDIENCE_USERS_INLINE_ROW_LIMIT:
             raise ValidationError(
                 f"Inline rows are limited to {AUDIENCE_USERS_INLINE_ROW_LIMIT}; pass a local CSV with file_path instead."
@@ -542,21 +676,21 @@ async def _send_audience_users(
         source_rows: list[Any] = rows
     else:
         source_rows = _read_customer_csv(file_path, keys)
-    prepared, raw_values, invalid, dropped = _hash_rows(source_rows, keys, pre_hashed=pre_hashed)
+    prepared, invalid, dropped = _hash_rows(source_rows, keys, pre_hashed=pre_hashed)
     if not prepared:
         raise ValidationError(
             f"No valid values to send: all {len(source_rows)} rows were blank or failed normalization."
         )
     batches = [
-        (prepared[start:start + AUDIENCE_USERS_BATCH_SIZE], raw_values[start:start + AUDIENCE_USERS_BATCH_SIZE])
+        prepared[start:start + AUDIENCE_USERS_BATCH_SIZE]
         for start in range(0, len(prepared), AUDIENCE_USERS_BATCH_SIZE)
     ]
     session_id = secrets.randbelow(2**62) + 1
     client = get_graph_api_client()
     send = client.create_edge_object if action == "add_audience_users" else client.delete_edge_object
-    totals = {"num_received": 0, "num_invalid_entries": 0}
     batch_results: list[dict[str, Any]] = []
-    for batch_seq, (batch, batch_raw) in enumerate(batches, start=1):
+    rows_accepted = 0
+    for batch_seq, batch in enumerate(batches, start=1):
         data = {
             "payload": {"schema": keys, "data": batch},
             "session": {
@@ -570,27 +704,24 @@ async def _send_audience_users(
         try:
             result = await send(audience_id, "users", data=data)
         except Exception as exc:
-            batch_secrets = [value for row in batch_raw for value in row] + [value for row in batch for value in row if value]
             failure = _sanitized_upload_error(
                 exc,
                 action=action,
                 batch_seq=batch_seq,
                 total_batches=len(batches),
+                rows_accepted=rows_accepted,
                 session_id=session_id,
-                batch_secrets=batch_secrets,
             )
         if failure is not None:
             # Raised outside the except block so the original error, which can
             # echo uploaded values, is not chained as __context__.
             raise failure
         counts = {
-            key: result.get(key) if isinstance(result.get(key), int) else None
+            key: result.get(key) if _is_count(result.get(key)) else None
             for key in ("num_received", "num_invalid_entries")
         }
-        for key, value in counts.items():
-            if value is not None:
-                totals[key] += value
         batch_results.append({"batch_seq": batch_seq, "rows_sent": len(batch), **counts})
+        rows_accepted += len(batch)
     return {
         "ok": True,
         "action": action,
@@ -607,19 +738,64 @@ async def _send_audience_users(
             "batches": len(batches),
             "last_batch_flag_sent": True,
         },
-        "meta": totals,
+        "meta": _session_counters(batch_results),
         "batches": batch_results,
         "privacy_note": "No row values or hashes are returned; the sample invalid entries Meta sends back are discarded.",
     }
 
 
-@mcp_server.tool()
+# FastMCP validates declared parameter types before a tool runs, and on failure
+# Pydantic quotes the rejected input, or every argument when one is missing, in
+# the raised error and in a WARNING log line. These parameters can carry
+# customer values, so the framework is given types it always accepts and
+# _send_audience_users validates them with structural messages instead.
+# WithJsonSchema keeps the advertised input schema. Field(default=None) lets a
+# missing argument reach the tool while Python callers must still pass it;
+# _register_customer_upload_tool restores those two in the schema's required list.
+_AudienceIdArgument = Annotated[Any, Field(default=None), WithJsonSchema({"type": "string"})]
+_SchemaArgument = Annotated[
+    Any,
+    Field(default=None),
+    WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}),
+]
+_FilePathArgument = Annotated[Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})]
+_RowsArgument = Annotated[
+    Any,
+    WithJsonSchema(
+        {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "string"}},
+                    "maxItems": AUDIENCE_USERS_INLINE_ROW_LIMIT,
+                },
+                {"type": "null"},
+            ],
+            "description": "One list per person with one string value per schema key, in schema order.",
+        }
+    ),
+]
+_PreHashedArgument = Annotated[Any, WithJsonSchema({"type": "boolean"})]
+_REQUIRED_UPLOAD_ARGUMENTS = ["audience_id", "schema"]
+
+
+def _register_customer_upload_tool(fn: Any) -> Any:
+    """Register an upload tool as @mcp_server.tool() does, keeping audience_id and schema required in its schema."""
+    tool = Tool.from_function(fn, task=False, run_in_thread=True)
+    tool.parameters["required"] = list(_REQUIRED_UPLOAD_ARGUMENTS)
+    for name in _REQUIRED_UPLOAD_ARGUMENTS:
+        tool.parameters["properties"][name].pop("default", None)
+    mcp_server.add_tool(tool)
+    return fn
+
+
+@_register_customer_upload_tool
 async def add_audience_users(
-    audience_id: str,
-    schema: StringList,
-    file_path: str | None = None,
-    rows: list[list[str]] | None = None,
-    pre_hashed: bool = False,
+    audience_id: _AudienceIdArgument,
+    schema: _SchemaArgument,
+    file_path: _FilePathArgument = None,
+    rows: _RowsArgument = None,
+    pre_hashed: _PreHashedArgument = False,
 ) -> dict[str, Any]:
     """Add people to a customer list audience. schema lists Meta keys (EMAIL, PHONE, FN, LN, FI, GEN, DOBY, DOBM, DOBD, CT, ST, ZIP, COUNTRY). Prefer file_path, a local CSV whose header names those columns, so values never pass through the model; inline rows (max 1,000) have already passed through the calling model and its provider. Values are normalized and SHA-256 hashed locally unless pre_hashed; blank or malformed values are dropped and counted. Returns counts only."""
     return await _send_audience_users(
@@ -632,13 +808,13 @@ async def add_audience_users(
     )
 
 
-@mcp_server.tool()
+@_register_customer_upload_tool
 async def remove_audience_users(
-    audience_id: str,
-    schema: StringList,
-    file_path: str | None = None,
-    rows: list[list[str]] | None = None,
-    pre_hashed: bool = False,
+    audience_id: _AudienceIdArgument,
+    schema: _SchemaArgument,
+    file_path: _FilePathArgument = None,
+    rows: _RowsArgument = None,
+    pre_hashed: _PreHashedArgument = False,
 ) -> dict[str, Any]:
     """Remove people from a customer list audience. Same inputs as add_audience_users: prefer file_path, a local CSV whose header names the schema columns, so values never pass through the model; inline rows (max 1,000) have already passed through the calling model and its provider. Values are normalized and SHA-256 hashed locally unless pre_hashed. Returns counts only."""
     return await _send_audience_users(

@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
+
 import pytest
 
 from meta_ads_mcp.tools import audiences
@@ -288,24 +290,36 @@ def _sha(value: str) -> str:
 
 
 class FakeUsersClient:
-    """Records audience user uploads; can fail on one batch with a value-echoing error."""
+    """Records audience user uploads; can fail on one batch with a value-echoing error.
 
-    def __init__(self, *, fail_on_batch: int | None = None, error: Exception | None = None) -> None:
+    num_received follows Meta's add-members guide: the total received in the session so far.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_on_batch: int | None = None,
+        error: Exception | None = None,
+        invalid_entries: list[int] | None = None,
+    ) -> None:
         self.requests: list[dict[str, object]] = []
         self.fail_on_batch = fail_on_batch
         self.error = error
+        self.invalid_entries = invalid_entries
+        self.received = 0
 
     def _record(self, method: str, parent_id: str, edge: str, data: dict) -> dict:
         self.requests.append({"method": method, "parent_id": parent_id, "edge": edge, "data": data})
         if self.fail_on_batch == len(self.requests):
             raise self.error
         rows = data["payload"]["data"]
+        self.received += len(rows)
         return {
             "audience_id": parent_id,
             "session_id": str(data["session"]["session_id"]),
-            "num_received": len(rows),
-            "num_invalid_entries": 0,
-            "invalid_entry_samples": {rows[0][0]: "sample echoing a hash"},
+            "num_received": self.received,
+            "num_invalid_entries": self.invalid_entries[len(self.requests) - 1] if self.invalid_entries else 0,
+            "invalid_entry_samples": {next(value for value in rows[0] if value): "sample echoing a hash"},
         }
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
@@ -420,6 +434,68 @@ def test_audience_users_normalizes_before_hashing(monkeypatch) -> None:
     ]]
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("PHONE", "1"),
+        ("PHONE", "12345"),
+        ("PHONE", "1234567890123456"),
+        ("PHONE", "+1 555 ٠١٠ 9999"),
+        ("ZIP", "!!!"),
+        ("ZIP", "9"),
+        ("ST", "123"),
+        ("ST", "Москва"),
+        ("CT", "Москва"),
+        ("CT", "123"),
+        ("COUNTRY", "zz"),
+        ("COUNTRY", "usa"),
+        ("DOBM", "²"),
+        ("DOBD", "٣"),
+        ("DOBY", "１９９０"),
+    ],
+)
+def test_audience_users_malformed_values_are_dropped_not_hashed(monkeypatch, key, value) -> None:
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL", key], rows=[["valid@example.invalid", value]],
+    ))
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha("valid@example.invalid"), ""]]
+    assert result["invalid_values"] == 1
+
+
+@pytest.mark.parametrize(
+    ("schema", "row", "expected"),
+    [
+        # Meta's normalization table: CT is a-z only; ST is the 2-letter ANSI code for
+        # US states and lowercase letters without punctuation or spaces elsewhere.
+        (["CT"], ["München"], ["munchen"]),
+        (["CT"], ["St. Louis"], ["stlouis"]),
+        (["ST"], ["California"], ["ca"]),
+        (["ST"], [" NY "], ["ny"]),
+        (["ST"], ["New-York"], ["ny"]),
+        (["COUNTRY", "ST"], ["US", "California"], ["us", "ca"]),
+        (["COUNTRY", "ST"], ["US", "Bavaria"], ["us", ""]),
+        (["COUNTRY", "ST"], ["DE", "Bayern"], ["de", "bayern"]),
+        (["COUNTRY", "ST"], ["FR", "Île-de-France"], ["fr", "iledefrance"]),
+        # ZIP: lowercase without spaces, first 5 digits in the US, Area/District/Sector in the UK.
+        (["ZIP"], ["94025-1234"], ["94025"]),
+        (["COUNTRY", "ZIP"], ["US", "1234"], ["us", ""]),
+        (["COUNTRY", "ZIP"], ["GB", "SW1A 1AA"], ["gb", "sw1a1"]),
+        (["COUNTRY", "ZIP"], ["CA", "K1A 0B1"], ["ca", "k1a0b1"]),
+        (["ZIP"], ["100-0001"], ["100-0001"]),
+        # PHONE: symbols, letters and leading zeros removed; 7 to 15 digits remain.
+        (["PHONE"], ["001 555 010 9999"], ["15550109999"]),
+        (["FN"], ["Zoë-Ann"], ["zoëann"]),
+    ],
+)
+def test_audience_users_values_follow_published_format(monkeypatch, schema, row, expected) -> None:
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=schema, rows=[row]))
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha(value) if value else "" for value in expected]]
+
+
 def test_audience_users_pre_hashed_rejects_non_digests(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(audiences.ValidationError, match="SHA-256") as excinfo:
@@ -447,45 +523,268 @@ def test_audience_users_never_echo_rows(monkeypatch, caplog, tool) -> None:
     digest = _sha(raw)
     caplog.set_level(logging.DEBUG)
 
-    client = FakeUsersClient()
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    class EchoingSuccess(FakeUsersClient):
+        """Answers like Meta but also echoes everything it was sent, so a leak would show."""
+
+        def _record(self, method, parent_id, edge, data):
+            response = super()._record(method, parent_id, edge, data)
+            return {**response, "echo": data, "note": f"received {raw}"}
+
+    client = EchoingSuccess()
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL"], rows=[[raw]]))
+    assert digest in json.dumps(client.requests)
     serialized = json.dumps(result)
     assert raw not in serialized and digest not in serialized
 
-    for error in (
-        audiences.MetaApiError(
-            message=f"Invalid entry {raw} with hash {digest}",
-            status_code=400, code=100, user_message=f"Bad {digest}",
-            error_data={"sample": digest}, details={"error": {"message": raw}},
-        ),
-        RuntimeError(f"transport failed while sending {raw} {digest}"),
-    ):
+    errors: list[tuple[Exception, type[Exception]]] = [
+        (_echoing_errors([raw, raw.upper(), digest])[0], audiences.MetaApiError),
+        (_echoing_errors([raw, raw.upper(), digest])[1], audiences.RateLimitError),
+        (RuntimeError(f"transport failed while sending {raw} {digest}"), audiences.MetaApiError),
+    ]
+    for error, expected in errors:
+        # The fake really carries the values, so the assertions below can fail.
+        assert raw in str(error) and digest in str(error)
         failing = FakeUsersClient(fail_on_batch=1, error=error)
         monkeypatch.setattr(audiences, "get_graph_api_client", lambda failing=failing: failing)
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(expected) as excinfo:
             asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL"], rows=[[raw]]))
-        rendered = " ".join([
-            str(excinfo.value), repr(excinfo.value),
-            json.dumps(getattr(excinfo.value, "to_public_dict", lambda: {})()),
-        ])
-        assert raw not in rendered and digest not in rendered
+        assert type(excinfo.value) is expected
+        rendered = _rendered_chain(excinfo.value)
+        assert raw not in rendered.lower() and digest not in rendered
         assert excinfo.value.__cause__ is None
         assert excinfo.value.__context__ is None
 
-        from fastmcp.exceptions import ToolError
-
-        from meta_ads_mcp.coordinator import mcp_server
-
         fresh = FakeUsersClient(fail_on_batch=1, error=error)
         monkeypatch.setattr(audiences, "get_graph_api_client", lambda fresh=fresh: fresh)
+        caplog.clear()
         with pytest.raises(ToolError) as tool_error:
             asyncio.run(mcp_server.call_tool(tool, {
                 "audience_id": "aud_1", "schema": "EMAIL", "rows": [[raw]],
             }))
-        assert raw not in str(tool_error.value) and digest not in str(tool_error.value)
+        assert json.loads(str(tool_error.value))["error"]["type"] in {"meta_api", "rate_limit"}
+        _assert_nothing_echoed(tool_error.value, caplog, raw)
+        _assert_nothing_echoed(tool_error.value, caplog, digest)
 
-    assert raw not in caplog.text and digest not in caplog.text
+
+def _rendered_chain(error: BaseException) -> str:
+    """Render an exception, its public payload and every chained cause and context."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts += [str(current), repr(current), json.dumps(getattr(current, "to_public_dict", lambda: {})())]
+        pending += [current.__cause__, current.__context__]
+    return "\n".join(parts)
+
+
+def _contains_value(text: str, value: str) -> bool:
+    """True when value appears in text as a whole token, ignoring case (short values such as "m" included)."""
+    return re.search(rf"(?<![^\W_]){re.escape(value)}(?![^\W_])", text, flags=re.IGNORECASE) is not None
+
+
+def _echoing_errors(values: list[str]) -> list[Exception]:
+    text = " ".join(f"'{value}'" for value in values)
+    return [
+        audiences.MetaApiError(
+            message=f"Invalid customer value: {text}", status_code=400, code=100, subcode=1870053,
+            user_title=f"Bad {text}", user_message=f"Check {text}", trace_id=f"trace {text}",
+            error_data={"sample": text}, details={"error": {"message": text}}, operation=f"op {text}",
+            is_transient=False,
+        ),
+        audiences.RateLimitError(
+            message=f"Too many calls for {text}", retry_after_seconds=60.0, code=17, subcode=2446079,
+            usage={"echo": text}, operation=f"op {text}",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize(
+    ("schema", "raw", "normalized"),
+    [
+        (["FN"], "Li", "li"),
+        (["GEN"], "m", "m"),
+        (["DOBM"], "3", "03"),
+        (["FN"], "Zoë-Ann", "zoëann"),
+        (["CT"], "Saint-Étienne", "saintetienne"),
+    ],
+)
+def test_audience_users_upload_errors_withhold_meta_text(monkeypatch, caplog, tool, schema, raw, normalized) -> None:
+    caplog.set_level(logging.DEBUG)
+    for error, expected_type in zip(_echoing_errors([raw, normalized, _sha(normalized)]), ["meta_api", "rate_limit"]):
+        client = FakeUsersClient(fail_on_batch=1, error=error)
+        monkeypatch.setattr(audiences, "get_graph_api_client", lambda client=client: client)
+        with pytest.raises((audiences.MetaApiError, audiences.RateLimitError)) as excinfo:
+            asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=schema, rows=[[raw]]))
+        rendered = _rendered_chain(excinfo.value)
+        for value in (raw, normalized, _sha(normalized)):
+            assert not _contains_value(rendered, value)
+        public = excinfo.value.to_public_dict()
+        assert public["type"] == expected_type
+        assert (public["code"], public["subcode"]) == ((100, 1870053) if expected_type == "meta_api" else (17, 2446079))
+        assert {"user_title", "user_message", "trace_id", "error_data", "usage", "operation"}.isdisjoint(public)
+        assert "batch 1 of 1" in public["message"] and "0 rows" in public["message"]
+    assert not _contains_value(caplog.text, raw) and not _contains_value(caplog.text, normalized)
+
+
+def test_audience_users_error_withholds_values_from_earlier_batches(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+    error = audiences.MetaApiError(
+        message="Session failed for customer Rosalind and rosalind", code=2650, subcode=1870148,
+        status_code=400, is_transient=True,
+    )
+    client = FakeUsersClient(fail_on_batch=2, error=error)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    with pytest.raises(audiences.MetaApiError) as excinfo:
+        asyncio.run(audiences.add_audience_users(
+            audience_id="aud_1", schema=["FN"], rows=[["Rosalind"], ["Maxwell"]],
+        ))
+    rendered = _rendered_chain(excinfo.value)
+    assert "rosalind" not in rendered.lower() and "maxwell" not in rendered.lower()
+    public = excinfo.value.to_public_dict()
+    assert public["retryable"] is True
+    assert (public["code"], public["subcode"], public["status_code"]) == (2650, 1870148, 400)
+    assert "batch 2 of 2" in public["message"] and "1 earlier batch" in public["message"]
+    assert "1 rows" in public["message"] or "1 row " in public["message"]
+
+
+def test_audience_users_transport_error_is_withheld(monkeypatch) -> None:
+    raw = "ab@example.com"
+    client = FakeUsersClient(fail_on_batch=1, error=RuntimeError(f"connection reset while sending {raw} {_sha(raw)}"))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    with pytest.raises(audiences.MetaApiError) as excinfo:
+        asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=["EMAIL"], rows=[[raw]]))
+    rendered = _rendered_chain(excinfo.value)
+    assert raw not in rendered and _sha(raw) not in rendered
+    assert excinfo.value.mutation_outcome_unknown is True
+    assert "RuntimeError" in str(excinfo.value)
+
+
+_PRIVATE_EMAIL = "private.customer@example.invalid"
+_PRIVATE_DIGEST = hashlib.sha256(_PRIVATE_EMAIL.encode()).hexdigest()
+
+
+def _malformed_upload_arguments(value: str) -> list[tuple[dict[str, object], str]]:
+    """Wrongly shaped arguments that each carry a customer value, with the expected structural message."""
+    return [
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": value}, "rows must be a list"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [value]}, "Row 1 must be a list"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": {"customer": value}}, "rows must be a list"),
+        ({"audience_id": "123", "schema": ["EMAIL", "PHONE"], "rows": [["a@example.com", 5551234567]]}, "Row 1, PHONE"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [[{"email": value}]]}, "Row 1, EMAIL"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [["a@example.com"], [value, value]]}, "Row 2 must have exactly 1"),
+        ({"audience_id": "123", "schema": {"EMAIL": value}, "rows": [["a@example.com"]]}, "schema must list"),
+        ({"audience_id": "123", "schema": [value], "rows": [["a@example.com"]]}, "schema position 1"),
+        ({"audience_id": "123", "schema": value, "rows": [["a@example.com"]]}, "schema position 1"),
+        ({"audience_id": [value], "schema": ["EMAIL"], "rows": [["a@example.com"]]}, "audience_id must be a string"),
+        ({"schema": ["EMAIL"], "rows": [[value]]}, "audience_id is required"),
+        ({"audience_id": "123", "rows": [[value]]}, "schema must list"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "file_path": {"path": value}}, "file_path must be a string"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [[value]], "pre_hashed": value}, "pre_hashed must be true or false"),
+    ]
+
+
+def _assert_nothing_echoed(error: BaseException, caplog, value: str) -> None:
+    rendered = _rendered_chain(error)
+    assert value not in rendered
+    assert value not in caplog.text
+    for record in caplog.records:
+        assert value not in record.getMessage()
+        assert value not in repr(record.args)
+        if record.exc_info:
+            assert value not in _rendered_chain(record.exc_info[1])
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+@pytest.mark.parametrize("value", [_PRIVATE_EMAIL, _PRIVATE_DIGEST], ids=["raw", "hashed"])
+def test_audience_users_mcp_argument_errors_never_echo_values(monkeypatch, caplog, tool, routed, value) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    for arguments, message in _malformed_upload_arguments(value):
+        name, call_arguments = (("call_tool", {"name": tool, "arguments": arguments}) if routed else (tool, arguments))
+        caplog.clear()
+        with pytest.raises(ToolError) as excinfo:
+            asyncio.run(mcp_server.call_tool(name, call_arguments))
+        assert message in str(excinfo.value), (arguments, str(excinfo.value))
+        # The server did log the failure (with its traceback), so the log check below is not vacuous.
+        assert any(record.exc_info for record in caplog.records)
+        _assert_nothing_echoed(excinfo.value, caplog, value)
+
+
+@pytest.mark.parametrize("value", [_PRIVATE_EMAIL, _PRIVATE_DIGEST], ids=["raw", "hashed"])
+@pytest.mark.parametrize("shape", ["list", "nested_list", "number_list"])
+def test_call_tool_proxy_rejects_non_object_arguments_without_echo(monkeypatch, caplog, value, shape) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    arguments = {"list": [value], "nested_list": [[value]], "number_list": [value, 1]}[shape]
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(mcp_server.call_tool("call_tool", {"name": "add_audience_users", "arguments": arguments}))
+    assert "arguments must be a JSON object" in str(excinfo.value)
+    _assert_nothing_echoed(excinfo.value, caplog, value)
+
+
+def test_call_tool_proxy_schema_is_unchanged_by_loose_arguments() -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    tools = {tool.name: tool for tool in asyncio.run(mcp_server.list_tools())}
+    assert tools["call_tool"].parameters["properties"]["arguments"] == {
+        "anyOf": [{"additionalProperties": True, "type": "object"}, {"type": "string"}, {"type": "null"}],
+        "default": None,
+        "description": "Tool arguments as an object or object-valued JSON string",
+    }
+
+
+def test_audience_users_mcp_schema_still_describes_the_expected_shape() -> None:
+    from meta_ads_mcp.coordinator import mcp_server, serialize_search_results_compact
+
+    for tool_name in USER_TOOLS:
+        tool = asyncio.run(mcp_server.get_tool(tool_name))
+        parameters = tool.parameters
+        assert parameters["required"] == ["audience_id", "schema"]
+        assert parameters["additionalProperties"] is False
+        properties = parameters["properties"]
+        assert properties["audience_id"]["type"] == "string"
+        assert {choice["type"] for choice in properties["schema"]["anyOf"]} == {"string", "array"}
+        rows_array = next(choice for choice in properties["rows"]["anyOf"] if choice["type"] == "array")
+        assert rows_array["items"] == {"type": "array", "items": {"type": "string"}}
+        assert rows_array["maxItems"] == audiences.AUDIENCE_USERS_INLINE_ROW_LIMIT
+        assert properties["pre_hashed"]["type"] == "boolean"
+        assert properties["pre_hashed"]["default"] is False
+        summary = serialize_search_results_compact([tool])
+        assert "req: audience_id (string), schema (string or list[string])" in summary
+        assert "rows (list[list[string]] or null)" in summary
+
+
+def test_audience_users_mcp_call_with_valid_arguments_still_uploads(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": "add_audience_users",
+        "arguments": {"audience_id": "aud_1", "schema": "EMAIL,PHONE", "rows": [["a@example.com", None]],
+                      "pre_hashed": "false"},
+    }))
+    assert result.structured_content["rows_sent"] == 1
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha("a@example.com"), ""]]
 
 
 def test_audience_users_error_mid_upload_reports_progress(monkeypatch) -> None:
@@ -520,8 +819,52 @@ def test_audience_users_batches_share_one_session(monkeypatch) -> None:
     assert [len(request["data"]["payload"]["data"]) for request in client.requests] == [2, 2, 1]
     assert result["session"]["batches"] == 3
     assert result["session"]["session_id"] == str(sessions[0]["session_id"])
-    assert result["meta"] == {"num_received": 5, "num_invalid_entries": 0}
+    assert [batch["num_received"] for batch in result["batches"]] == [2, 4, 5]
+    # num_received is a session-to-date count, so the latest value is the session total.
+    assert result["meta"]["num_received"] == 5 == result["rows_sent"]
     assert "invalid_entry_samples" not in json.dumps(result)
+
+
+def test_audience_users_received_count_is_latest_session_snapshot(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+
+    class Snapshots(FakeUsersClient):
+        snapshots = iter([10_000, 20_000, None])
+
+        def _record(self, method, parent_id, edge, data):
+            response = super()._record(method, parent_id, edge, data)
+            response["num_received"] = next(self.snapshots)
+            return response
+
+    client = Snapshots()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL"], rows=[[f"u{index}@example.com"] for index in range(3)],
+    ))
+    # The last batch did not report a count, so the latest reported snapshot is used and labelled.
+    assert result["meta"]["num_received"] == 20_000
+    assert result["meta"]["num_received_as_of_batch"] == 2
+    assert [batch["num_received"] for batch in result["batches"]] == [10_000, 20_000, None]
+
+
+def test_audience_users_invalid_entry_count_is_not_summed_across_batches(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+    client = FakeUsersClient(invalid_entries=[1, 1])
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL"], rows=[["a@example.com"], ["b@example.com"]],
+    ))
+    # Meta does not document whether this counter is per request or session-to-date.
+    assert result["meta"]["num_invalid_entries"] is None
+    assert "num_invalid_entries" in result["meta"]["counter_note"]
+    assert [batch["num_invalid_entries"] for batch in result["batches"]] == [1, 1]
+
+    single = FakeUsersClient(invalid_entries=[3])
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: single)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL"], rows=[["a@example.com"]],
+    ))
+    assert result["meta"] == {"num_received": 1, "num_received_as_of_batch": 1, "num_invalid_entries": 3}
 
 
 @pytest.mark.parametrize(
@@ -529,7 +872,8 @@ def test_audience_users_batches_share_one_session(monkeypatch) -> None:
     [
         ({"audience_id": " ", "schema": ["EMAIL"], "rows": [["a@example.com"]]}, "audience_id is required"),
         ({"audience_id": "aud_1", "schema": [], "rows": [["a@example.com"]]}, "schema"),
-        ({"audience_id": "aud_1", "schema": ["EMAIL_SHA256"], "rows": [["a@example.com"]]}, "Unsupported schema key"),
+        ({"audience_id": "aud_1", "schema": ["EMAIL", "EMAIL_SHA256"], "rows": [["a@example.com", "b"]]},
+         "schema position 2 is not a supported key"),
         ({"audience_id": "aud_1", "schema": ["EMAIL", "email"], "rows": [["a", "b"]]}, "more than once"),
         ({"audience_id": "aud_1", "schema": ["EMAIL", "PHONE"], "rows": [["a@example.com"]]}, "Row 1"),
         ({"audience_id": "aud_1", "schema": ["EMAIL"], "rows": [[""], ["nope"]]}, "No valid values"),
@@ -592,3 +936,41 @@ def test_audience_users_file_errors_make_no_call(monkeypatch, tmp_path) -> None:
     with pytest.raises(audiences.ValidationError, match="EMAIL") as excinfo:
         asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=["EMAIL"], file_path=str(csv_path)))
     assert "secret@example.com" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("content", "line"),
+    [
+        # An unterminated quote would otherwise swallow the following records.
+        ('email,fn\n"valid@example.invalid,Alice\nnext@example.invalid,Bob\n', 2),
+        ('email,fn\nfirst@example.invalid,Ann\n"second@example.invalid"x,Bob\n', 3),
+    ],
+)
+@pytest.mark.parametrize("tool", USER_TOOLS)
+def test_audience_users_malformed_csv_is_rejected_before_upload(monkeypatch, tmp_path, tool, content, line) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    csv_path = tmp_path / "ragged.csv"
+    csv_path.write_text(content)
+    with pytest.raises(audiences.ValidationError, match=f"line {line}") as excinfo:
+        asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL", "FN"], file_path=str(csv_path)))
+    message = str(excinfo.value)
+    for value in ("valid@example.invalid", "next@example.invalid", "second@example.invalid", "Alice", "Bob", "Ann"):
+        assert value not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__
+
+
+def test_audience_users_csv_keeps_bom_header_matching_and_blank_columns(monkeypatch, tmp_path) -> None:
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    csv_path = tmp_path / "bom.csv"
+    csv_path.write_bytes('﻿Email,"First, Name",fn\n"a@example.com","x",Ann\nb@example.com,,\n\n'.encode("utf-8"))
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL", "FN"], file_path=str(csv_path),
+    ))
+    assert client.requests[0]["data"]["payload"]["data"] == [
+        [_sha("a@example.com"), _sha("ann")],
+        [_sha("b@example.com"), ""],
+    ]
+    assert result["rows_read"] == 2
+    assert result["invalid_values"] == 1
