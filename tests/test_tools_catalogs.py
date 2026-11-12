@@ -297,6 +297,83 @@ def test_diagnostics_severity_filter_is_sent_and_validated(monkeypatch) -> None:
         _run(catalogs.get_catalog_diagnostics(catalog_id=" "))
 
 
+def _heavy_nested_entry(index: int) -> dict[str, Any]:
+    """A nested diagnostic entry shaped like the 12-key, multi-KB entries Meta returned live."""
+    return {
+        "type": f"NESTED_TYPE_{index}",
+        "severity": "MUST_FIX",
+        "title": f"Nested problem {index}",
+        "subtitle": "Some items are missing a required attribute. " * 8,
+        "call_to_action": {"label": "Fix items", "uri": "https://business.facebook.com/" + "x" * 200},
+        "affected_items": [{"id": f"item_{n}", "retailer_id": f"sku_{n}", "name": "Product " * 6} for n in range(25)],
+        "sample_values": ["value " * 10 for _ in range(20)],
+        "error_code": 1000 + index,
+        "number_of_affected_items": 400 + index,
+        "description": "Long description of the problem. " * 20,
+        "learn_more": "https://www.facebook.com/business/help/" + "y" * 150,
+        "affected_features": ["dynamic_ads", "shops"],
+    }
+
+
+def _heavy_group(index: int, entries: int = 5) -> dict[str, Any]:
+    return {
+        "type": f"GROUP_TYPE_{index}",
+        "severity": "MUST_FIX" if index % 2 else "OPPORTUNITY",
+        "title": f"Group {index}",
+        "subtitle": f"{index} kinds of item problems",
+        "affected_channels": ["da", "shops"],
+        "affected_entity": "product_item",
+        "affected_features": ["dynamic_ads"],
+        "error_code": 2000 + index,
+        "number_of_affected_items": 1000 - index,
+        "number_of_affected_entities": 10 + index,
+        "diagnostics": [_heavy_nested_entry(n) for n in range(entries)],
+    }
+
+
+def test_diagnostics_default_returns_compact_groups_with_capped_detail_sample(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={("cat_1", "diagnostics"): {"data": [
+        _heavy_group(1), _heavy_group(2),
+    ]}}))
+    result = _run(catalogs.get_catalog_diagnostics(catalog_id="cat_1", limit=5))
+    first = result["items"][0]
+    assert set(first) == {
+        "type", "severity", "title", "subtitle", "affected_entity", "error_code",
+        "number_of_affected_items", "number_of_affected_entities", "detail_count", "detail_sample",
+    }
+    assert first["title"] == "Group 1"
+    assert first["number_of_affected_items"] == 999
+    assert first["detail_count"] == 5
+    assert len(first["detail_sample"]) <= catalogs.DIAGNOSTIC_DETAIL_SAMPLE_SIZE
+    sample = first["detail_sample"][0]
+    assert "affected_items" not in sample and "sample_values" not in sample
+    assert sample["title"] == "Nested problem 0"
+    assert all(len(value) <= catalogs.DIAGNOSTIC_DETAIL_TEXT_LIMIT + 3
+               for value in sample.values() if isinstance(value, str))
+    summary = result["summary"]
+    assert summary["details_included"] is False
+    assert summary["detail_entries_total"] == 10
+    assert "include_details" in summary["detail_note"]
+
+
+def test_diagnostics_include_details_returns_full_nested_data(monkeypatch) -> None:
+    group = _heavy_group(1)
+    _use(monkeypatch, FakeCatalogClient(edges={("cat_1", "diagnostics"): {"data": [group]}}))
+    result = _run(catalogs.get_catalog_diagnostics(catalog_id="cat_1", include_details=True))
+    assert result["items"][0] == group
+    assert result["summary"]["details_included"] is True
+    assert "detail_note" not in result["summary"]
+
+
+def test_diagnostics_default_response_stays_small_for_heavy_groups(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={("cat_1", "diagnostics"): {"data": [
+        _heavy_group(index) for index in range(20)
+    ]}}))
+    result = _run(catalogs.get_catalog_diagnostics(catalog_id="cat_1"))
+    assert len(result["items"]) == 20
+    assert len(json.dumps(result).encode()) < 20_000
+
+
 # --------------------------------------------------- get_catalog_dynamic_ads_health
 
 
