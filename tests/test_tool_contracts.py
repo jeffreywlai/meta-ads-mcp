@@ -19,6 +19,7 @@ from meta_ads_mcp.tools import (
     audiences,
     auth_tools,
     campaigns,
+    catalog_feeds,
     creatives,
     diagnostics,
     discovery,
@@ -142,6 +143,21 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_page_recommendations": {"page_id": "page_123"},
     "list_change_history": {"account_id": "123"},
     "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
+    "list_product_feeds": {"catalog_id": "cat_123"},
+    "create_product_feed": {"catalog_id": "cat_123", "schedule": {"url": "https://example.com/feed.csv", "interval": "DAILY"}},
+    "update_product_feed": {"feed_id": "feed_123", "name": "Updated Feed"},
+    "delete_product_feed": {"feed_id": "feed_123"},
+    "create_product_feed_upload": {"feed_id": "feed_123", "url": "https://example.com/feed.csv"},
+    "list_product_feed_uploads": {"feed_id": "feed_123"},
+    "list_feed_rules": {"feed_id": "feed_123"},
+    "create_feed_rule": {"feed_id": "feed_123", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}},
+    "delete_feed_rule": {"rule_id": "rule_123"},
+    "list_catalog_event_sources": {"catalog_id": "cat_123"},
+    "list_event_source_catalogs": {"event_source_id": "external_event_sources_123"},
+    "get_catalog_event_source_health": {"catalog_id": "cat_123"},
+    "get_catalog_event_source_recommendations": {"catalog_id": "cat_123"},
+    "connect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "px_123"},
+    "disconnect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "external_event_sources_123"},
 }
 
 
@@ -365,6 +381,9 @@ class UniversalFakeClient:
     async def delete_object(self, object_id: str):
         return {"success": True, "id": object_id}
 
+    async def delete_from_edge(self, parent_id: str, edge: str, *, data):
+        return {"success": True, "parent_id": parent_id, "edge": edge}
+
     async def get_insights(self, object_id: str, *, fields, params):
         return {"data": [SAMPLE_INSIGHTS_ROW], "paging": {"cursors": {"after": "after_1"}}}
 
@@ -508,6 +527,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         audiences,
         auth_tools,
         campaigns,
+        catalog_feeds,
         creatives,
         diagnostics,
         discovery,

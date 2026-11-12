@@ -807,6 +807,16 @@ class GraphAPIClient:
             params["after"] = cursor
         return await self.request("GET", "ads_archive", params=params)
 
+    async def delete_from_edge(
+        self,
+        parent_id: str,
+        edge: str,
+        *,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Send a DELETE with form parameters to an edge, e.g. to dissociate objects."""
+        return await self.request("DELETE", f"{parent_id}/{edge}", data=data)
+
 
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:
     """Return a configured Graph API client."""

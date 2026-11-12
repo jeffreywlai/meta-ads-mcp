@@ -32,6 +32,8 @@ _WRITE_NAMES = frozenset(
         "generate_system_user_token",
         "refresh_to_long_lived_token",
         "setup_ab_test",
+        "connect_catalog_event_source",
+        "disconnect_catalog_event_source",
     }
 )
 _READ_TAGS = frozenset({"read", "read-only", "readonly"})

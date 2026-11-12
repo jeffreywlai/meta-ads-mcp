@@ -116,6 +116,14 @@ TOOL_GROUPS = {
         "update_creative",
         "update_ad_creative",
         "delete_creative",
+        "create_product_feed",
+        "update_product_feed",
+        "delete_product_feed",
+        "create_product_feed_upload",
+        "create_feed_rule",
+        "delete_feed_rule",
+        "connect_catalog_event_source",
+        "disconnect_catalog_event_source",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -133,6 +141,13 @@ TOOL_GROUPS = {
     "experiments": [
     ],
     "catalog": [
+        "list_product_feeds",
+        "list_product_feed_uploads",
+        "list_feed_rules",
+        "list_catalog_event_sources",
+        "list_event_source_catalogs",
+        "get_catalog_event_source_health",
+        "get_catalog_event_source_recommendations",
     ],
     "auth": [
         "generate_auth_url",
