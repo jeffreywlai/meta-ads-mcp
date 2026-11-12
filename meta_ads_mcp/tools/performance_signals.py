@@ -166,10 +166,11 @@ async def get_opportunity_score(
         window = {"from_date": params["from_date"], "to_date": params["to_date"]}
         try:
             payload = await client.list_objects(resolved_account_id, "opportunity_score_history", params=params)
-        except UnsupportedFeatureError as exc:
-            history = {"available": False, "window": window, "reason": str(exc), "points": []}
+        except (MetaApiError, UnsupportedFeatureError) as exc:
+            history = {"available": False, "window": window, "points": None, "error": _public_error(exc)}
             missing_signals.append(
-                "opportunity_score_history: Meta rejected the history edge for this account or API version."
+                "opportunity_score_history: Meta returned an error for the history edge, so history is unknown "
+                f"({_public_error(exc).get('message')}). Meta documents this edge on Graph API v27.0."
             )
         else:
             points = []

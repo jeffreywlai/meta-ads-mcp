@@ -209,6 +209,30 @@ def test_opportunity_score_history_unsupported_is_reported_not_raised(monkeypatc
     assert any("opportunity_score_history" in signal for signal in result["missing_signals"])
 
 
+def test_opportunity_score_history_meta_error_is_reported_with_its_message(monkeypatch) -> None:
+    error = MetaApiError(
+        message="(#100) Tried accessing nonexisting field (opportunity_score_history) on node type (AdAccount)",
+        status_code=400,
+        code=100,
+    )
+    _patch(
+        monkeypatch,
+        RecordingClient(
+            objects={"act_42": {"id": "act_42", "currency": "USD", "opportunity_score": 50}},
+            edges={("act_42", "opportunity_score_history"): error},
+            recommendations_payload={"data": []},
+        ),
+    )
+
+    result = asyncio.run(performance_signals.get_opportunity_score(account_id="act_42"))
+
+    assert result["opportunity_score"] == 50
+    assert result["history"]["available"] is False
+    assert result["history"]["points"] is None
+    assert "nonexisting field" in result["history"]["error"]["message"]
+    assert result["history"]["error"]["code"] == 100
+
+
 def test_opportunity_score_permission_error_is_not_swallowed(monkeypatch) -> None:
     _patch(
         monkeypatch,
