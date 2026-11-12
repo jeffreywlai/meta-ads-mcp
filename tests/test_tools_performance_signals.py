@@ -235,3 +235,168 @@ def test_opportunity_score_validation_errors_make_no_calls(monkeypatch, kwargs) 
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.get_opportunity_score(**kwargs))
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Daily insights helpers shared by trend and anomaly tests
+# ---------------------------------------------------------------------------
+
+
+def _day_row(day: str, *, spend: float, impressions: int, clicks: int, purchases: float | None = None,
+             purchase_value: float | None = None) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "date_start": day,
+        "date_stop": day,
+        "spend": str(spend),
+        "impressions": str(impressions),
+        "clicks": str(clicks),
+    }
+    if purchases is not None:
+        row["actions"] = [{"action_type": "purchase", "value": str(purchases)}]
+    if purchase_value is not None:
+        row["action_values"] = [{"action_type": "purchase", "value": str(purchase_value)}]
+    return row
+
+
+def _daily_handler(rows: list[dict[str, Any]]):
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        window = json.loads(params["time_range"])
+        selected = [row for row in rows if window["since"] <= row["date_start"] <= window["until"]]
+        return {"data": selected, "paging": {"cursors": {"after": "x"}}}
+
+    return handler
+
+
+# ---------------------------------------------------------------------------
+# get_performance_trend
+# ---------------------------------------------------------------------------
+
+
+def test_trend_requests_daily_rows_and_reports_first_to_last_change(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-01", spend=100, impressions=10000, clicks=100, purchases=5, purchase_value=500),
+        _day_row("2026-11-02", spend=110, impressions=10000, clicks=90, purchases=5, purchase_value=450),
+        _day_row("2026-11-03", spend=120, impressions=10000, clicks=80, purchases=4, purchase_value=400),
+    ]
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(
+        performance_signals.get_performance_trend(
+            level="campaign", object_id="cmp_1", since="2026-11-01", until="2026-11-03",
+        )
+    )
+
+    call = _calls(client, "get_insights")[0]
+    assert call["object_id"] == "cmp_1"
+    assert call["params"]["level"] == "campaign"
+    assert call["params"]["time_increment"] == 1
+    assert json.loads(call["params"]["time_range"]) == {"since": "2026-11-01", "until": "2026-11-03"}
+    assert {"spend", "impressions", "clicks", "actions", "action_values"} <= set(call["fields"])
+
+    assert result["granularity"] == "day"
+    assert [period["period_start"] for period in result["periods"]] == ["2026-11-01", "2026-11-02", "2026-11-03"]
+    first = result["periods"][0]["metrics"]
+    assert first["cpc"] == pytest.approx(1.0)
+    assert first["ctr"] == pytest.approx(0.01)
+    assert first["cpm"] == pytest.approx(10.0)
+    assert first["cost_per_result"] == pytest.approx(20.0)
+    assert first["conversion_rate"] == pytest.approx(0.05)
+    assert first["roas"] == pytest.approx(5.0)
+    cpc = result["changes"]["cpc"]
+    assert cpc["first"] == pytest.approx(1.0) and cpc["last"] == pytest.approx(1.5)
+    assert cpc["change"] == pytest.approx(0.5) and cpc["pct_change"] == pytest.approx(0.5)
+    assert cpc["direction"] == "up" and cpc["assessment"] == "worse"
+    roas = result["changes"]["roas"]
+    assert roas["direction"] == "down" and roas["assessment"] == "worse"
+    assert set(result["changes"]) == {"cpc", "cpm", "cost_per_result", "roas", "ctr", "conversion_rate"}
+    assert result["metric_definitions"]["cost_per_result"]["formula"] == "spend / results"
+
+
+def test_trend_zero_denominators_yield_null_not_error(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-01", spend=0, impressions=0, clicks=0),
+        _day_row("2026-11-02", spend=5, impressions=100, clicks=0),
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(
+        performance_signals.get_performance_trend(
+            level="ad", object_id="ad_1", since="2026-11-01", until="2026-11-02",
+        )
+    )
+
+    zero_day = result["periods"][0]["metrics"]
+    assert zero_day["ctr"] is None
+    assert zero_day["cpc"] is None
+    assert zero_day["cpm"] is None
+    assert zero_day["conversion_rate"] is None
+    assert zero_day["roas"] is None
+    no_click_day = result["periods"][1]["metrics"]
+    assert no_click_day["ctr"] == 0.0
+    assert no_click_day["cpc"] is None
+    assert no_click_day["conversion_rate"] is None
+
+
+def test_trend_weekly_buckets_are_derived_from_sums_and_marked_partial(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-04", spend=10, impressions=1000, clicks=10, purchases=1, purchase_value=30),
+        _day_row("2026-11-05", spend=30, impressions=1000, clicks=30, purchases=1, purchase_value=50),
+        _day_row("2026-11-10", spend=20, impressions=2000, clicks=20, purchases=2, purchase_value=40),
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(
+        performance_signals.get_performance_trend(
+            level="adset", object_id="as_1", since="2026-11-04", until="2026-11-10",
+            granularity="week", metrics=["cpc", "roas"],
+        )
+    )
+
+    periods = result["periods"]
+    assert [(period["period_start"], period["period_end"]) for period in periods] == [
+        ("2026-11-02", "2026-11-08"), ("2026-11-09", "2026-11-15"),
+    ]
+    assert periods[0]["partial"] is True and periods[0]["days_with_data"] == 2
+    assert periods[0]["inputs"]["spend"] == 40.0
+    assert periods[0]["metrics"]["cpc"] == pytest.approx(1.0)
+    assert periods[0]["metrics"]["roas"] == pytest.approx(2.0)
+    assert set(result["changes"]) == {"cpc", "roas"}
+    assert result["changes"]["cpc"]["first_period_partial"] is True
+
+
+def test_trend_monthly_default_window_uses_yesterday(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler([])))
+    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+
+    result = asyncio.run(
+        performance_signals.get_performance_trend(level="account", object_id="42", granularity="month")
+    )
+
+    call = _calls(client, "get_insights")[0]
+    assert call["object_id"] == "act_42"
+    window = json.loads(call["params"]["time_range"])
+    assert window["until"] == "2026-11-11"
+    assert window["since"] == (date(2026, 11, 11) - timedelta(days=179)).isoformat()
+    assert result["periods"] == []
+    assert result["changes"]["cpc"]["direction"] is None
+    assert any("no insights rows" in signal.lower() for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"level": "creative", "object_id": "x"},
+        {"level": "ad", "object_id": " "},
+        {"level": "ad", "object_id": "x", "granularity": "hour"},
+        {"level": "ad", "object_id": "x", "metrics": ["cpc", "vibes"]},
+        {"level": "ad", "object_id": "x", "since": "2026-11-01"},
+        {"level": "ad", "object_id": "x", "since": "2026-11-05", "until": "2026-11-01"},
+        {"level": "ad", "object_id": "x", "since": "2025-01-01", "until": "2026-11-01"},
+        {"level": "ad", "object_id": "x", "since": "11/01/2026", "until": "2026-11-02"},
+    ],
+)
+def test_trend_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.get_performance_trend(**kwargs))
+    assert client.calls == []
