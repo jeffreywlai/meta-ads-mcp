@@ -108,7 +108,7 @@ def test_list_catalogs_for_business_reads_owned_edge_with_paging(monkeypatch) ->
     assert kind == "list"
     assert call["parent_id"] == "biz_1"
     assert call["edge"] == "owned_product_catalogs"
-    assert call["fields"] == catalogs.CATALOG_FIELDS
+    assert call["fields"] == ["id", "name", "vertical", "product_count", "feed_count", "is_catalog_segment"]
     assert call["params"] == {"limit": 10, "after": "c1"}
     assert result["items"][0]["id"] == "cat_1"
     assert result["summary"]["complete"] is False
@@ -439,7 +439,11 @@ def test_diagnostics_ordered_by_products_affected(monkeypatch) -> None:
     assert result["summary"]["by_severity"] == {"MUST_FIX": 2, "OPPORTUNITY": 1, "UNKNOWN": 1}
     call = client.calls[0][1]
     assert (call["parent_id"], call["edge"]) == ("cat_1", "diagnostics")
-    assert call["fields"] == catalogs.DIAGNOSTIC_FIELDS
+    assert call["fields"] == [
+        "type", "severity", "title", "subtitle", "affected_channels", "affected_entity",
+        "affected_features", "error_code", "number_of_affected_items",
+        "number_of_affected_entities", "diagnostics",
+    ]
     assert call["params"] == {"limit": 100}
 
 
@@ -682,7 +686,7 @@ def test_list_catalog_data_sources_requests_all_sources(monkeypatch) -> None:
     result = _run(catalogs.list_catalog_data_sources(catalog_id="cat_1"))
     call = client.calls[0][1]
     assert (call["parent_id"], call["edge"]) == ("cat_1", "data_sources")
-    assert call["fields"] == catalogs.DATA_SOURCE_FIELDS
+    assert call["fields"] == ["id", "name", "ingestion_source_type", "upload_type", "app_id"]
     assert call["params"] == {"limit": 100, "ingestion_source_type": "ALL"}
     assert result["summary"]["by_upload_type"] == {"SCHEDULED": 2, "API": 1}
     assert result["summary"]["complete"] is True
@@ -750,7 +754,10 @@ def test_list_catalog_products_by_catalog_with_filter(monkeypatch) -> None:
     ))
     call = client.calls[0][1]
     assert (call["parent_id"], call["edge"]) == ("cat_1", "products")
-    assert call["fields"] == catalogs.PRODUCT_FIELDS
+    assert call["fields"] == [
+        "id", "retailer_id", "name", "availability", "price", "currency", "sale_price",
+        "url", "image_url", "brand", "visibility", "review_status",
+    ]
     assert call["params"] == {"limit": 10, "summary": "total_count", "filter": {"brand": {"eq": "Acme"}}}
     assert result["summary"]["total_count"] == 41
 
@@ -942,7 +949,12 @@ def test_delete_product_reads_then_deletes_and_returns_previous(monkeypatch) -> 
     client = _use(monkeypatch, FakeCatalogClient(objects={"p_1": product}))
     result = _run(catalogs.delete_catalog_product(product_id="p_1"))
     assert client.kinds() == ["get", "delete"]
-    assert client.calls[0][1]["fields"] == catalogs.PRODUCT_DETAIL_FIELDS
+    assert client.calls[0][1]["fields"] == [
+        "id", "retailer_id", "name", "availability", "price", "currency", "sale_price",
+        "url", "image_url", "brand", "visibility", "review_status", "description", "condition",
+        "product_type", "category", "retailer_product_group_id", "additional_image_urls",
+        "custom_label_0", "custom_label_1", "custom_label_2", "custom_label_3", "custom_label_4",
+    ]
     assert client.calls[1][1] == {"object_id": "p_1"}
     assert result["action"] == "delete_catalog_product"
     assert result["previous"] == product
@@ -1001,7 +1013,7 @@ def test_filter_builder_returns_match_count_and_sample(monkeypatch) -> None:
     assert call["params"] == {
         "filter": {"retailer_id": {"is_any": ["a", "b"]}}, "summary": "total_count", "limit": 5,
     }
-    assert call["fields"] == catalogs.FILTER_SAMPLE_FIELDS
+    assert call["fields"] == ["id", "retailer_id", "name", "price", "availability"]
     assert result["match_count"] == 123
     assert len(result["sample"]) == 5
     assert client.kinds() == ["list"]
@@ -1089,7 +1101,7 @@ def test_list_product_sets_three_scopes(monkeypatch) -> None:
     by_catalog = _run(catalogs.list_product_sets(catalog_id="cat_1", limit=5))
     assert client.calls[0][1]["edge"] == "product_sets"
     assert client.calls[0][1]["params"] == {"limit": 5, "summary": "total_count"}
-    assert client.calls[0][1]["fields"] == catalogs.PRODUCT_SET_FIELDS
+    assert client.calls[0][1]["fields"] == ["id", "name", "filter", "product_count", "retailer_id"]
     assert by_catalog["summary"]["total_count"] == 1
     one = _run(catalogs.list_product_sets(product_set_id="ps_1"))
     assert client.calls[1][0] == "get"

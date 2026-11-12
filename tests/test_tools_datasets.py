@@ -74,7 +74,9 @@ def test_list_datasets_reads_account_adspixels_with_paging(monkeypatch) -> None:
     assert call["parent_id"] == "act_123"
     assert call["edge"] == "adspixels"
     assert call["params"] == {"limit": 10, "after": "cur1"}
-    assert call["fields"] == datasets.DATASET_SUMMARY_FIELDS
+    assert call["fields"] == [
+        "id", "name", "creation_time", "last_fired_time", "is_unavailable", "data_use_setting",
+    ]
     assert result["items"][0]["id"] == "px1"
     assert result["summary"]["count"] == 1
     assert result["summary"]["complete"] is False
@@ -147,11 +149,14 @@ def test_get_dataset_reads_pixel_node_with_default_fields(monkeypatch) -> None:
 
     result = asyncio.run(datasets.get_dataset(dataset_id=" px1 "))
 
-    assert client.get_calls == [{"object_id": "px1", "fields": datasets.DATASET_FIELDS, "params": {}}]
+    assert client.get_calls == [{"object_id": "px1", "fields": [
+        "id", "name", "description", "creation_time", "last_fired_time", "is_unavailable",
+        "is_created_by_business", "owner_business", "data_use_setting", "enable_automatic_matching",
+        "automatic_matching_fields", "first_party_cookie_status", "last_upload_app",
+        "last_upload_app_changed_time", "config",
+    ], "params": {}}]
     assert result == {"item": {"id": "px1", "name": "Main", "last_upload_app": "Shopify"}, "summary": {"count": 1}}
-    for field in ("data_use_setting", "is_unavailable", "last_upload_app", "enable_automatic_matching"):
-        assert field in datasets.DATASET_FIELDS
-    assert "code" not in datasets.DATASET_FIELDS
+    assert "code" not in client.get_calls[0]["fields"]
 
 
 def test_get_dataset_accepts_custom_fields(monkeypatch) -> None:
@@ -443,7 +448,16 @@ def test_dataset_quality_requests_dataset_quality_root_edge(monkeypatch) -> None
     call = client.get_calls[0]
     assert call["object_id"] == "dataset_quality"
     assert call["params"] == {"dataset_id": "px1", "agent_name": "shopify"}
-    assert call["fields"] == [datasets.DATASET_QUALITY_FIELDS]
+    assert call["fields"] == [
+        "web{event_name,"
+        "event_match_quality{composite_score,"
+        "match_key_feedback{identifier,coverage{percentage}},"
+        "diagnostics{name,description,solution,percentage,affected_event_count,total_event_count}},"
+        "event_coverage{percentage,goal_percentage,description},"
+        "dedupe_key_feedback{dedupe_key,browser_events_with_dedupe_key{percentage},"
+        "server_events_with_dedupe_key{percentage}},"
+        "data_freshness{upload_frequency,description}}"
+    ]
     assert call["fields"][0].startswith("web{event_name,event_match_quality{composite_score,")
 
 
@@ -595,7 +609,10 @@ def test_list_custom_conversions_reads_account_edge(monkeypatch) -> None:
     call = client.list_calls[0]
     assert (call["parent_id"], call["edge"]) == ("act_123", "customconversions")
     assert call["params"] == {"limit": 5, "after": "a"}
-    assert call["fields"] == datasets.CUSTOM_CONVERSION_FIELDS
+    assert call["fields"] == [
+        "id", "name", "custom_event_type", "rule", "pixel", "event_source_type", "is_archived",
+        "is_unavailable", "creation_time", "first_fired_time", "last_fired_time",
+    ]
     assert result["items"][0]["custom_event_type"] == "LEAD"
     assert result["summary"]["complete"] is True
     assert result["summary"]["next_after"] is None
