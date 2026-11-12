@@ -100,7 +100,11 @@ def test_list_ad_studies_account_uses_documented_impacting_edge(monkeypatch) -> 
     result = run(experiments.list_ad_studies(account_id="123"))
     kind, parent, edge, fields, params = client.calls[0]
     assert (kind, parent, edge) == ("list", "act_123", "impacting_ad_studies")
-    assert fields == experiments.STUDY_LIST_FIELDS
+    # Literal field contract from Meta's Ad Study reference, not the module's own constant (F32).
+    assert fields == [
+        "id", "name", "type", "description", "start_time", "end_time", "canceled_time",
+        "results_first_available_date",
+    ]
     assert params == {"limit": 50}
     assert [item["state"] for item in result["items"]] == ["running", "scheduled", "ended", "canceled"]
     assert result["summary"]["count"] == 4
@@ -176,11 +180,18 @@ def test_get_ad_study_reads_study_cells_and_objectives(monkeypatch) -> None:
                ("study_1", "objectives"): {"data": [{"id": "obj_1", "name": "Purchases"}]}},
     ))
     result = run(experiments.get_ad_study(study_id=" study_1 "))
-    assert client.calls[0] == ("get", "study_1", experiments.STUDY_FIELDS, None)
+    # Literal field contracts from Meta's Ad Study, cell and objective documentation (F32).
+    assert client.calls[0] == ("get", "study_1", [
+        "id", "name", "type", "description", "start_time", "end_time", "canceled_time",
+        "results_first_available_date", "observation_end_time", "cooldown_start_time",
+        "created_time", "updated_time", "business",
+    ], None)
     assert client.calls[1][1:3] == ("study_1", "cells")
-    assert client.calls[1][3] == experiments.CELL_FIELDS
+    assert client.calls[1][3] == [
+        "id", "name", "treatment_percentage", "control_percentage", "campaigns", "adsets", "adaccounts",
+    ]
     assert client.calls[2][1:3] == ("study_1", "objectives")
-    assert "results" not in client.calls[2][3]
+    assert client.calls[2][3] == ["id", "name", "type", "is_primary", "last_updated_results"]
     assert result["item"]["state"] == "ended"
     assert result["cells"] == [
         {"id": "cell_a", "name": "Group A", "treatment_percentage": 50, "control_percentage": None,
