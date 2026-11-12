@@ -129,6 +129,13 @@ TOOL_GROUPS = {
     "assets": [
     ],
     "signals": [
+        "list_datasets",
+        "get_dataset",
+        "get_dataset_stats",
+        "get_dataset_quality",
+        "list_custom_conversions",
+        "list_pixel_event_rules",
+        "list_pixel_parameters",
     ],
     "experiments": [
     ],

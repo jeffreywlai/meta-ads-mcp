@@ -20,6 +20,7 @@ from meta_ads_mcp.tools import (
     auth_tools,
     campaigns,
     creatives,
+    datasets,
     diagnostics,
     discovery,
     execution,
@@ -142,6 +143,12 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_page_recommendations": {"page_id": "page_123"},
     "list_change_history": {"account_id": "123"},
     "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
+    "list_datasets": {"account_id": "123"},
+    "get_dataset": {"dataset_id": "px_123"},
+    "get_dataset_stats": {"dataset_id": "px_123", "since": "2026-03-01", "until": "2026-03-07"},
+    "get_dataset_quality": {"dataset_id": "px_123"},
+    "list_pixel_event_rules": {"pixel_id": "px_123"},
+    "list_pixel_parameters": {"pixel_id": "px_123"},
 }
 
 
@@ -509,6 +516,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         auth_tools,
         campaigns,
         creatives,
+        datasets,
         diagnostics,
         discovery,
         execution,
