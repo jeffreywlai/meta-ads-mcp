@@ -74,6 +74,7 @@ TOOL_GROUPS = {
         "get_audience_opportunities",
         "get_delivery_opportunities",
         "get_bidding_opportunities",
+        "get_opportunity_score",
     ],
     "social_feedback": [
         "get_ad_social_context",
