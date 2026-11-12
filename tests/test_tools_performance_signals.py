@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import pytest
@@ -460,8 +460,10 @@ def test_trend_weekly_buckets_are_derived_from_sums_and_marked_partial(monkeypat
 
 
 def test_trend_monthly_default_window_uses_yesterday(monkeypatch) -> None:
-    client = _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler([])))
-    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+    client = _patch(monkeypatch, RecordingClient(
+        objects={"act_42": {"timezone_name": "America/New_York"}}, insights_handler=_daily_handler([]),
+    ))
+    monkeypatch.setattr(performance_signals, "_now", lambda: datetime(2026, 11, 12, 17, tzinfo=timezone.utc))
 
     result = asyncio.run(
         performance_signals.get_performance_trend(level="account", object_id="42", granularity="month")
@@ -475,6 +477,71 @@ def test_trend_monthly_default_window_uses_yesterday(monkeypatch) -> None:
     assert result["periods"] == []
     assert result["changes"]["cpc"]["direction"] is None
     assert any("no insights rows" in signal.lower() for signal in result["missing_signals"])
+
+
+def _pin_now(monkeypatch, instant: datetime) -> None:
+    monkeypatch.setattr(performance_signals, "_now", lambda: instant)
+    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 1, 1))  # server date must not be used
+
+
+def test_trend_default_window_follows_account_time_zone_for_campaign_scope(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(
+        objects={"cmp_1": {"id": "cmp_1", "account_id": "42"}, "act_42": {"timezone_name": "Asia/Tokyo"}},
+        insights_handler=_daily_handler([]),
+    ))
+    # 18:00 UTC on Nov 12 is already Nov 13 in Tokyo, so the account's yesterday is Nov 12.
+    _pin_now(monkeypatch, datetime(2026, 11, 12, 18, tzinfo=timezone.utc))
+
+    result = asyncio.run(performance_signals.get_performance_trend(level="campaign", object_id="cmp_1"))
+
+    reads = _calls(client, "get_object")
+    assert [(call["object_id"], call["fields"]) for call in reads] == [
+        ("cmp_1", ["account_id"]), ("act_42", ["timezone_name"]),
+    ]
+    window = json.loads(_calls(client, "get_insights")[0]["params"]["time_range"])
+    assert window["until"] == "2026-11-12"
+    assert result["window"]["until"] == "2026-11-12"
+    assert result["reporting_timezone"] == {"timezone": "Asia/Tokyo", "source": "ad_account", "today": "2026-11-13"}
+
+
+def test_anomalies_default_end_follows_account_time_zone_when_server_is_ahead(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(
+        objects={"act_42": {"timezone_name": "Pacific/Honolulu"}},
+        insights_handler=_daily_handler([]),
+    ))
+    # 05:00 UTC on Nov 12 is still Nov 11 in Honolulu, so the account's yesterday is Nov 10.
+    _pin_now(monkeypatch, datetime(2026, 11, 12, 5, tzinfo=timezone.utc))
+
+    result = asyncio.run(performance_signals.detect_performance_anomalies(level="account", object_id="42"))
+
+    assert [call["object_id"] for call in _calls(client, "get_object")] == ["act_42"]
+    assert result["lookback_window"]["until"] == "2026-11-10"
+    assert result["reporting_timezone"]["timezone"] == "Pacific/Honolulu"
+
+
+def test_default_window_falls_back_to_server_date_when_time_zone_unreadable(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(
+        objects={"ad_1": {"id": "ad_1", "account_id": "42"}, "act_42": _permission_error()},
+        insights_handler=_daily_handler([]),
+    ))
+    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+
+    result = asyncio.run(performance_signals.get_performance_trend(level="ad", object_id="ad_1"))
+
+    window = json.loads(_calls(client, "get_insights")[0]["params"]["time_range"])
+    assert window["until"] == "2026-11-11"
+    assert result["reporting_timezone"] == {"timezone": None, "source": "server_date", "today": "2026-11-12"}
+    assert any("time zone could not be read" in signal and "Permissions" in signal
+               for signal in result["missing_signals"])
+
+
+def test_explicit_dates_need_no_time_zone_read(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler([])))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="cmp_1", since="2026-11-01", until="2026-11-02",
+    ))
+    assert _calls(client, "get_object") == []
+    assert result["reporting_timezone"]["source"] == "explicit_dates"
 
 
 @pytest.mark.parametrize(
@@ -951,7 +1018,7 @@ def test_advertiser_context_labels_itself_as_derived(monkeypatch) -> None:
 
 def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -> None:
     client = _patch(monkeypatch, _context_client())
-    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+    monkeypatch.setattr(performance_signals, "_now", lambda: datetime(2026, 11, 12, 17, tzinfo=timezone.utc))
 
     result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
 
@@ -1119,6 +1186,27 @@ def test_funnel_picks_the_alias_per_row_before_summing() -> None:
     assert drop["drop_off"] == pytest.approx(1 - 35 / 250)
     assert funnel["lead_events"]["count"] == 5
     assert funnel["lead_events"]["action_types_used"] == ["lead", "offsite_conversion.fb_pixel_lead"]
+
+
+@pytest.mark.parametrize(
+    ("timezone_name", "instant", "until"),
+    [
+        ("Asia/Tokyo", datetime(2026, 11, 12, 18, tzinfo=timezone.utc), "2026-11-12"),
+        ("Pacific/Honolulu", datetime(2026, 11, 12, 5, tzinfo=timezone.utc), "2026-11-10"),
+    ],
+)
+def test_advertiser_context_window_ends_on_the_account_yesterday(monkeypatch, timezone_name, instant, until) -> None:
+    client = _context_client()
+    client.objects["act_42"] = {**client.objects["act_42"], "timezone_name": timezone_name}
+    _patch(monkeypatch, client)
+    _pin_now(monkeypatch, instant)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=7))
+
+    assert result["window"]["until"] == until
+    assert json.loads(_calls(client, "get_insights")[0]["params"]["time_range"])["until"] == until
+    assert result["reporting_timezone"]["timezone"] == timezone_name
+    assert len(_calls(client, "get_object")) == 1
 
 
 def test_advertiser_context_section_permission_error_is_reported_not_empty(monkeypatch) -> None:

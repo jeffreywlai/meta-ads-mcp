@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import build_finding, metric_evidence
@@ -63,8 +64,66 @@ TREND_DEFAULT_WINDOW_DAYS = {"day": 30, "week": 84, "month": 180}
 
 
 def _today() -> date:
-    """Return today's date; isolated so tests can pin it."""
+    """Return the server's date, used only when the ad account's time zone cannot be read."""
     return date.today()
+
+
+def _now() -> datetime:
+    """Return the current instant in UTC; isolated so tests can pin it."""
+    return datetime.now(timezone.utc)
+
+
+async def _reporting_today(
+    level: str, object_id: str, *, account: dict[str, Any] | None = None,
+) -> tuple[date, dict[str, Any], str | None]:
+    """Return today's date in the ad account's time zone, a descriptor of it, and a missing signal on fallback.
+
+    An account scope needs one read of the account (none when the caller already has it); a campaign,
+    ad set or ad scope reads the object's account_id and then the account.
+    """
+    error: str | None = None
+    zone: ZoneInfo | None = None
+    try:
+        if account is None:
+            client = get_graph_api_client()
+            account_id = object_id
+            if level != "account":
+                owner = await client.get_object(object_id, fields=["account_id"])
+                raw_account_id = blank_to_none(str(owner.get("account_id") or ""))
+                if raw_account_id is None:
+                    raise ValueError("the object did not report its account_id")
+                account_id = normalize_account_id(raw_account_id)
+            account = await client.get_object(account_id, fields=["timezone_name"])
+        timezone_name = blank_to_none(str(account.get("timezone_name") or ""))
+        if timezone_name is None:
+            raise ValueError("the ad account did not report timezone_name")
+        try:
+            zone = ZoneInfo(timezone_name)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"unrecognized time zone {timezone_name!r}") from exc
+    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+        error = str(_public_error(exc).get("message"))
+    except ValueError as exc:
+        error = str(exc)
+    if zone is None:
+        today = _today()
+        return (
+            today,
+            {"timezone": None, "source": "server_date", "today": today.isoformat()},
+            (
+                f"The ad account's time zone could not be read ({error}), so default dates use the server's date "
+                "and may be one day off the account's reporting day."
+            ),
+        )
+    today = _now().astimezone(zone).date()
+    return today, {"timezone": zone.key, "source": "ad_account", "today": today.isoformat()}, None
+
+
+EXPLICIT_DATES_TIMEZONE = {
+    "timezone": None,
+    "source": "explicit_dates",
+    "note": "The dates given were sent as is; Meta reports them in the ad account's time zone.",
+}
 
 
 def _require_account_id(account_id: str | None) -> str:
@@ -260,20 +319,18 @@ def _parse_date(value: str, *, field: str) -> date:
         raise ValidationError(f"{field} must be a valid ISO date in YYYY-MM-DD format.") from exc
 
 
-def _resolve_window(since: str | None, until: str | None, *, default_days: int) -> tuple[date, date]:
-    """Resolve an explicit or default trailing window ending yesterday."""
+def _explicit_window(since: str | None, until: str | None) -> tuple[date, date] | None:
+    """Validate an explicit window before any network call; None means the default window applies."""
     since = blank_to_none(since)
     until = blank_to_none(until)
     if bool(since) != bool(until):
         raise ValidationError("Provide both since and until, or neither.")
-    if since and until:
-        start = _parse_date(since, field="since")
-        end = _parse_date(until, field="until")
-        if end < start:
-            raise ValidationError("until must be on or after since.")
-    else:
-        end = _today() - timedelta(days=1)
-        start = end - timedelta(days=default_days - 1)
+    if not (since and until):
+        return None
+    start = _parse_date(since, field="since")
+    end = _parse_date(until, field="until")
+    if end < start:
+        raise ValidationError("until must be on or after since.")
     if (end - start).days + 1 > MAX_DAILY_WINDOW_DAYS:
         raise ValidationError(f"The date window may cover at most {MAX_DAILY_WINDOW_DAYS} days.")
     return start, end
@@ -471,14 +528,24 @@ async def get_performance_trend(
     until: str | None = None,
     granularity: str = "day",
 ) -> dict[str, Any]:
-    """Trend CPC, CPM, cost per result, ROAS, CTR and conversion rate for one account, campaign, ad set or ad by day, week (Monday start) or month, with first-to-last change and direction. Periods are summed from daily rows, then divided; zero denominators give null. Default window ends yesterday (30/84/180 days)."""
+    """Trend CPC, CPM, cost per result, ROAS, CTR and conversion rate for one account, campaign, ad set or ad by day, week (Monday start) or month, with first-to-last change and direction. Periods are summed from daily rows, then divided; zero denominators give null. Default window ends yesterday in the ad account's time zone (30/84/180 days)."""
     resolved_level = _require_level(level, REPORTING_LEVELS)
     resolved_object_id = _require_object_id(resolved_level, object_id)
     resolved_granularity = (granularity or "").strip().lower()
     if resolved_granularity not in TREND_DEFAULT_WINDOW_DAYS:
         raise ValidationError("granularity must be day, week or month.")
     metric_names = _normalize_metric_names(metrics, TREND_DEFAULT_METRICS)
-    start, end = _resolve_window(since, until, default_days=TREND_DEFAULT_WINDOW_DAYS[resolved_granularity])
+    explicit = _explicit_window(since, until)
+    missing_signals: list[str] = []
+    if explicit is None:
+        today, reporting_timezone, timezone_signal = await _reporting_today(resolved_level, resolved_object_id)
+        if timezone_signal:
+            missing_signals.append(timezone_signal)
+        end = today - timedelta(days=1)
+        start = end - timedelta(days=TREND_DEFAULT_WINDOW_DAYS[resolved_granularity] - 1)
+    else:
+        start, end = explicit
+        reporting_timezone = dict(EXPLICIT_DATES_TIMEZONE)
 
     rows = await _daily_rows(resolved_level, resolved_object_id, start, end)
     known = _known_inputs(rows)
@@ -501,7 +568,6 @@ async def get_performance_trend(
             "metrics": {name: derived[name] for name in metric_names},
         })
 
-    missing_signals: list[str] = []
     if not rows:
         missing_signals.append("Meta returned no insights rows for this object and window.")
     elif "results" not in known:
@@ -520,6 +586,7 @@ async def get_performance_trend(
         missing_signals=missing_signals,
         extra={
             "window": {"since": start.isoformat(), "until": end.isoformat()},
+            "reporting_timezone": reporting_timezone,
             "granularity": resolved_granularity,
             "metrics_requested": metric_names,
             "periods": periods,
@@ -597,7 +664,7 @@ async def detect_performance_anomalies(
     sensitivity: str = "medium",
     end_date: str | None = None,
 ) -> dict[str, Any]:
-    """Flag days in the last lookback_days whose spend, CPC, CPM, CTR, cost per result or ROAS is far from the object's own baseline (the baseline_days before), using median and median absolute deviation, with same-weekday baselines when four or more exist. Returns the rule, baseline values and thresholds. Rule-based screen, not a statistical test. end_date defaults to yesterday."""
+    """Flag days in the last lookback_days whose spend, CPC, CPM, CTR, cost per result or ROAS is far from the object's own baseline (the baseline_days before), using median and median absolute deviation, with same-weekday baselines when four or more exist. Returns the rule, baseline values and thresholds. Rule-based screen, not a statistical test. end_date defaults to yesterday in the ad account's time zone."""
     resolved_level = _require_level(level, REPORTING_LEVELS)
     resolved_object_id = _require_object_id(resolved_level, object_id)
     metric_names = _normalize_metric_names(metrics, ANOMALY_DEFAULT_METRICS)
@@ -610,7 +677,14 @@ async def detect_performance_anomalies(
         raise ValidationError(f"sensitivity must be one of {list(SENSITIVITY_MULTIPLIERS)}.")
     multiplier = SENSITIVITY_MULTIPLIERS[resolved_sensitivity]
     end_text = blank_to_none(end_date)
-    end = _parse_date(end_text, field="end_date") if end_text else _today() - timedelta(days=1)
+    timezone_signals: list[str] = []
+    if end_text:
+        end = _parse_date(end_text, field="end_date")
+        reporting_timezone = dict(EXPLICIT_DATES_TIMEZONE)
+    else:
+        today, reporting_timezone, timezone_signal = await _reporting_today(resolved_level, resolved_object_id)
+        timezone_signals = [timezone_signal] if timezone_signal else []
+        end = today - timedelta(days=1)
     lookback_start = end - timedelta(days=lookback_days - 1)
     baseline_end = lookback_start - timedelta(days=1)
     baseline_start = baseline_end - timedelta(days=baseline_days - 1)
@@ -631,6 +705,7 @@ async def detect_performance_anomalies(
     windows = {
         "baseline_window": {"since": baseline_start.isoformat(), "until": baseline_end.isoformat()},
         "lookback_window": {"since": lookback_start.isoformat(), "until": end.isoformat()},
+        "reporting_timezone": reporting_timezone,
     }
 
     if len(baseline_dates) < baseline_days:
@@ -648,7 +723,8 @@ async def detect_performance_anomalies(
                 "confidence_status": "uncalibrated",
             }],
             missing_signals=[
-                f"Not enough history: {len(baseline_dates)} of {baseline_days} baseline days returned insights rows."
+                *timezone_signals,
+                f"Not enough history: {len(baseline_dates)} of {baseline_days} baseline days returned insights rows.",
             ],
             extra={
                 **windows,
@@ -664,7 +740,7 @@ async def detect_performance_anomalies(
 
     anomalies: list[dict[str, Any]] = []
     metric_status: dict[str, dict[str, Any]] = {}
-    missing_signals: list[str] = []
+    missing_signals: list[str] = list(timezone_signals)
     for metric in metric_names:
         baseline_points = [(day, daily[day][metric]) for day in baseline_dates if daily[day][metric] is not None]
         status: dict[str, Any] = {
@@ -1422,11 +1498,14 @@ async def get_advertiser_context(
     resolved_account_id = _require_account_id(account_id)
     if not 7 <= lookback_days <= 90:
         raise ValidationError("lookback_days must be between 7 and 90.")
-    end = _today() - timedelta(days=1)
-    start = end - timedelta(days=lookback_days - 1)
     client = get_graph_api_client()
-    account, rows, *edge_sections = await asyncio.gather(
-        client.get_object(resolved_account_id, fields=CONTEXT_ACCOUNT_FIELDS),
+    account = await client.get_object(resolved_account_id, fields=CONTEXT_ACCOUNT_FIELDS)
+    today, reporting_timezone, timezone_signal = await _reporting_today(
+        "account", resolved_account_id, account=account,
+    )
+    end = today - timedelta(days=1)
+    start = end - timedelta(days=lookback_days - 1)
+    rows, *edge_sections = await asyncio.gather(
         diagnostics_tools._child_insights(
             resolved_account_id,
             level="adset",
@@ -1440,7 +1519,7 @@ async def get_advertiser_context(
             for _, edge, fields in CONTEXT_EDGE_SECTIONS
         ),
     )
-    missing_signals: list[str] = []
+    missing_signals: list[str] = [timezone_signal] if timezone_signal else []
     currency = _supported_currency(account.get("currency"))
     money: dict[str, float | None] = {}
     for field in ("amount_spent", "spend_cap"):
@@ -1479,6 +1558,7 @@ async def get_advertiser_context(
                 "Built by this server from the account's own data. This is not Meta's own advertiser summary."
             ),
             "window": {"since": start.isoformat(), "until": end.isoformat(), "days": lookback_days},
+            "reporting_timezone": reporting_timezone,
             "account": {
                 "id": str(account.get("id") or resolved_account_id),
                 "name": account.get("name"),
