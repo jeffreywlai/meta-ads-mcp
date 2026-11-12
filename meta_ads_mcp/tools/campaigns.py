@@ -37,6 +37,46 @@ def _encode_budget_field(
     )
 
 
+def reject_named_and_params(named: dict[str, Any], params: dict[str, Any] | None, *, money: tuple[str, ...] = ()) -> None:
+    """Refuse a field given both as a named parameter and inside params, before any network call."""
+    for key, value in named.items():
+        if value is not None and params and key in params:
+            unit_note = (
+                " The named parameter takes major currency units; a params value is sent to Meta as minor units."
+                if key in money
+                else ""
+            )
+            raise ValidationError(
+                f"{key} was given both as a named parameter and inside params; give it once, "
+                f"preferably as the named {key} parameter.{unit_note}"
+            )
+
+
+def _nonempty_object_list(value: Any, field_name: str) -> list[dict[str, Any]]:
+    """Check a list of JSON objects, such as frequency_control_specs."""
+    if not isinstance(value, list) or any(not isinstance(item, dict) or not item for item in value):
+        raise ValidationError(f"{field_name} must be a list of non-empty objects.")
+    if not value:
+        raise ValidationError(f"{field_name} must not be empty; omit it instead.")
+    return value
+
+
+def validate_adlabels(adlabels: Any) -> list[dict[str, Any]]:
+    """Check Meta ad labels: objects naming an existing label by id or a label by name."""
+    labels = _nonempty_object_list(adlabels, "adlabels")
+    for label in labels:
+        if not any(isinstance(label.get(key), str) and label[key].strip() for key in ("id", "name")):
+            raise ValidationError('adlabels entries need an "id" or a "name", for example [{"name": "Q4"}].')
+    return labels
+
+
+def _nonblank_text(value: str, field_name: str) -> str:
+    """Check a free-text field that must not be blank."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field_name} must not be blank.")
+    return value
+
+
 @mcp_server.tool()
 async def create_campaign(
     account_id: str,
@@ -50,16 +90,50 @@ async def create_campaign(
     bid_strategy: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    spend_cap: CurrencyAmount | None = None,
+    start_time: str | None = None,
+    stop_time: str | None = None,
+    promoted_object: dict[str, Any] | None = None,
+    special_ad_category_country: StringList | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a new campaign shell before adding ad sets or ads."""
+    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. A named parameter and the same key inside params cannot both be given."""
+    reject_named_and_params(
+        {
+            "spend_cap": spend_cap,
+            "start_time": start_time,
+            "stop_time": stop_time,
+            "promoted_object": promoted_object,
+            "special_ad_category_country": special_ad_category_country,
+            "adlabels": adlabels,
+        },
+        params,
+        money=("spend_cap",),
+    )
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
         ("daily_budget", daily_budget),
         ("lifetime_budget", lifetime_budget),
+        ("spend_cap", spend_cap),
     ):
         if value is not None:
             validate_positive_amount(value, field_name=field_name)
+    new_start = _validate_adset_time(start_time, "start_time")
+    new_stop = _validate_adset_time(stop_time, "stop_time")
+    if new_start is not None and new_stop is not None and new_stop <= new_start:
+        raise ValidationError("stop_time must be after start_time.")
+    if promoted_object is not None and not promoted_object:
+        raise ValidationError("promoted_object must not be empty; omit it instead.")
+    countries = None
+    if special_ad_category_country is not None:
+        if not special_ad_category_country:
+            raise ValidationError("special_ad_category_country must not be empty; omit it instead.")
+        countries = [str(code).strip().upper() for code in special_ad_category_country]
+        if any(len(code) != 2 or not code.isalpha() for code in countries):
+            raise ValidationError("special_ad_category_country takes two-letter country codes such as US or CA.")
+    if adlabels is not None:
+        validate_adlabels(adlabels)
     payload: dict[str, Any] = {
         "name": name,
         "objective": objective,
@@ -70,15 +144,29 @@ async def create_campaign(
         "daily_budget": OMIT,
         "lifetime_budget": OMIT,
     }
+    # New named fields join the payload only when given, so a call that puts
+    # them in params (as callers did before they existed) is sent unchanged.
+    for key, value in (
+        ("spend_cap", spend_cap),
+        ("start_time", start_time),
+        ("stop_time", stop_time),
+        ("promoted_object", promoted_object),
+        ("special_ad_category_country", countries),
+        ("adlabels", adlabels),
+    ):
+        if value is not None:
+            payload[key] = value
     add_validate_only(payload, validate_only=validate_only)
     merge_graph_payload(payload, params)
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
     currency = None
-    if daily_budget is not None or lifetime_budget is not None:
+    if any(value is not None for value in (daily_budget, lifetime_budget, spend_cap)):
         currency = await resolve_account_currency(client, account_id)
     _encode_budget_field(payload, "daily_budget", daily_budget, currency=currency)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget, currency=currency)
+    if spend_cap is not None:
+        payload["spend_cap"] = to_minor_units(spend_cap, currency, field_name="spend_cap")
     result = await client.create_edge_object(
         account_id,
         "campaigns",
@@ -219,19 +307,54 @@ async def create_ad_set(
     end_time: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    frequency_control_specs: list[dict[str, Any]] | None = None,
+    attribution_spec: list[dict[str, Any]] | None = None,
+    adset_schedule: list[dict[str, Any]] | None = None,
+    daily_spend_cap: CurrencyAmount | None = None,
+    lifetime_spend_cap: CurrencyAmount | None = None,
+    daily_min_spend_target: CurrencyAmount | None = None,
+    lifetime_min_spend_target: CurrencyAmount | None = None,
+    dsa_beneficiary: str | None = None,
+    dsa_payor: str | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and pacing_type ["day_parting"] in params. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
+    named_spend = {
+        "daily_spend_cap": daily_spend_cap,
+        "lifetime_spend_cap": lifetime_spend_cap,
+        "daily_min_spend_target": daily_min_spend_target,
+        "lifetime_min_spend_target": lifetime_min_spend_target,
+    }
+    named_other = {
+        "frequency_control_specs": frequency_control_specs,
+        "attribution_spec": attribution_spec,
+        "adset_schedule": adset_schedule,
+    }
+    reject_named_and_params(
+        {**named_other, **named_spend, "dsa_beneficiary": dsa_beneficiary, "dsa_payor": dsa_payor, "adlabels": adlabels},
+        params,
+        money=_ADSET_SPEND_FIELDS,
+    )
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
         ("bid_amount", bid_amount),
         ("daily_budget", daily_budget),
         ("lifetime_budget", lifetime_budget),
+        *named_spend.items(),
     ):
         if value is not None:
             validate_positive_amount(value, field_name=field_name)
     if bid_constraints and not bid_strategy:
         raise ValidationError("bid_strategy is required when bid_constraints is provided.")
+    for field_name, value in named_other.items():
+        if value is not None:
+            _nonempty_object_list(value, field_name)
+    for field_name, value in (("dsa_beneficiary", dsa_beneficiary), ("dsa_payor", dsa_payor)):
+        if value is not None:
+            _nonblank_text(value, field_name)
+    if adlabels is not None:
+        validate_adlabels(adlabels)
     validate_targeting_placements(targeting)
     payload: dict[str, Any] = {
         "campaign_id": campaign_id,
@@ -249,12 +372,23 @@ async def create_ad_set(
         "daily_budget": OMIT,
         "lifetime_budget": OMIT,
     }
+    # New named fields join the payload only when given, so a call that puts
+    # them in params (as callers did before they existed) is sent unchanged.
+    for key, value in (
+        *named_other.items(),
+        *named_spend.items(),
+        ("dsa_beneficiary", dsa_beneficiary),
+        ("dsa_payor", dsa_payor),
+        ("adlabels", adlabels),
+    ):
+        if value is not None:
+            payload[key] = value
     add_validate_only(payload, validate_only=validate_only)
     merge_graph_payload(payload, params)
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
     currency = None
-    if any(value is not None for value in (bid_amount, daily_budget, lifetime_budget)):
+    if any(value is not None for value in (bid_amount, daily_budget, lifetime_budget, *named_spend.values())):
         currency = await resolve_account_currency(client, account_id)
     if bid_amount is not None:
         payload["bid_amount"] = to_minor_units(
@@ -264,6 +398,9 @@ async def create_ad_set(
         )
     _encode_budget_field(payload, "daily_budget", daily_budget, currency=currency)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget, currency=currency)
+    for field_name, value in named_spend.items():
+        if value is not None:
+            payload[field_name] = to_minor_units(value, currency, field_name=field_name)
     result = await client.create_edge_object(
         account_id,
         "adsets",

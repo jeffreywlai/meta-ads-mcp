@@ -685,6 +685,190 @@ def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
     assert result["target"] == {"account_id": "act_123", "campaign_id": "cmp_123"}
 
 
+def _no_client():
+    return pytest.fail("No client should be created")
+
+
+CAMPAIGN_BASE = {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES"}
+ADSET_BASE = {
+    "account_id": "123", "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS",
+    "optimization_goal": "REACH", "targeting": {"geo_locations": {"countries": ["DE"]}},
+}
+
+
+@pytest.mark.parametrize(
+    ("named", "params_value"),
+    [
+        ({"spend_cap": 250.0}, 25000),
+        ({"start_time": "2026-12-01T00:00:00Z"}, "2026-12-01T00:00:00Z"),
+        ({"stop_time": "2026-12-31T00:00:00Z"}, "2026-12-31T00:00:00Z"),
+        ({"promoted_object": {"pixel_id": "1"}}, {"pixel_id": "2"}),
+        ({"special_ad_category_country": ["US"]}, ["US"]),
+        ({"adlabels": [{"name": "Q4"}]}, [{"name": "Q4"}]),
+    ],
+)
+def test_create_campaign_named_parameter_and_same_params_key_together_raise(monkeypatch, named, params_value) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    (key, _value), = named.items()
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(campaigns.create_campaign(**CAMPAIGN_BASE, **named, params={key: params_value}))
+
+
+@pytest.mark.parametrize(
+    ("named", "params_value"),
+    [
+        ({"frequency_control_specs": [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 2}]}, []),
+        ({"attribution_spec": [{"event_type": "CLICK_THROUGH", "window_days": 7}]}, []),
+        ({"adset_schedule": [{"start_minute": 0, "end_minute": 60, "days": [0]}]}, []),
+        ({"daily_spend_cap": 90.0}, 9000),
+        ({"lifetime_spend_cap": 900.0}, 90000),
+        ({"daily_min_spend_target": 10.0}, 1000),
+        ({"lifetime_min_spend_target": 100.0}, 10000),
+        ({"dsa_beneficiary": "Acme"}, "Acme"),
+        ({"dsa_payor": "Acme"}, "Acme"),
+        ({"adlabels": [{"id": "123"}]}, [{"id": "123"}]),
+    ],
+)
+def test_create_ad_set_named_parameter_and_same_params_key_together_raise(monkeypatch, named, params_value) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    (key, _value), = named.items()
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **named, params={key: params_value}))
+
+
+def test_create_campaign_named_parameters_are_sent(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_campaign(
+        **CAMPAIGN_BASE,
+        special_ad_categories=["HOUSING"],
+        spend_cap=1000.25,
+        start_time="2026-12-01T00:00:00-05:00",
+        stop_time="2026-12-31T00:00:00-05:00",
+        promoted_object={"pixel_id": "999", "custom_event_type": "PURCHASE"},
+        special_ad_category_country=["us", "CA"],
+        adlabels=[{"name": "Q4"}, {"id": "456"}],
+        validate_only=True,
+        params={"is_skadnetwork_attribution": False},
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "campaigns", {
+            "name": "C",
+            "objective": "OUTCOME_SALES",
+            "status": "PAUSED",
+            "special_ad_categories": ["HOUSING"],
+            "spend_cap": 100025,
+            "start_time": "2026-12-01T00:00:00-05:00",
+            "stop_time": "2026-12-31T00:00:00-05:00",
+            "promoted_object": {"pixel_id": "999", "custom_event_type": "PURCHASE"},
+            "special_ad_category_country": ["US", "CA"],
+            "adlabels": [{"name": "Q4"}, {"id": "456"}],
+            "execution_options": ["validate_only"],
+            "is_skadnetwork_attribution": False,
+        }),
+    ]
+    assert result["validation_only"] is True
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"spend_cap": 0}, "spend_cap must be greater than 0"),
+        ({"start_time": "tomorrow"}, "start_time"),
+        ({"stop_time": "2026-12-31T00:00:00"}, "UTC offset"),
+        ({"start_time": "2026-12-31T00:00:00Z", "stop_time": "2026-12-01T00:00:00Z"}, "stop_time must be after start_time"),
+        ({"special_ad_category_country": ["USA"]}, "two-letter"),
+        ({"special_ad_category_country": []}, "special_ad_category_country must not be empty"),
+        ({"adlabels": [{"color": "red"}]}, "adlabels"),
+        ({"adlabels": []}, "adlabels must not be empty"),
+        ({"promoted_object": {}}, "promoted_object must not be empty"),
+    ],
+)
+def test_create_campaign_named_parameter_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_campaign(**CAMPAIGN_BASE, **arguments))
+
+
+def test_create_ad_set_named_parameters_are_sent(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    frequency = [{"event": "IMPRESSIONS", "interval_days": 7, "max_frequency": 2}]
+    attribution = [{"event_type": "CLICK_THROUGH", "window_days": 7}]
+    schedule = [{"start_minute": 540, "end_minute": 1020, "days": [1, 2, 3]}]
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE,
+        frequency_control_specs=frequency,
+        attribution_spec=attribution,
+        adset_schedule=schedule,
+        daily_spend_cap=90.5,
+        lifetime_spend_cap=900,
+        daily_min_spend_target=10,
+        lifetime_min_spend_target=100.01,
+        dsa_beneficiary="Acme GmbH",
+        dsa_payor="Acme Holding",
+        adlabels=[{"name": "Q4"}],
+        params={"pacing_type": ["day_parting"]},
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {
+            "campaign_id": "cmp_123",
+            "name": "S",
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "REACH",
+            "targeting": {"geo_locations": {"countries": ["DE"]}},
+            "status": "PAUSED",
+            "frequency_control_specs": frequency,
+            "attribution_spec": attribution,
+            "adset_schedule": schedule,
+            "daily_spend_cap": 9050,
+            "lifetime_spend_cap": 90000,
+            "daily_min_spend_target": 1000,
+            "lifetime_min_spend_target": 10001,
+            "dsa_beneficiary": "Acme GmbH",
+            "dsa_payor": "Acme Holding",
+            "adlabels": [{"name": "Q4"}],
+            "pacing_type": ["day_parting"],
+        }),
+    ]
+
+
+def test_create_ad_set_spend_cap_zero_decimal_currency(monkeypatch) -> None:
+    client = FakeZeroDecimalCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(**ADSET_BASE, daily_spend_cap=7000))
+    assert client.created_payload["data"]["daily_spend_cap"] == 7000
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"daily_spend_cap": -1}, "daily_spend_cap must be greater than 0"),
+        ({"lifetime_min_spend_target": 0}, "lifetime_min_spend_target must be greater than 0"),
+        ({"frequency_control_specs": []}, "frequency_control_specs must not be empty"),
+        ({"attribution_spec": ["CLICK"]}, "attribution_spec"),
+        ({"adset_schedule": [1]}, "adset_schedule"),
+        ({"dsa_beneficiary": " "}, "dsa_beneficiary"),
+        ({"dsa_payor": ""}, "dsa_payor"),
+        ({"adlabels": ["Q4"]}, "adlabels"),
+    ],
+)
+def test_create_ad_set_named_parameter_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **arguments))
+
+
+def test_create_ad_set_rejects_too_many_decimals_for_spend_cap_before_sending(monkeypatch) -> None:
+    client = FakeZeroDecimalCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="decimal places"):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, daily_spend_cap=10.5))
+    assert client.created_payload is None
+
+
 class MoneyAdsetClient:
     """Fake client for update_adset money fields: an ad set on an account with a currency."""
 
