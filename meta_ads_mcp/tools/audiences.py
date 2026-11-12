@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+import math
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
@@ -10,7 +13,7 @@ from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
-from meta_ads_mcp.tool_types import FieldList, StringList
+from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list
 
 AUDIENCE_SUMMARY_FIELDS = [
     "id",
@@ -37,17 +40,35 @@ def _resolve_lookalike_spec(
     countries: list[str] | None,
     ratio: float | None,
     starting_ratio: float | None,
-    lookalike_type: str,
+    lookalike_type: str | None,
 ) -> dict[str, Any]:
     """Build a lookalike_spec payload."""
-    location_values = countries or ([country] if country else None)
+    country = blank_to_none(country)
+    if country and countries:
+        raise ValidationError("Provide country or countries, not both.")
+    location_values = coerce_csv_string_list(countries) or ([country] if country else None)
     if not location_values:
         raise ValidationError("country or countries is required for create_lookalike_audience.")
-    spec: dict[str, Any] = {
-        "type": lookalike_type,
-        "country": location_values[0] if len(location_values) == 1 else None,
-        "location_spec": {"countries": location_values},
-    }
+    if any(not isinstance(value, str) or not value.strip() for value in location_values):
+        raise ValidationError("countries must contain nonblank country codes.")
+    location_values = list(dict.fromkeys(value.strip().upper() for value in location_values))
+    resolved_type = blank_to_none(lookalike_type) or (
+        "custom_ratio" if ratio is not None else "similarity"
+    )
+    if ratio is not None:
+        if not math.isfinite(ratio) or not 0 < ratio <= 1:
+            raise ValidationError("ratio must be a finite fraction greater than 0 and at most 1.")
+    elif starting_ratio is not None:
+        raise ValidationError("ratio is required when starting_ratio is supplied.")
+    if starting_ratio is not None and (
+        not math.isfinite(starting_ratio) or not 0 <= starting_ratio < ratio
+    ):
+        raise ValidationError("starting_ratio must be finite, nonnegative, and less than ratio.")
+    spec: dict[str, Any] = {"type": resolved_type}
+    if len(location_values) == 1:
+        spec["country"] = location_values[0]
+    else:
+        spec["location_spec"] = {"geo_locations": {"countries": location_values}}
     if ratio is not None:
         spec["ratio"] = ratio
     if starting_ratio is not None:
@@ -63,7 +84,9 @@ async def list_audiences(
     after: str | None = None,
     fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user needs audience ids, sizes, or subtype metadata for one ad account."""
+    """List one page of audience ids, sizes, or subtype metadata. Follow summary.next_after with after until summary.complete is true."""
+    if limit < 1:
+        raise ValidationError("limit must be positive.")
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit}
     if subtype:
@@ -76,7 +99,14 @@ async def list_audiences(
         fields=fields or AUDIENCE_SUMMARY_FIELDS,
         params=params,
     )
-    return normalize_collection(payload)
+    normalized = normalize_collection(payload)
+    has_more = bool(normalized["paging"].get("next"))
+    normalized["summary"].update({
+        "complete": not has_more,
+        "truncated": has_more,
+        "next_after": normalized["paging"].get("after") if has_more else None,
+    })
+    return normalized
 
 
 @mcp_server.tool()
@@ -141,11 +171,17 @@ async def create_lookalike_audience(
     countries: StringList | None = None,
     ratio: float | None = None,
     starting_ratio: float | None = None,
-    lookalike_type: str = "similarity",
+    lookalike_type: Annotated[
+        str | None,
+        Field(description="Defaults to custom_ratio when ratio is supplied, otherwise similarity. Explicit types are preserved and Meta validates their compatibility."),
+    ] = None,
     description: str | None = None,
-    params: dict[str, Any] | None = None,
+    params: Annotated[
+        dict[str, Any] | None,
+        Field(description="Additional Graph parameters. Cannot supply lookalike_spec or override tool-managed named fields; use country/countries, ratio, starting_ratio, and lookalike_type."),
+    ] = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to expand from a seed audience into a lookalike audience."""
+    """Create a lookalike from a seed with tool-managed lookalike_spec. Supply country or countries; ratio is a fraction (0.01 means 1%). params cannot carry lookalike_spec."""
     payload: dict[str, Any] = {
         "name": name,
         "subtype": "LOOKALIKE",

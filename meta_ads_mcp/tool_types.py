@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, TypeAlias
 
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, Field
 
 from meta_ads_mcp.api_compat import is_api_version_at_least
 from meta_ads_mcp.config import get_settings
@@ -74,6 +74,28 @@ StrictStringList: TypeAlias = Annotated[
 
 # Graph fields use the same top-level CSV grammar, including nested field expressions.
 FieldList: TypeAlias = StringList
+
+CurrencyAmount: TypeAlias = Annotated[
+    float,
+    Field(
+        description=(
+            "Amount in major units of the owning ad account currency "
+            "(for example, 12.50 means USD 12.50, not 1,250 cents). "
+            "The server converts to Meta's minor units using the account currency."
+        )
+    ),
+]
+
+BidConstraints: TypeAlias = Annotated[
+    dict[str, Any],
+    Field(
+        description=(
+            "Meta bid constraints passed through unchanged. roas_average_floor "
+            "is Meta's raw integer scaled by 10000 (30000 means 3.0 ROAS); "
+            "it is not a currency amount."
+        )
+    ),
+]
 
 
 def normalize_recommendation_filters(

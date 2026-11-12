@@ -13,6 +13,7 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.money import SUPPORTED_CURRENCY_DECIMAL_PLACES
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.tool_types import FieldList
 
@@ -215,6 +216,33 @@ def _activity_params(
     return params
 
 
+def _payment_amount_units(value: Any, path: str) -> list[dict[str, Any]]:
+    """Describe typed activity amounts without converting Meta's raw values."""
+    units: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if value.get("type") == "payment_amount":
+            currency = value.get("currency")
+            metadata: dict[str, Any] = {
+                "path": path,
+                "currency": currency,
+                "unit": "minor_currency_units",
+            }
+            decimal_places = (
+                SUPPORTED_CURRENCY_DECIMAL_PLACES.get(currency)
+                if isinstance(currency, str) else None
+            )
+            if decimal_places is not None:
+                metadata["major_unit_divisor"] = 10 ** decimal_places
+            units.append(metadata)
+        for key, child in value.items():
+            escaped_key = str(key).replace("~", "~0").replace("/", "~1")
+            units.extend(_payment_amount_units(child, f"{path}/{escaped_key}"))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            units.extend(_payment_amount_units(child, f"{path}/{index}"))
+    return units
+
+
 def _normalize_activity_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Add parsed extra_data when Meta returns JSON encoded details."""
     normalized_items: list[dict[str, Any]] = []
@@ -226,6 +254,13 @@ def _normalize_activity_items(items: list[dict[str, Any]]) -> list[dict[str, Any
                 normalized["extra_data_parsed"] = json.loads(extra_data)
             except json.JSONDecodeError:
                 pass
+        parsed = normalized.get("extra_data_parsed", extra_data)
+        units = _payment_amount_units(
+            parsed,
+            "/extra_data_parsed" if "extra_data_parsed" in normalized else "/extra_data",
+        )
+        if units:
+            normalized["extra_data_units"] = units
         normalized_items.append(normalized)
     return normalized_items
 
@@ -247,7 +282,7 @@ async def list_change_history(
     limit: int = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """Read Meta Ads activity/change history for an account, campaign, ad set, or ad."""
+    """Read Meta Ads activity/change history for an account, campaign, ad set, or ad. Activity payment_amount values remain raw minor currency units (USD cents); extra_data_units identifies their currency and divisor. Budget/bid tools instead use major account-currency units."""
     client = get_graph_api_client()
     scope = await _resolve_scope(
         level=level,

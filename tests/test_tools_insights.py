@@ -262,8 +262,8 @@ def test_sync_insights_can_omit_raw_actions_without_losing_metrics(monkeypatch, 
     assert row["purchase_value"] == 250
     assert row["metrics"]["roas"] == 2.5
     assert result["summary"]["action_filter"]["matched"] == ["purchase"]
-    assert row["actions_map"] == {"purchase": 2.0}
-    assert row["action_values_map"] == {"purchase": 250.0}
+    assert "actions_map" not in row
+    assert "action_values_map" not in row
     for field in ("actions", "action_values"):
         assert field not in row
 
@@ -279,8 +279,12 @@ def test_sync_insights_is_compact_by_default_and_raw_actions_are_opt_in(monkeypa
     assert row["purchase"] == 2
     assert row["purchase_value"] == 250
     assert row["metrics"]["roas"] == result["summary"]["metrics"]["roas"] == 2.5
-    assert row["actions_map"]["purchase"] == 2
-    assert row["action_values_map"]["purchase"] == 250
+    if raw_option.get("include_raw_actions"):
+        assert row["actions_map"]["purchase"] == 2
+        assert row["action_values_map"]["purchase"] == 250
+    else:
+        assert "actions_map" not in row
+        assert "action_values_map" not in row
     if raw_option.get("include_raw_actions"):
         assert row["actions"][0]["value"] == "2"
         assert row["action_values"][0]["value"] == "250"
@@ -434,7 +438,7 @@ def test_compact_attribution_queries_explain_raw_opt_in_for_named_windows(monkey
         flatten_actions=["purchase_value"],
     ))
     assert result["items"][0]["purchase_value"] == 250  # Generic value, not either named window.
-    assert result["items"][0]["action_values_map"] == {"purchase": 250.0}
+    assert "action_values_map" not in result["items"][0]
     assert "action_values" not in result["items"][0]
     assert "Set include_raw_actions=true" in result["summary"]["attribution_note"]
 
@@ -2198,7 +2202,7 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
         )
     )
 
-    assert result.structured_content is None
+    assert result.structured_content["overflow"] == result.meta["overflow"]
     overflow = result.meta["overflow"]
     assert overflow["archived"] is True
     export_id = overflow["export_id"]
@@ -2277,7 +2281,7 @@ def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
         )
     )
 
-    assert result.structured_content is None
+    assert result.structured_content["overflow"] == result.meta["overflow"]
     assert result.meta["overflow"]["archived"] is False
     assert RESPONSE_LIMIT_HINT.strip() in result.content[0].text
     assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES

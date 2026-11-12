@@ -947,8 +947,8 @@ async def get_budget_pacing_report(
             "daily_row_detail": "full" if include_full_daily_rows else "compact",
             "trend_summary": {
                 "days": len(rows),
-                "first_day_spend": rows[0]["metrics"]["spend"] if rows else None,
-                "last_day_spend": rows[-1]["metrics"]["spend"] if rows else None,
+                "first_day_spend": rows[0]["metrics"].get("spend") if rows else None,
+                "last_day_spend": rows[-1]["metrics"].get("spend") if rows else None,
             },
         },
     )

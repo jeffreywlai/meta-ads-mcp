@@ -363,3 +363,291 @@ def test_create_creative_alias_routes_to_ad_creative_tool() -> None:
 
     assert decision.preferred_tool == "create_ad_creative"
     assert decision.compatible_tools == {"create_ad_creative"}
+
+
+def _configuration_contracts() -> dict[str, Contract]:
+    return {
+        name: _contract(name, effect="write")
+        for name in (
+            "update_campaign", "update_campaign_budget", "update_campaign_bid_strategy",
+            "set_campaign_status", "update_adset_budget", "update_adset_bid_amount",
+            "update_adset_bid_strategy", "set_adset_status",
+        )
+    }
+
+
+def test_compact_daily_apply_query_exposes_each_requested_write() -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide("update ad set budget bid amount status campaign budget bid strategy")
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == (
+        "update_adset_budget", "update_adset_bid_amount", "set_adset_status",
+        "update_campaign_budget", "update_adset_bid_strategy", "update_campaign_bid_strategy",
+    )
+    assert "update_campaign" not in decision.compatible_tools
+    assert "set_campaign_status" not in decision.compatible_tools
+
+
+def test_daily_apply_shorthand_is_recognized_with_explicit_write_context() -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(
+        "bid amount cost cap; pause ad set status; campaign daily budget; bid strategy roas floor"
+    )
+
+    assert decision.compatible_tools == {
+        "update_adset_bid_amount", "set_adset_status", "update_campaign_budget",
+        "update_adset_bid_strategy",
+    }
+    assert router.decide("campaign daily budget; bid strategy roas floor").suppress_mutations
+
+
+@pytest.mark.parametrize("query", ["update campaign daily budget", "update campaign daily budget CBO", "set campaign lifetime budget"])
+def test_budget_intent_selects_dedicated_campaign_budget_tool(query: str) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    assert router.decide(query).compatible_tools == {"update_campaign_budget"}
+
+
+@pytest.mark.parametrize("query", [
+    "do not update campaign daily budget and update adset bid amount",
+    "don't update campaign daily budget, update adset bid strategy",
+    "never set adset budget bid amount status campaign budget bid strategy",
+    "compare campaign budget and bid strategy",
+])
+def test_negated_and_read_queries_do_not_expose_compound_writes(query: str) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(query)
+
+    assert decision.suppress_mutations
+    assert not decision.compatible_tools
+
+
+def test_configuration_qualifiers_do_not_turn_avoided_facets_into_changes() -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide("update adset budget without changing status or bid strategy")
+
+    assert decision.compatible_tools == {"update_adset_budget"}
+
+
+@pytest.mark.parametrize("query", [
+    "update campaign budget; bid amount must not change",
+    "update campaign budget; bid amount should not change",
+    "update campaign budget and name must not change",
+    "update campaign budget, objective should not change",
+    "update campaign budget without changing name and objective",
+    "update campaign budget; bid amount does not change",
+    "update campaign budget; bid amount did not change",
+    "update campaign budget; bid amount should remain unchanged",
+    "update campaign budget; bid amount is unchanged",
+    "update campaign budget; bid amount must never change",
+    "update campaign budget; bid amount and status must not change",
+    "update campaign budget; campaign name and objective must not change",
+    "update campaign budget; campaign status and objective should not change",
+    "update campaign budget; campaign name and objective should stay unchanged",
+    "update campaign budget; bid amount unchanged",
+    "update campaign budget; campaign name and objective unchanged",
+    "update campaign budget; campaign name needs to stay unchanged",
+    "update campaign budget; bid amount, must not change",
+    "update campaign budget; bid amount: must not change",
+    "update campaign budget; bid amount should remain unchanged and campaign status",
+    "update campaign budget to 100 without changing name and objective",
+])
+def test_negated_continuations_preserve_only_the_requested_configuration(query: str) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    assert router.decide(query).compatible_tools == {"update_campaign_budget"}
+
+
+@pytest.mark.parametrize("query", [
+    "update campaign budget must not change",
+    "set adset status should not change",
+    "do not update campaign budget and name",
+    "compare campaign budget and name",
+    "show campaign status and objective",
+])
+def test_negated_and_read_configuration_fields_never_enable_mutations(query: str) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(query)
+
+    assert not decision.compatible_tools
+    assert decision.suppress_mutations
+
+
+@pytest.mark.parametrize(("query", "expected"), [
+    ("update campaign budget and name", ("update_campaign_budget", "update_campaign")),
+    ("update campaign status and objective", ("set_campaign_status", "update_campaign")),
+    ("set campaign lifetime budget, name", ("update_campaign_budget", "update_campaign")),
+    ("update campaign name and budget", ("update_campaign", "update_campaign_budget")),
+    ("update adset budget and campaign name", ("update_adset_budget", "update_campaign")),
+    ("update adset budget and bid amount must not change", ("update_adset_budget",)),
+    ("update campaign budget to 100 and name", ("update_campaign_budget", "update_campaign")),
+    ("update campaign budget to 100, name", ("update_campaign_budget", "update_campaign")),
+    ("update campaign budget to 100, and name", ("update_campaign_budget", "update_campaign")),
+    ("update campaign status to paused and objective", ("set_campaign_status", "update_campaign")),
+    ("update campaign status to paused, objective", ("set_campaign_status", "update_campaign")),
+    ('update campaign name to "Winter", budget', ("update_campaign", "update_campaign_budget")),
+    ('update campaign name to "Budget and Status" and objective', ("update_campaign",)),
+    ("update campaign budget; bid amount shouldn't change; update campaign name", (
+        "update_campaign_budget", "update_campaign",
+    )),
+])
+def test_field_continuations_keep_scope_and_select_each_needed_updater(query, expected) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(query)
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == expected
+    assert decision.compatible_tools == set(expected)
+
+
+@pytest.mark.parametrize("entity", ["adset", "ad set"])
+@pytest.mark.parametrize("separator", [" and ", ", ", ", and "])
+@pytest.mark.parametrize("prefix_separator", ["; ", ", "])
+def test_coordinated_entity_subjects_share_their_preservation_predicate(
+    entity: str, separator: str, prefix_separator: str,
+) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+    query = (
+        f"update campaign budget{prefix_separator}{entity} bid amount"
+        f"{separator}{entity} status must not change"
+    )
+
+    assert router.decide(query).compatible_tools == {"update_campaign_budget"}
+
+
+@pytest.mark.parametrize(("query", "expected"), [
+    ("update campaign budget, name and objective must not change", ("update_campaign_budget",)),
+    ("update campaign budget and campaign name and campaign objective must not change", ("update_campaign_budget",)),
+    ("update campaign name; campaign objective and campaign status must not change", ("update_campaign",)),
+    ('update campaign budget and name to "Winter", objective and status must not change', (
+        "update_campaign_budget", "update_campaign",
+    )),
+    ("update campaign budget, name and objective must not change and update adset bid amount", (
+        "update_campaign_budget", "update_adset_bid_amount",
+    )),
+    ("update campaign budget, name and objective must not change, update adset bid amount", (
+        "update_campaign_budget", "update_adset_bid_amount",
+    )),
+    ("update campaign budget; bid amount to 2 and adset status must not change", (
+        "update_campaign_budget", "update_adset_bid_amount",
+    )),
+    ("update campaign budget; adset bid amount to 2, adset status must not change", (
+        "update_campaign_budget", "update_adset_bid_amount",
+    )),
+    ("update campaign budget; bid amount to 2 must not change", ("update_campaign_budget",)),
+    ("update campaign budget; bid amount and adset status to paused must not change", ("update_campaign_budget",)),
+    ("pause ad set status, campaign budget", ("set_adset_status", "update_campaign_budget")),
+    ("update campaign status to paused and campaign budget", ("set_campaign_status", "update_campaign_budget")),
+    ("update campaign budget and adset budget and bid strategy", (
+        "update_campaign_budget", "update_adset_budget", "update_adset_bid_strategy",
+    )),
+    ("update adset budget and campaign budget bid strategy", (
+        "update_adset_budget", "update_campaign_budget", "update_campaign_bid_strategy",
+    )),
+])
+def test_preservation_subjects_do_not_remove_separate_requested_changes(query, expected) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(query)
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == expected
+    assert decision.compatible_tools == set(expected)
+
+
+@pytest.mark.parametrize(("query", "expected"), [
+    ("show campaign budget and campaign status; update adset budget", (
+        "get_campaign", "update_adset_budget",
+    )),
+    ("update campaign budget; show adset bid amount, adset status", (
+        "update_campaign_budget", "get_adset",
+    )),
+    ("show campaign budget and ad set status; update adset budget", (
+        "get_campaign", "get_adset", "update_adset_budget",
+    )),
+])
+def test_coordinated_read_subjects_keep_their_read_verb(query, expected) -> None:
+    contracts = {
+        **_configuration_contracts(),
+        "get_campaign": _contract("get_campaign"),
+        "get_adset": _contract("get_adset"),
+    }
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide(query)
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == expected
+    assert decision.compatible_tools == set(expected)
+
+
+@pytest.mark.parametrize("value", ["LOWEST_COST_WITHOUT_CAP", '"CUSTOM"'])
+def test_bid_strategy_literal_values_allow_a_following_requested_field(value: str) -> None:
+    router = StructuredIntentRouter(tool_contracts=_configuration_contracts())  # type: ignore[arg-type]
+
+    decision = router.decide(f'update campaign budget to 100 and bid strategy to {value} and name "Winter"')
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == (
+        "update_campaign_budget", "update_campaign_bid_strategy", "update_campaign",
+    )
+
+
+def test_quoted_configuration_values_cannot_select_canonical_tools() -> None:
+    contracts = {**_configuration_contracts(), "get_campaign": _contract("get_campaign")}
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide('update campaign name to "get_campaign" and budget to 100')
+
+    assert decision.compatible_tools == {"update_campaign", "update_campaign_budget"}
+    assert router.decide('find tool "update_campaign"').compatible_tools == {"update_campaign"}
+
+
+def test_mixed_creative_workflow_keeps_all_explicit_operations() -> None:
+    contracts = {
+        "list_ads": _contract("list_ads"),
+        "get_ad": _contract("get_ad"),
+        "get_creative": _contract("get_creative"),
+        "update_ad_creative": _contract("update_ad_creative", effect="write"),
+        "upload_creative_asset": _contract("upload_creative_asset", effect="write"),
+    }
+    router = StructuredIntentRouter(tool_contracts=contracts)  # type: ignore[arg-type]
+
+    decision = router.decide(
+        "list ads filter by name, get ad creative details, update ad creative, upload image"
+    )
+
+    assert (decision.preferred_tool, *decision.additional_preferred_tools) == (
+        "list_ads", "get_creative", "update_ad_creative", "upload_creative_asset",
+    )
+    assert "get_ad" not in decision.compatible_tools
+
+
+def test_compound_exact_calls_preserve_literal_delimiters_and_validation() -> None:
+    decision = ROUTER.decide(
+        'get_campaign(campaign_id="123, and 456"); '
+        'delete_creative(creative_id="789")'
+    )
+
+    assert decision.compatible_tools == {"get_campaign", "delete_creative"}
+    invalid = ROUTER.decide('delete_campaign(campaign_id=123), list_campaigns')
+    assert "delete_campaign" not in invalid.compatible_tools
+    assert invalid.preferred_tool == "list_campaigns"
+    assert invalid.frame.invalid_exact_call
+    literal_negation = ROUTER.decide(
+        'get_campaign(campaign_id="without") and delete_creative(creative_id="789")'
+    )
+    assert literal_negation.compatible_tools == {"get_campaign", "delete_creative"}
+
+
+@pytest.mark.parametrize("query", [
+    "summarize async report spend by product_id",
+    "aggregate spend by month for report_run_id 123",
+])
+def test_saved_report_aggregation_routes_to_read_tool(query: str) -> None:
+    name = "summarize_async_insights_report"
+    router = StructuredIntentRouter(tool_contracts={name: _contract(name)})  # type: ignore[arg-type]
+
+    assert router.decide(query).preferred_tool == name

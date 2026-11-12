@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections import deque
 from datetime import datetime, timezone
+from dataclasses import replace
 import pytest
 
 from meta_ads_mcp.auth import build_appsecret_proof
@@ -68,6 +69,27 @@ class FakeAsyncClient:
 
     async def aclose(self) -> None:
         self.is_closed = True
+
+
+def test_total_mutation_deadline_is_unknown_and_never_retried(monkeypatch):
+    calls = []
+
+    class SlowClient(FakeAsyncClient):
+        async def request(self, *args, **kwargs):
+            calls.append(kwargs)
+            # Mimics a server that keeps the inactivity timeout alive.
+            await asyncio.sleep(1)
+            return FakeResponse(200, {"success": True})
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", SlowClient)
+    client = _client(max_retries=2)
+    client.settings = replace(client.settings, request_timeout=0.01)
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(client.request("POST", "123", data={"daily_budget": 1000}))
+    assert len(calls) == 1
+    assert error.value.to_public_dict()["mutation_outcome_unknown"] is True
+    assert error.value.to_public_dict()["retryable"] is False
+    assert "Verify" in error.value.to_public_dict()["next_step"]
 
 
 def _client(

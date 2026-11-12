@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from datetime import datetime, timezone
 import errno
 import hashlib
+from itertools import chain
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -40,6 +44,8 @@ DEFAULT_ARTIFACT_MAX_BYTES = 1_000_000_000
 DEFAULT_ARTIFACT_CHUNK_BYTES = 44_000
 MAX_ARTIFACT_CHUNK_BYTES = 44_000
 MAX_VERIFIED_ARTIFACT_CACHE_ENTRIES = 64
+MAX_PARSED_ARTIFACT_CACHE_ENTRIES = 4
+MAX_PARSED_ARTIFACT_CACHE_BYTES = 64 * 1024 * 1024
 EXPORT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32}$")
 ARTIFACT_PREFIX = "overflow-"
 ARTIFACT_FILE_PATTERN = re.compile(
@@ -50,7 +56,14 @@ MANIFEST_FILE_PATTERN = re.compile(
     rf"^{ARTIFACT_PREFIX}([A-Za-z0-9_-]{{32}})"
     rf"{re.escape(MANIFEST_SUFFIX)}$"
 )
-MAX_MANIFEST_BYTES = 4_096
+TEMP_MANIFEST_FILE_PATTERN = re.compile(
+    rf"^{ARTIFACT_PREFIX}[A-Za-z0-9_-]{{32}}{re.escape(MANIFEST_SUFFIX)}\.[0-9a-f]{{16}}\.tmp$"
+)
+MAX_MANIFEST_BYTES = 65_536
+MAX_RECENT_ARTIFACT_OFFSETS = 2_048
+DEFAULT_ARTIFACT_ITEM_LIMIT = 100
+MAX_ARTIFACT_ITEM_LIMIT = 500
+DEFAULT_ARTIFACT_RESULT_BYTES = 63_000
 LOCK_FILE_NAME = ".overflow.lock"
 DIRECTORY_FD_SUPPORTED = all(
     function in os.supports_dir_fd
@@ -58,6 +71,57 @@ DIRECTORY_FD_SUPPORTED = all(
 )
 
 ArtifactIdentity = tuple[int, int, int, int, int]
+_PROXY_CALL_ACTIVE: ContextVar[bool] = ContextVar("overflow_proxy_call", default=False)
+
+
+def _has_redundant_json_text(result: ToolResult) -> bool:
+    """Recognize only unannotated text that exactly duplicates structured JSON."""
+    if result.structured_content is None or len(result.content) != 1:
+        return False
+    content = result.content[0].model_dump(mode="json", by_alias=True)
+    if content.get("type") != "text" or any(
+        value is not None
+        for key, value in content.items()
+        if key not in {"type", "text"}
+    ):
+        return False
+    try:
+        decoded = json.loads(content["text"])
+    except (TypeError, ValueError):
+        return False
+    # Canonical JSON keeps booleans distinct from numbers (True != 1).
+    return json.dumps(decoded, sort_keys=True) == json.dumps(
+        result.structured_content, sort_keys=True
+    )
+
+
+def _serialized_mcp_result(result: ToolResult) -> bytes:
+    """Measure the MCP result envelope, including content, metadata and error status."""
+    wire_result = mt.CallToolResult(
+        content=result.content,
+        structuredContent=result.structured_content,
+        _meta=result.meta,
+        isError=result.is_error,
+    )
+    return pydantic_core.to_json(
+        wire_result, by_alias=True, exclude_none=True, fallback=str
+    )
+
+
+def _collection(payload: Any) -> tuple[list[str], list[Any]] | None:
+    """Find standard collections, including async reports' rows.items envelope."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("items", "rows"):
+        candidate = payload.get(key)
+        if isinstance(candidate, list):
+            return [key], candidate
+        if isinstance(candidate, dict):
+            for nested_key in ("items", "rows"):
+                nested = candidate.get(nested_key)
+                if isinstance(nested, list):
+                    return [key, nested_key], nested
+    return None
 
 
 def compact_overflow_chunk_result(
@@ -112,6 +176,11 @@ class OverflowArtifactStore:
             str,
             tuple[ArtifactIdentity, str],
         ] = OrderedDict()
+        self._parsed_artifacts: OrderedDict[
+            str,
+            tuple[ArtifactIdentity, str, dict[str, Any], int],
+        ] = OrderedDict()
+        self._parsed_artifact_bytes = 0
 
     def _ensure_directory(self) -> None:
         """Create the artifact directory without following a final-component link."""
@@ -255,7 +324,7 @@ class OverflowArtifactStore:
         """Remove an artifact and its integrity manifest when present."""
         names = [name]
         if artifact_match := ARTIFACT_FILE_PATTERN.fullmatch(name):
-            self._verified_artifacts.pop(artifact_match.group(1), None)
+            self._forget_artifact(artifact_match.group(1))
             names.append(self._manifest_name(artifact_match.group(1)))
         for candidate in names:
             try:
@@ -282,13 +351,24 @@ class OverflowArtifactStore:
                     directory_fd,
                 )
             except FileNotFoundError:
-                self._verified_artifacts.pop(export_id, None)
+                self._forget_artifact(export_id)
                 continue
             if not (
                 stat.S_ISREG(artifact_stat.st_mode)
                 and stat.S_ISREG(manifest_stat.st_mode)
             ):
-                self._verified_artifacts.pop(export_id, None)
+                self._forget_artifact(export_id)
+
+    def _forget_parsed_artifact(self, export_id: str) -> None:
+        """Release a decoded artifact and its accounted retained memory."""
+        cached = self._parsed_artifacts.pop(export_id, None)
+        if cached is not None:
+            self._parsed_artifact_bytes -= cached[3]
+
+    def _forget_artifact(self, export_id: str) -> None:
+        """Invalidate both caches together while the directory lock is held."""
+        self._verified_artifacts.pop(export_id, None)
+        self._forget_parsed_artifact(export_id)
 
     def _remember_verified_artifact(
         self,
@@ -305,7 +385,78 @@ class OverflowArtifactStore:
             MAX_VERIFIED_ARTIFACT_CACHE_ENTRIES,
         )
         while len(self._verified_artifacts) > cache_limit:
-            self._verified_artifacts.popitem(last=False)
+            oldest_id = next(iter(self._verified_artifacts))
+            self._forget_artifact(oldest_id)
+
+    @staticmethod
+    def _parsed_artifact_size(artifact: dict[str, Any]) -> int | None:
+        """Conservatively count decoded JSON memory, stopping at the cache budget.
+
+        JSON has no cycles. Count shared keys and scalar objects on every use,
+        which overestimates retained memory without a large visited-object set.
+        Iterator storage grows with nesting depth rather than collection length.
+        """
+        total = 0
+        pending = [iter((artifact,))]
+        while pending:
+            try:
+                value = next(pending[-1])
+            except StopIteration:
+                pending.pop()
+                continue
+            total += sys.getsizeof(value)
+            if total > MAX_PARSED_ARTIFACT_CACHE_BYTES:
+                return None
+            if isinstance(value, dict):
+                pending.append(chain.from_iterable(value.items()))
+            elif isinstance(value, list):
+                pending.append(iter(value))
+        return total
+
+    def _read_parsed_artifact(
+        self,
+        *,
+        export_id: str,
+        artifact_file: Any,
+        identity: ArtifactIdentity,
+        expected_digest: str,
+    ) -> dict[str, Any]:
+        """Reuse only a verified file version within count and decoded-byte bounds."""
+        cached = self._parsed_artifacts.get(export_id)
+        if cached is not None and cached[:2] == (identity, expected_digest):
+            self._parsed_artifacts.move_to_end(export_id)
+            return cached[2]
+        self._forget_parsed_artifact(export_id)
+        artifact_file.seek(0)
+        try:
+            artifact = json.load(artifact_file)
+            if not isinstance(artifact, dict) or not isinstance(
+                artifact.get("tool_result"), dict
+            ):
+                raise ValueError("Invalid artifact envelope.")
+        except (TypeError, ValueError) as exc:
+            self._forget_artifact(export_id)
+            raise ValidationError(
+                "Overflow artifact failed integrity validation."
+            ) from exc
+        if self._artifact_identity(os.fstat(artifact_file.fileno())) != identity:
+            self._forget_artifact(export_id)
+            raise ValidationError("Overflow artifact failed integrity validation.")
+        parsed_bytes = self._parsed_artifact_size(artifact)
+        if parsed_bytes is not None:
+            cache_limit = min(self.max_files, MAX_PARSED_ARTIFACT_CACHE_ENTRIES)
+            while self._parsed_artifacts and (
+                len(self._parsed_artifacts) >= cache_limit
+                or self._parsed_artifact_bytes + parsed_bytes
+                > MAX_PARSED_ARTIFACT_CACHE_BYTES
+            ):
+                self._forget_parsed_artifact(next(iter(self._parsed_artifacts)))
+            self._parsed_artifacts[export_id] = (
+                identity, expected_digest, artifact, parsed_bytes
+            )
+            self._parsed_artifact_bytes += parsed_bytes
+        # Oversized decoded artifacts remain readable without retaining them.
+        return artifact
 
     def _cleanup_orphans_unlocked(
         self,
@@ -316,6 +467,14 @@ class OverflowArtifactStore:
         removed_bytes = 0
         entries = os.listdir(directory_fd)
         for name in entries:
+            if TEMP_MANIFEST_FILE_PATTERN.fullmatch(name):
+                try:
+                    temporary_stat = self._stat_name(name, directory_fd)
+                    if stat.S_ISREG(temporary_stat.st_mode):
+                        self._unlink_name(name, directory_fd)
+                except FileNotFoundError:
+                    pass
+                continue
             manifest_match = MANIFEST_FILE_PATTERN.fullmatch(name)
             if manifest_match is None:
                 continue
@@ -404,22 +563,8 @@ class OverflowArtifactStore:
         """Store compact JSON, omitting only redundant unannotated compatibility text."""
         created_at = datetime.now(timezone.utc).isoformat()
         archived_result = result.model_dump(mode="json", by_alias=True)
-        content = archived_result.get("content", [])
-        structured = archived_result.get("structured_content")
-        if (
-            structured is not None
-            and len(content) == 1
-            and content[0].get("type") == "text"
-            and all(value is None for key, value in content[0].items() if key not in {"type", "text"})
-        ):
-            try:
-                decoded = json.loads(content[0]["text"])
-            except (TypeError, ValueError):
-                pass
-            else:
-                # Canonical JSON keeps booleans distinct from numbers (True != 1).
-                if json.dumps(decoded, sort_keys=True) == json.dumps(structured, sort_keys=True):
-                    archived_result["content"] = []
+        if _has_redundant_json_text(result):
+            archived_result["content"] = []
         artifact_payload = {
             "schema_version": 2,
             "tool_name": tool_name,
@@ -485,7 +630,7 @@ class OverflowArtifactStore:
         *,
         export_id: str,
         directory_fd: int,
-    ) -> tuple[int, str]:
+    ) -> dict[str, Any]:
         """Read and validate a bounded integrity manifest without following links."""
         try:
             descriptor = self._open_name(
@@ -523,13 +668,63 @@ class OverflowArtifactStore:
             ) from exc
         if (
             manifest.get("schema_version") != 1
-            or not isinstance(expected_size, int)
+            or type(expected_size) is not int
             or expected_size < 0
             or not isinstance(expected_digest, str)
             or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
         ):
             raise ValidationError("Overflow artifact failed integrity validation.")
-        return expected_size, expected_digest
+        for key in ("byte_offsets", "item_offsets"):
+            offsets = manifest.get(key, [])
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) > MAX_RECENT_ARTIFACT_OFFSETS
+                or any(type(value) is not int or value < 0 for value in offsets)
+            ):
+                raise ValidationError("Overflow artifact failed integrity validation.")
+        return manifest
+
+    def _record_offset(
+        self,
+        *,
+        export_id: str,
+        directory_fd: int,
+        manifest: dict[str, Any],
+        key: str,
+        offset: int,
+    ) -> None:
+        """Atomically persist recent continuations under the shared directory lock."""
+        offsets = manifest.get(key, [])
+        if offset in offsets or offset == 0:
+            return
+        manifest[key] = [*offsets, offset][-MAX_RECENT_ARTIFACT_OFFSETS:]
+        manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("ascii")
+        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise ValidationError("Overflow artifact continuation metadata is too large.")
+        manifest_name = self._manifest_name(export_id)
+        temporary_name = f"{manifest_name}.{secrets.token_hex(8)}.tmp"
+        try:
+            descriptor = self._open_name(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                directory_fd,
+            )
+            with _owned_fdopen(descriptor, "wb") as manifest_file:
+                os.fchmod(manifest_file.fileno(), 0o600)
+                manifest_file.write(manifest_bytes)
+                manifest_file.flush()
+                os.fsync(manifest_file.fileno())
+            os.replace(
+                temporary_name,
+                manifest_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        finally:
+            try:
+                self._unlink_name(temporary_name, directory_fd)
+            except FileNotFoundError:
+                pass
 
     def _refresh_manifest_lease(
         self,
@@ -592,6 +787,7 @@ class OverflowArtifactStore:
         ):
             self._verified_artifacts.move_to_end(export_id)
             return identity
+        self._forget_parsed_artifact(export_id)
         artifact_file.seek(0)
         digest = hashlib.sha256()
         while digest_chunk := artifact_file.read(64 * 1024):
@@ -605,7 +801,7 @@ class OverflowArtifactStore:
                 expected_digest,
             )
         ):
-            self._verified_artifacts.pop(export_id, None)
+            self._forget_artifact(export_id)
             raise ValidationError(
                 "Overflow artifact failed integrity validation."
             )
@@ -616,20 +812,109 @@ class OverflowArtifactStore:
         )
         return verified_identity
 
+    @staticmethod
+    def _item_page(
+        artifact: dict[str, Any],
+        *,
+        export_id: str,
+        collection: tuple[list[str], list[Any]],
+        item_offset: int,
+        item_limit: int,
+        max_result_bytes: int,
+    ) -> dict[str, Any]:
+        """Return a usable, byte-bounded item page with its original context."""
+        item_path, items = collection
+        if item_offset > len(items):
+            raise ValidationError("item_offset exceeds the collection size.")
+        context = dict(artifact)
+        context["tool_result"] = dict(artifact["tool_result"])
+        original = artifact["tool_result"]["structured_content"]
+        copied = dict(original)
+        context["tool_result"]["structured_content"] = copied
+        for key in item_path[:-1]:
+            original = original[key]
+            copied[key] = dict(original)
+            copied = copied[key]
+        copied[item_path[-1]] = []
+        page: dict[str, Any] = {
+            "export_id": export_id,
+            "format": "application/json",
+            "mode": "items",
+            "item_path": item_path,
+            "item_offset": item_offset,
+            "next_item_offset": item_offset,
+            "total_items": len(items),
+            "complete": item_offset == len(items),
+            "items": [],
+            "context_included": True,
+            "context": context,
+        }
+
+        def fits() -> bool:
+            return len(_serialized_mcp_result(compact_overflow_chunk_result(page))) <= max_result_bytes
+
+        def omit_context() -> None:
+            del page["context"]
+            page["context_included"] = False
+            page["context_note"] = "Read byte mode with offset=0 for the full response context."
+
+        if not fits():
+            omit_context()
+        count = min(item_limit, len(items) - item_offset)
+        if count and page["context_included"]:
+            page["items"] = items[item_offset:item_offset + 1]
+            page["next_item_offset"] = item_offset + 1
+            page["complete"] = item_offset + 1 == len(items)
+            if not fits():
+                omit_context()
+        lower, upper = 0, count
+        while lower < upper:
+            trial = (lower + upper + 1) // 2
+            page["items"] = items[item_offset:item_offset + trial]
+            page["next_item_offset"] = item_offset + trial
+            page["complete"] = item_offset + trial == len(items)
+            if fits():
+                lower = trial
+            else:
+                upper = trial - 1
+        page["items"] = items[item_offset:item_offset + lower]
+        page["next_item_offset"] = item_offset + lower
+        page["complete"] = item_offset + lower == len(items)
+        if lower == 0 and item_offset < len(items):
+            page["oversized_item"] = item_offset
+            page["next_step"] = (
+                "This item exceeds the item-page byte limit. Read the complete original "
+                "JSON in byte mode with offset=0, following next_offset. No item was skipped."
+            )
+        if not fits():
+            raise ValidationError("The requested result byte limit is too small for an item page.")
+        # Cached JSON stays private: callers may mutate returned items/context.
+        return deepcopy(page)
+
     def read(
         self,
         export_id: str,
         *,
         offset: int = 0,
         max_bytes: int = DEFAULT_ARTIFACT_CHUNK_BYTES,
+        item_offset: int | None = None,
+        item_limit: int = DEFAULT_ARTIFACT_ITEM_LIMIT,
+        prefer_items: bool = False,
+        max_result_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """Read one ASCII-safe JSON chunk by opaque id."""
-        if offset < 0:
+        """Read verified byte chunks or parsed item pages at issued continuations."""
+        if type(offset) is not int or offset < 0:
             raise ValidationError("offset must be at least 0.")
-        if max_bytes < 1 or max_bytes > MAX_ARTIFACT_CHUNK_BYTES:
+        if type(max_bytes) is not int or max_bytes < 1 or max_bytes > MAX_ARTIFACT_CHUNK_BYTES:
             raise ValidationError(
                 f"max_bytes must be between 1 and {MAX_ARTIFACT_CHUNK_BYTES}."
             )
+        if item_offset is not None and (type(item_offset) is not int or item_offset < 0):
+            raise ValidationError("item_offset must be at least 0.")
+        if type(item_limit) is not int or not 1 <= item_limit <= MAX_ARTIFACT_ITEM_LIMIT:
+            raise ValidationError(f"item_limit must be between 1 and {MAX_ARTIFACT_ITEM_LIMIT}.")
+        if item_offset is not None and offset != 0:
+            raise ValidationError("Use offset for bytes or item_offset for items, not both.")
         normalized_export_id = self._validate_export_id(export_id)
         artifact_name = self._artifact_name(normalized_export_id)
         with self._locked_directory() as directory_fd:
@@ -637,22 +922,23 @@ class OverflowArtifactStore:
             try:
                 path_stat = self._stat_name(artifact_name, directory_fd)
             except FileNotFoundError as exc:
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise NotFoundError(
                     "Overflow artifact was not found or has expired."
                 ) from exc
             if not stat.S_ISREG(path_stat.st_mode):
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise NotFoundError(
                     "Overflow artifact was not found or has expired."
                 )
             try:
-                expected_size, expected_digest = self._read_manifest(
+                manifest = self._read_manifest(
                     export_id=normalized_export_id,
                     directory_fd=directory_fd,
                 )
+                expected_size, expected_digest = manifest["size"], manifest["sha256"]
             except Exception:
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise
             try:
                 descriptor = self._open_name(
@@ -667,31 +953,28 @@ class OverflowArtifactStore:
                     errno.EISDIR,
                     errno.ENXIO,
                 }:
-                    self._verified_artifacts.pop(
-                        normalized_export_id,
-                        None,
-                    )
+                    self._forget_artifact(normalized_export_id)
                     raise NotFoundError(
                         "Overflow artifact was not found or has expired."
                     ) from exc
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise
             try:
                 file_stat = os.fstat(descriptor)
             except Exception:
                 os.close(descriptor)
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise
             if not stat.S_ISREG(file_stat.st_mode):
                 os.close(descriptor)
-                self._verified_artifacts.pop(normalized_export_id, None)
+                self._forget_artifact(normalized_export_id)
                 raise NotFoundError(
                     "Overflow artifact was not found or has expired."
                 )
             with _owned_fdopen(descriptor, "rb") as artifact_file:
                 total_bytes = file_stat.st_size
                 if total_bytes != expected_size:
-                    self._verified_artifacts.pop(normalized_export_id, None)
+                    self._forget_artifact(normalized_export_id)
                     raise ValidationError(
                         "Overflow artifact failed integrity validation."
                     )
@@ -703,41 +986,97 @@ class OverflowArtifactStore:
                     file_stat=file_stat,
                     expected_digest=expected_digest,
                 )
-                artifact_file.seek(offset)
-                chunk_bytes = artifact_file.read(max_bytes)
-                next_offset = offset + len(chunk_bytes)
+                collection = None
+                artifact = None
+                if item_offset is not None or prefer_items:
+                    artifact = self._read_parsed_artifact(
+                        export_id=normalized_export_id,
+                        artifact_file=artifact_file,
+                        identity=verified_identity,
+                        expected_digest=expected_digest,
+                    )
+                    collection = _collection(artifact["tool_result"].get("structured_content"))
+                if collection is not None:
+                    item_offset = 0 if item_offset is None else item_offset
+                    if item_offset != 0 and item_offset not in manifest.get("item_offsets", []):
+                        raise ValidationError(
+                            "item_offset must be 0 or a recently issued next_item_offset; "
+                            "restart at 0 if its continuation history has expired."
+                        )
+                    chunk = self._item_page(
+                        artifact,
+                        export_id=normalized_export_id,
+                        collection=collection,
+                        item_offset=item_offset,
+                        item_limit=item_limit,
+                        max_result_bytes=max_result_bytes or DEFAULT_ARTIFACT_RESULT_BYTES,
+                    )
+                    continuation_key, next_offset = "item_offsets", chunk["next_item_offset"]
+                else:
+                    if item_offset is not None:
+                        raise ValidationError("This artifact has no items/rows collection; use byte mode with offset=0.")
+                    if offset != 0 and offset not in manifest.get("byte_offsets", []):
+                        raise ValidationError(
+                            "offset must be 0 or a recently issued next_offset; "
+                            "restart at 0 if its continuation history has expired."
+                        )
+                    artifact_file.seek(offset)
+                    chunk_bytes = artifact_file.read(max_bytes)
+                    try:
+                        chunk_data = chunk_bytes.decode("ascii")
+                    except UnicodeDecodeError as exc:
+                        self._forget_artifact(normalized_export_id)
+                        raise ValidationError("Overflow artifact failed integrity validation.") from exc
+                    chunk = {
+                        "export_id": normalized_export_id,
+                        "format": "application/json",
+                        "encoding": "utf-8",
+                        "offset": offset,
+                        "next_offset": offset + len(chunk_bytes),
+                        "total_bytes": total_bytes,
+                        "complete": offset + len(chunk_bytes) >= total_bytes,
+                        "data": chunk_data,
+                    }
+                    if max_result_bytes is not None:
+                        lower, upper = 0, len(chunk_data)
+                        while lower < upper:
+                            trial = (lower + upper + 1) // 2
+                            chunk["data"] = chunk_data[:trial]
+                            chunk["next_offset"] = offset + trial
+                            chunk["complete"] = offset + trial >= total_bytes
+                            if len(_serialized_mcp_result(compact_overflow_chunk_result(chunk))) <= max_result_bytes:
+                                lower = trial
+                            else:
+                                upper = trial - 1
+                        chunk["data"] = chunk_data[:lower]
+                        chunk["next_offset"] = offset + lower
+                        chunk["complete"] = offset + lower >= total_bytes
+                        if lower == 0 and offset < total_bytes:
+                            raise ValidationError("The requested result byte limit is too small for a byte chunk.")
+                    continuation_key, next_offset = "byte_offsets", chunk["next_offset"]
                 if self._artifact_identity(
                     os.fstat(artifact_file.fileno())
                 ) != verified_identity:
-                    self._verified_artifacts.pop(normalized_export_id, None)
+                    self._forget_artifact(normalized_export_id)
                     raise ValidationError(
                         "Overflow artifact failed integrity validation."
                     )
                 try:
-                    chunk_data = chunk_bytes.decode("ascii")
-                except UnicodeDecodeError as exc:
-                    self._verified_artifacts.pop(normalized_export_id, None)
-                    raise ValidationError(
-                        "Overflow artifact failed integrity validation."
-                    ) from exc
-                try:
+                    self._record_offset(
+                        export_id=normalized_export_id,
+                        directory_fd=directory_fd,
+                        manifest=manifest,
+                        key=continuation_key,
+                        offset=next_offset,
+                    )
                     self._refresh_manifest_lease(
                         export_id=normalized_export_id,
                         directory_fd=directory_fd,
                     )
                 except Exception:
-                    self._verified_artifacts.pop(normalized_export_id, None)
+                    self._forget_artifact(normalized_export_id)
                     raise
-        return {
-            "export_id": normalized_export_id,
-            "format": "application/json",
-            "encoding": "utf-8",
-            "offset": offset,
-            "next_offset": next_offset,
-            "total_bytes": total_bytes,
-            "complete": next_offset >= total_bytes,
-            "data": chunk_data,
-        }
+        return chunk
 
     def delete(self, export_id: str) -> dict[str, Any]:
         """Delete one overflow artifact by opaque id."""
@@ -774,6 +1113,29 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         )
         self.artifact_store = artifact_store
 
+    def _overflow_notice(
+        self,
+        *,
+        message: str,
+        overflow: dict[str, Any],
+        original: ToolResult,
+        include_structured: bool,
+    ) -> ToolResult:
+        """Keep direct dict tools' required object output and the operation's status."""
+        notice = ToolResult(
+            content=[TextContent(type="text", text=message)],
+            structured_content={"overflow": overflow, "message": message}
+            if include_structured else None,
+            meta={"overflow": overflow},
+            is_error=original.is_error,
+        )
+        if original.meta is None:
+            return notice
+        candidate = notice.model_copy(update={
+            "meta": {**original.meta, **(notice.meta or {})},
+        })
+        return candidate if len(_serialized_mcp_result(candidate)) <= self.max_size else notice
+
     @staticmethod
     def _retrieval_message(
         *,
@@ -783,6 +1145,8 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         artifact_bytes: int | None = None,
         ttl_seconds: int | None = None,
         row_count: int | None = None,
+        response_bytes: int | None = None,
+        item_pages: bool = False,
     ) -> str:
         """Return compact remote-retrieval guidance for an archived payload."""
         details = []
@@ -792,13 +1156,21 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
             details.append(f"{row_count:,} rows")
         if ttl_seconds is not None:
             details.append(f"retention {ttl_seconds:,} seconds")
+        if response_bytes is not None:
+            details.append(f"{response_bytes:,} MCP result bytes")
         size_hint = f" ({'; '.join(details)})" if details else ""
+        arguments = (
+            f'{{"export_id": "{export_id}", "item_offset": 0}}'
+            if item_pages
+            else f'{{"export_id": "{export_id}", "offset": 0}}'
+        )
+        continuation = "next_item_offset" if item_pages else "next_offset"
         return (
             f"[{response_kind.capitalize()} exceeded the {max_size:,}-byte "
-            f"inline limit. The complete JSON is available as export_id "
+            f"MCP result limit. The complete JSON is available as export_id "
             f"'{export_id}'{size_hint}. Use call_tool with name='read_overflow_artifact' "
-            f'and arguments={{"export_id": "{export_id}", "offset": 0}} '
-            "repeatedly using next_offset. When done, use call_tool with "
+            f"and arguments={arguments} repeatedly using {continuation}. "
+            "Use offset=0 and next_offset for complete original JSON byte chunks. When done, use call_tool with "
             "name='delete_overflow_artifact' and that export_id.]"
         )
 
@@ -807,11 +1179,26 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         context: MiddlewareContext[mt.CallToolRequestParams],
         call_next: CallNext[mt.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
-        """Archive responses whose complete serialized MCP result exceeds the cap."""
+        """Bound the final MCP envelope, measuring proxy results only once."""
         if self.tools is not None and context.message.name not in self.tools:
             return await call_next(context)
+        if _PROXY_CALL_ACTIVE.get():
+            # The schema-free outer proxy owns its complete transport boundary.
+            return await call_next(context)
+        is_proxy = context.message.name == "call_tool"
+        archive_tool_name = context.message.name
+        if is_proxy:
+            proxy_arguments = context.message.arguments or {}
+            requested_name = proxy_arguments.get("name") or proxy_arguments.get("tool_name")
+            if isinstance(requested_name, str) and requested_name.strip():
+                archive_tool_name = requested_name.strip()
+        proxy_token = _PROXY_CALL_ACTIVE.set(True) if is_proxy else None
         try:
-            result = await call_next(context)
+            try:
+                result = await call_next(context)
+            finally:
+                if proxy_token is not None:
+                    _PROXY_CALL_ACTIVE.reset(proxy_token)
         except Exception as exc:
             error_text = str(exc)
             error_bytes = len(error_text.encode("utf-8", errors="replace"))
@@ -823,14 +1210,15 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                         "message_bytes": error_bytes,
                     }
                 },
+                is_error=True,
             )
-            serialized_error = pydantic_core.to_json(error_result, fallback=str)
+            serialized_error = _serialized_mcp_result(error_result)
             if len(serialized_error) <= self.max_size:
                 raise
             try:
                 export_id, artifact_size = self.artifact_store.create(
                     error_result,
-                    tool_name=context.message.name,
+                    tool_name=archive_tool_name,
                 )
             except (OSError, TypeError, ValueError):
                 raise ToolError(self.truncation_suffix.strip()) from None
@@ -841,60 +1229,68 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
                     response_kind="error",
                     artifact_bytes=artifact_size,
                     ttl_seconds=self.artifact_store.ttl_seconds,
+                    response_bytes=len(serialized_error),
                 )
             ) from None
 
-        if (
-            context.message.name == "read_overflow_artifact"
-            and result.structured_content is not None
-        ):
-            result = compact_overflow_chunk_result(
-                result.structured_content
-            )
-        serialized = pydantic_core.to_json(result, fallback=str)
+        if _has_redundant_json_text(result):
+            result = result.model_copy(update={
+                "content": compact_overflow_chunk_result(result.structured_content).content,
+            })
+        serialized = _serialized_mcp_result(result)
         if len(serialized) <= self.max_size:
             return result
+        if is_proxy and _has_redundant_json_text(result):
+            # call_tool has no output schema. Keep one compact JSON text copy for
+            # clients that consume only content; direct typed tools retain theirs.
+            compact = ToolResult(
+                content=[TextContent(type="text", text=pydantic_core.to_json(
+                    result.structured_content, fallback=str
+                ).decode())],
+                meta=result.meta,
+                is_error=result.is_error,
+            )
+            serialized = _serialized_mcp_result(compact)
+            if len(serialized) <= self.max_size:
+                return compact
 
         try:
             export_id, artifact_size = self.artifact_store.create(
                 result,
-                tool_name=context.message.name,
+                tool_name=archive_tool_name,
             )
         except (OSError, TypeError, ValueError):
-            return ToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=self.truncation_suffix.strip(),
-                    )
-                ],
-                meta={
-                    "overflow": {
-                        "archived": False,
-                        "original_response_bytes": len(serialized),
-                        "max_inline_bytes": self.max_size,
-                    }
+            return self._overflow_notice(
+                message=self.truncation_suffix.strip(),
+                overflow={
+                    "archived": False,
+                    "original_response_bytes": len(serialized),
+                    "max_inline_bytes": self.max_size,
                 },
+                original=result,
+                include_structured=not is_proxy and result.structured_content is not None,
             )
 
         structured = result.structured_content or {}
-        rows = structured.get("items", structured.get("rows"))
+        collection = _collection(structured)
         message = self._retrieval_message(
             max_size=self.max_size,
             export_id=export_id,
             artifact_bytes=artifact_size,
             ttl_seconds=self.artifact_store.ttl_seconds,
-            row_count=len(rows) if isinstance(rows, list) else None,
+            row_count=len(collection[1]) if collection is not None else None,
+            response_bytes=len(serialized),
+            item_pages=collection is not None,
         )
-        return ToolResult(
-            content=[TextContent(type="text", text=message)],
-            meta={
-                "overflow": {
-                    "archived": True,
-                    "export_id": export_id,
-                    "artifact_bytes": artifact_size,
-                    "original_response_bytes": len(serialized),
-                    "max_inline_bytes": self.max_size,
-                }
+        return self._overflow_notice(
+            message=message,
+            overflow={
+                "archived": True,
+                "export_id": export_id,
+                "artifact_bytes": artifact_size,
+                "original_response_bytes": len(serialized),
+                "max_inline_bytes": self.max_size,
             },
+            original=result,
+            include_structured=not is_proxy and result.structured_content is not None,
         )

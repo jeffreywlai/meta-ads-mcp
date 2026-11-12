@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import math
 import os
 
 try:
@@ -44,6 +45,9 @@ def get_settings() -> Settings:
     read_only = os.getenv("META_READ_ONLY", "false").strip().lower()
     if read_only not in {"true", "false", "1", "0"}:
         raise ValueError("META_READ_ONLY must be true, false, 1, or 0.")
+    request_timeout = float(os.getenv("META_REQUEST_TIMEOUT", "30"))
+    if not math.isfinite(request_timeout) or request_timeout <= 0:
+        raise ValueError("META_REQUEST_TIMEOUT must be a finite positive number of seconds.")
     return Settings(
         access_token=os.getenv("META_ACCESS_TOKEN"),
         api_version=os.getenv("META_API_VERSION", "v26.0"),
@@ -54,7 +58,7 @@ def get_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         host=os.getenv("FASTMCP_HOST", "127.0.0.1"),
         port=int(os.getenv("FASTMCP_PORT", "8000")),
-        request_timeout=float(os.getenv("META_REQUEST_TIMEOUT", "30")),
+        request_timeout=request_timeout,
         max_retries=int(os.getenv("META_MAX_RETRIES", "2")),
         export_directory=os.getenv("META_EXPORT_DIR"),
         export_ttl_seconds=int(os.getenv("META_EXPORT_TTL_SECONDS", "86400")),

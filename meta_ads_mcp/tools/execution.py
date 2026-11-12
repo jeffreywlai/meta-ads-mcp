@@ -12,6 +12,7 @@ from meta_ads_mcp.money import (
     validate_positive_amount,
 )
 from meta_ads_mcp.schemas import mutation_response
+from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount
 
 
 def _validate_status(status: str) -> str:
@@ -232,8 +233,8 @@ async def _update_bid_strategy(
 @mcp_server.tool()
 async def update_campaign_budget(
     campaign_id: str,
-    daily_budget: float | None = None,
-    lifetime_budget: float | None = None,
+    daily_budget: CurrencyAmount | None = None,
+    lifetime_budget: CurrencyAmount | None = None,
 ) -> dict[str, object]:
     """Use this when the user wants to change only campaign budget, not other campaign configuration."""
     return await _update_budget(
@@ -247,8 +248,8 @@ async def update_campaign_budget(
 @mcp_server.tool()
 async def update_adset_budget(
     adset_id: str,
-    daily_budget: float | None = None,
-    lifetime_budget: float | None = None,
+    daily_budget: CurrencyAmount | None = None,
+    lifetime_budget: CurrencyAmount | None = None,
 ) -> dict[str, object]:
     """Use this when the user wants to change only ad set budget, not other ad set settings."""
     return await _update_budget(
@@ -260,7 +261,7 @@ async def update_adset_budget(
 
 
 @mcp_server.tool()
-async def update_adset_bid_amount(adset_id: str, bid_amount: float) -> dict[str, object]:
+async def update_adset_bid_amount(adset_id: str, bid_amount: CurrencyAmount) -> dict[str, object]:
     """Use this when the user wants to change only the ad set bid amount, not status, targeting, or budget."""
     return await _update_bid_amount(adset_id, "adset", bid_amount=bid_amount)
 
@@ -290,8 +291,8 @@ async def update_campaign_bid_strategy(
 async def update_adset_bid_strategy(
     adset_id: str,
     bid_strategy: str,
-    bid_amount: float | None = None,
-    bid_constraints: dict[str, object] | None = None,
+    bid_amount: CurrencyAmount | None = None,
+    bid_constraints: BidConstraints | None = None,
 ) -> dict[str, object]:
     """Use this when the user wants to adjust ad set bidding strategy with an optional bid amount override."""
     return await _update_bid_strategy(

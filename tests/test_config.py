@@ -7,6 +7,14 @@ import pytest
 from meta_ads_mcp import config
 
 
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_request_timeout_must_be_positive_and_finite(monkeypatch, value):
+    with monkeypatch.context() as scoped:
+        scoped.setenv("META_REQUEST_TIMEOUT", value)
+        with pytest.raises(ValueError, match="finite positive"):
+            config.reload_settings()
+
+
 def test_api_version_defaults_to_v26(monkeypatch) -> None:
     monkeypatch.delenv("META_API_VERSION", raising=False)
 

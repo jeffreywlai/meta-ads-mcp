@@ -15,7 +15,7 @@ from meta_ads_mcp.money import (
     validate_positive_amount,
 )
 from meta_ads_mcp.schemas import collection_response, creation_response
-from meta_ads_mcp.tool_types import StrictStringList, coerce_strict_csv_string_list
+from meta_ads_mcp.tool_types import CurrencyAmount, StrictStringList, coerce_strict_csv_string_list
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -158,7 +158,7 @@ async def create_ad(
     creative_id: str | None = None,
     creative: dict[str, Any] | None = None,
     status: str = "PAUSED",
-    bid_amount: float | None = None,
+    bid_amount: CurrencyAmount | None = None,
     tracking_specs: list[dict[str, Any]] | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
