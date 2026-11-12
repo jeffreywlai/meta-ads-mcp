@@ -1122,6 +1122,28 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
         include_structured: bool,
     ) -> ToolResult:
         """Keep direct dict tools' required object output and the operation's status."""
+        structured = original.structured_content or {}
+        if isinstance(structured.get("coverage"), dict):
+            overflow = {**overflow, "source_complete": structured.get("complete"),
+                        "source_has_more": structured.get("has_more"),
+                        "coverage_note": "This artifact contains one tool response. Read its coverage and next_call before claiming complete source history."}
+            message = (
+                f"History source query complete={structured.get('complete')}; "
+                f"more source pages={structured.get('has_more')}. "
+                "This notice does not contain the events. " + message
+            )
+            delivery = structured.get("delivery")
+            if (
+                isinstance(delivery, dict) and delivery.get("inline_is_preview")
+                and isinstance(structured.get("export_id"), str)
+                and EXPORT_ID_PATTERN.fullmatch(structured["export_id"])
+            ):
+                overflow["full_history_export_id"] = structured["export_id"]
+                message += (
+                    " The archived response contains only an export preview. "
+                    f"Read every event from full_history_export_id='{structured['export_id']}' "
+                    "with read_overflow_artifact, then inspect its coverage/next_call."
+                )
         notice = ToolResult(
             content=[TextContent(type="text", text=message)],
             structured_content={"overflow": overflow, "message": message}
@@ -1170,6 +1192,7 @@ class ArchivedResponseLimitingMiddleware(ResponseLimitingMiddleware):
             f"MCP result limit. The complete JSON is available as export_id "
             f"'{export_id}'{size_hint}. Use call_tool with name='read_overflow_artifact' "
             f"and arguments={arguments} repeatedly using {continuation}. "
+            "Artifact completion covers this saved response only; inspect its coverage/paging for more source data. "
             "Use offset=0 and next_offset for complete original JSON byte chunks. When done, use call_tool with "
             "name='delete_overflow_artifact' and that export_id.]"
         )
