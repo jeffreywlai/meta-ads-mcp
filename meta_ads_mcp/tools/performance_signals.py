@@ -905,10 +905,24 @@ COST_RATIO_THRESHOLD = 1.5
 RANKING_REPORT_LEVELS = ("account", "campaign", "adset", "ad")
 # The ad-level read is one bounded page ordered by spend, highest first, using the
 # Insights API's documented sort parameter ("reach_descending" style, one element).
+# On a live account with more than 2,000 ads the sorted read failed ("An unknown error
+# occurred") whenever it carried the action fields, and succeeded with identifiers, spend,
+# impressions and the rankings only. So the sorted read is always lean, and results come
+# from one further request restricted to the selected ads.
 RANKING_DEFAULT_MAX_ADS = 200
 RANKING_MAX_ADS_LIMIT = 500
 RANKING_SORT = ["spend_descending"]
+RANKING_LEAN_FIELDS = [
+    "ad_id", "ad_name", "campaign_id", "adset_id", "spend", "impressions", *RANKING_FIELDS,
+]
+# Cost evidence: one unsorted request filtered with the documented `filtering` parameter
+# (dot notation for the object's fields, IN operator) to the selected ads' ids.
+RANKING_COST_FIELDS = ["ad_id", "clicks", "actions", "action_values"]
+RANKING_COST_MAX_ADS = 100
 RANKING_SCOPE_FIELDS = ["spend", "impressions", "clicks", "actions", "action_values"]
+RANKING_SCOPE_LEAN_FIELDS = ["spend", "impressions"]
+# Below this share of examined ads with all three rankings known, the report says it rests on little evidence.
+RANKING_EVIDENCE_MIN_SHARE = 0.5
 RANKING_RULES = {
     "ranking_values": {
         "ABOVE_AVERAGE": "above average",
@@ -925,7 +939,8 @@ RANKING_RULES = {
     ),
     "bid_and_budget": (
         "all three rankings are average or above, and either cost per result is at least cost_ratio_threshold times "
-        "the scope's cost per result, or the ad has no results after spending at least one scope cost per result."
+        "the scope's cost per result, or the ad has no results after spending at least one scope cost per result. "
+        "Needs the ad's results from the cost-evidence read; without them this diagnosis is not made."
     ),
     "cost_ratio_threshold": COST_RATIO_THRESHOLD,
     "weak_ad_order": "spend descending",
@@ -979,7 +994,7 @@ def _ranking_diagnosis(
             below,
         )
     scope_cost = scope_metrics["cost_per_result"]
-    if (metrics["results"] or 0) == 0 and scope_cost and (metrics["spend"] or 0) >= scope_cost:
+    if metrics["results"] == 0 and scope_cost and (metrics["spend"] or 0) >= scope_cost:
         return (
             "bid_and_budget",
             "All three rankings are average or above, yet the ad has no results after spending at least one scope "
@@ -989,14 +1004,49 @@ def _ranking_diagnosis(
     return None, None, below
 
 
-async def _ranking_scope_rows(level: str, object_id: str, window: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, str | None]:
-    """Read the scope's own insights total for spend coverage; report failure instead of raising."""
+async def _ranking_scope_rows(
+    level: str, object_id: str, window: dict[str, Any],
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Read the scope's own insights total; if the read with results fails, retry with spend and impressions only.
+
+    Failures are reported, never raised.
+    """
     params = insights_tools._insights_params(level=level, default_date_preset="last_30d", limit=25, **window)
+    errors: list[str] = []
+    for fields in (RANKING_SCOPE_FIELDS, RANKING_SCOPE_LEAN_FIELDS):
+        try:
+            payload = await get_graph_api_client().get_insights(object_id, fields=fields, params=params)
+        except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+            errors.append(str(_public_error(exc).get("message")))
+            continue
+        return insights_tools._normalize_rows(payload), ("; ".join(errors) or None)
+    return None, "; ".join(errors)
+
+
+async def _ranking_cost_rows(
+    object_id: str, ad_ids: list[str], window: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Read results for the selected ads in one request filtered to their ids. Never raises."""
+    if not ad_ids:
+        return {}, None
+    params = insights_tools._insights_params(
+        level="ad", default_date_preset="last_30d", limit=len(ad_ids),
+        filtering=[{"field": "ad.id", "operator": "IN", "value": list(ad_ids)}], **window,
+    )
     try:
-        payload = await get_graph_api_client().get_insights(object_id, fields=RANKING_SCOPE_FIELDS, params=params)
-    except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
-        return None, str(_public_error(exc).get("message"))
-    return insights_tools._normalize_rows(payload), None
+        payload = await get_graph_api_client().get_insights(object_id, fields=RANKING_COST_FIELDS, params=params)
+    except Exception as exc:  # an enrichment failure must not fail the rankings report
+        return {}, str(_public_error(exc).get("message"))
+    wanted = set(ad_ids)
+    rows: dict[str, dict[str, Any]] = {}
+    for row in payload.get("data", []) or []:
+        if isinstance(row, dict) and str(row.get("ad_id") or "") in wanted:
+            rows[str(row["ad_id"])] = row
+    return rows, None
+
+
+def _known_ranking(value: Any) -> bool:
+    return RANKING_POINTS.get(str(value or "").upper()) is not None
 
 
 def _row_spend(row: dict[str, Any]) -> float:
@@ -1030,7 +1080,7 @@ async def get_auction_ranking_report(
 
     async def read_ads() -> dict[str, Any]:
         return await get_graph_api_client().get_insights(
-            resolved_object_id, fields=diagnostics_tools.AD_QUALITY_FIELDS, params=ad_params,
+            resolved_object_id, fields=RANKING_LEAN_FIELDS, params=ad_params,
         )
 
     async def read_scope() -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -1039,8 +1089,19 @@ async def get_auction_ranking_report(
         return await _ranking_scope_rows(resolved_level, resolved_object_id, window)
 
     ad_payload, (scope_rows, scope_error) = await asyncio.gather(read_ads(), read_scope())
-    rows = insights_tools._normalize_rows(ad_payload)[:max_ads]
+    lean_rows = [row for row in (ad_payload.get("data", []) or []) if isinstance(row, dict)][:max_ads]
     more_ads_exist = bool(extract_paging(ad_payload).get("next"))
+
+    cost_ids = list(dict.fromkeys(
+        str(row["ad_id"]) for row in lean_rows
+        if row.get("ad_id") and any(_known_ranking(row.get(field)) for field in RANKING_FIELDS)
+    ))
+    cost_ids_capped = cost_ids[:RANKING_COST_MAX_ADS]
+    cost_rows, cost_error = await _ranking_cost_rows(resolved_object_id, cost_ids_capped, window)
+    rows = insights_tools._normalize_rows({"data": [
+        {**cost_rows[str(row.get("ad_id"))], **row} if str(row.get("ad_id")) in cost_rows else row
+        for row in lean_rows
+    ]})
     spends = [_row_spend(row) for row in rows]
     order_confirmed = all(earlier >= later for earlier, later in zip(spends, spends[1:]))
 
@@ -1072,17 +1133,60 @@ async def get_auction_ranking_report(
             "Meta returned the ad rows not ordered by spend, so the examined ads may not be the highest-spending ones."
         )
 
-    known = _known_inputs(rows)
-    if scope_rows:
-        scope_known = _known_inputs(scope_rows)
-        scope_metrics = _derived_metrics(_period_inputs(scope_rows, scope_known))
+    if cost_error is not None:
+        cost_status = "failed"
+        missing_signals.append(
+            f"Cost-per-result evidence was not available ({cost_error}); diagnoses rest on the rankings only, so "
+            "no ad can be diagnosed as bid_and_budget and results are null."
+        )
+    elif cost_ids_capped:
+        cost_status = "read"
+    else:
+        cost_status = "not_requested"
+        if rows:
+            missing_signals.append(
+                "No examined ad has a known ranking, so results and cost per result were not read and are null."
+            )
+    without_cost = len(rows) - len(cost_rows)
+    if cost_status == "read" and without_cost:
+        missing_signals.append(
+            f"Results and cost per result were read for {len(cost_rows)} of {len(rows)} examined ads: those with at "
+            f"least one known ranking (at most {RANKING_COST_MAX_ADS}, highest spend first). The others show them as null."
+        )
+    cost_evidence = {
+        "status": cost_status,
+        "method": (
+            "one insights request at ad level for the same window, filtered to the selected ad ids "
+            "(filtering ad.id IN), unsorted"
+        ),
+        "selection": f"examined ads with at least one known ranking, highest spend first, at most {RANKING_COST_MAX_ADS}",
+        "ads_requested": len(cost_ids_capped),
+        "ads_returned": len(cost_rows),
+        "ads_eligible_not_requested": len(cost_ids) - len(cost_ids_capped),
+        "error": cost_error,
+    }
+
+    cost_known_rows = [row for row in rows if str(row.get("ad_id")) in cost_rows]
+    known = _known_inputs(cost_known_rows)
+    if scope_rows and "results" in _known_inputs(scope_rows):
+        scope_metrics = _derived_metrics(_period_inputs(scope_rows, _known_inputs(scope_rows)))
+        scope_metrics_basis = "scope_total"
+    elif cost_known_rows:
+        scope_metrics = _derived_metrics(_period_inputs(cost_known_rows, known))
+        scope_metrics_basis = "examined_ads_with_cost_evidence"
+    elif scope_rows:
+        scope_metrics = _derived_metrics(_period_inputs(scope_rows, _known_inputs(scope_rows)))
         scope_metrics_basis = "scope_total"
     else:
-        scope_metrics = _derived_metrics(_period_inputs(rows, known))
+        scope_metrics = _derived_metrics(_period_inputs(rows, _known_inputs(rows)))
         scope_metrics_basis = "examined_ads"
     ads: list[dict[str, Any]] = []
     for row in rows:
-        metrics = _derived_metrics(_period_inputs([row], known))
+        inputs = _period_inputs([row], known)
+        if str(row.get("ad_id")) not in cost_rows:
+            inputs["results"] = None
+            inputs["conversion_value"] = None
+        metrics = _derived_metrics(inputs)
         rankings = {field: row.get(field) for field in RANKING_FIELDS}
         diagnosis, reason, below = _ranking_diagnosis(rankings, metrics, scope_metrics)
         points = [RANKING_POINTS.get(str(value or "").upper()) for value in rankings.values()]
@@ -1106,6 +1210,11 @@ async def get_auction_ranking_report(
             "reason": reason,
         })
 
+    ranking_coverage: dict[str, int] = {"ads_examined": len(ads)}
+    for field in RANKING_FIELDS:
+        ranking_coverage[f"{field}_known"] = sum(1 for ad in ads if _known_ranking(ad["rankings"][field]))
+    ranking_coverage["all_three_known"] = sum(1 for ad in ads if ad["ranking_points"] is not None)
+
     ranked = sorted(
         ads,
         key=lambda ad: (ad["ranking_points"] is None, ad["ranking_points"] or 0, -(ad["spend"] or 0.0), ad["ad_id"] or ""),
@@ -1115,6 +1224,28 @@ async def get_auction_ranking_report(
         key=lambda ad: (-(ad["spend"] or 0.0), ad["ad_id"] or ""),
     )
     findings: list[dict[str, Any]] = []
+    if ads and ranking_coverage["all_three_known"] < RANKING_EVIDENCE_MIN_SHARE * len(ads):
+        limited = build_finding(
+            "limited_ranking_evidence",
+            (
+                f"Only {ranking_coverage['quality_ranking_known']} of {len(ads)} examined ads have a known quality "
+                f"ranking ({ranking_coverage['engagement_rate_ranking_known']} engagement-rate, "
+                f"{ranking_coverage['conversion_rate_ranking_known']} conversion-rate; "
+                f"{ranking_coverage['all_three_known']} have all three). Meta reports UNKNOWN when an ad has too "
+                "little data, so this report rests on little evidence."
+            ),
+            severity="medium",
+            confidence=None,
+            evidence=[metric_evidence(
+                "all_three_rankings_known_share",
+                _ratio(ranking_coverage["all_three_known"], len(ads)),
+                "ads with all three rankings known / ads examined",
+                dict(ranking_coverage),
+            )],
+            next_actions=["Treat the diagnoses below as indicative only; widen the window for more ranked ads."],
+        )
+        limited["confidence_status"] = "uncalibrated"
+        findings.append(limited)
     for ad in weak[:top_n]:
         finding = build_finding(
             "weak_auction_ranking",
@@ -1150,7 +1281,7 @@ async def get_auction_ranking_report(
         )
         finding["confidence_status"] = "uncalibrated"
         findings.append(finding)
-    if not findings:
+    if not weak:
         has_ranked = any(ad["ranking_points"] is not None for ad in ads)
         findings.append({
             **build_finding(
@@ -1180,6 +1311,7 @@ async def get_auction_ranking_report(
                 "max_ads": max_ads,
                 "selection": "highest_spend_first",
                 "request_sort": list(RANKING_SORT),
+                "request_fields": list(RANKING_LEAN_FIELDS),
                 "meta_order_confirmed": order_confirmed,
                 "more_ads_exist": more_ads_exist,
                 "examined_spend": examined_spend,
@@ -1187,6 +1319,8 @@ async def get_auction_ranking_report(
                 "share_of_scope_spend": share,
                 "note": note,
             },
+            "ranking_coverage": ranking_coverage,
+            "cost_evidence": cost_evidence,
             "scope_metrics": scope_metrics,
             "scope_metrics_basis": scope_metrics_basis,
             "ranked_ads": ranked[:top_n],

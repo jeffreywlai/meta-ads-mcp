@@ -758,13 +758,14 @@ def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
 
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
 
-    call = _ad_level_calls(client)[0]
+    call, cost_call = _ad_level_calls(client)
     assert call["object_id"] == "cmp_1"
     assert call["params"]["level"] == "ad"
     assert call["params"]["date_preset"] == "last_30d"
-    assert {"quality_ranking", "engagement_rate_ranking", "conversion_rate_ranking", "spend", "actions"} <= set(
-        call["fields"]
-    )
+    assert {"quality_ranking", "engagement_rate_ranking", "conversion_rate_ranking", "spend"} <= set(call["fields"])
+    assert "actions" not in call["fields"]
+    assert "actions" in cost_call["fields"]
+    assert cost_call["params"]["filtering"][0]["value"] == ["creative", "bid", "postclick", "healthy"]
 
     weak = {ad["ad_id"]: ad for ad in result["weak_ads"]}
     assert set(weak) == {"creative", "bid", "postclick"}
@@ -848,17 +849,22 @@ def test_auction_ranking_report_account_level_reads_top_spending_ads_in_one_boun
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42", top_n=5))
 
     ad_calls = _ad_level_calls(client)
-    assert len(ad_calls) == 1
+    assert len(ad_calls) == 2
     params = ad_calls[0]["params"]
     assert ad_calls[0]["object_id"] == "act_42"
     assert params["sort"] == ["spend_descending"]
     assert params["limit"] == performance_signals.RANKING_DEFAULT_MAX_ADS == 200
     assert "after" not in params
+    assert "actions" not in ad_calls[0]["fields"]
+    cost_params = ad_calls[1]["params"]
+    assert "sort" not in cost_params
+    assert cost_params["limit"] == performance_signals.RANKING_COST_MAX_ADS
+    assert len(cost_params["filtering"][0]["value"]) == performance_signals.RANKING_COST_MAX_ADS
     scope_calls = [call for call in _calls(client, "get_insights") if call["params"]["level"] == "account"]
     assert len(scope_calls) == 1
     assert scope_calls[0]["object_id"] == "act_42"
     assert "spend" in scope_calls[0]["fields"]
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
 
     examined = result["examined"]
     assert examined["ads_examined"] == 200
@@ -896,7 +902,7 @@ def test_auction_ranking_report_scope_spend_failure_is_reported_not_raised(monke
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
     assert result["examined"]["share_of_scope_spend"] is None
     assert result["examined"]["scope_spend"] is None
-    assert result["scope_metrics_basis"] == "examined_ads"
+    assert result["scope_metrics_basis"] == "examined_ads_with_cost_evidence"
     assert any("scope" in signal and "Permissions" in signal for signal in result["missing_signals"])
 
 
@@ -926,6 +932,154 @@ def test_auction_ranking_report_no_rows_says_so(monkeypatch) -> None:
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="adset", object_id="as_1"))
     assert result["weak_ads"] == []
     assert result["findings"][0]["type"] == "insufficient_data"
+
+
+def _unknown_error() -> MetaApiError:
+    return MetaApiError(message="An unknown error occurred", status_code=500, code=1)
+
+
+LEAN_RANKING_KEYS = {
+    "ad_id", "ad_name", "campaign_id", "adset_id", "spend", "impressions",
+    "quality_ranking", "engagement_rate_ranking", "conversion_rate_ranking", "date_start", "date_stop",
+}
+
+
+def _meta_like_ranking_handler(ad_rows: list[dict[str, Any]], *, scope_spend: float, more: bool = True,
+                               cost_error: Exception | None = None, scope_heavy_error: bool = False):
+    """Models the live account: the sorted ad-level read fails when it carries action fields, works when lean."""
+
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if params["level"] == "ad":
+            if "sort" in params:
+                if {"actions", "action_values"} & set(fields):
+                    raise _unknown_error()
+                payload: dict[str, Any] = {
+                    "data": [{key: value for key, value in row.items() if key in LEAN_RANKING_KEYS}
+                             for row in ad_rows[: params["limit"]]],
+                }
+                if more:
+                    payload["paging"] = {"cursors": {"after": "next"}, "next": "https://graph.example/next"}
+                return payload
+            if cost_error is not None:
+                raise cost_error
+            (selector,) = params["filtering"]
+            assert selector["field"] == "ad.id" and selector["operator"] == "IN"
+            return {"data": [row for row in ad_rows if row["ad_id"] in selector["value"]]}
+        if scope_heavy_error and "actions" in fields:
+            raise _unknown_error()
+        row: dict[str, Any] = {"spend": str(scope_spend), "impressions": "5000000"}
+        if "actions" in fields:
+            row.update({"clicks": "50000", "actions": [{"action_type": "purchase", "value": "5000"}]})
+        return {"data": [row]}
+
+    return handler
+
+
+def test_auction_ranking_report_sorted_read_is_lean_so_heavy_failure_cannot_happen(monkeypatch) -> None:
+    rows = _many_ads(300)
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(rows, scope_spend=1e7)))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42"))
+
+    sorted_calls = [call for call in _ad_level_calls(client) if "sort" in call["params"]]
+    assert len(sorted_calls) == 1
+    lean = sorted_calls[0]
+    assert lean["params"]["sort"] == ["spend_descending"]
+    assert set(lean["fields"]) == {
+        "ad_id", "ad_name", "campaign_id", "adset_id", "spend", "impressions",
+        "quality_ranking", "engagement_rate_ranking", "conversion_rate_ranking",
+    }
+    assert result["examined"]["ads_examined"] == 200
+    assert result["cost_evidence"]["status"] == "read"
+
+
+def test_auction_ranking_report_cost_read_is_one_request_for_selected_ads_with_known_rankings(monkeypatch) -> None:
+    rows = [
+        _ad_row("a1", spend=900, purchases=1, quality="AVERAGE", engagement="AVERAGE", conversion="AVERAGE"),
+        _ad_row("a2", spend=800, purchases=9, quality="UNKNOWN", engagement="UNKNOWN", conversion="UNKNOWN"),
+        _ad_row("a3", spend=700, purchases=7, quality="BELOW_AVERAGE_10", engagement="UNKNOWN", conversion="UNKNOWN"),
+    ]
+    client = _patch(monkeypatch, RecordingClient(
+        insights_handler=_meta_like_ranking_handler(rows, scope_spend=2400.0, more=False),
+    ))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1",
+                                                                       date_preset="last_7d"))
+
+    cost_calls = [call for call in _ad_level_calls(client) if "filtering" in call["params"]]
+    assert len(cost_calls) == 1
+    cost = cost_calls[0]
+    assert cost["params"]["filtering"] == [{"field": "ad.id", "operator": "IN", "value": ["a1", "a3"]}]
+    assert "sort" not in cost["params"]
+    assert cost["params"]["date_preset"] == "last_7d"
+    assert cost["params"]["limit"] == 2
+    assert {"actions", "action_values", "ad_id"} <= set(cost["fields"])
+    ads = {ad["ad_id"]: ad for ad in result["ranked_ads"]}
+    assert ads["a1"]["results"] == 1.0 and ads["a1"]["cost_per_result"] == 900.0
+    assert ads["a2"]["results"] is None and ads["a2"]["cost_per_result"] is None
+    assert result["cost_evidence"]["ads_requested"] == 2 and result["cost_evidence"]["ads_returned"] == 2
+    assert any("a" in signal and "cost per result" in signal.lower() for signal in result["missing_signals"])
+
+
+def test_auction_ranking_report_cost_read_failure_keeps_rankings_diagnosis(monkeypatch) -> None:
+    rows = [
+        _ad_row("weak", spend=900, purchases=0, quality="BELOW_AVERAGE_10", engagement="AVERAGE", conversion="AVERAGE"),
+        _ad_row("fine", spend=800, purchases=0, quality="AVERAGE", engagement="AVERAGE", conversion="AVERAGE"),
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(
+        rows, scope_spend=1700.0, more=False, cost_error=_unknown_error(),
+    )))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42"))
+
+    assert [(ad["ad_id"], ad["diagnosis"]) for ad in result["weak_ads"]] == [("weak", "creative_quality")]
+    fine = next(ad for ad in result["ranked_ads"] if ad["ad_id"] == "fine")
+    assert fine["results"] is None and fine["diagnosis"] is None
+    assert result["cost_evidence"]["status"] == "failed"
+    assert "unknown error" in result["cost_evidence"]["error"]
+    assert any("cost-per-result evidence was not available" in signal.lower() for signal in result["missing_signals"])
+
+
+def test_auction_ranking_report_says_plainly_when_few_rankings_are_known(monkeypatch) -> None:
+    rows = _many_ads(200)
+    for index, row in enumerate(rows):
+        if index >= 3:
+            row.update({"quality_ranking": "UNKNOWN", "engagement_rate_ranking": "UNKNOWN",
+                        "conversion_rate_ranking": "UNKNOWN"})
+    _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(rows, scope_spend=1e6)))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42"))
+
+    coverage = result["ranking_coverage"]
+    assert coverage == {
+        "ads_examined": 200, "quality_ranking_known": 3, "engagement_rate_ranking_known": 3,
+        "conversion_rate_ranking_known": 3, "all_three_known": 3,
+    }
+    limited = next(finding for finding in result["findings"] if finding["type"] == "limited_ranking_evidence")
+    assert "3 of 200" in limited["summary"]
+    assert result["findings"][0]["type"] == "limited_ranking_evidence"
+
+
+def test_auction_ranking_report_scope_total_falls_back_to_lean_fields(monkeypatch) -> None:
+    rows = _many_ads(10)
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(
+        rows, scope_spend=sum(5000 - index for index in range(10)) * 4, more=False, scope_heavy_error=True,
+    )))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="account", object_id="42"))
+
+    scope_calls = [call for call in _calls(client, "get_insights") if call["params"]["level"] == "account"]
+    assert len(scope_calls) == 2
+    assert set(scope_calls[1]["fields"]) == {"spend", "impressions"}
+    assert result["examined"]["share_of_scope_spend"] == pytest.approx(0.25)
+    assert result["scope_metrics_basis"] == "examined_ads_with_cost_evidence"
+
+
+def test_ranking_zero_results_rule_needs_known_results() -> None:
+    rankings = {field: "AVERAGE" for field in performance_signals.RANKING_FIELDS}
+    metrics = {"spend": 500.0, "results": None, "cost_per_result": None}
+    scope = {"spend": 1000.0, "results": 10.0, "cost_per_result": 100.0}
+    assert performance_signals._ranking_diagnosis(rankings, metrics, scope)[0] is None
 
 
 @pytest.mark.parametrize(
