@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close every capability gap between this server and the 106 tools Meta's official Ads MCP server actually serves, without changing the call contract of any tool already on `master`.
+**Goal:** Close every capability gap between this server and the 106 tools Meta's official Ads MCP server actually serves, changing the call contract of a tool already on `master` only as a declared, genuine improvement.
 
 **Architecture:** Seven independent work streams, each in its own git worktree branched from the phase-two foundation commit, each owning a fixed set of files. Extensions to existing tools are additive optional parameters. The orchestrator merges the streams, then updates the parity ledger, README and search router.
 
@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- Backward compatibility is a hard constraint for the 102 tools in `tests/fixtures/master_tool_contract.json`: no rename, no removal, no removed parameter, no new required parameter, no changed default, no new confirmation step, no validation that rejects an input the tool accepts today, no change to the name or meaning of a field it already returns. `tests/test_backward_compat.py` must pass unchanged, and no stream edits its fixture.
-- For every extended tool that is on `master`, a test proves that a call made the old way sends exactly the same request as before the change.
+- Tools on `master` (the 102 in `tests/fixtures/master_tool_contract.json`) do not change their contract by accident. Additive changes (an optional parameter, a new response field) need no declaration and are preferred when they give the user the same result. A breaking change (removed or renamed tool, removed parameter, new required parameter, changed default, tighter validation, an added step, a changed returned field) is allowed only as a genuine improvement to the experience of using the tool, and only when the spec's tables call for it or the tool's current behaviour is wrong. It must be declared in `tests/fixtures/intentional_contract_changes.json` with `why_better` and `migration`. Any other breaking idea is proposed in the stream's report, not implemented. `tests/test_backward_compat.py` must pass; no stream edits `master_tool_contract.json`.
+- For every extended `master` tool that is meant to stay compatible, a test proves that a call made the old way sends exactly the same request as before the change.
 - No tool gets MCP annotations. No existing tool gets a confirmation step.
 - New tools and new parameters use `GraphId` and `AccountId` from `meta_ads_mcp/tool_types.py` for ids Meta documents as numeric. Tools on `master` keep plain `str` ids.
 - Evidence rule: an endpoint (object type or edge) is built on only if Meta's public reference documentation describes it; SDK presence alone is not enough. On a documented endpoint, a field or parameter may come from the documentation or the SDK source at tag `26.0.2`. Anything unconfirmed is reported, not guessed and not built.
@@ -31,7 +31,7 @@
 
 ## Review Focus
 
-1. An existing artifact calls an extended tool exactly as it does today. Expected: the same request reaches Meta and the same response fields come back. Owned by P1, P2, P3 and P4.
+1. An existing artifact calls an extended tool exactly as it does today. Expected: the same request reaches Meta and the same response fields come back, unless a declared change in `intentional_contract_changes.json` says otherwise. Owned by P1, P2, P3 and P4.
 2. A caller gives a new named parameter and the same key inside `params`. Expected: a `ValidationError` before any network call, naming both. Owned by P2.
 3. A batch write partly fails or times out. Expected: per-item results that say what was applied and what was not, and a plain statement of whether retrying is safe. Owned by P5.
 4. A one-step tool creates a campaign, then fails creating the ad set. Expected: the error names what was created so it can be found and removed, and nothing is left active. Owned by P1.

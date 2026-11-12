@@ -1,0 +1,4 @@
+{
+  "_about": "Deliberate changes to the call contract of tools that are on master. Each entry needs a real benefit and what a caller must change. tests/test_backward_compat.py fails on any undeclared change, and on any entry here that no longer matches a detected change. Kinds: removed_tool, removed_parameter, new_required_parameter, default_changed (all detected automatically), and behaviour (a change the signature does not show, such as stricter validation or a changed response field; not detected, so declare it by hand).",
+  "changes": []
+}

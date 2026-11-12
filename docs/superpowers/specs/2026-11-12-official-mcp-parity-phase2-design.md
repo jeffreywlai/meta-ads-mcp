@@ -44,41 +44,53 @@ them `unavailable`:
 If an implementer finds a documented public route for any of these, they report
 it; they do not build it in this phase.
 
-## Hard constraint: existing artifacts must keep working
+## Changing tools that are already on master
 
-Existing artifacts call this server. For any tool that is on `master` (the 102
-tools recorded in `tests/fixtures/master_tool_contract.json`):
+Existing artifacts call this server. Jeff's rule (2026-11-12): a change that
+breaks existing callers is allowed when it genuinely improves the experience of
+using the tool, and artifacts and processes will be reworked around the improved
+tool. A break that is not a real improvement is not allowed, and no tool changes
+its contract by accident.
 
-- no rename and no removal;
-- no removed parameter, no new required parameter, no changed default;
-- no new confirmation step and no change in how many calls a task takes;
-- no validation that rejects an input the tool accepts today;
-- no change to the meaning or name of a field it already returns. Adding fields
-  to a response is allowed.
+In practice, for the 102 tools recorded in
+`tests/fixtures/master_tool_contract.json`:
 
-`tests/test_backward_compat.py` enforces the signature rules. The rest is the
-implementer's responsibility and the reviewer's to check.
+- **Additive first.** Adding an optional parameter or a response field needs no
+  declaration. Prefer it when it gives the same result for the user.
+- **A breaking change must be declared.** Removing or renaming a tool, removing
+  a parameter, making one required, changing a default, tightening validation,
+  adding a step, or changing the name or meaning of a returned field: each one
+  gets an entry in `tests/fixtures/intentional_contract_changes.json` with
+  `why_better` (the benefit to the person using the tool, in plain words) and
+  `migration` (what a caller has to change). `tests/test_backward_compat.py`
+  fails on any undeclared signature change and on any stale declaration. Changes
+  the signature does not show are declared by hand with kind `behaviour`.
+- **When a stream may make one.** Only when this document's tables call for it,
+  or when the tool's current behaviour is wrong (it does not do what its
+  description says) and fixing it changes what callers get. For any other idea,
+  the stream does not implement it: it describes the change, the benefit and
+  what would break in its report, and the orchestrator takes it to Jeff.
+- **Review.** The orchestrator checks every declared change at merge and lists
+  them all for Jeff, so artifacts can be reworked from one list.
 
 Tools added in phase one (not on `master`) may be changed freely.
 
-Jeff decided on 2026-11-12 to hold off on three of Meta's design habits because
-of this constraint: read-only and destructive annotations, preview-then-confirm
-flows, and stricter input formats. In this phase:
+Still on hold from Jeff's earlier decision, until he says otherwise: MCP
+annotations on tools, and confirmation steps added to existing tools. A new tool
+may offer a plan-only or dry-run mode as an option, never as a required first
+call. The one exception is catalog access changes (stream P7), where a separate
+read-only preview tool exists because Meta's server has that capability.
 
-- No tool gets MCP annotations.
-- No existing tool gets a confirmation step. A new tool may offer a plan-only or
-  dry-run mode as an option, never as a required first call. The one exception
-  is catalog access changes (stream P7), where a separate read-only preview tool
-  exists because Meta's server has that capability.
-- Stricter input formats apply only to new tools and new parameters. Use the
-  shared types `GraphId` and `AccountId` from `meta_ads_mcp/tool_types.py`
-  (added in the foundation commit) for ids on new tools.
+Stricter input formats: new tools and new parameters use the shared types
+`GraphId` and `AccountId` from `meta_ads_mcp/tool_types.py` for ids Meta
+documents as numeric. Tools on `master` keep plain string ids unless a declared
+change says otherwise.
 
 ## New and extended tools
 
 Names are final. "Extend" means adding optional parameters or response fields to
 a tool that exists. Items marked (master) are on `master` and fall under the
-hard constraint.
+rules above.
 
 ### Stream P1: creatives, media and assets
 
@@ -205,9 +217,11 @@ extends the search router if any new write tool starts with an unknown verb.
 
 As in phase one, plus:
 
-- `tests/test_backward_compat.py` passes unchanged. No stream edits its fixture.
-- For every extended (master) tool, a test proves that a call made the old way
-  sends exactly the same request as before the change.
+- `tests/test_backward_compat.py` passes. A stream edits
+  `intentional_contract_changes.json` only to declare a change it made under
+  the rules above, and never edits `master_tool_contract.json`.
+- For every extended (master) tool that is meant to stay compatible, a test
+  proves that a call made the old way sends exactly the same request as before.
 - Every new write tool has a `dry_run` test proving nothing is sent.
 - Live checks by the orchestrator are read-only and paced, because the app's
   rate limit is shared with production use. Write tools stay `mocked` in the
