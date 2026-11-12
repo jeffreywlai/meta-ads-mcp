@@ -85,6 +85,9 @@ FEED_UPDATE_READ_FIELDS = [
     "update_schedule",
     "migrated_from_feed_id",
 ]
+# Fields this module already reads from a ProductFeed; a params change to one of
+# them is read first so previous shows its real prior value.
+FEED_READABLE_FIELDS = frozenset(field.split("{", 1)[0] for field in FEED_FIELDS)
 RULE_FIELDS = ["id", "attribute", "rule_type", "params"]
 EVENT_SOURCE_FIELDS = ["id", "name", "source_type"]
 EVENT_STAT_FIELDS = [
@@ -623,17 +626,29 @@ async def update_product_feed(
     data = merge_graph_payload(payload, params)
     if not data:
         raise ValidationError("At least one field must be provided for update_product_feed.")
+    extra_reads = [key for key in data if key in FEED_READABLE_FIELDS and key not in FEED_UPDATE_READ_FIELDS]
     client = get_graph_api_client()
-    previous = await client.get_object(feed_id, fields=FEED_UPDATE_READ_FIELDS)
+    previous = await client.get_object(feed_id, fields=[*FEED_UPDATE_READ_FIELDS, *extra_reads])
     await client.update_object(feed_id, data=data)
-    return mutation_response(
+    unavailable: dict[str, str] = {}
+    for key in data:
+        if key not in FEED_READABLE_FIELDS:
+            unavailable[key] = "not a field this server reads back from a product feed"
+        elif key not in previous:
+            unavailable[key] = "Meta returned no value for it; it may have been unset"
+    for key in ("schedule", "update_schedule"):
+        if isinstance(data.get(key), dict) and "password" in data[key]:
+            unavailable[f"{key}.password"] = "schedule passwords are never shown in responses"
+    response = mutation_response(
         action="update_product_feed",
         target={"feed_id": feed_id},
         previous=_redact_schedules({
-            key: previous.get(key) for key in data if key in FEED_UPDATE_READ_FIELDS
+            key: previous[key] for key in data if key in FEED_READABLE_FIELDS and key in previous
         }),
         current=_redact_schedules(data),
     )
+    response["previous_unavailable"] = unavailable
+    return response
 
 
 @mcp_server.tool()

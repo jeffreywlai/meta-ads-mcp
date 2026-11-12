@@ -252,6 +252,44 @@ def test_update_product_feed_reads_first_and_returns_previous(monkeypatch) -> No
     assert result["current"]["name"] == "New"
 
 
+class ProjectingFeedClient(FakeCatalogFeedClient):
+    """Returns only the fields the GET asked for, as the Graph API does."""
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        stored = await super().get_object(object_id, fields=fields, params=params)
+        return {key: value for key, value in stored.items() if key in (fields or [])}
+
+
+def test_update_product_feed_params_change_reads_that_fields_prior_value(monkeypatch) -> None:
+    client = _use(monkeypatch, ProjectingFeedClient(objects={
+        "feed_1": {"id": "feed_1", "name": "Main", "file_name": "old.csv", "country": "US"},
+    }))
+    result = run(catalog_feeds.update_product_feed(
+        feed_id="feed_1", params={"file_name": "new.csv", "country": "CA"},
+    ))
+    read_fields = client.calls[0]["fields"]
+    assert "file_name" in read_fields and "country" in read_fields
+    assert result["previous"] == {"file_name": "old.csv", "country": "US"}
+    assert result["current"] == {"file_name": "new.csv", "country": "CA"}
+    assert result["previous_unavailable"] == {}
+
+
+def test_update_product_feed_marks_unreadable_or_unreturned_prior_values_by_name(monkeypatch) -> None:
+    client = _use(monkeypatch, ProjectingFeedClient(objects={"feed_1": {"id": "feed_1", "name": "Main"}}))
+    result = run(catalog_feeds.update_product_feed(
+        feed_id="feed_1",
+        update_schedule={**SCHEDULE, "username": "feeduser", "password": "s3cret-value"},
+        params={"some_write_only_option": True},
+    ))
+    assert "some_write_only_option" not in client.calls[0]["fields"]
+    assert client.calls[1]["data"]["update_schedule"]["password"] == "s3cret-value"
+    assert result["previous"] == {}
+    assert set(result["previous_unavailable"]) == {
+        "some_write_only_option", "update_schedule", "update_schedule.password",
+    }
+    assert "s3cret-value" not in repr(result)
+
+
 def test_update_product_feed_requires_a_change(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="At least one"):
