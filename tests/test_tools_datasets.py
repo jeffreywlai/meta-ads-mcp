@@ -270,11 +270,17 @@ def test_dataset_stats_custom_data_field_sends_event(monkeypatch) -> None:
     assert client.list_calls[0]["params"]["event"] == "Purchase"
 
 
+def _hour_page(hour: int, *, next_after: str | None) -> dict[str, Any]:
+    return _stats_page([
+        {"aggregation": "event", "start_time": f"2026-11-01T{hour:02d}:00:00+0000",
+         "data": [{"value": "PageView", "count": 1}]},
+    ], next_after=next_after)
+
+
 def test_dataset_stats_reports_incomplete_scan_at_page_cap(monkeypatch) -> None:
-    endless = _stats_page([
-        {"aggregation": "event", "start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 1}]},
-    ], next_after="more")
-    client = FakeDatasetClient(list_pages={"stats": [endless]})
+    client = FakeDatasetClient(list_pages={"stats": [
+        _hour_page(hour, next_after=f"c{hour}") for hour in range(5)
+    ]})
     _use(monkeypatch, client)
     monkeypatch.setattr(datasets, "_utc_now", lambda: datetime(2026, 11, 12, tzinfo=timezone.utc))
     monkeypatch.setattr(datasets, "MAX_STATS_PAGES", 3)
@@ -285,7 +291,78 @@ def test_dataset_stats_reports_incomplete_scan_at_page_cap(monkeypatch) -> None:
     assert result["summary"]["complete"] is False
     assert result["summary"]["pages_fetched"] == 3
     assert result["summary"]["total_count"] == 3
+    assert result["summary"]["hours_with_data"] == 3
+    assert "3 pages" in result["summary"]["stop_reason"]
     assert "incomplete" in result["summary"]["note"].lower()
+
+
+def test_dataset_stats_repeated_page_is_never_counted_twice(monkeypatch) -> None:
+    """A stalled cursor that keeps returning the same hour must not multiply the totals."""
+    repeated = {
+        "data": [{"start_time": "2026-11-10T00:00:00Z", "data": [{"value": "Purchase", "count": 10}]}],
+        "paging": {"next": "next", "cursors": {"after": "repeat"}},
+    }
+    client = FakeDatasetClient(list_pages={"stats": [repeated]})
+    _use(monkeypatch, client)
+    monkeypatch.setattr(datasets, "_utc_now", lambda: datetime(2026, 11, 12, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(datasets, "MAX_STATS_PAGES", 3)
+
+    result = asyncio.run(datasets.get_dataset_stats("px1", since="2026-11-10", until="2026-11-10"))
+
+    assert result["summary"]["total_count"] == 10
+    assert result["summary"]["hours_with_data"] == 1
+    assert result["summary"]["complete"] is False
+    assert "already been read" in result["summary"]["stop_reason"]
+
+
+def test_dataset_stats_stops_on_a_cursor_already_read(monkeypatch) -> None:
+    """Cursors cycling A, B, A stop the scan without rereading A's page."""
+    client = FakeDatasetClient(list_pages={"stats": [
+        _hour_page(0, next_after="A"), _hour_page(1, next_after="B"), _hour_page(2, next_after="A"),
+    ]})
+    _use(monkeypatch, client)
+    monkeypatch.setattr(datasets, "_utc_now", lambda: datetime(2026, 11, 12, tzinfo=timezone.utc))
+
+    result = asyncio.run(datasets.get_dataset_stats("px1", since="2026-11-01", until="2026-11-02"))
+
+    assert [call["params"].get("after") for call in client.list_calls] == [None, "A", "B"]
+    assert result["summary"]["total_count"] == 3
+    assert result["summary"]["complete"] is False
+    assert "already been read" in result["summary"]["stop_reason"]
+
+
+def test_dataset_stats_empty_cursor_cycle_terminates(monkeypatch) -> None:
+    """Empty pages whose cursors never repeat are still bounded by the request cap."""
+    calls = {"n": 0}
+
+    class EmptyForever(FakeDatasetClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            calls["n"] += 1
+            assert calls["n"] <= 10, "stats scan does not stop on empty pages"
+            return {"data": [], "paging": {"next": "next", "cursors": {"after": f"c{calls['n']}"}}}
+
+    _use(monkeypatch, EmptyForever())
+    monkeypatch.setattr(datasets, "_utc_now", lambda: datetime(2026, 11, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(datasets, "MAX_STATS_PAGES", 4)
+
+    result = asyncio.run(datasets.get_dataset_stats("px1", since="2026-11-01", until="2026-11-02"))
+
+    assert calls["n"] == 4
+    assert result["summary"]["complete"] is False
+
+
+def test_dataset_stats_next_page_without_cursor_is_incomplete(monkeypatch) -> None:
+    client = FakeDatasetClient(list_pages={"stats": [
+        {"data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"}},
+    ]})
+    _use(monkeypatch, client)
+    monkeypatch.setattr(datasets, "_utc_now", lambda: datetime(2026, 11, 12, tzinfo=timezone.utc))
+
+    result = asyncio.run(datasets.get_dataset_stats("px1"))
+
+    assert len(client.list_calls) == 1
+    assert result["summary"]["complete"] is False
+    assert "no cursor" in result["summary"]["stop_reason"]
 
 
 def test_dataset_stats_rejects_windows_over_28_days(monkeypatch) -> None:

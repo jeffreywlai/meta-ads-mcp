@@ -10,6 +10,7 @@ Endpoints (Meta Marketing API reference):
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
@@ -143,11 +144,26 @@ def _page_summary(normalized: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _next_cursor(payload: dict[str, Any]) -> str | None:
+def _page_fingerprint(rows: list[Any]) -> str:
+    return json.dumps(rows, sort_keys=True, default=str)
+
+
+def _next_page(payload: dict[str, Any], seen_cursors: set[str]) -> tuple[bool, str | None, str | None]:
+    """Return (more_pages, next_cursor, stop_reason) for one Graph page.
+
+    A list is exhausted only when Meta's paging has no next link. A next link
+    without a usable cursor, or a cursor already requested, stops the scan with
+    a stated reason instead of claiming completeness or looping.
+    """
     paging = payload.get("paging") or {}
     if not paging.get("next"):
-        return None
-    return (paging.get("cursors") or {}).get("after")
+        return False, None, None
+    cursor = blank_to_none((paging.get("cursors") or {}).get("after"))
+    if cursor is None:
+        return True, None, "Meta reported another page but returned no cursor to read it."
+    if cursor in seen_cursors:
+        return True, None, "Meta returned a page cursor that had already been read."
+    return True, cursor, None
 
 
 def _parse_day(value: str, name: str) -> date:
@@ -270,13 +286,27 @@ async def get_dataset_stats(
     pages = 0
     cursor: str | None = None
     complete = False
-    while pages < MAX_STATS_PAGES:
+    stop_reason: str | None = None
+    seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    while True:
+        if pages >= MAX_STATS_PAGES:
+            stop_reason = f"Stopped after {pages} pages of hourly stats."
+            break
         params = dict(base_params)
         if cursor:
             params["after"] = cursor
+            seen_cursors.add(cursor)
         payload = await client.list_objects(dataset_id, "stats", params=params)
         pages += 1
-        for bucket in payload.get("data") or []:
+        buckets = payload.get("data") or []
+        if buckets:
+            fingerprint = _page_fingerprint(buckets)
+            if fingerprint in seen_pages:
+                stop_reason = "Meta returned a page that had already been read; it was not counted again."
+                break
+            seen_pages.add(fingerprint)
+        for bucket in buckets:
             rows = []
             for row in bucket.get("data") or []:
                 value = str(row.get("value"))
@@ -287,9 +317,11 @@ async def get_dataset_stats(
                 hours.append(str(bucket["start_time"]))
             if include_hourly:
                 hourly.append({"start_time": bucket.get("start_time"), "data": rows})
-        cursor = _next_cursor(payload)
-        if cursor is None:
+        more, cursor, stop_reason = _next_page(payload, seen_cursors)
+        if not more:
             complete = True
+            break
+        if stop_reason is not None:
             break
 
     items = [
@@ -306,9 +338,10 @@ async def get_dataset_stats(
         "complete": complete,
     }
     if not complete:
+        summary["stop_reason"] = stop_reason
         summary["note"] = (
-            f"Incomplete: stopped after {pages} pages of hourly stats; totals cover only the "
-            "hours read. Narrow the window to read the rest."
+            f"Incomplete: {stop_reason} Totals cover only the {pages} pages read, each counted once. "
+            "Narrow the window to read the rest."
         )
     response: dict[str, Any] = {
         "scope": {
