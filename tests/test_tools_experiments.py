@@ -297,35 +297,87 @@ def test_study_primary_without_results_does_not_fall_back_to_secondary(monkeypat
     assert results["objectives"][1] == {"objective_id": "obj_41", "is_primary": True, "status": "not_ready"}
 
 
-def test_get_ad_study_lift_results_report_lift_and_confidence(monkeypatch) -> None:
-    row = {"cell_id": "cell_t", "conversions_test": 1200, "conversions_control_scaled": 1000,
-           "conversions_incremental": 200, "conversions_incremental_lower": 150,
-           "conversions_incremental_upper": 250, "conversions_confidence": 0.97,
-           "conversions_CPiC": 12.5}
-    use(monkeypatch, FakeStudyClient(
-        objects={"study_2": {"id": "study_2", "type": "LIFT",
-                             "start_time": "2026-09-01T00:00:00+0000",
-                             "end_time": "2026-10-01T00:00:00+0000"}},
-        edges={("study_2", "cells"): {"data": [{"id": "cell_t", "name": "Test",
-                                                 "treatment_percentage": 90,
-                                                 "control_percentage": 10}]},
+LIFT_STUDY = {"id": "study_2", "type": "LIFT",
+              "start_time": "2026-09-01T00:00:00+0000", "end_time": "2026-10-01T00:00:00+0000"}
+LIFT_CELLS = {"data": [
+    {"id": "cell_t", "name": "Test", "treatment_percentage": 45, "control_percentage": 5},
+    {"id": "cell_u", "name": "Other", "treatment_percentage": 45, "control_percentage": 5},
+]}
+AGGREGATE_ROW = {"conversions_test": 2300, "conversions_control_scaled": 2000,
+                 "conversions_incremental": 300, "conversions_confidence": 0.95}
+CELL_ROW = {"cell_id": "cell_t", "conversions_test": 1200, "conversions_control_scaled": 1000,
+            "conversions_incremental": 200, "conversions_incremental_lower": 150,
+            "conversions_incremental_upper": 250, "conversions_confidence": 0.97,
+            "conversions_CPiC": 12.5}
+
+
+def _lift_client(monkeypatch, *, breakdown=None, errors=None, study=LIFT_STUDY):
+    objects = {"study_2": study}
+    if breakdown is not None:
+        objects["obj_9"] = {"id": "obj_9", "results": breakdown}
+    return use(monkeypatch, FakeStudyClient(
+        objects=objects,
+        errors=errors,
+        edges={("study_2", "cells"): LIFT_CELLS,
                ("study_2", "objectives"): {"data": [
                    {"id": "obj_9", "name": "Purchases", "is_primary": True,
-                    "last_updated_results": "2026-10-02", "results": [json.dumps(row)]},
+                    "last_updated_results": "2026-10-02", "results": [json.dumps(AGGREGATE_ROW)]},
                ]}},
     ))
+
+
+def test_get_ad_study_lift_results_report_lift_and_confidence(monkeypatch) -> None:
+    """F21: per-cell lift comes from the documented cell_id breakdown, kept apart from the aggregate."""
+    other = {**CELL_ROW, "cell_id": "cell_u", "conversions_incremental": 100}
+    client = _lift_client(monkeypatch, breakdown=[CELL_ROW, other])
     result = run(experiments.get_ad_study(study_id="study_2", include_results=True))
+    assert ("get", "obj_9", ["id", "results"], {"breakdowns": ["cell_id"]}) in client.calls
     lift = result["results"]
     assert lift["status"] == "available"
     assert lift["kind"] == "lift"
-    cell = lift["objectives"][0]["cells"][0]
+    objective = lift["objectives"][0]
+    assert objective["cells_status"] == "available"
+    aggregate = objective["aggregate"][0]
+    assert "cell_id" not in aggregate
+    assert aggregate["incremental_conversions"] == 300
+    assert aggregate["conversions_lift"] == pytest.approx(0.15)
+    cell = objective["cells"][0]
     assert cell["cell_id"] == "cell_t"
     assert cell["cell_name"] == "Test"
     assert cell["incremental_conversions"] == 200
     assert cell["conversions_lift"] == pytest.approx(0.2)
     assert cell["conversions_lift_basis"] == "conversions_incremental / conversions_control_scaled"
     assert cell["confidence"] == 0.97
-    assert cell["meta_fields"] == row
+    assert cell["meta_fields"] == CELL_ROW
+    assert [row["cell_name"] for row in objective["cells"]] == ["Test", "Other"]
+
+
+def test_lift_aggregate_is_never_presented_as_a_cell(monkeypatch) -> None:
+    """F21: without breakdown rows the aggregate stays aggregate and cells is empty, with the reason."""
+    _lift_client(monkeypatch, breakdown=[])
+    objective = run(experiments.get_ad_study(study_id="study_2", include_results=True))["results"]["objectives"][0]
+    assert objective["cells"] == []
+    assert objective["cells_status"] == "none_returned"
+    assert "100" in objective["cells_note"]
+    assert objective["aggregate"][0]["incremental_conversions"] == 300
+
+
+def test_lift_cell_breakdown_failure_is_reported(monkeypatch) -> None:
+    error = MetaApiError(message="(#100) Unsupported breakdown", status_code=400, code=100)
+    _lift_client(monkeypatch, errors={"obj_9": error})
+    objective = run(experiments.get_ad_study(study_id="study_2", include_results=True))["results"]["objectives"][0]
+    assert objective["cells"] == []
+    assert objective["cells_status"] == "unavailable"
+    assert "Unsupported breakdown" in objective["cells_note"]
+    assert objective["aggregate"][0]["incremental_conversions"] == 300
+
+
+def test_non_lift_study_does_not_request_undocumented_breakdown(monkeypatch) -> None:
+    client = _lift_client(monkeypatch, study={**LIFT_STUDY, "type": "GEO_LIFT"})
+    objective = run(experiments.get_ad_study(study_id="study_2", include_results=True))["results"]["objectives"][0]
+    assert not any(call[0] == "get" and call[1] == "obj_9" for call in client.calls)
+    assert objective["cells_status"] == "not_requested"
+    assert objective["cells"] == []
 
 
 def test_study_nested_membership_paging_is_not_complete(monkeypatch) -> None:

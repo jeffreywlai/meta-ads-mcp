@@ -679,46 +679,92 @@ def _split_results(
     return response
 
 
-def _lift_results(objectives: list[dict[str, Any]], cells: list[dict[str, Any]]) -> dict[str, Any]:
+def _lift_row(row: Any, names: dict[Any, Any], *, with_cell: bool) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {"meta_fields": row}
+    incremental = _to_number(row.get("conversions_incremental"))
+    baseline = _to_number(row.get("conversions_control_scaled"))
+    rendered: dict[str, Any] = {}
+    if with_cell:
+        cell_id = None if row.get("cell_id") in (None, "") else str(row.get("cell_id"))
+        rendered.update({"cell_id": cell_id, "cell_name": names.get(cell_id)})
+    rendered.update({
+        "incremental_conversions": row.get("conversions_incremental"),
+        "incremental_conversions_lower": row.get("conversions_incremental_lower"),
+        "incremental_conversions_upper": row.get("conversions_incremental_upper"),
+        "conversions_lift": incremental / baseline if incremental is not None and baseline else None,
+        "conversions_lift_basis": "conversions_incremental / conversions_control_scaled",
+        "confidence": row.get("conversions_confidence"),
+        "cost_per_incremental_conversion": row.get("conversions_CPiC"),
+        "meta_fields": row,
+    })
+    return rendered
+
+
+async def _read_cell_breakdowns(client: Any, objectives: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Read each objective's results broken down by cell, as Meta's lift guide documents.
+
+    GET /{objective_id}?fields=results&breakdowns=["cell_id"]; one row per cell.
+    """
+    breakdowns: dict[str, dict[str, Any]] = {}
+    for objective in objectives:
+        objective_id = objective.get("id")
+        if not objective["parsed_results"] or objective_id in (None, ""):
+            continue
+        try:
+            payload = await client.get_object(
+                str(objective_id), fields=["id", "results"], params={"breakdowns": ["cell_id"]},
+            )
+        except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
+            breakdowns[str(objective_id)] = {"status": "unavailable", "reason": f"Could not read per-cell results: {exc}"}
+            continue
+        breakdowns[str(objective_id)] = {"status": "read", "rows": _parse_results(payload.get("results"))}
+    return breakdowns
+
+
+def _lift_results(
+    objectives: list[dict[str, Any]],
+    cells: list[dict[str, Any]],
+    breakdowns: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
     names = {cell["id"]: cell["name"] for cell in cells}
     rendered: list[dict[str, Any]] = []
     for objective in objectives:
         if not objective["parsed_results"]:
             continue
-        rows: list[dict[str, Any]] = []
-        for row in objective["parsed_results"]:
-            if not isinstance(row, dict):
-                rows.append({"meta_fields": row})
-                continue
-            incremental = _to_number(row.get("conversions_incremental"))
-            baseline = _to_number(row.get("conversions_control_scaled"))
-            cell_id = row.get("cell_id")
-            rows.append({
-                "cell_id": cell_id,
-                "cell_name": names.get(cell_id),
-                "incremental_conversions": row.get("conversions_incremental"),
-                "incremental_conversions_lower": row.get("conversions_incremental_lower"),
-                "incremental_conversions_upper": row.get("conversions_incremental_upper"),
-                "conversions_lift": (
-                    incremental / baseline if incremental is not None and baseline else None
-                ),
-                "conversions_lift_basis": "conversions_incremental / conversions_control_scaled",
-                "confidence": row.get("conversions_confidence"),
-                "cost_per_incremental_conversion": row.get("conversions_CPiC"),
-                "meta_fields": row,
-            })
-        rendered.append({
-            "objective_id": objective.get("id"),
+        objective_id = objective.get("id")
+        item: dict[str, Any] = {
+            "objective_id": objective_id,
             "name": objective.get("name"),
             "is_primary": objective.get("is_primary"),
             "last_updated_results": objective.get("last_updated_results"),
-            "cells": rows,
-        })
+            "aggregate": [_lift_row(row, names, with_cell=False) for row in objective["parsed_results"]],
+            "cells": [],
+        }
+        breakdown = breakdowns.get(str(objective_id)) if breakdowns is not None else None
+        if breakdowns is None:
+            item["cells_status"] = "not_requested"
+            item["cells_note"] = "Meta documents the cell_id breakdown for LIFT studies only; it was not requested."
+        elif breakdown is None or breakdown["status"] == "unavailable":
+            item["cells_status"] = "unavailable"
+            item["cells_note"] = (breakdown or {}).get("reason", "Per-cell results were not read.")
+        elif not breakdown["rows"]:
+            item["cells_status"] = "none_returned"
+            item["cells_note"] = (
+                "Meta returned no per-cell rows. Its lift guide says a breakdown needs at least 100 "
+                "conversions from test and control combined to display."
+            )
+        else:
+            item["cells_status"] = "available"
+            item["cells"] = [_lift_row(row, names, with_cell=True) for row in breakdown["rows"]]
+        rendered.append(item)
     return {
         "status": "available",
         "kind": "lift",
         "objectives": rendered,
         "notes": [
+            "aggregate is Meta's result for the whole study; cells is Meta's cell_id breakdown. "
+            "They are separate reads and are not summed or mixed here.",
             "conversions_lift is derived here from Meta's fields as stated in conversions_lift_basis.",
             "Meta's lift guide does not document the scale of conversions_confidence.",
         ],
@@ -730,8 +776,9 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
     """Get one A/B test or lift study: settings, cells (shares and the campaigns or ad sets in each) and objectives.
 
     include_results adds the outcome: the winning cell and confidence for A/B tests (decided by the
-    primary objective; with no unique primary, each objective's outcome and no single winner), incremental
-    conversions, lift and confidence per cell for lift studies, or a plain not_ready status.
+    primary objective; with no unique primary, each objective's outcome and no single winner),
+    incremental conversions, lift and confidence for lift studies (whole-study aggregate and Meta's
+    per-cell breakdown, kept separate), or a plain not_ready status.
     """
     study_id = blank_to_none(study_id)
     if study_id is None:
@@ -792,7 +839,12 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
     elif str(study.get("type") or "").upper() in SPLIT_TEST_TYPES:
         response["results"] = _split_results(objectives, cells, response["summary"]["objectives_complete"])
     else:
-        response["results"] = _lift_results(objectives, cells)
+        breakdowns = (
+            await _read_cell_breakdowns(client, objectives)
+            if str(study.get("type") or "").upper() == "LIFT"
+            else None
+        )
+        response["results"] = _lift_results(objectives, cells, breakdowns)
     return response
 
 
