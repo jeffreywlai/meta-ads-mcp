@@ -505,6 +505,71 @@ def test_update_adset_validation_errors_make_no_call(monkeypatch, arguments, mes
         asyncio.run(campaigns.update_adset(**arguments))
 
 
+@pytest.mark.parametrize(
+    ("times", "message"),
+    [
+        ({"start_time": "2026-12-20T00:00:00Z", "end_time": "2026-12-01T00:00:00Z"}, "after start_time"),
+        ({"start_time": "2026-12-01T00:00:00Z", "end_time": "2026-12-01T00:00:00Z"}, "after start_time"),
+        ({"start_time": "2026-12-01T12:00:00"}, "UTC offset"),
+        ({"end_time": "2026-12-01"}, "UTC offset"),
+        ({"end_time": "tomorrow"}, "ISO 8601"),
+        ({"start_time": " "}, "ISO 8601"),
+        ({"start_time": "0"}, "positive"),
+    ],
+)
+def test_update_adset_dates_are_validated_before_network(monkeypatch, times, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", **times))
+
+
+@pytest.mark.parametrize(
+    "times",
+    [
+        {"start_time": "2026-11-20T00:00:00Z", "end_time": "2026-12-20T00:00:00-0500"},
+        {"start_time": "1795000000", "end_time": "1796000000"},
+        {"start_time": "2026-11-20T00:00:00+00:00", "end_time": "0"},
+    ],
+)
+def test_update_adset_valid_schedule_is_sent_as_given(monkeypatch, times) -> None:
+    client = FakeUpdateAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.update_adset(adset_id="adset_1", **times))
+    assert [call[0] for call in client.calls] == ["get", "update"]
+    assert client.calls[1][2] == times
+
+
+def test_update_adset_one_sided_start_is_checked_against_stored_end(monkeypatch) -> None:
+    client = FakeUpdateAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="stored end_time"):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", start_time="2026-12-05T00:00:00Z"))
+    assert [call[0] for call in client.calls] == ["get"]
+    assert set(client.calls[0][2]) == {"id", "start_time", "end_time"}
+
+
+def test_update_adset_one_sided_end_is_checked_against_stored_start(monkeypatch) -> None:
+    class StartedClient(FakeUpdateAdsetClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            stored = await super().get_object(object_id, fields=fields, params=params)
+            return {**stored, "start_time": "2026-11-15T00:00:00+0000"}
+
+    client = StartedClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="stored start_time"):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", end_time="2026-11-14T23:00:00-0100"))
+    assert [call[0] for call in client.calls] == ["get"]
+
+
+def test_update_adset_one_sided_start_before_stored_end_is_written(monkeypatch) -> None:
+    client = FakeUpdateAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="adset_1", start_time="2026-11-20T00:00:00Z"))
+    assert [call[0] for call in client.calls] == ["get", "update"]
+    assert client.calls[1][2] == {"start_time": "2026-11-20T00:00:00Z"}
+    assert "end_time" not in result["previous"]
+
+
 def test_update_adset_missing_object_sends_no_update(monkeypatch) -> None:
     from meta_ads_mcp.errors import MetaApiError
 
