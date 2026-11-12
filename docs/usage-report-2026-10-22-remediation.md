@@ -16,7 +16,7 @@ automatic mutation-retry system.
 
 ## Validation
 
-The latest full suite passed **1,654 tests**, with **32 live tests skipped**,
+The latest full suite passed **1,658 tests**, with **32 live tests skipped**,
 using the project's installed Python environment and this checkout's source.
 The unchanged baseline passed 1,257 tests with the same 32 skips. Installed
 dependencies passed `uv pip check`, and `git diff --check` was clean.
@@ -29,8 +29,62 @@ advancing report pages, and schema-valid direct-tool overflow notices. Real
 FastMCP Client tests exercise both normal overflow archival and archive failure;
 the original operation's success/error status is preserved in each case.
 
-These are repository and local transport results. They do not attest Meta's
-live write behavior or the installed server on Nick's computer.
+Those regression results are separate from the live acceptance checks below.
+Neither updates or attests an installation on another person's computer.
+
+### November 12 live acceptance
+
+The configured local `uvx` launcher loaded the merged implementation, and a
+fresh Claude Code 2.1.322 session successfully used `ToolSearch`, server tool
+discovery, capabilities, and health checks against Meta v26. The tested
+follow-up production-source fingerprint is
+`6b133660bbd7065cd144d87fe119ed7bd8c34efac5fe6f4a67b2d35787b4de67`.
+
+Live verification exposed one further defect: supplying the generated async
+polling fields caused Meta to omit breakdown dimensions from stored report
+rows. Polling fields now include the report's breakdown columns, while creation
+fields remain unchanged. Four regression cases failed before the correction
+and passed afterward. An independent Sol max review found no actionable issues,
+with 284 relevant tests and 75 additional offline checks passing.
+
+Ten read-only acceptance checks passed through stdio: 143 MCP calls and 40
+independent Graph reads. They covered projected fields and currency conversion,
+compound discovery, mixed-case ASCII and whole-term matching against 920 active
+ads, complete pagination of 542 audiences, creative settings and destinations,
+and full item/byte recovery of an oversized 100-ad response. A 31-day async
+placement report recovered all 628 rows through both artifact modes. Its 21
+grouped totals matched the recovered rows. A separately fetched account
+denominator matched a direct Graph request; placement sums differed from that
+denominator within the per-row currency rounding bound. Seven daily rows also
+verified purchase projection, paging, and resumed exact aggregation.
+
+The user then authorized temporary live writes, with every test ad, ad set,
+and campaign kept paused:
+
+- One-, three-, and six-country 1% lookalikes were created through the typed
+  tool. Read-back matched the seed, country sets, and ratio. The audiences were
+  deleted before population completed, so this verifies creation and stored
+  specifications, not eventual audience size or delivery eligibility.
+- A replacement creative was created and attached to a new paused test ad.
+  Read-back preserved placement rules, destinations, URL tags, and all 57
+  individual creative-feature settings. Copying the source's legacy
+  `creative_features_spec.standard_enhancements` field first produced Meta
+  error 100/subcode 3858504. Omitting that deprecated aggregate while retaining
+  individual settings succeeded. Generated asset-label IDs were omitted while
+  retaining label names and mappings. Meta appended a suffix to the supplied
+  creative name; the returned ID and unique test-name prefix were verified.
+- A new paused campaign and ad set exercised a budget update from 10 to 12
+  account-currency major units. MCP read-back returned 12; independent Graph
+  read-back returned 1,200 minor units for the USD test account. This does not
+  reproduce the historical timeout or replace the offline deadline tests.
+
+All eight temporary objects were deleted, with deletion acknowledged and
+subsequent reads confirming deleted status or object unavailability. The
+original ad set, campaign, and creative configuration remained unchanged.
+A fresh read-only audit confirmed all eight deletions; both test ads reported
+zero spend and zero impressions.
+The live probes used the checked-out source; installing this follow-up on any
+other running client still requires verifying its build fingerprint.
 
 ### November 11 independent review
 
@@ -156,10 +210,10 @@ intent, preservation, and coordinator suite passed all 288 tests.
 | --- | --- | --- |
 | M01: premature overflow | Fixed in repository | Nested calls defer size handling to the outer `call_tool` result. The wrapper can emit one compact JSON text copy when redundant text plus structured data would overflow. Direct tools retain required output-schema content. Notices distinguish actual serialized MCP bytes from archived bytes. Wrapper and direct transport tests cover both contracts. |
 | M02: difficult and unsafe overflow reads | Fixed in repository | Parsed item/row pages are the default for collections, including nested async rows. Byte mode remains available for the full artifact and huge individual items. Only zero or recently issued continuations are accepted, persisted in the existing integrity manifest; a guessed offset such as 62000 is rejected. Old evicted continuations explicitly require restarting at zero. Retention, ownership, integrity, and process-lock protections remain. |
-| M03: inflated insight rows and lost flattening | Fixed in repository, with an explicit polling contract | Named action projections remove full action maps unless raw actions are requested. Unrequested null padding is removed; flattened projections omit duplicate metrics. Creation now returns `poll_arguments` containing fields, `flatten_actions`, and dimensional-action raw mode. Every fetch must pass those arguments; projection options are deliberately not hidden in process state. A synthetic 21-row placement fixture with 30 action types per row stays below 16,000 bytes and retains a named `purchase` column. |
-| M04: lookalike spec | Payload fixed; live creation/read-back unverified | A supplied ratio defaults to `custom_ratio`; multi-country output uses `location_spec.geo_locations.countries` without `country:null`. The single-country path and explicit caller-selected types are preserved for Meta to validate. Invalid ratio bounds fail locally, and `params` documents that it cannot override the managed spec. Tests cover one, three, and six countries. No audiences were created or deleted for this work. |
+| M03: inflated insight rows and lost flattening | Fixed and exercised live, with an explicit polling contract | Named action projections remove full action maps unless raw actions are requested. Unrequested null padding is removed; flattened projections omit duplicate metrics. Creation returns `poll_arguments` containing fields including breakdown dimensions, `flatten_actions`, and dimensional-action raw mode. Every fetch must pass those arguments; projection options are deliberately not hidden in process state. Live daily and placement reports retained their projections through paging and artifact recovery. |
+| M04: lookalike spec | Payload fixed; live creation/read-back verified | A supplied ratio defaults to `custom_ratio`; multi-country output uses `location_spec.geo_locations.countries` without `country:null`. Invalid ratio bounds fail locally, and `params` cannot override the managed spec. Authorized one-, three-, and six-country 1% creates succeeded on November 12; stored seed/country/ratio values matched and all three test audiences were deleted. Eventual population and eligibility were not tested. |
 | M05: `get_adset(fields=...)` | Fixed in repository | `get_adset`, `get_ad`, and `get_ad_account` accept field projections like sibling reads. Money is still decoded using the owning account's currency; internally added context is removed from an explicit projection. |
-| M06: 1,000-ad inventory cap | Fixed in repository; Meta matching behavior remains upstream | Each OR term becomes a paged Graph `CONTAIN` query with the requested status filter. IDs are deduplicated and local whole-term matching refines candidates. Account size no longer triggers a 1,000-ad scan failure. Original term spelling is sent to Meta; exact Unicode/case candidate behavior requires live verification. |
+| M06: 1,000-ad inventory cap | Fixed in repository; sampled live matching verified | Each OR term becomes a paged Graph `CONTAIN` query with the requested status filter. IDs are deduplicated and local whole-term matching refines candidates. Account size no longer triggers a 1,000-ad scan failure. Mixed-case ASCII and whole-term results matched an independent 920-active-ad inventory with two-row search pages. Unicode equivalence remains dependent on Meta and was not established by that sample. |
 | M07: compound discovery | Fixed in repository | Compound requests union compatible operations instead of stopping at the first route. Campaign-budget intent favors `update_campaign_budget`. Negative/read-only intent and literal argument compatibility continue to constrain results. Report queries have regression coverage. |
 | M08: historical uncertain write | Existing uncertainty semantics preserved; request bound strengthened | HTTPX inactivity timeouts do not bound total elapsed time. Every request attempt now also has a wall-clock deadline. Mutation timeout remains unknown, nonretryable, and instructs a read-back. A delayed synthetic POST is attempted exactly once. This does not identify the cause of Nick's historical 221-second hang or prove the state of his write. |
 | M09: historical client result limit | Covered by M01/M02 and existing archival | Oversized results are retained and recovered through bounded responses. A client-specific token cap can still be lower than the server's byte limit; use a smaller page or scalar projection. |
@@ -172,7 +226,7 @@ intent, preservation, and coordinator suite passed all 288 tests.
 | Gap | Disposition and supported workflow |
 | --- | --- |
 | A: three-year catalog spend | Added `summarize_async_insights_report`. It reads the existing report page by page and sums only additive metrics with decimal arithmetic, grouping by fields such as `date_start`. A 99,164-row synthetic report reduces to three correct totals. Calls are bounded by page count, group count, and time; partial ranges expose continuations and never claim whole-report completeness. Total-account spend still requires its own denominator report. |
-| B: placement-image replacement | Existing `get_creative`, `upload_creative_asset`, and `create_ad_creative` preserve editable creative specs. Added the missing typed `update_ad_creative(ad_id, creative_id)` to attach the prepared replacement. Search surfaces the multi-step workflow. The caller must inspect and preserve placement rules and read back the ad; image filenames are not assumed to be ad names. No live creative changes were performed. |
+| B: placement-image replacement | Existing `get_creative`, `upload_creative_asset`, and `create_ad_creative` support preparing an edited creative. Added `update_ad_creative(ad_id, creative_id)` to attach it. Live creation, attachment to a paused test ad, preservation read-back, and cleanup passed. The caller must preserve placement rules and individual feature settings, omit the deprecated `standard_enhancements` aggregate when copying legacy read payloads, and read back the ad. New image upload and live delivery were not part of this test. |
 | C: lookalike recreation | The create payload and discoverability are addressed by M04. Duplicate deletion is not inferred from a create failure. Ad-set duplication was never attempted in the corpus and is not evidence of a missing server capability. |
 | D: landing-page inventory | `list_ads` and `get_ad` accept `destination_urls` in `fields`. The projection extracts configured story, carousel, video CTA, and asset-feed destinations without the large creative payload. It does not resolve redirects, dynamic catalog substitutions, URL tags, or product stock; those are separate operations. |
 | E: placement comparisons | Existing `get_account_health_snapshot`, `compare_time_ranges`, and `compare_performance` cover their documented comparison scopes. For placement mix, query both explicit windows with identical dimensions, use compact scalar actions, and compare spend shares only after confirming completeness. The new async reducer can sum additive placement totals. Causal judgments remain analysis, not a deterministic server claim. The corpus did not try the existing comparison tools, so no missing comparison endpoint was inferred. |
@@ -229,13 +283,11 @@ installed package versions. Pin the delivered commit in Nick's pipx spec,
 rebuild its cached environment, restart his MCP process, then record those
 values. A local test run cannot update or attest his computer.
 
-Before calling M04 live-verified, create a disposable lookalike with an
-authorized test seed and read its ratio/countries back; include the single,
-three-, and six-country cases and distinguish duplicate subcode 1713007 from
-invalid-spec subcode 1713084. Such a write was not required or performed for
-repository remediation. Before asserting Meta search equivalence, compare
-returned IDs for representative case/Unicode terms against Graph requests in
-the intended account.
+M04 creation and stored specifications were live-verified for the authorized
+seed in the November 12 acceptance run. Other seeds and accounts still depend
+on Meta's eligibility rules; distinguish duplicate subcode 1713007 from
+invalid-spec subcode 1713084. The search acceptance sample established ASCII
+case/whole-term matching, not universal Unicode equivalence.
 
 Primary references checked during implementation:
 
@@ -245,8 +297,7 @@ Primary references checked during implementation:
 - [Meta's generated AdAccount source](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/adaccount.py) exposes top-level `origin_audience_id` and the generic serialized lookalike-spec input.
 - [Meta's generated Ad source](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/ad.py) exposes the creative update parameter.
 
-Meta's detailed lookalike reference was unavailable/rate-limited during this
-work. The nested write payload is supported by the successful request recorded
-in Nick's report, while the generated SDK confirms the available parameters.
-Neither establishes successful new audience creation under today's account
-eligibility rules.
+Meta's detailed lookalike reference was unavailable/rate-limited during the
+initial implementation. The report and generated SDK supported that change;
+the November 12 live creates now provide direct acceptance evidence for the
+tested account and seed.

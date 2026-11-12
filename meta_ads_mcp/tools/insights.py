@@ -1384,7 +1384,12 @@ async def create_async_insights_report(
         ),
     )
     report_run_id = payload.get("report_run_id") or payload.get("id")
-    poll_arguments = {"report_run_id": report_run_id, "fields": requested_fields}
+    # Meta projects the report edge's explicit fields, including dimensions:
+    # selecting only the original metric fields drops the stored breakdowns.
+    poll_fields = list(dict.fromkeys([
+        *requested_fields, *(coerce_csv_string_list(breakdowns) or []),
+    ]))
+    poll_arguments = {"report_run_id": report_run_id, "fields": poll_fields}
     if flatten_actions:
         poll_arguments["flatten_actions"] = flatten_actions
     if any(value != "action_type" for value in coerce_csv_string_list(action_breakdowns) or []):
@@ -1397,7 +1402,7 @@ async def create_async_insights_report(
         "flatten_actions": flatten_actions,
         "poll_arguments": poll_arguments,
         "poll_hint": (
-            "Call get_async_insights_report with poll_arguments, including flatten_actions. "
+            "Call get_async_insights_report with poll_arguments to preserve breakdown columns and action projections. "
             "Projection options are explicit and must be passed on every fetch, including after a server restart."
         ),
     }
