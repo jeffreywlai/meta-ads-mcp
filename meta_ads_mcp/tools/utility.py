@@ -118,6 +118,8 @@ TOOL_GROUPS = {
         "delete_creative",
         "update_adset",
         "update_ad",
+        "add_audience_users",
+        "remove_audience_users",
     ],
     "creative_ops": [
         "get_ad_image",

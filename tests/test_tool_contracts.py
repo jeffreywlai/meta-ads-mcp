@@ -149,6 +149,8 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "get_field_reference": {"level": "ad", "field_names": ["name", "status"], "object_id": "ad_123"},
     "update_adset": {"name": "Updated Ad Set"},
     "update_ad": {"name": "Updated Ad"},
+    "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
+    "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
 }
 
 
@@ -371,6 +373,9 @@ class UniversalFakeClient:
 
     async def delete_object(self, object_id: str):
         return {"success": True, "id": object_id}
+
+    async def delete_edge_object(self, parent_id: str, edge: str, *, data):
+        return {"success": True, "parent_id": parent_id, "edge": edge}
 
     async def get_insights(self, object_id: str, *, fields, params):
         return {"data": [SAMPLE_INSIGHTS_ROW], "paging": {"cursors": {"after": "after_1"}}}

@@ -167,4 +167,6 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "upload_creative_asset",
         "update_adset",
         "update_ad",
+        "add_audience_users",
+        "remove_audience_users",
     }
