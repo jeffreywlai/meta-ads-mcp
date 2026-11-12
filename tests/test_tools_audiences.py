@@ -662,6 +662,97 @@ def test_audience_users_transport_error_is_withheld(monkeypatch) -> None:
     assert "RuntimeError" in str(excinfo.value)
 
 
+_PRIVATE_EMAIL = "private.customer@example.invalid"
+_PRIVATE_DIGEST = hashlib.sha256(_PRIVATE_EMAIL.encode()).hexdigest()
+
+
+def _malformed_upload_arguments(value: str) -> list[tuple[dict[str, object], str]]:
+    """Wrongly shaped arguments that each carry a customer value, with the expected structural message."""
+    return [
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": value}, "rows must be a list"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [value]}, "Row 1 must be a list"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": {"customer": value}}, "rows must be a list"),
+        ({"audience_id": "123", "schema": ["EMAIL", "PHONE"], "rows": [["a@example.com", 5551234567]]}, "Row 1, PHONE"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [[{"email": value}]]}, "Row 1, EMAIL"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [["a@example.com"], [value, value]]}, "Row 2 must have exactly 1"),
+        ({"audience_id": "123", "schema": {"EMAIL": value}, "rows": [["a@example.com"]]}, "schema must list"),
+        ({"audience_id": "123", "schema": [value], "rows": [["a@example.com"]]}, "schema position 1"),
+        ({"audience_id": "123", "schema": value, "rows": [["a@example.com"]]}, "schema position 1"),
+        ({"audience_id": [value], "schema": ["EMAIL"], "rows": [["a@example.com"]]}, "audience_id must be a string"),
+        ({"schema": ["EMAIL"], "rows": [[value]]}, "audience_id is required"),
+        ({"audience_id": "123", "rows": [[value]]}, "schema must list"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "file_path": {"path": value}}, "file_path must be a string"),
+        ({"audience_id": "123", "schema": ["EMAIL"], "rows": [[value]], "pre_hashed": value}, "pre_hashed must be true or false"),
+    ]
+
+
+def _assert_nothing_echoed(error: BaseException, caplog, value: str) -> None:
+    rendered = _rendered_chain(error)
+    assert value not in rendered
+    assert value not in caplog.text
+    for record in caplog.records:
+        assert value not in record.getMessage()
+        assert value not in repr(record.args)
+        if record.exc_info:
+            assert value not in _rendered_chain(record.exc_info[1])
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+@pytest.mark.parametrize("value", [_PRIVATE_EMAIL, _PRIVATE_DIGEST], ids=["raw", "hashed"])
+def test_audience_users_mcp_argument_errors_never_echo_values(monkeypatch, caplog, tool, routed, value) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    for arguments, message in _malformed_upload_arguments(value):
+        name, call_arguments = (("call_tool", {"name": tool, "arguments": arguments}) if routed else (tool, arguments))
+        caplog.clear()
+        with pytest.raises(ToolError) as excinfo:
+            asyncio.run(mcp_server.call_tool(name, call_arguments))
+        assert message in str(excinfo.value), (arguments, str(excinfo.value))
+        # The server did log the failure (with its traceback), so the log check below is not vacuous.
+        assert any(record.exc_info for record in caplog.records)
+        _assert_nothing_echoed(excinfo.value, caplog, value)
+
+
+def test_audience_users_mcp_schema_still_describes_the_expected_shape() -> None:
+    from meta_ads_mcp.coordinator import mcp_server, serialize_search_results_compact
+
+    for tool_name in USER_TOOLS:
+        tool = asyncio.run(mcp_server.get_tool(tool_name))
+        parameters = tool.parameters
+        assert parameters["required"] == ["audience_id", "schema"]
+        assert parameters["additionalProperties"] is False
+        properties = parameters["properties"]
+        assert properties["audience_id"]["type"] == "string"
+        assert {choice["type"] for choice in properties["schema"]["anyOf"]} == {"string", "array"}
+        rows_array = next(choice for choice in properties["rows"]["anyOf"] if choice["type"] == "array")
+        assert rows_array["items"] == {"type": "array", "items": {"type": "string"}}
+        assert rows_array["maxItems"] == audiences.AUDIENCE_USERS_INLINE_ROW_LIMIT
+        assert properties["pre_hashed"]["type"] == "boolean"
+        assert properties["pre_hashed"]["default"] is False
+        summary = serialize_search_results_compact([tool])
+        assert "req: audience_id (string), schema (string or list[string])" in summary
+        assert "rows (list[list[string]] or null)" in summary
+
+
+def test_audience_users_mcp_call_with_valid_arguments_still_uploads(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(mcp_server.call_tool("call_tool", {
+        "name": "add_audience_users",
+        "arguments": {"audience_id": "aud_1", "schema": "EMAIL,PHONE", "rows": [["a@example.com", None]],
+                      "pre_hashed": "false"},
+    }))
+    assert result.structured_content["rows_sent"] == 1
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha("a@example.com"), ""]]
+
+
 def test_audience_users_error_mid_upload_reports_progress(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
     error = audiences.MetaApiError(message="(#2650) Failed to update", status_code=400, code=2650)
@@ -747,7 +838,8 @@ def test_audience_users_invalid_entry_count_is_not_summed_across_batches(monkeyp
     [
         ({"audience_id": " ", "schema": ["EMAIL"], "rows": [["a@example.com"]]}, "audience_id is required"),
         ({"audience_id": "aud_1", "schema": [], "rows": [["a@example.com"]]}, "schema"),
-        ({"audience_id": "aud_1", "schema": ["EMAIL_SHA256"], "rows": [["a@example.com"]]}, "Unsupported schema key"),
+        ({"audience_id": "aud_1", "schema": ["EMAIL", "EMAIL_SHA256"], "rows": [["a@example.com", "b"]]},
+         "schema position 2 is not a supported key"),
         ({"audience_id": "aud_1", "schema": ["EMAIL", "email"], "rows": [["a", "b"]]}, "more than once"),
         ({"audience_id": "aud_1", "schema": ["EMAIL", "PHONE"], "rows": [["a@example.com"]]}, "Row 1"),
         ({"audience_id": "aud_1", "schema": ["EMAIL"], "rows": [[""], ["nope"]]}, "No valid values"),

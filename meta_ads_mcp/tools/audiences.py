@@ -12,7 +12,8 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import Field
+from fastmcp.tools import Tool
+from pydantic import Field, WithJsonSchema
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
@@ -434,10 +435,11 @@ def _audience_schema(schema: Any) -> list[str]:
     if not isinstance(keys, list) or not keys or any(not isinstance(key, str) or not key.strip() for key in keys):
         raise ValidationError("schema must list one or more Meta customer-list keys, such as EMAIL or PHONE.")
     normalized = [key.strip().upper() for key in keys]
-    unsupported = [key for key in normalized if key not in _AUDIENCE_KEY_NORMALIZERS]
+    # Positions, not the keys themselves: a misplaced customer value can arrive here.
+    unsupported = [str(position) for position, key in enumerate(normalized, start=1) if key not in _AUDIENCE_KEY_NORMALIZERS]
     if unsupported:
         raise ValidationError(
-            f"Unsupported schema key(s): {', '.join(unsupported)}. "
+            f"schema position {', '.join(unsupported)} is not a supported key (the value is not shown). "
             f"Supported keys: {', '.join(_AUDIENCE_KEY_NORMALIZERS)}."
         )
     if len(set(normalized)) != len(normalized):
@@ -498,8 +500,12 @@ def _hash_rows(
     invalid = 0
     dropped = 0
     for row_number, row in enumerate(rows, start=1):
-        if not isinstance(row, (list, tuple)) or len(row) != len(schema):
-            raise ValidationError(f"Row {row_number} must have exactly {len(schema)} values, one per schema key.")
+        if not isinstance(row, (list, tuple)):
+            raise ValidationError(f"Row {row_number} must be a list with one value per schema key.")
+        if len(row) != len(schema):
+            raise ValidationError(
+                f"Row {row_number} must have exactly {len(schema)} values, one per schema key; it has {len(row)}."
+            )
         sent: list[str] = []
         country: str | None = None
         if not pre_hashed and "COUNTRY" in schema:
@@ -626,25 +632,43 @@ def _session_counters(batch_results: list[dict[str, Any]]) -> dict[str, Any]:
     return counters
 
 
+def _upload_flag(value: Any) -> bool:
+    """Read pre_hashed the way MCP clients send booleans, without quoting a bad value."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise ValidationError("pre_hashed must be true or false (the value is not shown).")
+
+
 async def _send_audience_users(
     *,
     action: str,
-    audience_id: str,
-    schema: StringList,
-    file_path: str | None,
-    rows: list[list[str]] | None,
-    pre_hashed: bool,
+    audience_id: Any,
+    schema: Any,
+    file_path: Any,
+    rows: Any,
+    pre_hashed: Any,
 ) -> dict[str, Any]:
+    # Every argument is checked here rather than by the MCP framework (see the
+    # note above _AudienceIdArgument). Messages describe position and shape only.
+    if audience_id is not None and not isinstance(audience_id, str):
+        raise ValidationError("audience_id must be a string (the value is not shown).")
     audience_id = blank_to_none(audience_id)
     if audience_id is None:
         raise ValidationError("audience_id is required.")
+    if file_path is not None and not isinstance(file_path, str):
+        raise ValidationError("file_path must be a string path to a local CSV file (the value is not shown).")
     file_path = blank_to_none(file_path)
+    pre_hashed = _upload_flag(pre_hashed)
     if (file_path is None) == (rows is None):
         raise ValidationError("Provide exactly one of file_path or rows.")
     keys = _audience_schema(schema)
     if rows is not None:
         if not isinstance(rows, list):
-            raise ValidationError("rows must be a list of rows, each a list with one value per schema key.")
+            raise ValidationError(
+                "rows must be a list of rows, each a list with one value per schema key (the value is not shown)."
+            )
         if len(rows) > AUDIENCE_USERS_INLINE_ROW_LIMIT:
             raise ValidationError(
                 f"Inline rows are limited to {AUDIENCE_USERS_INLINE_ROW_LIMIT}; pass a local CSV with file_path instead."
@@ -720,13 +744,58 @@ async def _send_audience_users(
     }
 
 
-@mcp_server.tool()
+# FastMCP validates declared parameter types before a tool runs, and on failure
+# Pydantic quotes the rejected input, or every argument when one is missing, in
+# the raised error and in a WARNING log line. These parameters can carry
+# customer values, so the framework is given types it always accepts and
+# _send_audience_users validates them with structural messages instead.
+# WithJsonSchema keeps the advertised input schema. Field(default=None) lets a
+# missing argument reach the tool while Python callers must still pass it;
+# _register_customer_upload_tool restores those two in the schema's required list.
+_AudienceIdArgument = Annotated[Any, Field(default=None), WithJsonSchema({"type": "string"})]
+_SchemaArgument = Annotated[
+    Any,
+    Field(default=None),
+    WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}),
+]
+_FilePathArgument = Annotated[Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})]
+_RowsArgument = Annotated[
+    Any,
+    WithJsonSchema(
+        {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "string"}},
+                    "maxItems": AUDIENCE_USERS_INLINE_ROW_LIMIT,
+                },
+                {"type": "null"},
+            ],
+            "description": "One list per person with one string value per schema key, in schema order.",
+        }
+    ),
+]
+_PreHashedArgument = Annotated[Any, WithJsonSchema({"type": "boolean"})]
+_REQUIRED_UPLOAD_ARGUMENTS = ["audience_id", "schema"]
+
+
+def _register_customer_upload_tool(fn: Any) -> Any:
+    """Register an upload tool as @mcp_server.tool() does, keeping audience_id and schema required in its schema."""
+    tool = Tool.from_function(fn, task=False, run_in_thread=True)
+    tool.parameters["required"] = list(_REQUIRED_UPLOAD_ARGUMENTS)
+    for name in _REQUIRED_UPLOAD_ARGUMENTS:
+        tool.parameters["properties"][name].pop("default", None)
+    mcp_server.add_tool(tool)
+    return fn
+
+
+@_register_customer_upload_tool
 async def add_audience_users(
-    audience_id: str,
-    schema: StringList,
-    file_path: str | None = None,
-    rows: list[list[str]] | None = None,
-    pre_hashed: bool = False,
+    audience_id: _AudienceIdArgument,
+    schema: _SchemaArgument,
+    file_path: _FilePathArgument = None,
+    rows: _RowsArgument = None,
+    pre_hashed: _PreHashedArgument = False,
 ) -> dict[str, Any]:
     """Add people to a customer list audience. schema lists Meta keys (EMAIL, PHONE, FN, LN, FI, GEN, DOBY, DOBM, DOBD, CT, ST, ZIP, COUNTRY). Prefer file_path, a local CSV whose header names those columns, so values never pass through the model; inline rows (max 1,000) have already passed through the calling model and its provider. Values are normalized and SHA-256 hashed locally unless pre_hashed; blank or malformed values are dropped and counted. Returns counts only."""
     return await _send_audience_users(
@@ -739,13 +808,13 @@ async def add_audience_users(
     )
 
 
-@mcp_server.tool()
+@_register_customer_upload_tool
 async def remove_audience_users(
-    audience_id: str,
-    schema: StringList,
-    file_path: str | None = None,
-    rows: list[list[str]] | None = None,
-    pre_hashed: bool = False,
+    audience_id: _AudienceIdArgument,
+    schema: _SchemaArgument,
+    file_path: _FilePathArgument = None,
+    rows: _RowsArgument = None,
+    pre_hashed: _PreHashedArgument = False,
 ) -> dict[str, Any]:
     """Remove people from a customer list audience. Same inputs as add_audience_users: prefer file_path, a local CSV whose header names the schema columns, so values never pass through the model; inline rows (max 1,000) have already passed through the calling model and its provider. Values are normalized and SHA-256 hashed locally unless pre_hashed. Returns counts only."""
     return await _send_audience_users(
