@@ -191,10 +191,20 @@ async def _collect_edge(
     max_items: int | None = None,
     max_pages: int = MAX_EDGE_PAGES,
     extra_params: dict[str, Any] | None = None,
+    stop_reasons: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Read an edge across pages up to a cap; report whether the end was reached."""
+    """Read an edge across pages up to a cap; report whether the end was reached.
+
+    The end is reached only when Meta's page has no next link. When the read stops
+    early, a plain-language reason is appended to stop_reasons if a list is given.
+    """
     items: list[dict[str, Any]] = []
     after: str | None = None
+
+    def stopped(reason: str) -> None:
+        if stop_reasons is not None:
+            stop_reasons.append(f"{edge} of {parent_id}: {reason}")
+
     for _ in range(max_pages):
         params: dict[str, Any] = {**(extra_params or {}), "limit": page_size}
         if after:
@@ -202,12 +212,19 @@ async def _collect_edge(
         payload = await client.list_objects(parent_id, edge, fields=fields, params=params)
         page = normalize_collection(payload)
         items.extend(page["items"])
+        has_next = bool(page["paging"].get("next"))
         if max_items is not None and len(items) >= max_items:
-            more = len(items) > max_items or bool(page["paging"].get("next"))
+            more = len(items) > max_items or has_next
+            if more:
+                stopped(f"stopped at the {max_items}-item cap; more items exist.")
             return items[:max_items], not more
-        after = page["paging"].get("after")
-        if not page["paging"].get("next") or not after:
+        if not has_next:
             return items, True
+        after = page["paging"].get("after")
+        if not after:
+            stopped("Meta reported another page but gave no cursor to read it.")
+            return items, False
+    stopped(f"stopped after {max_pages} pages; more pages exist.")
     return items, False
 
 
@@ -366,10 +383,12 @@ def _validate_rule_params(rule_type: str, params: Any) -> dict[str, str]:
     return dict(params)
 
 
-async def _connected_sources(client: Any, catalog_id: str) -> tuple[list[dict[str, Any]], bool]:
+async def _connected_sources(
+    client: Any, catalog_id: str, stop_reasons: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     return await _collect_edge(
         client, catalog_id, "external_event_sources",
-        fields=EVENT_SOURCE_FIELDS, page_size=100, max_pages=5,
+        fields=EVENT_SOURCE_FIELDS, page_size=100, max_pages=5, stop_reasons=stop_reasons,
     )
 
 
@@ -722,10 +741,11 @@ async def list_event_source_catalogs(
                 "The event source has no readable owner_business; pass business_id to choose "
                 "which business's catalogs to check."
             )
+    stop_reasons: list[str] = []
     catalogs, catalogs_complete = await _collect_edge(
         client, business_id, "owned_product_catalogs",
         fields=CATALOG_SCAN_FIELDS, page_size=CATALOG_SCAN_PAGE_SIZE,
-        max_items=MAX_CATALOGS_SCANNED,
+        max_items=MAX_CATALOGS_SCANNED, stop_reasons=stop_reasons,
     )
     matches: list[dict[str, Any]] = []
     sources_complete = True
@@ -733,7 +753,7 @@ async def list_event_source_catalogs(
         catalog_id = _object_id(catalog.get("id"))
         if catalog_id is None:
             continue
-        sources, complete = await _connected_sources(client, catalog_id)
+        sources, complete = await _connected_sources(client, catalog_id, stop_reasons)
         sources_complete = sources_complete and complete
         if any(_object_id(source.get("id")) == event_source_id for source in sources):
             matches.append(catalog)
@@ -741,8 +761,8 @@ async def list_event_source_catalogs(
     note = (
         "Every owned catalog of the business was checked."
         if complete
-        else f"The scan is incomplete: it stopped after {len(catalogs)} catalogs or a catalog "
-        "had more connected sources than were read. Catalogs not checked may also be connected."
+        else f"The scan is incomplete after checking {len(catalogs)} catalogs: "
+        f"{' '.join(stop_reasons)} Catalogs or sources not read may also be connected."
     )
     return {
         "items": matches,
@@ -752,6 +772,7 @@ async def list_event_source_catalogs(
             "business_id": business_id,
             "catalogs_scanned": len(catalogs),
             "complete": complete,
+            "stop_reasons": stop_reasons,
             "method": "derived: each catalog owned by the business is checked for this source "
             "on its external_event_sources edge; catalogs shared with the business by others "
             "are not checked.",

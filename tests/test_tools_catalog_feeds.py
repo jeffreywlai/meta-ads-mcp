@@ -566,6 +566,33 @@ def test_list_event_source_catalogs_reports_incomplete_scan(monkeypatch) -> None
     assert result["summary"]["complete"] is False
     assert result["summary"]["catalogs_scanned"] == catalog_feeds.MAX_CATALOGS_SCANNED
     assert "incomplete" in result["summary"]["note"]
+    assert any("50-item cap" in reason for reason in result["summary"]["stop_reasons"])
+
+
+def test_list_event_source_catalogs_next_page_without_cursor_is_not_complete(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("biz_1", "owned_product_catalogs"): {
+            "data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"},
+        },
+    }))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    assert result["summary"]["complete"] is False
+    assert any("no cursor" in reason for reason in result["summary"]["stop_reasons"])
+    assert "no cursor" in result["summary"]["note"]
+
+
+def test_list_event_source_catalogs_catalog_sources_without_cursor_is_not_complete(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1"}]},
+        ("cat_1", "external_event_sources"): {
+            "data": [{"id": "px_9"}], "paging": {"next": "https://graph.invalid/next"},
+        },
+    }))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["stop_reasons"] == [
+        "external_event_sources of cat_1: Meta reported another page but gave no cursor to read it.",
+    ]
 
 
 def test_list_event_source_catalogs_permission_error_is_not_swallowed(monkeypatch) -> None:
