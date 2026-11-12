@@ -76,6 +76,74 @@ def test_async_poll_arguments_preserve_named_purchase_projection(monkeypatch):
     assert result["rows"]["summary"]["complete"] is True
 
 
+@pytest.mark.parametrize("breakdowns", [
+    ["publisher_platform", "platform_position"],
+    "publisher_platform,platform_position",
+    ["product_id"],
+])
+def test_async_poll_arguments_keep_breakdown_identity_across_pages(monkeypatch, breakdowns):
+    dimensions = breakdowns.split(",") if isinstance(breakdowns, str) else breakdowns
+    native_rows = [
+        {"spend": "1.25", "actions": [{"action_type": "purchase", "value": "1"}],
+         **{field: f"segment_{index}_{field}" for field in dimensions}}
+        for index in range(2)
+    ]
+
+    class Client:
+        async def create_async_insights_report(self, object_id, *, fields, params):
+            assert params["breakdowns"] == ",".join(dimensions)
+            assert fields == ["spend", "actions"]
+            return {"report_run_id": "report_1"}
+
+        async def get_async_report(self, report_run_id, *, fields, limit, after):
+            index = 1 if after else 0
+            # Meta projects explicitly selected fields on the report edge;
+            # dimensions present in the stored report are otherwise dropped.
+            row = {key: value for key, value in native_rows[index].items() if key in fields}
+            page = {"data": [row]}
+            if not after:
+                page["paging"] = {"next": "next", "cursors": {"after": "page2"}}
+            return {"status": {"async_status": "Job Completed"}, "rows": page}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", Client)
+
+    async def roundtrip():
+        created = (await mcp_server.call_tool("create_async_insights_report", {
+            "level": "account", "object_id": "act_123", "fields": ["spend"],
+            "breakdowns": breakdowns, "flatten_actions": ["purchase"],
+        })).structured_content
+        arguments = created["poll_arguments"]
+        first = (await mcp_server.call_tool("get_async_insights_report", arguments)).structured_content
+        second = (await mcp_server.call_tool("get_async_insights_report", {
+            **arguments, "after": first["rows"]["paging"]["after"],
+        })).structured_content
+        return first["rows"]["items"] + second["rows"]["items"]
+
+    rows = asyncio.run(roundtrip())
+    assert [{field: row[field] for field in dimensions} for row in rows] == [
+        {field: row[field] for field in dimensions} for row in native_rows
+    ]
+    assert all(row["purchase"] == 1 and "actions" not in row for row in rows)
+
+
+def test_async_batch_poll_arguments_keep_each_reports_own_dimensions(monkeypatch):
+    class Client:
+        async def create_async_insights_report(self, *args, **kwargs):
+            return {"report_run_id": "report_1"}
+
+    monkeypatch.setattr(insights, "get_graph_api_client", Client)
+    result = asyncio.run(insights.create_async_insights_report_batch(
+        level="account", object_id="act_123", fields=["spend", "publisher_platform"],
+        breakdown_sets=[["publisher_platform", "platform_position"], ["product_id"]],
+    ))
+    assert result["items"][0]["poll_arguments"]["fields"] == [
+        "spend", "publisher_platform", "platform_position",
+    ]
+    assert result["items"][1]["poll_arguments"]["fields"] == [
+        "spend", "publisher_platform", "product_id",
+    ]
+
+
 class ReportClient:
     def __init__(self, total_rows=99_164):
         self.total_rows = total_rows
