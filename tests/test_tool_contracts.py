@@ -147,6 +147,8 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_instagram_media": {"instagram_account_id": "ig_123"},
     "list_creative_ads": {"account_id": "123"},
     "get_field_reference": {"level": "ad", "field_names": ["name", "status"], "object_id": "ad_123"},
+    "update_adset": {"name": "Updated Ad Set"},
+    "update_ad": {"name": "Updated Ad"},
 }
 
 

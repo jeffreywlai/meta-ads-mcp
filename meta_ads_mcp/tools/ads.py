@@ -6,6 +6,7 @@ from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.field_reference import FIELD_REFERENCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
 from meta_ads_mcp.input_compat import resolve_identifier_alias
@@ -14,7 +15,8 @@ from meta_ads_mcp.money import (
     to_minor_units,
     validate_positive_amount,
 )
-from meta_ads_mcp.schemas import collection_response, creation_response
+from meta_ads_mcp.normalize import blank_to_none
+from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import CurrencyAmount, StrictStringList, coerce_strict_csv_string_list
 
 AD_IMAGE_FIELDS = [
@@ -328,3 +330,84 @@ async def get_ad_image(ad_id: str | None = None, ad_ids: StrictStringList | None
             "placement_note": results[0]["summary"]["placement_note"],
         },
     )
+
+
+_AD_PARAMS_REJECTED = {
+    "bid_amount": "bid_amount is a money field in minor units and is not supported by update_ad.",
+    "adset_id": "adset_id cannot be changed on an existing ad; Meta does not allow it.",
+    "creative": "Use creative_id instead of params.creative.",
+}
+
+
+@mcp_server.tool()
+async def update_ad(
+    ad_id: str,
+    name: str | None = None,
+    creative_id: str | None = None,
+    tracking_specs: list[dict[str, Any]] | None = None,
+    status: str | None = None,
+    validate_only: bool = False,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Edit an ad's name, creative, tracking specs or status (ACTIVE or PAUSED), with before/after. Use validate_only to have Meta check the change without applying it."""
+    ad_id = blank_to_none(ad_id)
+    if ad_id is None:
+        raise ValidationError("ad_id is required.")
+    if creative_id is not None and blank_to_none(creative_id) is None:
+        raise ValidationError("creative_id must be a nonblank creative id when provided.")
+    for key, message in _AD_PARAMS_REJECTED.items():
+        if params and key in params:
+            raise ValidationError(message)
+    if status is not None and status not in VALID_AD_STATUSES:
+        raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}; delete with delete_ad.")
+    resolved_creative_id = blank_to_none(creative_id)
+    payload: dict[str, Any] = {
+        "name": OMIT if name is None else name,
+        "creative": OMIT if resolved_creative_id is None else {"creative_id": resolved_creative_id},
+        "tracking_specs": OMIT if tracking_specs is None else tracking_specs,
+        "status": OMIT if status is None else status,
+    }
+    add_validate_only(payload, validate_only=validate_only)
+    payload = merge_graph_payload(payload, params)
+    changes = {key: value for key, value in payload.items() if key != "execution_options"}
+    if not changes:
+        raise ValidationError("At least one field must be provided for update_ad.")
+    readable = FIELD_REFERENCE["ad"]
+    read_fields = [
+        "creative{id}" if key == "creative" else key
+        for key in changes
+        if key in readable
+    ]
+    not_read = [key for key in changes if key not in readable]
+    client = get_graph_api_client()
+    previous = await client.get_object(ad_id, fields=["id", *read_fields])
+    result = await client.update_object(ad_id, data=payload)
+
+    def _public(values: dict[str, Any], *, before: bool) -> dict[str, Any]:
+        shaped: dict[str, Any] = {}
+        for key in changes:
+            if before and key not in readable:
+                continue
+            if key == "creative":
+                creative = values.get("creative")
+                if before:
+                    shaped["creative_id"] = creative.get("id") if isinstance(creative, dict) else creative
+                else:
+                    shaped["creative_id"] = resolved_creative_id
+            else:
+                shaped[key] = values.get(key)
+        return shaped
+
+    response = mutation_response(
+        action="update_ad",
+        target={"ad_id": ad_id},
+        previous=_public(previous, before=True),
+        current=_public(changes, before=False),
+    )
+    response.update({
+        "validation_only": validate_only,
+        "applied": not validate_only,
+        "previous_not_read": not_read,
+        "result": result,
+    })
+    return response

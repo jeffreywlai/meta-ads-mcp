@@ -116,6 +116,8 @@ TOOL_GROUPS = {
         "update_creative",
         "update_ad_creative",
         "delete_creative",
+        "update_adset",
+        "update_ad",
     ],
     "creative_ops": [
         "get_ad_image",

@@ -7,6 +7,7 @@ from typing import Any
 from meta_ads_mcp.api_compat import validate_targeting_placements
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.field_reference import FIELD_REFERENCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
 from meta_ads_mcp.money import (
@@ -15,6 +16,7 @@ from meta_ads_mcp.money import (
     to_minor_units,
     validate_positive_amount,
 )
+from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, StringList
 
@@ -272,3 +274,88 @@ async def create_ad_set(
         result=result,
         validate_only=validate_only,
     )
+
+
+_ADSET_MONEY_FIELD_TOOLS = {
+    "daily_budget": "update_adset_budget",
+    "lifetime_budget": "update_adset_budget",
+    "bid_amount": "update_adset_bid_amount",
+    "bid_strategy": "update_adset_bid_strategy",
+    "bid_constraints": "update_adset_bid_strategy",
+}
+_ADSET_MINOR_UNIT_FIELDS = {
+    "daily_spend_cap",
+    "lifetime_spend_cap",
+    "daily_min_spend_target",
+    "lifetime_min_spend_target",
+}
+_UPDATABLE_ADSET_STATUSES = {"ACTIVE", "PAUSED"}
+
+
+@mcp_server.tool()
+async def update_adset(
+    adset_id: str,
+    name: str | None = None,
+    targeting: dict[str, Any] | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    optimization_goal: str | None = None,
+    billing_event: str | None = None,
+    promoted_object: dict[str, Any] | None = None,
+    status: str | None = None,
+    validate_only: bool = False,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object or status, with before/after. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec."""
+    adset_id = blank_to_none(adset_id)
+    if adset_id is None:
+        raise ValidationError("adset_id is required.")
+    for field_name, tool_name in _ADSET_MONEY_FIELD_TOOLS.items():
+        if params and field_name in params:
+            raise ValidationError(f"{field_name} cannot be changed with update_adset; use {tool_name}.")
+    blocked = sorted(_ADSET_MINOR_UNIT_FIELDS.intersection(params or {}))
+    if blocked:
+        raise ValidationError(
+            f"{', '.join(blocked)}: money fields in minor units are not supported by update_adset."
+        )
+    if status is not None and status not in _UPDATABLE_ADSET_STATUSES:
+        raise ValidationError(
+            f"status must be one of {sorted(_UPDATABLE_ADSET_STATUSES)}; delete with delete_adset."
+        )
+    if targeting is not None:
+        validate_targeting_placements(targeting)
+    typed = {
+        "name": name,
+        "targeting": targeting,
+        "start_time": start_time,
+        "end_time": end_time,
+        "optimization_goal": optimization_goal,
+        "billing_event": billing_event,
+        "promoted_object": promoted_object,
+        "status": status,
+    }
+    payload: dict[str, Any] = {key: OMIT if value is None else value for key, value in typed.items()}
+    add_validate_only(payload, validate_only=validate_only)
+    payload = merge_graph_payload(payload, params)
+    changes = {key: value for key, value in payload.items() if key != "execution_options"}
+    if not changes:
+        raise ValidationError("At least one field must be provided for update_adset.")
+    readable = FIELD_REFERENCE["adset"]
+    read_fields = [key for key in changes if key in readable]
+    not_read = [key for key in changes if key not in readable]
+    client = get_graph_api_client()
+    previous = await client.get_object(adset_id, fields=["id", *read_fields])
+    result = await client.update_object(adset_id, data=payload)
+    response = mutation_response(
+        action="update_adset",
+        target={"adset_id": adset_id},
+        previous={key: previous.get(key) for key in read_fields},
+        current=changes,
+    )
+    response.update({
+        "validation_only": validate_only,
+        "applied": not validate_only,
+        "previous_not_read": not_read,
+        "result": result,
+    })
+    return response

@@ -378,3 +378,75 @@ def test_get_ad_image_supports_asset_feed_only_images(monkeypatch) -> None:
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: AssetFeedOnlyClient())
     result = asyncio.run(ads.get_ad_image(ad_id="ad_123"))
     assert result["item"]["best_image_url"] == "https://example.com/feed-only.png"
+
+
+class FakeUpdateAdClient:
+    """Fake client for update_ad that records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, object]] = []
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        return {
+            "id": object_id,
+            "name": "Old ad",
+            "status": "PAUSED",
+            "creative": {"id": "crt_old"},
+            "tracking_specs": [{"action.type": ["offsite_conversion"], "fb_pixel": ["1"]}],
+        }
+
+    async def update_object(self, object_id: str, *, data):
+        self.calls.append(("update", object_id, data))
+        return {"success": True}
+
+
+def test_update_ad_reads_then_updates_with_before_after(monkeypatch) -> None:
+    client = FakeUpdateAdClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(ads.update_ad(ad_id="ad_1", name="New ad", creative_id="crt_new", status="ACTIVE"))
+
+    assert [call[0] for call in client.calls] == ["get", "update"]
+    assert {"name", "status", "creative{id}"} <= set(client.calls[0][2])
+    assert client.calls[1][2] == {"name": "New ad", "creative": {"creative_id": "crt_new"}, "status": "ACTIVE"}
+    assert result["action"] == "update_ad"
+    assert result["target"] == {"ad_id": "ad_1"}
+    assert result["previous"] == {"name": "Old ad", "creative_id": "crt_old", "status": "PAUSED"}
+    assert result["current"] == {"name": "New ad", "creative_id": "crt_new", "status": "ACTIVE"}
+    assert result["validation_only"] is False
+
+
+def test_update_ad_validate_only_and_tracking_specs(monkeypatch) -> None:
+    client = FakeUpdateAdClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    specs = [{"action.type": ["offsite_conversion"], "fb_pixel": ["2"]}]
+    result = asyncio.run(ads.update_ad(ad_id="ad_1", tracking_specs=specs, validate_only=True))
+    assert client.calls[1][2] == {"tracking_specs": specs, "execution_options": ["validate_only"]}
+    assert result["validation_only"] is True
+    assert result["previous"]["tracking_specs"][0]["fb_pixel"] == ["1"]
+
+
+def test_update_ad_requires_a_change(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match="At least one field"):
+        asyncio.run(ads.update_ad(ad_id="ad_1"))
+    with pytest.raises(ads.ValidationError, match="At least one field"):
+        asyncio.run(ads.update_ad(ad_id="ad_1", validate_only=True, params={}))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"ad_id": "", "name": "x"}, "ad_id is required"),
+        ({"ad_id": "ad_1", "status": "DELETED"}, "status must be"),
+        ({"ad_id": "ad_1", "creative_id": " "}, "creative_id"),
+        ({"ad_id": "ad_1", "params": {"bid_amount": 100}}, "bid_amount"),
+        ({"ad_id": "ad_1", "params": {"adset_id": "s2"}}, "adset_id"),
+        ({"ad_id": "ad_1", "params": {"creative": {"creative_id": "c"}}}, "creative"),
+    ],
+)
+def test_update_ad_validation_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match=message):
+        asyncio.run(ads.update_ad(**arguments))
