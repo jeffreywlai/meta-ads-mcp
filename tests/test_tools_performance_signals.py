@@ -807,3 +807,207 @@ def test_advertiser_context_validation_errors_make_no_calls(monkeypatch, kwargs)
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.get_advertiser_context(**kwargs))
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# get_delivery_errors
+# ---------------------------------------------------------------------------
+
+
+def _spend_handler(spend_by_object: dict[str, float]):
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if object_id not in spend_by_object:
+            return {"data": []}
+        return {"data": [{"spend": str(spend_by_object[object_id])}]}
+
+    return handler
+
+
+ACTIVE_ACCOUNT = {"id": "act_42", "name": "Shop", "account_status": 1, "disable_reason": 0, "currency": "USD"}
+
+PROBLEM_ADS = [
+    {
+        "id": "ad_medium", "name": "Medium", "effective_status": "ACTIVE", "status": "ACTIVE",
+        "issues_info": [{"error_code": 1815, "error_summary": "Low delivery", "error_message": "Audience too narrow",
+                         "error_type": "SOFT_ERROR", "level": "AD"}],
+    },
+    {
+        "id": "ad_disapproved", "name": "Disapproved", "effective_status": "DISAPPROVED", "status": "ACTIVE",
+        "ad_review_feedback": {"global": {"Personal attributes": "Ads can't assert personal attributes."}},
+    },
+    {"id": "ad_with_issues", "name": "With issues", "effective_status": "WITH_ISSUES", "status": "ACTIVE"},
+    {
+        "id": "ad_paused", "name": "Paused", "effective_status": "ADSET_PAUSED", "status": "ACTIVE",
+        "failed_delivery_checks": [{"check_name": "no_active_creative", "summary": "No creative", "description": "Add one"}],
+    },
+    {"id": "ad_clean", "name": "Clean", "effective_status": "ACTIVE", "status": "ACTIVE", "issues_info": []},
+]
+
+
+def test_delivery_errors_scans_account_and_reads_problem_fields(monkeypatch) -> None:
+    client = _patch(
+        monkeypatch,
+        RecordingClient(
+            objects={"act_42": ACTIVE_ACCOUNT},
+            edges={("act_42", "ads"): {"data": PROBLEM_ADS}},
+            insights_handler=_spend_handler({"ad_medium": 50.0}),
+        ),
+    )
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="42"))
+
+    account_read = _calls(client, "get_object")[0]
+    assert account_read["object_id"] == "act_42"
+    assert {"account_status", "disable_reason"} <= set(account_read["fields"])
+    scan = _calls(client, "list_objects")[0]
+    assert scan["edge"] == "ads"
+    assert {"issues_info", "failed_delivery_checks", "ad_review_feedback", "effective_status"} <= set(scan["fields"])
+    assert "DELETED" not in scan["params"]["effective_status"]
+    assert "DISAPPROVED" in scan["params"]["effective_status"]
+    spend_calls = _calls(client, "get_insights")
+    assert {call["object_id"] for call in spend_calls} == {"ad_medium", "ad_disapproved", "ad_with_issues", "ad_paused"}
+    assert all(call["params"]["date_preset"] == "last_7d" and call["fields"] == ["spend"] for call in spend_calls)
+
+    problems = {problem["object_id"]: problem for problem in result["problems"]}
+    assert "ad_clean" not in problems and "act_42" not in problems
+    medium = problems["ad_medium"]
+    assert medium["severity"] == "medium"
+    assert medium["reasons"][0] == {
+        "source": "issues_info", "code": 1815, "summary": "Low delivery", "message": "Audience too narrow",
+        "error_type": "SOFT_ERROR", "issue_level": "AD",
+    }
+    assert medium["spend"] == 50.0
+    review = problems["ad_disapproved"]["reasons"][0]
+    assert review["source"] == "ad_review_feedback" and review["code"] == "Personal attributes"
+    assert problems["ad_paused"]["reasons"][0]["code"] == "no_active_creative"
+    assert result["scan"]["complete"] is True
+    assert result["scan"]["objects_examined"] == 5
+    assert result["missing_signals"] == []
+
+
+def test_delivery_errors_orders_by_severity_then_spend(monkeypatch) -> None:
+    account = {**ACTIVE_ACCOUNT, "account_status": 9}
+    _patch(
+        monkeypatch,
+        RecordingClient(
+            objects={"act_42": account},
+            edges={("act_42", "ads"): {"data": PROBLEM_ADS}},
+            insights_handler=_spend_handler(
+                {"act_42": 1000.0, "ad_with_issues": 100.0, "ad_disapproved": 10.0, "ad_medium": 500.0, "ad_paused": 0.0}
+            ),
+        ),
+    )
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+
+    assert [(problem["object_id"], problem["severity"]) for problem in result["problems"]] == [
+        ("act_42", "high"),
+        ("ad_with_issues", "high"),
+        ("ad_disapproved", "high"),
+        ("ad_medium", "medium"),
+        ("ad_paused", "low"),
+    ]
+    assert [finding["severity"] for finding in result["findings"]] == ["high", "high", "high", "medium", "low"]
+    assert result["ordering"] == ["severity", "spend_desc", "object_id"]
+
+
+def test_delivery_errors_disabled_account_is_critical_with_reason_label(monkeypatch) -> None:
+    account = {**ACTIVE_ACCOUNT, "account_status": 2, "disable_reason": 3}
+    _patch(
+        monkeypatch,
+        RecordingClient(objects={"act_42": account}, insights_handler=_spend_handler({})),
+    )
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42", level="account"))
+
+    problem = result["problems"][0]
+    assert problem["severity"] == "critical"
+    codes = {(reason["source"], reason["code"]) for reason in problem["reasons"]}
+    assert ("account_status", "DISABLED") in codes
+    assert ("disable_reason", "RISK_PAYMENT") in codes
+    assert result["scan"]["mode"] == "account_only"
+
+
+def test_delivery_errors_reports_incomplete_scan(monkeypatch) -> None:
+    def endless(params: dict[str, Any]) -> dict[str, Any]:
+        page = int(params.get("after", "0"))
+        return {
+            "data": [{"id": f"ad_{page}_{index}", "effective_status": "ACTIVE"} for index in range(2)],
+            "paging": {"cursors": {"after": str(page + 1)}, "next": "https://graph.example/next"},
+        }
+
+    client = _patch(
+        monkeypatch,
+        RecordingClient(objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): endless},
+                        insights_handler=_spend_handler({})),
+    )
+
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42", limit=4))
+
+    scans = _calls(client, "list_objects")
+    assert len(scans) == 2
+    assert result["scan"]["complete"] is False
+    assert result["scan"]["objects_examined"] == 4
+    assert result["scan"]["next_after"] == "2"
+    assert result["scan"]["stop_reason"] == "limit_reached"
+    assert any("incomplete" in signal and "4" in signal for signal in result["missing_signals"])
+
+
+def test_delivery_errors_named_objects_read_each_object(monkeypatch) -> None:
+    client = _patch(
+        monkeypatch,
+        RecordingClient(
+            objects={
+                "act_42": ACTIVE_ACCOUNT,
+                "as_1": {"id": "as_1", "name": "Set", "effective_status": "WITH_ISSUES",
+                         "issues_info": [{"error_code": 2, "error_summary": "Budget too low"}]},
+                "as_2": {"id": "as_2", "name": "Fine", "effective_status": "ACTIVE"},
+            },
+            insights_handler=_spend_handler({"as_1": 12.5}),
+        ),
+    )
+
+    result = asyncio.run(
+        performance_signals.get_delivery_errors(account_id="act_42", level="adset", object_ids="as_1, as_2")
+    )
+
+    assert _calls(client, "list_objects") == []
+    reads = {call["object_id"]: call for call in _calls(client, "get_object")}
+    assert set(reads) == {"act_42", "as_1", "as_2"}
+    assert "issues_info" in reads["as_1"]["fields"]
+    assert "ad_review_feedback" not in reads["as_1"]["fields"]
+    assert [problem["object_id"] for problem in result["problems"]] == ["as_1"]
+    assert result["problems"][0]["spend"] == 12.5
+    assert result["scan"] == {
+        "mode": "named_objects", "level": "adset", "objects_examined": 2, "complete": True,
+        "next_after": None, "stop_reason": None, "pages_fetched": 0, "limit": 500, "effective_status_filter": None,
+    }
+
+
+def test_delivery_errors_permission_error_is_not_swallowed(monkeypatch) -> None:
+    _patch(
+        monkeypatch,
+        RecordingClient(objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): _permission_error()}),
+    )
+    with pytest.raises(MetaApiError, match="Permissions"):
+        asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"account_id": ""},
+        {"account_id": "act_1", "level": "creative"},
+        {"account_id": "act_1", "level": "account", "object_ids": ["1"]},
+        {"account_id": "act_1", "level": "ad", "object_ids": [str(index) for index in range(51)]},
+        {"account_id": "act_1", "level": "ad", "object_ids": ["1"], "after": "cursor"},
+        {"account_id": "act_1", "limit": 0},
+        {"account_id": "act_1", "limit": 2001},
+        {"account_id": "act_1", "spend_date_preset": "last_forever"},
+    ],
+)
+def test_delivery_errors_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.get_delivery_errors(**kwargs))
+    assert client.calls == []

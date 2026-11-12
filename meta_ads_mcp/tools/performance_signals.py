@@ -14,8 +14,9 @@ from meta_ads_mcp.money import from_minor_units, normalize_currency
 from meta_ads_mcp.normalize import blank_to_none, to_float
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
-from meta_ads_mcp.tool_types import StringList
+from meta_ads_mcp.tool_types import StringList, coerce_csv_string_list
 from meta_ads_mcp.tools import diagnostics as diagnostics_tools
+from meta_ads_mcp.tools import insights as insights_tools
 from meta_ads_mcp.tools import recommendations as recommendation_tools
 from meta_ads_mcp.tools.insights import get_entity_insights
 
@@ -281,7 +282,7 @@ def _normalize_metric_names(metrics: list[str] | None, default: tuple[str, ...])
     if metrics is None:
         return list(default)
     names: list[str] = []
-    for raw in metrics:
+    for raw in coerce_csv_string_list(metrics):
         name = str(raw).strip().lower()
         if not name:
             continue
@@ -1304,5 +1305,316 @@ async def get_advertiser_context(
             **sections,
             "section_errors": section_errors,
             "results_definition": RESULTS_DEFINITION,
+        },
+    )
+
+
+DELIVERY_LEVELS = ("account", "campaign", "adset", "ad")
+DELIVERY_EDGES = {"campaign": "campaigns", "adset": "adsets", "ad": "ads"}
+DELIVERY_OBJECT_FIELDS = {
+    "campaign": ["id", "name", "status", "effective_status", "issues_info"],
+    "adset": ["id", "name", "status", "effective_status", "campaign_id", "issues_info"],
+    "ad": [
+        "id", "name", "status", "effective_status", "campaign_id", "adset_id",
+        "issues_info", "failed_delivery_checks", "ad_review_feedback",
+    ],
+}
+DELIVERY_SCAN_STATUSES = {
+    "campaign": ["ACTIVE", "PAUSED", "IN_PROCESS", "WITH_ISSUES"],
+    "adset": ["ACTIVE", "PAUSED", "CAMPAIGN_PAUSED", "IN_PROCESS", "WITH_ISSUES"],
+    "ad": [
+        "ACTIVE", "PAUSED", "PENDING_REVIEW", "DISAPPROVED", "PREAPPROVED", "PENDING_BILLING_INFO",
+        "CAMPAIGN_PAUSED", "ADSET_PAUSED", "IN_PROCESS", "WITH_ISSUES",
+    ],
+}
+DELIVERY_ACCOUNT_FIELDS = ["id", "name", "account_status", "disable_reason", "currency"]
+BLOCKING_EFFECTIVE_STATUSES = {"DISAPPROVED", "WITH_ISSUES", "PENDING_BILLING_INFO"}
+PAUSED_EFFECTIVE_STATUSES = {"PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"}
+SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+MAX_DELIVERY_SCAN = 2000
+MAX_DELIVERY_PAGE = 100
+MAX_NAMED_OBJECTS = 50
+SPEND_LOOKUP_CAP = 50
+SPEND_LOOKUP_CONCURRENCY = 5
+DELIVERY_SEVERITY_POLICY = {
+    "critical": "the ad account is not active (account_status other than ACTIVE or IN_GRACE_PERIOD), which stops all delivery",
+    "high": (
+        "account in grace period; or the object's effective_status is DISAPPROVED, WITH_ISSUES or "
+        "PENDING_BILLING_INFO; or the ad has review feedback while not paused"
+    ),
+    "medium": "issues_info or failed_delivery_checks on an object that is not paused",
+    "low": "problems on an object whose effective_status is PAUSED, CAMPAIGN_PAUSED or ADSET_PAUSED",
+}
+
+
+def _object_reasons(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect delivery problems Meta reports on one campaign, ad set or ad."""
+    reasons: list[dict[str, Any]] = []
+    for issue in item.get("issues_info") or []:
+        if not isinstance(issue, dict):
+            continue
+        reasons.append({
+            "source": "issues_info",
+            "code": issue.get("error_code"),
+            "summary": issue.get("error_summary"),
+            "message": issue.get("error_message"),
+            "error_type": issue.get("error_type"),
+            "issue_level": issue.get("level"),
+        })
+    for check in item.get("failed_delivery_checks") or []:
+        if not isinstance(check, dict):
+            continue
+        reasons.append({
+            "source": "failed_delivery_checks",
+            "code": check.get("check_name"),
+            "summary": check.get("summary"),
+            "message": check.get("description"),
+            "extra_info": check.get("extra_info"),
+        })
+    feedback = item.get("ad_review_feedback")
+    if isinstance(feedback, dict):
+        global_feedback = feedback.get("global")
+        if isinstance(global_feedback, dict):
+            for reason, message in global_feedback.items():
+                reasons.append({"source": "ad_review_feedback", "code": reason, "message": message})
+        if feedback.get("placement_specific"):
+            reasons.append({
+                "source": "ad_review_feedback",
+                "code": "placement_specific",
+                "message": feedback.get("placement_specific"),
+            })
+    status = str(item.get("effective_status") or "").upper()
+    if status in BLOCKING_EFFECTIVE_STATUSES and not reasons:
+        reasons.append({"source": "effective_status", "code": status, "message": f"Meta reports effective_status {status}."})
+    return reasons
+
+
+def _object_severity(item: dict[str, Any], reasons: list[dict[str, Any]]) -> str:
+    """Apply DELIVERY_SEVERITY_POLICY to one object."""
+    status = str(item.get("effective_status") or "").upper()
+    if status in BLOCKING_EFFECTIVE_STATUSES:
+        return "high"
+    if status in PAUSED_EFFECTIVE_STATUSES:
+        return "low"
+    if any(reason["source"] == "ad_review_feedback" for reason in reasons):
+        return "high"
+    return "medium"
+
+
+def _account_problem(account: dict[str, Any], account_id: str) -> dict[str, Any] | None:
+    """Turn account status and disable reason into a problem entry when delivery is affected."""
+    status = _code_label(account.get("account_status"), ACCOUNT_STATUS_LABELS)
+    reason = _code_label(account.get("disable_reason"), DISABLE_REASON_LABELS)
+    reasons: list[dict[str, Any]] = []
+    severity: str | None = None
+    if status is not None and status["code"] not in (1, 201):
+        severity = "high" if status["code"] == 9 else "critical"
+        reasons.append({"source": "account_status", "code": status["label"], "message": f"account_status {status['code']}"})
+    if reason is not None and reason["code"] != 0:
+        severity = severity or "high"
+        reasons.append({"source": "disable_reason", "code": reason["label"], "message": f"disable_reason {reason['code']}"})
+    if not reasons:
+        return None
+    return {
+        "level": "account",
+        "object_id": account_id,
+        "name": account.get("name"),
+        "effective_status": status["label"] if status else None,
+        "severity": severity,
+        "reasons": reasons,
+    }
+
+
+@mcp_server.tool()
+async def get_delivery_errors(
+    account_id: str,
+    level: str = "ad",
+    object_ids: StringList | None = None,
+    limit: int = 500,
+    after: str | None = None,
+    spend_date_preset: str = "last_7d",
+) -> dict[str, Any]:
+    """List delivery-blocking problems: account status and disable reason, plus issues_info, failed delivery checks and ad review feedback on campaigns, ad sets or ads (scanned across the account, or object_ids up to 50), ordered by severity then spend in spend_date_preset. The scan stops at limit objects and says when it is incomplete; pass after=scan.next_after to continue."""
+    resolved_account_id = _require_account_id(account_id)
+    resolved_level = _require_level(level, DELIVERY_LEVELS)
+    named_ids = [
+        str(object_id).strip()
+        for object_id in (coerce_csv_string_list(object_ids) or [])
+        if str(object_id).strip()
+    ]
+    cursor = blank_to_none(after)
+    if named_ids and resolved_level == "account":
+        raise ValidationError("object_ids require level campaign, adset or ad.")
+    if len(named_ids) > MAX_NAMED_OBJECTS:
+        raise ValidationError(f"Provide at most {MAX_NAMED_OBJECTS} object_ids per call.")
+    if named_ids and cursor:
+        raise ValidationError("after continues an account scan; omit it when passing object_ids.")
+    if not 1 <= limit <= MAX_DELIVERY_SCAN:
+        raise ValidationError(f"limit must be between 1 and {MAX_DELIVERY_SCAN}.")
+    spend_params_by_level = {
+        spend_level: insights_tools._insights_params(level=spend_level, date_preset=spend_date_preset)
+        for spend_level in DELIVERY_LEVELS
+    }
+
+    client = get_graph_api_client()
+    account = await client.get_object(resolved_account_id, fields=DELIVERY_ACCOUNT_FIELDS)
+    scanned: list[dict[str, Any]] = []
+    scan: dict[str, Any]
+    if resolved_level == "account":
+        scan = {"mode": "account_only", "level": "account", "objects_examined": 0, "complete": True,
+                "next_after": None, "stop_reason": None, "pages_fetched": 0, "limit": limit,
+                "effective_status_filter": None}
+    elif named_ids:
+        fields = DELIVERY_OBJECT_FIELDS[resolved_level]
+        unique_ids = list(dict.fromkeys(named_ids))
+        scanned = list(await asyncio.gather(*(client.get_object(object_id, fields=fields) for object_id in unique_ids)))
+        scan = {"mode": "named_objects", "level": resolved_level, "objects_examined": len(scanned), "complete": True,
+                "next_after": None, "stop_reason": None, "pages_fetched": 0, "limit": limit,
+                "effective_status_filter": None}
+    else:
+        statuses = DELIVERY_SCAN_STATUSES[resolved_level]
+        pages = 0
+        complete = False
+        next_after: str | None = None
+        stop_reason: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "limit": min(MAX_DELIVERY_PAGE, limit - len(scanned)),
+                "effective_status": statuses,
+            }
+            if cursor:
+                params["after"] = cursor
+            payload = await client.list_objects(
+                resolved_account_id, DELIVERY_EDGES[resolved_level],
+                fields=DELIVERY_OBJECT_FIELDS[resolved_level], params=params,
+            )
+            pages += 1
+            scanned.extend(item for item in payload.get("data", []) or [] if isinstance(item, dict))
+            paging = extract_paging(payload)
+            if not paging.get("next"):
+                complete = True
+                break
+            following = paging.get("after")
+            if not following or following == cursor:
+                stop_reason = "pagination_cursor_missing_or_repeated"
+                break
+            if len(scanned) >= limit:
+                stop_reason = "limit_reached"
+                next_after = following
+                break
+            cursor = following
+        scan = {"mode": "account_scan", "level": resolved_level, "objects_examined": len(scanned),
+                "complete": complete, "next_after": next_after, "stop_reason": stop_reason,
+                "pages_fetched": pages, "limit": limit, "effective_status_filter": statuses}
+
+    problems: list[dict[str, Any]] = []
+    account_problem = _account_problem(account, resolved_account_id)
+    if account_problem:
+        problems.append(account_problem)
+    for item in scanned:
+        reasons = _object_reasons(item)
+        if not reasons:
+            continue
+        problems.append({
+            "level": resolved_level,
+            "object_id": str(item.get("id")) if item.get("id") is not None else None,
+            "name": item.get("name"),
+            "effective_status": item.get("effective_status"),
+            "status": item.get("status"),
+            "campaign_id": item.get("campaign_id"),
+            "adset_id": item.get("adset_id"),
+            "severity": _object_severity(item, reasons),
+            "reasons": reasons,
+        })
+
+    problems.sort(key=lambda problem: (SEVERITY_RANK[problem["severity"]], problem["object_id"] or ""))
+    to_lookup = [problem for problem in problems if problem["object_id"]][:SPEND_LOOKUP_CAP]
+    semaphore = asyncio.Semaphore(SPEND_LOOKUP_CONCURRENCY)
+    failed_lookups = 0
+
+    async def lookup_spend(problem: dict[str, Any]) -> None:
+        nonlocal failed_lookups
+        async with semaphore:
+            try:
+                payload = await client.get_insights(
+                    problem["object_id"], fields=["spend"], params=spend_params_by_level[problem["level"]],
+                )
+            except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
+                failed_lookups += 1
+                problem["spend"] = None
+                problem["spend_status"] = "lookup_failed"
+                problem["spend_error"] = _public_error(exc).get("message")
+                return
+        problem["spend"] = sum(to_float(row.get("spend")) or 0.0 for row in payload.get("data", []) or [])
+        problem["spend_status"] = "read"
+
+    await asyncio.gather(*(lookup_spend(problem) for problem in to_lookup))
+    for problem in problems:
+        problem.setdefault("spend", None)
+        problem.setdefault("spend_status", "not_looked_up")
+    problems.sort(key=lambda problem: (
+        SEVERITY_RANK[problem["severity"]],
+        problem["spend"] is None,
+        -(problem["spend"] or 0.0),
+        problem["object_id"] or "",
+    ))
+
+    missing_signals: list[str] = []
+    if not scan["complete"]:
+        detail = (
+            f"pass after={scan['next_after']!r} to continue" if scan["next_after"]
+            else "Meta's pagination cursor was missing or repeated"
+        )
+        missing_signals.append(
+            f"Scan incomplete: examined {scan['objects_examined']} {resolved_level}(s) and more exist; {detail}. "
+            "Problems on objects not yet examined are not listed."
+        )
+    if len(problems) > SPEND_LOOKUP_CAP:
+        missing_signals.append(
+            f"Spend was looked up for the first {SPEND_LOOKUP_CAP} problems by severity only; the rest have spend null."
+        )
+    if failed_lookups:
+        missing_signals.append(f"Spend lookup failed for {failed_lookups} problem(s); their spend is null.")
+
+    findings = []
+    for problem in problems:
+        finding = build_finding(
+            "delivery_blocking_problem",
+            f"{problem['level']} {problem['object_id']}: "
+            + "; ".join(str(reason.get("summary") or reason.get("code")) for reason in problem["reasons"]),
+            severity=problem["severity"],
+            confidence=None,
+            evidence=[
+                metric_evidence(
+                    "spend", problem["spend"], f"Meta-reported spend for {spend_date_preset}",
+                    {"spend_status": problem["spend_status"]},
+                ),
+                *(
+                    metric_evidence(str(reason["source"]), None, "Meta-reported field", reason)
+                    for reason in problem["reasons"]
+                ),
+            ],
+            affected_entities=[{"level": problem["level"], "object_id": problem["object_id"], "name": problem["name"]}],
+        )
+        findings.append(finding)
+
+    return analysis_response(
+        scope={"level": "account", "object_id": resolved_account_id},
+        metrics={"problem_count": len(problems)},
+        findings=findings,
+        missing_signals=missing_signals,
+        extra={
+            "account": {
+                "id": str(account.get("id") or resolved_account_id),
+                "name": account.get("name"),
+                "account_status": _code_label(account.get("account_status"), ACCOUNT_STATUS_LABELS),
+                "disable_reason": _code_label(account.get("disable_reason"), DISABLE_REASON_LABELS),
+            },
+            "problems": problems,
+            "scan": scan,
+            "spend_window": {"date_preset": spend_params_by_level["account"]["date_preset"]},
+            "spend_lookups": {"attempted": len(to_lookup), "failed": failed_lookups, "cap": SPEND_LOOKUP_CAP},
+            "ordering": ["severity", "spend_desc", "object_id"],
+            "severity_policy": DELIVERY_SEVERITY_POLICY,
         },
     )

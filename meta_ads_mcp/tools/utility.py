@@ -79,6 +79,7 @@ TOOL_GROUPS = {
         "detect_performance_anomalies",
         "get_auction_ranking_report",
         "get_advertiser_context",
+        "get_delivery_errors",
     ],
     "social_feedback": [
         "get_ad_social_context",
