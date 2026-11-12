@@ -962,6 +962,26 @@ def test_advertiser_context_response_stays_small_for_300_adsets(monkeypatch) -> 
     assert len(json.dumps(result).encode()) < 20_000
 
 
+def test_funnel_picks_the_alias_per_row_before_summing() -> None:
+    rows = [
+        {"actions_map": {"link_click": 100, "purchase": 10, "lead": 2}},
+        {"actions_map": {"link_click": 100, "offsite_conversion.fb_pixel_purchase": 20,
+                         "offsite_conversion.fb_pixel_lead": 3}},
+        {"actions_map": {"link_click": 50, "purchase": 5, "omni_purchase": 5}},
+    ]
+
+    funnel = performance_signals._funnel(performance_signals._sum_actions(rows))
+
+    steps = {step["step"]: step for step in funnel["steps"]}
+    assert steps["purchase"]["count"] == 35
+    assert steps["purchase"]["action_types_used"] == ["purchase", "offsite_conversion.fb_pixel_purchase"]
+    assert steps["link_click"]["count"] == 250
+    drop = next(row for row in funnel["drop_off"] if row["to"] == "purchase")
+    assert drop["drop_off"] == pytest.approx(1 - 35 / 250)
+    assert funnel["lead_events"]["count"] == 5
+    assert funnel["lead_events"]["action_types_used"] == ["lead", "offsite_conversion.fb_pixel_lead"]
+
+
 def test_advertiser_context_section_permission_error_is_reported_not_empty(monkeypatch) -> None:
     _patch(monkeypatch, _context_client({("act_42", "adspixels"): _permission_error()}))
 

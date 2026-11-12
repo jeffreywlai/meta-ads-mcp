@@ -1210,24 +1210,42 @@ def _group_spend(rows: list[dict[str, Any]], key: str, total_spend: float) -> li
     return sorted(groups.values(), key=lambda group: (-group["spend"], group[key]))
 
 
-def _sum_actions(rows: list[dict[str, Any]]) -> dict[str, float]:
-    """Sum parsed action maps across rows."""
-    totals: dict[str, float] = {}
+FUNNEL_EVENT_FAMILIES: list[tuple[str, list[str]]] = [*FUNNEL_STEPS, ("lead", LEAD_ACTION_TYPES)]
+
+
+def _sum_actions(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Total each funnel event family: per row take the first alias Meta reports, then sum across rows.
+
+    Choosing the alias per row keeps rows that report a different alias of the same event, and
+    still counts an event only once in a row that reports several aliases of it.
+    """
+    totals: dict[str, dict[str, Any]] = {
+        family: {"count": None, "action_types_used": []} for family, _ in FUNNEL_EVENT_FAMILIES
+    }
     for row in rows:
-        for action_type, value in (row.get("actions_map") or {}).items():
-            totals[action_type] = totals.get(action_type, 0.0) + (to_float(value) or 0.0)
+        actions = row.get("actions_map") or {}
+        for family, candidates in FUNNEL_EVENT_FAMILIES:
+            matched = next((candidate for candidate in candidates if candidate in actions), None)
+            if matched is None:
+                continue
+            total = totals[family]
+            total["count"] = (total["count"] or 0.0) + (to_float(actions[matched]) or 0.0)
+            if matched not in total["action_types_used"]:
+                total["action_types_used"].append(matched)
+    for family, candidates in FUNNEL_EVENT_FAMILIES:
+        totals[family]["action_types_used"].sort(key=candidates.index)
     return totals
 
 
-def _funnel(action_totals: dict[str, float]) -> dict[str, Any]:
+def _funnel(family_totals: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Build funnel step counts and drop-off between adjacent steps that have data."""
     steps = []
     for step, candidates in FUNNEL_STEPS:
-        matched = next((candidate for candidate in candidates if candidate in action_totals), None)
+        total = family_totals[step]
         steps.append({
             "step": step,
-            "count": _number(action_totals[matched]) if matched else None,
-            "action_type": matched,
+            "count": _number(total["count"]),
+            "action_types_used": list(total["action_types_used"]),
             "action_types_checked": candidates,
         })
     present = [step for step in steps if step["count"] is not None]
@@ -1242,14 +1260,15 @@ def _funnel(action_totals: dict[str, float]) -> dict[str, Any]:
             "drop_off": None if rate is None else 1 - rate,
             "formula": "1 - to_count / from_count",
         })
-    lead = next((candidate for candidate in LEAD_ACTION_TYPES if candidate in action_totals), None)
+    lead = family_totals["lead"]
     return {
         "steps": steps,
         "drop_off": drop_off,
-        "lead_events": {"count": _number(action_totals[lead]) if lead else None, "action_type": lead},
+        "lead_events": {"count": _number(lead["count"]), "action_types_used": list(lead["action_types_used"])},
         "note": (
-            "Each step uses the first matching action type Meta reports, so the same event is not counted twice. "
-            "Steps with no data are skipped when computing drop-off. Counts use Meta attribution."
+            "In each ad set row, a step uses the first matching action type Meta reports, so the same event is not "
+            "counted twice; the chosen counts are then summed across rows, so rows reporting different aliases of "
+            "one event all count. Steps with no data are skipped when computing drop-off. Counts use Meta attribution."
         ),
     }
 
