@@ -115,15 +115,16 @@ def _refuse_logins(value: Any, name: str) -> None:
     """Refuse a URL with an embedded login anywhere in an input, before any request is built.
 
     A key is named in the error only when it is one this tool accepts; any other key may be a
-    misplaced value, so the position is given instead.
+    misplaced value, so the position is given instead. List positions count from 0 (name[0]),
+    as every list position in this module does; a field's position within an object counts from 1.
     """
     if isinstance(value, str):
         refuse_url_credentials(value, name)
     elif isinstance(value, dict):
-        for index, (key, item) in enumerate(value.items(), start=1):
-            _refuse_logins(item, f"{name}.{key}" if key in _KNOWN_ENTRY_KEYS else f"{name} field {index}")
+        for number, (key, item) in enumerate(value.items(), start=1):
+            _refuse_logins(item, f"{name}.{key}" if key in _KNOWN_ENTRY_KEYS else f"{name} field {number}")
     elif isinstance(value, list):
-        for index, item in enumerate(value, start=1):
+        for index, item in enumerate(value):
             _refuse_logins(item, f"{name}[{index}]")
 
 
@@ -204,7 +205,7 @@ def _link_data_image(media: dict[str, str]) -> dict[str, str]:
 def _check_cards(cards: Any) -> list[dict[str, Any]]:
     if not isinstance(cards, list) or not MIN_CARDS <= len(cards) <= MAX_CARDS:
         raise ValidationError(f"cards must list {MIN_CARDS} to {MAX_CARDS} cards.")
-    for index, card in enumerate(cards, start=1):
+    for index, card in enumerate(cards):
         if not isinstance(card, dict):
             raise ValidationError(f"cards[{index}] must be an object.")
         _unknown_keys(card, CARD_KEYS, f"cards[{index}]")
@@ -469,7 +470,7 @@ def _build_carousel(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
         raise ValidationError("link_url is required for a carousel: Meta requires the top-level 'See more' link.")
     cards = _check_cards(inputs.cards)
     attachments: list[dict[str, Any]] = []
-    for index, card in enumerate(cards, start=1):
+    for index, card in enumerate(cards):
         where = f"cards[{index}]"
         media = _card_media(card, where)
         link = _text(card.get("link")) or inputs.link_url
@@ -529,7 +530,7 @@ def _build_messaging_carousel(inputs: _Inputs, page_id: str) -> tuple[dict[str, 
     cards = _check_cards(inputs.cards)
     button = {"type": cta, "value": {"app_destination": MESSAGING_DESTINATIONS[cta]}}
     attachments: list[dict[str, Any]] = []
-    for index, card in enumerate(cards, start=1):
+    for index, card in enumerate(cards):
         where = f"cards[{index}]"
         if card.get("link") is not None:
             raise ValidationError(f"{where} link is not used: on a click-to-Instagram carousel every card opens the chat.")
@@ -641,7 +642,7 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
     seen_media: set[str] = set()
     claimed: dict[tuple[str, str], int] = {}
     fallback_index: int | None = None
-    for index, entry in enumerate(entries, start=1):
+    for index, entry in enumerate(entries):
         where = f"placement_customizations[{index}]"
         if not isinstance(entry, dict):
             raise ValidationError(f"{where} must be an object.")
@@ -663,7 +664,8 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
         if media in seen_media:
             raise ValidationError(f"{where} repeats the media of an earlier entry; give each placement group a different asset.")
         seen_media.add(media)
-        label = f"placement_{index}"
+        # The label Meta sees keeps its 1-based name, so the request is unchanged.
+        label = f"placement_{index + 1}"
         if kind == "image":
             image_ref = {"url": image_url} if image_url else {"hash": image_hash}
             assets.append({**image_ref, "adlabels": [{"name": label}]})
@@ -678,7 +680,8 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
                 raise ValidationError(f"{where} sets {', '.join(position_keys)} without publisher_platforms.")
             if fallback_index is not None:
                 raise ValidationError(
-                    f"Only one entry may omit publisher_platforms (the fallback); entries {fallback_index} and {index} both do."
+                    "Only one entry may omit publisher_platforms (the fallback); "
+                    f"placement_customizations[{fallback_index}] and {where} both do."
                 )
             fallback_index = index
             customization_spec: dict[str, Any] = {}
@@ -706,7 +709,8 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
                     owner = claimed.get((platform, position))
                     if owner is not None:
                         raise ValidationError(
-                            f"A {platform} position is claimed by entries {owner} and {index}; placements must not overlap."
+                            f"A {platform} position is claimed by placement_customizations[{owner}] and {where}; "
+                            "placements must not overlap."
                         )
                     claimed[(platform, position)] = index
         label_key = "image_label" if kind == "image" else "video_label"
@@ -723,7 +727,8 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
     ]
     if fallback_index is not None:
         notes.append(
-            f"Entry {fallback_index} has no publisher_platforms and is sent with an empty customization_spec, as in "
+            f"placement_customizations[{fallback_index}] has no publisher_platforms and is sent with an empty "
+            "customization_spec, as in "
             "Meta's Threads example; Meta's guide does not state how such a rule is used."
         )
     return {"object_story_spec": _story_spec(inputs, page_id), "asset_feed_spec": feed}, notes
@@ -917,7 +922,7 @@ def _build_multi_media(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
     videos: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     primary: dict[str, Any] = {}
-    for index, entry in enumerate(entries, start=1):
+    for index, entry in enumerate(entries):
         where = f"multi_media[{index}]"
         if not isinstance(entry, dict):
             raise ValidationError(f"{where} must be an object.")
@@ -938,14 +943,14 @@ def _build_multi_media(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
             if image_url:
                 _require_url(image_url, f"{where} image_url")
             images.append({**({"url": image_url} if image_url else {"hash": image_hash}), "source": "multi_media", "opt_in_status": "opt_in"})
-            if index == 1:
+            if index == 0:
                 primary = {"image_url": image_url} if image_url else {"image_hash": image_hash}
             continue
         if not video_id.isdigit():
             raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
         if thumb_url and thumb_hash:
             raise ValidationError(f"{where}: give thumbnail_url or thumbnail_hash, not both.")
-        if thumb_hash and index != 1:
+        if thumb_hash and index != 0:
             raise ValidationError(
                 f"{where}: Meta's multi-media guide shows thumbnail_url for pool videos; thumbnail_hash is accepted only "
                 "on the first entry, which becomes the main video."
@@ -954,7 +959,7 @@ def _build_multi_media(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
         if thumb_url:
             video.update({"thumbnail_url": _require_url(thumb_url, f"{where} thumbnail_url"), "thumbnail_source": "custom"})
         videos.append(video)
-        if index == 1:
+        if index == 0:
             if not (thumb_url or thumb_hash):
                 raise ValidationError(
                     f"{where} is the main video, so it needs thumbnail_url or thumbnail_hash, as a single video does."

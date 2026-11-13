@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Annotated, Any, TypeAlias
 
 from pydantic import BeforeValidator, Field
 
 from meta_ads_mcp.api_compat import validate_targeting_placements
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaAdsError, ValidationError
+from meta_ads_mcp.errors import MetaAdsError, MetaApiError, ValidationError
 from meta_ads_mcp.field_reference import FIELD_REFERENCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
@@ -216,17 +217,18 @@ def _nonempty_object(value: Any, field_name: str) -> dict[str, Any]:
 # Scheduled budget increases (Meta's high demand periods): the budget_schedules
 # reference and the budget_schedule_specs parameter on campaign and ad set creation.
 BUDGET_SCHEDULE_VALUE_TYPES = ("ABSOLUTE", "MULTIPLIER")
-# Meta does not say whether an ABSOLUTE budget_value is in whole currency units
-# or in cents: its budgets overview says amounts are in the smallest unit, its
-# budget schedule reference says "140 could be $140 or 140%". A wrong guess is a
-# 100-fold error in a spend increase, so ABSOLUTE stays off until one live check
-# settles the unit. Set this to True, and keep or drop the conversion in
-# encode_budget_schedule_specs, once that check has been made.
-BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED = False
+# Live check, 2026-11-13: an ABSOLUTE budget_value is in minor units (raw 8000 read back as 8000 and was
+# "$80.00"), so the conversion in encode_budget_schedule_specs is right; increases past 8 times the daily budget were refused.
 _BUDGET_SCHEDULE_KEYS = ("time_start", "time_end", "budget_value", "budget_value_type")
 MAX_BUDGET_SCHEDULE_SPECS = 50
 _MIN_HIGH_DEMAND_SECONDS = 3 * 60 * 60
+# The largest ABSOLUTE increase Meta accepted live: 8 times the daily budget (80.00 on 10.00).
 _MAX_SCHEDULED_BUDGET_MULTIPLE = 8
+# Meta refuses a high demand period that does not start and end on a quarter hour
+# (subcode 3858205, "must be in a 15-minute interval (0, 15, 30, 45)"). Every UTC
+# offset in use is a multiple of 15 minutes, so a whole number of 15-minute steps
+# in Unix seconds is a quarter hour in the account's time zone too.
+_QUARTER_HOUR_SECONDS = 15 * 60
 
 
 def _enum_value(value: Any, allowed: tuple[str, ...], field_name: str, *, params_hint: bool = False) -> str:
@@ -290,25 +292,26 @@ def check_budget_schedule_specs(
         value_type = _enum_value(spec["budget_value_type"], BUDGET_SCHEDULE_VALUE_TYPES, f"{label}.budget_value_type")
         start = _schedule_seconds(spec["time_start"], f"{label}.time_start")
         end = _schedule_seconds(spec["time_end"], f"{label}.time_end")
+        for bound, seconds in (("time_start", start), ("time_end", end)):
+            if seconds % _QUARTER_HOUR_SECONDS:
+                raise ValidationError(
+                    f"{label}.{bound} must fall on a quarter hour (minute 0, 15, 30 or 45, zero seconds); "
+                    "Meta refuses any other time for a budget increase."
+                )
         if end - start < _MIN_HIGH_DEMAND_SECONDS:
             raise ValidationError(f"{label} must end at least 3 hours after it starts.")
         value = spec["budget_value"]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValidationError(f"{label}.budget_value must be a number, not {type(value).__name__}.")
         if value_type == "ABSOLUTE":
-            if not BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED:
-                raise ValidationError(
-                    f"{label}: ABSOLUTE is not offered yet. Meta does not document whether its "
-                    "budget_value is in whole currency units or in cents, and a wrong guess would be "
-                    "a 100-fold error in the increase. Use MULTIPLIER instead (Meta's example: 140 "
-                    "means 140 percent)."
-                )
             validate_positive_amount(value, field_name=f"{label}.budget_value")
-            if daily_budget is not None and daily_budget + value > _MAX_SCHEDULED_BUDGET_MULTIPLE * daily_budget:
+            # Compared as decimals, so 8 times 0.1 is exactly 0.8.
+            largest = None if daily_budget is None else _MAX_SCHEDULED_BUDGET_MULTIPLE * Decimal(str(daily_budget))
+            if largest is not None and Decimal(str(value)) > largest:
                 raise ValidationError(
-                    f"{label}.budget_value {value} would take the daily budget {daily_budget} past 8 times "
-                    "its size, which Meta does not allow. budget_value is the increase in major units "
-                    "(20 means 20.00), not cents."
+                    f"{label}.budget_value {value} is more than 8 times the daily budget {daily_budget}; "
+                    f"Meta allows an increase of at most {largest.normalize():f}. "
+                    "budget_value is the increase in major units (20 means 20.00), not cents."
                 )
         else:
             if value != value or value <= 0 or not float(value).is_integer():
@@ -357,6 +360,94 @@ def check_campaign_round_four_fields(named: dict[str, Any]) -> dict[str, Any]:
     if named["topline_id"] is not None:
         _graph_id(named["topline_id"], "topline_id")
     return checked
+
+
+_BUDGET_SHARING = "is_adset_budget_sharing_enabled"
+_BUDGET_SHARING_DEFAULT_REASON = (
+    "Meta requires true or false here for a campaign without a campaign budget; false keeps each ad set on its "
+    "own budget, which is how campaigns behaved before Meta added sharing, and passing true lets ad sets share "
+    "up to 20 percent of their budgets."
+)
+
+# Meta accepts a campaign's start_time and stop_time and may store neither: the
+# campaign's schedule comes from its ad sets (live, 2026-11-13). An unset start
+# reads back as a time at or before 1970-01-01, such as 1969-12-31T18:59:59-0500.
+_CAMPAIGN_SCHEDULE_FIELDS = ("start_time", "stop_time")
+_UNSET_TIME_BEFORE = datetime(1970, 1, 2, tzinfo=timezone.utc)
+
+
+def _schedule_instant(value: Any) -> datetime | None:
+    """A schedule time as an instant (ISO 8601 with an offset, or Unix seconds); None when it is neither."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(int(text), timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    parsed = _parse_iso_time(text)
+    return parsed if parsed is not None and parsed.tzinfo is not None else None
+
+
+def _is_unset_time(instant: datetime | None) -> bool:
+    return instant is not None and instant < _UNSET_TIME_BEFORE
+
+
+async def _read_campaign_schedule(client: Any, campaign_id: Any) -> dict[str, Any] | None:
+    """Read a campaign's stored start and stop times after a write; None when the read fails.
+
+    The write has already succeeded here, so nothing in this function may raise.
+    """
+    if campaign_id in (None, ""):
+        return None
+    try:
+        stored = await client.get_object(str(campaign_id), fields=list(_CAMPAIGN_SCHEDULE_FIELDS))
+    except Exception:  # A failed read-back must not turn a successful write into an error.
+        return None
+    return stored if isinstance(stored, dict) else None
+
+
+def _campaign_schedule_report(sent: dict[str, Any], stored: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
+    """Compare the schedule times sent with what Meta stored, as instants.
+
+    Returns the response fields to add (stored_schedule and warnings) and the sent
+    keys Meta is not known to hold: not stored, or not known because the read failed.
+    """
+    if stored is None:
+        names = " and ".join(sent)
+        warning = (
+            f"{names}: Meta accepted the request, but the times it stored could not be read back. Meta takes a "
+            "campaign's schedule from its ad sets and may not store these; check with get_campaign, and set "
+            "start and end times on the ad sets."
+        )
+        return {"warnings": [warning]}, list(sent)
+    shown = {}
+    for key in _CAMPAIGN_SCHEDULE_FIELDS:
+        value = stored.get(key)
+        shown[key] = None if value in (None, "") or _is_unset_time(_schedule_instant(value)) else value
+    missing = []
+    for key, value in sent.items():
+        sent_at = _schedule_instant(value)
+        if shown[key] is None:
+            if not _is_unset_time(sent_at):
+                missing.append(key)
+            continue
+        held = _schedule_instant(shown[key])
+        if sent_at is not None and held is not None and held != sent_at:
+            missing.append(key)
+    fields: dict[str, Any] = {"stored_schedule": shown}
+    if missing:
+        names = " and ".join(missing)
+        what = "this time" if len(missing) == 1 else "these times"
+        fields["warnings"] = [
+            f"{names}: Meta accepted the request but did not store {what}. A campaign's schedule comes from its "
+            "ad sets, so set start and end times on the ad sets (create_ad_set or update_adset); stored_schedule "
+            "shows what Meta holds."
+        ]
+    return fields, missing
 
 
 _ROTATION_PAIR = ("time_based_ad_rotation_id_blocks", "time_based_ad_rotation_intervals")
@@ -494,8 +585,9 @@ async def create_campaign(
     is_using_l3_schedule: bool | None = None,
     iterative_split_test_configs: list[dict[str, Any]] | None = None,
     topline_id: GraphId | None = None,
+    is_adset_budget_sharing_enabled: bool | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. is_skadnetwork_attribution true makes an iOS 14 SKAdNetwork campaign; campaign_optimization_type is NONE or ICO_ONLY; is_using_l3_schedule, iterative_split_test_configs (a list of objects) and topline_id (a numeric id) are sent as Meta's fields of those names. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours, account permission required): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
+    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). Without a campaign budget, is_adset_budget_sharing_enabled is sent as false (each ad set keeps its own budget) unless given; true lets ad sets share up to 20 percent of their budgets. start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; Meta takes a campaign's schedule from its ad sets and may not store these, so a real create reads them back into stored_schedule and warns when they were not stored. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. is_skadnetwork_attribution true makes an iOS 14 SKAdNetwork campaign; campaign_optimization_type is NONE or ICO_ONLY; is_using_l3_schedule, iterative_split_test_configs (a list of objects) and topline_id (a numeric id) are sent as Meta's fields of those names. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours, account permission required): each item has time_start and time_end (on a quarter hour; ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER or ABSOLUTE, and budget_value: for MULTIPLIER a whole number sent unchanged (Meta's example: 140 means 140 percent), for ABSOLUTE the increase in major units of the account currency, at most 8 times the daily budget. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named_later = {
         "is_skadnetwork_attribution": is_skadnetwork_attribution,
         "campaign_optimization_type": campaign_optimization_type,
@@ -513,12 +605,15 @@ async def create_campaign(
             "adlabels": adlabels,
             "budget_schedule_specs": budget_schedule_specs,
             **named_later,
+            _BUDGET_SHARING: is_adset_budget_sharing_enabled,
         },
         params,
         money=("spend_cap", "budget_schedule_specs"),
     )
     reject_money_in_params(params, _CAMPAIGN_MONEY_FIELDS)
     named_later = check_campaign_round_four_fields(named_later)
+    if is_adset_budget_sharing_enabled is not None:
+        check_true_or_false(is_adset_budget_sharing_enabled, _BUDGET_SHARING)
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
@@ -574,9 +669,20 @@ async def create_campaign(
         ("adlabels", adlabels),
         ("budget_schedule_specs", schedule),
         *named_later.items(),
+        (_BUDGET_SHARING, is_adset_budget_sharing_enabled),
     ):
         if value is not None:
             payload[key] = value
+    # Meta refuses a campaign without a campaign budget unless this choice is sent
+    # (live, 2026-11-13: code 100, subcode 4834011). Budgets cannot be inside params.
+    sharing_defaulted = (
+        daily_budget is None
+        and lifetime_budget is None
+        and is_adset_budget_sharing_enabled is None
+        and _BUDGET_SHARING not in (params or {})
+    )
+    if sharing_defaulted:
+        payload[_BUDGET_SHARING] = False
     add_validate_only(payload, validate_only=validate_only)
     merge_graph_payload(payload, params)
     client = get_graph_api_client()
@@ -593,17 +699,24 @@ async def create_campaign(
         payload["spend_cap"] = to_minor_units(spend_cap, currency, field_name="spend_cap")
     if schedule is not None:
         payload["budget_schedule_specs"] = encode_budget_schedule_specs(schedule, currency)
-    result = await client.create_edge_object(
-        account_id,
-        "campaigns",
-        data=merge_graph_payload(payload, params),
-    )
-    return creation_response(
+    data = merge_graph_payload(payload, params)
+    result = await client.create_edge_object(account_id, "campaigns", data=data)
+    response = creation_response(
         action="create_campaign",
         target={"account_id": account_id},
         result=result,
         validate_only=validate_only,
     )
+    if sharing_defaulted:
+        response["defaults_applied"] = {
+            _BUDGET_SHARING: {"value": False, "reason": _BUDGET_SHARING_DEFAULT_REASON},
+        }
+    sent_schedule = {key: data[key] for key in _CAMPAIGN_SCHEDULE_FIELDS if key in data}
+    if sent_schedule and not validate_only:
+        new_id = result.get("id") if isinstance(result, dict) else None
+        stored = await _read_campaign_schedule(client, new_id)
+        response.update(_campaign_schedule_report(sent_schedule, stored)[0])
+    return response
 
 
 @mcp_server.tool()
@@ -620,7 +733,7 @@ async def update_campaign(
     stop_time: str | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
+    """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. Meta takes a campaign's schedule from its ad sets and may not store these, so after the update they are read back into stored_schedule, and a time Meta did not store is listed under sent, not current, with a warning. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named = {"spend_cap": spend_cap, "start_time": start_time, "stop_time": stop_time, "adlabels": adlabels}
     reject_named_and_params(named, params, money=("spend_cap",))
     reject_money_in_params(params, _CAMPAIGN_MONEY_FIELDS)
@@ -755,12 +868,21 @@ async def update_campaign(
         else:
             previous_response[key] = previous.get(key)
     await client.update_object(campaign_id, data=payload)
+    sent_schedule = {key: payload[key] for key in _CAMPAIGN_SCHEDULE_FIELDS if key in payload}
+    schedule_fields: dict[str, Any] = {}
+    if sent_schedule:
+        stored = await _read_campaign_schedule(client, campaign_id)
+        schedule_fields, missing = _campaign_schedule_report(sent_schedule, stored)
+        # A time Meta did not store is not the campaign's current value: it is shown under sent.
+        if missing:
+            schedule_fields["sent"] = {key: current.pop(key) for key in missing}
     response = mutation_response(
         action="update_campaign",
         target={"campaign_id": campaign_id},
         previous=previous_response,
         current=current,
     )
+    response.update(schedule_fields)
     if unavailable:
         response["previous_unavailable"] = unavailable
     if incomplete:
@@ -834,7 +956,7 @@ async def create_ad_set(
     max_budget_spend_percentage: WholeNumber | None = None,
     brand_safety_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE, or PHONE_CALL for call ads); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. existing_customer_budget_percentage, min_budget_spend_percentage and max_budget_spend_percentage are whole percentages from 0 to 100; daily_imps and lifetime_imps are impression counts for FIXED_CPM campaigns; multi_optimization_goal_weight is UNDEFINED, BALANCED, PREFER_INSTALL or PREFER_EVENT; tune_for_category is a special ad category such as HOUSING; is_incremental_attribution_enabled turns on incremental attribution; campaign_attribution is the app attribution type, for example SKAN or AEM; value_rule_set_id attaches a value rule set and sends value_rules_applied true with it; rf_prediction_id is a reach and frequency prediction id; creative_sequence lists ad ids in the order to show them; time_based_ad_rotation_id_blocks (lists of ad ids) and time_based_ad_rotation_intervals (at least two range start times, ISO 8601 with a UTC offset or Unix seconds; sent as Unix seconds) go together, one block per range, and are checked as a pair even when one of them is inside params (where start times must already be Unix seconds); placement_soft_opt_out and brand_safety_config are Meta's objects. start_time and end_time are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE, or PHONE_CALL for call ads); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (on a quarter hour; ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER or ABSOLUTE, and budget_value: for MULTIPLIER a whole number sent unchanged (Meta's example: 140 means 140 percent), for ABSOLUTE the increase in major units of the account currency, at most 8 times the daily budget. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. existing_customer_budget_percentage, min_budget_spend_percentage and max_budget_spend_percentage are whole percentages from 0 to 100; daily_imps and lifetime_imps are impression counts for FIXED_CPM campaigns; multi_optimization_goal_weight is UNDEFINED, BALANCED, PREFER_INSTALL or PREFER_EVENT; tune_for_category is a special ad category such as HOUSING; is_incremental_attribution_enabled turns on incremental attribution; campaign_attribution is the app attribution type, for example SKAN or AEM; value_rule_set_id attaches a value rule set and sends value_rules_applied true with it; rf_prediction_id is a reach and frequency prediction id; creative_sequence lists ad ids in the order to show them; time_based_ad_rotation_id_blocks (lists of ad ids) and time_based_ad_rotation_intervals (at least two range start times, ISO 8601 with a UTC offset or Unix seconds; sent as Unix seconds) go together, one block per range, and are checked as a pair even when one of them is inside params (where start times must already be Unix seconds); placement_soft_opt_out and brand_safety_config are Meta's objects. start_time and end_time are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named_spend = {
         "daily_spend_cap": daily_spend_cap,
         "lifetime_spend_cap": lifetime_spend_cap,
@@ -977,11 +1099,14 @@ async def create_ad_set(
     for field_name, value in named_spend.items():
         if value is not None:
             payload[field_name] = to_minor_units(value, currency, field_name=field_name)
-    result = await client.create_edge_object(
-        account_id,
-        "adsets",
-        data=merge_graph_payload(payload, params),
-    )
+    data = merge_graph_payload(payload, params)
+    try:
+        result = await client.create_edge_object(account_id, "adsets", data=data)
+    except MetaApiError as error:
+        # Meta's own type, code, subcode and text are kept; the hint is added to its message.
+        if error.subcode in _MISSING_BID_SUBCODES and "bid_strategy" not in data:
+            error.message = f"{error.message} {_NO_BID_STRATEGY_HINT}"
+        raise
     response = creation_response(
         action="create_ad_set",
         target={"account_id": account_id, "campaign_id": campaign_id},
@@ -992,6 +1117,16 @@ async def create_ad_set(
     if zoneless:
         await _add_zoneless_time_warning(response, client, zoneless, result, validate_only=validate_only)
     return response
+
+
+# Live, 2026-11-13: an ad set sent with no bid strategy, under a campaign with no
+# campaign bid strategy, is refused with subcode 2490487, whose text asks for a bid
+# cap. What was missing was the bid strategy.
+_MISSING_BID_SUBCODES = (2490487, "2490487")
+_NO_BID_STRATEGY_HINT = (
+    "No bid strategy was sent with this ad set. For automatic bidding with no cap, pass "
+    'bid_strategy="LOWEST_COST_WITHOUT_CAP", or give the campaign a campaign-level bid strategy.'
+)
 
 
 async def _add_zoneless_time_warning(

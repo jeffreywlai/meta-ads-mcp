@@ -51,6 +51,27 @@
       "what_changed": "When start_time or end_time is given without a time zone (for example 2026-11-27T00:00:00), the ad set is still created with exactly the same request as before, but the tool then reads the new ad set once and the response gains two fields: warnings, saying the time had no time zone so Meta chose how to read it, and stored_schedule, the start and end time Meta stored. With validate_only the warning is given without the read. A time with an offset, Unix seconds or no time at all makes the same requests and returns the same fields as before.",
       "why_better": "A time with no time zone can be read as a different hour than the caller meant, which starts or ends delivery hours early or late. Showing what Meta stored makes a shift visible at once, without refusing calls that worked before.",
       "migration": "No change to how the tool is called. To avoid the warning and the extra read, pass times with a UTC offset, for example 2026-11-27T00:00:00-05:00. If the read after the create fails, the create is still reported as a success with its id."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "A campaign created without a campaign budget (no daily_budget and no lifetime_budget) and without is_adset_budget_sharing_enabled, named or inside params, is now sent with is_adset_budget_sharing_enabled false, one more field than before, and the response gains defaults_applied naming the field, the value sent and why. This applies to validate_only calls too. A campaign with a campaign budget is sent exactly as before, and a caller who gives the field gets exactly the value given.",
+      "why_better": "Meta now refuses every campaign without a campaign budget unless this choice is sent (seen live on 2026-11-13: code 100, subcode 4834011), so the old call always failed. It now succeeds, with each ad set keeping its own budget, which is how such campaigns behaved before Meta added budget sharing, and the response says what was chosen.",
+      "migration": "Nothing to change. To let ad sets share up to 20 percent of their budgets, pass is_adset_budget_sharing_enabled=true; to state the default yourself, pass false."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "When start_time or stop_time is sent, named or inside params, a real create (not validate_only) now reads the new campaign's start_time and stop_time once after the create, and the response gains stored_schedule (what Meta holds; a start Meta reports as 1969 or 1970, meaning unset, is shown as null) and, when a sent time was not stored, warnings saying so. The create request itself is unchanged. If the read fails, the create is still reported as a success, with a warning that the stored times could not be read.",
+      "why_better": "Meta accepts a campaign's start_time and stop_time and stores neither (seen live on 2026-11-13): a campaign's schedule comes from its ad sets. Before, the caller had no sign that the times were ignored and could believe the campaign was scheduled when it was not.",
+      "migration": "No change to how the tool is called. Set start and end times on the ad sets (create_ad_set or update_adset) instead of the campaign; a call without start_time or stop_time makes the same requests and returns the same fields as before."
+    },
+    {
+      "tool": "update_campaign",
+      "kind": "behaviour",
+      "what_changed": "When start_time or stop_time is sent, named or inside params, the tool now reads the campaign's start_time and stop_time once after the update and adds stored_schedule to the response. A sent time that Meta did not store is no longer listed under current; it moves to a new field, sent, and warnings says Meta did not store it. A sent time Meta did store stays in current, and every other field of current is unchanged. If the read fails, the update is still reported as a success, the times are listed under sent, and a warning says the stored times could not be read.",
+      "why_better": "Meta accepts a campaign's start_time and stop_time and stores neither (seen live on 2026-11-13), and the tool used to report the times it sent as the campaign's current values, which was false. The response now shows what the campaign really holds.",
+      "migration": "Read the times you sent from sent instead of current when Meta did not store them, and read what Meta holds from stored_schedule. Set schedules on the ad sets (update_adset) instead of the campaign. A call without start_time or stop_time makes the same requests and returns the same fields as before."
     }
   ]
 }
