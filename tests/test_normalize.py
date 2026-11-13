@@ -74,3 +74,14 @@ def test_derive_core_metrics_computes_kpis() -> None:
     assert metrics["cpm"] == 120.0
     assert metrics["cpa"] == 30.0
     assert round(metrics["roas"], 2) == 3.33
+
+
+def test_read_collection_page_only_reads_a_data_list() -> None:
+    import pytest
+    from meta_ads_mcp.normalize import read_collection_page
+
+    assert read_collection_page({"data": []}) == ([], 0, False)
+    assert read_collection_page({"data": [{"id": "1"}, None, "x", {"id": "2"}]}) == ([{"id": "1"}, {"id": "2"}], 2, False)
+    for unreadable in ({}, {"data": None}, {"data": {"id": "1"}}, {"data": "x"}, None, [], "text", 3):
+        assert read_collection_page(unreadable) == ([], 0, True), unreadable
+    assert pytest is not None

@@ -105,6 +105,23 @@ def normalize_insights_row(row: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def read_collection_page(payload: Any) -> tuple[list[dict[str, Any]], int, bool]:
+    """A collection page's rows that are objects, how many entries are not, and whether the page could not be read.
+
+    Only a data list is a readable page, and an empty list is an empty page. A payload that
+    is not an object, or whose data is missing, null or not a list, is an unreadable page:
+    rows may have been there, so it must never pass as empty, as complete, or as the last
+    page. Use this wherever what a read found, or did not find, decides something: whether
+    to write, whether a list is complete, or whether "none found" is true.
+    normalize_collection is the lenient shaping helper for showing a page as it came.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return [], 0, True
+    data = payload["data"]
+    rows = [row for row in data if isinstance(row, dict)]
+    return rows, len(data) - len(rows), False
+
+
 def normalize_collection(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize a collection response into the shared envelope."""
     items = payload.get("data", [])

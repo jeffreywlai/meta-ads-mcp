@@ -15,7 +15,7 @@ from meta_ads_mcp.diagnostics import build_finding, metric_evidence
 from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, normalize_currency
-from meta_ads_mcp.normalize import blank_to_none, to_float
+from meta_ads_mcp.normalize import blank_to_none, read_collection_page, to_float
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tool_types import StringList, coerce_csv_string_list
@@ -656,18 +656,8 @@ PAGE_UNREADABLE = (
 )
 
 
-def _page_rows(payload: Any) -> tuple[list[dict[str, Any]], int, bool]:
-    """A page's rows that are objects, how many entries are not, and whether the page itself could not be read.
-
-    Only a data list is a readable page, and an empty list is an empty page. A payload that is not an object, or
-    whose data is missing, null or not a list, is an unreadable page: rows may have been there, so it must never
-    pass as empty or as the last page.
-    """
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        return [], 0, True
-    data = payload["data"]
-    rows = [row for row in data if isinstance(row, dict)]
-    return rows, len(data) - len(rows), False
+# The strict page reader lives in normalize so every module shares one rule.
+_page_rows = read_collection_page
 
 
 def _identity_part(value: Any) -> str:
