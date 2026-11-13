@@ -88,3 +88,50 @@ def test_read_only_mode_hides_the_new_write_tools(monkeypatch) -> None:
 )
 def test_existing_write_verbs_still_route_as_before(query, expected) -> None:
     assert expected in _search(query)
+
+
+PHASE_TWO_VERB_WRITE_TOOLS = {
+    "duplicate_campaign",
+    "duplicate_adset",
+    "duplicate_ad",
+    "batch_update_catalog_products",
+}
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("duplicate campaign", "duplicate_campaign"),
+        ("duplicate this campaign with its ad sets", "duplicate_campaign"),
+        ("duplicate the ad set into another campaign", "duplicate_adset"),
+        ("duplicate adset", "duplicate_adset"),
+        ("duplicate the ad", "duplicate_ad"),
+        ("copy this campaign", "duplicate_campaign"),
+        ("clone the ad set", "duplicate_adset"),
+        ("batch update catalog products", "batch_update_catalog_products"),
+        ("batch edit the products in my catalog by SKU", "batch_update_catalog_products"),
+    ],
+)
+def test_duplicate_and_batch_requests_offer_the_write_tool(query, expected) -> None:
+    assert expected in _search(query)[:2]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "show campaigns I could duplicate",
+        "list duplicate ads by name",
+        "copy of last week's spend report",
+        "batch report on catalog diagnostics",
+        "clone the performance summary into a table",
+    ],
+)
+def test_other_requests_never_offer_the_duplicate_or_batch_tools(query) -> None:
+    assert not PHASE_TWO_VERB_WRITE_TOOLS & set(_search(query))
+
+
+def test_read_only_mode_hides_the_duplicate_and_batch_tools(monkeypatch) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    for query in ("duplicate campaign", "batch update catalog products", "copy this campaign"):
+        assert not PHASE_TWO_VERB_WRITE_TOOLS & set(_search(query))

@@ -108,12 +108,21 @@ _SUBJECT_SCOPED_WRITE_VERBS = frozenset(
         "add",
         "boost",
         "cancel",
+        "batch",
+        "clone",
         "connect",
+        "copy",
         "disconnect",
+        "duplicate",
         "remove",
     }
 )
 _WRITE_VERBS = _WRITE_VERBS | _SUBJECT_SCOPED_WRITE_VERBS
+# A request verb that names tools under a different prefix.
+_WRITE_VERB_TOOL_PREFIX = {"clone": "duplicate", "copy": "duplicate"}
+# "batch" is also an everyday noun ("a batch report on the catalog"), so it must name
+# two things the tool acts on before it offers a write.
+_SUBJECT_WORDS_REQUIRED = {"batch": 2}
 _GET_SYNONYMS = frozenset({"fetch", "find", "inspect", "read", "show", "view"})
 _ARTICLES = frozenset({"a", "an", "the"})
 
@@ -709,10 +718,14 @@ class StructuredIntentRouter:
                     verb_scoped_candidates.update(
                         name
                         for name in names
-                        if name.startswith(f"{direct_verb}_")
+                        if name.startswith(f"{_WRITE_VERB_TOOL_PREFIX.get(direct_verb, direct_verb)}_")
                         and (
                             direct_verb not in _SUBJECT_SCOPED_WRITE_VERBS
-                            or _names_tool_subject(clause, name)
+                            or _names_tool_subject(
+                                clause,
+                                name,
+                                required=_SUBJECT_WORDS_REQUIRED.get(direct_verb, 1),
+                            )
                         )
                     )
                 continue
@@ -776,10 +789,15 @@ def _singular(word: str) -> str:
     return word
 
 
-def _names_tool_subject(clause: str, name: str) -> bool:
-    """Return whether a clause mentions something a verb-named tool acts on."""
-    words = {_singular(word) for word in re.findall(r"[a-z0-9]+", clause)}
-    return any(_singular(part) in words for part in name.split("_")[1:])
+def _names_tool_subject(clause: str, name: str, *, required: int = 1) -> bool:
+    """Return whether a clause mentions enough of what a verb-named tool acts on.
+
+    Adjacent words are also tried joined, so "ad set" matches a tool named for "adset".
+    """
+    tokens = [_singular(word) for word in re.findall(r"[a-z0-9]+", clause)]
+    words = set(tokens) | {f"{first}{second}" for first, second in zip(tokens, tokens[1:])}
+    subjects = {_singular(part) for part in name.split("_")[1:]}
+    return len(subjects & words) >= required
 
 
 def is_compatible_name(name: str, decision: RouteDecision) -> bool:
