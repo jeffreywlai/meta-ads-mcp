@@ -402,6 +402,10 @@ class GraphAPIClient:
                 payload = {"success": payload}
             elif isinstance(payload, list):
                 payload = {"data": payload}
+            elif not isinstance(payload, dict):
+                # A bare null, text or number. Wrapped so callers always get an object
+                # and its wording is never mistaken for an error field.
+                payload = {"json_response": payload}
             if response.is_error or "error" in payload:
                 error = MetaApiError.from_payload(payload, status_code=response.status_code)
                 error.operation = operation

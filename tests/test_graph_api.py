@@ -1072,3 +1072,31 @@ def test_upload_ad_image_needs_exactly_one_complete_source(monkeypatch, argument
     monkeypatch.setattr(GraphAPIClient, "request", fake_request)
     with pytest.raises(UnsupportedFeatureError):
         asyncio.run(_client().upload_ad_image("123", **arguments))
+
+
+@pytest.mark.parametrize("body", [None, "ok", "an error word in plain text", 7, 1.5])
+def test_a_json_answer_that_is_not_an_object_is_returned_as_an_object(monkeypatch, body) -> None:
+    # Meta documents object answers. A bare null, text or number must not crash the
+    # client (null and numbers raised TypeError; text holding "error" raised
+    # AttributeError), and must not be mistaken for an error by its wording.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    result = asyncio.run(_client().request("GET", "123"))
+    assert result == {"json_response": body}
+
+
+@pytest.mark.parametrize("body", [None, "refused", 7])
+def test_an_error_status_with_a_non_object_json_answer_is_a_meta_error(monkeypatch, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(400, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("GET", "123"))
+    assert error.value.status_code == 400
+
+
+def test_bool_and_list_answers_keep_their_existing_wrappers(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, True), FakeResponse(200, [{"id": "1"}])])
+    client = _client()
+    assert asyncio.run(client.request("GET", "123")) == {"success": True}
+    assert asyncio.run(client.request("GET", "123")) == {"data": [{"id": "1"}]}
