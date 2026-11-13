@@ -135,8 +135,12 @@ async def get_audience(
     return {"item": audience, "summary": {"count": 1}}
 
 
-# Labels Meta accepts on custom audience creation (AdAccount create_custom_audience,
-# audience_labels: list<audience_labels_enum>, facebook-python-business-sdk 26.0.2).
+# Labels Meta accepts on custom audience creation and update (audience_labels:
+# list<audience_labels_enum> on AdAccount create_custom_audience and CustomAudience
+# api_update, CustomAudience.AudienceLabels in facebook-python-business-sdk 26.0.2).
+# Meta's custom audiences guide ("Build a custom audience") publishes ten of them; the SDK
+# enum adds CART_ABANDONERS, RECENT_PURCHASERS and OTHER_1 to OTHER_3. Neither source lists
+# APP_INSTALLERS or CUSTOMER_LEADS, which Meta's own Ads MCP server describes, so they are refused.
 AUDIENCE_LABELS = frozenset({
     "APP_USERS", "AT_RISK", "CART_ABANDONERS", "DISENGAGED", "DISQUALIFIED_LEADS", "ENGAGED_USERS",
     "GENERAL_CUSTOMERS", "HIGH_VALUE_CUSTOMERS", "LOW_VALUE_CUSTOMERS", "OTHER_1", "OTHER_2", "OTHER_3",
@@ -295,12 +299,15 @@ async def update_custom_audience(
     customer_file_source: str | None = None,
     params: dict[str, Any] | None = None,
     rule: dict[str, Any] | str | None = None,
+    audience_labels: StringList | None = None,
 ) -> dict[str, Any]:
     """Use this when the user already has an audience id and needs to change audience metadata.
 
     rule replaces a website (or other rule-based) audience's rule: a JSON object or JSON string in the
     format create_custom_audience takes; for website audiences, retention is retention_seconds inside it.
     The prior rule is read first and returned in previous.
+    audience_labels replaces the audience's labels (the values create_custom_audience takes, for example
+    HIGH_VALUE_CUSTOMERS); the prior labels are read first and returned in previous.
     """
     payload: dict[str, Any] = {
         "name": OMIT,
@@ -320,6 +327,11 @@ async def update_custom_audience(
         # Added only when named, so a call that passes rule through params (as callers did
         # before rule was named) is unchanged, while giving it both ways is rejected.
         payload["rule"] = _audience_rule(rule)
+    if audience_labels is not None:
+        # Added only when named, with create_custom_audience's check, so a call that passes
+        # audience_labels through params (as callers did before it was named) is unchanged,
+        # while giving it both ways is rejected by merge_graph_payload.
+        payload["audience_labels"] = _audience_labels(audience_labels)
     payload = merge_graph_payload(payload, params)
     if not payload:
         raise ValidationError("At least one field must be provided for update_custom_audience.")
@@ -327,7 +339,13 @@ async def update_custom_audience(
     # Read the stored rule whenever the rule is being changed, by either route, so the
     # prior rule is returned and the edit can be undone.
     changes_rule = "rule" in payload
-    read_fields = [*AUDIENCE_FIELDS, "rule"] if changes_rule else AUDIENCE_FIELDS
+    # The stored labels are read only when they are changed by name: a params-only label
+    # change keeps the exact read it made before audience_labels was named. Meta documents
+    # reading them with GET /{custom-audience-id} (custom audiences guide, "Read audience labels").
+    changes_labels = audience_labels is not None
+    read_fields = [*AUDIENCE_FIELDS, "rule"] if changes_rule else list(AUDIENCE_FIELDS)
+    if changes_labels:
+        read_fields.append("audience_labels")
     previous = await client.get_object(audience_id, fields=read_fields)
     await client.update_object(audience_id, data=payload)
     prior = {
@@ -338,6 +356,8 @@ async def update_custom_audience(
     }
     if changes_rule:
         prior["rule"] = previous.get("rule")
+    if changes_labels:
+        prior["audience_labels"] = previous.get("audience_labels")
     return mutation_response(
         action="update_custom_audience",
         target={"audience_id": audience_id},

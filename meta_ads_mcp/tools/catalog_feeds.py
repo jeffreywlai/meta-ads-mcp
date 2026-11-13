@@ -19,7 +19,7 @@ from pydantic import WithJsonSchema
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import build_finding
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaApiError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
@@ -50,6 +50,23 @@ UPLOAD_ERROR_FIELDS = [
     "affected_surfaces",
     "total_count",
 ]
+# One sample per error from ProductFeedUploadError's documented samples edge, read by field
+# expansion. ProductFeedUploadErrorSample has id, row_number and retailer_id (SDK 26.0.2
+# productfeeduploaderrorsample.py; the sample response in Meta's Feed API guide shows the same
+# three). Meta's public API gives the row and the item's retailer id, not the invalid value.
+UPLOAD_ERROR_SAMPLE_FIELD = "samples.limit(1){id,row_number,retailer_id}"
+UPLOAD_ERROR_PAGE_SIZE = 100
+# This server's own caps on one upload's error read: rows, and so requests (rows / page size).
+MAX_UPLOAD_ERRORS = 1000
+# A sample's retailer id is the advertiser's own product id; Meta caps it at 100 characters,
+# and anything longer is cut here so one sample cannot fill the response.
+MAX_SAMPLE_CHARS = 100
+# ProductFeed fields read by list_product_feeds on top of FEED_FIELDS and FEED_LIST_FIELDS.
+# Their readability rests on the SDK alone (ProductFeed.Field in SDK 26.0.2 productfeed.py lists
+# supplementary_feeds among the readable fields; Meta's reference does not list it), so a read
+# Meta refuses is repeated without them and the response names them. They are kept out of
+# FEED_FIELDS so the pre-read of a delete or an update never depends on them.
+FEED_OPTIONAL_FIELDS = ["supplementary_feeds"]
 FEED_FIELDS = [
     "id",
     "name",
@@ -636,8 +653,131 @@ def _sort_upload_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(errors, key=key)
 
 
-async def _upload_with_errors(client: Any, upload: dict[str, Any]) -> dict[str, Any]:
-    """Attach the upload's errors (by rows affected) and a derived status."""
+def _short_sample(error: dict[str, Any]) -> dict[str, Any]:
+    """Replace Meta's nested samples page with one short sample (or None when Meta gave none)."""
+    shaped = {key: value for key, value in error.items() if key != "samples"}
+    samples = error.get("samples")
+    rows = samples.get("data") if isinstance(samples, dict) else samples
+    first = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
+    if first is None:
+        shaped["sample"] = None
+        return shaped
+    sample = {key: first[key] for key in ("id", "row_number", "retailer_id") if key in first}
+    retailer_id = sample.get("retailer_id")
+    if isinstance(retailer_id, str) and len(retailer_id) > MAX_SAMPLE_CHARS:
+        sample["retailer_id"] = retailer_id[:MAX_SAMPLE_CHARS]
+        sample["retailer_id_truncated"] = True
+    shaped["sample"] = sample
+    return shaped
+
+
+async def _read_upload_errors(
+    client: Any,
+    upload_id: str,
+    *,
+    max_errors: int,
+    after: str | None,
+    include_samples: bool,
+) -> dict[str, Any]:
+    """Read one upload's errors across pages, up to max_errors rows.
+
+    Requests are capped by max_errors / UPLOAD_ERROR_PAGE_SIZE. The list is complete only when
+    Meta's last page has no next link. A next page with no cursor, a cursor already read, or a
+    page identical to one already read stops the read as incomplete, with the reason. When
+    samples were asked for and Meta refuses the first read, it is repeated without them.
+    """
+    fields = [*UPLOAD_ERROR_FIELDS, UPLOAD_ERROR_SAMPLE_FIELD] if include_samples else list(UPLOAD_ERROR_FIELDS)
+    samples_unavailable: str | None = None
+    errors: list[dict[str, Any]] = []
+    cursor = after
+    cursors_read: set[str | None] = {cursor}
+    pages_read: set[str] = set()
+    complete = False
+    next_after: str | None = None
+    stop_reason: str | None = None
+    # One request per page; cursors_read holds one entry per request made so far.
+    max_requests = -(-max_errors // UPLOAD_ERROR_PAGE_SIZE)
+    while True:
+        params: dict[str, Any] = {"limit": min(UPLOAD_ERROR_PAGE_SIZE, max_errors - len(errors))}
+        if cursor:
+            params["after"] = cursor
+        try:
+            payload = await client.list_objects(upload_id, "errors", fields=fields, params=params)
+        except MetaApiError as error:
+            if not (include_samples and samples_unavailable is None and not errors and error.code == 100):
+                raise
+            fields = list(UPLOAD_ERROR_FIELDS)
+            samples_unavailable = (
+                "Meta refused the samples part of the error read (error code 100), so the errors "
+                "were read again without samples and could not be read with one."
+            )
+            payload = await client.list_objects(upload_id, "errors", fields=fields, params=params)
+        page = normalize_collection(payload)
+        if page["items"]:
+            fingerprint = json.dumps(page["items"], sort_keys=True, default=str)
+            if fingerprint in pages_read:
+                stop_reason = (
+                    "Meta returned the same page of errors again; it was not counted twice and the "
+                    "read stopped, so later errors were not read."
+                )
+                break
+            pages_read.add(fingerprint)
+        errors.extend(page["items"])
+        if not page["paging"].get("next"):
+            complete = True
+            break
+        cursor = page["paging"].get("after")
+        if not cursor:
+            stop_reason = "Meta reported more errors but gave no cursor to read them."
+            break
+        if cursor in cursors_read:
+            stop_reason = (
+                "Meta returned a cursor that was already read; the read stopped so no error is "
+                "counted twice, and later errors were not read."
+            )
+            break
+        if len(errors) >= max_errors or len(cursors_read) >= max_requests:
+            next_after = cursor
+            limit_reached = (
+                f"error_limit ({max_errors} errors)" if len(errors) >= max_errors
+                else f"the cap of {max_requests} requests for error_limit {max_errors}"
+            )
+            stop_reason = (
+                f"Stopped at {limit_reached}; more errors exist. Call again with upload_id and "
+                "error_after set to errors_next_after to read on."
+            )
+            break
+        cursors_read.add(cursor)
+    if include_samples and samples_unavailable is None:
+        errors = [_short_sample(error) for error in errors]
+    result: dict[str, Any] = {
+        "errors": _sort_upload_errors(errors),
+        "errors_complete": complete,
+        "errors_next_after": next_after,
+        "errors_from_start": after is None,
+    }
+    if stop_reason:
+        result["errors_stop_reason"] = stop_reason
+    if include_samples:
+        if samples_unavailable:
+            result["samples_unavailable"] = samples_unavailable
+        else:
+            result["samples_note"] = (
+                "Each error carries one sample: the row number and the item's retailer id in the feed "
+                "file. Meta's public API gives no copy of the invalid value itself."
+            )
+    return result
+
+
+async def _upload_with_errors(
+    client: Any,
+    upload: dict[str, Any],
+    *,
+    max_errors: int = UPLOAD_ERROR_PAGE_SIZE,
+    after: str | None = None,
+    include_samples: bool = False,
+) -> dict[str, Any]:
+    """Attach the upload's errors (by rows affected among those read) and a derived status."""
     upload_id = _object_id(upload.get("id"))
     item = {**upload, "status": _upload_status(upload)}
     error_count = to_int(upload.get("error_count"))
@@ -645,14 +785,9 @@ async def _upload_with_errors(client: Any, upload: dict[str, Any]) -> dict[str, 
     if upload_id is None or (error_count == 0 and warning_count == 0):
         item.update({"errors": [], "errors_complete": True})
         return item
-    payload = await client.list_objects(
-        upload_id, "errors", fields=UPLOAD_ERROR_FIELDS, params={"limit": 100}
-    )
-    page = normalize_collection(payload)
-    item.update({
-        "errors": _sort_upload_errors(page["items"]),
-        "errors_complete": not bool(page["paging"].get("next")),
-    })
+    item.update(await _read_upload_errors(
+        client, upload_id, max_errors=max_errors, after=after, include_samples=include_samples,
+    ))
     return item
 
 
@@ -905,12 +1040,42 @@ async def list_product_feeds(
     _validate_limit(limit)
     client = get_graph_api_client()
     if feed_id is not None:
-        feed = await client.get_object(feed_id, fields=FEED_FIELDS)
-        return {"item": feed, "summary": {"count": 1}}
-    payload = await client.list_objects(
-        catalog_id, "product_feeds", fields=FEED_LIST_FIELDS, params=_page_params(limit, after),
+        feed, unavailable = await _read_with_optional_fields(
+            lambda fields: client.get_object(feed_id, fields=fields), FEED_FIELDS,
+        )
+        result: dict[str, Any] = {"item": feed, "summary": {"count": 1}}
+    else:
+        payload, unavailable = await _read_with_optional_fields(
+            lambda fields: client.list_objects(
+                catalog_id, "product_feeds", fields=fields, params=_page_params(limit, after),
+            ),
+            FEED_LIST_FIELDS,
+        )
+        result = _paged_collection(payload, after)
+    if unavailable:
+        result["summary"]["fields_unavailable"] = unavailable
+    return result
+
+
+async def _read_with_optional_fields(
+    read: Callable[[list[str]], Awaitable[Any]], fields: list[str],
+) -> tuple[Any, dict[str, str]]:
+    """Read with FEED_OPTIONAL_FIELDS added; if Meta refuses the read as an invalid field
+    (error code 100), read again without them and name them as unavailable.
+
+    Any other error, or a refusal that persists without them, is raised.
+    """
+    try:
+        return await read([*fields, *FEED_OPTIONAL_FIELDS]), {}
+    except MetaApiError as error:
+        if error.code != 100:
+            raise
+    payload = await read(list(fields))
+    reason = (
+        "Meta refused this field when it was requested (error code 100), so the feed was read "
+        "without it. Meta's reference does not list it; its readability rests on the SDK."
     )
-    return _paged_collection(payload, after)
+    return payload, {field: reason for field in FEED_OPTIONAL_FIELDS}
 
 
 @mcp_server.tool()
@@ -1153,16 +1318,32 @@ async def list_product_feed_uploads(
     upload_id: str | None = None,
     limit: int = 10,
     after: str | None = None,
+    include_samples: bool = False,
+    error_limit: int | None = None,
+    error_after: str | None = None,
 ) -> dict[str, Any]:
-    """List uploads for a product catalog data feed, newest first, with item counts and errors ordered by rows affected; pass upload_id for one upload. status is finished when Meta reports an end_time."""
+    """List uploads for a product catalog data feed, newest first, with item counts and errors ordered by rows affected; pass upload_id for one upload. status is finished when Meta reports an end_time. Each upload carries its first 100 errors; with upload_id, error_limit (up to 1000) reads more and error_after continues from errors_next_after. include_samples=true adds one sample per error: the row number and item retailer id in the feed file (Meta gives no copy of the invalid value)."""
     feed_id = _require_id(feed_id, "feed_id")
     upload_id = blank_to_none(upload_id)
     _validate_limit(limit)
+    if not isinstance(include_samples, bool):
+        raise ValidationError("include_samples must be true or false.")
+    error_after = blank_to_none(error_after)
+    if upload_id is None and (error_limit is not None or error_after is not None):
+        raise ValidationError("error_limit and error_after apply only with upload_id, to one upload's errors.")
+    if error_limit is not None and (
+        isinstance(error_limit, bool) or not isinstance(error_limit, int)
+        or not 1 <= error_limit <= MAX_UPLOAD_ERRORS
+    ):
+        raise ValidationError(f"error_limit must be an integer from 1 to {MAX_UPLOAD_ERRORS}.")
     client = get_graph_api_client()
     if upload_id is not None:
         upload = await client.get_object(upload_id, fields=UPLOAD_FIELDS)
         return {
-            "item": await _upload_with_errors(client, upload),
+            "item": await _upload_with_errors(
+                client, upload, max_errors=error_limit or UPLOAD_ERROR_PAGE_SIZE, after=error_after,
+                include_samples=include_samples,
+            ),
             "feed_id": feed_id,
             "summary": {"count": 1},
         }
@@ -1171,7 +1352,8 @@ async def list_product_feed_uploads(
     )
     collection = _paged_collection(payload, after)
     collection["items"] = [
-        await _upload_with_errors(client, upload) for upload in collection["items"]
+        await _upload_with_errors(client, upload, include_samples=include_samples)
+        for upload in collection["items"]
     ]
     return collection
 

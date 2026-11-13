@@ -1367,3 +1367,107 @@ def test_g18_rule_that_is_not_json_has_a_clean_exception_chain(monkeypatch) -> N
         asyncio.run(audiences.update_custom_audience(audience_id="aud_1", rule=rule))
     _assert_chain_holds_no_customer_data(info.value, SYNTHETIC_CUSTOMER)
     assert info.value.__context__ is None
+
+
+# update_custom_audience: named audience_labels (round four, P46)
+
+
+def test_update_custom_audience_without_labels_is_unchanged(monkeypatch) -> None:
+    """Calls made before audience_labels was named send exactly the same requests and get the same response."""
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    named = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", name="Renamed"))
+    through_params = asyncio.run(audiences.update_custom_audience(
+        audience_id="aud_1", description="New", params={"audience_labels": ["AT_RISK"]},
+    ))
+    assert client.calls == [
+        ("get", "aud_1", OLD_AUDIENCE_READ_FIELDS, None),
+        ("update", "aud_1", {"name": "Renamed"}),
+        ("get", "aud_1", OLD_AUDIENCE_READ_FIELDS, None),
+        ("update", "aud_1", {"description": "New", "audience_labels": ["AT_RISK"]}),
+    ]
+    prior = {"name": "Existing Audience", "description": "Old", "retention_days": 30,
+             "customer_file_source": "USER_PROVIDED_ONLY"}
+    assert named == {
+        "ok": True, "action": "update_custom_audience", "target": {"audience_id": "aud_1"},
+        "previous": prior, "current": {"name": "Renamed"},
+    }
+    assert through_params == {
+        "ok": True, "action": "update_custom_audience", "target": {"audience_id": "aud_1"},
+        "previous": prior, "current": {"description": "New", "audience_labels": ["AT_RISK"]},
+    }
+
+
+def test_update_custom_audience_named_labels_read_old_labels_first_and_send_them(monkeypatch) -> None:
+    client = RecordingAudienceClient(previous={
+        "id": "aud_1", "name": "Buyers", "description": None, "audience_labels": ["GENERAL_CUSTOMERS"],
+    })
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(
+        audience_id="aud_1", audience_labels=" high_value_customers, Recent_Purchasers, HIGH_VALUE_CUSTOMERS ",
+    ))
+    assert client.calls == [
+        ("get", "aud_1", [*OLD_AUDIENCE_READ_FIELDS, "audience_labels"], None),
+        ("update", "aud_1", {"audience_labels": ["HIGH_VALUE_CUSTOMERS", "RECENT_PURCHASERS"]}),
+    ]
+    assert result["previous"]["audience_labels"] == ["GENERAL_CUSTOMERS"]
+    assert result["current"] == {"audience_labels": ["HIGH_VALUE_CUSTOMERS", "RECENT_PURCHASERS"]}
+
+
+def test_update_custom_audience_named_labels_with_a_rule_read_both(monkeypatch) -> None:
+    client = RecordingAudienceClient(previous={"id": "aud_1", "rule": "{}"})
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(
+        audience_id="aud_1", rule=WEBSITE_RULE, audience_labels=["ENGAGED_USERS"],
+    ))
+    assert client.calls[0] == ("get", "aud_1", [*OLD_AUDIENCE_READ_FIELDS, "rule", "audience_labels"], None)
+    assert client.calls[1] == ("update", "aud_1", {"rule": WEBSITE_RULE, "audience_labels": ["ENGAGED_USERS"]})
+    assert result["previous"]["rule"] == "{}"
+    # Meta returned no labels (it omits an empty field), so previous says None rather than dropping the key.
+    assert "audience_labels" in result["previous"] and result["previous"]["audience_labels"] is None
+
+
+def test_update_custom_audience_labels_through_mcp_boundary(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(mcp_server.call_tool(
+        "update_custom_audience", {"audience_id": "aud_1", "audience_labels": "qualified_leads"},
+    )).structured_content
+    assert client.calls[-1] == ("update", "aud_1", {"audience_labels": ["QUALIFIED_LEADS"]})
+    assert result["current"] == {"audience_labels": ["QUALIFIED_LEADS"]}
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"audience_labels": ["AT_RISK"], "params": {"audience_labels": ["AT_RISK"]}}, "audience_labels"),
+    ({"audience_labels": ["NOT_A_LABEL"]}, "NOT_A_LABEL"),
+    ({"audience_labels": ["APP_INSTALLERS"]}, "APP_INSTALLERS"),
+    ({"audience_labels": [" "]}, "audience_labels"),
+    ({"audience_labels": []}, "audience_labels"),
+    ({"audience_labels": ""}, "audience_labels"),
+])
+def test_update_custom_audience_named_labels_are_validated_before_any_request(monkeypatch, kwargs, match) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(audiences.ValidationError, match=match) as excinfo:
+        asyncio.run(audiences.update_custom_audience(audience_id="aud_1", **kwargs))
+    if "params" in kwargs:
+        assert "params" in str(excinfo.value)
+
+
+def test_update_custom_audience_labels_failed_pre_read_writes_nothing(monkeypatch) -> None:
+    from meta_ads_mcp.errors import NotFoundError
+
+    client = RecordingAudienceClient(read_error=NotFoundError("Meta object or edge not found: aud_1"))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    with pytest.raises(NotFoundError):
+        asyncio.run(audiences.update_custom_audience(audience_id="aud_1", audience_labels=["AT_RISK"]))
+    assert [call[0] for call in client.calls] == ["get"]
+
+
+def test_audience_labels_match_metas_published_list_and_sdk_enum() -> None:
+    """The guide's ten labels plus the five more in the SDK 26.0.2 enum; neither lists APP_INSTALLERS or CUSTOMER_LEADS."""
+    guide = {"QUALIFIED_LEADS", "DISQUALIFIED_LEADS", "APP_USERS", "TRIAL_USERS", "ENGAGED_USERS",
+             "HIGH_VALUE_CUSTOMERS", "LOW_VALUE_CUSTOMERS", "AT_RISK", "DISENGAGED", "GENERAL_CUSTOMERS"}
+    sdk_only = {"CART_ABANDONERS", "RECENT_PURCHASERS", "OTHER_1", "OTHER_2", "OTHER_3"}
+    assert audiences.AUDIENCE_LABELS == guide | sdk_only
