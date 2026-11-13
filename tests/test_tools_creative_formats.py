@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 import json
+from copy import deepcopy
 
 import httpx
 import pytest
@@ -338,7 +339,7 @@ INVALID_COMBINATIONS = [
     ({"page_id": "111", "link_url": "https://x", "cards": [{"image_hash": "a"}]}, "2 to 10"),
     ({"page_id": "111", "link_url": "https://x", "cards": [{"image_hash": "a"}, {"video_id": "1"}]}, "needs image_hash"),
     ({"page_id": "111", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "See more"),
-    ({"page_id": "111", "link_url": "https://x", "cards": [{"image_hash": "a"}, {"image_hash": "b", "colour": "red"}]}, "unknown keys"),
+    ({"page_id": "111", "link_url": "https://x", "cards": [{"image_hash": "a"}, {"image_hash": "b", "colour": "red"}]}, "unknown key"),
     ({"page_id": "111", "link_url": "https://x", "image_hash": "h", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "does not accept"),
     ({"page_id": "111", "link_url": "https://x", "message": "m", "primary_texts": ["a"], "image_hash": "h"}, "not both"),
     ({"page_id": "111", "link_url": "https://x", "primary_texts": ["a"] * 2, "image_hash": "h"}, "repeat"),
@@ -350,14 +351,14 @@ INVALID_COMBINATIONS = [
     ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}]}, "2 to 10"),
     ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "b"}]}, "Only one entry"),
     ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"video_id": "1", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}]}, "all images or all videos"),
-    ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "a", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}]}, "repeats media"),
+    ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "a", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}]}, "repeats the media"),
     ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "b", "publisher_platforms": ["facebook"]}]}, "needs facebook_positions"),
     ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "b", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"], "instagram_positions": ["story"]}]}, "does not include instagram"),
     ({"page_id": "111", "link_url": "https://x", "placement_customizations": [
         {"image_hash": "a", "publisher_platforms": ["facebook"], "facebook_positions": ["feed", "story"]},
         {"image_hash": "b", "publisher_platforms": ["facebook"], "facebook_positions": ["story"]},
     ]}, "must not overlap"),
-    ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "b", "publisher_platforms": ["oculus"], "oculus_positions": ["x"]}]}, "unknown keys"),
+    ({"page_id": "111", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "b", "publisher_platforms": ["oculus"], "oculus_positions": ["x"]}]}, "unknown key"),
     ({"object_story_id": "111_222", "message": "new text"}, "does not accept message"),
     ({"object_story_id": "111_222", "link_url": "https://x"}, "does not accept link_url"),
     ({"object_story_id": "abc"}, "digits on both sides"),
@@ -368,8 +369,8 @@ INVALID_COMBINATIONS = [
     ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "SHOP_NOW"}, "needs link_url"),
     ({"source_instagram_media_id": "4", "page_id": "111", "partnership_ad_format": 1}, "sponsor"),
     ({"source_instagram_media_id": "4", "object_story_id": "1_2"}, "Use only one"),
-    ({"partnership_ad_code": "c", "page_id": "111"}, "sponsor"),
-    ({"partnership_ad_code": "c", "page_id": "111", "sponsor_page_id": "2", "link_url": "https://x"}, "does not accept link_url"),
+    ({"partnership_ad_code": "AQSYNTHETICCODE1", "page_id": "111"}, "sponsor"),
+    ({"partnership_ad_code": "AQSYNTHETICCODE1", "page_id": "111", "sponsor_page_id": "2", "link_url": "https://x"}, "does not accept link_url"),
     ({"page_id": "111", "image_hash": "h", "link_url": "https://x", "partnership_ad_format": 4}, "partnership_ad_format"),
     ({"page_id": "111"}, "No creative format selected"),
     ({"page_id": "111", "image_hash": "h", "link_url": "https://x", "message": "x" * 1025}, "1024"),
@@ -840,10 +841,10 @@ ROUND_THREE_INVALID = [
     ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": f"h{i}"} for i in range(11)]}, "2 to 10"),
     ({"page_id": "111", "multi_media": [{"image_hash": "a"}, {"image_hash": "b"}]}, "link_url is required"),
     ({"link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"image_hash": "b"}]}, "page_id is required"),
-    ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"image_hash": "a"}]}, "repeats media"),
+    ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"image_hash": "a"}]}, "repeats the media"),
     ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "a", "video_id": "1"}, {"image_hash": "b"}]}, "exactly one of"),
     ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "a", "image_url": "https://x/a.png"}, {"image_hash": "b"}]}, "exactly one of"),
-    ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"image_hash": "b", "colour": "red"}]}, "unknown keys"),
+    ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"image_hash": "b", "colour": "red"}]}, "unknown key"),
     ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "a", "thumbnail_url": "https://x/t.png"}, {"image_hash": "b"}]}, "thumbnail"),
     ({"page_id": "111", "link_url": "https://x", "multi_media": [{"video_id": "1"}, {"image_hash": "b"}]}, "thumbnail"),
     ({"page_id": "111", "link_url": "https://x", "multi_media": [{"image_hash": "b"}, {"video_id": "1", "thumbnail_hash": "t"}]}, "thumbnail_url"),
@@ -865,14 +866,14 @@ ROUND_THREE_INVALID = [
     ({"page_id": "111", "product_set_id": "7", "link_url": "https://x", "sponsor_page_id": "2"}, "Partnership"),
     ({"page_id": "111", "product_set_id": "7", "link_url": "https://x", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "Use only one"),
     # Facebook Partnership Ads
-    ({"facebook_partnership_ad_code": "c"}, "sponsor_page_id"),
-    ({"facebook_partnership_ad_code": "c", "sponsor_instagram_account_id": "3"}, "sponsor_page_id"),
-    ({"facebook_partnership_ad_code": "c", "sponsor_page_id": "2", "image_hash": "h"}, "does not accept image_hash"),
-    ({"facebook_partnership_ad_code": "c", "sponsor_page_id": "2", "message": "m"}, "does not accept message"),
-    ({"facebook_partnership_ad_code": "c", "sponsor_page_id": "2", "call_to_action_type": "SHOP_NOW"}, "needs link_url"),
-    ({"facebook_partnership_ad_code": "c", "sponsor_page_id": "2", "call_to_action_type": "WHATSAPP_MESSAGE"}, "not built"),
-    ({"facebook_partnership_ad_code": "c", "partnership_ad_code": "d", "sponsor_page_id": "2"}, "Use only one"),
-    ({"facebook_partnership_ad_code": "c", "object_story_id": "1_2", "sponsor_page_id": "2"}, "Use only one"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1"}, "sponsor_page_id"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "sponsor_instagram_account_id": "3"}, "sponsor_page_id"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "sponsor_page_id": "2", "image_hash": "h"}, "does not accept image_hash"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "sponsor_page_id": "2", "message": "m"}, "does not accept message"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "sponsor_page_id": "2", "call_to_action_type": "SHOP_NOW"}, "needs link_url"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "sponsor_page_id": "2", "call_to_action_type": "WHATSAPP_MESSAGE"}, "not built"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "partnership_ad_code": "AQSYNTHETICCODE2", "sponsor_page_id": "2"}, "Use only one"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "object_story_id": "1_2", "sponsor_page_id": "2"}, "Use only one"),
     ({"object_story_id": "1_2", "sponsor_instagram_account_id": "3"}, "sponsor_page_id"),
     ({"object_story_id": "1_2", "partnership_ad_format": 1}, "sponsor_page_id"),
     ({"object_story_id": "1_2", "sponsor_page_id": "2", "link_url": "https://x"}, "does not accept link_url"),
@@ -917,3 +918,564 @@ def test_mcp_boundary_accepts_new_format_inputs() -> None:
         {"account_id": "123", "name": "C", "page_id": "111", "product_set_id": "777", "link_url": "https://x.example", "dry_run": True},
     ))
     assert "template_data" in str(result)
+
+
+# Round four: new forms (click-to-Instagram carousel, click-to-message on an Instagram post,
+# display_link, product extensions)
+
+
+def test_click_to_instagram_carousel_spec(monkeypatch) -> None:
+    result, data = _create(
+        monkeypatch, page_id="111", instagram_account_id="222", call_to_action_type="INSTAGRAM_MESSAGE",
+        message="Ask us", page_welcome_message="Hi there",
+        cards=[
+            {"image_hash": "h1", "headline": "One", "description": "First"},
+            {"image_url": "https://cdn.example.com/t.png", "video_id": "77", "headline": "Two", "call_to_action_type": "instagram_message"},
+        ],
+    )
+    button = {"type": "INSTAGRAM_MESSAGE", "value": {"app_destination": "INSTAGRAM_DIRECT"}}
+    assert data == {
+        "name": "Creative",
+        "object_story_spec": {
+            "page_id": "111",
+            "instagram_user_id": "222",
+            "link_data": {
+                "call_to_action": button,
+                "child_attachments": [
+                    {"image_hash": "h1", "name": "One", "description": "First", "call_to_action": button},
+                    {"picture": "https://cdn.example.com/t.png", "video_id": "77", "name": "Two", "call_to_action": button},
+                ],
+                "message": "Ask us",
+                "page_welcome_message": "Hi there",
+            },
+        },
+    }
+    assert result["format"] == "carousel"
+    assert any("INSTAGRAM_DIRECT" in note for note in result["notes"])
+
+
+def test_click_to_instagram_carousel_dry_run_sends_nothing(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="DM carousel", page_id="111", instagram_account_id="222",
+        call_to_action_type="INSTAGRAM_MESSAGE", cards=[{"image_hash": "a"}, {"image_hash": "b"}], dry_run=True,
+    ))
+    assert result["sent"] is False
+    link_data = result["would_send"]["data"]["object_story_spec"]["link_data"]
+    assert "link" not in link_data
+    assert [card["call_to_action"]["type"] for card in link_data["child_attachments"]] == ["INSTAGRAM_MESSAGE"] * 2
+
+
+@pytest.mark.parametrize(
+    ("cta", "expected_cta"),
+    [
+        ("WHATSAPP_MESSAGE", {"type": "WHATSAPP_MESSAGE", "value": {"link": "https://api.whatsapp.com/send", "app_destination": "WHATSAPP"}}),
+        ("INSTAGRAM_MESSAGE", {"type": "INSTAGRAM_MESSAGE", "value": {"link": "https://www.instagram.com"}}),
+    ],
+)
+def test_instagram_post_click_to_message_spec(monkeypatch, cta, expected_cta) -> None:
+    result, data = _create(
+        monkeypatch, source_instagram_media_id="444", page_id="111", instagram_account_id="333", call_to_action_type=cta,
+    )
+    assert data == {
+        "name": "Creative",
+        "object_id": "111",
+        "source_instagram_media_id": "444",
+        "instagram_user_id": "333",
+        "call_to_action": expected_cta,
+    }
+    assert result["format"] == "instagram_post"
+    assert any("destination_type" in note for note in result["notes"])
+
+
+def test_instagram_post_click_to_message_dry_run_sends_nothing(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="Post", source_instagram_media_id="444", page_id="111", instagram_account_id="333",
+        call_to_action_type="WHATSAPP_MESSAGE", dry_run=True,
+    ))
+    assert result["sent"] is False
+    assert result["would_send"]["data"]["call_to_action"]["value"]["app_destination"] == "WHATSAPP"
+
+
+DISPLAY_LINK_CASES = [
+    (
+        {"page_id": "111", "image_hash": "h1", "link_url": "https://example.com/p"},
+        lambda data: data["object_story_spec"]["link_data"]["caption"],
+    ),
+    (
+        {"page_id": "111", "video_id": "555", "image_hash": "t", "link_url": "https://example.com/p"},
+        lambda data: data["object_story_spec"]["video_data"]["call_to_action"]["value"]["link_caption"],
+    ),
+    (
+        {"page_id": "111", "link_url": "https://example.com/p", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]},
+        lambda data: data["object_story_spec"]["link_data"]["caption"],
+    ),
+    (
+        {"page_id": "111", "image_hash": "h1", "link_url": "https://example.com/p", "primary_texts": ["A", "B"]},
+        lambda data: data["asset_feed_spec"]["link_urls"][0]["display_url"],
+    ),
+    (
+        {"page_id": "111", "link_url": "https://example.com/p", "placement_customizations": [
+            {"image_hash": "a", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}, {"image_hash": "b"},
+        ]},
+        lambda data: data["asset_feed_spec"]["link_urls"][0]["display_url"],
+    ),
+    (
+        {"page_id": "111", "link_url": "https://example.com/p", "multi_media": [{"image_hash": "a"}, {"video_id": "5"}]},
+        lambda data: data["object_story_spec"]["link_data"]["caption"],
+    ),
+    (
+        {"page_id": "111", "link_url": "https://example.com/p", "multi_media": [{"video_id": "5", "thumbnail_hash": "t"}, {"image_hash": "a"}]},
+        lambda data: data["object_story_spec"]["video_data"]["call_to_action"]["value"]["link_caption"],
+    ),
+    (
+        {"page_id": "111", "product_set_id": "777", "link_url": "https://shop.example.com"},
+        lambda data: data["object_story_spec"]["template_data"]["caption"],
+    ),
+]
+
+
+@pytest.mark.parametrize(("arguments", "where"), DISPLAY_LINK_CASES)
+def test_display_link_is_sent_as_metas_caption(monkeypatch, arguments, where) -> None:
+    _, data = _create(monkeypatch, display_link="Example.com", **arguments)
+    assert where(data) == "Example.com"
+    assert "Example.com" in json.dumps(data)
+    assert json.dumps(data).count("Example.com") == 1
+
+
+def test_display_link_exact_single_image_spec_and_dry_run(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="Spring", page_id="111", image_hash="h1", link_url="https://example.com/p",
+        display_link="https://example.com", dry_run=True,
+    ))
+    assert result["would_send"]["data"]["object_story_spec"]["link_data"] == {
+        "link": "https://example.com/p",
+        "call_to_action": {"type": "LEARN_MORE", "value": {"link": "https://example.com/p"}},
+        "image_hash": "h1",
+        "caption": "https://example.com",
+    }
+    assert result["sent"] is False
+
+
+PRODUCT_EXTENSIONS = {
+    "creative_sourcing_spec": {"associated_product_set_id": "888"},
+    "degrees_of_freedom_spec": {"creative_features_spec": {
+        "product_extensions": {"enroll_status": "OPT_IN", "action_metadata": {"type": "MANUAL"}},
+    }},
+}
+
+
+def test_product_extensions_single_image_spec(monkeypatch) -> None:
+    result, data = _create(
+        monkeypatch, page_id="111", image_hash="h1", link_url="https://example.com/p", product_extensions_product_set_id="888",
+    )
+    assert data == {
+        "name": "Creative",
+        "object_story_spec": {
+            "page_id": "111",
+            "link_data": {
+                "link": "https://example.com/p",
+                "call_to_action": {"type": "LEARN_MORE", "value": {"link": "https://example.com/p"}},
+                "image_hash": "h1",
+            },
+        },
+        **PRODUCT_EXTENSIONS,
+    }
+    assert result["format"] == "single_image"
+    assert any("Sales or Traffic" in note for note in result["notes"])
+
+
+def test_product_extensions_single_video_spec_and_dry_run(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="Video", page_id="111", video_id="555", image_hash="t", link_url="https://example.com/p",
+        product_extensions_product_set_id="888", dry_run=True,
+    ))
+    data = result["would_send"]["data"]
+    assert {key: data[key] for key in PRODUCT_EXTENSIONS} == PRODUCT_EXTENSIONS
+    assert data["object_story_spec"]["video_data"]["video_id"] == "555"
+    assert result["sent"] is False
+
+
+ROUND_FOUR_INVALID = [
+    # click-to-message carousels
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "WHATSAPP_MESSAGE", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "Instagram Direct"),
+    ({"page_id": "111", "call_to_action_type": "MESSAGE_PAGE", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "Instagram Direct"),
+    ({"page_id": "111", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "instagram_account_id"),
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "link_url": "https://x", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "link_url is not used"),
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a", "link": "https://x"}, {"image_hash": "b"}]}, "cards\\[1\\] link is not used"),
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a"}, {"image_hash": "b", "call_to_action_type": "SHOP_NOW"}]}, "same messaging surface"),
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a"}, {"video_id": "7"}]}, "needs image_hash"),
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "display_link": "example.com", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "display_link"),
+    ({"page_id": "111", "link_url": "https://x", "cards": [{"image_hash": "a"}, {"image_hash": "b", "call_to_action_type": "INSTAGRAM_MESSAGE"}]}, "top level and on every card"),
+    ({"page_id": "111", "link_url": "https://x", "page_welcome_message": "hi", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "INSTAGRAM_MESSAGE"),
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "sponsor_page_id": "5", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "single image or single video"),
+    # click-to-message on an existing Instagram post
+    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "MESSAGE_PAGE"}, "not built"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "WHATSAPP_MESSAGE", "link_url": "https://x"}, "link_url is not used"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "sponsor_page_id": "5", "call_to_action_type": "WHATSAPP_MESSAGE"}, "Partnership"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "WHATSAPP_MESSAGE", "page_welcome_message": "hi"}, "does not accept page_welcome_message"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "call_to_action_type": "INSTAGRAM_MESSAGE"}, "instagram_account_id is required"),
+    # display_link
+    ({"page_id": "111", "image_hash": "h", "display_link": "example.com", "call_to_action_type": "WHATSAPP_MESSAGE"}, "display_link needs link_url"),
+    ({"page_id": "111", "image_hash": "h", "display_link": "example.com", "lead_gen_form_id": "8"}, "display_link needs link_url"),
+    ({"page_id": "111", "video_id": "5", "image_hash": "t", "display_link": "example.com"}, "display_link needs link_url"),
+    ({"page_id": "111", "image_hash": "h", "link_url": "https://x", "display_link": "Shop now"}, "must be a URL or a domain"),
+    ({"page_id": "111", "image_hash": "h", "link_url": "https://x", "display_link": "ftp://example.com"}, "must be a URL or a domain"),
+    ({"page_id": "111", "image_hash": "h", "link_url": "https://x", "display_link": "https://user:pw@example.com"}, "username or password"),
+    ({"object_story_id": "111_222", "display_link": "example.com"}, "does not accept display_link"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "link_url": "https://x", "display_link": "example.com"}, "does not accept display_link"),
+    ({"partnership_ad_code": "AQSYNTHETICCODE1", "page_id": "111", "sponsor_page_id": "2", "display_link": "example.com"}, "does not accept display_link"),
+    ({"facebook_partnership_ad_code": "AQSYNTHETICCODE1", "sponsor_page_id": "2", "link_url": "https://x", "display_link": "example.com"}, "does not accept display_link"),
+    # product extensions
+    ({"page_id": "111", "link_url": "https://x", "product_extensions_product_set_id": "8", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "single image or single video only"),
+    ({"page_id": "111", "link_url": "https://x", "product_extensions_product_set_id": "8", "product_set_id": "7"}, "product_set_id builds a catalog carousel"),
+    ({"page_id": "111", "link_url": "https://x", "product_extensions_product_set_id": "8", "image_hash": "h", "primary_texts": ["a", "b"]}, "single image or single video only"),
+    ({"page_id": "111", "link_url": "https://x", "product_extensions_product_set_id": "8", "multi_media": [{"image_hash": "a"}, {"image_hash": "b"}]}, "single image or single video only"),
+    ({"page_id": "111", "image_hash": "h", "product_extensions_product_set_id": "8"}, "needs link_url"),
+    ({"page_id": "111", "image_hash": "h", "product_extensions_product_set_id": "8", "call_to_action_type": "WHATSAPP_MESSAGE"}, "needs link_url"),
+    ({"page_id": "111", "image_hash": "h", "product_extensions_product_set_id": "8", "lead_gen_form_id": "9"}, "needs link_url"),
+    ({"page_id": "111", "image_hash": "h", "link_url": "https://x", "product_extensions_product_set_id": "8", "sponsor_page_id": "2"}, "Partnership"),
+    ({"object_story_id": "111_222", "product_extensions_product_set_id": "8"}, "single image or single video only"),
+]
+
+
+@pytest.mark.parametrize(("arguments", "message"), ROUND_FOUR_INVALID)
+def test_round_four_invalid_combinations_raise_before_any_call(monkeypatch, arguments, message) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=message):
+        asyncio.run(cf.create_ad_creative_from_inputs(account_id="123", name="Creative", **arguments))
+
+
+def test_mcp_boundary_rejects_non_numeric_product_extensions_set() -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    with pytest.raises(Exception, match="pattern|string_pattern_mismatch|should match|product_extensions_product_set_id"):
+        asyncio.run(mcp_server.call_tool(
+            "create_ad_creative_from_inputs",
+            {"account_id": "123", "name": "C", "page_id": "111", "image_hash": "h", "link_url": "https://x.example",
+             "product_extensions_product_set_id": "set one", "dry_run": True},
+        ))
+
+
+# H17: an enhancement copy keeps every part of a creative this server built.
+
+
+class ProjectingClient(FakeClient):
+    """Serves the ad's creative with only the fields requested, as Meta does."""
+
+    def __init__(self, creative: dict[str, Any]) -> None:
+        super().__init__(objects={"10": AD})
+        self.creative = creative
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        if object_id == "20":
+            return {key: deepcopy(value) for key, value in self.creative.items() if fields is None or key in fields}
+        return dict(self.objects.get(object_id, {"id": object_id}))
+
+
+ROUND_TRIP_SHAPES = {
+    "single_image": {"page_id": "111", "instagram_account_id": "222", "image_hash": "h1", "link_url": "https://example.com/p",
+                     "message": "Body", "headline": "Head", "description": "Desc", "url_tags": "utm_source=meta",
+                     "display_link": "example.com"},
+    "single_video": {"page_id": "111", "video_id": "555", "image_url": "https://cdn.example.com/t.png",
+                     "link_url": "https://example.com", "headline": "Title", "display_link": "example.com"},
+    "carousel": {"page_id": "111", "link_url": "https://example.com", "message": "Pick", "display_link": "example.com",
+                 "cards": [{"image_hash": "h1", "headline": "One"}, {"image_hash": "h2", "video_id": "77", "call_to_action_type": "SHOP_NOW"}]},
+    "click_to_instagram_carousel": {"page_id": "111", "instagram_account_id": "222", "call_to_action_type": "INSTAGRAM_MESSAGE",
+                                    "page_welcome_message": "Hi", "cards": [{"image_hash": "h1"}, {"image_hash": "h2", "video_id": "77"}]},
+    "text_variants": {"page_id": "111", "image_hash": "h1", "link_url": "https://example.com", "primary_texts": ["A", "B"],
+                      "headlines": ["H1", "H2"], "display_link": "example.com"},
+    "placement_customizations": {"page_id": "111", "link_url": "https://example.com", "message": "Body", "placement_customizations": [
+        {"image_hash": "feed", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}, {"image_hash": "fallback"}]},
+    "page_post": {"object_story_id": "111_222", "page_id": "111", "instagram_account_id": "333"},
+    "instagram_post": {"source_instagram_media_id": "444", "page_id": "111", "instagram_account_id": "333",
+                       "link_url": "https://example.com", "call_to_action_type": "SHOP_NOW"},
+    "instagram_post_whatsapp": {"source_instagram_media_id": "444", "page_id": "111", "instagram_account_id": "333",
+                                "call_to_action_type": "WHATSAPP_MESSAGE"},
+    "instagram_post_instagram_direct": {"source_instagram_media_id": "444", "page_id": "111", "instagram_account_id": "333",
+                                        "call_to_action_type": "INSTAGRAM_MESSAGE"},
+    "click_to_whatsapp_image": {"page_id": "111", "image_hash": "h1", "call_to_action_type": "WHATSAPP_MESSAGE", "page_welcome_message": "Hi"},
+    "click_to_messenger_video": {"page_id": "111", "video_id": "555", "image_hash": "t", "call_to_action_type": "MESSAGE_PAGE",
+                                 "description": "Chat"},
+    "lead_form": {"page_id": "111", "image_hash": "h1", "lead_gen_form_id": "888", "call_to_action_type": "SIGN_UP"},
+    "partnership_instagram_post": {"source_instagram_media_id": "444", "page_id": "111", "sponsor_page_id": "222",
+                                   "sponsor_instagram_account_id": "333", "partnership_ad_format": 2},
+    "partnership_ad_code": {"partnership_ad_code": "AQSYNTHETICCODE1", "page_id": "111", "sponsor_page_id": "222",
+                            "partnership_ad_format": 1},
+    "facebook_partnership_post": {"object_story_id": "900_901", "sponsor_page_id": "222", "partnership_ad_format": 3},
+    "facebook_partnership_ad_code": {"facebook_partnership_ad_code": "AQSYNTHETICCODE2", "sponsor_page_id": "222",
+                                     "link_url": "https://example.com", "call_to_action_type": "SHOP_NOW"},
+    "partnership_new_media": {"page_id": "111", "image_hash": "h1", "link_url": "https://example.com", "sponsor_page_id": "222",
+                              "sponsor_instagram_account_id": "333"},
+    "multi_media": {"page_id": "111", "link_url": "https://example.com", "primary_texts": ["A", "B"], "headline": "H",
+                    "display_link": "example.com",
+                    "multi_media": [{"image_hash": "h1"}, {"video_id": "55", "thumbnail_url": "https://cdn.example.com/t.png"}, {"image_hash": "h3"}]},
+    "catalog_carousel": {"page_id": "111", "product_set_id": "777", "link_url": "https://shop.example.com",
+                         "message": "{{product.name}}", "display_link": "shop.example.com"},
+    "product_extensions": {"page_id": "111", "image_hash": "h1", "link_url": "https://example.com", "product_extensions_product_set_id": "888"},
+}
+
+
+def _built_spec(monkeypatch, arguments: dict[str, Any]) -> dict[str, Any]:
+    client = FakeClient()
+    _patch(monkeypatch, client)
+    asyncio.run(cf.create_ad_creative_from_inputs(account_id="123", name="Built", **arguments))
+    return client.calls[0][3]
+
+
+@pytest.mark.parametrize("shape", sorted(ROUND_TRIP_SHAPES))
+def test_h17_enhancement_copy_keeps_every_part_of_each_built_creative(monkeypatch, shape) -> None:
+    built = _built_spec(monkeypatch, ROUND_TRIP_SHAPES[shape])
+    client = ProjectingClient({"id": "20", "account_id": "123", **deepcopy(built)})
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+
+    sent = next(call[3] for call in client.calls if call[0] == "create")
+    unchanged = {key: value for key, value in built.items() if key not in {"name", "degrees_of_freedom_spec"}}
+    assert {key: value for key, value in sent.items() if key not in {"name", "degrees_of_freedom_spec"}} == unchanged
+    expected_features = deepcopy(built.get("degrees_of_freedom_spec", {}))
+    expected_features.setdefault("creative_features_spec", {})["image_touchups"] = {"enroll_status": "OPT_OUT"}
+    assert sent["degrees_of_freedom_spec"] == expected_features
+    assert result["fields_not_copied"] == []
+    assert ("update", "10", {"creative": {"creative_id": "999"}}) in client.calls
+
+
+def test_h17_enhancement_copy_preserves_multi_media_asset_pool(monkeypatch) -> None:
+    pool = {
+        "images": [{"hash": "secondary-image", "source": "multi_media", "opt_in_status": "opt_in"}],
+        "videos": [{"video_id": "50", "original_video_id": "50", "source": "multi_media", "opt_in_status": "opt_in"}],
+    }
+    client = ProjectingClient({
+        "id": "20", "account_id": "123", "name": "Asset pool",
+        "object_story_spec": {"page_id": "40", "link_data": {"link": "https://example.invalid", "image_hash": "primary-image"}},
+        "media_sourcing_spec": pool,
+    })
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    replacement = next(call[3] for call in client.calls if call[0] == "create")
+    assert replacement.get("media_sourcing_spec") == pool, (replacement, result)
+
+
+def test_h17_every_field_the_builder_writes_is_read_and_copied(monkeypatch) -> None:
+    written: set[str] = set()
+    for arguments in ROUND_TRIP_SHAPES.values():
+        written.update(_built_spec(monkeypatch, arguments))
+    written -= {"name", "degrees_of_freedom_spec"}
+    assert written <= set(cf.COPYABLE_CREATIVE_FIELDS)
+    assert set(cf.COPYABLE_CREATIVE_FIELDS) | {"degrees_of_freedom_spec"} <= set(cf.ENHANCEMENT_READ_FIELDS)
+
+
+def test_h17_a_returned_field_the_copy_drops_is_named(monkeypatch) -> None:
+    client = ProjectingClient({
+        "id": "20", "account_id": "123",
+        "object_story_spec": {"page_id": "40", "link_data": {"link": "https://example.invalid", "image_hash": "h"}},
+        "object_story_id": "40_41",
+    })
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}, dry_run=True))
+    assert result["fields_not_copied"] == ["object_story_id"]
+
+
+def test_enhancement_dry_run_never_shows_a_partnership_ad_code(monkeypatch) -> None:
+    built = _built_spec(monkeypatch, ROUND_TRIP_SHAPES["partnership_ad_code"])
+    client = ProjectingClient({"id": "20", "account_id": "123", **built})
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}, dry_run=True))
+    assert "AQSYNTHETICCODE1" not in json.dumps(result)
+    assert result["would_send"][0]["data"]["branded_content"]["instagram_boost_post_access_token"] == "<partnership_ad_code>"
+    assert [call[0] for call in client.calls] == ["get", "get"]
+
+
+# H1: a Partnership Ad code never comes back inside an error.
+
+CODE = "synthetic-private-code"
+
+
+def _echoing_error(cycle: bool) -> MetaApiError:
+    """A Meta refusal that repeats the code everywhere, behind a cause chain (optionally with a cycle)."""
+    inner = httpx.HTTPStatusError(f"upstream said {CODE}", request=httpx.Request("POST", "https://graph.invalid"), response=httpx.Response(400))
+    error = MetaApiError(
+        f"Invalid authorization code {CODE}", code=100, user_message=f"Rejected {CODE}", user_title=CODE,
+        error_data={"blame": CODE, "nested": [CODE]}, details={"error": {"message": CODE}},
+    )
+    error.__cause__ = inner
+    if cycle:
+        inner.__context__ = error
+    inner.add_note(f"note {CODE}")
+    return error
+
+
+class EchoClient(FakeClient):
+    # The cycle is built for direct calls only: the server's rich log handler does not stop on a
+    # cyclic error chain (a third-party limit outside this tool), so the server cases use a plain chain.
+    def __init__(self, creative: dict[str, Any] | None = None, cycle: bool = True) -> None:
+        super().__init__(objects={"10": AD, "20": creative or {}})
+        self.cycle = cycle
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, data))
+        raise _echoing_error(self.cycle)
+
+
+def _assert_no_code(exc: BaseException) -> None:
+    import traceback
+
+    assert CODE not in "".join(traceback.format_exception(exc))
+    pending, seen = [exc], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        assert CODE not in repr(current.args)
+        assert CODE not in str(current)
+        if isinstance(current, MetaApiError):
+            assert CODE not in json.dumps(current.to_public_dict())
+            assert CODE not in json.dumps(current.details)
+        pending.extend([current.__cause__, current.__context__])
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"partnership_ad_code": CODE, "page_id": "20", "sponsor_page_id": "30"},
+        {"partnership_ad_code": f"  {CODE} ", "page_id": "20", "sponsor_page_id": "30"},
+        {"facebook_partnership_ad_code": CODE, "sponsor_page_id": "30"},
+    ],
+)
+def test_h1_partnership_code_is_removed_from_a_direct_error(monkeypatch, arguments) -> None:
+    client = EchoClient()
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.create_ad_creative_from_inputs(account_id="10", name="Partnership", **arguments))
+    assert client.calls[0][3]["branded_content"]  # the code was sent
+    _assert_no_code(info.value)
+    assert "<partnership_ad_code>" in str(info.value)
+    assert "no creative was created" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"sponsor_page_id": "30", "facebook_partnership_ad_code": CODE},
+        {"sponsor_page_id": "30", "partnership_ad_code": CODE},
+    ],
+)
+@pytest.mark.parametrize("routed", [False, True])
+def test_h1_partnership_upstream_error_never_discloses_code(monkeypatch, caplog, extra, routed) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.coordinator import mcp_server
+
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    _patch(monkeypatch, EchoClient(cycle=False))
+    args = {"account_id": "10", "page_id": "20", "name": "Partnership", **extra}
+    name, args = ("call_tool", {"name": "create_ad_creative_from_inputs", "arguments": args}) if routed else ("create_ad_creative_from_inputs", args)
+    with pytest.raises(ToolError) as info:
+        asyncio.run(mcp_server.call_tool(name, args))
+    assert CODE not in str(info.value)
+    assert CODE not in caplog.text
+
+
+def test_h1_code_is_removed_from_an_unexpected_error_too(monkeypatch) -> None:
+    class Broken(FakeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise RuntimeError(f"transport dropped {CODE}")
+
+    _patch(monkeypatch, Broken())
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            account_id="10", name="Partnership", page_id="20", sponsor_page_id="30", partnership_ad_code=CODE,
+        ))
+    _assert_no_code(info.value)
+    assert info.value.mutation_outcome_unknown is True
+
+
+def test_h1_enhancement_error_never_shows_the_copied_code(monkeypatch) -> None:
+    built = {
+        "id": "20", "account_id": "123", "name": "Code",
+        "object_id": "111", "branded_content": {"instagram_boost_post_access_token": CODE}, "facebook_branded_content": {"sponsor_page_id": "222"},
+    }
+    client = EchoClient(built)
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    assert client.calls[-1][3]["branded_content"]["instagram_boost_post_access_token"] == CODE
+    _assert_no_code(info.value)
+    assert "still uses creative 20" in str(info.value)
+
+
+# H2: validation errors never copy caller text.
+
+PRIVATE = "synthetic.private.customer@example.invalid"
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_h2_private_body_validation_does_not_echo_customer_key(caplog, routed) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    args = {"account_id": "10", "name": "Carousel", "page_id": "20", "link_url": "https://example.invalid",
+            "cards": [{"image_hash": "a", PRIVATE: "misplaced"}, {"image_hash": "b"}], "dry_run": True}
+    name, args = ("call_tool", {"name": "create_ad_creative_from_inputs", "arguments": args}) if routed else ("create_ad_creative_from_inputs", args)
+    with pytest.raises(ToolError) as info:
+        asyncio.run(mcp_server.call_tool(name, args))
+    assert PRIVATE not in str(info.value)
+    assert PRIVATE not in caplog.text
+    assert "cards[1] has 1 unknown key" in str(info.value)
+
+
+PRIVATE_PLACEMENTS = [
+    # misplaced as a key, in each entry kind
+    {"page_id": "1", "link_url": "https://x", "cards": [{"image_hash": "a", PRIVATE: "v"}, {"image_hash": "b"}]},
+    {"page_id": "1", "link_url": "https://x", "placement_customizations": [{"image_hash": "a", PRIVATE: "v"}, {"image_hash": "b"}]},
+    {"page_id": "1", "link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"image_hash": "b", PRIVATE: "v"}]},
+    # misplaced as a key whose value is a login URL (the login check runs first)
+    {"page_id": "1", "link_url": "https://x", "cards": [{"image_hash": "a", PRIVATE: "https://u:p@x.invalid/"}, {"image_hash": "b"}]},
+    # misplaced as a value
+    {"page_id": "1", "link_url": "https://x", "call_to_action_type": PRIVATE, "image_hash": "h"},
+    {"page_id": "1", "link_url": "https://x", "cards": [{"image_hash": "a", "call_to_action_type": PRIVATE}, {"image_hash": "b"}]},
+    {"page_id": "1", "link_url": "https://x", "cards": [{"image_hash": "a", "link": PRIVATE}, {"image_hash": "b"}]},
+    {"page_id": "1", "link_url": "https://x", "cards": [{"image_hash": "a", "video_id": PRIVATE}, {"image_hash": "b"}]},
+    {"page_id": "1", "link_url": "https://x", "placement_customizations": [{"image_hash": PRIVATE}, {"image_hash": PRIVATE, "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}]},
+    {"page_id": "1", "link_url": "https://x", "placement_customizations": [{"image_hash": "a"}, {"image_hash": "b", "publisher_platforms": [PRIVATE], "facebook_positions": ["feed"]}]},
+    {"page_id": "1", "link_url": "https://x", "placement_customizations": [
+        {"image_hash": "a", "publisher_platforms": ["facebook"], "facebook_positions": [PRIVATE]},
+        {"image_hash": "b", "publisher_platforms": ["facebook"], "facebook_positions": [PRIVATE]},
+    ]},
+    {"page_id": "1", "link_url": "https://x", "placement_customizations": [{"image_url": PRIVATE}, {"image_hash": "b", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}]},
+    {"page_id": "1", "link_url": "https://x", "multi_media": [{"image_hash": PRIVATE}, {"image_hash": PRIVATE}]},
+    {"page_id": "1", "link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"video_id": PRIVATE}]},
+    {"page_id": "1", "link_url": "https://x", "multi_media": [{"image_hash": "a"}, {"video_id": "1", "thumbnail_url": PRIVATE}]},
+    {"page_id": "1", "image_hash": "h", "link_url": PRIVATE},
+    {"page_id": "1", "image_hash": "h", "link_url": "https://x", "display_link": PRIVATE},
+    {"page_id": "1", "image_url": PRIVATE, "link_url": "https://x"},
+    {"object_story_id": PRIVATE},
+    {"page_id": "1", "image_hash": "h", "link_url": "https://x", "lead_gen_form_id": "8"},
+    {"page_id": "1", "image_hash": "h", "lead_gen_form_id": "8", "call_to_action_type": "SHOP_NOW"},
+    {"page_id": "1", "link_url": "https://x", "primary_texts": [PRIVATE, PRIVATE], "image_hash": "h"},
+]
+
+
+@pytest.mark.parametrize("arguments", PRIVATE_PLACEMENTS)
+def test_h2_no_validation_message_copies_caller_text(monkeypatch, arguments) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError) as info:
+        asyncio.run(cf.create_ad_creative_from_inputs(account_id="123", name="Creative", **arguments))
+    assert "synthetic.private" not in str(info.value).lower()
+
+
+def test_h2_enhancement_feature_names_are_counted_not_quoted(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={PRIVATE: "OPT_IN", "image_touchups": "OPT_OUT"}))
+    assert PRIVATE not in str(info.value)
+    assert "1 name" in str(info.value)
