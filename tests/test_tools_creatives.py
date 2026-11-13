@@ -351,3 +351,75 @@ def test_boost_instagram_post_validation_errors_make_no_call(monkeypatch, argume
     }
     with pytest.raises(creatives.ValidationError, match=message):
         asyncio.run(creatives.boost_instagram_post(**{**base, **arguments}))
+
+
+# Phase two: old-style calls to master tools send exactly what they sent before.
+
+
+class RecordingCreativeClient(FakeCreativeClient):
+    """Records every request in order, including previews and edge writes."""
+
+    def __init__(self, *, adlabels=None, fail_formats=()) -> None:
+        super().__init__()
+        self.requests: list[tuple] = []
+        self.adlabels = adlabels
+        self.fail_formats = set(fail_formats)
+
+    async def preview_ad(self, **kwargs):
+        self.requests.append(("preview", kwargs))
+        if kwargs.get("ad_format") in self.fail_formats:
+            from meta_ads_mcp.errors import MetaApiError
+
+            raise MetaApiError(message="Unsupported ad format", status_code=400, code=100)
+        return {"data": [{"body": f"<html>{kwargs.get('ad_format')}</html>"}]}
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.requests.append(("get", object_id, list(fields or []), params))
+        payload = await super().get_object(object_id, fields=fields, params=params)
+        if self.adlabels is not None:
+            payload["adlabels"] = self.adlabels
+        return payload
+
+    async def update_object(self, object_id: str, *, data):
+        self.requests.append(("update", object_id, dict(data)))
+        return await super().update_object(object_id, data=data)
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.requests.append(("create", parent_id, edge, dict(data)))
+        return {"success": True}
+
+
+def test_preview_ad_single_format_call_is_unchanged(monkeypatch) -> None:
+    client = RecordingCreativeClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+
+    by_ad = asyncio.run(creatives.preview_ad(ad_id="ad_1"))
+    by_creative = asyncio.run(creatives.preview_ad(account_id="123", creative_id="crt_1", ad_format="MOBILE_FEED_STANDARD"))
+
+    assert client.requests == [
+        ("preview", {"ad_id": "ad_1", "account_id": None, "creative_id": None, "creative": None, "ad_format": "DESKTOP_FEED_STANDARD"}),
+        ("preview", {"ad_id": None, "account_id": "act_123", "creative_id": "crt_1", "creative": None, "ad_format": "MOBILE_FEED_STANDARD"}),
+    ]
+    assert by_ad == {"item": {"data": [{"body": "<html>DESKTOP_FEED_STANDARD</html>"}]}, "summary": {"count": 1}}
+    assert by_creative["item"]["data"][0]["body"] == "<html>MOBILE_FEED_STANDARD</html>"
+
+
+def test_update_creative_without_labels_is_unchanged(monkeypatch) -> None:
+    client = RecordingCreativeClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(creatives.update_creative(
+        creative_id="crt_1", name="New", status="ACTIVE", params={"adlabels": [{"name": "legacy"}]},
+    ))
+
+    assert client.requests == [
+        ("get", "crt_1", creatives.CREATIVE_FIELDS, None),
+        ("update", "crt_1", {"name": "New", "status": "ACTIVE", "adlabels": [{"name": "legacy"}]}),
+    ]
+    assert result == {
+        "ok": True,
+        "action": "update_creative",
+        "target": {"creative_id": "crt_1"},
+        "previous": {"name": "Old", "title": "Old title", "body": "Old body", "status": "ACTIVE"},
+        "current": {"name": "New", "status": "ACTIVE", "adlabels": [{"name": "legacy"}]},
+    }
