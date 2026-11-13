@@ -598,7 +598,7 @@ async def create_ad_set(
     optimization_sub_event: str | None = None,
     budget_schedule_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. start_time and end_time are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named_spend = {
         "daily_spend_cap": daily_spend_cap,
         "lifetime_spend_cap": lifetime_spend_cap,
@@ -723,12 +723,51 @@ async def create_ad_set(
         "adsets",
         data=merge_graph_payload(payload, params),
     )
-    return creation_response(
+    response = creation_response(
         action="create_ad_set",
         target={"account_id": account_id, "campaign_id": campaign_id},
         result=result,
         validate_only=validate_only,
     )
+    zoneless = [key for key, value in (("start_time", start_time), ("end_time", end_time)) if _time_without_zone(value)]
+    if zoneless:
+        await _add_zoneless_time_warning(response, client, zoneless, result, validate_only=validate_only)
+    return response
+
+
+async def _add_zoneless_time_warning(
+    response: dict[str, Any],
+    client: Any,
+    zoneless: list[str],
+    result: Any,
+    *,
+    validate_only: bool,
+) -> None:
+    """Warn that a schedule time had no time zone and, after a real create, show what Meta stored.
+
+    The ad set already exists here, so nothing in this function may raise: a
+    failed read-back only changes the warning's wording.
+    """
+    names = " and ".join(zoneless)
+    verb, pronoun = ("was", "it") if len(zoneless) == 1 else ("were", "them")
+    warning = (
+        f"{names} {verb} given without a time zone, so Meta chose how to read {pronoun}. "
+        "To be unambiguous, include a UTC offset, for example 2026-11-27T00:00:00-05:00."
+    )
+    if not validate_only:
+        new_id = result.get("id") if isinstance(result, dict) else None
+        stored = None
+        if new_id not in (None, ""):
+            try:
+                stored = await client.get_object(str(new_id), fields=["start_time", "end_time"])
+            except Exception:  # The create succeeded; a failed read-back must not turn it into an error.
+                stored = None
+        if isinstance(stored, dict):
+            response["stored_schedule"] = {"start_time": stored.get("start_time"), "end_time": stored.get("end_time")}
+            warning += " stored_schedule shows the times Meta stored; check they are what you meant."
+        else:
+            warning += " The time Meta stored could not be read back; check it with get_adset."
+    response["warnings"] = [warning]
 
 
 _ADSET_MONEY_FIELD_TOOLS = {
@@ -759,6 +798,22 @@ _UNREAD_ADSET_PREVIOUS = "Not a field this server reads back from an ad set."
 _ADSET_TIME_FORMAT = "an ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00) or Unix seconds"
 
 
+def _parse_iso_time(text: str) -> datetime | None:
+    """Parse an ISO 8601 time the way every schedule check in this module does; None when it is not one."""
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _time_without_zone(value: Any) -> bool:
+    """True for an ISO 8601 time with no UTC offset; Unix seconds, blanks and unparsable text are not flagged."""
+    if not isinstance(value, str) or not value.strip() or value.strip().isdigit():
+        return False
+    parsed = _parse_iso_time(value.strip())
+    return parsed is not None and parsed.tzinfo is None
+
+
 def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
     """Check an ad set schedule time; None when absent or end_time 0 (Meta's no-end-date value)."""
     if value is None:
@@ -773,10 +828,9 @@ def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
         if seconds == 0:
             raise ValidationError(f"{field_name} must be a positive Unix time.")
         return datetime.fromtimestamp(seconds, timezone.utc)
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.") from exc
+    parsed = _parse_iso_time(text)
+    if parsed is None:
+        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.")
     if parsed.tzinfo is None:
         raise ValidationError(
             f"{field_name} needs a UTC offset or Z (for example 2026-12-01T00:00:00-05:00) "
@@ -794,11 +848,8 @@ def _stored_adset_time(value: Any) -> datetime | None:
     """Read a stored ad set time such as 2026-12-01T00:00:00+0000; None when absent or unreadable."""
     if not isinstance(value, str) or not value.strip():
         return None
-    try:
-        parsed = datetime.fromisoformat(value.strip())
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
+    parsed = _parse_iso_time(value.strip())
+    return parsed if parsed is not None and parsed.tzinfo is not None else None
 
 
 @mcp_server.tool()

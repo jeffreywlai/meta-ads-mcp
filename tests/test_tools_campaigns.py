@@ -1938,3 +1938,157 @@ def test_create_ad_set_zoneless_start_time_request_is_unchanged(monkeypatch) -> 
         }),
     ]
     assert list(client.calls[1][3]) == [*ZONELESS_ADSET_CREATE, "start_time", "end_time", "daily_budget"]
+
+
+class ScheduleReadClient(RecordingCampaignClient):
+    """Records calls; the create returns adset_new, whose stored schedule is read back as configured."""
+
+    def __init__(self, *, stored=None, read_error: BaseException | None = None, created=None) -> None:
+        super().__init__()
+        self.stored = {"id": "adset_new"} if stored is None else stored
+        self.read_error = read_error
+        self.created = {"id": "adset_new"} if created is None else created
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return self.created
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        if object_id == "act_123":
+            return await super().get_object(object_id, fields=fields, params=params)
+        self.calls.append(("get", object_id, list(fields or [])))
+        if self.read_error is not None:
+            raise self.read_error
+        return self.stored
+
+
+OLD_STYLE_ADSET_RESPONSE = {
+    "ok": True,
+    "action": "create_ad_set",
+    "target": {"account_id": "act_123", "campaign_id": "cmp_123"},
+    "validation_only": False,
+    "created": {"id": "adset_new"},
+}
+
+
+def test_create_ad_set_old_style_zoneless_response_keeps_every_field(monkeypatch) -> None:
+    """Every field an old-style call's response had is still there with the same value; two fields are added."""
+    client = ScheduleReadClient(stored={
+        "id": "adset_new", "start_time": "2026-11-27T00:00:00-0800", "end_time": "2026-11-30T00:00:00-0800",
+    })
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00", end_time="2026-11-30T00:00:00",
+    ))
+    assert {key: result[key] for key in OLD_STYLE_ADSET_RESPONSE} == OLD_STYLE_ADSET_RESPONSE
+    assert set(result) == {*OLD_STYLE_ADSET_RESPONSE, "warnings", "stored_schedule"}
+    assert client.calls == [
+        ("create", "act_123", "adsets", {
+            **ZONELESS_ADSET_CREATE, "start_time": "2026-11-27T00:00:00", "end_time": "2026-11-30T00:00:00",
+        }),
+        ("get", "adset_new", ["start_time", "end_time"]),
+    ]
+    assert result["stored_schedule"] == {
+        "start_time": "2026-11-27T00:00:00-0800", "end_time": "2026-11-30T00:00:00-0800",
+    }
+    [warning] = result["warnings"]
+    assert warning.startswith("start_time and end_time were given without a time zone")
+    assert "Meta chose how to read them" in warning
+    assert "2026-11-27T00:00:00-05:00" in warning
+    assert "stored_schedule" in warning
+
+
+def test_create_ad_set_warning_names_only_the_zoneless_time(monkeypatch) -> None:
+    client = ScheduleReadClient(stored={"id": "adset_new", "start_time": "2026-11-27T00:00:00-0500"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00-05:00", end_time="2026-11-30",
+    ))
+    [warning] = result["warnings"]
+    assert warning.startswith("end_time was given without a time zone")
+    assert "start_time" not in warning
+    assert "Meta chose how to read it." in warning
+    assert result["stored_schedule"] == {"start_time": "2026-11-27T00:00:00-0500", "end_time": None}
+    assert client.calls[-1] == ("get", "adset_new", ["start_time", "end_time"])
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        ScheduleReadClient(read_error=campaigns.MetaAdsError("Meta read failed")),
+        ScheduleReadClient(read_error=RuntimeError("connection dropped")),
+        ScheduleReadClient(stored=["not", "an", "object"]),
+    ],
+    ids=["meta-error", "other-error", "unreadable-shape"],
+)
+def test_create_ad_set_failed_read_back_still_reports_the_create(monkeypatch, client) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(**ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00"))
+    assert {key: result[key] for key in OLD_STYLE_ADSET_RESPONSE} == OLD_STYLE_ADSET_RESPONSE
+    assert "stored_schedule" not in result
+    [warning] = result["warnings"]
+    assert warning.startswith("start_time was given without a time zone")
+    assert "could not be read" in warning
+    assert "get_adset" in warning
+    assert client.calls[-1] == ("get", "adset_new", ["start_time", "end_time"])
+
+
+def test_create_ad_set_without_created_id_skips_the_read_back(monkeypatch) -> None:
+    client = ScheduleReadClient(created={"success": True})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(**ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00"))
+    assert result["created"] == {"success": True}
+    assert [call[0] for call in client.calls] == ["create"]
+    assert "could not be read" in result["warnings"][0]
+
+
+def test_create_ad_set_validate_only_warns_without_read_back(monkeypatch) -> None:
+    client = ScheduleReadClient(created={"success": True})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00", validate_only=True,
+    ))
+    assert client.calls == [
+        ("create", "act_123", "adsets", {
+            **ZONELESS_ADSET_CREATE, "start_time": "2026-11-27T00:00:00", "execution_options": ["validate_only"],
+        }),
+    ]
+    assert result["validation_only"] is True
+    assert result["validation"] == {"success": True}
+    assert "stored_schedule" not in result
+    [warning] = result["warnings"]
+    assert warning.startswith("start_time was given without a time zone")
+    assert "2026-11-27T00:00:00-05:00" in warning
+    assert "get_adset" not in warning
+
+
+@pytest.mark.parametrize(
+    "times",
+    [
+        {},
+        {"start_time": "2026-11-27T00:00:00-05:00", "end_time": "2026-11-30T00:00:00-0500"},
+        {"start_time": "2026-11-27T05:00:00Z"},
+        {"start_time": "1795000000", "end_time": "0"},
+        {"start_time": "next friday"},
+        {"start_time": "", "end_time": "   "},
+    ],
+    ids=["no-times", "offsets", "utc-z", "unix-seconds", "unparsable", "blank"],
+)
+def test_create_ad_set_times_with_a_zone_make_the_same_requests_and_response(monkeypatch, times) -> None:
+    client = ScheduleReadClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(**ZONELESS_ADSET_ARGS, daily_budget=20.0, **times))
+    sent_times = {key: value for key, value in times.items() if value}
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {**ZONELESS_ADSET_CREATE, **sent_times, "daily_budget": 2000}),
+    ]
+    assert result == OLD_STYLE_ADSET_RESPONSE
+
+
+def test_create_ad_set_docstring_explains_zoneless_times_and_money_in_params() -> None:
+    doc = campaigns.create_ad_set.__doc__
+    assert "without a UTC offset" in doc
+    assert "stored_schedule" in doc
+    assert "refused inside params" in doc
+    assert "+" not in doc
