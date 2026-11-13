@@ -462,8 +462,15 @@ def _tools_using_credential_helpers() -> dict[str, set[str]]:
             for node in tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        # Only the body counts. A decorator that masks what Meta returned (applied to
+        # every tool in a module) says nothing about what the tool's own input can hold.
         direct = {
-            name: {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
+            name: {
+                node.id
+                for statement in function.body
+                for node in ast.walk(statement)
+                if isinstance(node, ast.Name)
+            }
             for name, function in functions.items()
         }
 

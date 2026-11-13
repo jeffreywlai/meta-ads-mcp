@@ -54,6 +54,14 @@ PRIVATE_ARGUMENT_TOOLS: frozenset[str] = frozenset(
         "update_catalog_product",
         "batch_update_catalog_products",
         "list_dpa_eligible_catalogs",
+        # Product set filters and names are checked for URLs that carry a login, so
+        # the value being checked must not be quoted back by a framework error.
+        "create_product_set",
+        "update_product_set",
+        "list_catalog_products",
+        "build_product_set_filter",
+        # Reads a creative that can hold a Partnership Ad code and previews its copy.
+        "update_ad_creative_enhancements",
         # Catalog settings in params can carry an integration access token
         # (partner_integration.external_access_token).
         "create_catalog",
