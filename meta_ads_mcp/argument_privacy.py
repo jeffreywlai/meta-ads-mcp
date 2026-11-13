@@ -207,8 +207,16 @@ class ValidationLogPrivacyFilter(logging.Filter):
             return set()
 
     def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._sanitize(record)
+        except Exception:
+            # Never raise from a filter: that would break every record of the logger.
+            _withhold_record(record, f"FastMCP record ({_WITHHELD})")
+        return True
+
+    def _sanitize(self, record: logging.LogRecord) -> None:
         if not str(record.msg).startswith(_INVALID_ARGUMENTS_PREFIX):
-            return True
+            return
         args = record.args
         if isinstance(args, tuple) and len(args) == 2:
             name, detail = args
@@ -221,7 +229,7 @@ class ValidationLogPrivacyFilter(logging.Filter):
             # A message formatted some other way: keep only the fixed prefix.
             record.msg = f"{_INVALID_ARGUMENTS_PREFIX} ({_WITHHELD})"
             record.args = ()
-        return True
+        record.getMessage()
 
 
 def _catalog_parameter_names(server: Any) -> set[str]:
@@ -261,9 +269,17 @@ class HandlerLogPrivacyFilter(logging.Filter):
             return False
 
     def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._sanitize(record)
+        except Exception:
+            # Never raise from a filter: that would break every record of the logger.
+            _withhold_record(record, f"FastMCP handler record ({_WITHHELD})")
+        return True
+
+    def _sanitize(self, record: logging.LogRecord) -> None:
         message = str(record.msg)
         if _HANDLER_CALL_MARKER not in message:
-            return True
+            return
         args = record.args
         if isinstance(args, tuple) and len(args) == 2:
             name, arguments = args
@@ -275,7 +291,7 @@ class HandlerLogPrivacyFilter(logging.Filter):
         else:
             record.msg = f"{message.split(_HANDLER_CALL_MARKER, 1)[0]}{_HANDLER_CALL_MARKER} ({_WITHHELD})"
             record.args = ()
-        return True
+        record.getMessage()
 
 
 def _catalog_tool_names(server: Any) -> set[str]:
@@ -496,6 +512,24 @@ def _rewrite(record: logging.LogRecord, message: str) -> None:
     record.args = ()
 
 
+def _withhold_record(record: logging.LogRecord, message: str) -> None:
+    """The fallback when a filter cannot read a record: a fixed message, no exception text.
+
+    A filter that raises would break logging for every record of its logger, so
+    this never raises; the record keeps its level and logger.
+    """
+    try:
+        _rewrite(record, message)
+        record.exc_info = None
+        record.exc_text = None
+    except Exception:
+        pass
+
+
+# A request id written as text is the client's choice and may be anything, so it is not logged.
+_TEXT_REQUEST_ID = "<request id that is text, withheld>"
+
+
 def _active_exception() -> BaseException | None:
     # The session logs these records inside its except block, so the exception
     # being handled is the one whose text the record quotes.
@@ -516,14 +550,17 @@ class SessionLogPrivacyFilter(logging.Filter):
         return os.path.normcase(str(record.pathname)).endswith(_MCP_SESSION_SOURCE)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not self._from_session(record):
+        try:
+            if not self._from_session(record):
+                return True
+        except Exception:
+            # A record whose source cannot be read is not known to be the session's; it passes as it is.
             return True
         try:
             self._sanitize(record)
+            record.getMessage()
         except Exception:
-            _rewrite(record, f"MCP session record ({_TRANSPORT_WITHHELD})")
-            record.exc_info = None
-            record.exc_text = None
+            _withhold_record(record, f"MCP session record ({_TRANSPORT_WITHHELD})")
         return True
 
     @staticmethod
@@ -564,12 +601,18 @@ class LowLevelServerLogPrivacyFilter(logging.Filter):
     """Keep message contents and names that are no tool out of the low-level MCP server's records.
 
     Installed on the ``mcp.server.lowlevel.server`` logger. The records it logs
-    with a value are rewritten; the rest (request type names, request ids) pass.
+    with a value are rewritten; the rest (the server's own name, request and
+    notification type names) pass. A request id is chosen by the client and may
+    be any text, so it is shown only when it is a number.
     """
 
     _UNKNOWN_TOOL_TEMPLATES = (
         "Tool cache miss for %s, refreshing cache",
         "Tool '%s' not listed, no validation will be performed",
+    )
+    _REQUEST_ID_TEMPLATES = (
+        "Request %s cancelled - duplicate response suppressed",
+        "Response for %s dropped - transport closed",
     )
 
     def __init__(self, tool_names: Callable[[], Iterable[str]]) -> None:
@@ -585,10 +628,10 @@ class LowLevelServerLogPrivacyFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             self._sanitize(record)
+            # A record that cannot be formatted would fail in every handler; say what is known instead.
+            record.getMessage()
         except Exception:
-            _rewrite(record, f"MCP server record ({_TRANSPORT_WITHHELD})")
-            record.exc_info = None
-            record.exc_text = None
+            _withhold_record(record, f"MCP server record ({_TRANSPORT_WITHHELD})")
         return True
 
     @staticmethod
@@ -603,6 +646,10 @@ class LowLevelServerLogPrivacyFilter(logging.Filter):
         if message in self._UNKNOWN_TOOL_TEMPLATES:
             name = args[0] if args else None
             record.args = (name if self._known(name) else _UNKNOWN_TOOL,)
+        elif message in self._REQUEST_ID_TEMPLATES:
+            request_id = args[0] if args else None
+            numeric = isinstance(request_id, int) and not isinstance(request_id, bool)
+            record.args = (request_id if numeric else _TEXT_REQUEST_ID,)
         elif message.startswith("Received exception from stream: "):
             errors = _errors_from_text(message)
             detail = describe_message_validation(errors, None) if errors is not None else (
@@ -634,7 +681,9 @@ def _install_transport_log_privacy(server: Any) -> None:
     session_filter = SessionLogPrivacyFilter()
     logging.getLogger().addFilter(session_filter)
     lowlevel_filter = LowLevelServerLogPrivacyFilter(_transport_tool_names)
-    logging.getLogger(MCP_LOWLEVEL_LOGGER).addFilter(lowlevel_filter)
+    # First, so the filters already on this logger (FastMCP's formats every record to
+    # look for one warning) see a record that has been made private and printable.
+    logging.getLogger(MCP_LOWLEVEL_LOGGER).filters.insert(0, lowlevel_filter)
     _TRANSPORT_FILTERS.extend((session_filter, lowlevel_filter))
 
 

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import pytest
+from fastmcp.exceptions import ToolError
 
+from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.tools import diagnostics, insights, performance_signals, recommendations
 
@@ -2661,7 +2664,7 @@ def test_g19_ranking_does_not_borrow_another_ads_result_definition(monkeypatch) 
         return {
             "20": {"ad_id": "20", "clicks": "10"},
             "21": {"ad_id": "21", "clicks": "10", "results": [{"indicator": "actions:lead", "values": [{"value": "2"}]}]},
-        }, None, None
+        }, None, None, []
 
     _patch(monkeypatch, RecordingClient(insights_handler=handler))
     monkeypatch.setattr(performance_signals, "_ranking_cost_rows", costs)
@@ -3982,7 +3985,12 @@ def test_history_overlapping_pages_count_each_day_once_and_say_so(monkeypatch) -
     result = asyncio.run(performance_signals.get_opportunity_score(account_id="42", history_days=14))
     history = result["history"]
     assert [point["date"] for point in history["points"]].count("2026-11-02") == 1
-    assert next(point for point in history["points"] if point["date"] == "2026-11-02")["opportunity_score"] == 75
+    # R6 L8: the two copies of 2026-11-02 disagree (75 and 99), so neither is shown; the first is not preferred.
+    disputed = next(point for point in history["points"] if point["date"] == "2026-11-02")
+    assert disputed["opportunity_score"] is None and disputed["unknown_reason"]
+    assert history["days_with_contradictory_rows"] == ["2026-11-02"]
+    assert next(point for point in history["points"] if point["date"] == "2026-11-01")["opportunity_score"] == 70
+    assert history["summary"]["max"] == 80 and 99 not in [point["opportunity_score"] for point in history["points"]]
     assert history["complete"] is False and "more than once" in history["incomplete_reason"]
 
 
@@ -4135,3 +4143,273 @@ def test_context_named_scope_with_a_failed_read_does_not_call_an_id_unmatched(mo
     assert result["adset_coverage"]["status"] == "partly_read"
     assert not any("not a campaign or ad set of this account" in signal for signal in result["missing_signals"])
     assert any("may not have been read" in signal for signal in result["missing_signals"])
+
+
+# ---------------------------------------------------------------------------
+# Round seven (R6 L8): a fault Meta's rows show is kept even when every selected id has a row, and an identity
+# whose rows disagree has no value
+# ---------------------------------------------------------------------------
+
+
+def _r6_result(count: int) -> list[dict[str, Any]]:
+    return [{"indicator": "actions:link_click", "values": [{"value": str(count), "attribution_windows": ["default"]}]}]
+
+
+class _SelectedIdsReport(RecordingClient):
+    """Ids 20 and 21 over two pages, each page within the requested limit of two.
+
+    second: what page two holds besides id 21: 'contradict' repeats id 20 with other values, 'identical' repeats
+    id 20 unchanged, 'unreadable' adds a row that is not an object, 'clean' adds nothing.
+    """
+
+    def __init__(self, second: str) -> None:
+        account = {"currency": "USD", "account_status": 1, "disable_reason": 0, "timezone_name": "UTC"}
+        super().__init__(
+            objects={"10": {"id": "10", **account}, "act_10": {"id": "act_10", **account}},
+            edges={("act_10", edge): {"data": []} for _, edge, _ in performance_signals.CONTEXT_EDGE_SECTIONS},
+        )
+        self.second = second
+        self.insights_handler = self._handler
+
+    def _handler(self, object_id, fields, params):
+        if params["level"] in ("account", "campaign"):
+            return {"data": [{"spend": "190", "impressions": "2000", "date_start": "2026-11-01",
+                              "date_stop": "2026-11-07"}]}
+        key = "ad_id" if params["level"] == "ad" else "adset_id"
+        row = {key: "20", "adset_id": "20", "campaign_id": "30", "spend": "100",
+               "date_start": "2026-11-01", "date_stop": "2026-11-07",
+               "clicks": "100", "impressions": "1000", "objective": "OUTCOME_TRAFFIC",
+               "optimization_goal": "LINK_CLICKS", "results": _r6_result(10),
+               "quality_ranking": "AVERAGE", "engagement_rate_ranking": "AVERAGE",
+               "conversion_rate_ranking": "AVERAGE"}
+        other = {**row, key: "21", "adset_id": "21", "spend": "90", "results": _r6_result(9)}
+        if params.get("sort"):
+            return {"data": [dict(row), dict(other)]}
+        if params.get("after"):
+            extra = {
+                "contradict": [{**row, "spend": "900", "results": _r6_result(100)}],
+                "identical": [dict(row)],
+                "unreadable": [None],
+                "clean": [],
+            }[self.second]
+            return {"data": [*extra, dict(other)]}
+        return {"data": [dict(row)], "paging": {"next": "more", "cursors": {"after": "second"}}}
+
+
+def _r6_context(monkeypatch, second: str, scope: str) -> dict[str, Any]:
+    _patch(monkeypatch, _SelectedIdsReport(second))
+    arguments: dict[str, Any] = {}
+    if scope == "named_ads":
+        arguments = {"ad_ids": ["20", "21"]}
+    elif scope == "named_adsets":
+        arguments = {"object_ids": ["20", "21"]}
+    return asyncio.run(performance_signals.get_advertiser_context(
+        "10", since="2026-11-01", until="2026-11-07", **arguments,
+    ))
+
+
+@pytest.mark.parametrize("scope", ["top_adsets", "named_ads"])
+def test_l8_context_does_not_call_contradictory_rows_complete(monkeypatch, scope) -> None:
+    """Reviewer reproduction: id 20 read with spend 100, then again with 900, gave spend 190 and complete=true."""
+    result = _r6_context(monkeypatch, "contradict", scope)
+    coverage = result["ad_coverage" if scope == "named_ads" else "adset_coverage"]
+    assert coverage["complete"] is False
+    assert coverage["rows_read_stopped"] is not None
+    # Neither copy of id 20 is used: the briefing shows only id 21, read once, and says why 20 is missing.
+    assert coverage["examined_spend"] == 90.0
+    assert result["metrics"]["spend"] == 90.0
+    assert result["metrics"]["ad_rows" if scope == "named_ads" else "adset_rows"] == 1
+    listed = coverage.get("ads_with_contradictory_rows") or [
+        item["adset_id"] for item in coverage.get("adsets_with_contradictory_rows", [])
+    ]
+    assert listed == ["20"]
+    assert any("disagree" in signal and "20" in signal for signal in result["missing_signals"])
+    goals = {entry["optimization_goal"]: entry for entry in result["spend_by_optimization_goal"]}
+    assert goals["LINK_CLICKS"]["spend"] == 90.0
+    if scope == "named_ads":
+        # Ad 20 was returned, so it is not called unmatched (not an ad of this account).
+        assert result["object_scope"]["unmatched_ad_ids"] == []
+
+
+def test_l8_context_named_adsets_with_contradictory_rows_are_not_used(monkeypatch) -> None:
+    result = _r6_context(monkeypatch, "contradict", "named_adsets")
+    coverage = result["adset_coverage"]
+    assert coverage["complete"] is False
+    assert [item["adset_id"] for item in coverage["adsets_with_contradictory_rows"]] == ["20"]
+    assert result["metrics"]["adset_rows"] == 1 and result["metrics"]["spend"] == 90.0
+    assert result["object_scope"]["unmatched_object_ids"] == []
+
+
+def test_l8_ranking_keeps_fault_when_all_selected_ids_are_present(monkeypatch) -> None:
+    _patch(monkeypatch, _SelectedIdsReport("contradict"))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(
+        "account", "10", since="2026-11-01", until="2026-11-07",
+    ))
+    cost = result["cost_evidence"]
+    assert cost["read_stopped"] is not None
+    assert cost["ads_with_contradictory_rows"] == ["20"]
+    ads = {ad["ad_id"]: ad for ad in result["ranked_ads"]}
+    # Ad 20's results are unknown, not 10 (first copy) or 100 (second copy); ad 21, read once, keeps its 9.
+    assert ads["20"]["results"] is None and ads["20"]["cost_per_result"] is None
+    assert ads["20"]["result_status"] == "contradictory_rows"
+    assert ads["21"]["results"] == 9.0
+    assert any("disagree" in signal and "20" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize("scope", ["top_adsets", "named_ads", "named_adsets"])
+def test_l8_control_clean_multi_page_read_with_every_id_is_still_complete(monkeypatch, scope) -> None:
+    result = _r6_context(monkeypatch, "clean", scope)
+    coverage = result["ad_coverage" if scope == "named_ads" else "adset_coverage"]
+    assert coverage["complete"] is True, coverage
+    assert coverage["rows_read_stopped"] is None
+    assert coverage["examined_spend"] == 190.0
+    assert not any("disagree" in signal or "not read cleanly" in signal for signal in result["missing_signals"])
+
+
+def test_l8_control_clean_multi_page_ranking_cost_read_is_complete(monkeypatch) -> None:
+    _patch(monkeypatch, _SelectedIdsReport("clean"))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(
+        "account", "10", since="2026-11-01", until="2026-11-07",
+    ))
+    cost = result["cost_evidence"]
+    assert cost["read_stopped"] is None and cost["ads_with_contradictory_rows"] == []
+    assert cost["ads_returned"] == 2
+    ads = {ad["ad_id"]: ad for ad in result["ranked_ads"]}
+    assert ads["20"]["results"] == 10.0 and ads["21"]["results"] == 9.0
+    assert not any("not clean" in signal or "disagree" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize("second", ["identical", "unreadable"])
+@pytest.mark.parametrize("scope", ["top_adsets", "named_ads"])
+def test_l8_fault_with_every_id_present_is_incomplete_but_single_reads_keep_values(monkeypatch, scope, second) -> None:
+    """A repeat that agrees, or a row that cannot be read, is a fault in Meta's rows; ids read once keep values."""
+    result = _r6_context(monkeypatch, second, scope)
+    coverage = result["ad_coverage" if scope == "named_ads" else "adset_coverage"]
+    assert coverage["complete"] is False
+    assert coverage["rows_read_stopped"] is not None
+    assert not coverage.get("ads_with_contradictory_rows") and not coverage.get("adsets_with_contradictory_rows")
+    assert coverage["examined_spend"] == 190.0
+
+
+@pytest.mark.parametrize("second", ["identical", "unreadable"])
+def test_l8_ranking_fault_with_every_id_present_keeps_values_and_says_so(monkeypatch, second) -> None:
+    _patch(monkeypatch, _SelectedIdsReport(second))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(
+        "account", "10", since="2026-11-01", until="2026-11-07",
+    ))
+    cost = result["cost_evidence"]
+    assert cost["read_stopped"] is not None and cost["ads_with_contradictory_rows"] == []
+    ads = {ad["ad_id"]: ad for ad in result["ranked_ads"]}
+    assert ads["20"]["results"] == 10.0 and ads["21"]["results"] == 9.0
+    assert any("not clean" in signal for signal in result["missing_signals"])
+
+
+def test_l8_selected_rows_two_rows_for_one_id_in_one_read_are_contradictory() -> None:
+    read = performance_signals._PagedRead(
+        rows=[{"ad_id": "20", "date_start": "2026-11-01", "spend": "1"},
+              {"ad_id": "20", "date_start": "2026-11-02", "spend": "2"},
+              {"ad_id": "21", "date_start": "2026-11-01", "spend": "3"}],
+        stopped=None, fault=None, contradicted=[],
+    )
+    rows, contradicted, reason = performance_signals._selected_rows(read, "ad_id", ["20", "21"])
+    assert list(rows) == ["21"] and contradicted == ["20"]
+    assert reason is not None and "20" in reason
+
+
+def test_l8_ranking_lean_rows_that_disagree_give_no_spend_or_rankings(monkeypatch) -> None:
+    base = _meta_like_ranking_handler(_many_ads(2), scope_spend=1e5, more=False)
+
+    def handler(object_id, fields, params):
+        payload = base(object_id, fields, params)
+        if params["level"] == "ad" and "sort" in params:
+            payload["data"].append({**payload["data"][1], "spend": "1", "quality_ranking": "BELOW_AVERAGE_10"})
+        return payload
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=5))
+    ads = {ad["ad_id"]: ad for ad in result["ranked_ads"]}
+    disputed = ads["ad_0001"]
+    assert disputed["spend"] is None and disputed["rankings"]["quality_ranking"] is None
+    assert disputed["diagnosis"] is None and disputed["result_status"] == "contradictory_rows"
+    assert ads["ad_0000"]["spend"] == 5000.0
+    assert result["examined"]["examined_spend"] is None
+    assert any("disagree" in signal and "ad_0001" in signal for signal in result["missing_signals"])
+    assert not any("not ordered by spend" in signal for signal in result["missing_signals"])
+
+
+def test_l8_delivery_spend_rows_that_disagree_give_no_spend(monkeypatch) -> None:
+    def pages(params):
+        if params.get("after"):
+            return {"data": [{"ad_id": "ad_0000", "spend": "4000"}]}
+        return {"data": [{"ad_id": "ad_0000", "spend": "40"}, {"ad_id": "other", "spend": "30"}],
+                "paging": {"cursors": {"after": "c2"}, "next": "https://graph.example/next"}}
+
+    _delivery_client(monkeypatch, pages)
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    problems = {problem["object_id"]: problem for problem in result["problems"]}
+    assert problems["ad_0000"]["spend"] is None and problems["ad_0000"]["spend_status"] == "spend_unavailable"
+    assert result["spend_lookup"]["objects_with_contradictory_spend_rows"] == ["ad_0000"]
+    assert "objects_with_unreadable_spend" not in result["spend_lookup"]
+    assert any("disagree" in signal and "ad_0000" in signal for signal in result["missing_signals"])
+
+
+def test_l8_history_day_repeated_unchanged_keeps_its_score() -> None:
+    """Control: an identical repeat is a fault (incomplete), not a disagreement."""
+    pages = {
+        None: {"data": [{"date": "2026-11-01", "opportunity_score": "70"}],
+               "paging": {"next": "https://graph.example/next", "cursors": {"after": "h2"}}},
+        "h2": {"data": [{"date": "2026-11-01", "opportunity_score": "70"},
+                        {"date": "2026-11-02", "opportunity_score": "71"}]},
+    }
+
+    class Client:
+        async def list_objects(self, parent_id, edge, *, params=None, fields=None):
+            return pages[params.get("after")]
+
+    payload, stopped, contradicted = asyncio.run(performance_signals._history_pages(Client(), "act_1", {}))
+    assert [row["opportunity_score"] for row in payload["data"]] == ["70", "71"]
+    assert contradicted == set() and "more than once" in stopped
+
+
+# ---------------------------------------------------------------------------
+# Round seven (R6 L3): a validation error names the position of a bad value, never the value
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool", ["get_performance_trend", "detect_performance_anomalies"])
+def test_l3_metric_error_does_not_quote_misplaced_personal_text(monkeypatch, caplog, tool) -> None:
+    private = "".join(("private.person", "@r6-metric.invalid"))
+    monkeypatch.setattr(
+        performance_signals, "get_graph_api_client", lambda: pytest.fail("Invalid metrics must precede a client call"),
+    )
+    arguments: dict[str, Any] = {"level": "campaign", "object_id": "10", "metrics": [private]}
+    arguments.update({"since": "2026-11-01", "until": "2026-11-07"} if tool == "get_performance_trend"
+                     else {"end_date": "2026-11-07"})
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as raised:
+        asyncio.run(mcp_server.call_tool(tool, arguments))
+    assert private not in str(raised.value)
+    assert private not in caplog.text
+    assert "metrics[0] is not a supported metric" in str(raised.value)
+
+
+def test_l3_metric_error_names_the_position_and_the_supported_names() -> None:
+    with pytest.raises(ValidationError) as raised:
+        performance_signals._normalize_metric_names(["cpc", "Jane Doe 0400 000 000"], ("cpc",))
+    message = str(raised.value)
+    assert "metrics[1] is not a supported metric" in message
+    assert "Jane" not in message and "0400" not in message
+    assert "cost_per_result" in message and "roas" in message
+    # Known names in any case still work.
+    assert performance_signals._normalize_metric_names("CPC, spend", ("cpc",)) == ["cpc", "spend"]
+
+
+@pytest.mark.parametrize("field", ["object_ids", "ad_ids"])
+def test_l3_id_list_error_does_not_quote_a_value_that_is_not_an_id(field) -> None:
+    private = "".join(("private.person", "@r6-ids.invalid"))
+    with pytest.raises(ValidationError) as raised:
+        performance_signals._require_graph_ids(["10", private, "11"], field=field)
+    message = str(raised.value)
+    assert private not in message and "private" not in message
+    assert f"{field}[1]" in message
+    assert performance_signals._require_graph_ids(["10", " 11 ", "10"], field=field) == ["10", "11"]

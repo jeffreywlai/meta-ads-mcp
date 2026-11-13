@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from meta_ads_mcp.coordinator import mcp_server
@@ -215,39 +215,47 @@ def _history_summary(points: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-async def _history_pages(client: Any, account_id: str, params: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Read every page of the score history edge (bounded); return the rows and why the read stopped early.
+async def _history_pages(
+    client: Any, account_id: str, params: dict[str, Any],
+) -> tuple[dict[str, Any], str | None, set[str]]:
+    """Read every page of the score history edge (bounded); return the rows, why the read stopped early, and the
+    days whose copies disagree.
 
     A history row is one day, so its identity is its date: a day read twice is kept once and ends the read, a
-    row without a date cannot be read, and a page without a readable data list ends the read.
+    row without a date cannot be read, and a page without a readable data list ends the read. A day whose
+    second copy differs from the first has no known score.
     """
     identity = _RowIdentity(("date",))
     rows: list[dict[str, Any]] = []
     page_params = dict(params)
     seen: set[str] = set()
-    seen_rows: set[tuple[str, ...]] = set()
+    kept: dict[tuple[str, ...], dict[str, Any]] = {}
+    contradicted: set[str] = set()
     unreadable = 0
     for _request in range(INSIGHTS_MAX_PAGES):
         payload = await client.list_objects(account_id, "opportunity_score_history", params=page_params)
         page_rows, page_unreadable, page_bad = _page_rows(payload)
         if page_bad:
-            return {"data": rows}, _stop_reason(PAGE_UNREADABLE, unreadable)
-        new, repeated, unidentified = _new_rows(page_rows, identity, seen_rows)
+            return {"data": rows}, _stop_reason(PAGE_UNREADABLE, unreadable), contradicted
+        new, repeated, unidentified, disputed = _split_rows(page_rows, identity, kept)
         rows.extend(new)
+        contradicted.update(key[0] for key in disputed)
         unreadable += page_unreadable + unidentified
         if repeated:
-            return {"data": rows}, _stop_reason(None, unreadable, repeated=repeated, identity=identity)
+            stopped = _stop_reason(None, unreadable, repeated=repeated, identity=identity)
+            return {"data": rows}, stopped, contradicted
         paging = extract_paging(payload)
         if not paging.get("next"):
-            return {"data": rows}, _stop_reason(None, unreadable)
+            return {"data": rows}, _stop_reason(None, unreadable), contradicted
         cursor = paging.get("after")
         if not cursor:
-            return {"data": rows}, _stop_reason(CURSOR_MISSING, unreadable)
+            return {"data": rows}, _stop_reason(CURSOR_MISSING, unreadable), contradicted
         if cursor in seen:
-            return {"data": rows}, _stop_reason(CURSOR_REPEATED, unreadable)
+            return {"data": rows}, _stop_reason(CURSOR_REPEATED, unreadable), contradicted
         seen.add(cursor)
         page_params = {**params, "after": cursor}
-    return {"data": rows}, _stop_reason(f"stopped after {INSIGHTS_MAX_PAGES} requests with more pages left", unreadable)
+    stopped = _stop_reason(f"stopped after {INSIGHTS_MAX_PAGES} requests with more pages left", unreadable)
+    return {"data": rows}, stopped, contradicted
 
 
 @mcp_server.tool()
@@ -285,7 +293,7 @@ async def get_opportunity_score(
             params["get_reason"] = True
         window = {"from_date": params["from_date"], "to_date": params["to_date"]}
         try:
-            payload, history_stopped = await _history_pages(client, resolved_account_id, params)
+            payload, history_stopped, contradicted_days = await _history_pages(client, resolved_account_id, params)
         except (MetaApiError, UnsupportedFeatureError) as exc:
             history = {"available": False, "window": window, "points": None, "error": _public_error(exc)}
             missing_signals.append(
@@ -296,11 +304,15 @@ async def get_opportunity_score(
             points = []
             # The reader keeps each dated day once; anything it could not read is in history_stopped.
             for raw in payload["data"]:
+                disputed = str(raw.get("date")) in contradicted_days
                 point: dict[str, Any] = {
                     "date": raw.get("date"),
-                    "opportunity_score": _number(raw.get("opportunity_score")),
+                    "opportunity_score": None if disputed else _number(raw.get("opportunity_score")),
                 }
-                if include_history_reasons and "changelog" in raw:
+                if disputed:
+                    # Neither copy of the day is used: Meta returned two that disagree.
+                    point["unknown_reason"] = "Meta returned this day more than once with different values"
+                elif include_history_reasons and "changelog" in raw:
                     point["changelog"] = _convert_history_budgets(raw.get("changelog"), currency)
                 points.append(point)
             points.sort(key=lambda point: str(point.get("date") or ""))
@@ -317,6 +329,13 @@ async def get_opportunity_score(
                 missing_signals.append(
                     f"opportunity_score_history could not be read to the last page ({history_stopped}), so the "
                     "history and its summary cover only the days read."
+                )
+            if contradicted_days:
+                history["days_with_contradictory_rows"] = sorted(contradicted_days)
+                missing_signals.append(
+                    "opportunity_score_history returned copies that disagree for "
+                    f"{', '.join(sorted(contradicted_days))}, so those days' scores are null rather than taken from "
+                    "one copy."
                 )
             if include_history_reasons:
                 history["budget_units"] = (
@@ -407,12 +426,15 @@ def _normalize_metric_names(metrics: list[str] | None, default: tuple[str, ...])
     if metrics is None:
         return list(default)
     names: list[str] = []
-    for raw in coerce_csv_string_list(metrics):
+    for position, raw in enumerate(coerce_csv_string_list(metrics)):
         name = str(raw).strip().lower()
         if not name:
             continue
         if name not in METRIC_DEFINITIONS:
-            raise ValidationError(f"Unknown metric {raw!r}. Supported metrics: {sorted(METRIC_DEFINITIONS)}.")
+            # The value is not repeated: a metric name is a short fixed word, and anything else may be private text.
+            raise ValidationError(
+                f"metrics[{position}] is not a supported metric. Supported metrics: {sorted(METRIC_DEFINITIONS)}."
+            )
         if name not in names:
             names.append(name)
     if not names:
@@ -725,6 +747,33 @@ def _new_rows(
     return new, repeated, unidentified
 
 
+def _split_rows(
+    rows: list[dict[str, Any]], identity: _RowIdentity, kept: dict[tuple[str, ...], dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int, list[tuple[str, ...]]]:
+    """Like _new_rows, keeping each identity's first copy in `kept`, and naming the identities that contradict.
+
+    Returns the new rows, how many rows repeated an identity already read, how many had no identity, and the
+    identities whose repeated copy differs from the first copy. A contradicted identity has no known value: the
+    caller must not use either copy.
+    """
+    new: list[dict[str, Any]] = []
+    repeated = 0
+    unidentified = 0
+    contradicted: list[tuple[str, ...]] = []
+    for row in rows:
+        key = identity.key(row)
+        if key is None:
+            unidentified += 1
+        elif key in kept:
+            repeated += 1
+            if row != kept[key] and key not in contradicted:
+                contradicted.append(key)
+        else:
+            kept[key] = row
+            new.append(row)
+    return new, repeated, unidentified, contradicted
+
+
 def _unreadable_rows_reason(count: int) -> str:
     return f"Meta returned {count} row(s) that could not be read, so the rows read are incomplete"
 
@@ -762,51 +811,137 @@ def _finite(value: Any) -> float | None:
     return number if number is not None and math.isfinite(number) else None
 
 
-async def _read_bounded_pages(
+class _PagedRead(NamedTuple):
+    """What one bounded paged read found.
+
+    rows: each identity's first copy. stopped: why the read is partial, None when it reached Meta's last page
+    or `enough` was satisfied (see _read_pages). fault: the part of that which is a fault in Meta's rows (a page
+    or row that could not be read, or a row read twice); unlike a stop, a fault stays a fault when the rows
+    already hold every id the caller wanted. contradicted: the first copies of rows whose later copy differs.
+    """
+
+    rows: list[dict[str, Any]]
+    stopped: str | None
+    fault: str | None
+    contradicted: list[dict[str, Any]]
+
+
+async def _read_pages(
     object_id: str, fields: list[str], params: dict[str, Any], *,
     max_pages: int = INSIGHTS_MAX_PAGES, max_rows: int | None = None,
     enough: Callable[[list[dict[str, Any]]], bool] | None = None,
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> _PagedRead:
     """Read one insights request page by page, keeping what was read when the read cannot finish.
 
-    Returns the raw rows and None when Meta reported no further page (or `enough` says the rows already hold
-    everything the caller needs), or the reason the read is partial: ROW_BOUND_REACHED once max_rows rows
-    are read, a next page without a cursor, a repeated cursor, a page that could not be read (data missing,
-    null or not a list), a row already read (same identity, see _insights_identity; not added a second time),
-    rows that could not be read or identified, or the request cap. Callers label the result partial instead of
-    failing.
+    `stopped` is None when Meta reported no further page (or `enough` says the rows already hold everything
+    the caller needs), otherwise the reason the read is partial: ROW_BOUND_REACHED once max_rows rows are read,
+    a next page without a cursor, a repeated cursor, a page that could not be read (data missing, null or not a
+    list), a row already read (same identity, see _insights_identity; not added a second time), rows that could
+    not be read or identified, or the request cap. `fault` repeats only the last three. Callers label the
+    result partial instead of failing.
     """
     client = get_graph_api_client()
     identity = _insights_identity(fields, params)
     rows: list[dict[str, Any]] = []
     page_params = dict(params)
     seen: set[str] = set()
-    seen_rows: set[tuple[str, ...]] = set()
+    kept: dict[tuple[str, ...], dict[str, Any]] = {}
+    contradicted: list[tuple[str, ...]] = []
     unreadable = 0
+    repeated = 0
+    page_bad = False
+
+    def finish(stopped: str | None) -> _PagedRead:
+        fault = _stop_reason(
+            PAGE_UNREADABLE if page_bad else None, unreadable, repeated=repeated, identity=identity,
+        )
+        reason = _stop_reason(stopped, unreadable, repeated=repeated, identity=identity)
+        return _PagedRead(rows, reason, fault, [kept[key] for key in contradicted])
+
     for _request in range(max_pages):
         payload = await client.get_insights(object_id, fields=fields, params=page_params)
         page_rows, page_unreadable, page_bad = _page_rows(payload)
         if page_bad:
-            return rows, _stop_reason(PAGE_UNREADABLE, unreadable)
-        new, repeated, unidentified = _new_rows(page_rows, identity, seen_rows)
+            return finish(PAGE_UNREADABLE)
+        new, repeated, unidentified, page_contradicted = _split_rows(page_rows, identity, kept)
         rows.extend(new)
+        contradicted.extend(page_contradicted)
         unreadable += page_unreadable + unidentified
         if repeated:
             # Overlapping pages mean Meta's paging is not stable, so the read stops here.
-            return rows, _stop_reason(None, unreadable, repeated=repeated, identity=identity)
+            return finish(None)
         paging = extract_paging(payload)
         if not paging.get("next") or (enough is not None and enough(rows)):
-            return rows, _stop_reason(None, unreadable)
+            return finish(None)
         if max_rows is not None and len(rows) >= max_rows:
-            return rows, _stop_reason(ROW_BOUND_REACHED, unreadable)
+            return finish(ROW_BOUND_REACHED)
         cursor = paging.get("after")
         if not cursor:
-            return rows, _stop_reason(CURSOR_MISSING, unreadable)
+            return finish(CURSOR_MISSING)
         if cursor in seen:
-            return rows, _stop_reason(CURSOR_REPEATED, unreadable)
+            return finish(CURSOR_REPEATED)
         seen.add(cursor)
         page_params = {**params, "after": cursor}
-    return rows, _stop_reason(f"stopped after {max_pages} requests with more pages left", unreadable)
+    return finish(f"stopped after {max_pages} requests with more pages left")
+
+
+async def _read_bounded_pages(
+    object_id: str, fields: list[str], params: dict[str, Any], *,
+    max_pages: int = INSIGHTS_MAX_PAGES, max_rows: int | None = None,
+    enough: Callable[[list[dict[str, Any]]], bool] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """The rows and stop reason of _read_pages, for callers that discard the whole read when it stopped early."""
+    read = await _read_pages(object_id, fields, params, max_pages=max_pages, max_rows=max_rows, enough=enough)
+    return read.rows, read.stopped
+
+
+def _disputed_ids(read: _PagedRead, key: str) -> set[str]:
+    """Ids (by the row's `key` field) whose rows in this read disagree: a repeated row that differs from the
+    first copy, or more than one row for the same id. Identical repeats are not a disagreement."""
+    counts: dict[str, int] = {}
+    for row in read.rows:
+        row_id = str(row.get(key) or "")
+        counts[row_id] = counts.get(row_id, 0) + 1
+    disputed = {str(row.get(key) or "") for row in read.contradicted}
+    disputed.update(row_id for row_id, count in counts.items() if count > 1)
+    disputed.discard("")
+    return disputed
+
+
+def _selected_rows(
+    read: _PagedRead, key: str, wanted: list[str],
+) -> tuple[dict[str, dict[str, Any]], list[str], str | None]:
+    """The one row of each wanted id from a read filtered to those ids, the ids that cannot be known, and why.
+
+    An id has a row only when Meta returned it once, or returned copies that all agree. An id with copies that
+    differ (a repeated row that contradicts the first, or two rows for the same id in this read) is
+    contradicted: neither copy is used. The reason is None only when every wanted id has its row and the read
+    found no fault; a fault (a row or page that could not be read, a row read twice) is kept even when every
+    id was found, since it may hide another copy of one of them.
+    """
+    wanted_set = set(wanted)
+    disputed = _disputed_ids(read, key)
+    contradicted = [row_id for row_id in wanted if row_id in disputed]
+    rows: dict[str, dict[str, Any]] = {}
+    for row in read.rows:
+        row_id = str(row.get(key) or "")
+        if row_id in wanted_set and row_id not in disputed:
+            rows[row_id] = row
+    reasons: list[str] = []
+    if len(rows) + len(contradicted) < len(wanted_set) and read.stopped is not None:
+        reasons.append(read.stopped)
+    elif read.fault is not None:
+        reasons.append(read.fault)
+    if contradicted:
+        reasons.append(_contradicted_reason(key, contradicted))
+    return rows, contradicted, "; ".join(reasons) or None
+
+
+def _contradicted_reason(key: str, ids: list[str]) -> str:
+    return (
+        f"Meta returned rows for {key} {', '.join(ids)} that disagree with each other, so no value is shown for "
+        "them rather than picking one"
+    )
 
 
 def _covers(key: str, ids: list[str]) -> Callable[[list[dict[str, Any]]], bool]:
@@ -1220,16 +1355,18 @@ _ENTITY_READ_ERRORS = (MetaApiError, NotFoundError, UnsupportedFeatureError, Val
 
 def _require_graph_ids(values: Any, *, field: str = "object_ids", limit: int = MAX_ENTITIES) -> list[str]:
     """Validate a list of numeric Meta ids before any network call; duplicates are dropped."""
-    ids = list(dict.fromkeys(
-        str(value).strip() for value in (coerce_csv_string_list(values) or []) if str(value).strip()
-    ))
+    given = [str(value).strip() for value in (coerce_csv_string_list(values) or [])]
+    # Positions refer to the list as given; a value that is not an id is never repeated in the error.
+    bad = [f"{field}[{position}]" for position, value in enumerate(given) if value and not value.isdigit()]
+    ids = list(dict.fromkeys(value for value in given if value))
     if not ids:
         raise ValidationError(f"{field} must contain at least one id.")
     if len(ids) > limit:
         raise ValidationError(f"Provide at most {limit} {field} per call.")
-    bad = [value for value in ids if not value.isdigit()]
     if bad:
-        raise ValidationError(f"{field} must be numeric Meta ids passed as strings; not valid: {bad[:3]}.")
+        raise ValidationError(
+            f"{field} must be numeric Meta ids passed as strings; not a numeric id: {', '.join(bad[:3])}."
+        )
     return ids
 
 
@@ -2423,31 +2560,25 @@ async def _ranking_scope_rows(
 
 async def _ranking_cost_rows(
     object_id: str, ad_ids: list[str], window: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], str | None, str | None]:
+) -> tuple[dict[str, dict[str, Any]], str | None, str | None, list[str]]:
     """Read results for the selected ads in one request filtered to their ids, page by page. Never raises.
 
-    Returns the rows by ad id, the error that stopped the read, and why the read stopped before Meta's last
-    page while some selected ads still had no row.
+    Returns the rows by ad id, the error that stopped the read, why the cost evidence is incomplete (the read
+    stopped before Meta's last page while some selected ads still had no row, or Meta's rows had a fault even
+    though every selected ad has a row), and the selected ads whose rows disagreed (they have no row here).
     """
     if not ad_ids:
-        return {}, None, None
+        return {}, None, None, []
     params = insights_tools._insights_params(
         level="ad", default_date_preset="last_30d", limit=len(ad_ids),
         filtering=[{"field": "ad.id", "operator": "IN", "value": list(ad_ids)}], **window,
     )
     try:
-        raw_rows, stopped = await _read_bounded_pages(
-            object_id, RANKING_COST_FIELDS, params, enough=_covers("ad_id", ad_ids),
-        )
+        read = await _read_pages(object_id, RANKING_COST_FIELDS, params, enough=_covers("ad_id", ad_ids))
     except Exception as exc:  # an enrichment failure must not fail the rankings report
-        return {}, str(_public_error(exc).get("message")), None
-    wanted = set(ad_ids)
-    rows: dict[str, dict[str, Any]] = {}
-    for row in raw_rows:
-        key = str(row.get("ad_id") or "")
-        if key in wanted and key not in rows:
-            rows[key] = row
-    return rows, None, (stopped if len(rows) < len(wanted) else None)
+        return {}, str(_public_error(exc).get("message")), None, []
+    rows, contradicted, reason = _selected_rows(read, "ad_id", list(dict.fromkeys(ad_ids)))
+    return rows, None, reason, contradicted
 
 
 def _known_ranking(value: Any) -> bool:
@@ -2509,27 +2640,42 @@ async def _ranking_entity(
     # One row per ad over the window: an ad returned twice is examined once, and a row without its ad id (or that
     # is not an object) is an ad that was not examined. Either way the read is not all the highest-spending ads.
     lean_identity = _RowIdentity(("ad_id",))
-    lean_rows, lean_repeated, lean_unidentified = _new_rows(lean_page_rows, lean_identity, set())
+    lean_rows, lean_repeated, lean_unidentified, lean_disputed = _split_rows(lean_page_rows, lean_identity, {})
     lean_rows = lean_rows[:max_ads]
     lean_issue = _stop_reason(
         PAGE_UNREADABLE if lean_page_bad else None, lean_unreadable + lean_unidentified,
         repeated=lean_repeated, identity=lean_identity,
     )
+    # An ad whose two rows disagree has no known spend or rankings: only who it is is kept.
+    lean_contradicted = {key[0] for key in lean_disputed}
+    lean_rows = [
+        {field: row[field] for field in ("ad_id", "ad_name", "campaign_id", "adset_id") if field in row}
+        if str(row.get("ad_id")) in lean_contradicted else row
+        for row in lean_rows
+    ]
     more_ads_exist = bool(extract_paging(ad_payload).get("next")) or lean_issue is not None
     cost_ids = list(dict.fromkeys(
         str(row["ad_id"]) for row in lean_rows
         if row.get("ad_id") and any(_known_ranking(row.get(field)) for field in RANKING_FIELDS)
     ))
     cost_ids_capped = cost_ids[:RANKING_COST_MAX_ADS]
-    cost_rows, cost_error, cost_stopped = await _ranking_cost_rows(object_id, cost_ids_capped, window)
+    cost_rows, cost_error, cost_stopped, cost_contradicted = await _ranking_cost_rows(
+        object_id, cost_ids_capped, window,
+    )
+    contradicted_ads = [
+        str(row.get("ad_id")) for row in lean_rows
+        if str(row.get("ad_id")) in lean_contradicted or str(row.get("ad_id")) in cost_contradicted
+    ]
     rows = _normalize_with_results({"data": [
         {**cost_rows[str(row.get("ad_id"))], **row} if str(row.get("ad_id")) in cost_rows else row
         for row in lean_rows
     ]})
     spends = [_row_spend(row) for row in rows]
-    spend_unknown = sum(1 for spend in spends if spend is None)
+    spend_unknown = sum(
+        1 for row, spend in zip(rows, spends) if spend is None and str(row.get("ad_id")) not in lean_contradicted
+    )
     # Order can be confirmed only from known spends; a missing one is reported below, not read as zero.
-    order_confirmed = not spend_unknown and all(
+    order_confirmed = all(spend is not None for spend in spends) and all(
         earlier >= later for earlier, later in zip(spends, spends[1:])  # type: ignore[operator]
     )
 
@@ -2538,6 +2684,12 @@ async def _ranking_entity(
         missing_signals.append(
             f"The read of the highest-spending ads was incomplete ({lean_issue}); ads on rows that could not be read "
             "were not examined or ranked, and the examined ads may not be the highest-spending ones."
+        )
+    if lean_contradicted:
+        missing_signals.append(
+            f"Meta returned rows that disagree for ad(s) {', '.join(sorted(lean_contradicted))} in the read of the "
+            "highest-spending ads, so their spend and rankings are not known (null) rather than taken from one "
+            "copy; the examined spend and the spend order are unknown."
         )
     examined_spend = _known_sum(spends)
     if spend_unknown:
@@ -2578,7 +2730,7 @@ async def _ranking_entity(
         missing_signals.append(note)
     else:
         note = f"Examined all {len(rows)} ads with insights in the window, highest spend first."
-    if not order_confirmed and not spend_unknown:
+    if not order_confirmed and all(spend is not None for spend in spends):
         missing_signals.append(
             "Meta returned the ad rows not ordered by spend, so the examined ads may not be the highest-spending ones."
         )
@@ -2598,12 +2750,24 @@ async def _ranking_entity(
                 "No examined ad has a known ranking, so results and cost per result were not read and are null."
             )
     without_cost = len(rows) - len(cost_rows)
+    lacking = len(cost_ids_capped) - len(cost_rows) - len(cost_contradicted)
     if cost_status == "read" and cost_stopped is not None:
-        missing_signals.append(
-            f"The results read stopped before Meta's last page ({cost_stopped}), so "
-            f"{len(cost_ids_capped) - len(cost_rows)} of the {len(cost_ids_capped)} ads selected for cost evidence "
-            "have no results or cost per result."
-        )
+        if lacking:
+            missing_signals.append(
+                f"The results read stopped before Meta's last page ({cost_stopped}), so {lacking} of the "
+                f"{len(cost_ids_capped)} ads selected for cost evidence have no results or cost per result."
+            )
+        else:
+            missing_signals.append(
+                f"The results read was not clean ({cost_stopped}), so the cost evidence is incomplete; ads whose "
+                "row was read once keep their results."
+            )
+        if cost_contradicted:
+            missing_signals.append(
+                f"Meta returned results rows that disagree for ad(s) {', '.join(cost_contradicted)}, so their "
+                "results and cost per result are not known (null) rather than taken from one copy, and they are "
+                "left out of every cost baseline."
+            )
     elif cost_status == "read" and without_cost:
         missing_signals.append(
             f"Results and cost per result were read for {len(cost_rows)} of {len(rows)} examined ads: those with at "
@@ -2622,6 +2786,7 @@ async def _ranking_entity(
         "ads_eligible_not_requested": len(cost_ids) - len(cost_ids_capped),
         "error": cost_error,
         "read_stopped": cost_stopped,
+        "ads_with_contradictory_rows": list(cost_contradicted),
     }
 
     cost_known_rows = [row for row in rows if str(row.get("ad_id")) in cost_rows]
@@ -2677,7 +2842,10 @@ async def _ranking_entity(
     ads: list[dict[str, Any]] = []
     for row in rows:
         has_cost = str(row.get("ad_id")) in cost_rows
-        own = _result_basis([row]) if has_cost else {"status": "not_requested"}
+        if str(row.get("ad_id")) in contradicted_ads:
+            own: dict[str, Any] = {"status": "contradictory_rows"}
+        else:
+            own = _result_basis([row]) if has_cost else {"status": "not_requested"}
         inputs = _period_inputs([row], own)
         metrics = _derived_metrics(inputs, own)
         indicator = own.get("indicator") if own["status"] == "single" else None
@@ -3420,23 +3588,23 @@ _CONTEXT_READ_ERRORS = (MetaApiError, NotFoundError, UnsupportedFeatureError, Va
 async def _read_pages_with_results(
     object_id: str, fields: list[str], params: dict[str, Any], *, level: str, max_rows: int | None = None,
     enough: Callable[[list[dict[str, Any]]], bool] | None = None,
-) -> tuple[list[dict[str, Any]], str | None, str | None]:
+) -> tuple[_PagedRead, str | None]:
     """Read every page (bounded) with Meta's result fields, once more without them if Meta rejects them.
 
-    Returns the normalized rows, why the read stopped before Meta's last page (None when it reached it; see
-    _read_bounded_pages), and the error that made the result fields unavailable.
+    Returns the read (see _read_pages) with its rows normalized, and the error that made the result fields
+    unavailable. The read's contradicted rows stay as Meta returned them; only their ids are needed.
     """
     with_results = [*fields, *(field for field in _result_fields(level) if field not in fields)]
     bounds: dict[str, Any] = {"max_rows": max_rows, "enough": enough}
     try:
-        rows, stopped = await _read_bounded_pages(object_id, with_results, params, **bounds)
+        read = await _read_pages(object_id, with_results, params, **bounds)
         result_error = None
     except (MetaApiError, UnsupportedFeatureError) as exc:
         if isinstance(exc, MetaApiError) and exc.code not in RESULT_RETRY_CODES:
             raise
         result_error = str(_public_error(exc).get("message"))
-        rows, stopped = await _read_bounded_pages(object_id, fields, params, **bounds)
-    return _normalize_with_results({"data": rows}), stopped, result_error
+        read = await _read_pages(object_id, fields, params, **bounds)
+    return read._replace(rows=_normalize_with_results({"data": read.rows})), result_error
 
 
 async def _context_account_spend(account_id: str, start: date, end: date) -> tuple[float | None, str | None]:
@@ -3489,23 +3657,37 @@ async def _context_adset_rows(
         ), return_exceptions=True)
         errors = []
         seen: set[str] = set()
-        for read in reads:
-            if isinstance(read, BaseException):
-                if not isinstance(read, _CONTEXT_READ_ERRORS):
-                    raise read
-                errors.append(str(_public_error(read).get("message")))
+        disputed: set[str] = set()
+        named_rows: list[dict[str, Any]] = []
+        for outcome in reads:
+            if isinstance(outcome, BaseException):
+                if not isinstance(outcome, _CONTEXT_READ_ERRORS):
+                    raise outcome
+                errors.append(str(_public_error(outcome).get("message")))
                 continue
-            read_rows, stopped, read_error = read
-            more = more or stopped is not None
-            if stopped not in (None, ROW_BOUND_REACHED):
-                stop_reasons.append(stopped)
+            read, read_error = outcome
+            # A fault in Meta's rows is already part of read.stopped here, since this read has no early stop.
+            more = more or read.stopped is not None
+            if read.stopped not in (None, ROW_BOUND_REACHED):
+                stop_reasons.append(read.stopped)
             result_error = result_error or read_error
-            for row in read_rows:
+            disputed |= _disputed_ids(read, "adset_id")
+            for row in read.rows:
                 key = str(row.get("adset_id") or "")
                 named = str(row.get("campaign_id") or "") in scope_ids or key in scope_ids
+                # The two reads overlap when both an ad set and its campaign are named; the ad set is kept once.
                 if named and key not in seen:
                     seen.add(key)
-                    rows.append(row)
+                    named_rows.append(row)
+        contradicted = [str(row.get("adset_id")) for row in named_rows if str(row.get("adset_id")) in disputed]
+        rows.extend(row for row in named_rows if str(row.get("adset_id")) not in disputed)
+        if contradicted:
+            more = True
+            stop_reasons.append(_contradicted_reason("adset_id", contradicted))
+            coverage["adsets_with_contradictory_rows"] = [
+                {"adset_id": str(row.get("adset_id")), "campaign_id": row.get("campaign_id")}
+                for row in named_rows if str(row.get("adset_id")) in disputed
+            ]
         if errors:
             coverage["error"] = "; ".join(errors)
             coverage["status"] = "failed" if len(errors) == len(reads) else "partly_read"
@@ -3559,7 +3741,7 @@ async def _context_adset_rows(
                 coverage["selection_incomplete_reason"] = selection_issue
             if ids:
                 try:
-                    read_rows, stopped, result_error = await _read_pages_with_results(
+                    read, result_error = await _read_pages_with_results(
                         account_id, CONTEXT_INSIGHTS_FIELDS,
                         {**full_params, "limit": len(ids),
                          "filtering": [{"field": "adset.id", "operator": "IN", "value": ids}]},
@@ -3568,21 +3750,26 @@ async def _context_adset_rows(
                 except _CONTEXT_READ_ERRORS as exc:
                     coverage.update({"status": "failed", "error": str(_public_error(exc).get("message"))})
                 else:
-                    wanted = set(ids)
-                    kept: set[str] = set()
-                    for row in read_rows:
-                        key = str(row.get("adset_id") or "")
-                        if key in wanted and key not in kept:
-                            kept.add(key)
-                            rows.append(row)
-                    if len(rows) < len(ids):
+                    by_id, contradicted, reason = _selected_rows(read, "adset_id", ids)
+                    rows.extend(row for row in read.rows if by_id.get(str(row.get("adset_id") or "")) is row)
+                    if contradicted:
+                        coverage["adsets_with_contradictory_rows"] = [
+                            {"adset_id": row_id, "campaign_id": next(
+                                (row.get("campaign_id") for row in read.rows if str(row.get("adset_id")) == row_id),
+                                None,
+                            )}
+                            for row_id in contradicted
+                        ]
+                        more = True
+                    if len(rows) + len(contradicted) < len(ids):
                         # A selected ad set without its full row leaves its spend, funnel and goal events out.
                         # Once every selected ad set has its row, a page Meta still offers holds nothing needed.
                         coverage["adsets_selected"] = len(ids)
-                        coverage["adsets_selected_without_rows"] = len(ids) - len(rows)
+                        coverage["adsets_selected_without_rows"] = len(ids) - len(rows) - len(contradicted)
                         more = True
-                        if stopped is not None:
-                            stop_reasons.append(stopped)
+                    if reason is not None:
+                        # A fault in Meta's rows stays a fault even when every selected ad set has its row.
+                        stop_reasons.append(reason)
     coverage["rows_read_stopped"] = "; ".join(dict.fromkeys(stop_reasons)) or None
     examined_spend = _known_total_spend(rows)
     share = _ratio(examined_spend, account_spend)
@@ -3593,7 +3780,7 @@ async def _context_adset_rows(
         "account_spend": account_spend,
         "account_spend_error": spend_error,
         "share_of_account_spend": None if share is None else min(share, 1.0),
-        "complete": coverage["status"] == "read" and not more,
+        "complete": coverage["status"] == "read" and not more and coverage["rows_read_stopped"] is None,
     })
     return rows, result_error, coverage
 
@@ -3624,7 +3811,7 @@ async def _context_ad_rows(
     result_error: str | None = None
     more = False
 
-    async def read() -> tuple[list[dict[str, Any]], str | None, str | None] | BaseException:
+    async def read() -> tuple[_PagedRead, str | None] | BaseException:
         try:
             return await _read_pages_with_results(
                 account_id, CONTEXT_AD_FIELDS, params, level="ad", enough=_covers("ad_id", ad_ids),
@@ -3638,18 +3825,16 @@ async def _context_ad_rows(
     if isinstance(outcome, BaseException):
         coverage.update({"status": "failed", "error": str(_public_error(outcome).get("message"))})
     else:
-        read_rows, stopped, result_error = outcome
-        wanted = set(ad_ids)
-        seen: set[str] = set()
-        for row in read_rows:
-            key = str(row.get("ad_id") or "")
-            if key in wanted and key not in seen:
-                seen.add(key)
-                rows.append(row)
-        # Once every named ad has its row, a page Meta still offers holds nothing needed.
-        if stopped is not None and len(rows) < len(wanted):
-            more = True
-            coverage["rows_read_stopped"] = stopped
+        paged, result_error = outcome
+        by_id, contradicted, reason = _selected_rows(paged, "ad_id", list(ad_ids))
+        rows.extend(row for row in paged.rows if by_id.get(str(row.get("ad_id") or "")) is row)
+        # Once every named ad has its row, a page Meta still offers holds nothing needed; a fault in Meta's rows
+        # (a row that could not be read, or read twice) still makes the read incomplete.
+        if contradicted:
+            coverage["ads_with_contradictory_rows"] = contradicted
+        missing = len(set(ad_ids)) - len(rows) - len(contradicted)
+        more = bool(contradicted) or (missing > 0 and paged.stopped is not None)
+        coverage["rows_read_stopped"] = reason
     examined_spend = _known_total_spend(rows)
     share = _ratio(examined_spend, account_spend)
     coverage.update({
@@ -3659,7 +3844,7 @@ async def _context_ad_rows(
         "account_spend": account_spend,
         "account_spend_error": spend_error,
         "share_of_account_spend": None if share is None else min(share, 1.0),
-        "complete": coverage["status"] == "read" and not more,
+        "complete": coverage["status"] == "read" and not more and coverage["rows_read_stopped"] is None,
     })
     return rows, result_error, coverage
 
@@ -3729,8 +3914,18 @@ def _coverage_signal(coverage: dict[str, Any]) -> list[str]:
             f"{coverage['adsets_selected_without_rows']} of the {coverage['adsets_selected']} selected "
             "highest-spending ad sets had no full row read, so their spend, funnel and goal events are left out."
         )
+    contradicted = coverage.get("adsets_with_contradictory_rows") or coverage.get("ads_with_contradictory_rows")
+    if contradicted:
+        ids = [item["adset_id"] if isinstance(item, dict) else item for item in contradicted]
+        signals.append(
+            f"Meta returned rows that disagree for {unit} {', '.join(ids)}, so their spend, results, funnel events "
+            "and goal events are not known; they are left out of every section rather than taken from one copy."
+        )
     if coverage.get("rows_read_stopped"):
-        signals.append(f"Meta's {unit} rows could not be read to the last page ({coverage['rows_read_stopped']}).")
+        signals.append(
+            f"Meta's {unit} rows were not all read, or not read cleanly ({coverage['rows_read_stopped']}), so the "
+            "rows read are incomplete."
+        )
     if coverage.get("account_spend_error"):
         signals.append(
             f"The account's total spend could not be read ({coverage['account_spend_error']}), so the share of spend "
@@ -3812,6 +4007,11 @@ async def get_advertiser_context(
     account_wide = ["account", "datasets", "custom_conversions", "pages", "instagram_accounts"]
     if scope_ids is not None:
         matched = {str(row.get(key)) for row in rows for key in ("campaign_id", "adset_id") if row.get(key)}
+        # An ad set whose rows disagreed was returned, so it and its campaign matched; its values are unknown.
+        matched |= {
+            str(item.get(key)) for item in row_coverage.get("adsets_with_contradictory_rows", [])
+            for key in ("campaign_id", "adset_id") if item.get(key)
+        }
         unmatched = [value for value in scope_ids if value not in matched]
         scope["object_ids"] = scope_ids
         object_scope = {
@@ -3827,7 +4027,7 @@ async def get_advertiser_context(
                 "No ad set insights rows in the window matched " + ", ".join(unmatched) + (
                     " among the rows read; " + (
                         "one of the two filtered reads failed" if row_coverage["status"] == "partly_read"
-                        else "the read stopped before Meta's last page"
+                        else "the read was not complete"
                     ) + ", so their rows may not have been read."
                     if not row_coverage["complete"]
                     else " (not a campaign or ad set of this account, or no delivery in the window)."
@@ -3835,6 +4035,7 @@ async def get_advertiser_context(
             )
     if scope_ad_ids is not None:
         matched = {str(row.get("ad_id")) for row in rows if row.get("ad_id")}
+        matched |= set(row_coverage.get("ads_with_contradictory_rows", []))
         unmatched = [value for value in scope_ad_ids if value not in matched]
         scope["ad_ids"] = scope_ad_ids
         object_scope = {
@@ -3847,7 +4048,7 @@ async def get_advertiser_context(
         if unmatched and row_coverage["status"] != "failed":
             missing_signals.append(
                 "No ad insights rows in the window matched " + ", ".join(unmatched) + (
-                    " among the rows read; the read stopped before Meta's last page, so their rows may not have "
+                    " among the rows read; the read was not complete, so their rows may not have "
                     "been read." if not row_coverage["complete"]
                     else " (not an ad of this account, or no delivery in the window)."
                 )
@@ -4131,7 +4332,8 @@ async def _delivery_spend(
     lowest: float | None = None
     order_confirmed = True
     seen_cursors: set[str] = set()
-    seen_rows: set[tuple[str, ...]] = set()
+    kept: dict[tuple[str, ...], dict[str, Any]] = {}
+    spend_contradicted: set[str] = set()
     while requests < DELIVERY_SPEND_MAX_REQUESTS:
         page_params = {**params, "limit": DELIVERY_SPEND_PAGE, "sort": ["spend_descending"]}
         if after:
@@ -4146,9 +4348,11 @@ async def _delivery_spend(
         if page_bad:
             page_unreadable = True
             break
-        new, repeated, unidentified = _new_rows(page_rows, identity, seen_rows)
+        new, repeated, unidentified, disputed = _split_rows(page_rows, identity, kept)
         unreadable_rows += bad_rows + unidentified
         repeated_rows += repeated
+        # An object whose two spend rows disagree has no known spend; neither copy is used.
+        spend_contradicted.update(key[0] for key in disputed)
         for row in new:
             object_id = str(row[id_field])
             value = _finite(row.get("spend"))
@@ -4174,8 +4378,11 @@ async def _delivery_spend(
         PAGE_UNREADABLE if page_unreadable else None, unreadable_rows, repeated=repeated_rows, identity=identity,
     )
     return {
-        "spend": {key: value for key, value in spend.items() if key not in spend_unreadable},
-        "spend_unreadable": spend_unreadable,
+        "spend": {
+            key: value for key, value in spend.items() if key not in spend_unreadable and key not in spend_contradicted
+        },
+        "spend_unreadable": spend_unreadable | spend_contradicted,
+        "spend_contradicted": spend_contradicted,
         "rows_unreadable": unreadable_rows,
         "rows_repeated": repeated_rows,
         "page_unreadable": page_unreadable,
@@ -4402,8 +4609,10 @@ async def get_delivery_errors(
             "meta_order_confirmed": read["order_confirmed"],
             "error": _short(read["error"]),
         })
-        if read["spend_unreadable"]:
-            spend_lookup["objects_with_unreadable_spend"] = len(read["spend_unreadable"])
+        if read["spend_unreadable"] - read["spend_contradicted"]:
+            spend_lookup["objects_with_unreadable_spend"] = len(read["spend_unreadable"] - read["spend_contradicted"])
+        if read["spend_contradicted"]:
+            spend_lookup["objects_with_contradictory_spend_rows"] = sorted(read["spend_contradicted"])
         if read["rows_unreadable"]:
             spend_lookup["rows_unreadable"] = read["rows_unreadable"]
         if read["rows_repeated"]:
@@ -4524,6 +4733,11 @@ async def get_delivery_errors(
         missing_signals.append(
             f"{spend_lookup['objects_with_unreadable_spend']} {resolved_level}(s) had a spend row without a readable "
             "spend value; their spend is null (spend_unavailable), not zero."
+        )
+    if spend_lookup.get("objects_with_contradictory_spend_rows"):
+        missing_signals.append(
+            f"Meta returned spend rows that disagree for {', '.join(spend_lookup['objects_with_contradictory_spend_rows'])}, "
+            "so their spend is null (spend_unavailable) rather than taken from one copy."
         )
     if spend_lookup.get("rows_unreadable"):
         missing_signals.append(
