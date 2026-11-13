@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -51,7 +52,20 @@ METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     "cost_per_result": {"formula": "spend / results", "better": "lower"},
     "conversion_rate": {"formula": "results / clicks", "better": "higher"},
     "roas": {"formula": "conversion_value / spend", "better": "higher"},
+    "reach": {
+        "formula": (
+            "Meta's reach (accounts that saw the ads at least once, estimated by Meta) read with one query over "
+            "exactly the period's days; never summed across days"
+        ),
+        "better": "neutral",
+    },
 }
+REACH_POLICY = (
+    "Reach counts unique accounts, so it does not add up across days: the reach of a week is not the sum of its "
+    "days. A day's reach comes from that day's row; a week's or month's reach, and a multi-entity window total, "
+    "come from one Meta query over exactly that period's days inside the window (the Insights time_ranges "
+    "parameter). Reach is never summed here."
+)
 # Results follow Meta's own result for each object: the Insights `results` field ("The number of times your
 # ad achieved an outcome, based on the objective and settings you selected") and `cost_per_result`, both
 # list<AdsInsightsResult> in Meta's Insights reference. Each entry names the result in `indicator` and carries
@@ -382,36 +396,104 @@ def _result_fields(level: str) -> list[str]:
     return [RESULT_FIELD] if level == "account" else [RESULT_FIELD, COST_PER_RESULT_FIELD]
 
 
+def _unreadable(reason: str, indicator: str | None = None) -> dict[str, Any]:
+    parsed: dict[str, Any] = {"status": "unreadable", "reason": reason}
+    if indicator is not None:
+        parsed["indicator"] = indicator
+    return parsed
+
+
+def _result_number(raw: Any) -> float | None:
+    """A result value only when it is a finite, non-negative number (or a numeric string); never a boolean."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        number = float(raw)
+    elif isinstance(raw, str):
+        try:
+            number = float(raw.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _parse_result_values(indicator: str, values: Any) -> dict[str, Any]:
+    """Pick the one value of an indicator's `values` list, or say why no single value can be chosen."""
+    if values is None or values == []:
+        return {"status": "read", "indicator": indicator, "value": None}
+    if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
+        return _unreadable(f"{indicator}: values is not a list of objects", indicator)
+    defaults: list[dict[str, Any]] = []
+    for item in values:
+        windows = item.get("attribution_windows")
+        if windows is None:
+            continue
+        if not isinstance(windows, list) or not all(isinstance(window, str) for window in windows):
+            return _unreadable(f"{indicator}: attribution_windows is not a list of window names", indicator)
+        if "default" in windows:
+            defaults.append(item)
+    if len(values) == 1:
+        chosen = values[0]
+    elif len(defaults) == 1:
+        chosen = defaults[0]
+    elif defaults:
+        return _unreadable(f"{indicator}: more than one value is marked as the default attribution window", indicator)
+    else:
+        return _unreadable(
+            f"{indicator}: several attribution-window values and none is marked as the default", indicator,
+        )
+    raw = chosen.get("value")
+    number = _result_number(raw)
+    if number is None:
+        if isinstance(raw, bool):
+            detail = "a true or false value, not a number"
+        elif raw is None:
+            detail = "no value"
+        else:
+            detail = "not a finite number of zero or more"
+        return _unreadable(f"{indicator}: the value is {detail}", indicator)
+    return {"status": "read", "indicator": indicator, "value": number}
+
+
 def _parse_result_list(value: Any) -> dict[str, Any]:
     """Read one of Meta's result fields: a list of {indicator, values: [{value, attribution_windows}]}.
 
-    Returns a status: absent (no field or an empty list), read (one indicator; value None when Meta lists the
-    indicator without a value), mixed (several indicators in one row), or unreadable (any other shape).
+    Live shape (confirmed): [{"indicator": "actions:<type>", "values": [{"value": "12",
+    "attribution_windows": ["default"]}]}]. Returns a status: absent (no field or an empty list), read (one
+    indicator with one unambiguous value; value None when Meta lists the indicator without values), mixed
+    (several different indicators in one row), or unreadable with a `reason` (any other shape). A value is used
+    only when it is unambiguous: one entry for the indicator, a finite non-negative number that is not a boolean,
+    and either a single value or exactly one value in the default attribution window. Nothing is guessed.
     """
     if value is None:
         return {"status": "absent"}
     if not isinstance(value, list):
-        return {"status": "unreadable"}
-    entries = [entry for entry in value if isinstance(entry, dict)]
-    if len(entries) != len(value):
-        return {"status": "unreadable"}
-    if not entries:
+        return _unreadable("the results field is not a list")
+    if not value:
         return {"status": "absent"}
-    indicators = list(dict.fromkeys(str(entry.get("indicator") or "").strip() for entry in entries))
-    if "" in indicators:
-        return {"status": "unreadable"}
-    if len(indicators) > 1:
-        return {"status": "mixed", "indicators": indicators}
-    values = entries[0].get("values")
-    if values is None or values == []:
-        return {"status": "read", "indicator": indicators[0], "value": None}
-    if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
-        return {"status": "unreadable", "indicator": indicators[0]}
-    chosen = next((item for item in values if "default" in (item.get("attribution_windows") or [])), values[0])
-    number = to_float(chosen.get("value"))
-    if number is None:
-        return {"status": "unreadable", "indicator": indicators[0]}
-    return {"status": "read", "indicator": indicators[0], "value": number}
+    parsed: list[dict[str, Any]] = []
+    seen: list[str] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            return _unreadable("an entry of the results field is not an object")
+        indicator = entry.get("indicator")
+        if not isinstance(indicator, str) or not indicator.strip():
+            return _unreadable("an entry of the results field has no indicator name")
+        indicator = indicator.strip()
+        if indicator in seen:
+            return _unreadable(f"{indicator}: the results field lists this indicator more than once", indicator)
+        seen.append(indicator)
+        item = _parse_result_values(indicator, entry.get("values"))
+        if item["status"] == "unreadable":
+            return item
+        parsed.append(item)
+    if len(parsed) > 1:
+        return {"status": "mixed", "indicators": seen}
+    return parsed[0]
 
 
 def _attach_meta_results(payload: dict[str, Any]) -> dict[str, Any]:
@@ -427,6 +509,8 @@ def _attach_meta_results(payload: dict[str, Any]) -> dict[str, Any]:
         result = _parse_result_list(row.pop(RESULT_FIELD, None))
         cost = _parse_result_list(row.pop(COST_PER_RESULT_FIELD, None))
         row["meta_result"] = result
+        if cost["status"] == "unreadable":
+            row["meta_cost_per_result_issue"] = f"cost_per_result: {cost['reason']}"
         row["meta_cost_per_result"] = (
             cost["value"]
             if cost["status"] == "read" and result.get("status") == "read" and cost.get("indicator") == result.get("indicator")
@@ -509,11 +593,56 @@ async def _daily_rows(
         level=rows_level, since=start.isoformat(), until=end.isoformat(), time_increment=1,
         limit=INSIGHTS_PAGE_LIMIT, filtering=filtering,
     )
-    fields = [*DAILY_INSIGHTS_FIELDS, *(extra_fields or [])]
+    fields = [*DAILY_INSIGHTS_FIELDS, *(field for field in (extra_fields or []) if field not in DAILY_INSIGHTS_FIELDS)]
     rows, result_error = await _read_with_results(object_id, fields, params, level=rows_level, max_rows=max_rows)
     rows = [row for row in rows if row.get("date_start")]
     rows.sort(key=lambda row: str(row["date_start"]))
     return rows, result_error
+
+
+# Reach over a period comes from one query per period (Meta's documented `time_ranges`: "Each time range will
+# have one result set"). Meta documents no maximum number of ranges, so they are sent in small batches.
+REACH_RANGES_PER_REQUEST = 25
+_ReachKey = tuple[str | None, str, str]
+
+
+async def _reach_for_ranges(
+    object_id: str, row_level: str, ranges: list[tuple[date, date]], *, id_field: str | None = None,
+    ids: list[str] | None = None,
+) -> tuple[dict[_ReachKey, float | None], str | None]:
+    """Read Meta's reach for each (since, until) range with one query per range, never summing days.
+
+    With id_field and ids the query is at the children's level, filtered to those ids (adset.id IN style), and
+    the result is keyed by child id; otherwise the key's id is None. Never raises: a failure returns the error,
+    and every reach is then unknown.
+    """
+    unique = sorted(set(ranges))
+    found: dict[_ReachKey, float | None] = {}
+    fields = ["reach", "date_start", "date_stop", *([id_field] if id_field else [])]
+    for offset in range(0, len(unique), REACH_RANGES_PER_REQUEST):
+        batch = unique[offset:offset + REACH_RANGES_PER_REQUEST]
+        params: dict[str, Any] = {
+            "level": row_level,
+            "limit": INSIGHTS_PAGE_LIMIT,
+            "use_unified_attribution_setting": "true",
+            "time_ranges": [{"since": since.isoformat(), "until": until.isoformat()} for since, until in batch],
+        }
+        if id_field and ids:
+            params["filtering"] = [{"field": f"{row_level}.id", "operator": "IN", "value": list(ids)}]
+        try:
+            rows = await _read_insights_pages(
+                object_id, fields, params, max_rows=len(batch) * max(1, len(ids or [])) + INSIGHTS_PAGE_LIMIT,
+            )
+        except (*_ENTITY_READ_ERRORS, RateLimitError) as exc:
+            return {}, str(_public_error(exc).get("message"))
+        wanted = set(ids or [])
+        for row in rows:
+            key_id = str(row.get(id_field) or "") if id_field else None
+            if id_field and key_id not in wanted:
+                continue
+            key = (key_id, str(row.get("date_start") or ""), str(row.get("date_stop") or ""))
+            found[key] = to_float(row.get("reach"))
+    return found, None
 
 
 # Two separate rules govern a value a row does not report:
@@ -539,17 +668,26 @@ INPUT_POLICY = {
 }
 
 
-def _result_basis(rows: list[dict[str, Any]], *, result_error: str | None = None) -> dict[str, Any]:
+MAX_UNREADABLE_REASONS = 3
+
+
+def _result_basis(
+    rows: list[dict[str, Any]], *, result_error: str | None = None, one_entity: bool = True,
+) -> dict[str, Any]:
     """Decide which result the rows report, and whether it can be added up across rows.
 
     Statuses: single (one indicator), mixed (several), not_reported (no row reports a result), unreadable (rows
-    report a result in a shape that cannot be read), or request_failed (Meta rejected the result fields).
+    report a result in a shape that cannot be read, with the reasons), or request_failed (Meta rejected the
+    result fields). one_entity says the rows all belong to one object (its days): only then does a row without a
+    result count as zero, because the object's own other rows define its result. Rows of different objects
+    (ad sets in a group, ads in a pool) never lend their result to an object that reports none.
     """
     if result_error is not None:
         return {"status": "request_failed", "error": result_error}
     indicators: list[str] = []
     mixed = False
     unreadable = 0
+    reasons: list[str] = []
     for row in rows:
         result = row.get("meta_result") or {"status": "absent"}
         if result["status"] == "read":
@@ -560,10 +698,22 @@ def _result_basis(rows: list[dict[str, Any]], *, result_error: str | None = None
             indicators.extend(item for item in result["indicators"] if item not in indicators)
         elif result["status"] == "unreadable":
             unreadable += 1
+            reason = result.get("reason") or "the results field has an unexpected shape"
+            if reason not in reasons:
+                reasons.append(reason)
+        issue = row.get("meta_cost_per_result_issue")
+        if issue and issue not in reasons:
+            reasons.append(issue)
+    reasons = reasons[:MAX_UNREADABLE_REASONS]
     if mixed or len(indicators) > 1:
-        return {"status": "mixed", "indicators": indicators}
+        basis: dict[str, Any] = {"status": "mixed", "indicators": indicators}
+        if reasons:
+            basis["unreadable_reasons"] = reasons
+        return basis
     if not indicators:
-        return {"status": "unreadable"} if unreadable else {"status": "not_reported"}
+        if unreadable:
+            return {"status": "unreadable", "rows_unreadable": unreadable, "unreadable_reasons": reasons}
+        return {"status": "not_reported", **({"unreadable_reasons": reasons} if reasons else {})}
     indicator = indicators[0]
     if indicator.startswith(ACTION_INDICATOR_PREFIX):
         action_type: str | None = indicator[len(ACTION_INDICATOR_PREFIX):] or None
@@ -579,23 +729,34 @@ def _result_basis(rows: list[dict[str, Any]], *, result_error: str | None = None
         "value_reported": action_type is not None
         and any(action_type in (row.get("action_values_map") or {}) for row in rows),
         "rows_unreadable": unreadable,
+        "absent_counts_zero": one_entity,
+        **({"unreadable_reasons": reasons} if reasons else {}),
     }
 
 
 def _row_result(row: dict[str, Any], basis: dict[str, Any]) -> float | None:
-    """One row's count of the basis result: absent counts as zero, unreadable is unknown."""
+    """One row's count of the basis result.
+
+    Absent counts as zero only when the basis comes from the same object's own rows; unreadable is unknown.
+    """
     if basis.get("status") != "single":
         return None
     result = row.get("meta_result") or {"status": "absent"}
     if result["status"] == "absent":
-        return 0.0
+        return 0.0 if basis.get("absent_counts_zero", False) else None
     if result["status"] == "read" and result["indicator"] == basis["indicator"]:
         return 0.0 if result["value"] is None else result["value"]
     return None
 
 
-def _period_inputs(rows: list[dict[str, Any]], basis: dict[str, Any]) -> dict[str, float | None]:
-    """Sum additive inputs under INPUT_POLICY for the rows of one period."""
+def _period_inputs(
+    rows: list[dict[str, Any]], basis: dict[str, Any], *, with_reach: bool = False,
+) -> dict[str, float | None]:
+    """Sum additive inputs under INPUT_POLICY for the rows of one period.
+
+    Reach is never summed: with_reach takes it only from a single row (one day); longer periods get their reach
+    from a query over the whole period (see _reach_for_ranges).
+    """
     totals: dict[str, float | None] = {}
     for name, source in _DELIVERY_INPUT_SOURCES.items():
         values = [to_float((row.get("metrics") or {}).get(source)) for row in rows]
@@ -607,7 +768,7 @@ def _period_inputs(rows: list[dict[str, Any]], basis: dict[str, Any]) -> dict[st
         counts = [_row_result(row, basis) for row in rows]
         if basis["additive"]:
             results = None if any(count is None for count in counts) else sum(counts)  # type: ignore[arg-type]
-            if basis["value_reported"]:
+            if basis["value_reported"] and (results is not None or basis.get("absent_counts_zero")):
                 conversion_value = sum(
                     to_float((row.get("action_values_map") or {}).get(basis["action_type"])) or 0.0 for row in rows
                 )
@@ -618,6 +779,8 @@ def _period_inputs(rows: list[dict[str, Any]], basis: dict[str, Any]) -> dict[st
     totals["results"] = results
     totals["conversion_value"] = conversion_value
     totals["meta_cost_per_result"] = meta_cost
+    if with_reach:
+        totals["reach"] = to_float(rows[0].get("reach")) if len(rows) == 1 else None
     return totals
 
 
@@ -660,13 +823,14 @@ def _derived_metrics(inputs: dict[str, float | None], basis: dict[str, Any]) -> 
         "cost_per_result": _ratio(spend, results) if additive else inputs.get("meta_cost_per_result"),
         "conversion_rate": _ratio(results, clicks) if additive else None,
         "roas": _ratio(inputs["conversion_value"], spend),
+        "reach": inputs.get("reach"),
     }
 
 
 def _result_summary(basis: dict[str, Any]) -> dict[str, Any]:
     """The result definition actually used for one object, for the response."""
     summary: dict[str, Any] = {"source": "meta_results_field", "status": basis["status"]}
-    for key in ("indicator", "action_type", "additive", "indicators", "error"):
+    for key in ("indicator", "action_type", "additive", "indicators", "error", "unreadable_reasons"):
         if key in basis:
             summary[key] = basis[key]
     if basis.get("status") == "single":
@@ -696,8 +860,13 @@ def _result_signals(basis: dict[str, Any], level: str, *, rows_exist: bool) -> l
             "Meta reported no result (the Insights results field) for this object in this window, so results, cost "
             f"per result, conversion rate and ROAS are null. No other action is substituted.{hint}"
         ]
+    reasons = basis.get("unreadable_reasons") or []
+    why = f" ({'; '.join(reasons)})" if reasons else ""
     if status == "unreadable":
-        return ["Meta's results field could not be read in this window, so the result metrics are null."]
+        return [
+            f"Meta's results field could not be read in this window{why}, so the result metrics are null. No "
+            "value was guessed from it."
+        ]
     if status == "mixed":
         return [
             f"Meta reported more than one result type in this window ({', '.join(basis['indicators'])}); they "
@@ -717,8 +886,11 @@ def _result_signals(basis: dict[str, Any], level: str, *, rows_exist: bool) -> l
         )
     if basis.get("rows_unreadable"):
         signals.append(
-            f"{basis['rows_unreadable']} row(s) had a result that could not be read; their periods' results are null."
+            f"{basis['rows_unreadable']} row(s) had a result that could not be read{why}; their periods' results "
+            "are null."
         )
+    elif reasons:
+        signals.append(f"Meta's cost per result could not be read in some rows{why}; it is null there.")
     return signals
 
 
@@ -859,7 +1031,7 @@ async def _select_children(
 
 
 async def _read_entities_one_by_one(
-    level: str, ids: list[str], start: date, end: date,
+    level: str, ids: list[str], start: date, end: date, *, extra_fields: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Read each entity's daily rows with its own request; a failure is recorded for that entity only.
 
@@ -874,7 +1046,9 @@ async def _read_entities_one_by_one(
             if stopped:
                 return entity_id, {"status": "not_read", "error": stopped["reason"]}
             try:
-                rows, result_error = await _daily_rows(level, entity_id, start, end, extra_fields=[name_field])
+                rows, result_error = await _daily_rows(
+                    level, entity_id, start, end, extra_fields=[name_field, *extra_fields],
+                )
             except RateLimitError as exc:
                 stopped["reason"] = f"Meta's rate limit was reached ({exc}); this entity was not read."
                 return entity_id, {"status": "unreadable", "error": str(exc)}
@@ -888,6 +1062,7 @@ async def _read_entities_one_by_one(
 
 async def _read_children(
     object_id: str, child_level: str, children: list[dict[str, Any]], start: date, end: date,
+    *, extra_fields: tuple[str, ...] = (),
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Read the selected children's daily rows in one request filtered to their ids.
 
@@ -900,7 +1075,7 @@ async def _read_children(
     days = (end - start).days + 1
     try:
         rows, result_error = await _daily_rows(
-            child_level, object_id, start, end, row_level=child_level, extra_fields=[id_field],
+            child_level, object_id, start, end, row_level=child_level, extra_fields=[id_field, *extra_fields],
             filtering=[{"field": f"{child_level}.id", "operator": "IN", "value": ids}],
             max_rows=len(ids) * days,
         )
@@ -908,7 +1083,7 @@ async def _read_children(
         raise
     except _ENTITY_READ_ERRORS as exc:
         error = str(_public_error(exc).get("message"))
-        entities = await _read_entities_one_by_one(child_level, ids, start, end)
+        entities = await _read_entities_one_by_one(child_level, ids, start, end, extra_fields=extra_fields)
         return entities, {"data_read": "one_request_per_entity", "filtered_read_error": error}
     grouped: dict[str, list[dict[str, Any]]] = {entity_id: [] for entity_id in ids}
     for row in rows:
@@ -923,13 +1098,13 @@ async def _read_children(
 
 
 async def _read_targets(
-    targets: dict[str, Any], level: str, start: date, end: date,
+    targets: dict[str, Any], level: str, start: date, end: date, *, extra_fields: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Read the daily rows of every entity a multi-entity call covers, with coverage."""
     coverage: dict[str, Any] = {"mode": targets["mode"]}
     if targets["mode"] == "object_ids":
         ids = targets["ids"]
-        read = await _read_entities_one_by_one(level, ids, start, end)
+        read = await _read_entities_one_by_one(level, ids, start, end, extra_fields=extra_fields)
         names: dict[str, Any] = {}
         coverage["data_read"] = "one_request_per_entity"
         coverage["why"] = (
@@ -952,7 +1127,9 @@ async def _read_targets(
             "max_entities": targets["max_entities"],
             "more_children_exist": more,
         }
-        read, method = (await _read_children(targets["object_id"], entity_level, children, start, end)) if ids else ({}, {
+        read, method = (await _read_children(
+            targets["object_id"], entity_level, children, start, end, extra_fields=extra_fields,
+        )) if ids else ({}, {
             "data_read": "none", "filtered_read_error": None,
         })
         coverage.update(method)
@@ -1028,7 +1205,7 @@ def _group_entity_signals(entities: list[dict[str, Any]]) -> list[dict[str, Any]
 
 def _compact_result(basis: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {"status": basis["status"]}
-    for key in ("indicator", "additive", "indicators", "error"):
+    for key in ("indicator", "additive", "indicators", "error", "unreadable_reasons"):
         if key in basis:
             compact[key] = basis[key]
     return compact
@@ -1042,9 +1219,13 @@ def _multi_scope(level: str, targets: dict[str, Any]) -> dict[str, Any]:
 
 def _trend_periods(
     rows: list[dict[str, Any]], basis: dict[str, Any], start: date, end: date, granularity: str,
-    metric_names: list[str],
+    metric_names: list[str], *, with_reach: bool = False,
 ) -> list[dict[str, Any]]:
-    """Group daily rows into periods, sum inputs under INPUT_POLICY, and derive each metric."""
+    """Group daily rows into periods, sum inputs under INPUT_POLICY, and derive each metric.
+
+    With reach, a day takes its own row's reach; a week or month gets None here and is filled from a query over
+    that period (_fill_period_reach), never from a sum of days.
+    """
     buckets: dict[date, list[dict[str, Any]]] = {}
     for row in rows:
         day = _parse_date(str(row["date_start"]), field="date_start")
@@ -1052,7 +1233,9 @@ def _trend_periods(
     periods: list[dict[str, Any]] = []
     for period_start in sorted(buckets):
         _, period_end = _period_bounds(period_start, granularity)
-        inputs = _period_inputs(buckets[period_start], basis)
+        inputs = _period_inputs(buckets[period_start], basis, with_reach=with_reach)
+        if with_reach and granularity != "day":
+            inputs["reach"] = None
         derived = _derived_metrics(inputs, basis)
         periods.append({
             "period_start": period_start.isoformat(),
@@ -1076,12 +1259,132 @@ def _trend_signals(rows: list[dict[str, Any]], basis: dict[str, Any], periods: l
     return signals
 
 
+def _clipped_range(period: dict[str, Any], start: date, end: date) -> tuple[date, date]:
+    """The days of a period that fall inside the window."""
+    return (
+        max(date.fromisoformat(period["period_start"]), start),
+        min(date.fromisoformat(period["period_end"]), end),
+    )
+
+
+def _reach_ranges(periods: list[dict[str, Any]], start: date, end: date, granularity: str, *, window: bool) -> list[tuple[date, date]]:
+    """The ranges whose reach needs its own query: each multi-day period, and the window for totals."""
+    ranges = [] if granularity == "day" else [_clipped_range(period, start, end) for period in periods]
+    if window:
+        ranges.append((start, end))
+    return ranges
+
+
+def _fill_period_reach(
+    periods: list[dict[str, Any]], reach: dict[_ReachKey, float | None], key_id: str | None, start: date, end: date,
+) -> int:
+    """Set each multi-day period's reach from its own query; return how many periods Meta gave no reach for."""
+    missing = 0
+    for period in periods:
+        since, until = _clipped_range(period, start, end)
+        value = reach.get((key_id, since.isoformat(), until.isoformat()))
+        if value is None:
+            missing += 1
+        period["inputs"]["reach"] = value
+        if "reach" in period["metrics"]:
+            period["metrics"]["reach"] = value
+    return missing
+
+
+def _reach_signals(error: str | None, missing_periods: int, *, totals: bool = False) -> list[str]:
+    signals = []
+    where = "weeks or months" + (" and the window total" if totals else "")
+    if error is not None:
+        signals.append(
+            f"Reach for {where} could not be read ({error}), so it is null there; it is never summed from days."
+        )
+    elif missing_periods:
+        signals.append(
+            f"Meta returned no reach for {missing_periods} period(s) read with their own query, so reach is null there."
+        )
+    return signals
+
+
 _COMPACT_CHANGE_KEYS = ("first", "last", "first_period", "last_period", "pct_change", "direction", "assessment")
 TREND_METHOD = (
     "Daily rows are read with time_increment=1, additive inputs are summed per period under input_policy, "
     "and each metric is divided from those sums. Direction compares the first and last periods with a "
     "value; partial periods are flagged and are not scaled."
 )
+# A multi-entity trend returns each entity's periods as columns aligned to one shared list of period starts.
+# By default the most recent periods that keep the whole response under SERIES_TARGET_BYTES are returned;
+# series_periods asks for a number of periods, still capped so the response stays under SERIES_MAX_BYTES (this
+# server moves responses above about 63 KB to an overflow artifact, which the default never relies on).
+SERIES_TARGET_BYTES = 19_000
+SERIES_MAX_BYTES = 55_000
+
+
+def _window_period_starts(start: date, end: date, granularity: str) -> list[date]:
+    starts: list[date] = []
+    current = _period_bounds(start, granularity)[0]
+    while current <= end:
+        starts.append(current)
+        current = _period_bounds(current, granularity)[1] + timedelta(days=1)
+    return starts
+
+
+SERIES_SIGNIFICANT_FIGURES = 6
+
+
+def _series_value(value: Any) -> Any:
+    """A series value rounded to six significant figures, to keep the response small; totals stay exact."""
+    if isinstance(value, float) and math.isfinite(value):
+        rounded = float(f"{value:.{SERIES_SIGNIFICANT_FIGURES}g}")
+        return int(rounded) if rounded.is_integer() and abs(rounded) < 1e15 else rounded
+    return value
+
+
+def _entity_series(
+    periods: list[dict[str, Any]], starts: list[str], metric_names: list[str], granularity: str,
+) -> dict[str, list[Any]]:
+    """One entity's metrics as columns aligned to the shared period starts; null where it has no row."""
+    by_start = {period["period_start"]: period for period in periods}
+    series: dict[str, list[Any]] = {
+        name: [_series_value(by_start[start]["metrics"].get(name)) if start in by_start else None for start in starts]
+        for name in metric_names
+    }
+    if granularity != "day":
+        series["days_with_data"] = [by_start[start]["days_with_data"] if start in by_start else 0 for start in starts]
+    return series
+
+
+def _fit_series(
+    build: Any, full: dict[str, dict[str, list[Any]]], starts: list[str], requested: int | None,
+) -> tuple[dict[str, Any], int]:
+    """Choose how many of the most recent periods to return, and build the response with them.
+
+    Without a request, the most periods that keep the response under SERIES_TARGET_BYTES; with one, at most
+    that many, still under SERIES_MAX_BYTES. Returns the response and the number of periods kept.
+    """
+    limit = SERIES_TARGET_BYTES if requested is None else SERIES_MAX_BYTES
+    wanted = len(starts) if requested is None else min(requested, len(starts))
+
+    def response_for(count: int) -> dict[str, Any]:
+        kept = starts[len(starts) - count:] if count else []
+        columns = {
+            entity_id: {name: values[len(values) - count:] if count else [] for name, values in series.items()}
+            for entity_id, series in full.items()
+        }
+        return build(kept, columns)
+
+    def size(count: int) -> int:
+        return len(json.dumps(response_for(count), default=str).encode())
+
+    if size(wanted) <= limit:
+        return response_for(wanted), wanted
+    low, high = 0, wanted
+    while low < high:
+        middle = (low + high + 1) // 2
+        if size(middle) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return response_for(low), low
 
 
 @mcp_server.tool()
@@ -1095,14 +1398,25 @@ async def get_performance_trend(
     object_ids: StringList | None = None,
     child_level: str | None = None,
     max_entities: int = DEFAULT_MAX_ENTITIES,
+    series_periods: int | None = None,
 ) -> dict[str, Any]:
-    """Trend CPC, CPM, cost per result, ROAS, CTR and conversion rate for an account, campaign, ad set or ad by day, week (Monday start) or month, with first-to-last change and direction. Results follow Meta's own result for the object (the Insights results field); the response states the result used. Periods are summed from daily rows, then divided; zero denominators give null. Default window ends yesterday in the ad account's time zone (30/84/180 days). Several entities: object_ids (up to 10 numeric ids at level) or child_level (the max_entities highest-spending children of object_id); these return per-entity totals and changes, not periods."""
+    """Trend CPC, CPM, cost per result, ROAS, CTR and conversion rate (or spend, impressions, clicks, results, reach) for an account, campaign, ad set or ad by day, week (Monday start) or month, with first-to-last change and direction. Results follow Meta's own result for the object (the Insights results field); the response states the result used. Periods are summed from daily rows, then divided; zero denominators give null. Reach is never summed: each week or month gets its own reach query. Default window ends yesterday in the ad account's time zone (30/84/180 days). Several entities: object_ids (up to 10 numeric ids at level) or child_level (the max_entities highest-spending children of object_id); each entity gets totals, changes and a period series. By default the series keeps the most recent periods that fit a small response and says what was left out; series_periods (0 to 366) asks for a number of periods."""
     resolved_level = _require_level(level, REPORTING_LEVELS)
     targets = _entity_targets(resolved_level, object_id, object_ids, child_level, max_entities)
     resolved_granularity = (granularity or "").strip().lower()
     if resolved_granularity not in TREND_DEFAULT_WINDOW_DAYS:
         raise ValidationError("granularity must be day, week or month.")
     metric_names = _normalize_metric_names(metrics, TREND_DEFAULT_METRICS)
+    if series_periods is not None:
+        if isinstance(series_periods, bool) or not 0 <= series_periods <= MAX_DAILY_WINDOW_DAYS:
+            raise ValidationError(f"series_periods must be between 0 and {MAX_DAILY_WINDOW_DAYS}.")
+        if targets["mode"] == "single":
+            raise ValidationError(
+                "series_periods applies to several entities (object_ids or child_level); a single object always "
+                "returns every period."
+            )
+    with_reach = "reach" in metric_names
+    extra_fields = ("reach",) if with_reach else ()
     explicit = _explicit_window(since, until)
     missing_signals: list[str] = []
     if explicit is None:
@@ -1120,7 +1434,7 @@ async def get_performance_trend(
     else:
         start, end = explicit
         reporting_timezone = dict(EXPLICIT_DATES_TIMEZONE)
-    common = {
+    common: dict[str, Any] = {
         "window": {"since": start.isoformat(), "until": end.isoformat()},
         "reporting_timezone": reporting_timezone,
         "granularity": resolved_granularity,
@@ -1129,13 +1443,22 @@ async def get_performance_trend(
         "results_definition": RESULTS_DEFINITION,
         "input_policy": INPUT_POLICY,
     }
+    if with_reach:
+        common["reach_policy"] = REACH_POLICY
 
     if targets["mode"] == "single":
         resolved_object_id = targets["object_id"]
-        rows, result_error = await _daily_rows(resolved_level, resolved_object_id, start, end)
+        rows, result_error = await _daily_rows(
+            resolved_level, resolved_object_id, start, end, extra_fields=list(extra_fields),
+        )
         basis = _result_basis(rows, result_error=result_error)
-        periods = _trend_periods(rows, basis, start, end, resolved_granularity, metric_names)
+        periods = _trend_periods(rows, basis, start, end, resolved_granularity, metric_names, with_reach=with_reach)
         missing_signals.extend(_trend_signals(rows, basis, periods, resolved_level))
+        ranges = _reach_ranges(periods, start, end, resolved_granularity, window=False) if with_reach else []
+        if ranges:
+            reach, reach_error = await _reach_for_ranges(resolved_object_id, resolved_level, ranges)
+            missing = _fill_period_reach(periods, reach, None, start, end)
+            missing_signals.extend(_reach_signals(reach_error, 0 if reach_error else missing))
         return analysis_response(
             scope={"level": resolved_level, "object_id": resolved_object_id},
             metrics={},
@@ -1150,17 +1473,62 @@ async def get_performance_trend(
             },
         )
 
-    entities, coverage = await _read_targets(targets, resolved_level, start, end)
+    entities, coverage = await _read_targets(targets, resolved_level, start, end, extra_fields=extra_fields)
     if targets["mode"] == "children":
         coverage["child_level"] = targets["child_level"]
+    entity_periods: dict[str, list[dict[str, Any]]] = {}
+    entity_rows: dict[str, list[dict[str, Any]]] = {}
+    entity_basis: dict[str, dict[str, Any]] = {}
     for entity in entities:
         rows = entity.pop("_rows", None)
         result_error = entity.pop("_result_error", None)
         if rows is None:
             continue
         basis = _result_basis(rows, result_error=result_error)
-        periods = _trend_periods(rows, basis, start, end, resolved_granularity, metric_names)
+        entity_rows[entity["object_id"]] = rows
+        entity_basis[entity["object_id"]] = basis
+        entity_periods[entity["object_id"]] = _trend_periods(
+            rows, basis, start, end, resolved_granularity, metric_names, with_reach=with_reach,
+        )
+
+    reach_by_entity: dict[str, tuple[dict[_ReachKey, float | None], str | None]] = {}
+    reach_ids = [entity_id for entity_id, rows in entity_rows.items() if rows]
+    if with_reach and reach_ids:
+        if targets["mode"] == "children":
+            child = targets["child_level"]
+            ranges = [
+                item for entity_id in reach_ids
+                for item in _reach_ranges(entity_periods[entity_id], start, end, resolved_granularity, window=True)
+            ]
+            shared = await _reach_for_ranges(
+                targets["object_id"], child, ranges, id_field=f"{child}_id", ids=reach_ids,
+            )
+            reach_by_entity = {entity_id: shared for entity_id in reach_ids}
+        else:
+            semaphore = asyncio.Semaphore(ENTITY_CONCURRENCY)
+
+            async def entity_reach(entity_id: str) -> tuple[str, tuple[dict[_ReachKey, float | None], str | None]]:
+                async with semaphore:
+                    ranges = _reach_ranges(entity_periods[entity_id], start, end, resolved_granularity, window=True)
+                    return entity_id, await _reach_for_ranges(entity_id, resolved_level, ranges)
+
+            reach_by_entity = dict(await asyncio.gather(*(entity_reach(entity_id) for entity_id in reach_ids)))
+
+    for entity in entities:
+        entity_id = entity["object_id"]
+        if entity_id not in entity_rows:
+            continue
+        rows, basis, periods = entity_rows[entity_id], entity_basis[entity_id], entity_periods[entity_id]
+        signals = _trend_signals(rows, basis, periods, entity["level"])
         totals_inputs = _period_inputs(rows, basis) if rows else None
+        if with_reach and totals_inputs is not None:
+            reach, reach_error = reach_by_entity.get(entity_id, ({}, None))
+            key_id = entity_id if targets["mode"] == "children" else None
+            missing = _fill_period_reach(periods, reach, key_id, start, end) if resolved_granularity != "day" else 0
+            totals_inputs["reach"] = reach.get((key_id, start.isoformat(), end.isoformat()))
+            signals.extend(_reach_signals(reach_error, 0 if reach_error else missing, totals=True))
+            if reach_error is None and totals_inputs["reach"] is None:
+                signals.append("Meta returned no reach for the window total, so total reach is null.")
         entity["daily_rows_returned"] = len(rows)
         entity["result"] = _compact_result(basis)
         entity["totals"] = None if totals_inputs is None else {
@@ -1172,21 +1540,72 @@ async def get_performance_trend(
             for name in metric_names
             for change in (_first_to_last(name, periods),)
         }
-        entity["missing_signals"] = _trend_signals(rows, basis, periods, entity["level"])
+        entity["missing_signals"] = signals
     missing_signals.extend(_coverage_signals(coverage))
-    return analysis_response(
-        scope=_multi_scope(resolved_level, targets),
-        metrics={},
-        missing_signals=missing_signals,
-        extra={
-            **common,
-            "entity_signals": _group_entity_signals(entities),
-            "entities": entities,
-            "coverage": coverage,
-            "method": TREND_METHOD + " With several entities, each entity's window totals and first-to-last changes "
-            "are returned; call with that entity's object_id for its periods.",
-        },
-    )
+
+    starts = [day.isoformat() for day in _window_period_starts(start, end, resolved_granularity)]
+    partial_starts = [
+        value for value in starts
+        if date.fromisoformat(value) < start or _period_bounds(date.fromisoformat(value), resolved_granularity)[1] > end
+    ]
+    full_series = {
+        entity_id: _entity_series(periods, starts, metric_names, resolved_granularity)
+        for entity_id, periods in entity_periods.items()
+    }
+    entity_signals = _group_entity_signals(entities)
+
+    def build(kept: list[str], columns: dict[str, dict[str, list[Any]]]) -> dict[str, Any]:
+        left_out = len(starts) - len(kept)
+        shown = [
+            {**entity, "series": columns[entity["object_id"]]} if entity["object_id"] in columns else entity
+            for entity in entities
+        ]
+        series_info: dict[str, Any] = {
+            "period_starts": kept,
+            "partial_periods": [value for value in partial_starts if value in kept],
+            "layout": (
+                "each entity's series holds one list per metric, aligned to period_starts; null where the entity "
+                "had no row in that period or the metric has no value; values are rounded to "
+                f"{SERIES_SIGNIFICANT_FIGURES} significant figures (totals and changes are exact)"
+                + ("; days_with_data counts the daily rows in each period" if resolved_granularity != "day" else "")
+            ),
+            "periods_in_window": len(starts),
+            "periods_returned": len(kept),
+            "periods_left_out": left_out,
+            "requested_periods": series_periods,
+        }
+        signals = list(missing_signals)
+        if left_out and kept:
+            series_info["left_out"] = f"the earliest {left_out} period(s), before {kept[0]}"
+            signals.append(
+                f"The per-entity series covers the most recent {len(kept)} of {len(starts)} periods to keep the "
+                f"response small; the earliest {left_out} were left out (totals and changes still cover the whole "
+                "window). Ask for fewer metrics, a coarser granularity, fewer entities or series_periods, or call "
+                "with one object_id for every period."
+            )
+        elif left_out and series_periods != 0:
+            series_info["left_out"] = "every period"
+            signals.append(
+                "The per-entity series was left out to keep the response small; totals and changes cover the whole "
+                "window. Ask for fewer metrics or entities, or call with one object_id for every period."
+            )
+        return analysis_response(
+            scope=_multi_scope(resolved_level, targets),
+            metrics={},
+            missing_signals=signals,
+            extra={
+                **common,
+                "entity_signals": entity_signals,
+                "series": series_info,
+                "entities": shown,
+                "coverage": coverage,
+                "method": TREND_METHOD + " With several entities, each entity also gets window totals, first-to-last "
+                "changes and a series of its periods (see series).",
+            },
+        )
+
+    response, _ = _fit_series(build, full_series, starts, series_periods)
+    return response
 
 
 ANOMALY_DEFAULT_METRICS = ("spend", "cpc", "cpm", "ctr", "cost_per_result", "roas")
@@ -1250,7 +1669,7 @@ def _anomaly_analysis(
     daily_inputs: list[tuple[str, dict[str, float | None]]] = []
     for row in rows:
         day = _parse_date(str(row["date_start"]), field="date_start")
-        inputs = _period_inputs([row], basis)
+        inputs = _period_inputs([row], basis, with_reach="reach" in metric_names)
         daily_inputs.append((day.isoformat(), inputs))
         daily[day] = _derived_metrics(inputs, basis)
     baseline_dates = sorted(day for day in daily if baseline_start <= day <= baseline_end)
@@ -1425,7 +1844,7 @@ async def detect_performance_anomalies(
     child_level: str | None = None,
     max_entities: int = DEFAULT_MAX_ENTITIES,
 ) -> dict[str, Any]:
-    """Flag days in the last lookback_days whose spend, CPC, CPM, CTR, cost per result or ROAS is far from the object's own baseline (the baseline_days before), using median and median absolute deviation, with same-weekday baselines when four or more exist. Cost per result and ROAS follow Meta's own result for the object (the Insights results field). Returns the rule, baseline values and thresholds. Rule-based screen, not a statistical test. end_date defaults to yesterday in the ad account's time zone. Several entities: object_ids (up to 10 numeric ids at level) or child_level (the max_entities highest-spending children of object_id)."""
+    """Flag days in the last lookback_days whose spend, CPC, CPM, CTR, cost per result or ROAS (or another metric named in metrics, such as daily reach) is far from the object's own baseline (the baseline_days before), using median and median absolute deviation, with same-weekday baselines when four or more exist. Cost per result and ROAS follow Meta's own result for the object (the Insights results field). Returns the rule, baseline values and thresholds. Rule-based screen, not a statistical test. end_date defaults to yesterday in the ad account's time zone. Several entities: object_ids (up to 10 numeric ids at level) or child_level (the max_entities highest-spending children of object_id)."""
     resolved_level = _require_level(level, REPORTING_LEVELS)
     targets = _entity_targets(resolved_level, object_id, object_ids, child_level, max_entities)
     metric_names = _normalize_metric_names(metrics, ANOMALY_DEFAULT_METRICS)
@@ -1437,6 +1856,7 @@ async def detect_performance_anomalies(
     if resolved_sensitivity not in SENSITIVITY_MULTIPLIERS:
         raise ValidationError(f"sensitivity must be one of {list(SENSITIVITY_MULTIPLIERS)}.")
     multiplier = SENSITIVITY_MULTIPLIERS[resolved_sensitivity]
+    extra_fields = ("reach",) if "reach" in metric_names else ()
     end_text = blank_to_none(end_date)
     timezone_signals: list[str] = []
     if end_text:
@@ -1467,7 +1887,9 @@ async def detect_performance_anomalies(
     if targets["mode"] == "single":
         resolved_object_id = targets["object_id"]
         scope = {"level": resolved_level, "object_id": resolved_object_id}
-        rows, result_error = await _daily_rows(resolved_level, resolved_object_id, baseline_start, end)
+        rows, result_error = await _daily_rows(
+            resolved_level, resolved_object_id, baseline_start, end, extra_fields=list(extra_fields),
+        )
         basis = _result_basis(rows, result_error=result_error)
         analysis = _anomaly_analysis(rows, basis, metric_names, **analysis_kwargs)
         result_signals = _result_signals(basis, resolved_level, rows_exist=bool(rows))
@@ -1518,7 +1940,7 @@ async def detect_performance_anomalies(
             },
         )
 
-    entities, coverage = await _read_targets(targets, resolved_level, baseline_start, end)
+    entities, coverage = await _read_targets(targets, resolved_level, baseline_start, end, extra_fields=extra_fields)
     if targets["mode"] == "children":
         coverage["child_level"] = targets["child_level"]
     scored: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -1754,17 +2176,18 @@ def _is_action_indicator(indicator: str, row: dict[str, Any]) -> bool:
     return indicator.startswith(ACTION_INDICATOR_PREFIX) or indicator in (row.get("actions_map") or {})
 
 
-def _pooled_costs(rows: list[dict[str, Any]], pool_basis: dict[str, Any]) -> dict[str, float | None]:
-    """Cost per result for each action result across ads: summed spend / summed results, per indicator."""
+def _pooled_costs(rows: list[dict[str, Any]]) -> dict[str, float | None]:
+    """Cost per result for each action result across ads: summed spend / summed results, per indicator.
+
+    Only ads that report that result themselves are pooled; an ad that reports no result is left out rather
+    than counted as zero for another ad's result.
+    """
     sums: dict[str, list[float | None]] = {}
     for row in rows:
         result = row.get("meta_result") or {"status": "absent"}
-        if result["status"] == "read":
-            indicator, count = result["indicator"], result["value"] or 0.0
-        elif result["status"] == "absent" and pool_basis.get("status") == "single":
-            indicator, count = pool_basis["indicator"], 0.0
-        else:
+        if result["status"] != "read":
             continue
+        indicator, count = result["indicator"], result["value"] or 0.0
         if not _is_action_indicator(indicator, row):
             continue
         spend = to_float((row.get("metrics") or {}).get("spend"))
@@ -1867,7 +2290,7 @@ async def _ranking_entity(
     }
 
     cost_known_rows = [row for row in rows if str(row.get("ad_id")) in cost_rows]
-    pool_basis = _result_basis(cost_known_rows)
+    pool_basis = _result_basis(cost_known_rows, one_entity=False)
     scope_basis = _result_basis(scope_rows or []) if scope_has_results else {"status": "not_reported"}
     if scope_rows and scope_basis["status"] == "single":
         scope_metrics = _derived_metrics(_period_inputs(scope_rows, scope_basis), scope_basis)
@@ -1885,7 +2308,7 @@ async def _ranking_entity(
         scope_metrics = _derived_metrics(_period_inputs(rows, {"status": "not_reported"}), {})
         scope_metrics_basis = "examined_ads"
         scope_result = {"status": "not_reported"}
-    pooled = _pooled_costs(cost_known_rows, pool_basis)
+    pooled = _pooled_costs(cost_known_rows)
     scope_cost = (
         _derived_metrics(_period_inputs(scope_rows, scope_basis), scope_basis)["cost_per_result"]
         if scope_rows and scope_basis["status"] == "single" else None
@@ -1899,12 +2322,27 @@ async def _ranking_entity(
             ]
         )
 
+    unreported = sum(
+        1 for row in cost_known_rows if (row.get("meta_result") or {}).get("status", "absent") == "absent"
+    )
+    if cost_status == "read" and unreported and pool_basis["status"] != "not_reported":
+        missing_signals.append(
+            f"{unreported} examined ad(s) with cost evidence reported no Meta result. Their result type is unknown, "
+            "so their results are null rather than zero, they are left out of every cost baseline, and they are "
+            "not diagnosed on cost."
+        )
+    unreadable_ads = [row for row in cost_known_rows if (row.get("meta_result") or {}).get("status") == "unreadable"]
+    if cost_status == "read" and unreadable_ads:
+        reasons = list(dict.fromkeys(str(row["meta_result"].get("reason")) for row in unreadable_ads))
+        missing_signals.append(
+            f"{len(unreadable_ads)} examined ad(s) had a Meta result that could not be read "
+            f"({'; '.join(reasons[:MAX_UNREADABLE_REASONS])}); their results are null and no value was guessed."
+        )
+
     ads: list[dict[str, Any]] = []
     for row in rows:
         has_cost = str(row.get("ad_id")) in cost_rows
         own = _result_basis([row]) if has_cost else {"status": "not_requested"}
-        if has_cost and own["status"] == "not_reported" and pool_basis["status"] == "single":
-            own = pool_basis
         inputs = _period_inputs([row], own)
         metrics = _derived_metrics(inputs, own)
         indicator = own.get("indicator") if own["status"] == "single" else None
@@ -1929,6 +2367,8 @@ async def _ranking_entity(
             "spend": metrics["spend"],
             "impressions": metrics["impressions"],
             "result_indicator": indicator,
+            "result_status": own["status"],
+            **({"result_unreadable_reasons": own["unreadable_reasons"]} if own.get("unreadable_reasons") else {}),
             "results": metrics["results"],
             "cost_per_result": metrics["cost_per_result"],
             "cpm": metrics["cpm"],
@@ -2335,25 +2775,27 @@ def _known_total_spend(rows: list[dict[str, Any]]) -> float | None:
 
 def _group_spend(
     rows: list[dict[str, Any]], key: str, total_spend: float | None, *, result_error: str | None = None,
+    unit: str = "adset",
 ) -> list[dict[str, Any]]:
-    """Group ad set rows by a dimension, with spend, share, and Meta's result where the group has one.
+    """Group ad set (or ad) rows by a dimension, with spend, share, and Meta's result where the group has one.
 
-    A row without spend makes its group's spend (and share) null. Results are added up only when every ad set in
-    the group that reports a result reports the same action result; otherwise they are null and the group lists
-    the result types it mixes.
+    A row without spend makes its group's spend (and share) null. Results are added up only when every row in
+    the group reports the same action result itself; a row that reports no result has an unknown result type,
+    so it makes the group's results null (never zero), and the group counts such rows. Mixed result types are
+    null and listed.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(str(row.get(key) or "UNKNOWN"), []).append(row)
     output: list[dict[str, Any]] = []
     for label, group_rows in grouped.items():
-        basis = _result_basis(group_rows, result_error=result_error)
+        basis = _result_basis(group_rows, result_error=result_error, one_entity=False)
         inputs = _period_inputs(group_rows, basis)
         spend = _known_total_spend(group_rows)
         group: dict[str, Any] = {
             key: label,
             "spend": spend,
-            "adset_count": len(group_rows),
+            f"{unit}_count": len(group_rows),
             "spend_share": _ratio(spend, total_spend),
             "result_indicator": basis.get("indicator") if basis["status"] == "single" else None,
             "results": inputs["results"],
@@ -2361,6 +2803,14 @@ def _group_spend(
         }
         if basis["status"] == "mixed":
             group["result_indicators"] = basis["indicators"]
+        if basis["status"] in ("single", "mixed"):
+            without = sum(
+                1 for row in group_rows if (row.get("meta_result") or {}).get("status", "absent") == "absent"
+            )
+            if without:
+                group[f"{unit}s_without_reported_result"] = without
+        if basis.get("unreadable_reasons"):
+            group["result_unreadable_reasons"] = basis["unreadable_reasons"]
         output.append(group)
     return sorted(output, key=lambda group: (group["spend"] is None, -(group["spend"] or 0.0), group[key]))
 
@@ -2452,19 +2902,21 @@ def _top_by_spend(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 _META_RESULT_EVENT_BASIS = (
     "Meta's own result for each ad set (the Insights results field), which counts the event the ad set "
-    "optimizes for; an ad set whose row reports no result counts zero events"
+    "optimizes for"
 )
 
 
 def _meta_result_events(row: dict[str, Any]) -> tuple[float | None, str | None, str | None]:
-    """An ad set's optimization events from Meta's result: (events, indicator, reason it cannot be judged)."""
+    """An ad set's optimization events from its own reported Meta result: (events, indicator, reason it cannot be judged).
+
+    Only called for a row that reports a result; a row without one is handled by its own goal, never as zero.
+    """
     result = row.get("meta_result") or {"status": "absent"}
-    if result["status"] == "absent":
-        return 0.0, None, None
     if result["status"] == "mixed":
         return None, None, f"the ad set reports several results ({', '.join(result['indicators'])})"
     if result["status"] != "read":
-        return None, None, "the ad set's result could not be read"
+        reason = result.get("reason") or "an unexpected shape"
+        return None, None, f"the ad set's result could not be read ({reason})"
     if not _is_action_indicator(result["indicator"], row):
         return None, result["indicator"], f"Meta's result {result['indicator']} is not an event count"
     return (result["value"] or 0.0), result["indicator"], None
@@ -2474,14 +2926,21 @@ def _results_reported(rows: list[dict[str, Any]]) -> bool:
     return any((row.get("meta_result") or {}).get("status") in ("read", "mixed", "unreadable") for row in rows)
 
 
+GOAL_VOLUME_MIN_DAYS = 7
+_SHORT_WINDOW_REASON = (
+    "The window has fewer than 7 days. Meta's learning-phase guidance counts events over 7 days, and a shorter "
+    "window is not scaled up to a week, so the goal is not assessed."
+)
+
+
 def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[str, Any]]:
     """Summarize, per optimization goal, how many ad sets reach the learning-phase weekly volume, with the top spenders.
 
-    When Meta reports a result for any ad set, each ad set is judged on its own result. Otherwise only goals whose
-    event is known from the goal itself (GOAL_EVENT_BASIS) are judged, on that action. Ad sets with zero spend are
-    skipped; an ad set whose spend is missing is kept and makes its goal's spend null.
+    Each ad set is judged on its own data only. An ad set whose row reports Meta's result is judged on that
+    result. An ad set whose row reports no result is judged on its goal's own event when the goal identifies it
+    (GOAL_EVENT_BASIS); otherwise it is not judged. Another ad set's result never decides how this one is read.
+    Ad sets with zero spend are skipped; an ad set whose spend is missing is kept and makes its goal's spend null.
     """
-    use_results = _results_reported(rows)
     by_goal: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         spend = to_float((row.get("metrics") or {}).get("spend"))
@@ -2494,14 +2953,16 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
         goal_spend = _known_total_spend(goal_rows)
         unknown_spend = sum(1 for row in goal_rows if to_float((row.get("metrics") or {}).get("spend")) is None)
         mapping = GOAL_EVENT_BASIS.get(goal)
-        if not use_results and mapping is None:
+        unidentified = GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal.")
+        short_window = lookback_days < GOAL_VOLUME_MIN_DAYS
+        if short_window or (mapping is None and not _results_reported(goal_rows)):
             output.append({
                 "optimization_goal": goal,
                 "adset_count": len(goal_rows),
                 "spend": goal_spend,
                 "adsets_with_unknown_spend": unknown_spend,
                 "verdict": "not_assessed",
-                "reason": GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal."),
+                "reason": _SHORT_WINDOW_REASON if short_window else unidentified,
                 "top_adsets_by_spend": _top_by_spend([_adset_volume_entry(row, None, None) for row in goal_rows]),
             })
             continue
@@ -2510,16 +2971,26 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
         not_judged: list[dict[str, Any]] = []
         reasons: list[str] = []
         indicators: list[str] = []
+        bases: set[str] = set()
         for row in goal_rows:
-            if use_results:
+            if (row.get("meta_result") or {}).get("status", "absent") != "absent":
                 events, indicator, reason = _meta_result_events(row)
                 if indicator and indicator not in indicators:
                     indicators.append(indicator)
-            else:
-                action_types, _ = mapping  # type: ignore[misc]
+                if events is not None:
+                    bases.add("results")
+            elif mapping is not None:
+                action_types, _ = mapping
                 actions = row.get("actions_map") or {}
                 matched = next((candidate for candidate in action_types if candidate in actions), None)
                 events, reason = ((to_float(actions.get(matched)) or 0.0) if matched else 0.0), None
+                bases.add("goal_event")
+            else:
+                events = None
+                reason = (
+                    "an ad set reports no Meta result, so its result type is unknown and it is not counted as zero; "
+                    + unidentified[0].lower() + unidentified[1:]
+                )
             if events is None:
                 not_judged.append(_adset_volume_entry(row, None, None))
                 if reason and reason not in reasons:
@@ -2544,9 +3015,17 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
             else "some_adsets_meet_threshold" if meeting
             else "no_adsets_meet_threshold"
         )
+        if bases == {"results"}:
+            event_basis = _META_RESULT_EVENT_BASIS
+        elif bases == {"goal_event"}:
+            event_basis = mapping[1]  # type: ignore[index]
+        else:
+            event_basis = (
+                f"{_META_RESULT_EVENT_BASIS} where the ad set reports one; otherwise {mapping[1]}"  # type: ignore[index]
+            )
         entry_out: dict[str, Any] = {
             "optimization_goal": goal,
-            "event_basis": _META_RESULT_EVENT_BASIS if use_results else mapping[1],  # type: ignore[index]
+            "event_basis": event_basis,
             "threshold_events_per_week": LEARNING_EVENTS_PER_WEEK,
             "adset_count": len(goal_rows),
             "spend": goal_spend,
@@ -2557,7 +3036,7 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
             "top_meeting_threshold": _top_by_spend(meeting),
             "top_below_threshold": _top_by_spend(below),
         }
-        if use_results:
+        if indicators:
             entry_out["result_indicators"] = indicators[:5]
         if not_judged:
             entry_out["adsets_not_judged"] = len(not_judged)
@@ -2721,23 +3200,112 @@ async def _context_adset_rows(
     return rows, result_error, coverage
 
 
+CONTEXT_AD_FIELDS = [*CONTEXT_INSIGHTS_FIELDS, "ad_id", "ad_name"]
+
+
+async def _context_ad_rows(
+    account_id: str, start: date, end: date, ad_ids: list[str],
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
+    """Read the named ads' rows in one ad-level request filtered to their ids (ad.id IN). Never raises for a read failure."""
+    params = insights_tools._insights_params(
+        level="ad", since=start.isoformat(), until=end.isoformat(), limit=len(ad_ids),
+        filtering=[{"field": "ad.id", "operator": "IN", "value": list(ad_ids)}],
+    )
+    coverage: dict[str, Any] = {
+        "mode": "ad_ids",
+        "row_level": "ad",
+        "method": "one ad-level insights request filtered to the named ad ids (ad.id IN), one page",
+        "status": "read",
+        "error": None,
+    }
+    rows: list[dict[str, Any]] = []
+    result_error: str | None = None
+    more = False
+
+    async def read() -> tuple[list[dict[str, Any]], bool, str | None] | BaseException:
+        try:
+            return await _read_one_page_with_results(account_id, CONTEXT_AD_FIELDS, params, level="ad")
+        except _CONTEXT_READ_ERRORS as exc:
+            return exc
+
+    outcome, (account_spend, spend_error) = await asyncio.gather(
+        read(), _context_account_spend(account_id, start, end),
+    )
+    if isinstance(outcome, BaseException):
+        coverage.update({"status": "failed", "error": str(_public_error(outcome).get("message"))})
+    else:
+        read_rows, more, result_error = outcome
+        wanted = set(ad_ids)
+        seen: set[str] = set()
+        for row in read_rows:
+            key = str(row.get("ad_id") or "")
+            if key in wanted and key not in seen:
+                seen.add(key)
+                rows.append(row)
+    examined_spend = _known_total_spend(rows)
+    share = _ratio(examined_spend, account_spend)
+    coverage.update({
+        "ads_examined": len(rows),
+        "more_ads_exist": more,
+        "examined_spend": examined_spend,
+        "account_spend": account_spend,
+        "account_spend_error": spend_error,
+        "share_of_account_spend": None if share is None else min(share, 1.0),
+        "complete": coverage["status"] == "read" and not more,
+    })
+    return rows, result_error, coverage
+
+
+_AD_SCOPE_GOAL_REASON = (
+    "ad_ids names ads, but Meta's learning phase counts optimization events per ad set, and the named ads may be "
+    "only part of their ad sets' delivery, so weekly volume per ad set is not assessed. Pass the ad set ids "
+    "(adset_ids_of_named_ads) in object_ids to assess it."
+)
+
+
+def _ad_scope_goal_volume(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per goal, the named ads and their ad sets; the learning-phase volume itself is not judged for ads."""
+    by_goal: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_goal.setdefault(str(row.get("optimization_goal") or "UNKNOWN"), []).append(row)
+    output = []
+    for goal in sorted(by_goal):
+        goal_rows = by_goal[goal]
+        adset_ids = list(dict.fromkeys(str(row["adset_id"]) for row in goal_rows if row.get("adset_id")))
+        output.append({
+            "optimization_goal": goal,
+            "ad_count": len(goal_rows),
+            "spend": _known_total_spend(goal_rows),
+            "verdict": "not_assessed",
+            "reason": _AD_SCOPE_GOAL_REASON,
+            "adset_ids_of_named_ads": adset_ids[:MAX_CONTEXT_OBJECT_IDS],
+        })
+    return output
+
+
 def _coverage_signal(coverage: dict[str, Any]) -> list[str]:
-    """Plain statements of how much of the account's ad set activity the briefing examined."""
+    """Plain statements of how much of the account's ad set (or named ad) activity the briefing examined."""
+    unit = "ad" if coverage.get("row_level") == "ad" else "ad set"
     if coverage["status"] == "failed":
         return [
-            f"Ad set insights could not be read ({coverage['error']}), so spend by objective and goal, the funnel "
-            "and goal volume are empty; account settings and asset lists are still reported."
+            f"{unit.capitalize()} insights could not be read ({coverage['error']}), so spend by objective and goal, "
+            "the funnel and goal volume are empty; account settings and asset lists are still reported."
         ]
     signals = []
     if coverage["status"] == "partly_read":
         signals.append(f"One of the filtered ad set reads failed ({coverage['error']}); the other was used.")
-    if coverage["more_adsets_exist"]:
+    if coverage.get("more_adsets_exist") or coverage.get("more_ads_exist"):
         share = coverage["share_of_account_spend"]
         covered = f", covering {share:.0%} of the account's spend in the window" if share is not None else ""
-        which = "highest-spending ad sets" if coverage["mode"] == "top_spenders" else "ad sets under the named objects"
+        which = {
+            "top_spenders": "highest-spending ad sets",
+            "object_ids": "ad sets under the named objects",
+            "ad_ids": "named ads",
+        }[coverage["mode"]]
+        examined = coverage.get("adsets_examined", coverage.get("ads_examined"))
         signals.append(
-            f"Partial briefing: examined the {coverage['adsets_examined']} {which}{covered}; the remaining ad sets "
-            "were not examined, so spend, funnel and goal sections describe only the examined ones."
+            f"Partial briefing: examined the {examined} {which}{covered}; the remaining {unit}s were not examined, "
+            "so spend, funnel and goal sections describe only the examined ones."
         )
     if coverage.get("account_spend_error"):
         signals.append(
@@ -2747,36 +3315,77 @@ def _coverage_signal(coverage: dict[str, Any]) -> list[str]:
     return signals
 
 
+def _context_window(
+    lookback_days: int | None, since: str | None, until: str | None,
+) -> tuple[tuple[date, date] | None, int]:
+    """Validate the briefing window before any network call: lookback_days, or an explicit since and until."""
+    explicit = _explicit_window(since, until)
+    if explicit is not None and lookback_days is not None:
+        raise ValidationError("Give lookback_days or since and until, not both.")
+    if explicit is None:
+        days = CONTEXT_DEFAULT_LOOKBACK_DAYS if lookback_days is None else lookback_days
+        if isinstance(days, bool) or not 7 <= days <= 90:
+            raise ValidationError("lookback_days must be between 7 and 90.")
+        return None, days
+    return explicit, (explicit[1] - explicit[0]).days + 1
+
+
+CONTEXT_DEFAULT_LOOKBACK_DAYS = 30
+
+
 @mcp_server.tool()
 async def get_advertiser_context(
     account_id: str,
-    lookback_days: int = 30,
+    lookback_days: int | None = None,
     object_ids: StringList | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    ad_ids: StringList | None = None,
 ) -> dict[str, Any]:
-    """Briefing built from this account's data: account and business settings, spend by objective and optimization goal, funnel event volumes with drop-off, pixels/datasets and custom conversions, Pages and Instagram identities, and which optimization goals get about 50 events per ad set per week, judged on Meta's own result for each ad set. object_ids (up to 50 numeric campaign or ad set ids in this account) limits the spend, funnel and goal sections to those; account settings and the asset lists stay account-wide. Derived here; not Meta's own summary."""
+    """Briefing built from this account's data: account and business settings, spend by objective and optimization goal, funnel event volumes with drop-off, pixels/datasets and custom conversions, Pages and Instagram identities, and which optimization goals get about 50 events per ad set per week, judged on each ad set's own Meta result. Window: lookback_days (7 to 90, default 30, ending yesterday in the account's time zone) or since and until (YYYY-MM-DD, up to 366 days). object_ids (up to 50 numeric campaign or ad set ids) or ad_ids (up to 50 numeric ad ids) limits the spend, funnel and goal sections to those; account settings and the asset lists stay account-wide. Derived here; not Meta's own summary."""
     resolved_account_id = _require_account_id(account_id)
-    if not 7 <= lookback_days <= 90:
-        raise ValidationError("lookback_days must be between 7 and 90.")
+    explicit, window_days = _context_window(lookback_days, since, until)
     has_ids = object_ids is not None and coerce_csv_string_list(object_ids) not in ([], "")
+    has_ad_ids = ad_ids is not None and coerce_csv_string_list(ad_ids) not in ([], "")
+    if has_ids and has_ad_ids:
+        raise ValidationError("Give object_ids (campaigns or ad sets) or ad_ids, not both.")
     scope_ids = _require_graph_ids(object_ids, limit=MAX_CONTEXT_OBJECT_IDS) if has_ids else None
+    scope_ad_ids = _require_graph_ids(ad_ids, field="ad_ids", limit=MAX_CONTEXT_OBJECT_IDS) if has_ad_ids else None
     client = get_graph_api_client()
     account = await client.get_object(resolved_account_id, fields=CONTEXT_ACCOUNT_FIELDS)
     today, reporting_timezone, timezone_signal = await _reporting_today(
         "account", resolved_account_id, account=account,
     )
-    end = today - timedelta(days=1)
-    start = end - timedelta(days=lookback_days - 1)
-    (rows, result_error, adset_coverage), *edge_sections = await asyncio.gather(
-        _context_adset_rows(resolved_account_id, start, end, scope_ids),
+    if explicit is None:
+        end = today - timedelta(days=1)
+        start = end - timedelta(days=window_days - 1)
+        window_source = "lookback_days"
+    else:
+        start, end = explicit
+        window_source = "since_until"
+    if scope_ad_ids is not None:
+        rows_read = _context_ad_rows(resolved_account_id, start, end, scope_ad_ids)
+    else:
+        rows_read = _context_adset_rows(resolved_account_id, start, end, scope_ids)
+    (rows, result_error, row_coverage), *edge_sections = await asyncio.gather(
+        rows_read,
         *(
             _optional_edge_section(client, resolved_account_id, edge, fields)
             for _, edge, fields in CONTEXT_EDGE_SECTIONS
         ),
     )
+    ad_scope = scope_ad_ids is not None
+    unit, units = ("ad", "ads") if ad_scope else ("ad set", "ad sets")
     missing_signals: list[str] = [timezone_signal] if timezone_signal else []
-    missing_signals.extend(_coverage_signal(adset_coverage))
+    if explicit is not None and end >= today:
+        missing_signals.append(
+            f"The window ends on {end.isoformat()}, on or after today ({today.isoformat()}) in the account's time "
+            "zone, so its last days are incomplete or empty."
+        )
+    missing_signals.extend(_coverage_signal(row_coverage))
     scope: dict[str, Any] = {"level": "account", "object_id": resolved_account_id}
     object_scope: dict[str, Any] | None = None
+    account_wide = ["account", "datasets", "custom_conversions", "pages", "instagram_accounts"]
     if scope_ids is not None:
         matched = {str(row.get(key)) for row in rows for key in ("campaign_id", "adset_id") if row.get(key)}
         unmatched = [value for value in scope_ids if value not in matched]
@@ -2785,13 +3394,29 @@ async def get_advertiser_context(
             "object_ids": scope_ids,
             "matched_adset_rows": len(rows),
             "unmatched_object_ids": unmatched,
-            "method": adset_coverage["method"],
-            "account_wide_sections": ["account", "datasets", "custom_conversions", "pages", "instagram_accounts"],
+            "method": row_coverage["method"],
+            "account_wide_sections": account_wide,
         }
-        if unmatched and adset_coverage["status"] != "failed":
+        if unmatched and row_coverage["status"] != "failed":
             missing_signals.append(
                 "No ad set insights rows in the window matched " + ", ".join(unmatched)
                 + " (not a campaign or ad set of this account, or no delivery in the window)."
+            )
+    if scope_ad_ids is not None:
+        matched = {str(row.get("ad_id")) for row in rows if row.get("ad_id")}
+        unmatched = [value for value in scope_ad_ids if value not in matched]
+        scope["ad_ids"] = scope_ad_ids
+        object_scope = {
+            "ad_ids": scope_ad_ids,
+            "matched_ad_rows": len(rows),
+            "unmatched_ad_ids": unmatched,
+            "method": row_coverage["method"],
+            "account_wide_sections": account_wide,
+        }
+        if unmatched and row_coverage["status"] != "failed":
+            missing_signals.append(
+                "No ad insights rows in the window matched " + ", ".join(unmatched)
+                + " (not an ad of this account, or no delivery in the window)."
             )
     currency = _supported_currency(account.get("currency"))
     money: dict[str, float | None] = {}
@@ -2803,21 +3428,21 @@ async def get_advertiser_context(
     business = account.get("business") if isinstance(account.get("business"), dict) else None
 
     total_spend = _known_total_spend(rows)
-    if not rows and adset_coverage["status"] != "failed":
-        missing_signals.append("Meta returned no ad set insights rows for the lookback window.")
+    if not rows and row_coverage["status"] != "failed":
+        missing_signals.append(f"Meta returned no {unit} insights rows for the window.")
     elif total_spend is None:
         missing_signals.append(
-            "At least one ad set row had no spend, so total spend and spend shares are null rather than computed "
+            f"At least one {unit} row had no spend, so total spend and spend shares are null rather than computed "
             "from zero."
         )
     if result_error is not None:
         missing_signals.append(
-            f"Meta rejected the request for its result fields ({result_error}), so ad set results are null and goal "
+            f"Meta rejected the request for its result fields ({result_error}), so {unit} results are null and goal "
             "volume falls back to the goal's own event where that is known."
         )
     elif rows and not _results_reported(rows):
         missing_signals.append(
-            "Meta reported no result for any ad set, so results are null and goal volume is judged only for goals "
+            f"Meta reported no result for any {unit}, so results are null and goal volume is judged only for goals "
             "whose event is known from the goal itself (LEAD_GENERATION, LINK_CLICKS, LANDING_PAGE_VIEWS)."
         )
     sections = {
@@ -2826,14 +3451,14 @@ async def get_advertiser_context(
     section_errors = {name: section["error"] for name, section in sections.items() if not section["available"]}
     for name, error in section_errors.items():
         missing_signals.append(f"{name}: Meta returned an error, so this section is unknown ({error.get('message')}).")
-    goal_volume = _goal_volume(rows, lookback_days)
+    goal_volume = _ad_scope_goal_volume(rows) if ad_scope else _goal_volume(rows, window_days)
     unassessed = [entry for entry in goal_volume if entry["verdict"] == "not_assessed"]
     if unassessed:
+        count_key = "ad_count" if ad_scope else "adset_count"
         missing_signals.append(
             "Weekly optimization event volume was not assessed for "
-            + ", ".join(f"{entry['optimization_goal']} ({entry['adset_count']} ad sets)" for entry in unassessed)
-            + " because the event each optimizes for could not be identified from ad set insights; see each "
-            "goal's reason in optimization_goal_volume."
+            + ", ".join(f"{entry['optimization_goal']} ({entry[count_key]} {units})" for entry in unassessed)
+            + "; see each goal's reason in optimization_goal_volume."
         )
 
     extra: dict[str, Any] = {
@@ -2841,7 +3466,12 @@ async def get_advertiser_context(
         "derived_note": (
             "Built by this server from the account's own data. This is not Meta's own advertiser summary."
         ),
-        "window": {"since": start.isoformat(), "until": end.isoformat(), "days": lookback_days},
+        "window": {
+            "since": start.isoformat(), "until": end.isoformat(), "days": window_days, "source": window_source,
+            "weekly_volume_basis": (
+                f"events in these {window_days} days / {window_days} x 7; there is no comparison period"
+            ),
+        },
         "reporting_timezone": reporting_timezone,
         "account": {
             "id": str(account.get("id") or resolved_account_id),
@@ -2859,28 +3489,37 @@ async def get_advertiser_context(
             "money_units": f"major units of {currency}" if currency else None,
             "created_time": account.get("created_time"),
         },
-        "spend_by_objective": _group_spend(rows, "objective", total_spend, result_error=result_error),
-        "spend_by_optimization_goal": _group_spend(rows, "optimization_goal", total_spend, result_error=result_error),
+        "spend_by_objective": _group_spend(
+            rows, "objective", total_spend, result_error=result_error, unit="ad" if ad_scope else "adset",
+        ),
+        "spend_by_optimization_goal": _group_spend(
+            rows, "optimization_goal", total_spend, result_error=result_error, unit="ad" if ad_scope else "adset",
+        ),
         "funnel": _funnel(_sum_actions(rows)),
         "optimization_goal_volume": goal_volume,
         "optimization_goal_volume_rule": (
-            f"An ad set meets the threshold when its events / lookback_days x 7 is at least "
+            f"An ad set meets the threshold when its events / window days x 7 is at least "
             f"{LEARNING_EVENTS_PER_WEEK}, following Meta's learning-phase guidance of about 50 optimization "
-            "events per ad set in a 7-day period. Events are Meta's own result for the ad set when Meta reports "
-            "results; a result that is not an action count (for example reach) is not judged. Only ad sets with "
+            "events per ad set in a 7-day period. Events are each ad set's own Meta result when it reports one, "
+            "otherwise its goal's own event where the goal identifies it; a result that is not an action count "
+            "(for example reach) is not judged, and windows shorter than 7 days are not judged. Only ad sets with "
             f"spend in the window are counted. Each goal lists counts and the {GOAL_VOLUME_TOP_ADSETS} "
             "highest-spending ad sets that meet and that miss the threshold, not every ad set."
         ),
         **sections,
         "section_errors": section_errors,
         "results_definition": RESULTS_DEFINITION,
-        "adset_coverage": adset_coverage,
+        ("ad_coverage" if ad_scope else "adset_coverage"): row_coverage,
     }
     if object_scope is not None:
         extra["object_scope"] = object_scope
     return analysis_response(
         scope=scope,
-        metrics={"spend": total_spend, "adset_rows": len(rows), "account_spend": adset_coverage["account_spend"]},
+        metrics={
+            "spend": total_spend,
+            ("ad_rows" if ad_scope else "adset_rows"): len(rows),
+            "account_spend": row_coverage["account_spend"],
+        },
         missing_signals=missing_signals,
         extra=extra,
     )
