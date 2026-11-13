@@ -50,6 +50,60 @@ def _upload_folder() -> Path:
     return folder
 
 
+# Folders on the way to the file are opened only to look up the next name, so
+# Linux's O_PATH or macOS's O_SEARCH is used where available: they need search
+# permission on a folder, as an ordinary open by path does, not read permission.
+# A platform without descriptor-relative opens or these flags (Windows) cannot
+# make the guarantee, so reading is refused there rather than done unsafely.
+_SAFE_OPEN_SUPPORTED = (
+    os.open in os.supports_dir_fd
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_NONBLOCK")
+)
+_FOLDER_FLAGS = (
+    (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+# O_NONBLOCK so opening a named pipe cannot hang.
+_FILE_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _open_without_links(resolved: Path) -> int:
+    """Open an already-resolved absolute path one name at a time, refusing every link.
+
+    The path was resolved and checked by name, and something could replace any
+    folder on it with a link before the open. Opening each name relative to the
+    folder opened before it, with O_NOFOLLOW, means a link anywhere on the path
+    (the upload folder and its parents included) makes the open fail instead of
+    being followed. The resolved path itself contains no links, so a legitimate
+    read never meets one. Raises OSError; every folder descriptor is closed.
+    """
+    if not _SAFE_OPEN_SUPPORTED:
+        raise OSError("descriptor-relative opens are not available on this platform")
+    anchor, *names = resolved.parts
+    if not names:
+        raise IsADirectoryError(resolved)
+    current = os.open(anchor, _FOLDER_FLAGS)
+    try:
+        for name in names[:-1]:
+            following = os.open(name, _FOLDER_FLAGS, dir_fd=current)
+            previous, current = current, following
+            os.close(previous)
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise NotADirectoryError(name)
+        return os.open(names[-1], _FILE_FLAGS, dir_fd=current)
+    finally:
+        os.close(current)
+
+
 def read_upload_file(
     file_path: object,
     *,
@@ -88,9 +142,7 @@ def read_upload_file(
         raise ValidationError(f"{parameter} must end in one of: {', '.join(allowed_types)}.")
     descriptor = None
     try:
-        # O_NONBLOCK so opening a named pipe cannot hang; O_NOFOLLOW so the final
-        # name cannot have been swapped for a link since it was resolved.
-        descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        descriptor = _open_without_links(resolved)
         details = os.fstat(descriptor)
         if not stat.S_ISREG(details.st_mode):
             raise ValidationError(f"{parameter} does not point to a file that can be read.")

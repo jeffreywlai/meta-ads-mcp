@@ -135,3 +135,93 @@ def test_read_only_mode_hides_the_duplicate_and_batch_tools(monkeypatch) -> None
     reload_settings()
     for query in ("duplicate campaign", "batch update catalog products", "copy this campaign"):
         assert not PHASE_TWO_VERB_WRITE_TOOLS & set(_search(query))
+
+
+# Round-two review G16: "add", "remove" and "boost" also have arithmetic and
+# reporting meanings. A tool-name noun later in the request ("audience",
+# "instagram post") must not turn such a request into a write-only result.
+
+ANALYTICAL_QUERIES = [
+    "add up audience performance",
+    "remove outliers from audience performance",
+    "boost in instagram post engagement",
+    # Beyond the reproduction: other particles, reporting qualifiers and noun uses.
+    "add together audience results by country",
+    "add audience performance to the weekly report",
+    "remove the outliers from the custom audience spend",
+    "remove audience overlap from the summary",
+    "boost of instagram post reach last month",
+    "boost instagram post engagement totals by week",
+    "cancel out the ad study noise in the results",
+    "duplicate campaign spend in the export",
+    "connect the dots between catalog event source volume and sales",
+    "copy of the ad study results",
+]
+
+
+def _decision(query: str):
+    from meta_ads_mcp.intent_routing import StructuredIntentRouter
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+
+    contracts = build_tool_contracts(list(mcp_server.local_provider._components.values()))
+    return StructuredIntentRouter().decide(query, tool_contracts=contracts)
+
+
+@pytest.mark.parametrize("query", ANALYTICAL_QUERIES)
+def test_g16_analytical_requests_never_offer_mutations(query) -> None:
+    decision = _decision(query)
+    assert decision.suppress_mutations is True, sorted(decision.compatible_tools)
+
+
+ALL_SUBJECT_VERB_WRITE_TOOLS = NEW_VERB_WRITE_TOOLS | PHASE_TWO_VERB_WRITE_TOOLS
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize("query", ANALYTICAL_QUERIES)
+def test_analytical_requests_return_read_tools_only(monkeypatch, query, locked) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
+    reload_settings()
+    found = _search(query)
+    assert found, "a read request should still find read tools"
+    assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), found
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "add up audience performance and show the campaign insights",
+        "show the campaign insights and add up audience performance",
+        "remove outliers from audience performance, then compare campaigns",
+        "compare campaigns, then remove outliers from audience performance",
+        "boost in instagram post engagement and list the ads",
+        "list the ads and boost in instagram post engagement",
+    ],
+)
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+def test_analytical_clauses_stay_read_safe_in_either_order(monkeypatch, query, locked) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
+    reload_settings()
+    assert _decision(query).suppress_mutations is True
+    found = _search(query)
+    assert found
+    assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), found
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("add up audience performance and add users to the custom audience", "add_audience_users"),
+        ("add users to the custom audience and add up audience performance", "add_audience_users"),
+        ("remove outliers from audience performance, then remove customers from the audience", "remove_audience_users"),
+        ("remove customers from the audience, then remove outliers from audience performance", "remove_audience_users"),
+        ("boost in instagram post engagement and boost the instagram post", "boost_instagram_post"),
+        ("boost the instagram post and boost in instagram post engagement", "boost_instagram_post"),
+    ],
+)
+def test_a_real_write_clause_is_still_offered_next_to_an_analytical_one(monkeypatch, query, expected) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    assert expected in _search(query)[:2]
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    assert expected not in _search(query)

@@ -721,13 +721,22 @@ class StructuredIntentRouter:
                         if name.startswith(f"{_WRITE_VERB_TOOL_PREFIX.get(direct_verb, direct_verb)}_")
                         and (
                             direct_verb not in _SUBJECT_SCOPED_WRITE_VERBS
-                            or _names_tool_subject(
+                            or _acts_on_tool_subject(
                                 clause,
                                 name,
                                 required=_SUBJECT_WORDS_REQUIRED.get(direct_verb, 1),
                             )
                         )
                     )
+                continue
+            if (
+                negated is None
+                and direct_verb in _SUBJECT_SCOPED_WRITE_VERBS
+                and route in mutation_names
+                and _is_analytical(clause)
+            ):
+                # "boost instagram post engagement totals" starts with a tool's
+                # name but asks for numbers; leave it to the read tools.
                 continue
             if negated is not None:
                 excluded.add(route)
@@ -795,9 +804,75 @@ def _names_tool_subject(clause: str, name: str, *, required: int = 1) -> bool:
     Adjacent words are also tried joined, so "ad set" matches a tool named for "adset".
     """
     tokens = [_singular(word) for word in re.findall(r"[a-z0-9]+", clause)]
+    tokens = [_SUBJECT_SYNONYMS.get(token, token) for token in tokens]
     words = set(tokens) | {f"{first}{second}" for first, second in zip(tokens, tokens[1:])}
     subjects = {_singular(part) for part in name.split("_")[1:]}
     return len(subjects & words) >= required
+
+
+# Words a request uses for what a subject-scoped write tool acts on, mapped to
+# the word in the tool's name ("add customers" adds audience users).
+_SUBJECT_SYNONYMS = {
+    "contact": "user",
+    "customer": "user",
+    "member": "user",
+    "people": "user",
+    "person": "user",
+    "dataset": "source",
+    "pixel": "source",
+}
+# Words that end the thing a verb acts on. When one follows the verb directly
+# ("add up", "boost in", "copy of", "cancel out"), the verb is not a command
+# acting on anything.
+_OBJECT_PHRASE_ENDINGS = frozenset(
+    {
+        "about", "across", "against", "and", "as", "at", "between", "by", "for",
+        "from", "in", "into", "of", "off", "on", "onto", "or", "out", "over", "per",
+        "then", "to", "together", "under", "up", "versus", "vs", "with", "within",
+        "without",
+    }
+)
+# Reporting and arithmetic words. A clause that contains one is asking about
+# numbers ("add audience performance to the report"), not changing an object.
+_ANALYTICAL_WORDS = frozenset(
+    {
+        "analysis", "average", "breakdown", "chart", "cpa", "cpc", "cpm", "ctr",
+        "engagement", "export", "insight", "metric", "noise", "outlier", "overlap",
+        "performance", "reach", "report", "reporting", "result", "roas", "spend",
+        "stat", "statistic", "sum", "summary", "table", "total", "trend",
+    }
+)
+
+
+def _is_analytical(clause: str) -> bool:
+    """Return whether a clause talks about reporting numbers."""
+    return any(
+        word in _ANALYTICAL_WORDS or _singular(word) in _ANALYTICAL_WORDS
+        for word in re.findall(r"[a-z0-9]+", clause)
+    )
+
+
+def _acts_on_tool_subject(clause: str, name: str, *, required: int = 1) -> bool:
+    """Return whether a clause starting with a subject-scoped verb is a command for this tool.
+
+    The words right after the verb, up to the first preposition or conjunction,
+    must name what the tool acts on: "add customers to the audience" adds
+    audience users, while in "remove outliers from audience performance" the
+    thing removed is outliers. A clause that uses the verb with a particle
+    ("add up", "boost in") or talks about reporting numbers is never a command.
+    The required count still applies to the whole clause.
+    """
+    if _is_analytical(clause):
+        return False
+    words = re.findall(r"[a-z0-9]+", clause)
+    object_words: list[str] = []
+    for word in words[1:]:
+        if word in _OBJECT_PHRASE_ENDINGS:
+            break
+        object_words.append(word)
+    if not object_words or not _names_tool_subject(" ".join(object_words), name):
+        return False
+    return _names_tool_subject(clause, name, required=required)
 
 
 def is_compatible_name(name: str, decision: RouteDecision) -> bool:
