@@ -14,11 +14,12 @@ from copy import deepcopy
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 # AdCreativeLinkDataCallToAction.type values from Meta's reference page, plus
 # INSTAGRAM_MESSAGE, which Meta's click-to-Instagram examples use.
@@ -81,7 +82,20 @@ def _text(value: Any) -> str | None:
     return blank_to_none(value) if isinstance(value, str) else None
 
 
+def _refuse_logins(value: Any, name: str) -> None:
+    """Refuse a URL with an embedded login anywhere in an input, before any request is built."""
+    if isinstance(value, str):
+        refuse_url_credentials(value, name)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_logins(item, f"{name}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value, start=1):
+            _refuse_logins(item, f"{name}[{index}]")
+
+
 def _require_url(value: str, name: str) -> str:
+    refuse_url_credentials(value, name)
     if not re.match(r"^https?://\S+$", value):
         raise ValidationError(f"{name} must be a full http:// or https:// URL.")
     return value
@@ -673,6 +687,11 @@ async def create_ad_creative_from_inputs(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image_hash or video_id; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash or video_id with publisher_platforms and positions; at most one entry without platforms), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE), instant form (lead_gen_form_id) and Partnership Ads (sponsor ids on an Instagram post, or partnership_ad_code). dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
+    for label, value in (
+        ("link_url", link_url), ("image_url", image_url), ("cards", cards),
+        ("placement_customizations", placement_customizations),
+    ):
+        _refuse_logins(value, label)
     account = blank_to_none(account_id)
     creative_name = blank_to_none(name)
     if account is None:
@@ -773,6 +792,38 @@ COPYABLE_CREATIVE_FIELDS = [
     "product_set_id",
 ]
 ENHANCEMENT_READ_FIELDS = ["id", "name", "account_id", *COPYABLE_CREATIVE_FIELDS, "degrees_of_freedom_spec"]
+
+
+def _raise_step_failure(exc: Exception, *, definite: str, unknown: str) -> None:
+    """Raise the error for a failed write step, stating what is known about its outcome.
+
+    Must be called inside the ``except`` block that caught ``exc``.
+    """
+    error = _step_failure(exc, definite=definite, unknown=unknown)
+    if error is exc:
+        raise exc
+    raise error from exc
+
+
+def _step_failure(exc: Exception, *, definite: str, unknown: str) -> Exception:
+    """Return the error to raise when a write step fails, stating what is known about its outcome.
+
+    A Meta error response or a rate limit means the request was refused. A lost
+    response (mutation_outcome_unknown) or any error that is not one of this
+    server's own errors (a transport failure, for example) leaves the outcome
+    unknown. Meta error types keep their type; anything else becomes a
+    MetaApiError so the message reaches the caller.
+    """
+    outcome_unknown = bool(getattr(exc, "mutation_outcome_unknown", False)) or not isinstance(exc, MetaAdsError)
+    reason = getattr(exc, "message", None) if isinstance(exc, (MetaApiError, RateLimitError)) else None
+    reason = reason or str(exc) or type(exc).__name__
+    message = f"{unknown if outcome_unknown else definite}. Error: {reason}"
+    if isinstance(exc, (MetaApiError, RateLimitError)):
+        exc.message = message
+        if isinstance(exc, MetaApiError) and outcome_unknown:
+            exc.mutation_outcome_unknown = True
+        return exc
+    return MetaApiError(message=message, mutation_outcome_unknown=outcome_unknown)
 
 
 def _features_of(spec: Any) -> dict[str, str]:
@@ -876,18 +927,40 @@ async def update_ad_creative_enhancements(
             "fields_not_copied": not_copied,
             "notes": [copy_note, review_note],
         }
-    created = await client.create_edge_object(resolved_account, "adcreatives", data=payload)
+    try:
+        created = await client.create_edge_object(resolved_account, "adcreatives", data=payload)
+    except Exception as exc:
+        _raise_step_failure(
+            exc,
+            definite=(
+                f"No replacement creative was created and ad {ad_id} still uses creative {old_creative_id}"
+            ),
+            unknown=(
+                f"Meta may have created a replacement creative named {payload['name']!r} before the connection "
+                f"failed. Nothing was attached, so ad {ad_id} still uses creative {old_creative_id}. Look for that "
+                "creative in the account before retrying, so a second copy is not made"
+            ),
+        )
     new_creative_id = str(created.get("id") or "")
     if not new_creative_id:
         raise ValidationError("Meta did not return a creative id, so the ad was not changed.")
     try:
         await client.update_object(ad_id, data={"creative": {"creative_id": new_creative_id}})
-    except MetaApiError as exc:
-        exc.message = (
-            f"Creative {new_creative_id} was created but ad {ad_id} still uses creative {old_creative_id}: {exc.message} "
-            "Delete the new creative with delete_creative or attach it with update_ad_creative."
+    except Exception as exc:
+        _raise_step_failure(
+            exc,
+            definite=(
+                f"Creative {new_creative_id} was created but ad {ad_id} still uses creative {old_creative_id}, "
+                "because Meta refused the attach. Delete the new creative with delete_creative or attach it with "
+                "update_ad_creative"
+            ),
+            unknown=(
+                f"Creative {new_creative_id} was created, but whether ad {ad_id} now uses it is unknown: the attach "
+                f"request got no clear answer. The ad's current creative is unknown (it was {old_creative_id}). Read "
+                "the ad with get_ad before retrying, and before deleting either creative, since the ad may be "
+                "using either one"
+            ),
         )
-        raise
     response = mutation_response(
         action="update_ad_creative_enhancements",
         target=target,

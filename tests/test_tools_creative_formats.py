@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import json
+
+import httpx
 import pytest
 
-from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, ValidationError
 from meta_ads_mcp.tools import creative_formats as cf
 
 
@@ -383,6 +386,31 @@ def test_invalid_combinations_raise_before_any_call(monkeypatch, arguments, mess
         asyncio.run(cf.create_ad_creative_from_inputs(account_id="123", name="Creative", **arguments))
 
 
+SECRET = "synthetic-media-password"
+LOGIN_URL = f"https://user:{SECRET}@example.invalid/asset.png"
+LOGIN_URL_CASES = [
+    {"page_id": "20", "image_url": LOGIN_URL, "link_url": "https://example.invalid/product"},
+    {"page_id": "20", "image_hash": "h", "link_url": LOGIN_URL},
+    {"page_id": "20", "image_hash": "h", "link_url": f"https://{SECRET}@example.invalid/"},
+    {"page_id": "20", "video_id": "5", "image_url": LOGIN_URL, "link_url": "https://example.invalid", "primary_texts": ["a"]},
+    {"page_id": "20", "link_url": "https://example.invalid", "cards": [{"image_hash": "a"}, {"image_url": LOGIN_URL}]},
+    {"page_id": "20", "link_url": "https://example.invalid", "cards": [{"image_hash": "a"}, {"image_hash": "b", "link": LOGIN_URL}]},
+    {"page_id": "20", "link_url": "https://example.invalid", "placement_customizations": [
+        {"image_url": LOGIN_URL, "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}, {"image_hash": "b"},
+    ]},
+    {"source_instagram_media_id": "4", "page_id": "20", "instagram_account_id": "3", "link_url": LOGIN_URL},
+]
+
+
+@pytest.mark.parametrize("arguments", LOGIN_URL_CASES)
+def test_g20_dry_run_request_never_exposes_url_password_creative(monkeypatch, arguments) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError) as info:
+        asyncio.run(cf.create_ad_creative_from_inputs(account_id="10", name="Creative", dry_run=True, **arguments))
+    assert SECRET not in str(info.value)
+    assert "username or password" in str(info.value)
+
+
 def test_name_is_required_and_bounded(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="name is required"):
@@ -465,6 +493,73 @@ def test_enhancements_attach_failure_names_the_new_creative(monkeypatch) -> None
     _patch(monkeypatch, client)
     with pytest.raises(MetaApiError, match="Creative 999 was created but ad 10 still uses creative 20"):
         asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+
+
+def test_g10_later_rate_limit_preserves_created_object_id_enhancements(monkeypatch) -> None:
+    client = FakeClient(objects={"10": AD, "20": CREATIVE}, fail_update=RateLimitError("Synthetic limit", code=4))
+    _patch(monkeypatch, client)
+    with pytest.raises(RateLimitError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    message = str(info.value)
+    assert "999" in message
+    assert "still uses creative 20" in message
+    assert "Synthetic limit" in message
+
+
+def test_g10_uncertain_enhancement_attach_does_not_claim_old_creative(monkeypatch) -> None:
+    client = FakeClient(
+        objects={"10": AD, "20": {"id": "20", "object_story_id": "30_40"}},
+        fail_update=MetaApiError("Synthetic lost response", mutation_outcome_unknown=True),
+    )
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    message = str(info.value)
+    assert "999" in message
+    assert "still uses creative 20" not in message
+    assert "delete_creative" not in message.split("before")[0]
+    assert "unknown" in message
+    assert "get_ad" in message
+    assert info.value.mutation_outcome_unknown is True
+
+
+@pytest.mark.parametrize("failure", [httpx.ReadTimeout("synthetic"), RuntimeError("synthetic transport")])
+def test_g10_unexpected_attach_failure_names_new_creative_and_unknown_state(monkeypatch, failure) -> None:
+    client = FakeClient(objects={"10": AD, "20": CREATIVE}, fail_update=failure)
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    message = str(info.value)
+    assert "999" in message
+    assert "still uses creative 20" not in message
+    assert "unknown" in message
+    assert info.value.mutation_outcome_unknown is True
+
+
+def test_g10_attach_not_found_names_new_creative(monkeypatch) -> None:
+    client = FakeClient(objects={"10": AD, "20": CREATIVE}, fail_update=NotFoundError("Meta object or edge not found: 10"))
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    assert "999" in str(info.value)
+    assert info.value.mutation_outcome_unknown is False
+
+
+def test_g10_uncertain_creative_create_says_a_copy_may_exist_and_ad_is_unchanged(monkeypatch) -> None:
+    class LostCreate(FakeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            self.calls.append(("create", parent_id, edge, data))
+            raise MetaApiError("Meta API request failed before a response was received.", mutation_outcome_unknown=True)
+
+    client = LostCreate(objects={"10": AD, "20": CREATIVE})
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    message = str(info.value)
+    assert "Spring (enhancements updated)" in message
+    assert "may" in message
+    assert "still uses creative 20" in message
+    assert [call[0] for call in client.calls] == ["get", "get", "create"]
 
 
 def test_enhancements_refuse_a_creative_that_cannot_be_copied(monkeypatch) -> None:
