@@ -1046,9 +1046,24 @@ def test_recommendations_rank_unconnected_pixels_with_evidence(monkeypatch) -> N
 
 
 def _endless(rows):
-    """An edge that always reports another page, so a capped scan cannot finish."""
+    """An edge that always reports another page, so a capped scan cannot finish.
+
+    Each page has a new cursor and its own copy of the rows (marked with the page
+    number), so the read stops at the page cap rather than at a repeated page.
+    """
     def page(params):
-        return {"data": rows, "paging": {"next": "https://next", "cursors": {"after": "again"}}}
+        number = int(params.get("after") or 0)
+        return {
+            "data": [{**row, "page": number} for row in rows],
+            "paging": {"next": "https://next", "cursors": {"after": str(number + 1)}},
+        }
+    return page
+
+
+def _stalled(rows, cursor: str = "repeat"):
+    """An edge that returns the same page and the same cursor on every read."""
+    def page(params):
+        return {"data": [dict(row) for row in rows], "paging": {"next": "https://next", "cursors": {"after": cursor}}}
     return page
 
 
@@ -2102,3 +2117,153 @@ def test_g6_chained_error_password_reaches_no_mcp_error_or_log(monkeypatch, capl
     for record in caplog.records:
         if record.exc_info:
             _assert_chain_clean(record.exc_info[1], G6_SECRET)
+
+
+# round three: G15, a page Meta keeps returning is read once and the read says it stalled -----------
+
+
+def _stats_reads(client: FakeCatalogFeedClient) -> list[dict[str, Any]]:
+    return [call for call in client.calls if call["method"] == "list_objects" and call["edge"] == "event_stats"]
+
+
+def test_g15_feed_stats_repeated_page_is_not_counted_twice(monkeypatch) -> None:
+    row = {
+        "event_source": "20", "date_start": "2026-11-01",
+        "total_matched_content_ids": 7, "total_unmatched_content_ids": 3,
+    }
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"id": "20", "source_type": "PIXEL"}]},
+        ("10", "event_stats"): _stalled([row]),
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health("10"))
+    source = result["sources"][0]
+    assert source["matched_content_ids"] == 7, source
+    assert source["unmatched_content_ids"] == 3, source
+    assert len(_stats_reads(client)) <= 2
+    # The counts come from a stalled read: they are flagged, and no rate or finding rests on them.
+    assert result["metrics"]["stats_complete"] is False
+    assert result["metrics"]["event_stat_rows"] == 1
+    assert source["counts_complete"] is False
+    assert source["window_match_rate"] is None
+    assert "low_match_rate" not in [finding["type"] for finding in result["findings"]]
+    assert any("same page" in signal for signal in result["missing_signals"]), result["missing_signals"]
+
+
+def test_g15_repeated_cursor_stops_the_read_after_counting_each_new_page_once(monkeypatch) -> None:
+    def pages(params):
+        after = params.get("after")
+        day = {None: "2026-11-01", "a": "2026-11-02"}.get(after, "2026-11-09")
+        # The second page hands back the cursor that led to it.
+        return {
+            "data": [_stat(day, "px_1", "ViewContent", 4, 1)],
+            "paging": {"next": "https://next", "cursors": {"after": "a"}},
+        }
+
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "OFFLINE"}]},
+        ("cat_1", "event_stats"): pages,
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert len(_stats_reads(client)) == 2
+    source = result["sources"][0]
+    assert source["matched_content_ids"] == 8
+    assert [day["date"] for day in source["match_rate_history"]] == ["2026-11-01", "2026-11-02"]
+    assert source["counts_complete"] is False
+    assert any("cursor" in signal and "already" in signal for signal in result["missing_signals"])
+
+
+def test_g15_complete_stats_read_is_marked_complete(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "OFFLINE"}]},
+        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 9, 1)]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    source = result["sources"][0]
+    assert source["counts_complete"] is True
+    assert source["window_match_rate"] == 0.9
+
+
+def test_g15_recommendations_never_total_a_stalled_stats_read(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): _stalled([_stat("2026-11-01", "px_1", "ViewContent", 7, 3)]),
+        ("biz_1", "adspixels"): {"data": []},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    metrics = result["metrics"]
+    assert len(_stats_reads(client)) <= 2
+    assert metrics["matched_content_ids_28d"] is None
+    assert metrics["match_rate_28d"] is None
+    assert metrics["partial_counts_from_pages_read"] == {
+        "event_stat_rows": 1, "matched_content_ids": 7, "unmatched_content_ids": 3,
+    }
+    assert result["findings"] == []
+
+
+def test_g15_match_rate_per_catalog_from_a_stalled_read_is_partial(monkeypatch) -> None:
+    edges = _scan_edges() | {("cat_1", "event_stats"): _stalled([_stat("2026-11-01", "px_1", "ViewContent", 7, 3)])}
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    first = result["items"][0]["match_rate"]
+    assert first["status"] == "partial_read"
+    assert first["partial_counts_from_pages_read"] == {"matched_content_ids": 7, "unmatched_content_ids": 3}
+    assert "same page" in first["note"]
+    assert len([call for call in _stats_reads(client) if call["parent_id"] == "cat_1"]) <= 2
+
+
+def test_g15_repeated_catalog_page_is_scanned_once(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("biz_1", "owned_product_catalogs"): _stalled([{"id": "cat_1", "name": "A"}]),
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}]},
+    }))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    assert result["summary"]["catalogs_scanned"] == 1
+    assert result["summary"]["count"] == 1
+    assert [item["id"] for item in result["items"]] == ["cat_1"]
+    assert result["summary"]["complete"] is False
+    assert any("same page" in reason for reason in result["summary"]["stop_reasons"])
+    assert len([call for call in client.calls if call.get("edge") == "external_event_sources"]) == 1
+
+
+def test_g15_repeated_source_page_does_not_duplicate_connected_sources(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): _stalled([{"id": "px_1"}]),
+    }))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_2"))
+    assert result["previous"]["connected_event_source_ids"] == ["px_1"]
+    assert result["current"]["connected_event_source_ids"] == ["px_1", "px_2"]
+    assert result["previous_complete"] is False
+    assert any("same page" in gap for gap in result["missing_signals"])
+    assert len([call for call in client.calls if call.get("edge") == "external_event_sources" and call["method"] == "list_objects"]) <= 2
+
+
+def test_g15_repeated_empty_pages_stop_on_the_repeated_cursor(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): _stalled([]),
+        ("cat_1", "event_stats"): {"data": []},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert result["metrics"]["sources_complete"] is False
+    assert result["findings"] == []
+    assert len([call for call in client.calls if call.get("edge") == "external_event_sources"]) == 2
+    assert any("already" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize(("tool", "arguments", "parent", "edge"), [
+    ("list_product_feeds", {"catalog_id": "cat_1"}, "cat_1", "product_feeds"),
+    ("list_product_feed_uploads", {"feed_id": "feed_1"}, "feed_1", "uploads"),
+    ("list_feed_rules", {"feed_id": "feed_1"}, "feed_1", "rules"),
+    ("list_catalog_event_sources", {"catalog_id": "cat_1"}, "cat_1", "external_event_sources"),
+])
+def test_g15_list_page_that_hands_back_its_own_cursor_offers_no_next_cursor(monkeypatch, tool, arguments, parent, edge) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={(parent, edge): _stalled([{"id": "1"}], cursor="c1")}))
+    result = run(getattr(catalog_feeds, tool)(**arguments, after="c1"))
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["next_after"] is None
+    assert "repeat this page" in result["summary"]["stop_reason"]
+    # A page with a new cursor still offers it.
+    fresh = run(getattr(catalog_feeds, tool)(**arguments, after="c0"))
+    assert fresh["summary"]["next_after"] == "c1"
+    assert "stop_reason" not in fresh["summary"]

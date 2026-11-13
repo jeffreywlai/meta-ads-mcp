@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -218,15 +219,27 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
     return params
 
 
-def _paged_collection(payload: dict[str, Any]) -> dict[str, Any]:
-    """Shape one Graph page the way list_audiences does."""
+def _paged_collection(payload: dict[str, Any], after: str | None = None) -> dict[str, Any]:
+    """Shape one Graph page the way list_audiences does.
+
+    When Meta hands back the cursor that was just read, following it would return this
+    page again, so no next cursor is offered and the stop reason says why.
+    """
     normalized = normalize_collection(payload)
     has_more = bool(normalized["paging"].get("next"))
+    next_after = normalized["paging"].get("after") if has_more else None
+    requested = blank_to_none(after)
+    repeated = has_more and next_after is not None and next_after == requested
     normalized["summary"].update({
         "complete": not has_more,
         "truncated": has_more,
-        "next_after": normalized["paging"].get("after") if has_more else None,
+        "next_after": None if repeated else next_after,
     })
+    if repeated:
+        normalized["summary"]["stop_reason"] = (
+            "Meta returned the cursor that was just read, so following it would repeat this page; "
+            "the rest of the list cannot be read with this cursor."
+        )
     return normalized
 
 
@@ -246,9 +259,14 @@ async def _collect_edge(
 
     The end is reached only when Meta's page has no next link. When the read stops
     early, a plain-language reason is appended to stop_reasons if a list is given.
+    A page identical to one already read is not added again, and a cursor already
+    read is not followed: either stops the read as incomplete, so a page Meta keeps
+    returning is never counted twice.
     """
     items: list[dict[str, Any]] = []
     after: str | None = None
+    cursors_read: set[str | None] = {None}
+    pages_read: set[str] = set()
 
     def stopped(reason: str) -> None:
         if stop_reasons is not None:
@@ -260,6 +278,15 @@ async def _collect_edge(
             params["after"] = after
         payload = await client.list_objects(parent_id, edge, fields=fields, params=params)
         page = normalize_collection(payload)
+        if page["items"]:
+            fingerprint = json.dumps(page["items"], sort_keys=True, default=str)
+            if fingerprint in pages_read:
+                stopped(
+                    "Meta returned the same page again; its rows were not counted a second time "
+                    "and the read stopped, so later pages were not read."
+                )
+                return items, False
+            pages_read.add(fingerprint)
         items.extend(page["items"])
         has_next = bool(page["paging"].get("next"))
         if max_items is not None and len(items) >= max_items:
@@ -273,6 +300,13 @@ async def _collect_edge(
         if not after:
             stopped("Meta reported another page but gave no cursor to read it.")
             return items, False
+        if after in cursors_read:
+            stopped(
+                "Meta returned a cursor that was already read; the read stopped so no page is "
+                "counted twice, and later pages were not read."
+            )
+            return items, False
+        cursors_read.add(after)
     stopped(f"stopped after {max_pages} pages; more pages exist.")
     return items, False
 
@@ -770,7 +804,7 @@ async def list_product_feeds(
     payload = await client.list_objects(
         catalog_id, "product_feeds", fields=FEED_LIST_FIELDS, params=_page_params(limit, after),
     )
-    return _paged_collection(payload)
+    return _paged_collection(payload, after)
 
 
 @mcp_server.tool()
@@ -998,7 +1032,7 @@ async def list_product_feed_uploads(
     payload = await client.list_objects(
         feed_id, "uploads", fields=UPLOAD_FIELDS, params=_page_params(limit, after),
     )
-    collection = _paged_collection(payload)
+    collection = _paged_collection(payload, after)
     collection["items"] = [
         await _upload_with_errors(client, upload) for upload in collection["items"]
     ]
@@ -1019,7 +1053,7 @@ async def list_feed_rules(
     payload = await client.list_objects(
         feed_id, "rules", fields=RULE_FIELDS, params=_page_params(limit, after),
     )
-    return _paged_collection(payload)
+    return _paged_collection(payload, after)
 
 
 @mcp_server.tool()
@@ -1131,7 +1165,7 @@ async def list_catalog_event_sources(
         catalog_id, "external_event_sources",
         fields=EVENT_SOURCE_FIELDS, params=_page_params(limit, after),
     )
-    return _paged_collection(payload)
+    return _paged_collection(payload, after)
 
 
 def _canonical_event_name(event_name: str | None, include_match_rates: bool) -> str | None:
@@ -1333,8 +1367,11 @@ async def get_catalog_event_source_health(
             "name": source.get("name"),
             "source_type": source.get("source_type"),
             "history_available": stats is not None,
+            # False when event_stats stopped early: the counts below then cover only the
+            # pages read, are not 28-day totals, and no window rate is given from them.
+            "counts_complete": inputs["stats_complete"],
             "match_rate_history": stats["match_rate_history"] if stats else [],
-            "window_match_rate": stats["window_match_rate"] if stats else None,
+            "window_match_rate": stats["window_match_rate"] if stats and inputs["stats_complete"] else None,
             "matched_content_ids": stats["matched_content_ids"] if stats else None,
             "unmatched_content_ids": stats["unmatched_content_ids"] if stats else None,
             "by_event": stats["by_event"] if stats else {},
