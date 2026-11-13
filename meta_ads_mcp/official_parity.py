@@ -160,11 +160,11 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_boost_ig_post": _partial(
         "boost_instagram_post", "create_ad_creative_from_inputs",
-        note="Meta's tool can also: One-step boosts for Traffic (profile visits, Meta's default), Leads, Sales and App Promotion, and to messaging destinations. Takes a creator-issued ad_code. Defaults budget, targeting and Page. Ours one-step mode takes OUTCOME_ENGAGEMENT or OUTCOME_AWARENESS and requires daily_budget, targeting and page_id. Why this is open: Built differently: two objectives, no default budget or targeting.",
+        note="Meta's tool can also: In one step: App Promotion; messaging destinations (Instagram Direct, Messenger, WhatsApp) with their message buttons; instant forms (ON_AD) and calls (PHONE_CALL); a choice of optimization goal, billing event, bid strategy and bid cap; lifetime or campaign-level budget; start time; special ad categories; buying type; the Page found from the Instagram account. Ours in one step covers Engagement, Awareness, Traffic (profile or website), and Sales and Leads (website with a pixel). It fixes billing, bidding and empty special ad categories (creatives.py:954-978, :1135-1152) and requires page_id (:1129). All of these are reachable in several calls: create_campaign, then create_ad_set, then boost_instagram_post with adset_id. On purpose, ours sets no default budget or targeting (:1120-1124). Now built: partnership_ad_code, destination_type, promoted_object and three more objectives (:1265-1267, :954-972). Why this is open: Not built.",
     ),
-    "ads_catalog_create": _covered(
+    "ads_catalog_create": _partial(
         "create_catalog", "create_product_feed", "create_product_feed_upload", "batch_update_catalog_products",
-        note="Same capability.",
+        note="Meta's tool can also: An SFTP feed URL. Ours accepts http, https and ftp for schedules (SCHEDULE_URL_SCHEMES, catalog_feeds.py:131) and http or https for one-off uploads (:1099). Convenience: one call instead of several. Built differently: the feed file inline as base64; ours reads it from the upload folder so its rows do not pass through the conversation (catalog_feeds.py:1068-1077). Why this is open: Not built.",
     ),
     "ads_catalog_create_feed_rule": _covered(
         "create_feed_rule",
@@ -172,15 +172,15 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_catalog_create_product_feed": _partial(
         "create_product_feed",
-        note="Meta's tool can also: Named feed_type for hotel, flight, vehicle and other non-product feeds; ours via params. Reclassified under the strict rule; code unchanged. Why this is open: Not built.",
+        note="Meta's tool can also: An SFTP schedule URL (catalog_feeds.py:131). feed_type and the parsing options are now named (catalog_feeds.py:918-937). Why this is open: Not built.",
     ),
     "ads_catalog_create_product_feed_upload_session": _covered(
         "create_product_feed_upload",
         note="Covers Meta's tool. Ours also offers: Uploads from any URL, with add-or-update-only mode (update_only); Meta's only re-fetches the configured URL.",
     ),
-    "ads_catalog_create_product_set": _covered(
+    "ads_catalog_create_product_set": _partial(
         "create_product_set",
-        note="Creates a product set from a filter.",
+        note="Meta's tool can also: Named retailer_id on creation; ours reaches it only through params (catalogs.py:2383-2393), although update_product_set names it (:2403). Found in this pass; code unchanged. Why this is open: Not built.",
     ),
     "ads_catalog_delete_product": _covered(
         "batch_update_catalog_products", "delete_catalog_product",
@@ -208,7 +208,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_catalog_event_source_get_recommendations": _partial(
         "get_catalog_event_source_recommendations",
-        note="Meta's tool can also: Meta's computed best source (recommended_pixel_id), considering apps and offline datasets as well as pixels. Why this is open: No public API route known.",
+        note="Meta's tool can also: Meta's computed best source (recommended_pixel_id), which also weighs apps and offline datasets as well as pixels. Why this is open: No public API route known.",
     ),
     "ads_catalog_get_businesses": _covered(
         "list_businesses",
@@ -224,15 +224,15 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_catalog_get_dynamic_ads_health": _partial(
         "get_catalog_dynamic_ads_health",
-        note="Meta's tool can also: Meta's named checks (checks) and format-specific product counts (ad_creation_use_case). Why this is open: No public API route known.",
+        note="Meta's tool can also: Meta's named checks (checks, with_issue_only) and format-specific product counts (ad_creation_use_case). Ours combines diagnostics, product counts and event sources, and states that Meta has no single catalog-ads health endpoint (catalogs.py:1246). Convenience: takes a product set id alone; ours requires catalog_id (:1149). Why this is open: No public API route known.",
     ),
     "ads_catalog_get_feed_rules": _covered(
         "list_feed_rules",
         note="Lists rules on a feed.",
     ),
-    "ads_catalog_get_product_feed_upload_sessions": _covered(
+    "ads_catalog_get_product_feed_upload_sessions": _partial(
         "list_product_feed_uploads",
-        note="Uploads with status, counts and errors ordered by rows affected.",
+        note="Meta's tool can also: One sample invalid value per error (include_samples), and paging through errors (error_limit, error_cursor). Ours reads the first 100 errors of an upload, without samples (UPLOAD_ERROR_FIELDS, catalog_feeds.py:44; :649). The second pass listed both but marked the row equivalent. Why this is open: Not built.",
     ),
     "ads_catalog_get_suggested_filter": _partial(
         "list_catalog_attribute_values", "build_product_set_filter",
@@ -244,7 +244,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_catalog_list_dpa_eligible_catalogs": _partial(
         "list_dpa_eligible_catalogs",
-        note="Meta's tool can also: Meta's own eligibility ranking, and tuning by page_id and ad_format. Why this is open: No public API route known.",
+        note="Meta's tool can also: Meta's own eligible-catalog set and recommendation. Ours ranks from documented catalog data and states that Meta publishes no eligibility endpoint (catalogs.py:1022). page_id and ad_format are now built (catalogs.py:827-828, :839-845). Why this is open: No public API route known.",
     ),
     "ads_catalog_list_partner_integrations": _unavailable(
         note="No public API route is known for partner store integrations (Shopify, WooCommerce and similar) and their sync health.",
@@ -291,7 +291,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_catalog_update_product_feed": _partial(
         "update_product_feed",
-        note="Meta's tool can also: Stops a fetch schedule without deleting the feed (clear_replace_schedule, clear_update_schedule). Named parsing options; ours via params. Why this is open: Not built.",
+        note="Meta's tool can also: An SFTP schedule URL (catalog_feeds.py:131). Stops a fetch schedule without deleting the feed (clear_replace_schedule, clear_update_schedule); our docstring says Meta's public API documents no way to clear a schedule (catalog_feeds.py:987), so that part has no public API route known. Convenience: changes a schedule's timing without restating its URL; ours requires the URL (:509-512). The parsing options are now named (:975-987). Why this is open: Not built.",
     ),
     "ads_catalog_update_product_set": _covered(
         "update_product_set",
@@ -299,23 +299,23 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_create_ad": _partial(
         "create_ad", "duplicate_ad",
-        note="Meta's tool can also: Named ad_schedule_start_time and ad_schedule_end_time (ours via params). Why this is open: Not built.",
+        note="Meta's tool can also: Named display_sequence and engagement_audience; ours reaches them only through params (ads.py:167-183). Convenience: adset_spec creates the ad set in the same call. Drafts (no public API route known). ad_schedule_start_time and ad_schedule_end_time are now named (ads.py:181-182). Why this is open: Not built.",
     ),
     "ads_create_ad_set": _partial(
         "create_ad_set", "duplicate_adset",
-        note="Meta's tool can also: Named destination_type (needed for messaging and profile-visit ad sets), pacing_type, is_dynamic_creative, budget_schedule_specs and optimization_sub_event (ours via params). Auto-fills DSA fields and the messaging Page. Why this is open: Not built.",
+        note="Meta's tool can also: 66 further named fields. source_adset_id is served by duplicate_adset; the other 65 reach Meta only through params (campaigns.py:542-575). Those with a plain advertiser use: existing_customer_budget_percentage, multi_optimization_goal_weight, is_incremental_attribution_enabled, campaign_attribution, tune_for_category, cost_bidding_mode, conversion_locations, value rules (value_rules_spec, value_rule_set_id, conversion_value_expression_spec), placement_soft_opt_out, creative_sequence, time-based ad rotation (time_based_ad_rotation_id_blocks, time_based_ad_rotation_intervals), rf_prediction_id, daily_imps and lifetime_imps, min_budget_spend_percentage and max_budget_spend_percentage, saved_audience_id, brand_safety_config, calling_settings, marketing_goal. The rest look like Meta's internal fields (creative diversity scores, guidance estimates, metrics metadata). Also ABSOLUTE budget schedules (campaigns.py:136). Convenience: fills in the EU DSA beneficiary and payor from the business name, and the messaging Page. Drafts (no public API route known). destination_type, pacing_type, is_dynamic_creative, budget_schedule_specs and optimization_sub_event are now named (:570-574). Why this is open: Not built.",
     ),
     "ads_create_campaign": _partial(
         "create_campaign", "duplicate_campaign",
-        note="Meta's tool can also: Named budget_schedule_specs, is_skadnetwork_attribution and campaign_optimization_type (ours via params). Staging into Ads Manager drafts. Why this is open: Not built.",
+        note="Meta's tool can also: Named is_skadnetwork_attribution, campaign_optimization_type (NONE, ICO_ONLY), is_using_l3_schedule, iterative_split_test_configs and topline_id; ours reaches them only through params (campaigns.py:254-273). Fixed-amount (ABSOLUTE) budget schedules, which ours refuses until Meta's unit is confirmed (campaigns.py:136, :207-214). Staging into Ads Manager drafts (no public API route known). budget_schedule_specs with MULTIPLIER is now named (:272). Why this is open: Not built.",
     ),
     "ads_create_creative": _partial(
         "create_ad_creative_from_inputs", "create_ad_creative", "upload_creative_asset",
-        note="Meta's tool can also: Builds these formats from named inputs, which ours does not: asset pool (multi_media), catalog carousel (product_set_id), Facebook Partnership Ads (facebook_partnership_ad), Instagram Partnership Ads from new media, click-to-message carousels and Instagram posts, mixed image and video placement sets. Also sets AI-content disclosure (self_ai_disclosure) and Advantage+ defaults at creation, and downloads image_url into the account. Why this is open: Not built.",
+        note="Meta's tool can also: Click-to-message static carousels, which ours refuses (creative_formats.py:388, :402). Click-to-message buttons on an existing Instagram post (refused, :619). Instagram Partnership Ads from new media as a carousel; ours builds them from a single image or video only (:857-861). Images and videos mixed in one placement customization (refused, :517-521). display_link, Meta's caption field, which ours lacks (:898-929). Requesting Product Extensions at creation (objective, conversion_location, product_extensions_product_set_id). AI-content disclosure self_ai_disclosure (no public API route known). Conveniences: Advantage+ switches on the builder (ours: raw degrees_of_freedom_spec on create_ad_creative, creatives.py:134, or update_ad_creative_enhancements afterwards); image_url downloaded into the account (ours sends the URL, creative_formats.py:149-153, or uploads it first with upload_creative_asset); default thumbnails for video cards and pool videos. Asset pools, catalog carousels and Facebook Partnership Ads are now built (:926-928, :662-830). Why this is open: Not built.",
     ),
-    "ads_create_custom_audience": _partial(
+    "ads_create_custom_audience": _covered(
         "create_custom_audience", "create_lookalike_audience",
-        note="Meta's tool can also: Named is_value_based (value-based customer lists) and audience_labels; ours via params. Reclassified under the strict rule; code unchanged since the first pass. Why this is open: Not built.",
+        note="Same capability.",
     ),
     "ads_creative_delete": _covered(
         "delete_creative",
@@ -328,9 +328,9 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     "ads_creative_upload_local_image": _app_internal(
         "Part of Meta's own app, with no capability to match. Starts an upload from Meta's in-chat upload app. The capability behind it (upload a local file) is covered for images by upload_creative_asset.",
     ),
-    "ads_creative_upload_media": _partial(
+    "ads_creative_upload_media": _covered(
         "upload_ad_video", "upload_creative_asset",
-        note="Meta's tool can also: Local video files up to 100 MB; ours takes 25 MB from META_UPLOAD_DIR and no chunked upload. AI provenance tag (media_creation_source). Why this is open: Not built.",
+        note="Same capability.",
     ),
     "ads_delete_custom_audience": _covered(
         "delete_audience",
@@ -342,7 +342,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_experiment_abtest_create_test": _partial(
         "create_ab_test", "setup_ab_test",
-        note="Meta's tool can also: Chooses the metric that decides the winner (primary_kpi, secondary_kpis). Our code states Meta's documented API offers no such choice; not independently verified. Why this is open: No public API route known.",
+        note="Meta's tool can also: Chooses the metric that decides the winner (primary_kpi, secondary_kpis). Our code states that Meta's documented API offers no such choice (experiments.py:1482, :1540); this has not been checked independently. Why this is open: No public API route known.",
     ),
     "ads_experiment_abtest_get_test": _covered(
         "get_ad_study",
@@ -354,7 +354,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_experiment_check_eligibility": _partial(
         "check_ab_test_eligibility",
-        note="Meta's tool can also: Meta's own verdict, including Lift study eligibility. Accepts ad ids; ours accepts campaign or ad set only, although create_ab_test now takes ad cells. Why this is open: No public API route known.",
+        note="Meta's tool can also: Meta's own verdict, including Lift study eligibility, and an account-level check with no ids (over the top campaigns by spend). Ours is a local pre-check and states that Meta has no public eligibility endpoint (experiments.py:1307-1315). Ad ids are now accepted (level=ad, :1318). Why this is open: No public API route known.",
     ),
     "ads_experiment_lift_create_test": _covered(
         "create_lift_study",
@@ -385,7 +385,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_get_ad_entities": _partial(
         "get_entity_insights", "compare_performance", "list_campaigns", "list_adsets", "list_ads",
-        note="Meta's tool can also: Reads unpublished Ads Manager drafts (object_state=draft) and adds benchmark and incrementality context (include_additional_context). Also returns settings and metrics in one row, which ours does in two calls. Why this is open: No public API route known.",
+        note="Meta's tool can also: Reads unpublished Ads Manager drafts (object_state=draft). Adds benchmark and incrementality context (include_additional_context). Convenience: settings and metrics in one row; ours uses the list tools for settings and get_entity_insights (insights.py:812) for metrics. Why this is open: No public API route known.",
     ),
     "ads_get_ad_images": _covered(
         "list_ad_images",
@@ -431,7 +431,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_get_dataset_quality": _partial(
         "get_dataset_quality",
-        note="Meta's tool can also: CRM and custom-attribution channels (query_type); ours covers web and offline. Why this is open: No public API route known.",
+        note="Meta's tool can also: CRM and custom-attribution channels (query_type); ours covers web and offline (DATASET_QUALITY_CHANNELS, datasets.py:104). Why this is open: No public API route known.",
     ),
     "ads_get_dataset_stats": _covered(
         "get_dataset_stats",
@@ -447,7 +447,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_get_field_context": _partial(
         "get_field_reference",
-        note="Meta's tool can also: Field descriptions, display names, aliases (spend to amount_spent) and which levels support each metric. Ours (level=metric) gives types, sort syntax and filter operators. Why this is open: Built differently: SDK-derived types, no descriptions or aliases.",
+        note="Meta's tool can also: Field descriptions, display names, aliases (spend to amount_spent), and which levels support each metric. Ours (level=metric, assets.py:1008) gives types, sort syntax and filter operators. Why this is open: Built differently: SDK-derived types, no descriptions or aliases.",
     ),
     "ads_get_help_article": _unavailable(
         note="Meta has no public API for searching the Business Help Center. Search https://www.facebook.com/business/help directly.",
@@ -474,11 +474,11 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_insights_advertiser_context": _partial(
         "get_advertiser_context",
-        note="Meta's tool can also: Takes an explicit date range (date_from/date_to, date_preset) and ad ids. Ours takes campaign or ad set ids and a trailing lookback_days of 7 to 90. The summary itself is Meta's own. Why this is open: Not built.",
+        note="Meta's tool can also: A lifetime window: ours takes lookback_days 7 to 90, or since and until covering at most 366 days (performance_signals.py:3318-3330, :358). Meta's summary is its own; ours is derived from account data, and the two cannot be compared from code. Explicit dates and ad ids are now built (performance_signals.py:3337-3345). Why this is open: Built differently: windows of at most 366 days, summary derived from account data.",
     ),
     "ads_insights_anomaly_signal": _partial(
         "detect_performance_anomalies",
-        note="Meta's tool can also: Meta's own detector, over entity lists of unstated size. Ours applies its stated median rule to at most 10 entities per call (object_ids, child_level). Why this is open: Built differently: stated rule, up to 10 entities per call.",
+        note="Meta's tool can also: Meta's own detector, over entity lists of unstated size. Ours applies its stated median rule to at most 10 entities per call (MAX_ENTITIES, performance_signals.py:955; tool at :1835). Why this is open: Built differently: stated rule, up to 10 entities per call.",
     ),
     "ads_insights_auction_ranking_benchmarks": _covered(
         "get_auction_ranking_report", "detect_auction_overlap",
@@ -490,7 +490,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_insights_performance_trend": _partial(
         "get_performance_trend",
-        note="Meta's tool can also: REACH as a trend metric. Period-by-period series for each of several entities; ours returns per-entity totals and change in multi-entity mode. Why this is open: Not built.",
+        note="Meta's tool can also: Trends over the full available history; ours covers at most 366 days per call (performance_signals.py:42, :358). Convenience: entity lists of unstated size; ours takes up to 10 (:955). Reach as a metric and a period series for each entity are now built (:1401-1403). Why this is open: Built differently: at most 366 days and 10 entities per call.",
     ),
     "ads_insights_performance_vs_peers": _unavailable(
         "get_auction_ranking_report",
@@ -504,24 +504,24 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
         "Part of Meta's own app, with no capability to match. Telemetry from Meta's UI widgets.",
     ),
     "ads_permission_list_assigned_assets": _partial(
-        "list_user_assigned_catalogs",
-        note="Meta's tool can also: Shows the permissions shared with a partner business; ours lists the shared catalogs only. Name search. Why this is open: Built differently: partner rows without permissions.",
+        "list_user_assigned_catalogs", "list_catalog_partners",
+        note="Meta's tool can also: In the partner view, catalogs shared with the partner through a Business Asset Group. Ours checks each owned catalog's direct partner list (business_access.py:505-530). Conveniences: each catalog's permissions in the same call (ours: list_catalog_partners for each catalog, business_access.py:946); name search. Why this is open: Built differently: direct partner shares, read catalog by catalog.",
     ),
     "ads_permission_list_assigned_users": _partial(
-        "list_catalog_assigned_users",
-        note="Meta's tool can also: Explains why a person lacks access (not on business, no permissions, two-factor required) and counts access through Business Asset Groups and business roles. Name search. Why this is open: Built differently: direct assignments only.",
+        "list_catalog_assigned_users", "list_catalog_partners",
+        note="Meta's tool can also: Explains why a person lacks access: not on the business, the business lacks the asset, no permissions, or two-factor required. Counts access through Business Asset Groups and business roles. Partner checks report pending requests. Ours lists direct assignments only (business_access.py:404). Convenience: name search. Partner rows with their tasks are now built (business_access.py:946-953). Why this is open: Built differently: direct assignments only.",
     ),
     "ads_permission_list_business_users": _covered(
         "list_business_users",
         note="Same capability.",
     ),
-    "ads_permission_preview_set_asset_permissions": _partial(
+    "ads_permission_preview_set_asset_permissions": _covered(
         "preview_catalog_access_change",
-        note="Meta's tool can also: Previews sharing a catalog with, or removing it from, a partner business. Why this is open: Not built.",
+        note="Same capability.",
     ),
-    "ads_permission_set_asset_permissions": _partial(
+    "ads_permission_set_asset_permissions": _covered(
         "set_catalog_access",
-        note="Meta's tool can also: Shares a catalog with, or removes it from, a partner business (/{catalog_id}/agencies in Meta's SDK). Why this is open: Not built.",
+        note="Same capability.",
     ),
     "ads_pixel_event_create": _unavailable(
         note="Meta's own server limits pixel event rules and parameter extractors to first-party clients. The public reference marks changes as unsupported, and the live API rejected the documented reads on 2026-11-12. Use Events Manager.",
@@ -547,13 +547,13 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     "ads_pixel_parameter_update": _unavailable(
         note="Meta's own server limits pixel event rules and parameter extractors to first-party clients. The public reference marks changes as unsupported, and the live API rejected the documented reads on 2026-11-12. Use Events Manager.",
     ),
-    "ads_update_custom_audience": _covered(
+    "ads_update_custom_audience": _partial(
         "update_custom_audience",
-        note="Same capability.",
+        note="Meta's tool can also: Named audience_labels on update; ours reaches it only through params (audiences.py:290-298). Found in this pass; the code is unchanged since the second pass. Why this is open: Not built.",
     ),
     "ads_update_entity": _partial(
-        "update_campaign", "update_adset", "update_ad", "update_ad_creative_enhancements", "set_campaign_status", "set_adset_status", "set_ad_status", "update_campaign_budget", "update_adset_budget", "update_adset_bid_amount", "update_campaign_bid_strategy", "update_adset_bid_strategy",
-        note="Meta's tool can also: Campaign spend_cap, start_time and stop_time as named update fields (ours via params on update_campaign). One switch for all default Advantage+ enhancements (advantage_plus_creative_defaults). Discarding Ads Manager drafts. Why this is open: Not built.",
+        "update_campaign", "update_adset", "update_ad", "update_ad_creative_enhancements", "set_campaign_status", "set_adset_status", "set_ad_status", "update_campaign_budget", "update_adset_budget", "update_adset_bid_amount", "update_campaign_bid_strategy", "update_adset_bid_strategy", "delete_campaign", "delete_adset", "delete_ad",
+        note="Meta's tool can also: Discards Ads Manager draft changes. Convenience: one switch (advantage_plus_creative_defaults=OFF) turns off whichever default Advantage+ enhancements apply to the ad; ours names features one by one (creative_formats.py:1094-1114). Now named on ours: campaign spend_cap, start_time and stop_time, and labels on campaign, ad set and ad updates (campaigns.py:380-383, :795, ads.py:420). Why this is open: No public API route known.",
     ),
     "offer_report": _app_internal(
         "Part of Meta's own app, with no capability to match. Offers a scheduled-report button in Meta's app.",
