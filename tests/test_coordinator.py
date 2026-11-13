@@ -457,8 +457,9 @@ def test_historical_f10_argument_sets_are_supported_or_list_accepted_keywords(
 def test_compact_search_serializer_surfaces_required_archive_params() -> None:
     components = mcp_server.local_provider.__dict__["_components"]
     result = serialize_search_results_compact([components["tool:search_ads_archive@"]])
-    assert "`search_ads_archive` | req: search_terms (string), ad_reached_countries (string or list[string])" in result
-    assert "opt: ad_type (string), limit (integer), fields (string or list[string] or null)" in result
+    # search_terms became optional in phase two (search_page_ids is the other route); countries stay required.
+    assert "`search_ads_archive` | req: ad_reached_countries (string or list[string])" in result
+    assert "opt: search_terms (string or null), ad_type (string), limit (integer), fields (string or list[string] or null)" in result
 
 
 def test_compact_search_serializer_surfaces_required_targeting_category_params() -> None:

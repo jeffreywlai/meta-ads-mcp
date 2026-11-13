@@ -222,6 +222,8 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "detect_performance_anomalies": {"object_id": "cmp_123"},
     "get_auction_ranking_report": {"object_id": "cmp_123"},
 }
+# search_terms became optional (search_page_ids is the other route), so the smoke run names it.
+TOOL_OVERRIDES["search_ads_archive"] = {**TOOL_OVERRIDES["search_ads_archive"], "search_terms": "shirts"}
 
 
 class UniversalFakeClient:
