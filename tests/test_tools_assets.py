@@ -912,3 +912,130 @@ def test_audience_adsets_targeting_failure_keeps_the_ads_scan(monkeypatch) -> No
     assert summary["targeting_scan"]["error"] == "Synthetic limit"
     with pytest.raises(RateLimitError):
         asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting"))
+
+
+# R13: a page or row that cannot be read is never a complete read that found nothing ------------
+
+UNREADABLE_PAGES = [
+    pytest.param({}, id="no-data"),
+    pytest.param({"data": None}, id="null-data"),
+    pytest.param({"data": "x"}, id="data-not-a-list"),
+    pytest.param({"data": {"id": "a1"}}, id="data-an-object"),
+]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_plain_listings_do_not_call_an_unreadable_page_complete(monkeypatch, payload) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={
+        ("me", "accounts"): [payload], ("act_1", "adimages"): [payload], ("act_1", "advideos"): [payload],
+        ("ig_1", "media"): [payload],
+    }))
+    results = [
+        asyncio.run(assets.list_pages(source="user")),
+        asyncio.run(assets.list_ad_images(account_id="1")),
+        asyncio.run(assets.list_ad_videos(account_id="1")),
+        asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1")),
+        asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", boost_eligible_only=False)),
+    ]
+    for result in results:
+        assert result["items"] == []
+        assert result["summary"]["complete"] is False and result["summary"]["next_after"] is None
+        assert "readable data list" in result["summary"]["incomplete_reason"]
+
+
+def test_instagram_media_rows_that_are_not_objects_are_counted_not_fatal(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("ig_1", "media"): [_paged([_media("m1", True), None, "x"])]}))
+    for eligible_only in (True, False):
+        result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", boost_eligible_only=eligible_only))
+        assert [item["id"] for item in result["items"]] == ["m1"]
+        assert result["summary"]["unreadable_rows"] == 2 and result["summary"]["complete"] is False
+        assert "not objects" in result["summary"]["incomplete_reason"]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_creative_ad_scan_with_an_unreadable_page_is_incomplete_and_resumable(monkeypatch, payload) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("act_123", "ads"): [_paged([_ad("a1", "crt_1")], after="c1"), payload]}))
+    result = asyncio.run(assets.list_creative_ads(creative_id="crt_1", account_id="123"))
+    assert [item["id"] for item in result["items"]] == ["a1"]
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["next_after"] == "c1"
+    assert "without a readable data list" in summary["scan_note"]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_creative_ad_scan_with_an_unreadable_first_page_finds_nothing_but_says_so(monkeypatch, payload) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("act_123", "ads"): [payload]}))
+    summary = asyncio.run(assets.list_creative_ads(creative_id="crt_1", account_id="123"))["summary"]
+    assert summary["count"] == 0 and summary["complete"] is False
+    assert "Scan complete" not in summary["scan_note"]
+
+
+@pytest.mark.parametrize("bad_ad", [
+    None, "x", {"id": "a2"}, {"id": "a2", "creative": None}, {"id": "a2", "creative": {"name": "No id"}},
+])
+def test_creative_ad_scan_with_an_unreadable_ad_is_incomplete(monkeypatch, bad_ad) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("act_123", "ads"): [_paged([_ad("a1", "crt_1"), bad_ad])]}))
+    result = asyncio.run(assets.list_creative_ads(creative_id="crt_1", account_id="123"))
+    assert [item["id"] for item in result["items"]] == ["a1"]
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["next_after"] is None
+    assert summary.get("unreadable_rows", 0) + summary.get("ads_without_creative_id", 0) == 1
+
+
+def test_video_title_scan_counts_rows_that_are_not_objects(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("act_1", "advideos"): [_paged([{"id": "v1", "title": "Launch"}, None])]}))
+    summary = asyncio.run(assets.list_ad_videos(account_id="1", title_contains="launch"))["summary"]
+    assert summary["count"] == 1 and summary["unreadable_rows"] == 1
+    assert summary["complete"] is False and "not objects" in summary["scan_note"]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_audience_adsets_unreadable_pages_leave_both_scans_incomplete(monkeypatch, payload) -> None:
+    _patch(monkeypatch, FakeAssetsClient(
+        objects={"aud_1": {"id": "aud_1", "account_id": "123"}},
+        pages={("aud_1", "ads"): [payload], ("act_123", "adsets"): [payload]},
+    ))
+    summary = asyncio.run(assets.list_audience_adsets(audience_id="aud_1"))["summary"]
+    assert summary["count"] == 0 and summary["complete"] is False
+    assert summary["ads_scan"]["complete"] is False and summary["targeting_scan"]["complete"] is False
+    assert "without a readable data list" in summary["scan_note"]
+    assert "without a readable data list" in summary["targeting_scan"]["scan_note"]
+
+
+def test_audience_adsets_ad_without_an_adset_id_leaves_the_ads_scan_incomplete(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("aud_1", "ads"): [_paged([
+        {"id": "a1", "adset_id": "s1"}, {"id": "a2"},
+    ])]}))
+    summary = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="ads"))["summary"]
+    assert summary["ads_without_adset_id"] == 1
+    assert summary["complete"] is False and summary["ads_scan"]["complete"] is False
+    assert "ad set id" in summary["ads_scan"]["incomplete_reason"]
+
+
+@pytest.mark.parametrize("bad_adset", [
+    None,
+    {"id": "s9", "targeting": None},
+    {"id": "s9"},
+    {"id": "s9", "targeting": {"custom_audiences": "aud_1"}},
+    {"id": "s9", "targeting": {"custom_audiences": [{"name": "No id"}]}},
+    {"id": "s9", "targeting": {"excluded_custom_audiences": [None]}},
+    {"name": "No id", "targeting": {"custom_audiences": [{"id": "aud_1"}]}},
+])
+def test_audience_adsets_unreadable_targeting_leaves_the_targeting_scan_incomplete(monkeypatch, bad_adset) -> None:
+    _patch(monkeypatch, FakeAssetsClient(
+        objects={"aud_1": {"id": "aud_1", "account_id": "123"}},
+        pages={("act_123", "adsets"): [_paged([_adset("s1", included=["aud_1"]), bad_adset])]},
+    ))
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting"))
+    assert [item["id"] for item in result["items"]] == ["s1"]
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["targeting_scan"]["complete"] is False
+
+
+def test_audience_adsets_targeting_without_audience_lists_is_readable(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(
+        objects={"aud_1": {"id": "aud_1", "account_id": "123"}},
+        pages={("act_123", "adsets"): [_paged([_adset("s1", included=["aud_1"]), _adset("s2")])]},
+    ))
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting"))
+    assert result["summary"]["complete"] is True

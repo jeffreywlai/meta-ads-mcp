@@ -11,7 +11,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, ValidationError
 from meta_ads_mcp.field_reference import FIELD_REFERENCE, SDK_SOURCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.tool_types import (
     FieldList,
@@ -146,6 +146,31 @@ def _with_page_summary(normalized: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+PAGE_UNREADABLE_REASON = (
+    "Meta returned a page without a readable data list, so the rows on it, and whether more pages "
+    "follow, are unknown."
+)
+
+
+def _unreadable_page() -> dict[str, Any]:
+    """The listing envelope for a page without a readable data list: not empty, not complete."""
+    return {
+        "items": [],
+        "paging": {"before": None, "after": None, "next": None},
+        "summary": {
+            "count": 0, "complete": False, "truncated": False, "next_after": None,
+            "page_unreadable": True, "incomplete_reason": PAGE_UNREADABLE_REASON,
+        },
+    }
+
+
+def _listing_page(payload: Any) -> dict[str, Any]:
+    """One listing page as Meta returned it; a page without a readable data list is never complete."""
+    if read_collection_page(payload)[2]:
+        return _unreadable_page()
+    return _with_page_summary(normalize_collection(payload))
+
+
 async def _scan_edge(
     client: Any,
     parent_id: str,
@@ -154,8 +179,15 @@ async def _scan_edge(
     fields: list[str],
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Read up to MAX_SCAN_PAGES pages of one edge and report how far the scan got."""
+    """Read up to MAX_SCAN_PAGES pages of one edge and report how far the scan got.
+
+    A page without a readable data list stops the scan (stop_reason page_unreadable) with
+    next_after pointing at that page, so it can be asked for again. Rows that are not
+    objects are counted in unreadable_rows and leave the scan incomplete, because any one
+    of them could be a row the caller is looking for.
+    """
     items: list[dict[str, Any]] = []
+    unreadable_rows = 0
     query = dict(params)
     seen_cursors: set[str] = set()
     pages_read = 0
@@ -175,11 +207,19 @@ async def _scan_edge(
             next_after = query.get("after")
             break
         pages_read += 1
-        items.extend(payload.get("data", []))
+        rows, bad_rows, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            stop_reason = "page_unreadable"
+            next_after = query.get("after")
+            break
+        unreadable_rows += bad_rows
+        items.extend(rows)
         paging = extract_paging(payload)
         if not paging.get("next"):
-            complete = True
+            complete = not unreadable_rows
             stop_reason = "end_of_edge"
+            # The end was reached; there is no later page to continue from.
+            next_after = None
             break
         cursor = paging.get("after")
         if not cursor or cursor in seen_cursors:
@@ -196,6 +236,7 @@ async def _scan_edge(
         "scan_capped": stop_reason == "page_cap",
         "stop_reason": stop_reason,
         "next_after": None if complete else next_after,
+        "unreadable_rows": unreadable_rows,
     }
     if read_error is not None:
         scan["read_error"] = read_error
@@ -207,19 +248,35 @@ def _scan_note(scan: dict[str, Any], noun: str) -> str:
     examined = len(scan["items"])
     if scan["complete"]:
         return f"Scan complete: all {examined} {noun} on the edge were examined."
+    unreadable = scan.get("unreadable_rows", 0)
+    rows_note = (
+        f" Meta also returned {unreadable} row(s) that are not objects; they could not be examined."
+        if unreadable else ""
+    )
+    if scan["stop_reason"] == "end_of_edge":
+        return (
+            f"Scan incomplete: the end of the edge was reached with {examined} {noun} examined, but Meta "
+            f"returned {unreadable} row(s) that are not objects, so they could not be examined."
+        )
+    if scan["stop_reason"] == "page_unreadable":
+        return (
+            f"Scan incomplete: Meta returned page {scan['pages_read']} without a readable data list after "
+            f"{examined} {noun} were examined. Call again with after=summary.next_after to retry that page."
+            f"{rows_note}"
+        )
     if scan["stop_reason"] == "read_failed":
         return (
             f"Scan incomplete: Meta refused page {scan['pages_read'] + 1} ({scan.get('read_error')}) after {examined} "
-            f"{noun} were examined. Call again with after=summary.next_after to retry that page."
+            f"{noun} were examined. Call again with after=summary.next_after to retry that page.{rows_note}"
         )
     if scan["stop_reason"] == "page_cap":
         return (
             f"Scan incomplete: stopped after the {MAX_SCAN_PAGES}-page cap with {examined} {noun} examined. "
-            "Call again with after=summary.next_after to continue."
+            f"Call again with after=summary.next_after to continue.{rows_note}"
         )
     return (
         f"Scan incomplete: Meta returned a missing or repeated cursor after {examined} {noun} were examined, "
-        "so the scan cannot be continued safely."
+        f"so the scan cannot be continued safely.{rows_note}"
     )
 
 
@@ -266,7 +323,7 @@ async def list_pages(
         fields=normalize_field_list(fields) or default_fields,
         params=params,
     )
-    normalized = _with_page_summary(normalize_collection(payload))
+    normalized = _listing_page(payload)
     normalized["summary"].update({"source": normalized_source, "edge": f"{parent_id}/{edge}"})
     return normalized
 
@@ -296,7 +353,7 @@ async def list_ad_images(
         fields=normalize_field_list(fields) or AD_IMAGE_LIST_FIELDS,
         params=params,
     )
-    return _with_page_summary(normalize_collection(payload))
+    return _listing_page(payload)
 
 
 MAX_VIDEO_ID_LOOKUPS = 25
@@ -402,6 +459,7 @@ async def list_ad_videos(
                 "title_contains": title_filter,
                 "matching": "local, case-insensitive, on title",
                 "scanned_count": len(scan["items"]),
+                "unreadable_rows": scan["unreadable_rows"],
                 "pages_read": scan["pages_read"],
                 "complete": scan["complete"],
                 "scan_capped": scan["scan_capped"],
@@ -415,7 +473,7 @@ async def list_ad_videos(
         fields=requested_fields,
         params=_page_params(limit, after),
     )
-    normalized = _with_page_summary(normalize_collection(payload))
+    normalized = _listing_page(payload)
     normalized["items"] = [
         _with_processing_status(item) if isinstance(item, dict) else item for item in normalized["items"]
     ]
@@ -446,22 +504,39 @@ async def list_creative_ads(
         params["effective_status"] = list(effective_status)
     scan = await _scan_edge(client, resolved_account_id, "ads", fields=CREATIVE_AD_FIELDS, params=params)
     matched: list[dict[str, Any]] = []
+    # An ad whose creative id cannot be read could be using this creative.
+    without_creative_id = 0
     for ad in scan["items"]:
         creative = ad.get("creative") if isinstance(ad.get("creative"), dict) else {}
-        if str(creative.get("id") or "") != creative_id:
+        ad_creative_id = creative.get("id")
+        if isinstance(ad_creative_id, bool) or not isinstance(ad_creative_id, (str, int)) or not str(ad_creative_id).strip():
+            without_creative_id += 1
+            continue
+        if str(ad_creative_id).strip() != creative_id:
             continue
         item = {key: value for key, value in ad.items() if key != "creative"}
         item["creative_id"] = creative_id
         matched.append(item)
+    summary: dict[str, Any] = {
+        "count": len(matched),
+        "creative_id": creative_id,
+        "account_id": resolved_account_id,
+        "scanned_count": len(scan["items"]),
+    }
+    if scan["unreadable_rows"]:
+        summary["unreadable_rows"] = scan["unreadable_rows"]
+    if without_creative_id:
+        summary["ads_without_creative_id"] = without_creative_id
+        summary["creative_id_note"] = (
+            f"{without_creative_id} ad(s) came back without a readable creative id, so whether they use this "
+            "creative is unknown."
+        )
     return {
         "items": matched,
         "summary": {
-            "count": len(matched),
-            "creative_id": creative_id,
-            "account_id": resolved_account_id,
-            "scanned_count": len(scan["items"]),
+            **summary,
             "pages_read": scan["pages_read"],
-            "complete": scan["complete"],
+            "complete": scan["complete"] and not without_creative_id,
             "scan_capped": scan["scan_capped"],
             "next_after": scan["next_after"],
             "matching": "local",
@@ -579,8 +654,12 @@ async def list_instagram_media(
         fields=requested_fields,
         params=params,
     )
+    scanned, unreadable_rows, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        normalized = _unreadable_page()
+        normalized["summary"].update({"source": edge, "boost_eligible_only": boost_eligible_only, "scanned_count": 0})
+        return normalized
     normalized = normalize_collection(payload)
-    scanned = normalized["items"]
     items: list[dict[str, Any]] = []
     excluded_ineligible = 0
     unknown = 0
@@ -600,6 +679,14 @@ async def list_instagram_media(
     normalized["items"] = items
     normalized["summary"] = {"count": len(items)}
     _with_page_summary(normalized)
+    if unreadable_rows:
+        # They could be eligible items or matches; they are left out and the page is not complete.
+        normalized["summary"]["complete"] = False
+        normalized["summary"]["unreadable_rows"] = unreadable_rows
+        normalized["summary"]["incomplete_reason"] = (
+            f"Meta returned {unreadable_rows} item(s) that are not objects on this page; they could not be "
+            "read or filtered and are left out."
+        )
     normalized["summary"].update({
         "source": edge,
         "boost_eligible_only": boost_eligible_only,
@@ -648,6 +735,27 @@ def _audience_ids(targeting: Any, key: str) -> set[str]:
         elif isinstance(entry, (str, int)):
             ids.add(str(entry))
     return ids
+
+
+def _targeting_readable(targeting: Any) -> bool:
+    """Whether an ad set's audience targeting can be read: an object whose audience lists are lists of ids.
+
+    A missing list means the ad set does not use that kind of audience. A list that is not
+    a list, or an entry without a readable id, could hide the audience.
+    """
+    if not isinstance(targeting, dict):
+        return False
+    for key in ("custom_audiences", "excluded_custom_audiences"):
+        entries = targeting.get(key)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            return False
+        for entry in entries:
+            value = entry.get("id") if isinstance(entry, dict) else entry
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+                return False
+    return True
 
 
 def _audience_adset_entry(adsets: dict[str, dict[str, Any]], adset_id: str) -> dict[str, Any]:
@@ -719,7 +827,15 @@ async def list_audience_adsets(
             "next_after": scan["next_after"],
             "scan_note": _scan_note(scan, "ads"),
         })
-        ads_scan = {"ran": True, "complete": scan["complete"]}
+        # An ad whose ad set id cannot be read uses the audience through an ad set this list cannot name.
+        ads_scan = {"ran": True, "complete": scan["complete"] and not ads_without_adset}
+        if scan["unreadable_rows"]:
+            ads_scan["unreadable_rows"] = scan["unreadable_rows"]
+        if ads_without_adset:
+            ads_scan["incomplete_reason"] = (
+                f"{ads_without_adset} ad(s) using the audience came back without a readable ad set id, so their "
+                "ad sets are not listed."
+            )
     else:
         ads_scan = _skipped_scan("source=targeting")
         summary["next_after"] = None
@@ -758,14 +874,22 @@ async def list_audience_adsets(
         else:
             account_edge = normalize_account_id(resolved_account)
             matched = 0
+            # Ad sets whose targeting cannot be read could use the audience; so could a match without an id.
+            unreadable_targeting = 0
             for adset in scan["items"]:
                 targeting = adset.get("targeting")
+                if not _targeting_readable(targeting):
+                    unreadable_targeting += 1
+                    continue
                 uses = []
                 if audience_id in _audience_ids(targeting, "custom_audiences"):
                     uses.append("included")
                 if audience_id in _audience_ids(targeting, "excluded_custom_audiences"):
                     uses.append("excluded")
-                if not uses or not adset.get("id"):
+                if not uses:
+                    continue
+                if not adset.get("id"):
+                    unreadable_targeting += 1
                     continue
                 matched += 1
                 entry = _audience_adset_entry(adsets, str(adset["id"]))
@@ -778,7 +902,7 @@ async def list_audience_adsets(
                     entry["campaign_id"] = str(adset["campaign_id"])
             targeting_scan = {
                 "ran": True,
-                "complete": scan["complete"],
+                "complete": scan["complete"] and not unreadable_targeting,
                 "source_edge": f"{account_edge}/adsets",
                 "scanned_adsets": len(scan["items"]),
                 "matched_adsets": matched,
@@ -790,6 +914,14 @@ async def list_audience_adsets(
                     "which leaves out deleted ad sets."
                 ),
             }
+            if scan["unreadable_rows"]:
+                targeting_scan["unreadable_rows"] = scan["unreadable_rows"]
+            if unreadable_targeting:
+                targeting_scan["adsets_with_unreadable_targeting"] = unreadable_targeting
+                targeting_scan["incomplete_reason"] = (
+                    f"{unreadable_targeting} ad set(s) came back with targeting (or an id) this server cannot "
+                    "read, so whether they use the audience is unknown."
+                )
             summary["targeting_next_after"] = scan["next_after"]
     else:
         targeting_scan = _skipped_scan("source=ads")
