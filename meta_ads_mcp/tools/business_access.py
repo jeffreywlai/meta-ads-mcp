@@ -225,20 +225,30 @@ async def _scan(
             "unreadable_rows": unreadable}
 
 
-def _usable_id(value: Any) -> str | None:
-    """A Graph id as a string when Meta returned a plain numeric id, otherwise None."""
+def _readable_id(value: Any) -> str | None:
+    """An id Meta returned as a non-empty string or a whole number, as a string; otherwise None."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return str(value) if value >= 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
+        return str(value)
+    if isinstance(value, str) and value.strip():
         return value.strip()
     return None
 
 
+def _usable_id(value: Any) -> str | None:
+    """A Graph id as a string only when Meta returned a plain numeric id, otherwise None.
+
+    Used for the caller's own identities, where a value in any other shape cannot be
+    compared with the numeric recipient id and so cannot clear a removal.
+    """
+    readable = _readable_id(value)
+    return readable if readable is not None and readable.isdigit() else None
+
+
 def _unidentified_rows(scan: dict[str, Any]) -> int:
-    """Rows of a scan whose own id cannot be read: not an object, or no usable id."""
-    return scan.get("unreadable_rows", 0) + sum(1 for row in scan["rows"] if _usable_id(row.get("id")) is None)
+    """Rows of a scan whose own id cannot be read: not an object, or no id at all."""
+    return scan.get("unreadable_rows", 0) + sum(1 for row in scan["rows"] if _readable_id(row.get("id")) is None)
 
 
 def _matches(row: dict[str, Any], search: str, text_fields: tuple[str, ...]) -> bool:
@@ -552,7 +562,7 @@ async def list_user_assigned_catalogs(
         gaps.append(f"{unidentified_catalogs} owned catalog row(s) had no readable id and could not be checked.")
     skipped = 0
     for catalog in catalogs:
-        usable = _usable_id(catalog.get("id"))
+        usable = _readable_id(catalog.get("id"))
         if usable is None:
             skipped += 1
             continue
@@ -637,9 +647,12 @@ async def _caller_ids(client: Any) -> set[str] | None:
         scan = await _scan(client, "me", "business_users", fields=["id", "business"], max_pages=3)
     except MetaAdsError:
         return None
-    if own_id is None or not scan["complete"] or _unidentified_rows(scan):
+    if own_id is None or not scan["complete"] or scan.get("unreadable_rows"):
         return None
-    return {own_id, *(_usable_id(row.get("id")) for row in scan["rows"])}  # type: ignore[misc]
+    row_ids = [_usable_id(row.get("id")) for row in scan["rows"]]
+    if any(row_id is None for row_id in row_ids):
+        return None
+    return {own_id, *row_ids}  # type: ignore[arg-type]
 
 
 def _row_business_id(row: dict[str, Any]) -> str | None:

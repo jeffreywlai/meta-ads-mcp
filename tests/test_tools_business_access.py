@@ -1486,7 +1486,9 @@ def test_h18_fully_readable_caller_businesses_still_allow_removal(monkeypatch) -
     assert preview["would_be_refused"] is False and preview["self_check"]["is_caller_business"] is False
 
 
-@pytest.mark.parametrize("bad_row", [{"business": {"id": BUSINESS}}, {"id": "", "business": {"id": BUSINESS}}, "x"])
+@pytest.mark.parametrize("bad_row", [
+    {"business": {"id": BUSINESS}}, {"id": "", "business": {"id": BUSINESS}}, {"id": "abc", "business": {"id": BUSINESS}}, "x",
+])
 @pytest.mark.parametrize("tasks", [[], ["ADVERTISE"]])
 def test_h18_person_removal_refused_when_one_caller_id_row_is_unreadable(monkeypatch, bad_row, tasks) -> None:
     client = _access_client(["MANAGE", "ADVERTISE"])
