@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -382,36 +383,104 @@ def _result_fields(level: str) -> list[str]:
     return [RESULT_FIELD] if level == "account" else [RESULT_FIELD, COST_PER_RESULT_FIELD]
 
 
+def _unreadable(reason: str, indicator: str | None = None) -> dict[str, Any]:
+    parsed: dict[str, Any] = {"status": "unreadable", "reason": reason}
+    if indicator is not None:
+        parsed["indicator"] = indicator
+    return parsed
+
+
+def _result_number(raw: Any) -> float | None:
+    """A result value only when it is a finite, non-negative number (or a numeric string); never a boolean."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        number = float(raw)
+    elif isinstance(raw, str):
+        try:
+            number = float(raw.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _parse_result_values(indicator: str, values: Any) -> dict[str, Any]:
+    """Pick the one value of an indicator's `values` list, or say why no single value can be chosen."""
+    if values is None or values == []:
+        return {"status": "read", "indicator": indicator, "value": None}
+    if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
+        return _unreadable(f"{indicator}: values is not a list of objects", indicator)
+    defaults: list[dict[str, Any]] = []
+    for item in values:
+        windows = item.get("attribution_windows")
+        if windows is None:
+            continue
+        if not isinstance(windows, list) or not all(isinstance(window, str) for window in windows):
+            return _unreadable(f"{indicator}: attribution_windows is not a list of window names", indicator)
+        if "default" in windows:
+            defaults.append(item)
+    if len(values) == 1:
+        chosen = values[0]
+    elif len(defaults) == 1:
+        chosen = defaults[0]
+    elif defaults:
+        return _unreadable(f"{indicator}: more than one value is marked as the default attribution window", indicator)
+    else:
+        return _unreadable(
+            f"{indicator}: several attribution-window values and none is marked as the default", indicator,
+        )
+    raw = chosen.get("value")
+    number = _result_number(raw)
+    if number is None:
+        if isinstance(raw, bool):
+            detail = "a true or false value, not a number"
+        elif raw is None:
+            detail = "no value"
+        else:
+            detail = "not a finite number of zero or more"
+        return _unreadable(f"{indicator}: the value is {detail}", indicator)
+    return {"status": "read", "indicator": indicator, "value": number}
+
+
 def _parse_result_list(value: Any) -> dict[str, Any]:
     """Read one of Meta's result fields: a list of {indicator, values: [{value, attribution_windows}]}.
 
-    Returns a status: absent (no field or an empty list), read (one indicator; value None when Meta lists the
-    indicator without a value), mixed (several indicators in one row), or unreadable (any other shape).
+    Live shape (confirmed): [{"indicator": "actions:<type>", "values": [{"value": "12",
+    "attribution_windows": ["default"]}]}]. Returns a status: absent (no field or an empty list), read (one
+    indicator with one unambiguous value; value None when Meta lists the indicator without values), mixed
+    (several different indicators in one row), or unreadable with a `reason` (any other shape). A value is used
+    only when it is unambiguous: one entry for the indicator, a finite non-negative number that is not a boolean,
+    and either a single value or exactly one value in the default attribution window. Nothing is guessed.
     """
     if value is None:
         return {"status": "absent"}
     if not isinstance(value, list):
-        return {"status": "unreadable"}
-    entries = [entry for entry in value if isinstance(entry, dict)]
-    if len(entries) != len(value):
-        return {"status": "unreadable"}
-    if not entries:
+        return _unreadable("the results field is not a list")
+    if not value:
         return {"status": "absent"}
-    indicators = list(dict.fromkeys(str(entry.get("indicator") or "").strip() for entry in entries))
-    if "" in indicators:
-        return {"status": "unreadable"}
-    if len(indicators) > 1:
-        return {"status": "mixed", "indicators": indicators}
-    values = entries[0].get("values")
-    if values is None or values == []:
-        return {"status": "read", "indicator": indicators[0], "value": None}
-    if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
-        return {"status": "unreadable", "indicator": indicators[0]}
-    chosen = next((item for item in values if "default" in (item.get("attribution_windows") or [])), values[0])
-    number = to_float(chosen.get("value"))
-    if number is None:
-        return {"status": "unreadable", "indicator": indicators[0]}
-    return {"status": "read", "indicator": indicators[0], "value": number}
+    parsed: list[dict[str, Any]] = []
+    seen: list[str] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            return _unreadable("an entry of the results field is not an object")
+        indicator = entry.get("indicator")
+        if not isinstance(indicator, str) or not indicator.strip():
+            return _unreadable("an entry of the results field has no indicator name")
+        indicator = indicator.strip()
+        if indicator in seen:
+            return _unreadable(f"{indicator}: the results field lists this indicator more than once", indicator)
+        seen.append(indicator)
+        item = _parse_result_values(indicator, entry.get("values"))
+        if item["status"] == "unreadable":
+            return item
+        parsed.append(item)
+    if len(parsed) > 1:
+        return {"status": "mixed", "indicators": seen}
+    return parsed[0]
 
 
 def _attach_meta_results(payload: dict[str, Any]) -> dict[str, Any]:
@@ -427,6 +496,8 @@ def _attach_meta_results(payload: dict[str, Any]) -> dict[str, Any]:
         result = _parse_result_list(row.pop(RESULT_FIELD, None))
         cost = _parse_result_list(row.pop(COST_PER_RESULT_FIELD, None))
         row["meta_result"] = result
+        if cost["status"] == "unreadable":
+            row["meta_cost_per_result_issue"] = f"cost_per_result: {cost['reason']}"
         row["meta_cost_per_result"] = (
             cost["value"]
             if cost["status"] == "read" and result.get("status") == "read" and cost.get("indicator") == result.get("indicator")
@@ -539,17 +610,26 @@ INPUT_POLICY = {
 }
 
 
-def _result_basis(rows: list[dict[str, Any]], *, result_error: str | None = None) -> dict[str, Any]:
+MAX_UNREADABLE_REASONS = 3
+
+
+def _result_basis(
+    rows: list[dict[str, Any]], *, result_error: str | None = None, one_entity: bool = True,
+) -> dict[str, Any]:
     """Decide which result the rows report, and whether it can be added up across rows.
 
     Statuses: single (one indicator), mixed (several), not_reported (no row reports a result), unreadable (rows
-    report a result in a shape that cannot be read), or request_failed (Meta rejected the result fields).
+    report a result in a shape that cannot be read, with the reasons), or request_failed (Meta rejected the
+    result fields). one_entity says the rows all belong to one object (its days): only then does a row without a
+    result count as zero, because the object's own other rows define its result. Rows of different objects
+    (ad sets in a group, ads in a pool) never lend their result to an object that reports none.
     """
     if result_error is not None:
         return {"status": "request_failed", "error": result_error}
     indicators: list[str] = []
     mixed = False
     unreadable = 0
+    reasons: list[str] = []
     for row in rows:
         result = row.get("meta_result") or {"status": "absent"}
         if result["status"] == "read":
@@ -560,10 +640,22 @@ def _result_basis(rows: list[dict[str, Any]], *, result_error: str | None = None
             indicators.extend(item for item in result["indicators"] if item not in indicators)
         elif result["status"] == "unreadable":
             unreadable += 1
+            reason = result.get("reason") or "the results field has an unexpected shape"
+            if reason not in reasons:
+                reasons.append(reason)
+        issue = row.get("meta_cost_per_result_issue")
+        if issue and issue not in reasons:
+            reasons.append(issue)
+    reasons = reasons[:MAX_UNREADABLE_REASONS]
     if mixed or len(indicators) > 1:
-        return {"status": "mixed", "indicators": indicators}
+        basis: dict[str, Any] = {"status": "mixed", "indicators": indicators}
+        if reasons:
+            basis["unreadable_reasons"] = reasons
+        return basis
     if not indicators:
-        return {"status": "unreadable"} if unreadable else {"status": "not_reported"}
+        if unreadable:
+            return {"status": "unreadable", "rows_unreadable": unreadable, "unreadable_reasons": reasons}
+        return {"status": "not_reported", **({"unreadable_reasons": reasons} if reasons else {})}
     indicator = indicators[0]
     if indicator.startswith(ACTION_INDICATOR_PREFIX):
         action_type: str | None = indicator[len(ACTION_INDICATOR_PREFIX):] or None
@@ -579,16 +671,21 @@ def _result_basis(rows: list[dict[str, Any]], *, result_error: str | None = None
         "value_reported": action_type is not None
         and any(action_type in (row.get("action_values_map") or {}) for row in rows),
         "rows_unreadable": unreadable,
+        "absent_counts_zero": one_entity,
+        **({"unreadable_reasons": reasons} if reasons else {}),
     }
 
 
 def _row_result(row: dict[str, Any], basis: dict[str, Any]) -> float | None:
-    """One row's count of the basis result: absent counts as zero, unreadable is unknown."""
+    """One row's count of the basis result.
+
+    Absent counts as zero only when the basis comes from the same object's own rows; unreadable is unknown.
+    """
     if basis.get("status") != "single":
         return None
     result = row.get("meta_result") or {"status": "absent"}
     if result["status"] == "absent":
-        return 0.0
+        return 0.0 if basis.get("absent_counts_zero", False) else None
     if result["status"] == "read" and result["indicator"] == basis["indicator"]:
         return 0.0 if result["value"] is None else result["value"]
     return None
@@ -607,7 +704,7 @@ def _period_inputs(rows: list[dict[str, Any]], basis: dict[str, Any]) -> dict[st
         counts = [_row_result(row, basis) for row in rows]
         if basis["additive"]:
             results = None if any(count is None for count in counts) else sum(counts)  # type: ignore[arg-type]
-            if basis["value_reported"]:
+            if basis["value_reported"] and (results is not None or basis.get("absent_counts_zero")):
                 conversion_value = sum(
                     to_float((row.get("action_values_map") or {}).get(basis["action_type"])) or 0.0 for row in rows
                 )
@@ -666,7 +763,7 @@ def _derived_metrics(inputs: dict[str, float | None], basis: dict[str, Any]) -> 
 def _result_summary(basis: dict[str, Any]) -> dict[str, Any]:
     """The result definition actually used for one object, for the response."""
     summary: dict[str, Any] = {"source": "meta_results_field", "status": basis["status"]}
-    for key in ("indicator", "action_type", "additive", "indicators", "error"):
+    for key in ("indicator", "action_type", "additive", "indicators", "error", "unreadable_reasons"):
         if key in basis:
             summary[key] = basis[key]
     if basis.get("status") == "single":
@@ -696,8 +793,13 @@ def _result_signals(basis: dict[str, Any], level: str, *, rows_exist: bool) -> l
             "Meta reported no result (the Insights results field) for this object in this window, so results, cost "
             f"per result, conversion rate and ROAS are null. No other action is substituted.{hint}"
         ]
+    reasons = basis.get("unreadable_reasons") or []
+    why = f" ({'; '.join(reasons)})" if reasons else ""
     if status == "unreadable":
-        return ["Meta's results field could not be read in this window, so the result metrics are null."]
+        return [
+            f"Meta's results field could not be read in this window{why}, so the result metrics are null. No "
+            "value was guessed from it."
+        ]
     if status == "mixed":
         return [
             f"Meta reported more than one result type in this window ({', '.join(basis['indicators'])}); they "
@@ -717,8 +819,11 @@ def _result_signals(basis: dict[str, Any], level: str, *, rows_exist: bool) -> l
         )
     if basis.get("rows_unreadable"):
         signals.append(
-            f"{basis['rows_unreadable']} row(s) had a result that could not be read; their periods' results are null."
+            f"{basis['rows_unreadable']} row(s) had a result that could not be read{why}; their periods' results "
+            "are null."
         )
+    elif reasons:
+        signals.append(f"Meta's cost per result could not be read in some rows{why}; it is null there.")
     return signals
 
 
@@ -1028,7 +1133,7 @@ def _group_entity_signals(entities: list[dict[str, Any]]) -> list[dict[str, Any]
 
 def _compact_result(basis: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {"status": basis["status"]}
-    for key in ("indicator", "additive", "indicators", "error"):
+    for key in ("indicator", "additive", "indicators", "error", "unreadable_reasons"):
         if key in basis:
             compact[key] = basis[key]
     return compact
@@ -1754,17 +1859,18 @@ def _is_action_indicator(indicator: str, row: dict[str, Any]) -> bool:
     return indicator.startswith(ACTION_INDICATOR_PREFIX) or indicator in (row.get("actions_map") or {})
 
 
-def _pooled_costs(rows: list[dict[str, Any]], pool_basis: dict[str, Any]) -> dict[str, float | None]:
-    """Cost per result for each action result across ads: summed spend / summed results, per indicator."""
+def _pooled_costs(rows: list[dict[str, Any]]) -> dict[str, float | None]:
+    """Cost per result for each action result across ads: summed spend / summed results, per indicator.
+
+    Only ads that report that result themselves are pooled; an ad that reports no result is left out rather
+    than counted as zero for another ad's result.
+    """
     sums: dict[str, list[float | None]] = {}
     for row in rows:
         result = row.get("meta_result") or {"status": "absent"}
-        if result["status"] == "read":
-            indicator, count = result["indicator"], result["value"] or 0.0
-        elif result["status"] == "absent" and pool_basis.get("status") == "single":
-            indicator, count = pool_basis["indicator"], 0.0
-        else:
+        if result["status"] != "read":
             continue
+        indicator, count = result["indicator"], result["value"] or 0.0
         if not _is_action_indicator(indicator, row):
             continue
         spend = to_float((row.get("metrics") or {}).get("spend"))
@@ -1867,7 +1973,7 @@ async def _ranking_entity(
     }
 
     cost_known_rows = [row for row in rows if str(row.get("ad_id")) in cost_rows]
-    pool_basis = _result_basis(cost_known_rows)
+    pool_basis = _result_basis(cost_known_rows, one_entity=False)
     scope_basis = _result_basis(scope_rows or []) if scope_has_results else {"status": "not_reported"}
     if scope_rows and scope_basis["status"] == "single":
         scope_metrics = _derived_metrics(_period_inputs(scope_rows, scope_basis), scope_basis)
@@ -1885,7 +1991,7 @@ async def _ranking_entity(
         scope_metrics = _derived_metrics(_period_inputs(rows, {"status": "not_reported"}), {})
         scope_metrics_basis = "examined_ads"
         scope_result = {"status": "not_reported"}
-    pooled = _pooled_costs(cost_known_rows, pool_basis)
+    pooled = _pooled_costs(cost_known_rows)
     scope_cost = (
         _derived_metrics(_period_inputs(scope_rows, scope_basis), scope_basis)["cost_per_result"]
         if scope_rows and scope_basis["status"] == "single" else None
@@ -1899,12 +2005,27 @@ async def _ranking_entity(
             ]
         )
 
+    unreported = sum(
+        1 for row in cost_known_rows if (row.get("meta_result") or {}).get("status", "absent") == "absent"
+    )
+    if cost_status == "read" and unreported and pool_basis["status"] != "not_reported":
+        missing_signals.append(
+            f"{unreported} examined ad(s) with cost evidence reported no Meta result. Their result type is unknown, "
+            "so their results are null rather than zero, they are left out of every cost baseline, and they are "
+            "not diagnosed on cost."
+        )
+    unreadable_ads = [row for row in cost_known_rows if (row.get("meta_result") or {}).get("status") == "unreadable"]
+    if cost_status == "read" and unreadable_ads:
+        reasons = list(dict.fromkeys(str(row["meta_result"].get("reason")) for row in unreadable_ads))
+        missing_signals.append(
+            f"{len(unreadable_ads)} examined ad(s) had a Meta result that could not be read "
+            f"({'; '.join(reasons[:MAX_UNREADABLE_REASONS])}); their results are null and no value was guessed."
+        )
+
     ads: list[dict[str, Any]] = []
     for row in rows:
         has_cost = str(row.get("ad_id")) in cost_rows
         own = _result_basis([row]) if has_cost else {"status": "not_requested"}
-        if has_cost and own["status"] == "not_reported" and pool_basis["status"] == "single":
-            own = pool_basis
         inputs = _period_inputs([row], own)
         metrics = _derived_metrics(inputs, own)
         indicator = own.get("indicator") if own["status"] == "single" else None
@@ -1929,6 +2050,8 @@ async def _ranking_entity(
             "spend": metrics["spend"],
             "impressions": metrics["impressions"],
             "result_indicator": indicator,
+            "result_status": own["status"],
+            **({"result_unreadable_reasons": own["unreadable_reasons"]} if own.get("unreadable_reasons") else {}),
             "results": metrics["results"],
             "cost_per_result": metrics["cost_per_result"],
             "cpm": metrics["cpm"],
@@ -2335,25 +2458,27 @@ def _known_total_spend(rows: list[dict[str, Any]]) -> float | None:
 
 def _group_spend(
     rows: list[dict[str, Any]], key: str, total_spend: float | None, *, result_error: str | None = None,
+    unit: str = "adset",
 ) -> list[dict[str, Any]]:
-    """Group ad set rows by a dimension, with spend, share, and Meta's result where the group has one.
+    """Group ad set (or ad) rows by a dimension, with spend, share, and Meta's result where the group has one.
 
-    A row without spend makes its group's spend (and share) null. Results are added up only when every ad set in
-    the group that reports a result reports the same action result; otherwise they are null and the group lists
-    the result types it mixes.
+    A row without spend makes its group's spend (and share) null. Results are added up only when every row in
+    the group reports the same action result itself; a row that reports no result has an unknown result type,
+    so it makes the group's results null (never zero), and the group counts such rows. Mixed result types are
+    null and listed.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(str(row.get(key) or "UNKNOWN"), []).append(row)
     output: list[dict[str, Any]] = []
     for label, group_rows in grouped.items():
-        basis = _result_basis(group_rows, result_error=result_error)
+        basis = _result_basis(group_rows, result_error=result_error, one_entity=False)
         inputs = _period_inputs(group_rows, basis)
         spend = _known_total_spend(group_rows)
         group: dict[str, Any] = {
             key: label,
             "spend": spend,
-            "adset_count": len(group_rows),
+            f"{unit}_count": len(group_rows),
             "spend_share": _ratio(spend, total_spend),
             "result_indicator": basis.get("indicator") if basis["status"] == "single" else None,
             "results": inputs["results"],
@@ -2361,6 +2486,14 @@ def _group_spend(
         }
         if basis["status"] == "mixed":
             group["result_indicators"] = basis["indicators"]
+        if basis["status"] in ("single", "mixed"):
+            without = sum(
+                1 for row in group_rows if (row.get("meta_result") or {}).get("status", "absent") == "absent"
+            )
+            if without:
+                group[f"{unit}s_without_reported_result"] = without
+        if basis.get("unreadable_reasons"):
+            group["result_unreadable_reasons"] = basis["unreadable_reasons"]
         output.append(group)
     return sorted(output, key=lambda group: (group["spend"] is None, -(group["spend"] or 0.0), group[key]))
 
@@ -2452,19 +2585,21 @@ def _top_by_spend(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 _META_RESULT_EVENT_BASIS = (
     "Meta's own result for each ad set (the Insights results field), which counts the event the ad set "
-    "optimizes for; an ad set whose row reports no result counts zero events"
+    "optimizes for"
 )
 
 
 def _meta_result_events(row: dict[str, Any]) -> tuple[float | None, str | None, str | None]:
-    """An ad set's optimization events from Meta's result: (events, indicator, reason it cannot be judged)."""
+    """An ad set's optimization events from its own reported Meta result: (events, indicator, reason it cannot be judged).
+
+    Only called for a row that reports a result; a row without one is handled by its own goal, never as zero.
+    """
     result = row.get("meta_result") or {"status": "absent"}
-    if result["status"] == "absent":
-        return 0.0, None, None
     if result["status"] == "mixed":
         return None, None, f"the ad set reports several results ({', '.join(result['indicators'])})"
     if result["status"] != "read":
-        return None, None, "the ad set's result could not be read"
+        reason = result.get("reason") or "an unexpected shape"
+        return None, None, f"the ad set's result could not be read ({reason})"
     if not _is_action_indicator(result["indicator"], row):
         return None, result["indicator"], f"Meta's result {result['indicator']} is not an event count"
     return (result["value"] or 0.0), result["indicator"], None
@@ -2477,11 +2612,11 @@ def _results_reported(rows: list[dict[str, Any]]) -> bool:
 def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[str, Any]]:
     """Summarize, per optimization goal, how many ad sets reach the learning-phase weekly volume, with the top spenders.
 
-    When Meta reports a result for any ad set, each ad set is judged on its own result. Otherwise only goals whose
-    event is known from the goal itself (GOAL_EVENT_BASIS) are judged, on that action. Ad sets with zero spend are
-    skipped; an ad set whose spend is missing is kept and makes its goal's spend null.
+    Each ad set is judged on its own data only. An ad set whose row reports Meta's result is judged on that
+    result. An ad set whose row reports no result is judged on its goal's own event when the goal identifies it
+    (GOAL_EVENT_BASIS); otherwise it is not judged. Another ad set's result never decides how this one is read.
+    Ad sets with zero spend are skipped; an ad set whose spend is missing is kept and makes its goal's spend null.
     """
-    use_results = _results_reported(rows)
     by_goal: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         spend = to_float((row.get("metrics") or {}).get("spend"))
@@ -2494,14 +2629,15 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
         goal_spend = _known_total_spend(goal_rows)
         unknown_spend = sum(1 for row in goal_rows if to_float((row.get("metrics") or {}).get("spend")) is None)
         mapping = GOAL_EVENT_BASIS.get(goal)
-        if not use_results and mapping is None:
+        unidentified = GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal.")
+        if mapping is None and not _results_reported(goal_rows):
             output.append({
                 "optimization_goal": goal,
                 "adset_count": len(goal_rows),
                 "spend": goal_spend,
                 "adsets_with_unknown_spend": unknown_spend,
                 "verdict": "not_assessed",
-                "reason": GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal."),
+                "reason": unidentified,
                 "top_adsets_by_spend": _top_by_spend([_adset_volume_entry(row, None, None) for row in goal_rows]),
             })
             continue
@@ -2510,16 +2646,26 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
         not_judged: list[dict[str, Any]] = []
         reasons: list[str] = []
         indicators: list[str] = []
+        bases: set[str] = set()
         for row in goal_rows:
-            if use_results:
+            if (row.get("meta_result") or {}).get("status", "absent") != "absent":
                 events, indicator, reason = _meta_result_events(row)
                 if indicator and indicator not in indicators:
                     indicators.append(indicator)
-            else:
-                action_types, _ = mapping  # type: ignore[misc]
+                if events is not None:
+                    bases.add("results")
+            elif mapping is not None:
+                action_types, _ = mapping
                 actions = row.get("actions_map") or {}
                 matched = next((candidate for candidate in action_types if candidate in actions), None)
                 events, reason = ((to_float(actions.get(matched)) or 0.0) if matched else 0.0), None
+                bases.add("goal_event")
+            else:
+                events = None
+                reason = (
+                    "an ad set reports no Meta result, so its result type is unknown and it is not counted as zero; "
+                    + unidentified[0].lower() + unidentified[1:]
+                )
             if events is None:
                 not_judged.append(_adset_volume_entry(row, None, None))
                 if reason and reason not in reasons:
@@ -2544,9 +2690,17 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
             else "some_adsets_meet_threshold" if meeting
             else "no_adsets_meet_threshold"
         )
+        if bases == {"results"}:
+            event_basis = _META_RESULT_EVENT_BASIS
+        elif bases == {"goal_event"}:
+            event_basis = mapping[1]  # type: ignore[index]
+        else:
+            event_basis = (
+                f"{_META_RESULT_EVENT_BASIS} where the ad set reports one; otherwise {mapping[1]}"  # type: ignore[index]
+            )
         entry_out: dict[str, Any] = {
             "optimization_goal": goal,
-            "event_basis": _META_RESULT_EVENT_BASIS if use_results else mapping[1],  # type: ignore[index]
+            "event_basis": event_basis,
             "threshold_events_per_week": LEARNING_EVENTS_PER_WEEK,
             "adset_count": len(goal_rows),
             "spend": goal_spend,
@@ -2557,7 +2711,7 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
             "top_meeting_threshold": _top_by_spend(meeting),
             "top_below_threshold": _top_by_spend(below),
         }
-        if use_results:
+        if indicators:
             entry_out["result_indicators"] = indicators[:5]
         if not_judged:
             entry_out["adsets_not_judged"] = len(not_judged)
@@ -2832,8 +2986,8 @@ async def get_advertiser_context(
         missing_signals.append(
             "Weekly optimization event volume was not assessed for "
             + ", ".join(f"{entry['optimization_goal']} ({entry['adset_count']} ad sets)" for entry in unassessed)
-            + " because the event each optimizes for could not be identified from ad set insights; see each "
-            "goal's reason in optimization_goal_volume."
+            + " because no ad set's optimization events could be identified or read from its own insights; see "
+            "each goal's reason in optimization_goal_volume."
         )
 
     extra: dict[str, Any] = {

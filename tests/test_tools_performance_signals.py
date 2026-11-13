@@ -2513,3 +2513,230 @@ def test_insights_page_cap_says_pages_not_rows(monkeypatch) -> None:
     _patch(monkeypatch, RecordingClient(insights_handler=handler))
     with pytest.raises(ValidationError, match="pages"):
         asyncio.run(performance_signals._read_insights_pages("cmp_1", ["spend"], {"level": "campaign"}))
+
+
+# ---------------------------------------------------------------------------
+# Round three: Meta's results field is read only when its shape is unambiguous (G9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [
+    [{"indicator": "actions:lead", "values": [{"value": True}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": ["1d_click"]},
+                                              {"value": "9", "attribution_windows": ["7d_click"]}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": "not_default"},
+                                              {"value": "9", "attribution_windows": ["default"]}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": ["default"]}]},
+     {"indicator": "actions:lead", "values": [{"value": "9", "attribution_windows": ["default"]}]}],
+    [{"indicator": {"unexpected": "object"}, "values": [{"value": "2"}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": 7}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "NaN"}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "Infinity"}]}],
+])
+def test_g9_unexpected_result_shape_is_explicitly_unknown(raw) -> None:
+    parsed = performance_signals._parse_result_list(raw)
+    assert parsed["status"] == "unreadable", parsed
+    assert parsed["reason"], parsed
+
+
+@pytest.mark.parametrize("raw", [
+    [{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": ["default"]},
+                                              {"value": "9", "attribution_windows": ["default"]}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "-3"}]}],
+    [{"indicator": "actions:lead", "values": [{"value": float("nan")}]}],
+    [{"indicator": "actions:lead", "values": [{"value": None}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": ["default", 7]}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "2"}, "9"]}],
+    [{"indicator": "actions:lead", "values": {"value": "2"}}],
+    [{"indicator": 7, "values": [{"value": "2"}]}],
+    [{"indicator": "  ", "values": [{"value": "2"}]}],
+    [{"indicator": True, "values": [{"value": "2"}]}],
+    [{"indicator": "actions:lead", "values": [{"value": "2"}]}, {"indicator": "actions:lead", "values": []}],
+    [{"indicator": "actions:lead", "values": [{"value": "2"}]}, {"indicator": 3, "values": []}],
+    ["actions:lead"],
+    {"indicator": "actions:lead"},
+])
+def test_g9_other_ambiguous_or_malformed_shapes_are_unknown_never_a_crash(raw) -> None:
+    parsed = performance_signals._parse_result_list(raw)
+    assert parsed["status"] == "unreadable", parsed
+    assert parsed["reason"], parsed
+    assert "value" not in parsed
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ([{"indicator": "actions:offsite_conversion.fb_pixel_purchase",
+       "values": [{"value": "12", "attribution_windows": ["default"]}]}],
+     {"status": "read", "indicator": "actions:offsite_conversion.fb_pixel_purchase", "value": 12.0}),
+    ([{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": ["1d_click"]},
+                                               {"value": "9", "attribution_windows": ["default"]}]}],
+     {"status": "read", "indicator": "actions:lead", "value": 9.0}),
+    ([{"indicator": "actions:lead", "values": [{"value": "4", "attribution_windows": ["7d_click"]}]}],
+     {"status": "read", "indicator": "actions:lead", "value": 4.0}),
+    ([{"indicator": "actions:lead", "values": [{"value": 5}]}],
+     {"status": "read", "indicator": "actions:lead", "value": 5.0}),
+    ([{"indicator": "actions:lead", "values": []}], {"status": "read", "indicator": "actions:lead", "value": None}),
+    ([], {"status": "absent"}),
+    (None, {"status": "absent"}),
+])
+def test_g9_confirmed_live_shape_and_unambiguous_shapes_still_read(raw, expected) -> None:
+    assert performance_signals._parse_result_list(raw) == expected
+
+
+def test_g9_mixed_indicators_still_reported_as_mixed() -> None:
+    parsed = performance_signals._parse_result_list([
+        {"indicator": "actions:lead", "values": [{"value": "2"}]},
+        {"indicator": "actions:link_click", "values": [{"value": "9"}]},
+    ])
+    assert parsed == {"status": "mixed", "indicators": ["actions:lead", "actions:link_click"]}
+
+
+def test_g9_unreadable_result_reason_reaches_the_trend_report(monkeypatch) -> None:
+    rows = [_day_row("2026-11-01", spend=10, impressions=100, clicks=5)]
+    rows[0]["results"] = [{"indicator": "actions:lead", "values": [{"value": True}]}]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="1", since="2026-11-01", until="2026-11-01",
+    ))
+    assert result["result"]["status"] == "unreadable"
+    assert result["result"]["unreadable_reasons"]
+    assert result["periods"][0]["metrics"]["cost_per_result"] is None
+    assert any("could not be read" in signal and "true or false" in signal for signal in result["missing_signals"])
+
+
+def test_g9_unreadable_row_in_a_readable_window_makes_its_day_unknown(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-01", spend=10, impressions=100, clicks=5, result=("actions:lead", 2)),
+        _day_row("2026-11-02", spend=10, impressions=100, clicks=5),
+    ]
+    rows[1]["results"] = [{"indicator": "actions:lead", "values": [{"value": "Infinity"}]}]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="1", since="2026-11-01", until="2026-11-02",
+    ))
+    assert result["periods"][0]["metrics"]["cost_per_result"] == pytest.approx(5.0)
+    assert result["periods"][1]["metrics"]["cost_per_result"] is None
+    assert any("not a finite number" in signal for signal in result["missing_signals"])
+
+
+def test_g9_unreadable_result_is_not_judged_in_goal_volume() -> None:
+    row = _goal_row("as_1", "LEAD_GENERATION", {"lead": 500})
+    row["meta_result"] = performance_signals._parse_result_list(
+        [{"indicator": "actions:lead", "values": [{"value": "2", "attribution_windows": ["1d_click"]},
+                                                  {"value": "9", "attribution_windows": ["7d_click"]}]}]
+    )
+    entry = performance_signals._goal_volume([row], 7)[0]
+    assert entry["verdict"] == "not_assessed"
+    assert "attribution" in entry["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Round three: one entity's result definition is never applied to another (G19)
+# ---------------------------------------------------------------------------
+
+
+def test_g19_ranking_does_not_borrow_another_ads_result_definition(monkeypatch) -> None:
+    ranked = [
+        {"ad_id": str(ad_id), "spend": str(spend), "impressions": "1000",
+         **{field: "AVERAGE" for field in performance_signals.RANKING_FIELDS}}
+        for ad_id, spend in ((20, 20), (21, 10))
+    ]
+
+    def handler(object_id, fields, params):
+        return {"data": ranked if params["level"] == "ad" else [{"spend": "30", "impressions": "2000", "clicks": "20"}]}
+
+    async def costs(*args, **kwargs):
+        return {
+            "20": {"ad_id": "20", "clicks": "10"},
+            "21": {"ad_id": "21", "clicks": "10", "results": [{"indicator": "actions:lead", "values": [{"value": "2"}]}]},
+        }, None
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    monkeypatch.setattr(performance_signals, "_ranking_cost_rows", costs)
+    result = asyncio.run(performance_signals.get_auction_ranking_report("campaign", "10", max_ads=2))
+    unknown = next(ad for ad in result["ranked_ads"] if ad["ad_id"] == "20")
+    assert unknown["result_indicator"] is None, unknown
+    assert unknown["results"] is None, unknown
+    assert unknown["diagnosis"] is None, unknown
+    assert unknown["result_status"] == "not_reported"
+    known = next(ad for ad in result["ranked_ads"] if ad["ad_id"] == "21")
+    assert known["result_indicator"] == "actions:lead" and known["results"] == 2.0
+    # The pooled baseline for leads uses only the ad that reports leads: 10 / 2.
+    assert known["cost_per_result_baseline"]["value"] == pytest.approx(5.0)
+    # The pooled scope total cannot count ad 20's spend against leads it may not optimize for.
+    assert result["scope_metrics"]["results"] is None
+    assert result["scope_metrics"]["cost_per_result"] is None
+
+
+def test_g19_unknown_goal_is_not_judged_from_another_entitys_results() -> None:
+    rows = [
+        {"adset_id": "20", "optimization_goal": "LEAD_GENERATION", "metrics": {"spend": 10},
+         "meta_result": {"status": "read", "indicator": "actions:lead", "value": 50}},
+        {"adset_id": "21", "optimization_goal": "OFFSITE_CONVERSIONS", "metrics": {"spend": 20},
+         "meta_result": {"status": "absent"}},
+    ]
+    result = performance_signals._goal_volume(rows, 7)
+    unknown = next(goal for goal in result if goal["optimization_goal"] == "OFFSITE_CONVERSIONS")
+    assert unknown["verdict"] == "not_assessed", unknown
+    assert "promoted_object" in unknown["reason"]
+    lead = next(goal for goal in result if goal["optimization_goal"] == "LEAD_GENERATION")
+    assert lead["verdict"] == "all_adsets_meet_threshold"
+
+
+def test_g19_same_goal_absent_result_is_not_zero_from_a_sibling() -> None:
+    rows = [
+        {"adset_id": "20", "optimization_goal": "VALUE", "metrics": {"spend": 10},
+         "meta_result": {"status": "read", "indicator": "actions:offsite_conversion.fb_pixel_purchase", "value": 80}},
+        {"adset_id": "21", "optimization_goal": "VALUE", "metrics": {"spend": 20}, "meta_result": {"status": "absent"}},
+    ]
+    entry = performance_signals._goal_volume(rows, 7)[0]
+    assert entry["adsets_meeting_threshold"] == 1
+    assert entry["adsets_below_threshold"] == 0
+    assert entry["adsets_not_judged"] == 1
+    assert entry["verdict"] == "judged_adsets_meet_threshold"
+
+
+def test_g19_absent_result_with_a_known_goal_event_uses_that_ad_sets_own_actions() -> None:
+    rows = [
+        {"adset_id": "20", "optimization_goal": "OFFSITE_CONVERSIONS", "metrics": {"spend": 10},
+         "meta_result": {"status": "read", "indicator": "actions:offsite_conversion.fb_pixel_purchase", "value": 80}},
+        {"adset_id": "21", "optimization_goal": "LINK_CLICKS", "metrics": {"spend": 20},
+         "actions_map": {"link_click": 30}, "meta_result": {"status": "absent"}},
+    ]
+    volume = {entry["optimization_goal"]: entry for entry in performance_signals._goal_volume(rows, 7)}
+    clicks = volume["LINK_CLICKS"]
+    assert clicks["verdict"] == "no_adsets_meet_threshold"
+    assert clicks["top_below_threshold"][0]["events"] == 30
+    assert "link_click" in clicks["event_basis"]
+
+
+def test_g19_group_spend_does_not_count_a_sibling_without_results_as_zero(monkeypatch) -> None:
+    rows = [dict(row) for row in CONTEXT_ROWS]
+    rows[0]["results"] = _meta_result("actions:offsite_conversion.fb_pixel_purchase", 300)
+    client = _context_client()
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
+    by_objective = {row["objective"]: row for row in result["spend_by_objective"]}
+    sales = by_objective["OUTCOME_SALES"]
+    assert sales["results"] is None and sales["cost_per_result"] is None
+    assert sales["adsets_without_reported_result"] == 1
+    assert sales["result_indicator"] == "actions:offsite_conversion.fb_pixel_purchase"
+
+
+def test_g19_trend_entities_each_keep_their_own_result(monkeypatch) -> None:
+    rows = {
+        "111": [_day_row("2026-11-01", spend=10, impressions=100, clicks=5, result=("actions:lead", 2)),
+                _day_row("2026-11-02", spend=10, impressions=100, clicks=5)],
+        "222": [_day_row("2026-11-01", spend=30, impressions=300, clicks=15),
+                _day_row("2026-11-02", spend=30, impressions=300, clicks=15)],
+    }
+    _patch(monkeypatch, RecordingClient(insights_handler=_per_object_handler(rows)))
+    trend = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_ids=["111", "222"], since="2026-11-01", until="2026-11-02",
+    ))
+    entities = {entity["object_id"]: entity for entity in trend["entities"]}
+    # The same entity reported leads on another day, so its silent day counts zero leads.
+    assert entities["111"]["totals"]["inputs"]["results"] == 2.0
+    # The other entity never reported a result, so nothing is borrowed from the first.
+    assert entities["222"]["result"]["status"] == "not_reported"
+    assert entities["222"]["totals"]["inputs"]["results"] is None
