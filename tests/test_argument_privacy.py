@@ -393,3 +393,100 @@ def test_every_tool_with_a_sensitive_parameter_is_in_the_private_list():
 
 def test_the_private_list_names_only_registered_tools():
     assert PRIVATE_ARGUMENT_TOOLS <= set(_tools()), sorted(PRIVATE_ARGUMENT_TOOLS - set(_tools()))
+
+
+# --- Round-three review H14: credentials nested inside free-form arguments ---------
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+def test_h14_catalog_settings_tool_is_private_before_body_validation(routed, caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = "R3TOKEN7"
+    arguments = {
+        "catalog_id": {"misplaced_token": secret},
+        "params": {"partner_integration": {"external_access_token": secret}},
+    }
+    with pytest.raises((ToolError, MCPValidationError)) as info:
+        _call("update_catalog", arguments, routed)
+    assert secret not in _rendered_chain(info.value)
+    assert "catalog_id" in str(info.value)
+    _assert_not_logged(caplog, secret)
+
+
+# Tools whose credentials arrive inside free-form or nested arguments, where the
+# parameter-name guard above cannot see them. Reviewed by hand: when a tool
+# starts accepting a credential inside params or a nested object, add it here.
+CREDENTIALS_INSIDE_NESTED_ARGUMENTS = {
+    # params.partner_integration.external_access_token (catalogs.py masks it in current).
+    "update_catalog": "params.partner_integration.external_access_token",
+    # params is merged into the create request, which takes the same catalog settings.
+    "create_catalog": "params.partner_integration.external_access_token",
+    # schedule and update_schedule carry a feed host's username and password.
+    "create_product_feed": "schedule.password, update_schedule.password",
+    "update_product_feed": "schedule.password, update_schedule.password",
+    # Product and image URLs can carry a login, inside params or batch items.
+    "create_catalog_product": "params.url, params.image_url",
+    "update_catalog_product": "params.url, params.image_url",
+    "batch_update_catalog_products": "items[].url, items[].image_url",
+    # Card and media URLs can carry a login.
+    "create_ad_creative_from_inputs": "cards[].link, multi_media[].url",
+}
+
+
+@pytest.mark.parametrize("tool_name", sorted(CREDENTIALS_INSIDE_NESTED_ARGUMENTS))
+def test_h14_tools_with_credentials_inside_nested_arguments_are_private(tool_name):
+    assert tool_name in _tools(), f"{tool_name} is no longer registered; update the reviewed list"
+    assert tool_name in PRIVATE_ARGUMENT_TOOLS, (
+        f"{tool_name} carries {CREDENTIALS_INSIDE_NESTED_ARGUMENTS[tool_name]} and must be in "
+        "PRIVATE_ARGUMENT_TOOLS in meta_ads_mcp/argument_privacy.py"
+    )
+
+
+# Helpers a tool calls when its own input can hold a credential: masking what it
+# sent, redacting a request preview, or refusing a URL that carries a login.
+_CREDENTIAL_HELPERS = frozenset({"_mask_secrets", "_redacted", "refuse_url_credentials"})
+
+
+def _tools_using_credential_helpers() -> dict[str, set[str]]:
+    """Registered tools whose code reaches a credential helper, following module-level calls."""
+    import ast
+
+    import meta_ads_mcp.tools as tools_package
+
+    registered = set(_tools())
+    found: dict[str, set[str]] = {}
+    for path in sorted(Path(tools_package.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        direct = {
+            name: {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
+            for name, function in functions.items()
+        }
+
+        def reached(name: str, seen: set[str], direct=direct, functions=functions) -> set[str]:
+            helpers = direct[name] & _CREDENTIAL_HELPERS
+            for called in direct[name] & set(functions):
+                if called not in seen:
+                    seen.add(called)
+                    helpers |= reached(called, seen)
+            return helpers
+
+        for name in set(functions) & registered:
+            helpers = reached(name, {name})
+            if helpers:
+                found[name] = helpers
+    return found
+
+
+def test_h14_tools_that_mask_or_refuse_their_own_credentials_are_private():
+    found = _tools_using_credential_helpers()
+    assert {"update_catalog", "create_ad_creative_from_inputs"} <= set(found), found
+    missing = {name: sorted(helpers) for name, helpers in found.items() if name not in PRIVATE_ARGUMENT_TOOLS}
+    assert not missing, (
+        "These tools mask, redact or refuse credentials in their own input, so their argument "
+        f"errors must not quote values; add them to PRIVATE_ARGUMENT_TOOLS: {missing}"
+    )
