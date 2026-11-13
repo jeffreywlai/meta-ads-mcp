@@ -46,6 +46,7 @@ LIVE_VERIFIED_TOOLS: frozenset[str] = frozenset(
         "export_change_history",
         "get_ad_account",
         "get_ad_study",
+        "get_advertiser_context",
         "get_auction_ranking_report",
         "get_audience",
         "get_catalog_diagnostics",
