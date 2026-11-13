@@ -61,6 +61,17 @@ CATALOG_EXTRA_READABLE = {
 # Keys inside a catalog setting that hold credentials (partner_integration's
 # external_access_token); they are sent but never shown back.
 _SECRET_SETTING_KEYS = frozenset({"external_access_token", "access_token", "password"})
+# Where a caller's input keys are field names, so that a key naming a password or token
+# holds one: the tool's named parameters, the Graph params passed through to Meta, and
+# params.partner_integration (external_access_token). Every other mapping (a product's
+# custom_data, a product set filter, a batch item's fields) is not searched by key name;
+# a password inside a URL is found anywhere.
+_CATALOG_CREDENTIAL_PATHS = frozenset({(), ("params",), ("params", "partner_integration")})
+# Keys whose value is a data map whose own keys are the advertiser's values, never field
+# names: a product's custom data and variant attributes, and a product set filter (keyed by
+# whatever product fields and values the advertiser filters on). A key inside one is never
+# masked as a credential, so the values shown are the values sent.
+_CATALOG_DATA_MAP_KEYS = frozenset({"custom_data", "additional_variant_attributes", "filter"})
 # Allowed `vertical` values on POST /{business_id}/owned_product_catalogs.
 CATALOG_VERTICALS = (
     "adoptable_pets", "apps_and_software", "articles_and_publications", "commerce",
@@ -357,15 +368,20 @@ async def _read_previous(
     return await client.get_object(object_id, fields=list(base_fields)), extra
 
 
-def _mask_secrets(value: Any) -> Any:
-    """Return value with credential keys replaced, for showing what was sent."""
+def _mask_secrets(value: Any, *, in_data: bool = False) -> Any:
+    """Return value with credential keys replaced, for showing what was sent.
+
+    A key is taken to name a credential only where keys are field names: not inside a
+    data map (_CATALOG_DATA_MAP_KEYS), whose keys are the advertiser's own values.
+    """
     if isinstance(value, dict):
         return {
-            key: "[redacted]" if str(key).lower() in _SECRET_SETTING_KEYS and item is not None else _mask_secrets(item)
+            key: "[redacted]" if not in_data and str(key).lower() in _SECRET_SETTING_KEYS and item is not None
+            else _mask_secrets(item, in_data=in_data or key in _CATALOG_DATA_MAP_KEYS)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_mask_secrets(item) for item in value]
+        return [_mask_secrets(item, in_data=in_data) for item in value]
     return value
 
 
@@ -388,7 +404,7 @@ def _refuse_url_logins_in(**values: Any) -> None:
 
 def _shown(value: Any) -> Any:
     """Copy a value for a response: URL passwords and credential keys are masked."""
-    return _mask_secrets(_redact(value))
+    return _mask_secrets(_redact(value, _CATALOG_DATA_MAP_KEYS))
 
 
 def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
@@ -401,7 +417,7 @@ def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
     is removed wherever Meta repeats it, in the result or in an error and every error
     behind it.
     """
-    return _guard_secrets(fn, _shown)
+    return _guard_secrets(fn, _shown, _CATALOG_CREDENTIAL_PATHS)
 
 
 def _row_identity(row: Any) -> str | None:
@@ -1905,12 +1921,21 @@ _NO_MESSAGE_WARNING = "Meta reported a warning for this item without a message."
 
 
 def _entry_list(entries: Any) -> list[Any]:
-    """Return Meta's error or warning entries as a list; an empty value means none."""
+    """Return Meta's error or warning entries as a list; an empty value means none.
+
+    A null inside a list is left out here; _null_entries counts it, because Meta listed
+    something there that cannot be read.
+    """
     if entries is None or entries == "" or entries == [] or entries == {}:
         return []
     if isinstance(entries, list):
         return [entry for entry in entries if entry is not None]
     return [entries]
+
+
+def _null_entries(entries: Any) -> int:
+    """How many entries of a listed value are null: listed by Meta, but unreadable."""
+    return sum(1 for entry in entries if entry is None) if isinstance(entries, list) else 0
 
 
 def _entry_text(entry: Any, generic: str) -> str:
@@ -1974,11 +1999,22 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
     in the batch is known to belong to a named item, so an item not named can be
     called applied: Meta gave an explicit zero error count, or Meta listed the
     invalid requests by id, or every error counted is listed with an item id.
-    An error entry that names no item, or a missing error count, leaves every
-    item not named unknown; reason says which.
+    An error entry that names no item, an invalid-request entry that cannot be read
+    as an id (null, blank, an object), or a missing error count, leaves every item
+    not named unknown; reason says which.
     """
-    invalid = {str(value).strip() for value in row.get("ids_of_invalid_requests") or []
-               if value is not None and str(value).strip()}
+    raw_invalid = row.get("ids_of_invalid_requests")
+    raw_invalid = _entry_list(raw_invalid) + [None] * _null_entries(raw_invalid)
+    invalid: set[str] = set()
+    unreadable_invalid = 0
+    for value in raw_invalid:
+        # Meta documents these as the requests' ids; a single id given without a list is
+        # read as one id, never character by character.
+        text = str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+        if text:
+            invalid.add(text)
+        else:
+            unreadable_invalid += 1
     listed = row.get("errors") or []
     if not isinstance(listed, list):
         listed = [listed]
@@ -1992,6 +2028,10 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
         reason = ("Meta did not report how many errors the batch had"
                   + (", and listed errors" if listed else "")
                   + ", so items it did not name cannot be called applied.")
+    elif unreadable_invalid:
+        complete = False
+        reason = (f"Meta listed {unreadable_invalid} invalid request(s) whose id could not be read, so any "
+                  "item it did not name may be among them.")
     elif unnamed:
         complete = False
         reason = (f"Meta listed {unnamed} error(s) that name no item, so any item it did not name "
@@ -2011,7 +2051,8 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
             str(message) if message else "Meta reported an error for this item."
         )
     return {"failed_ids": failed_ids, "errors_by_id": errors_by_id, "complete": complete,
-            "reason": reason, "errors_total_count": error_total, "unattributed_errors": unnamed}
+            "reason": reason, "errors_total_count": error_total, "unattributed_errors": unnamed,
+            "unreadable_invalid_ids": unreadable_invalid}
 
 
 _UNFINISHED_REASON = (
@@ -2025,6 +2066,7 @@ def _settle(
     *,
     unfinished_reason: str | None = None,
     unattributed_submission_errors: int = 0,
+    unreadable_submission_entries: int = 0,
 ) -> None:
     """Set a sent item's outcome from the status of every handle of its batch.
 
@@ -2033,8 +2075,11 @@ def _settle(
     holds which item, so an item is applied only when every handle is finished
     and every error in every handle is attributed to a named item. An item Meta
     named as failed in any handle is failed. An item flagged when the batch was
-    submitted (validation_status), even by an error without a message, is never
-    called applied; nor is any item when a submission error named no item.
+    submitted (validation_status), even by an error without a message or by an
+    error entry that cannot be read, is never called applied; nor is any item
+    when a submission error named no item, or when the submission answer held an
+    entry that cannot be read and so cannot be tied to an item
+    (unreadable_submission_entries).
     """
     rows = [rows] if isinstance(rows, dict) else list(rows)
     attributions = [_batch_attribution(row) for row in rows]
@@ -2061,12 +2106,23 @@ def _settle(
             "Meta listed errors for this item when the batch was submitted, but the finished batch "
             "did not name it as failed. Read the product before resending."
         )
+    elif item.get("submission_unreadable_error_count"):
+        item["outcome"] = "outcome_unknown"
+        item["reason"] = (
+            f"Meta listed {item['submission_unreadable_error_count']} error entr"
+            f"{'y' if item['submission_unreadable_error_count'] == 1 else 'ies'} for this item when the batch "
+            "was submitted that could not be read, so whether it was applied is unknown. Read the product "
+            "before resending."
+        )
     elif unattributed_submission_errors:
         item["outcome"] = "outcome_unknown"
         item["reason"] = (
             f"Meta listed {unattributed_submission_errors} error(s) when the batch was submitted that name no "
             "item in it, so this item may be among them. Read the product before resending."
         )
+    elif unreadable_submission_entries:
+        item["outcome"] = "outcome_unknown"
+        item["reason"] = _unreadable_submission_reason(unreadable_submission_entries)
     elif attributions and all(attribution["complete"] for attribution in attributions):
         item["outcome"] = "applied"
     else:
@@ -2075,6 +2131,14 @@ def _settle(
             (attribution["reason"] for attribution in attributions if not attribution["complete"]),
             "No finished batch status was read, so the outcome is unknown.",
         )
+
+
+def _unreadable_submission_reason(unreadable: int) -> str:
+    return (
+        f"Meta's answer to the submission held {unreadable} entr{'y' if unreadable == 1 else 'ies'} that could "
+        "not be read (an entry that is not an object, or a null error), so it cannot be tied to an item and this "
+        "item may be among them. Read the product before resending."
+    )
 
 
 def _unreadable_handles_reason(unreadable: int, returned: int) -> str:
@@ -2124,8 +2188,9 @@ def _retry_statement(outcomes: set[str], handles: list[str] | str | None) -> dic
 async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, Any]:
     row = await _check_batch(client, catalog_id, handle)
     finished = _is_finished(row)
-    errors = [entry for entry in row.get("errors") or [] if isinstance(entry, dict)]
-    warnings = [entry for entry in row.get("warnings") or [] if isinstance(entry, dict)]
+    # A single object given without a list is one entry, not a list of its keys.
+    errors = [entry for entry in _entry_list(row.get("errors")) if isinstance(entry, dict)]
+    warnings = [entry for entry in _entry_list(row.get("warnings")) if isinstance(entry, dict)]
     attribution = _batch_attribution(row)
     failed = sorted(attribution["failed_ids"])
     if not finished:
@@ -2138,6 +2203,8 @@ async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, 
         "complete": attribution["complete"] if finished else None,
         "unattributed_errors": attribution["unattributed_errors"],
     }
+    if attribution["unreadable_invalid_ids"]:
+        attribution_view["unreadable_invalid_ids"] = attribution["unreadable_invalid_ids"]
     if finished and attribution["reason"]:
         attribution_view["reason"] = attribution["reason"]
     return {
@@ -2369,8 +2436,15 @@ async def batch_update_catalog_products(
             sent_ids = {item["retailer_id"] for item in to_send}
             flagged: dict[str, list[dict[str, Any]]] = {}
             unattributed: list[str] = []
-            for entry in _entry_list(posted.get("validation_status")):
+            # Evidence that cannot be read is counted, never skipped: a validation_status entry
+            # that is not an object (null, text, a number), and a null error inside an entry
+            # that names no item in this batch. Neither can be tied to an item.
+            validation_status = posted.get("validation_status")
+            unreadable_entries = _null_entries(validation_status)
+            unreadable_unattributed_errors = 0
+            for entry in _entry_list(validation_status):
                 if not isinstance(entry, dict):
+                    unreadable_entries += 1
                     continue
                 raw_id = entry.get("retailer_id")
                 entry_id = str(raw_id).strip() if raw_id is not None else ""
@@ -2378,6 +2452,7 @@ async def batch_update_catalog_products(
                     flagged.setdefault(entry_id, []).append(entry)
                 else:
                     unattributed.extend(_messages(entry.get("errors")))
+                    unreadable_unattributed_errors += _null_entries(entry.get("errors"))
             for item in to_send:
                 statuses = flagged.get(item["retailer_id"], [])
                 item["errors"] = [text for status in statuses for text in _messages(status.get("errors"))]
@@ -2387,13 +2462,30 @@ async def batch_update_catalog_products(
                 # The count is kept apart from the texts, so an error is never lost for want of a message.
                 if item["errors"]:
                     item["submission_error_count"] = len(item["errors"])
-            if unattributed:
-                response["submission"] = {
-                    "unattributed_errors": unattributed[:20],
-                    "unattributed_error_count": len(unattributed),
-                    "note": ("Meta's answer to the submission listed these errors without naming an item in "
-                             "this batch, so no item can be called applied."),
-                }
+                # A null error entry for this item cannot be read, but Meta listed it.
+                unreadable_errors = sum(_null_entries(status.get("errors")) for status in statuses)
+                if unreadable_errors:
+                    item["submission_unreadable_error_count"] = unreadable_errors
+            unreadable_submission = unreadable_entries + unreadable_unattributed_errors
+            if unattributed or unreadable_submission:
+                submission: dict[str, Any] = {}
+                if unattributed:
+                    submission.update({
+                        "unattributed_errors": unattributed[:20],
+                        "unattributed_error_count": len(unattributed),
+                    })
+                if unreadable_entries:
+                    submission["unreadable_entries"] = unreadable_entries
+                if unreadable_unattributed_errors:
+                    submission["unreadable_error_entries"] = unreadable_unattributed_errors
+                submission["note"] = (
+                    "Meta's answer to the submission listed "
+                    + ("errors without naming an item in this batch" if unattributed else "")
+                    + (" and " if unattributed and unreadable_submission else "")
+                    + ("entries that could not be read" if unreadable_submission else "")
+                    + ", so no item can be called applied."
+                )
+                response["submission"] = submission
             raw_handles = posted.get("handles")
             raw_handles = raw_handles if isinstance(raw_handles, list) else _entry_list(raw_handles)
             # Meta documents handles as strings. Any other entry (an object, null, true, a
@@ -2427,7 +2519,8 @@ async def batch_update_catalog_products(
                         )
                 for item in to_send:
                     _settle(item, finished_rows, unfinished_reason=unfinished_reason,
-                            unattributed_submission_errors=len(unattributed))
+                            unattributed_submission_errors=len(unattributed),
+                            unreadable_submission_entries=unreadable_submission)
                     if unreadable_handles and item["outcome"] == "applied":
                         item["outcome"] = "outcome_unknown"
                         item["reason"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))

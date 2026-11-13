@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import logging
+import re
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 import pytest
 from fastmcp.exceptions import ToolError
@@ -2861,11 +2865,18 @@ def test_long_secret_is_removed_wherever_it_occurs() -> None:
 
 
 def test_secret_forms_cover_encoded_and_escaped_repeats() -> None:
+    from meta_ads_mcp.tools import catalogs
+
     secret = ' pa"ss word/1 '
-    forms = catalog_feeds._caller_secrets({"schedule": {"password": secret}})
+    found = catalog_feeds._caller_secrets({"schedule": {"password": secret}})
+    assert found == [secret.strip()]
     for form in (secret, secret.strip(), "pa%22ss%20word%2F1", "pa%22ss+word%2F1", 'pa\\"ss word/1'):
-        assert form in forms
-    assert catalog_feeds._caller_secrets({"params": {"partner_integration": {"api_key": "k" * 9}}}) == ["k" * 9]
+        error = MetaApiError("echo " + form + " end", code=100)
+        catalog_feeds._scrub_known_secrets(error, found)
+        assert form.strip() not in error.message and "[redacted]" in error.message
+    assert catalog_feeds._caller_secrets(
+        {"params": {"partner_integration": {"api_key": "k" * 9}}}, catalogs._CATALOG_CREDENTIAL_PATHS,
+    ) == ["k" * 9]
     assert catalog_feeds._caller_secrets({"name": "plain", "params": {"note": "text"}}) == []
     url_password = catalog_feeds._caller_secrets({"params": {"x": "see https://u:" + _KNOWN_SECRET + "@h.invalid/"}})
     assert _KNOWN_SECRET in url_password
@@ -2982,3 +2993,281 @@ def test_later_page_refusal_without_samples_still_raises(monkeypatch) -> None:
     ))
     with pytest.raises(MetaApiError):
         run(catalog_feeds.list_product_feed_uploads("10", upload_id="20", include_samples=True, error_limit=200))
+
+
+# round six: encoded secrets in errors, short passwords in results, data maps -----------------
+
+
+_R6_SECRET = "".join(("R5+credential", "/part=9"))
+# Every kind of character an encoder treats differently: space, slash, plus, quote, backslash,
+# HTML-sensitive characters, characters some encoders leave as they are, a non-ASCII letter,
+# and a character outside the Basic Multilingual Plane.
+_R6_ENCODED_SECRET = "".join(("R6 pass/w", "örd+\"x\\<&>~!*'()=", "\U0001F511"))
+
+
+def _lowercase_escapes(text: str) -> str:
+    return re.sub(r"%[0-9A-F]{2}", lambda match: match[0].lower(), text)
+
+
+def _encoded_forms(secret: str) -> dict[str, str]:
+    """The ways an upstream error or result can plausibly write a supplied secret."""
+    escaped = json.dumps(secret)[1:-1]
+    return {
+        "url_encoded": quote(secret, safe=""),
+        "url_encoded_lowercase": _lowercase_escapes(quote(secret, safe="")),
+        "slash_preserved": quote(secret),
+        "slash_preserved_lowercase": _lowercase_escapes(quote(secret)),
+        "component_safe_set": quote(secret, safe="/~!*'()"),
+        "form_encoded": quote_plus(secret),
+        "form_encoded_lowercase": _lowercase_escapes(quote_plus(secret)),
+        "double_encoded": quote(quote(secret, safe=""), safe=""),
+        "double_encoded_lowercase": _lowercase_escapes(quote(quote(secret, safe=""), safe="")),
+        "form_then_url_encoded": quote(quote_plus(secret), safe=""),
+        "json": escaped,
+        "json_unicode": json.dumps(secret, ensure_ascii=False)[1:-1],
+        "json_uppercase_unicode_escapes": re.sub(r"\\u([0-9a-f]{4})", lambda m: "\\u" + m[1].upper(), escaped),
+        "json_escaped_slash": escaped.replace("/", "\\/"),
+        "json_html_safe": escaped.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"),
+        "json_of_url_encoded": json.dumps(quote(secret))[1:-1].replace("/", "\\/"),
+    }
+
+
+@pytest.mark.parametrize("tool", ["create_product_feed_upload", "create_catalog"])
+@pytest.mark.parametrize("encoding", ["slash_preserved", "lowercase_escapes"])
+def test_known_credentials_are_removed_from_encoded_errors(monkeypatch, caplog, tool, encoding) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+    from meta_ads_mcp.tools import catalogs
+
+    secret = _R6_SECRET
+    encoded = quote(secret) if encoding == "slash_preserved" else _lowercase_escapes(quote(secret, safe=""))
+
+    class Echo(FakeCatalogFeedClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            raise MetaApiError("Rejected credential " + encoded, code=100, user_message="Invalid " + encoded)
+
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    client = Echo()
+    monkeypatch.setattr(catalogs, "get_graph_api_client", lambda: client)
+    _use(monkeypatch, client)
+    arguments = {
+        "create_product_feed_upload": {
+            "feed_id": "10", "url": "https://example.invalid/feed.csv", "username": "feed-user", "password": secret,
+        },
+        "create_catalog": {
+            "business_id": "10", "name": "C", "params": {"partner_integration": {"external_access_token": secret}},
+        },
+    }[tool]
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        run(mcp_server.call_tool(tool, arguments))
+    assert encoded not in str(error.value)
+    assert encoded not in _all_error_text(error.value)
+    assert encoded not in caplog.text
+
+
+@pytest.mark.parametrize("form", list(_encoded_forms(_R6_ENCODED_SECRET)))
+def test_known_secret_is_removed_from_an_error_in_every_encoding(form) -> None:
+    text = _encoded_forms(_R6_ENCODED_SECRET)[form]
+    error = MetaApiError("before " + text + " after", code=100, user_message="see " + text)
+    catalog_feeds._scrub_known_secrets(error, [_R6_ENCODED_SECRET])
+    assert error.message == "before [redacted] after"
+    assert error.user_message == "see [redacted]"
+
+
+@pytest.mark.parametrize("form", list(_encoded_forms(_R6_ENCODED_SECRET)))
+def test_known_secret_is_removed_from_a_successful_result_in_every_encoding(monkeypatch, form) -> None:
+    text = _encoded_forms(_R6_ENCODED_SECRET)[form]
+    result, _ = _upload_answering(monkeypatch, _R6_ENCODED_SECRET, {"id": "20", "message": "fetched " + text})
+    assert result["created"]["message"] == "fetched [redacted]"
+
+
+def test_letters_of_a_secret_stay_case_sensitive() -> None:
+    # Only the hex digits of an escape match in either case; the secret's own letters do not.
+    other = _R6_SECRET.upper()
+    for text in (other, quote(other, safe=""), _lowercase_escapes(quote(other, safe=""))):
+        error = MetaApiError("echo " + text, code=100)
+        catalog_feeds._scrub_known_secrets(error, [_R6_SECRET])
+        assert error.message == "echo " + text
+
+
+class _AnsweringUploadClient(FakeCatalogFeedClient):
+    def __init__(self, answer: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.answer = answer
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        await super().create_edge_object(parent_id, edge, data=data, files=files)
+        return dict(self.answer)
+
+
+def _upload_answering(monkeypatch, password: str, answer: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+    client = _use(monkeypatch, _AnsweringUploadClient(answer))
+    result = run(catalog_feeds.create_product_feed_upload(
+        feed_id="10", url="https://example.invalid/feed.csv", username="feed-user", password=password,
+    ))
+    return result, client
+
+
+def test_realistic_short_password_is_removed_from_successful_upstream_text(monkeypatch) -> None:
+    secret = "".join(("S3", "cur3!"))
+    result, _ = _upload_answering(monkeypatch, secret, {"id": "20", "message": "Fetched with credential " + secret})
+    assert secret not in json.dumps(result)
+    assert result["created"]["message"] == "Fetched with credential [redacted]"
+
+
+_SEVEN = "".join(("S3", "cur3!"))
+
+
+@pytest.mark.parametrize(("password", "message", "shown"), [
+    # Seven characters inside a sentence, beside punctuation, and between underscores.
+    (_SEVEN, "Login " + _SEVEN + " failed, retried (" + _SEVEN + ").",
+     "Login [redacted] failed, retried ([redacted])."),
+    (_SEVEN, "id_" + _SEVEN + "_x", "id_[redacted]_x"),
+    # The same seven characters inside a longer word or id are left alone.
+    (_SEVEN, "item x" + _SEVEN + " and " + _SEVEN + "9 and abc" + _SEVEN + "def",
+     "item x" + _SEVEN + " and " + _SEVEN + "9 and abc" + _SEVEN + "def"),
+    # Four characters: the floor of the whole-token band.
+    ("".join(("ab", "cd")), "user abcd logged in; abcdef kept", "user [redacted] logged in; abcdef kept"),
+    # Eight characters or more: removed wherever they occur.
+    ("".join(("pass", "word8")), "xxpassword8yy", "xx[redacted]yy"),
+])
+def test_successful_result_scrubs_a_supplied_password_by_its_length(monkeypatch, password, message, shown) -> None:
+    result, _ = _upload_answering(monkeypatch, password, {"id": "20", "message": message})
+    assert result["created"]["message"] == shown
+
+
+def test_three_character_password_leaves_ordinary_words_in_a_result(monkeypatch) -> None:
+    message = "Fetched feed.csv as csv; csv rows read"
+    result, client = _upload_answering(monkeypatch, "csv", {"id": "20", "message": message})
+    assert result["created"]["message"] == message
+    assert client.calls[0]["data"]["password"] == "csv"
+
+
+@pytest.mark.parametrize("password", ["csv", "".join(("S3", "cur3!")), "".join(("long", "password-9"))])
+def test_value_under_a_password_key_is_masked_whatever_its_length(monkeypatch, password) -> None:
+    answer = {"id": "20", "request": {"username": "feed-user", "password": password}, "schedule": {"password": "x"}}
+    result, _ = _upload_answering(monkeypatch, password, answer)
+    assert result["created"]["request"] == {"username": "feed-user", "password": "[redacted]"}
+    assert result["created"]["schedule"] == {"password": "[redacted]"}
+
+
+@pytest.mark.parametrize("password", ["".join(("x", "9")), "csv"])
+def test_short_password_is_removed_from_errors_whatever_its_length(monkeypatch, caplog, password) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    class Refuse(FakeCatalogFeedClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            raise MetaApiError("Bad login " + password + " for the feed", code=100)
+
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    _use(monkeypatch, Refuse())
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        run(mcp_server.call_tool("create_product_feed_upload", {
+            "feed_id": "10", "url": "https://example.invalid/feed.csv", "username": "feed-user", "password": password,
+        }))
+    assert "Bad login [redacted] for the feed" in _all_error_text(error.value)
+    assert "login " + password + " " not in _all_error_text(error.value)
+    assert "login " + password + " " not in caplog.text
+
+
+def test_value_mapping_product_text_is_not_mistaken_for_a_credential(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"20": {
+        "id": "20", "attribute": "brand", "rule_type": "value_mapping_rule", "params": {"secret": "Old Brand"},
+    }}))
+    new_params = {"secret": "Secret Escapes"}
+    result = run(catalog_feeds.update_feed_rule("20", new_params, dry_run=True))
+    assert result["current"]["params"] == new_params
+    assert result["would_send"]["data"]["params"] == new_params
+    assert client.methods() == ["get_object"]
+
+
+_PRODUCT_TEXT_MAPPING = {"password": "Kennwort", "Secret": "Secret Escapes", "token": "Jeton", "api_key": "Key"}
+
+
+def test_feed_rule_value_mapping_is_shown_and_sent_as_written(monkeypatch) -> None:
+    rule = {"id": "20", "attribute": "brand", "rule_type": "value_mapping_rule", "params": {"password": "Old"}}
+    dry = _use(monkeypatch, FakeCatalogFeedClient(objects={"20": dict(rule)}))
+    planned = run(catalog_feeds.update_feed_rule("20", dict(_PRODUCT_TEXT_MAPPING), dry_run=True))
+    assert dry.methods() == ["get_object"]
+    real = _use(monkeypatch, FakeCatalogFeedClient(objects={"20": dict(rule)}))
+    sent = run(catalog_feeds.update_feed_rule("20", dict(_PRODUCT_TEXT_MAPPING)))
+    update = next(call for call in real.calls if call["method"] == "update_object")
+    # The dry run shows exactly the request a real run sends.
+    assert planned["would_send"]["data"] == update["data"] == {"params": _PRODUCT_TEXT_MAPPING}
+    assert planned["current"]["params"] == sent["current"]["params"] == _PRODUCT_TEXT_MAPPING
+    assert planned["previous"]["params"] == sent["previous"]["params"] == {"password": "Old"}
+
+
+def test_listed_and_deleted_feed_rules_show_their_value_mapping_as_read(monkeypatch) -> None:
+    rule = {"id": "20", "attribute": "brand", "rule_type": "value_mapping_rule", "params": dict(_PRODUCT_TEXT_MAPPING)}
+    _use(monkeypatch, FakeCatalogFeedClient(objects={"20": dict(rule)}, edges={("10", "rules"): {"data": [rule]}}))
+    listed = run(catalog_feeds.list_feed_rules("10"))
+    assert listed["items"][0]["params"] == _PRODUCT_TEXT_MAPPING
+    deleted = run(catalog_feeds.delete_feed_rule("20"))
+    assert deleted["previous"]["params"] == _PRODUCT_TEXT_MAPPING
+
+
+def test_feed_rule_product_text_is_kept_in_an_error(monkeypatch) -> None:
+    class Refuse(FakeCatalogFeedClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            raise MetaApiError("Duplicate mapping for Secret Escapes", code=100)
+
+    _use(monkeypatch, Refuse())
+    with pytest.raises(MetaApiError) as error:
+        run(catalog_feeds.create_feed_rule("10", "brand", "value_mapping_rule", {"secret": "Secret Escapes"}))
+    assert error.value.message == "Duplicate mapping for Secret Escapes"
+
+
+def test_url_password_inside_a_data_map_is_still_a_secret(monkeypatch) -> None:
+    secret = "".join(("url-pass", "word-r6"))
+    params = {"user_default_value": "https://u:" + secret + "@h.invalid/default.png"}
+
+    class Refuse(FakeCatalogFeedClient):
+        async def update_object(self, object_id: str, *, data):
+            raise MetaApiError("Rejected value " + quote(secret), code=100)
+
+    _use(monkeypatch, Refuse(objects={"20": {"id": "20", "rule_type": "fallback_rule", "params": {}}}))
+    with pytest.raises(MetaApiError) as error:
+        run(catalog_feeds.update_feed_rule("20", params))
+    assert error.value.message == "Rejected value [redacted]"
+
+
+def test_secrets_are_collected_only_where_keys_are_field_names() -> None:
+    from meta_ads_mcp.tools import catalogs
+
+    feed_arguments = {
+        "password": "upload-pass-1",
+        "schedule": {"url": "https://h.invalid/f.csv", "password": "schedule-pass-2", "username": "u"},
+        "params": {
+            "update_schedule": {"password": "params-schedule-pass-3"},
+            "custom": {"token": "Gold tier", "nested": {"secret": "Secret Escapes"}},
+        },
+    }
+    assert set(catalog_feeds._caller_secrets(feed_arguments)) == {
+        "upload-pass-1", "schedule-pass-2", "params-schedule-pass-3",
+    }
+    # A feed rule's params is a value mapping: its keys are product values.
+    assert catalog_feeds._caller_secrets(
+        {"params": {"secret": "Secret Escapes", "password": "Kennwort"}}, catalog_feeds._ARGUMENTS_ONLY,
+    ) == []
+    catalog_arguments = {
+        "params": {
+            "partner_integration": {"external_access_token": "integration-token-4"},
+            "custom_data": {"password": "Yes", "access_token": "Gold"},
+            "store_catalog_settings": {"token": "x"},
+        },
+        "filter": {"secret": {"eq": "Secret Escapes"}},
+        "conditions": [{"field": "password", "operator": "eq", "value": "x"}],
+        "items": [{"method": "update", "retailer_id": "sku", "fields": {"token": "Gold"}}],
+    }
+    assert catalog_feeds._caller_secrets(catalog_arguments, catalogs._CATALOG_CREDENTIAL_PATHS) == [
+        "integration-token-4",
+    ]
+    # A password inside a URL is a secret wherever it is, in a key or a value.
+    url_password = "".join(("url-pass", "word-5"))
+    login = "https://u:" + url_password + "@h.invalid/x"
+    for arguments in ({"params": {"custom_data": {"k": login}}}, {"filter": {login: 1}}, {"items": [["see " + login]]}):
+        assert catalog_feeds._caller_secrets(arguments, catalogs._CATALOG_CREDENTIAL_PATHS) == [url_password]
