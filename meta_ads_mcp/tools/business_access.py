@@ -8,10 +8,11 @@ an email address.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaAdsError, ValidationError
+from meta_ads_mcp.errors import MetaAdsError, MetaApiError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.tool_types import GraphId, StringList
@@ -96,22 +97,26 @@ def _known_kind(value: Any) -> str | None:
 
 
 def _user_kind(value: Any) -> str:
-    """Return EMPLOYEE, SYSTEM_USER or AGENCY, or raise listing what is accepted."""
+    """Return EMPLOYEE, SYSTEM_USER or AGENCY, or raise listing what is accepted.
+
+    The message never repeats the value given: callers sometimes put a name or
+    an email address in the wrong argument.
+    """
     kind = _known_kind(value)
     if kind is None:
-        raise ValidationError(f"user_type {str(value).strip()!r} is not recognised. Accepted values: {_USER_TYPE_ACCEPTED}.")
+        raise ValidationError(f"user_type is not recognised. Accepted values: {_USER_TYPE_ACCEPTED}.")
     return kind
 
 
 def _catalog_recipient_kind(value: Any) -> str:
-    """Return PERSON or AGENCY for list_catalog_assigned_users, accepting the other tools' kinds."""
+    """Return PERSON or AGENCY for the catalog access tools, accepting the other tools' kinds."""
     if str(value or "").strip().upper() == "PERSON":
         return "PERSON"
     try:
         kind = _user_kind(value)
     except ValidationError:
         raise ValidationError(
-            f"user_type {str(value).strip()!r} is not recognised. Accepted values: PERSON, {_USER_TYPE_ACCEPTED}."
+            f"user_type is not recognised. Accepted values: PERSON, {_USER_TYPE_ACCEPTED}."
         ) from None
     return "AGENCY" if kind == "AGENCY" else "PERSON"
 
@@ -315,18 +320,37 @@ async def _catalog_business_id(client: Any, catalog_id: str) -> str:
     business_id = business.get("id") if isinstance(business, dict) else None
     if not business_id:
         raise ValidationError(
-            f"Meta did not return an owning business for catalog {catalog_id}; pass business_id."
+            "Meta did not return an owning business for this catalog; pass business_id."
         )
     return str(business_id)
 
 
-def _row_tasks(row: dict[str, Any] | None) -> list[str]:
+def _tasks_state(row: dict[str, Any] | None, field: str = "tasks") -> tuple[list[str] | None, str | None]:
+    """Return (tasks, None) when a row's tasks can be trusted, or (None, reason) when not.
+
+    No row means no direct access: an empty set. A row whose task list is absent,
+    is not a list, or holds a value this server does not recognise is not "no
+    tasks"; the person's current access is unknown, and every caller treats it as
+    an incomplete read. The reason never quotes Meta's values.
+    """
     if not row:
-        return []
-    tasks = row.get("tasks")
+        return [], None
+    if field not in row or row.get(field) is None:
+        return None, f"Meta returned the row without its {field} list"
+    tasks = row.get(field)
     if not isinstance(tasks, list):
-        return []
-    return sorted({str(task).upper() for task in tasks})
+        return None, f"Meta returned {field} in a shape this server cannot read"
+    names: set[str] = set()
+    unknown = 0
+    for task in tasks:
+        name = task.strip().upper() if isinstance(task, str) else None
+        if name not in CATALOG_TASKS:
+            unknown += 1
+            continue
+        names.add(name)
+    if unknown:
+        return None, f"Meta returned {unknown} {field} value(s) this server does not recognise"
+    return sorted(names), None
 
 
 def _task_meanings(tasks: list[str]) -> dict[str, str]:
@@ -343,13 +367,28 @@ async def _find_assignment(
         stop_when=lambda rows: any(str(row.get("id")) == user_id for row in rows),
     )
     row = next((row for row in scan["rows"] if str(row.get("id")) == user_id), None)
-    known = row is not None or scan["complete"]
+    return _found(row, scan, ASSIGNED_USER_FIELDS, "tasks")
+
+
+def _found(row: dict[str, Any] | None, scan: dict[str, Any], fields: list[str], task_field: str) -> dict[str, Any]:
+    """One recipient's row and whether their current access is fully known.
+
+    Known means the row was found with readable tasks, or every page was read
+    and the row was not there. A row whose tasks cannot be read is not known.
+    """
+    tasks, problem = _tasks_state(row, task_field)
+    known = (row is not None or scan["complete"]) and problem is None
+    if problem is not None:
+        reason = f"{problem}, so the current tasks are unknown"
+    else:
+        reason = None if known else scan["reason"]
     return {
-        "row": _project(row, ASSIGNED_USER_FIELDS) if row else None,
+        "row": _project(row, fields) if row else None,
+        "tasks": tasks,
         "known": known,
         "scanned": len(scan["rows"]),
         "requests": scan["requests"],
-        "reason": None if known else scan["reason"],
+        "reason": reason,
     }
 
 
@@ -381,7 +420,10 @@ async def list_catalog_assigned_users(
             scan = await _scan(client, catalog_id, "agencies", fields=PARTNER_FIELDS, after=after)
             response = _search_response(scan, PARTNER_FIELDS, user_id, ("name",), limit)
         response["scope"] = {"catalog_id": catalog_id, "user_type": "AGENCY"}
-        response["notes"] = ["Meta's catalog agencies edge returns the partner businesses only, not the tasks shared with each."]
+        response["notes"] = [
+            "This view reads the partner businesses only, not the tasks shared with each; "
+            "list_catalog_partners also reads the tasks.",
+        ]
         return response
 
     if business_id is None:
@@ -390,32 +432,42 @@ async def list_catalog_assigned_users(
     if user_id is not None:
         found = await _find_assignment(client, catalog_id, business_id, user_id)
         row = found["row"]
-        tasks = _row_tasks(row)
-        if row:
-            status = "HAS_DIRECT_ACCESS" if tasks else "ASSIGNED_WITHOUT_TASKS"
-        elif found["known"]:
-            status = "NO_DIRECT_ACCESS"
-        else:
+        tasks = found["tasks"]
+        if not found["known"]:
             status = "UNKNOWN"
+        elif row:
+            status = "HAS_DIRECT_ACCESS" if tasks else "ASSIGNED_WITHOUT_TASKS"
+        else:
+            status = "NO_DIRECT_ACCESS"
         result: dict[str, Any] = {
             "scope": {**scope, "user_id": user_id},
             "item": {
                 **(row or {"id": user_id}), "user_kind": _row_kind(row or {}),
-                "tasks": tasks, "can": _task_meanings(tasks),
+                "tasks": tasks, "can": _task_meanings(tasks or []),
             },
             "access_status": status,
             "summary": {"scanned": found["scanned"], "requests": found["requests"], "complete": found["known"]},
             "notes": [UNTOUCHED_ACCESS_NOTE, TASK_MEANINGS_NOTE],
         }
         if status == "UNKNOWN":
-            result["summary"]["incomplete_reason"] = f"The person was not among the rows read: {found['reason']}"
+            result["summary"]["incomplete_reason"] = (
+                f"The person's row was found, but {found['reason']}." if row
+                else f"The person was not among the rows read: {found['reason']}"
+            )
         return result
     params = {**_page_params(limit, after), "business": business_id}
     payload = await client.list_objects(catalog_id, "assigned_users", fields=ASSIGNED_USER_FIELDS, params=params)
     response = _page_response(payload, ASSIGNED_USER_FIELDS)
+    unreadable = 0
     for item in response["items"]:
-        item["tasks"] = _row_tasks(item)
+        tasks, problem = _tasks_state(item)
+        item["tasks"] = tasks
+        if problem is not None:
+            unreadable += 1
+            item["tasks_unreadable"] = f"{problem}; this person's current tasks are unknown."
         item["user_kind"] = _row_kind(item)
+    if unreadable:
+        response["summary"]["rows_with_unreadable_tasks"] = unreadable
     response["scope"] = scope
     response["task_meanings"] = dict(TASK_MEANINGS)
     response["notes"] = [UNTOUCHED_ACCESS_NOTE, TASK_MEANINGS_NOTE]
@@ -495,29 +547,37 @@ async def list_user_assigned_catalogs(
         "summary": summary,
         "scope": {"user_id": user_id, "user_type": "AGENCY", "business_id": business_id},
         "notes": [
-            "Only catalogs owned by business_id were checked; Meta's catalog agencies edge does not return the tasks shared.",
+            "Only catalogs owned by business_id were checked, and only whether each is shared with the partner; "
+            "list_catalog_partners reads the tasks shared on one catalog.",
         ],
     }
 
 
 def _normalize_tasks(tasks: Any) -> list[str]:
+    """Return the requested task set, or raise without repeating what was given."""
+    accepted = ", ".join(CATALOG_TASKS)
     if tasks is None:
         raise ValidationError(
-            f"tasks is required: the complete set the person should hold, from {', '.join(CATALOG_TASKS)}; "
+            f"tasks is required: the complete set the recipient should hold, from {accepted}; "
             "pass an empty list to remove their direct access."
         )
     if isinstance(tasks, str):
         tasks = [part for part in tasks.split(",")] if tasks.strip() else []
     if not isinstance(tasks, list):
-        raise ValidationError("tasks must be a list of task names.")
+        raise ValidationError(f"tasks must be a list of task names from {accepted}.")
     normalized: set[str] = set()
+    unknown = 0
     for task in tasks:
-        name = str(task).strip().upper()
+        name = task.strip().upper() if isinstance(task, str) else None
         if name not in CATALOG_TASKS:
-            raise ValidationError(
-                f"Unknown catalog task {str(task).strip()!r}. Accepted values: {', '.join(CATALOG_TASKS)}."
-            )
+            unknown += 1
+            continue
         normalized.add(name)
+    if unknown:
+        raise ValidationError(
+            f"tasks has {unknown} entr{'y' if unknown == 1 else 'ies'} that are not catalog tasks. "
+            f"Accepted values: {accepted}."
+        )
     return sorted(normalized)
 
 
@@ -535,19 +595,79 @@ async def _caller_ids(client: Any) -> set[str] | None:
     return ids
 
 
-def _access_inputs(catalog_id: Any, user_id: Any, tasks: Any, business_id: Any) -> dict[str, Any]:
+async def _caller_business_ids(client: Any) -> set[str] | None:
+    """Businesses the token's own user belongs to, or None when that cannot be read.
+
+    An empty answer is treated as unreadable: a system-user token can see no
+    business rows even though it belongs to one.
+    """
+    try:
+        scan = await _scan(client, "me", "business_users", fields=["id", "business"], max_pages=3)
+    except MetaAdsError:
+        return None
+    if not scan["complete"]:
+        return None
+    ids = {
+        str(row["business"]["id"]) for row in scan["rows"]
+        if isinstance(row.get("business"), dict) and row["business"].get("id")
+    }
+    return ids or None
+
+
+def _access_inputs(catalog_id: Any, user_id: Any, tasks: Any, business_id: Any, user_type: Any) -> dict[str, Any]:
     """Validate the access-change inputs before any network call."""
-    return {
+    inputs = {
+        "kind": _catalog_recipient_kind(user_type),
         "catalog_id": _numeric_id(catalog_id, "catalog_id"),
         "user_id": _numeric_id(user_id, "user_id"),
         "business_id": _optional_numeric_id(business_id, "business_id"),
         "proposed": _normalize_tasks(tasks),
     }
+    if inputs["kind"] == "AGENCY" and inputs["business_id"] is not None:
+        raise ValidationError(
+            "business_id is not used with user_type=AGENCY: user_id is the partner business and the share belongs to the catalog."
+        )
+    return inputs
+
+
+def _classify(found: dict[str, Any], proposed: list[str]) -> tuple[str, list[str], list[str]]:
+    """Name the change from a known current task set, and what is lost and gained."""
+    row, previous = found["row"], found["tasks"]
+    if not found["known"]:
+        return "unknown", [], []
+    lost = [task for task in previous if task not in proposed]
+    gained = [task for task in proposed if task not in previous]
+    if not proposed:
+        return ("remove" if row is not None else "nothing_to_remove"), lost, gained
+    if row is None:
+        return "grant", lost, gained
+    if previous == proposed:
+        return "no_change", lost, gained
+    if not lost:
+        return "increase", lost, gained
+    if not gained:
+        return "reduce", lost, gained
+    return "change", lost, gained
+
+
+def _previous_state(found: dict[str, Any]) -> dict[str, Any]:
+    if not found["known"]:
+        return {"tasks": None, "has_direct_access": True if found["row"] is not None else None, "can": {}}
+    tasks = found["tasks"] or []
+    return {"tasks": tasks, "has_direct_access": found["row"] is not None, "can": _task_meanings(tasks)}
+
+
+def _current_access_read(found: dict[str, Any]) -> dict[str, Any]:
+    read = {"complete": found["known"], "rows_scanned": found["scanned"], "requests": found["requests"]}
+    if not found["known"]:
+        read["incomplete_reason"] = found["reason"]
+    return read
 
 
 async def _plan_access_change(
     client: Any,
     *,
+    kind: str,
     catalog_id: str,
     user_id: str,
     proposed: list[str],
@@ -555,27 +675,15 @@ async def _plan_access_change(
     allow_self_removal: bool,
 ) -> dict[str, Any]:
     """Read current access and compute the change; shared by the preview and the write."""
+    if kind == "AGENCY":
+        return await _plan_partner_change(
+            client, catalog_id=catalog_id, partner_id=user_id, proposed=proposed, allow_self_removal=allow_self_removal,
+        )
     if business_id is None:
         business_id = await _catalog_business_id(client, catalog_id)
     found = await _find_assignment(client, catalog_id, business_id, user_id)
     row = found["row"]
-    previous = _row_tasks(row)
-    lost = [task for task in previous if task not in proposed]
-    gained = [task for task in proposed if task not in previous]
-    if not found["known"]:
-        change = "unknown"
-    elif not proposed:
-        change = "remove" if row is not None else "nothing_to_remove"
-    elif row is not None and previous == proposed:
-        change = "no_change"
-    elif row is None:
-        change = "grant"
-    elif not lost:
-        change = "increase"
-    elif not gained:
-        change = "reduce"
-    else:
-        change = "change"
+    change, lost, gained = _classify(found, proposed)
 
     target = {"catalog_id": catalog_id, "business_id": business_id, "user_id": user_id}
     if change == "remove":
@@ -598,25 +706,28 @@ async def _plan_access_change(
         self_check = {"checked": True, "is_caller": is_self}
         if is_self is True and not allow_self_removal:
             refusal = (
-                f"User {user_id} is the token's own user. This change would remove its own catalog "
+                "This person is the token's own user. This change would remove its own catalog "
                 "access or its MANAGE task and could lock this server out of the catalog. "
                 "Pass allow_self_removal=true only if that is intended."
             )
         elif is_self is None and not allow_self_removal:
             refusal = (
                 "The token's own user ids could not be read, so this server cannot confirm that "
-                f"user {user_id} is not the caller. Pass allow_self_removal=true to proceed after "
+                "this person is not the caller. Pass allow_self_removal=true to proceed after "
                 "confirming the recipient is not you."
             )
         elif is_self is True:
             warnings.append("This removes or reduces the token's own access; this server may lose the ability to manage the catalog.")
     if change == "unknown":
         refusal = (
-            f"The current access of user {user_id} could not be read completely ({found['reason']}); "
+            f"The person's current access could not be read completely ({found['reason']}); "
             "nothing can be changed safely."
         )
+        warnings.append(
+            "The person's current tasks are unknown, so this server cannot say what the change would remove."
+        )
     if change == "nothing_to_remove":
-        refusal = f"User {user_id} has no direct access to catalog {catalog_id}; there is nothing to remove."
+        refusal = "This person has no direct access to the catalog; there is nothing to remove."
     if lost:
         what = "; ".join(f"{task}: {TASK_MEANINGS[task]}" for task in lost)
         warnings.insert(0, f"After this change user {user_id} can no longer: {what}.")
@@ -630,10 +741,13 @@ async def _plan_access_change(
             "grant and the result is read back to confirm Meta replaced the old set."
         )
 
+    async def read_back() -> dict[str, Any]:
+        return await _find_assignment(client, catalog_id, business_id, user_id)
+
     return {
         "target": target,
         "recipient": row or {"id": user_id},
-        "previous": {"tasks": previous, "has_direct_access": row is not None, "can": _task_meanings(previous)},
+        "previous": _previous_state(found),
         "proposed": {"tasks": proposed, "has_direct_access": bool(proposed), "can": _task_meanings(proposed)},
         "change": change,
         "can_no_longer": _task_meanings(lost),
@@ -642,11 +756,257 @@ async def _plan_access_change(
         "request": request,
         "refusal": refusal,
         "self_check": self_check,
-        "current_access_read": {
-            "complete": found["known"], "rows_scanned": found["scanned"], "requests": found["requests"],
-        },
+        "current_access_read": _current_access_read(found),
         "notes": [UNTOUCHED_ACCESS_NOTE, TASK_MEANINGS_NOTE],
+        "edge": "assigned_users",
+        "read_back": read_back,
+        "extra": {},
     }
+
+
+# Partner businesses: sharing a catalog with another business ----------------------------
+
+PARTNER_TASK_FIELDS = ["id", "name", "permitted_tasks"]
+PARTNER_VERIFIED_LIVE_REASON = (
+    "Meta's reference lists the catalog agencies edge but documents neither its permitted_tasks field "
+    "nor sharing a whole catalog through it, so the request shape comes from Meta's Python SDK and has "
+    "not been run against the live API; a failure may be the request shape rather than your permissions."
+)
+PARTNER_ACCESS_NOTE = (
+    "Only the partner business's direct share of this catalog is shown or changed. Which of the partner's "
+    "own people can use the catalog is set inside the partner's business and is not visible here."
+)
+PARTNER_TASKS_REJECTED_REASON = (
+    "Meta refused the permitted_tasks field on the catalog agencies edge, so partners were read without "
+    "their tasks"
+)
+
+
+def _partner_unverified() -> dict[str, Any]:
+    return {"verified_live": False, "verified_live_reason": PARTNER_VERIFIED_LIVE_REASON}
+
+
+async def _read_partners(read: Any) -> tuple[dict[str, Any], bool]:
+    """Run a partner read with permitted_tasks, falling back to id and name if Meta refuses the field.
+
+    Returns the read and whether the tasks field was refused. Only Meta's
+    invalid-parameter error (code 100) triggers the fallback; anything else is raised.
+    """
+    try:
+        return await read(PARTNER_TASK_FIELDS), False
+    except MetaApiError as error:
+        if error.code != 100:
+            raise _partner_error(error) from error
+    try:
+        return await read(PARTNER_FIELDS), True
+    except MetaApiError as error:
+        raise _partner_error(error) from error
+
+
+PARTNER_ERROR_HINT = (
+    "The partner request shape is not yet confirmed against Meta's live API (verified_live=false), "
+    "so this error may come from the request shape rather than your permissions."
+)
+
+
+def _partner_error(error: MetaApiError) -> MetaApiError:
+    """The same Meta error with a sentence saying the partner request is unconfirmed."""
+    return dataclasses.replace(error, message=f"{error.message} {PARTNER_ERROR_HINT}")
+
+
+def _partner_item(row: dict[str, Any], tasks_rejected: bool) -> dict[str, Any]:
+    item = _project(row, PARTNER_TASK_FIELDS)
+    tasks, problem = _tasks_state(row, "permitted_tasks")
+    item["permitted_tasks"] = tasks
+    item["can"] = _task_meanings(tasks or [])
+    if problem is not None:
+        reason = PARTNER_TASKS_REJECTED_REASON if tasks_rejected else problem
+        item["tasks_unreadable"] = f"{reason}; the tasks shared with this partner are unknown."
+    return item
+
+
+async def _find_partner(client: Any, catalog_id: str, partner_id: str) -> dict[str, Any]:
+    """Read the catalog's partner shares until one partner's row is found."""
+
+    async def read(fields: list[str]) -> dict[str, Any]:
+        return await _scan(
+            client, catalog_id, "agencies", fields=fields,
+            stop_when=lambda rows: any(str(row.get("id")) == partner_id for row in rows),
+        )
+
+    scan, rejected = await _read_partners(read)
+    row = next((row for row in scan["rows"] if str(row.get("id")) == partner_id), None)
+    found = _found(row, scan, PARTNER_TASK_FIELDS, "permitted_tasks")
+    if rejected and row is not None:
+        found["reason"] = f"{PARTNER_TASKS_REJECTED_REASON}, so the current tasks are unknown"
+    found["tasks_field_rejected"] = rejected
+    return found
+
+
+async def _plan_partner_change(
+    client: Any,
+    *,
+    catalog_id: str,
+    partner_id: str,
+    proposed: list[str],
+    allow_self_removal: bool,
+) -> dict[str, Any]:
+    """Read the partner's current share and compute the change, for preview and write alike."""
+    found = await _find_partner(client, catalog_id, partner_id)
+    change, lost, gained = _classify(found, proposed)
+    if change == "grant":
+        change = "share"
+    target = {"catalog_id": catalog_id, "user_id": partner_id, "user_type": "AGENCY"}
+    path = f"{catalog_id}/agencies"
+    if change == "remove":
+        request = {"method": "DELETE", "path": path, "data": {"business": partner_id}}
+    elif change in {"share", "increase"}:
+        request = {"method": "POST", "path": path, "data": {"business": partner_id, "permitted_tasks": proposed}}
+    else:
+        request = None
+
+    warnings: list[str] = []
+    refusal: str | None = None
+    self_check: dict[str, Any] = {"checked": False}
+    if change == "remove":
+        businesses = await _caller_business_ids(client)
+        is_self = None if businesses is None else partner_id in businesses
+        self_check = {"checked": True, "is_caller_business": is_self}
+        if is_self is True and not allow_self_removal:
+            refusal = (
+                "The token's own user belongs to this partner business, so removing the share could lock "
+                "this server out of the catalog. Pass allow_self_removal=true only if that is intended."
+            )
+        elif is_self is None and not allow_self_removal:
+            refusal = (
+                "The businesses the token's own user belongs to could not be read, so this server cannot "
+                "confirm that the caller does not use the catalog through this partner. Pass "
+                "allow_self_removal=true to proceed after confirming that."
+            )
+        elif is_self is True:
+            warnings.append("This removes the share the token's own business uses; this server may lose access to the catalog.")
+    if change in {"reduce", "change"}:
+        refusal = (
+            "Taking tasks away from a partner is not supported: the only documented share request adds "
+            "tasks, and Meta documents no way to remove one task from a share. Remove the whole share with "
+            "tasks=[] and share again with the smaller set, or change it in Business Manager."
+        )
+    if change == "unknown":
+        refusal = (
+            f"The partner's current share could not be read completely ({found['reason']}); "
+            "nothing can be changed safely."
+        )
+        warnings.append(
+            "The partner's current tasks are unknown, so this server cannot say what the change would remove."
+        )
+    if change == "nothing_to_remove":
+        refusal = "This partner business has no direct share of the catalog; there is nothing to remove."
+    if lost:
+        what = "; ".join(f"{task}: {TASK_MEANINGS[task]}" for task in lost)
+        warnings.insert(0, f"After this change partner business {partner_id} can no longer: {what}.")
+    if change == "remove":
+        warnings.insert(
+            1, f"Partner business {partner_id} loses its direct share of catalog {catalog_id}, and its people "
+            "lose the access they had through it.",
+        )
+    if "MANAGE" in gained:
+        warnings.append(f"MANAGE gives partner business {partner_id} full control of catalog {catalog_id}.")
+    if change == "increase":
+        warnings.append(
+            "Meta documents sharing and removing, not editing a share; the full new set is sent as a share "
+            "and the result is read back to confirm it."
+        )
+
+    async def read_back() -> dict[str, Any]:
+        return await _find_partner(client, catalog_id, partner_id)
+
+    current_read = _current_access_read(found)
+    current_read["tasks_field_refused"] = found["tasks_field_rejected"]
+    return {
+        "target": target,
+        "recipient": found["row"] or {"id": partner_id},
+        "previous": _previous_state(found),
+        "proposed": {"tasks": proposed, "has_direct_access": bool(proposed), "can": _task_meanings(proposed)},
+        "change": change,
+        "can_no_longer": _task_meanings(lost),
+        "gains": _task_meanings(gained),
+        "warnings": warnings,
+        "request": request,
+        "refusal": refusal,
+        "self_check": self_check,
+        "current_access_read": current_read,
+        "notes": [PARTNER_ACCESS_NOTE, TASK_MEANINGS_NOTE],
+        "edge": "agencies",
+        "read_back": read_back,
+        "extra": _partner_unverified(),
+    }
+
+
+@mcp_server.tool()
+async def list_catalog_partners(
+    catalog_id: GraphId,
+    partner_id: GraphId | None = None,
+    search: str | None = None,
+    limit: int = 25,
+    after: str | None = None,
+) -> dict[str, Any]:
+    """List the partner businesses a Meta product catalog is shared with and the tasks shared with each (permitted_tasks from MANAGE, ADVERTISE, MANAGE_AR, AA_ANALYZE). Pass partner_id to check one partner, or search for a name substring or exact id. The request shape is not yet confirmed against Meta's live API: every response carries verified_live=false, so a failure may be the request shape rather than your permissions. Shows direct shares only, not what the partner's own people can do."""
+    catalog_id = _numeric_id(catalog_id, "catalog_id")
+    partner_id = _optional_numeric_id(partner_id, "partner_id")
+    query = blank_to_none(search)
+    _validate_limit(limit)
+    if partner_id is not None and query is not None:
+        raise ValidationError("Pass partner_id or search, not both.")
+    client = get_graph_api_client()
+    scope: dict[str, Any] = {"catalog_id": catalog_id}
+    common = {
+        **_partner_unverified(),
+        "task_meanings": dict(TASK_MEANINGS),
+        "notes": [PARTNER_ACCESS_NOTE, TASK_MEANINGS_NOTE],
+    }
+    if partner_id is not None:
+        found = await _find_partner(client, catalog_id, partner_id)
+        row = found["row"]
+        if not found["known"]:
+            status = "UNKNOWN"
+        else:
+            status = "SHARED" if row is not None else "NOT_SHARED"
+        item = (
+            _partner_item(row, found["tasks_field_rejected"]) if row is not None
+            else {"id": partner_id, "permitted_tasks": [] if found["known"] else None, "can": {}}
+        )
+        summary: dict[str, Any] = {"scanned": found["scanned"], "requests": found["requests"], "complete": found["known"]}
+        if not found["known"]:
+            summary["incomplete_reason"] = (
+                f"The partner's row was found, but {found['reason']}." if row is not None
+                else f"The partner was not among the rows read: {found['reason']}"
+            )
+        return {
+            "scope": {**scope, "partner_id": partner_id}, "item": item, "share_status": status,
+            "summary": summary, **common,
+        }
+    if query is None:
+        async def read_page(fields: list[str]) -> dict[str, Any]:
+            return await client.list_objects(catalog_id, "agencies", fields=fields, params=_page_params(limit, after))
+
+        payload, rejected = await _read_partners(read_page)
+        response = _page_response(payload, PARTNER_TASK_FIELDS)
+    else:
+        async def read_all(fields: list[str]) -> dict[str, Any]:
+            return await _scan(client, catalog_id, "agencies", fields=fields, after=after)
+
+        scan, rejected = await _read_partners(read_all)
+        response = _search_response(scan, PARTNER_TASK_FIELDS, query, ("name",), limit)
+    # Items are already projected to id, name and permitted_tasks.
+    response["items"] = [_partner_item(item, rejected) for item in response["items"]]
+    unreadable = sum(1 for item in response["items"] if "tasks_unreadable" in item)
+    if unreadable:
+        response["summary"]["rows_with_unreadable_tasks"] = unreadable
+    if rejected:
+        response["summary"]["tasks_field_refused"] = True
+    response["scope"] = scope
+    response.update(common)
+    return response
 
 
 @mcp_server.tool(tags={"read-only"})
@@ -656,9 +1016,10 @@ async def preview_catalog_access_change(
     tasks: StringList,
     business_id: GraphId | None = None,
     allow_self_removal: bool = False,
+    user_type: str = "PERSON",
 ) -> dict[str, Any]:
-    """Read-only. Show a person's or system user's current tasks on a Meta product catalog, the proposed set, what they would lose or gain, warnings, and the exact request set_catalog_access would send. Sends no change. tasks is the complete new set from MANAGE, ADVERTISE, MANAGE_AR, AA_ANALYZE; an empty list means remove direct access."""
-    inputs = _access_inputs(catalog_id, user_id, tasks, business_id)
+    """Read-only. Show a person's or system user's current tasks on a Meta product catalog, the proposed set, what they would lose or gain, warnings, and the exact request set_catalog_access would send. Sends no change. tasks is the complete new set from MANAGE, ADVERTISE, MANAGE_AR, AA_ANALYZE; an empty list means remove direct access. With user_type=AGENCY, user_id is a partner business and the preview covers sharing the catalog with it or removing the share; that request shape is not yet confirmed against Meta's live API (the response says verified_live=false)."""
+    inputs = _access_inputs(catalog_id, user_id, tasks, business_id, user_type)
     client = get_graph_api_client()
     plan = await _plan_access_change(client, **inputs, allow_self_removal=allow_self_removal)
     return {
@@ -671,6 +1032,7 @@ async def preview_catalog_access_change(
         "self_check": plan["self_check"],
         "current_access_read": plan["current_access_read"],
         "notes": plan["notes"],
+        **plan["extra"],
     }
 
 
@@ -682,9 +1044,10 @@ async def set_catalog_access(
     business_id: GraphId | None = None,
     allow_self_removal: bool = False,
     dry_run: bool = False,
+    user_type: str = "PERSON",
 ) -> dict[str, Any]:
-    """Use only on an explicit request to grant, change or remove a person's or system user's direct access to a Meta product catalog. tasks is the complete new set (MANAGE, ADVERTISE, MANAGE_AR, AA_ANALYZE); an empty list removes direct access. Reads current access first, refuses to remove the token's own access unless allow_self_removal=true, and returns before and after. Partner businesses are not supported."""
-    inputs = _access_inputs(catalog_id, user_id, tasks, business_id)
+    """Use only on an explicit request to grant, change or remove a person's or system user's direct access to a Meta product catalog. tasks is the complete new set (MANAGE, ADVERTISE, MANAGE_AR, AA_ANALYZE); an empty list removes direct access. Reads current access first, refuses when it cannot be read completely, refuses to remove the token's own access unless allow_self_removal=true, and returns before and after. With user_type=AGENCY, user_id is a partner business: a non-empty set shares the catalog with it or adds tasks, an empty list removes the share, and taking single tasks away is refused. The partner request shape is not yet confirmed against Meta's live API (the response says verified_live=false), so a failure may be the request shape rather than your permissions."""
+    inputs = _access_inputs(catalog_id, user_id, tasks, business_id, user_type)
     client = get_graph_api_client()
     plan = await _plan_access_change(client, **inputs, allow_self_removal=allow_self_removal)
     if plan["refusal"] is not None:
@@ -700,27 +1063,39 @@ async def set_catalog_access(
         "gains": plan["gains"],
         "warnings": plan["warnings"],
         "notes": plan["notes"],
+        **plan["extra"],
     }
     if plan["change"] == "no_change":
-        return {**base, "current": plan["previous"], "sent": False, "message": "The person already holds exactly these tasks; nothing was sent."}
+        return {**base, "current": plan["previous"], "sent": False, "message": "The recipient already holds exactly these tasks; nothing was sent."}
     request = plan["request"]
     if dry_run:
         return {**base, "dry_run": True, "sent": False, "would_send": request, "current": plan["proposed"]}
-    if request["method"] == "DELETE":
-        await client.delete_edge_object(target["catalog_id"], "assigned_users", data=dict(request["data"]))
-    else:
-        await client.create_edge_object(target["catalog_id"], "assigned_users", data=dict(request["data"]))
-    response = {**base, "sent": True, "request_sent": request}
     try:
-        after = await _find_assignment(client, target["catalog_id"], target["business_id"], target["user_id"])
+        if request["method"] == "DELETE":
+            meta_response = await client.delete_edge_object(target["catalog_id"], plan["edge"], data=dict(request["data"]))
+        else:
+            meta_response = await client.create_edge_object(target["catalog_id"], plan["edge"], data=dict(request["data"]))
+    except MetaApiError as error:
+        if inputs["kind"] != "AGENCY":
+            raise
+        raise _partner_error(error) from error
+    response = {**base, "sent": True, "request_sent": request}
+    if inputs["kind"] == "AGENCY":
+        response["meta_response"] = meta_response if isinstance(meta_response, dict) else None
+    try:
+        after = await plan["read_back"]()
     except MetaAdsError:
         after = None
     if after is None or not after["known"]:
         response["current"] = plan["proposed"]
         response["verified"] = False
-        response["warnings"] = [*plan["warnings"], "Meta accepted the request, but the access could not be read back to confirm it."]
+        detail = f" ({after['reason']})" if after is not None and after.get("reason") else ""
+        response["warnings"] = [
+            *plan["warnings"],
+            f"Meta accepted the request, but the access could not be read back to confirm it{detail}.",
+        ]
         return response
-    after_tasks = _row_tasks(after["row"])
+    after_tasks = after["tasks"] or []
     response["current"] = {"tasks": after_tasks, "has_direct_access": after["row"] is not None, "can": _task_meanings(after_tasks)}
     response["verified"] = after_tasks == plan["proposed"]["tasks"]
     if not response["verified"]:

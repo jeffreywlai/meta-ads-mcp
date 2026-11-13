@@ -231,6 +231,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_user_assigned_catalogs": {"user_id": "789"},
     "preview_catalog_access_change": {"catalog_id": "456", "business_id": "123", "user_id": "789", "tasks": ["ADVERTISE"]},
     "set_catalog_access": {"catalog_id": "456", "business_id": "123", "user_id": "789", "tasks": ["ADVERTISE"], "dry_run": True},
+    "list_catalog_partners": {"catalog_id": "456"},
     "duplicate_campaign": {"campaign_id": "111", "deep_copy": True},
     "duplicate_adset": {"adset_id": "411", "campaign_id": "999"},
     "duplicate_ad": {"ad_id": "611", "new_name": "Copied ad"},

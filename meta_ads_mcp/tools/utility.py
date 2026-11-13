@@ -213,6 +213,7 @@ TOOL_GROUPS = {
         "list_catalog_assigned_users",
         "list_user_assigned_catalogs",
         "preview_catalog_access_change",
+        "list_catalog_partners",
     ],
     "auth": [
         "generate_auth_url",
@@ -617,7 +618,8 @@ INTENT_GUIDE = {
         "description": (
             "List the businesses you can access, a business's people, system users or partner agencies, "
             "who can use a product catalog and with which permissions, or which catalogs one person or partner "
-            "can use; preview or grant, change or remove a person's catalog access."
+            "can use; preview or grant, change or remove a person's catalog access; see, share or unshare a "
+            "catalog with a partner business."
         ),
         "recommended_order": [
             "list_businesses",
@@ -625,12 +627,14 @@ INTENT_GUIDE = {
             "list_catalog_assigned_users",
             "list_user_assigned_catalogs",
             "preview_catalog_access_change",
+            "list_catalog_partners",
         ],
         "avoid_unless_needed": ["set_catalog_access"],
         "notes": [
             "Catalog access tools take a person's business-scoped id from list_business_users, not a personal Facebook id.",
             "Run preview_catalog_access_change first and show the user what the person would lose before set_catalog_access.",
-            "set_catalog_access refuses to remove the token's own access unless allow_self_removal=true; partner business shares cannot be changed here.",
+            "set_catalog_access refuses to remove the token's own access unless allow_self_removal=true.",
+            "Share a catalog with a partner business, or remove the share, with user_type=AGENCY and the partner's business id as user_id; list_catalog_partners shows current shares. The partner request shape is not yet confirmed against Meta's live API.",
         ],
     },
     "duplicate_campaigns_ad_sets_or_ads": {
