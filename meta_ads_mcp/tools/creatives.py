@@ -11,7 +11,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
-from meta_ads_mcp.local_files import open_upload_file
+from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_file
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
@@ -287,6 +287,23 @@ async def preview_ad(
     return {"item": result, "summary": {"count": 1}}
 
 
+# Meta's ad image reference (act_{id}/adimages) names neither file types nor a size
+# limit and points to the Ads Guide, whose image placements list "JPG or PNG" with a
+# maximum file size of 30MB (facebook.com/business/ads-guide/image/facebook-feed).
+IMAGE_FILE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+MAX_IMAGE_BYTES = 30 * 1024 * 1024
+
+
+def _read_image_file(file_path: str) -> LocalUpload:
+    """Read an image from the operator's upload folder; errors never quote the path."""
+    return read_upload_file(
+        file_path,
+        allowed_types=IMAGE_FILE_TYPES,
+        max_bytes=MAX_IMAGE_BYTES,
+        too_large_hint="Meta's Ads Guide gives 30 MB as the largest image file for ads.",
+    )
+
+
 @mcp_server.tool()
 async def upload_creative_asset(
     account_id: str,
@@ -294,16 +311,24 @@ async def upload_creative_asset(
     image_url: str | None = None,
     name: str | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user needs an image asset uploaded before creating or updating a creative."""
+    """Use this when the user needs an image asset uploaded before creating or updating a creative. Give exactly one of image_url or file_path. file_path is read only from the folder named by the META_UPLOAD_DIR environment variable (a path inside it, or a name relative to it); local files are refused while that variable is unset. Files must be JPG or PNG (.jpg, .jpeg or .png, the types Meta's Ads Guide lists for image ads) and at most 30 MB."""
     if bool(file_path) == bool(image_url):
         raise ValidationError("Provide exactly one of file_path or image_url.")
+    image_file = _read_image_file(file_path) if file_path else None
     client = get_graph_api_client()
-    result = await client.upload_ad_image(
-        normalize_account_id(account_id),
-        file_path=file_path,
-        image_url=image_url,
-        name=name,
-    )
+    if image_file is not None:
+        result = await client.upload_ad_image(
+            normalize_account_id(account_id),
+            file_name=image_file.name,
+            file_content=image_file.content,
+            name=name,
+        )
+    else:
+        result = await client.upload_ad_image(
+            normalize_account_id(account_id),
+            image_url=image_url,
+            name=name,
+        )
     return {
         "ok": True,
         "action": "upload_creative_asset",

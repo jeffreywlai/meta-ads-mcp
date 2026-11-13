@@ -9,7 +9,6 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -811,20 +810,27 @@ class GraphAPIClient:
         self,
         account_id: str,
         *,
-        file_path: str | None = None,
+        file_name: str | None = None,
+        file_content: bytes | None = None,
         image_url: str | None = None,
         name: str | None = None,
     ) -> dict[str, Any]:
-        """Upload an image asset for creative use."""
-        if bool(file_path) == bool(image_url):
-            raise UnsupportedFeatureError("Provide exactly one of file_path or image_url.")
+        """Upload an image asset for creative use, from a link or from a file's name and bytes.
+
+        This client never reads a local path: the caller reads and checks the file
+        (meta_ads_mcp.local_files) and passes its name and bytes.
+        """
+        has_file = file_name is not None or file_content is not None
+        if has_file == bool(image_url):
+            raise UnsupportedFeatureError("Provide exactly one of a file or image_url.")
+        if has_file and (not file_name or not file_content):
+            raise UnsupportedFeatureError("An image file needs both a file name and its bytes.")
         data: dict[str, Any] = {}
         files: dict[str, Any] | None = None
         if image_url:
             data["url"] = image_url
-        if file_path:
-            path = Path(file_path).expanduser()
-            files = {"filename": (path.name, path.read_bytes())}
+        if has_file:
+            files = {"filename": (file_name, file_content)}
         if name:
             data["name"] = name
         return await self.create_edge_object(normalize_account_id(account_id), "adimages", data=data, files=files)
