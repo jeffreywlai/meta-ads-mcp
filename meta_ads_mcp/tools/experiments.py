@@ -20,7 +20,8 @@ from meta_ads_mcp.errors import (
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
+from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import StrictCurrencyAmount, StringList, coerce_csv_string_list
 
@@ -131,6 +132,14 @@ REPEATED_CURSOR_REASON = "Meta returned a cursor already read, so paging stopped
 REPEATED_PAGE_REASON = (
     "Meta returned a page that had already been read; it was not counted again and paging stopped."
 )
+PAGE_UNREADABLE_REASON = (
+    "Meta returned a page without a readable data list, so the rows on it, and whether more pages "
+    "follow, are unknown."
+)
+
+
+def _non_object_rows_reason(count: int) -> str:
+    return f"Meta returned {count} row(s) that are not objects, so they could not be read."
 
 
 def _page_fingerprint(items: list[Any]) -> str:
@@ -293,9 +302,16 @@ def _iso(seconds: int) -> str:
 
 
 def _study_state(study: dict[str, Any], now: datetime) -> str:
-    """Classify a study as canceled, scheduled, running, ended or unknown from its times."""
-    if _parse_meta_time(study.get("canceled_time")) is not None:
+    """Classify a study as canceled, scheduled, running, ended or unknown from its times.
+
+    A canceled_time that is present but cannot be read leaves the state unknown: the study
+    may have been canceled, so it is not classified from its start and end alone.
+    """
+    canceled = study.get("canceled_time")
+    if _parse_meta_time(canceled) is not None:
         return "canceled"
+    if canceled not in (None, ""):
+        return "unknown"
     start = _parse_meta_time(study.get("start_time"))
     end = _parse_meta_time(study.get("end_time"))
     if start is not None and start > now:
@@ -633,9 +649,11 @@ async def _read_edge_pages(
 ) -> dict[str, Any]:
     """Read every page of an edge, within max_pages requests.
 
-    complete is true only when Meta's last page had no next link. A next link without a usable
+    complete is true only when every page was readable, Meta's last page had no next link, and
+    every row was an object. A page without a readable data list, a next link without a usable
     cursor, a repeated cursor, a page already read, or the page cap ends the read as incomplete
-    with stop_reason saying why. A repeated page is not added, and an id is kept only once.
+    with stop_reason saying why. Rows that are not objects are counted in unreadable_rows and also
+    leave the read incomplete. A repeated page is not added, and an id is kept only once.
     """
     items: list[Any] = []
     params: dict[str, Any] = {"limit": page_size}
@@ -643,18 +661,35 @@ async def _read_edge_pages(
     seen_pages: set[str] = set()
     seen_ids: set[str] = set()
     pages = 0
+    unreadable = 0
+
+    def finish(reason: str | None) -> dict[str, Any]:
+        reasons = [text for text in (reason, _non_object_rows_reason(unreadable) if unreadable else None) if text]
+        return {
+            "items": items,
+            "pages_read": pages,
+            "complete": not reasons,
+            "stop_reason": " ".join(reasons) if reasons else None,
+            "unreadable_rows": unreadable,
+        }
+
     while True:
-        normalized = normalize_collection(await client.list_objects(parent, edge, fields=fields, params=params))
+        payload = await client.list_objects(parent, edge, fields=fields, params=params)
         pages += 1
-        if normalized["items"]:
-            fingerprint = _page_fingerprint(normalized["items"])
+        rows, bad_rows, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            return finish(PAGE_UNREADABLE_REASON)
+        if rows or bad_rows:
+            fingerprint = _page_fingerprint(payload["data"])
             if fingerprint in seen_pages:
-                return {"items": items, "pages_read": pages, "complete": False, "stop_reason": REPEATED_PAGE_REASON}
+                return finish(REPEATED_PAGE_REASON)
             seen_pages.add(fingerprint)
-        items.extend(_new_rows(normalized["items"], seen_ids))
-        if not normalized["paging"].get("next"):
-            return {"items": items, "pages_read": pages, "complete": True, "stop_reason": None}
-        cursor = normalized["paging"].get("after")
+        unreadable += bad_rows
+        items.extend(_new_rows(rows, seen_ids))
+        paging = extract_paging(payload)
+        if not paging.get("next"):
+            return finish(None)
+        cursor = paging.get("after")
         if not cursor:
             reason = NO_CURSOR_REASON
         elif cursor in seen_cursors:
@@ -665,7 +700,7 @@ async def _read_edge_pages(
             seen_cursors.add(cursor)
             params = {"limit": page_size, "after": cursor}
             continue
-        return {"items": items, "pages_read": pages, "complete": False, "stop_reason": reason}
+        return finish(reason)
 
 
 @mcp_server.tool()
@@ -707,12 +742,24 @@ async def list_ad_studies(
     if blank_to_none(after):
         params["after"] = after.strip()
     payload = await get_graph_api_client().list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
+    _, bad_rows, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        # Not an empty list: the studies on this page, and whether more follow, are unknown.
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {
+                "count": 0, "complete": False, "truncated": False, "next_after": None,
+                "stop_reason": PAGE_UNREADABLE_REASON, "page_unreadable": True, "source_edge": edge,
+            },
+        }
     normalized = normalize_collection(payload)
     now = _now()
-    items = [{**item, "state": _study_state(item, now)} for item in normalized["items"]]
+    # Rows that are not objects are shown as Meta returned them, without a derived state.
+    items = [{**item, "state": _study_state(item, now)} if isinstance(item, dict) else item for item in normalized["items"]]
     removed = 0
     if type_filter is not None:
-        kept = [item for item in items if str(item.get("type") or "").upper() == type_filter]
+        kept = [item for item in items if isinstance(item, dict) and str(item.get("type") or "").upper() == type_filter]
         removed = len(items) - len(kept)
         items = kept
     normalized["items"] = items
@@ -723,6 +770,12 @@ async def list_ad_studies(
             "applied": "locally to this page",
             "removed_on_this_page": removed,
         }
+        if bad_rows:
+            normalized["summary"]["study_type_filter"]["unreadable_rows_removed"] = bad_rows
+            normalized["summary"]["study_type_filter"]["unreadable_note"] = (
+                f"{bad_rows} row(s) on this page are not objects, so their type is unknown; they were left out "
+                "and may be studies of this type."
+            )
     return normalized
 
 
@@ -783,8 +836,14 @@ def _to_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _split_outcome(objective: dict[str, Any], cells: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """One objective's split-test outcome, or None when its results are not in a recognised shape."""
+def _split_outcome(
+    objective: dict[str, Any], cells: list[dict[str, Any]], cell_nodes_complete: bool = True,
+) -> dict[str, Any] | None:
+    """One objective's split-test outcome, or None when its results are not in a recognised shape.
+
+    A winner or high performer not found in the cells read is said to be unmapped because the
+    cells read are incomplete whenever they are: not every cell, or not every membership page.
+    """
     for entry in objective["parsed_results"]:
         if not isinstance(entry, dict) or not SPLIT_RESULT_KEYS & set(entry):
             continue
@@ -808,6 +867,11 @@ def _split_outcome(objective: dict[str, Any], cells: list[dict[str, Any]]) -> di
                     "cell_name": cell["name"] if cell else None,
                 })
             response["high_performer_cells"] = mapped
+            if not cell_nodes_complete and any(item["cell_id"] is None for item in mapped):
+                response["high_performer_mapping_note"] = (
+                    "Some high performers were not found in the cells read, and not every cell could be read; "
+                    "they may belong to a cell that was not read."
+                )
         if winner_id not in (None, ""):
             winner_id = str(winner_id)
             cell = next((cell for cell in cells if winner_id in _cell_members(cell)), None)
@@ -817,7 +881,12 @@ def _split_outcome(objective: dict[str, Any], cells: list[dict[str, Any]]) -> di
                 "cell_name": cell["name"] if cell else None,
                 "confidence": entry.get("winner_confidence"),
             }
-            if cell is None and any(item.get("membership_truncated") for item in cells):
+            if cell is None and not cell_nodes_complete:
+                response["winner"]["cell_mapping_note"] = (
+                    "The winner was not found in the cells read, which are incomplete: not every cell could be "
+                    "read, so it may belong to a cell that was not read."
+                )
+            elif cell is None and any(item.get("membership_truncated") for item in cells):
                 response["winner"]["cell_mapping_note"] = (
                     "The winner was not found in the cell memberships read, which are incomplete; "
                     "it may belong to a cell whose later membership pages were not returned."
@@ -838,7 +907,7 @@ def _deciding_objective(
     if len(primaries) > 1:
         return None, f"Meta marked {len(primaries)} objectives as primary."
     if not objectives_complete:
-        return None, "No primary objective was found among the objectives read, and Meta reported more objectives."
+        return None, "No primary objective was found among the objectives read, and not every objective was read."
     return None, f"The study has {len(objectives)} objectives and none is marked primary."
 
 
@@ -846,6 +915,7 @@ def _split_results(
     objectives: list[dict[str, Any]],
     cells: list[dict[str, Any]],
     objectives_complete: bool = True,
+    cell_nodes_complete: bool = True,
 ) -> dict[str, Any]:
     base: dict[str, Any] = {
         "status": "available",
@@ -853,7 +923,7 @@ def _split_results(
         "winner": None,
         "confidence_scale_note": "Meta does not document the scale of these confidence values.",
     }
-    outcomes = {id(objective): _split_outcome(objective, cells) for objective in objectives}
+    outcomes = {id(objective): _split_outcome(objective, cells, cell_nodes_complete) for objective in objectives}
     if not any(outcomes.values()):
         return {
             "status": "available",
@@ -1073,6 +1143,9 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             "objectives_stop_reason": objectives_read["stop_reason"],
         },
     }
+    for key, read in (("cells", cells_read), ("objectives", objectives_read)):
+        if read["unreadable_rows"]:
+            response["summary"][f"{key}_unreadable_rows"] = read["unreadable_rows"]
     if ad_membership_note:
         response["summary"]["ad_membership_note"] = ad_membership_note
     if not memberships_complete:
@@ -1082,7 +1155,16 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
         )
     if not include_results:
         return response
-    if not any(objective["parsed_results"] for objective in objectives):
+    if not any(objective["parsed_results"] for objective in objectives) and not objectives_read["complete"]:
+        # The objectives not read could hold the results, so "not published yet" is not known.
+        response["results"] = {
+            "status": "unknown",
+            "message": (
+                "No results were found in the objectives read, but not every objective could be read "
+                f"({objectives_read['stop_reason']}), so whether Meta has published results is unknown."
+            ),
+        }
+    elif not any(objective["parsed_results"] for objective in objectives):
         response["results"] = {
             "status": "not_ready",
             "message": (
@@ -1090,8 +1172,22 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
                 f"results_first_available_date: {study.get('results_first_available_date')})."
             ),
         }
+    elif not isinstance(study.get("type"), str) or not study["type"].strip():
+        # Whether these are split test or lift results depends on the type, which was not returned.
+        response["results"] = {
+            "status": "available",
+            "kind": "unknown",
+            "winner": None,
+            "message": (
+                "Meta did not return the study's type, so its results cannot be read as a split test or a "
+                "lift study; see raw_results."
+            ),
+            "raw_results": [objective["parsed_results"] for objective in objectives if objective["parsed_results"]],
+        }
     elif str(study.get("type") or "").upper() in SPLIT_TEST_TYPES:
-        response["results"] = _split_results(objectives, cells, response["summary"]["objectives_complete"])
+        response["results"] = _split_results(
+            objectives, cells, response["summary"]["objectives_complete"], cell_nodes_complete,
+        )
     else:
         breakdowns = (
             await _read_cell_breakdowns(client, objectives)
@@ -1099,7 +1195,17 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             else None
         )
         response["results"] = _lift_results(objectives, cells, breakdowns)
+        if not objectives_read["complete"]:
+            response["results"]["notes"].append(
+                f"Not every objective could be read ({objectives_read['stop_reason']}); results are shown only "
+                "for the objectives read."
+            )
     return response
+
+
+UNCLASSIFIED_STUDIES_NOTE = (
+    "their start, end and cancel times could not be read, so whether they are scheduled or running is unknown"
+)
 
 
 async def _scan_active_studies(
@@ -1113,35 +1219,58 @@ async def _scan_active_studies(
 ) -> dict[str, Any]:
     """Page a study edge for scheduled or running studies.
 
-    complete is true only when Meta's last page had no next link. A next link without a usable
-    cursor, a repeated cursor, a page already read, the page cap, or reaching stop_at ends the scan
-    as incomplete with stop_reason saying why. A repeated page is not counted, and each study id
-    is counted once.
+    pages_complete is true only when every page was readable and Meta's last page had no next
+    link. A page without a readable data list, a next link without a usable cursor, a repeated
+    cursor, a page already read, the page cap, or reaching stop_at ends the scan with
+    stop_reason saying why. A repeated page is not counted, and each study id is counted once.
+
+    A study whose state cannot be classified (a row that is not an object, or one without the
+    times that place it) is never dropped: unclassified counts them and lists the ids it can.
+    complete is true only when the pages were complete and every study was classified, so a
+    count of active studies is never presented as complete when one could be missing from it.
     """
     active: list[dict[str, Any]] = []
+    unclassified: list[str | None] = []
     pages = 0
     params: dict[str, Any] = {"limit": 100}
     seen_cursors: set[str] = set()
     seen_pages: set[str] = set()
     seen_ids: set[str] = set()
+
+    def finish(pages_complete: bool, reason: str | None) -> dict[str, Any]:
+        return {
+            "active": active,
+            "unclassified": len(unclassified),
+            "unclassified_ids": [study_id for study_id in unclassified if study_id is not None],
+            "pages_read": pages,
+            "pages_complete": pages_complete,
+            "complete": pages_complete and not unclassified,
+            "stop_reason": reason,
+        }
+
     while True:
-        normalized = normalize_collection(
-            await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
-        )
+        payload = await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
         pages += 1
-        if normalized["items"]:
-            fingerprint = _page_fingerprint(normalized["items"])
+        rows, bad_rows, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            return finish(False, PAGE_UNREADABLE_REASON)
+        if rows or bad_rows:
+            fingerprint = _page_fingerprint(payload["data"])
             if fingerprint in seen_pages:
-                return {"active": active, "pages_read": pages, "complete": False, "stop_reason": REPEATED_PAGE_REASON}
+                return finish(False, REPEATED_PAGE_REASON)
             seen_pages.add(fingerprint)
-        active.extend(
-            {"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state}
-            for study in _new_rows(normalized["items"], seen_ids)
-            if isinstance(study, dict) and (state := _study_state(study, now)) in ACTIVE_STATES
-        )
-        if not normalized["paging"].get("next"):
-            return {"active": active, "pages_read": pages, "complete": True, "stop_reason": None}
-        cursor = normalized["paging"].get("after")
+        unclassified.extend([None] * bad_rows)
+        for study in _new_rows(rows, seen_ids):
+            state = _study_state(study, now)
+            if state in ACTIVE_STATES:
+                active.append({"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state})
+            elif state == "unknown":
+                study_id = study.get("id")
+                unclassified.append(None if study_id in (None, "") else str(study_id))
+        paging = extract_paging(payload)
+        if not paging.get("next"):
+            return finish(True, None)
+        cursor = paging.get("after")
         if not cursor:
             reason = NO_CURSOR_REASON
         elif cursor in seen_cursors:
@@ -1154,7 +1283,13 @@ async def _scan_active_studies(
             seen_cursors.add(cursor)
             params = {"limit": 100, "after": cursor}
             continue
-        return {"active": active, "pages_read": pages, "complete": False, "stop_reason": reason}
+        return finish(False, reason)
+
+
+def _unclassified_message(scan: dict[str, Any], where: str) -> str:
+    ids = scan["unclassified_ids"]
+    named = f" ({', '.join(ids)})" if ids else ""
+    return f"{scan['unclassified']} study row(s) {where}{named}: {UNCLASSIFIED_STUDIES_NOTE}."
 
 
 async def _count_account_active_studies(client: Any, account_id: str, now: datetime) -> dict[str, Any]:
@@ -1165,9 +1300,14 @@ async def _count_account_active_studies(client: Any, account_id: str, now: datet
     )
     return {
         "active_studies": len(scan["active"]),
+        "unclassified_studies": scan["unclassified"],
         "pages_read": scan["pages_read"],
+        "pages_complete": scan["pages_complete"],
         "count_complete": scan["complete"],
         "stop_reason": scan["stop_reason"],
+        "unclassified_note": (
+            _unclassified_message(scan, f"on {account_id}'s impacting_ad_studies") if scan["unclassified"] else None
+        ),
     }
 
 
@@ -1195,8 +1335,14 @@ def _check_account_and_status(
         result["blockers"].append(
             f"{subject or entity_id} belongs to ad account {entity_account}, not {account_number}."
         )
-    status = str(entity.get("effective_status") or "").upper()
-    if status in NON_DELIVERING_STATUSES:
+    raw_status = entity.get("effective_status")
+    status = raw_status.strip().upper() if isinstance(raw_status, str) else ""
+    if not status:
+        result["unresolved"].append(
+            f"Meta returned no readable effective_status{' for ' + subject if subject else ''}, so whether it "
+            "is DELETED or ARCHIVED was not checked."
+        )
+    elif status in NON_DELIVERING_STATUSES:
         result["unresolved"].append(
             f"{'The ' + subject + ' has ' if subject else ''}effective_status {status}, so it cannot deliver. "
             "Meta's developer documentation states no study rule for this, so this pre-check cannot say "
@@ -1235,8 +1381,15 @@ def _note_studies(
         missing_signals.append(message)
         return None
     active = scan["active"]
-    if not scan["complete"]:
+    if not scan["pages_complete"]:
         message = f"Read only {scan['pages_read']} page(s) of the studies containing {subject}: {scan['stop_reason']}"
+        result["unresolved"].append(message)
+        missing_signals.append(message)
+    if scan["unclassified"]:
+        message = (
+            f"{_unclassified_message(scan, f'containing {subject}')} This pre-check cannot say "
+            f"{subject} is not already in a scheduled or running study."
+        )
         result["unresolved"].append(message)
         missing_signals.append(message)
     if active:
@@ -1360,6 +1513,8 @@ async def check_ab_test_eligibility(
         result["active_studies"] = active
         if scan is not None:
             result["active_studies_complete"] = scan["complete"]
+            if scan["unclassified"]:
+                result["unclassified_studies"] = scan["unclassified"]
         entities.append(_with_outcome(result))
     try:
         account_check = await _count_account_active_studies(client, account_id, now)
@@ -1371,7 +1526,9 @@ async def check_ab_test_eligibility(
         account_check = {
             "performed": False,
             "active_studies": None,
+            "unclassified_studies": None,
             "pages_read": None,
+            "pages_complete": False,
             "count_complete": False,
             "stop_reason": message,
             "blockers": [],
@@ -1387,10 +1544,18 @@ async def check_ab_test_eligibility(
                 f"Meta documents a maximum of {MAX_CONCURRENT_STUDIES} concurrent studies per advertiser."
             )
         elif not account_check["count_complete"]:
-            message = (
-                f"Counted active studies on the first {account_check['pages_read']} page(s) only: "
-                f"{account_check['stop_reason']} The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
-            )
+            gaps = []
+            if not account_check["pages_complete"]:
+                gaps.append(
+                    f"Counted active studies on the first {account_check['pages_read']} page(s) only: "
+                    f"{account_check['stop_reason']}"
+                )
+            if account_check["unclassified_studies"]:
+                gaps.append(
+                    f"{account_check['unclassified_note']} The count of {account_check['active_studies']} "
+                    "scheduled or running studies may be too low."
+                )
+            message = f"{' '.join(gaps)} The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
             account_check["unresolved"].append(message)
             missing_signals.append(message)
     if normalized_level == "ad":
@@ -1740,9 +1905,19 @@ async def update_ad_study(
     now = _now()
     state = _study_state(previous, now)
     previous_start = _parse_meta_time(previous.get("start_time"))
-    if start is not None and previous_start is not None and previous_start <= now:
+    if start is not None and previous_start is None:
+        raise ValidationError(
+            "The study's current start_time could not be read, so whether it has started (after which Meta "
+            "does not allow changing start_time) is unknown. Nothing was changed."
+        )
+    if start is not None and previous_start <= now:
         raise ValidationError("Meta does not allow changing start_time after a study has started.")
     if end is not None:
+        if state == "unknown":
+            raise ValidationError(
+                "The study's start, end or cancel time could not be read, so whether it has already ended "
+                "(after which end_time cannot change) is unknown. Nothing was changed."
+            )
         if state in {"ended", "canceled"}:
             raise ValidationError(f"end_time can only change before a study ends; this study is {state}.")
         if end <= int(now.timestamp()):
@@ -1820,7 +1995,7 @@ async def cancel_ad_study(study_id: str) -> dict[str, Any]:
         response["message"] = (
             f"Nothing was sent: the study is {state}."
             if state != "unknown"
-            else "Nothing was sent: the study's start and end times could not be read."
+            else "Nothing was sent: the study's start, end or cancel time could not be read, so its state is unknown."
         )
         return response
     return mutation_response(

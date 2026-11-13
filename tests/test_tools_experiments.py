@@ -612,7 +612,10 @@ def test_study_count_pages_to_the_last_page() -> None:
         ("act_10", "impacting_ad_studies", "p2"): {"data": [_study("s2", "LIFT", *RUNNING)]},
     })
     result = run(experiments._count_account_active_studies(client, "act_10", NOW))
-    assert result == {"active_studies": 2, "pages_read": 2, "count_complete": True, "stop_reason": None}
+    assert result == {
+        "active_studies": 2, "unclassified_studies": 0, "pages_read": 2, "pages_complete": True,
+        "count_complete": True, "stop_reason": None, "unclassified_note": None,
+    }
 
 
 def test_eligibility_does_not_miss_entity_study_second_page(monkeypatch) -> None:
@@ -1704,3 +1707,252 @@ def test_ad_level_eligibility_through_the_mcp_boundary(monkeypatch) -> None:
     use(monkeypatch, FakeStudyClient(objects={"41": _ad("41"), "20": _adset("20"), "30": _campaign("30")}))
     result = _mcp_call("check_ab_test_eligibility", {"account_id": "123", "level": "ad", "entity_ids": "41"})
     assert result.structured_content["precheck_outcome"] == "passed"
+
+
+# --- R13 (review R5): a study whose state cannot be read is never dropped --------------------
+
+UNREADABLE_PAGES = [
+    pytest.param({}, id="no-data"),
+    pytest.param({"data": None}, id="null-data"),
+    pytest.param({"data": "x"}, id="data-not-a-list"),
+    pytest.param({"data": {"id": "30"}}, id="data-an-object"),
+]
+UNKNOWN_STATE_ROWS = [
+    pytest.param({"id": "30", "name": "Unknown state", "type": "SPLIT_TEST"}, id="no-times"),
+    pytest.param({"id": "30", "type": "SPLIT_TEST", "start_time": RUNNING[0]}, id="no-end"),
+    pytest.param({"id": "30", "type": "SPLIT_TEST", "start_time": "soon", "end_time": "later"}, id="unparseable"),
+    pytest.param(
+        {"id": "30", "type": "SPLIT_TEST", "start_time": RUNNING[0], "end_time": RUNNING[1], "canceled_time": "?"},
+        id="unreadable-cancel-time",
+    ),
+    pytest.param(None, id="not-an-object"),
+    pytest.param("x", id="a-string"),
+]
+
+
+def test_r5_unclassifiable_study_rows_do_not_pass_eligibility(monkeypatch) -> None:
+    class Client:
+        async def get_object(self, object_id, **kwargs):
+            return {"id": object_id, "account_id": "10", "effective_status": "ACTIVE"}
+
+        async def list_objects(self, parent_id, edge, **kwargs):
+            return {"data": [{"id": "30", "name": "Unknown state", "type": "SPLIT_TEST"}]}
+
+    monkeypatch.setattr(experiments, "get_graph_api_client", Client)
+    result = run(experiments.check_ab_test_eligibility("10", "campaign", ["20"]))
+    assert result["precheck_outcome"] == "inconclusive", result
+    assert result["account"]["count_complete"] is False
+
+
+@pytest.mark.parametrize("row", UNKNOWN_STATE_ROWS)
+def test_unclassified_study_on_the_entity_edge_makes_membership_inconclusive(monkeypatch, row) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"c1": _campaign("c1")}, edges={("c1", "ad_studies"): {"data": [row]}},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    entity = result["entities"][0]
+    assert entity["outcome"] == "inconclusive"
+    assert entity["active_studies"] == [] and entity["active_studies_complete"] is False
+    assert entity["unclassified_studies"] == 1
+    assert any("scheduled or running is unknown" in message for message in entity["unresolved"])
+    assert any("studies containing c1" in signal or "containing c1" in signal for signal in result["missing_signals"])
+    assert result["precheck_outcome"] == "inconclusive"
+    assert result["eligible_by_local_precheck"] is None
+    # The account edge read nothing unknown, so its own count stays complete.
+    assert result["account"]["count_complete"] is True
+
+
+@pytest.mark.parametrize("row", UNKNOWN_STATE_ROWS)
+def test_unclassified_study_on_the_account_edge_leaves_the_count_incomplete(monkeypatch, row) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"c1": _campaign("c1")},
+        edges={("act_123", "impacting_ad_studies"): {"data": [_study("s1", "LIFT", *RUNNING), row]}},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    account = result["account"]
+    assert account["active_studies"] == 1 and account["unclassified_studies"] == 1
+    assert account["count_complete"] is False and account["pages_complete"] is True
+    assert account["blockers"] == []
+    assert len(account["unresolved"]) == 1 and "may be too low" in account["unresolved"][0]
+    assert "not confirmed" in account["unresolved"][0]
+    assert result["precheck_outcome"] == "inconclusive"
+
+
+def test_unclassified_studies_keep_a_definite_concurrency_blocker(monkeypatch) -> None:
+    studies = [_study(str(100 + index), "SPLIT_TEST", *RUNNING) for index in range(100)]
+    use(monkeypatch, FakeStudyClient(
+        objects={"c1": _campaign("c1")},
+        edges={("act_123", "impacting_ad_studies"): {"data": [*studies, {"id": "999", "type": "LIFT"}]}},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["account"]["active_studies"] == 100
+    assert result["account"]["count_complete"] is False
+    assert len(result["account"]["blockers"]) == 1
+    assert result["precheck_outcome"] == "failed"
+
+
+def test_unclassified_studies_keep_a_definite_entity_blocker(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"c1": _campaign("c1", account="999")},
+        edges={("c1", "ad_studies"): {"data": [{"id": "30"}]}},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["entities"][0]["outcome"] == "failed"
+    assert result["precheck_outcome"] == "failed"
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+@pytest.mark.parametrize("where", ["entity", "account"])
+def test_unreadable_study_page_is_never_an_empty_complete_read(monkeypatch, payload, where) -> None:
+    edge = ("c1", "ad_studies") if where == "entity" else ("act_123", "impacting_ad_studies")
+    use(monkeypatch, FakeStudyClient(objects={"c1": _campaign("c1")}, edges={edge: payload}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["precheck_outcome"] == "inconclusive"
+    if where == "entity":
+        entity = result["entities"][0]
+        assert entity["active_studies_complete"] is False
+        assert any("readable data list" in message for message in entity["unresolved"])
+    else:
+        assert result["account"]["count_complete"] is False
+        assert "readable data list" in result["account"]["unresolved"][0]
+
+
+def test_unreadable_second_study_page_leaves_the_count_incomplete() -> None:
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): {
+            "data": [_study("s1", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/next", "cursors": {"after": "p2"}},
+        },
+        ("act_10", "impacting_ad_studies", "p2"): {"data": None},
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["active_studies"] == 1
+    assert result["count_complete"] is False and result["pages_complete"] is False
+    assert "readable data list" in result["stop_reason"]
+
+
+def test_ad_level_parent_with_unclassified_study_is_inconclusive(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"41": _ad("41"), "20": _adset("20"), "30": _campaign("30")},
+        edges={("20", "ad_studies"): {"data": [{"id": "77", "type": "SPLIT_TEST"}]}},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="ad", entity_ids=["41"]))
+    entity = result["entities"][0]
+    assert entity["outcome"] == "inconclusive" and entity["active_studies_complete"] is False
+    assert any("(77)" in message for message in entity["unresolved"])
+
+
+@pytest.mark.parametrize("status", [None, "", 5])
+def test_entity_without_a_readable_status_is_inconclusive(monkeypatch, status) -> None:
+    campaign = _campaign("c1")
+    campaign["effective_status"] = status
+    use(monkeypatch, FakeStudyClient(objects={"c1": campaign}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["precheck_outcome"] == "inconclusive"
+    assert any("effective_status" in message for message in result["entities"][0]["unresolved"])
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_get_ad_study_unreadable_objectives_do_not_say_results_are_not_ready(monkeypatch, payload) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS, ("study_1", "objectives"): payload},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    assert result["summary"]["objectives_complete"] is False
+    assert "readable data list" in result["summary"]["objectives_stop_reason"]
+    assert result["results"]["status"] == "unknown"
+    assert "not published" not in result["results"]["message"]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_get_ad_study_unreadable_cells_page_is_incomplete(monkeypatch, payload) -> None:
+    results = [json.dumps({"winner_ad_object_id": "as_9", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): payload,
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "is_primary": True, "results": results}]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    assert result["cells"] == []
+    assert result["summary"]["cells_complete"] is False and result["summary"]["cell_nodes_complete"] is False
+    assert "readable data list" in result["summary"]["cells_stop_reason"]
+    winner = result["results"]["winner"]
+    assert winner["cell_id"] is None and "not every cell could be read" in winner["cell_mapping_note"]
+
+
+def test_get_ad_study_rows_that_are_not_objects_make_the_reads_incomplete(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): {"data": [*SPLIT_CELLS["data"], None]},
+               ("study_1", "objectives"): {"data": [{"id": "obj_1"}, "x"]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    summary = result["summary"]
+    assert summary["cell_nodes_complete"] is False and summary["cells_unreadable_rows"] == 1
+    assert summary["objectives_complete"] is False and summary["objectives_unreadable_rows"] == 1
+    assert "not objects" in summary["objectives_stop_reason"]
+    assert result["results"]["status"] == "unknown"
+
+
+def test_get_ad_study_unreadable_objective_row_is_not_taken_as_the_only_objective(monkeypatch) -> None:
+    results = [json.dumps({"winner_ad_object_id": "as_1", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS,
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "results": results}, None]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    assert result["results"]["winner"] is None
+    assert "not every objective was read" in result["results"]["message"]
+
+
+def test_get_ad_study_without_a_type_does_not_guess_the_result_kind(monkeypatch) -> None:
+    results = [json.dumps({"winner_ad_object_id": "as_1", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": {key: value for key, value in SPLIT_STUDY.items() if key != "type"}},
+        edges={("study_1", "cells"): SPLIT_CELLS,
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "results": results}]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    assert result["results"]["kind"] == "unknown" and result["results"]["raw_results"]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_list_ad_studies_unreadable_page_is_not_complete(monkeypatch, payload) -> None:
+    use(monkeypatch, FakeStudyClient(edges={("act_123", "impacting_ad_studies"): payload}))
+    result = run(experiments.list_ad_studies(account_id="123"))
+    assert result["items"] == []
+    assert result["summary"]["complete"] is False and result["summary"]["next_after"] is None
+    assert "readable data list" in result["summary"]["stop_reason"]
+
+
+def test_list_ad_studies_shows_rows_that_are_not_objects_without_failing(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(edges={
+        ("act_123", "impacting_ad_studies"): {"data": [_study("s1", "SPLIT_TEST", *RUNNING), None]},
+    }))
+    result = run(experiments.list_ad_studies(account_id="123"))
+    assert result["items"][0]["state"] == "running" and result["items"][1] is None
+    filtered = run(experiments.list_ad_studies(account_id="123", study_type="SPLIT_TEST"))
+    assert [item["id"] for item in filtered["items"]] == ["s1"]
+    assert filtered["summary"]["study_type_filter"]["unreadable_rows_removed"] == 1
+
+
+def test_cancel_study_with_unreadable_cancel_time_sends_nothing(monkeypatch) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": {**RUNNING_STUDY, "canceled_time": "?"}}))
+    result = run(experiments.cancel_ad_study(study_id="study_1"))
+    assert result["ok"] is False and client.kinds() == ["get"]
+    assert "cancel time could not be read" in result["message"]
+
+
+@pytest.mark.parametrize(("stored", "change"), [
+    ({**SCHEDULED_STUDY, "start_time": None}, {"start_time": FUTURE_START}),
+    ({**RUNNING_STUDY, "end_time": None}, {"end_time": FUTURE_END}),
+    ({**RUNNING_STUDY, "canceled_time": "?"}, {"end_time": FUTURE_END}),
+])
+def test_update_study_refuses_a_time_change_when_the_state_cannot_be_read(monkeypatch, stored, change) -> None:
+    previous = stored
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": previous}))
+    with pytest.raises(experiments.ValidationError, match="could not be read"):
+        run(experiments.update_ad_study(study_id="study_1", **change))
+    assert client.kinds() == ["get"]
