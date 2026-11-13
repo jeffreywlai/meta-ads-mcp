@@ -1944,3 +1944,45 @@ def test_url_password_masking_matches_how_a_url_is_parsed(url, secret) -> None:
 )
 def test_url_password_masking_leaves_text_without_a_url_password_alone(text) -> None:
     assert catalog_feeds._mask_url_passwords(text) == text
+
+
+def test_feed_file_upload_only_reads_files_from_the_upload_folder(monkeypatch, tmp_path) -> None:
+    """A path from the model must not be able to send some other file on this machine to Meta."""
+    allowed = tmp_path / "uploads"
+    allowed.mkdir()
+    monkeypatch.setenv("META_UPLOAD_DIR", str(allowed))
+    reload_settings()
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    outside = tmp_path / "private-export.csv"
+    outside.write_text("id\nsecret-row\n")
+    (allowed / "link.csv").symlink_to(outside)
+    for path, expected in (
+        (str(outside), "inside the upload folder"),
+        ("../private-export.csv", "inside the upload folder"),
+        ("link.csv", "inside the upload folder"),
+    ):
+        with pytest.raises(ValidationError, match=expected) as error:
+            run(catalog_feeds.create_product_feed_upload(feed_id="123", file_path=path))
+        assert "private-export" not in str(error.value)
+        assert "secret-row" not in str(error.value)
+
+
+def test_feed_file_upload_is_off_without_an_upload_folder(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("META_UPLOAD_DIR", raising=False)
+    reload_settings()
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    target = tmp_path / "feed.csv"
+    target.write_text("id\n1\n")
+    with pytest.raises(ValidationError, match="META_UPLOAD_DIR"):
+        run(catalog_feeds.create_product_feed_upload(feed_id="123", file_path=str(target)))
+
+
+def test_feed_file_upload_from_the_upload_folder_is_sent(monkeypatch, tmp_path) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    (tmp_path / "feed.csv").write_bytes(b"id\n1\n")
+    result = run(catalog_feeds.create_product_feed_upload(feed_id="123", file_path="feed.csv"))
+    sent = client.calls[-1]
+    assert sent["edge"] == "uploads"
+    assert sent["files"]["file"][0] == "feed.csv"
+    assert sent["files"]["file"][1] == b"id\n1\n"
+    assert result["ok"] is True

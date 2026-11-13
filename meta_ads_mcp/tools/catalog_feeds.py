@@ -10,7 +10,6 @@ import functools
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
@@ -21,6 +20,7 @@ from meta_ads_mcp.diagnostics import build_finding
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
+from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import GraphId
@@ -836,31 +836,16 @@ async def delete_product_feed(feed_id: str) -> dict[str, Any]:
 
 
 def _read_feed_file(file_path: Any) -> tuple[str, bytes, str]:
-    """Read a local feed file in the server; errors never quote the path or the contents."""
-    text = blank_to_none(file_path) if isinstance(file_path, str) else None
-    if text is None:
-        raise ValidationError("file_path must be a non-blank local file path.")
-    path = Path(text).expanduser()
-    content_type = FEED_FILE_TYPES.get(path.suffix.lower())
-    if content_type is None:
-        raise ValidationError(
-            "file_path must name a feed file ending in one of "
-            f"{', '.join(FEED_FILE_TYPES)} (the formats Meta documents for feed uploads)."
-        )
-    try:
-        if not path.is_file():
-            raise ValidationError("file_path does not point to a readable file.")
-        size = path.stat().st_size
-        if size == 0:
-            raise ValidationError("file_path points to an empty file.")
-        if size > MAX_FEED_FILE_BYTES:
-            raise ValidationError(
-                f"file_path is larger than this server's {MAX_FEED_FILE_BYTES}-byte limit for feed files."
-            )
-        content = path.read_bytes()
-    except OSError:
-        raise ValidationError("file_path could not be read.") from None
-    return path.name, content, content_type
+    """Read a local feed file in the server, only from the operator's upload folder.
+
+    Errors never quote the path or the contents.
+    """
+    upload = read_upload_file(
+        file_path,
+        allowed_types=FEED_FILE_TYPES,
+        max_bytes=MAX_FEED_FILE_BYTES,
+    )
+    return upload.name, upload.content, upload.content_type
 
 
 @mcp_server.tool()

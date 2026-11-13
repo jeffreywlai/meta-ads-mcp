@@ -927,7 +927,7 @@ def test_remove_audience_users_sends_delete_with_body_not_query(monkeypatch) -> 
 
 def test_audience_users_file_errors_make_no_call(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
-    with pytest.raises(audiences.ValidationError, match="readable file"):
+    with pytest.raises(audiences.ValidationError, match="does not point to a file"):
         asyncio.run(audiences.add_audience_users(
             audience_id="aud_1", schema=["EMAIL"], file_path=str(tmp_path / "missing.csv"),
         ))
@@ -1105,3 +1105,42 @@ def test_update_custom_audience_rule_failed_pre_read_writes_nothing(monkeypatch)
     with pytest.raises(NotFoundError):
         asyncio.run(audiences.update_custom_audience(audience_id="aud_1", rule=WEBSITE_RULE))
     assert [call[0] for call in client.calls] == ["get"]
+
+
+@pytest.mark.parametrize("tool", ["add_audience_users", "remove_audience_users"])
+def test_audience_users_only_read_files_from_the_upload_folder(monkeypatch, tmp_path, tool) -> None:
+    """A path from the model must not be able to send some other file on this machine to Meta."""
+    from meta_ads_mcp.config import reload_settings
+
+    allowed = tmp_path / "uploads"
+    allowed.mkdir()
+    monkeypatch.setenv("META_UPLOAD_DIR", str(allowed))
+    reload_settings()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    outside = tmp_path / "customers-outside.csv"
+    outside.write_text("EMAIL\nprivate.person@example.com\n")
+    (allowed / "link.csv").symlink_to(outside)
+    (allowed / "list.txt").write_text("EMAIL\nprivate.person@example.com\n")
+    function = getattr(audiences, tool)
+    for path, expected in (
+        (str(outside), "inside the upload folder"),
+        ("../customers-outside.csv", "inside the upload folder"),
+        ("link.csv", "inside the upload folder"),
+        ("list.txt", "must end in"),
+    ):
+        with pytest.raises(audiences.ValidationError, match=expected) as error:
+            asyncio.run(function(audience_id="aud_1", schema=["EMAIL"], file_path=path))
+        assert "private.person" not in str(error.value)
+        assert "customers-outside" not in str(error.value)
+
+
+def test_audience_users_file_reading_is_off_without_an_upload_folder(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.config import reload_settings
+
+    monkeypatch.delenv("META_UPLOAD_DIR", raising=False)
+    reload_settings()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    target = tmp_path / "list.csv"
+    target.write_text("EMAIL\na@example.com\n")
+    with pytest.raises(audiences.ValidationError, match="META_UPLOAD_DIR"):
+        asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=["EMAIL"], file_path=str(target)))

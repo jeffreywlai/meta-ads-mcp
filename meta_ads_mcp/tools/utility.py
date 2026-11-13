@@ -923,6 +923,7 @@ async def get_capabilities(
             "META_EXPORT_MAX_FILES",
             "META_EXPORT_MAX_BYTES",
             "META_READ_ONLY",
+            "META_UPLOAD_DIR",
         ],
     }
     notes = [

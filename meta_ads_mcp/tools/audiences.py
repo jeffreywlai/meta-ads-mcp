@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import hashlib
 import json
 import math
@@ -10,7 +11,6 @@ import re
 import secrets
 import unicodedata
 from datetime import date
-from pathlib import Path
 from typing import Annotated, Any
 
 from fastmcp.tools import Tool
@@ -20,6 +20,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
+from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list
@@ -481,14 +482,23 @@ def _audience_schema(schema: Any) -> list[str]:
     return normalized
 
 
+# A customer list is read whole into memory before hashing, so its size is bounded.
+CUSTOMER_FILE_TYPES = {".csv": "text/csv"}
+MAX_CUSTOMER_FILE_BYTES = 100 * 1024 * 1024
+
+
 def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
     """Read only the schema columns from a local CSV, matched to the header by name."""
-    path = Path(file_path).expanduser()
-    if not path.is_file():
-        raise ValidationError("file_path must point to a readable file.")
+    # Only from the operator's upload folder: a path from the model must not be able
+    # to send some other file on this machine to Meta.
+    upload = read_upload_file(
+        file_path,
+        allowed_types=CUSTOMER_FILE_TYPES,
+        max_bytes=MAX_CUSTOMER_FILE_BYTES,
+    )
     lines_read = 0
     try:
-        with path.open(newline="", encoding="utf-8-sig") as handle:
+        with io.StringIO(upload.content.decode("utf-8-sig"), newline="") as handle:
             # strict rejects malformed quoting (such as an unclosed quote) instead of
             # silently merging the following lines into one different record.
             reader = csv.reader(handle, strict=True)

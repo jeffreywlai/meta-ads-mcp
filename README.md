@@ -598,6 +598,15 @@ Analysis agents using tool search need access to `search_tools`, `call_tool`, an
 The default remains writable; no existing server or dbt agent configuration is
 changed automatically.
 
+Tools that upload a local file (`add_audience_users`, `remove_audience_users` and
+`create_product_feed_upload` with `file_path`) read only from one folder you
+choose. Set `META_UPLOAD_DIR` in the launch environment to that folder and put
+the file there. Until it is set, these tools refuse to read any local file. A
+path that leads outside the folder, including through a link, is refused. This
+matters because the model also reads text written by other people, such as ad
+comments, and a file path it supplies should not be able to send some other file
+on your machine to Meta.
+
 For click/view attribution comparisons, use `get_entity_insights` with explicit
 dates, `fields=["actions","action_values"]`,
 `use_unified_attribution_setting=false`,
