@@ -1118,9 +1118,31 @@ def test_list_catalog_partners_falls_back_when_meta_refuses_the_tasks_field(monk
 
 def test_list_catalog_partners_raises_other_errors(monkeypatch) -> None:
     client = _use(monkeypatch, FakeClient(errors={(CATALOG, "agencies"): _graph_error()}))
-    with pytest.raises(MetaApiError):
+    with pytest.raises(MetaApiError) as error:
         run(business_access.list_catalog_partners(catalog_id=CATALOG))
     assert len(client.calls) == 1
+    assert error.value.code == 200
+    assert str(error.value).startswith("(#200) Permissions error")
+    assert "not yet confirmed against Meta's live API" in str(error.value)
+
+
+def test_a_failed_partner_write_says_the_request_shape_is_unconfirmed(monkeypatch) -> None:
+    client = _partner_client(None)
+    client.errors[("POST", CATALOG, "agencies")] = MetaApiError(message="(#100) Invalid parameter", status_code=400, code=100)
+    _use(monkeypatch, client)
+    with pytest.raises(MetaApiError) as error:
+        run(business_access.set_catalog_access(catalog_id=CATALOG, user_id=PARTNER, tasks=["ADVERTISE"], user_type="AGENCY"))
+    assert error.value.code == 100 and error.value.status_code == 400
+    assert "may come from the request shape" in str(error.value)
+
+
+def test_a_failed_person_write_keeps_metas_message_unchanged(monkeypatch) -> None:
+    client = _access_client(None)
+    client.errors[("POST", CATALOG, "assigned_users")] = _graph_error()
+    _use(monkeypatch, client)
+    with pytest.raises(MetaApiError) as error:
+        run(business_access.set_catalog_access(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON, tasks=["ADVERTISE"]))
+    assert str(error.value) == "(#200) Permissions error"
 
 
 @pytest.mark.parametrize(("rows", "status", "tasks"), [

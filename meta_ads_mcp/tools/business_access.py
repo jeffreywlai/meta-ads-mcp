@@ -8,6 +8,7 @@ an email address.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
@@ -795,8 +796,22 @@ async def _read_partners(read: Any) -> tuple[dict[str, Any], bool]:
         return await read(PARTNER_TASK_FIELDS), False
     except MetaApiError as error:
         if error.code != 100:
-            raise
-    return await read(PARTNER_FIELDS), True
+            raise _partner_error(error) from error
+    try:
+        return await read(PARTNER_FIELDS), True
+    except MetaApiError as error:
+        raise _partner_error(error) from error
+
+
+PARTNER_ERROR_HINT = (
+    "The partner request shape is not yet confirmed against Meta's live API (verified_live=false), "
+    "so this error may come from the request shape rather than your permissions."
+)
+
+
+def _partner_error(error: MetaApiError) -> MetaApiError:
+    """The same Meta error with a sentence saying the partner request is unconfirmed."""
+    return dataclasses.replace(error, message=f"{error.message} {PARTNER_ERROR_HINT}")
 
 
 def _partner_item(row: dict[str, Any], tasks_rejected: bool) -> dict[str, Any]:
@@ -1055,10 +1070,15 @@ async def set_catalog_access(
     request = plan["request"]
     if dry_run:
         return {**base, "dry_run": True, "sent": False, "would_send": request, "current": plan["proposed"]}
-    if request["method"] == "DELETE":
-        meta_response = await client.delete_edge_object(target["catalog_id"], plan["edge"], data=dict(request["data"]))
-    else:
-        meta_response = await client.create_edge_object(target["catalog_id"], plan["edge"], data=dict(request["data"]))
+    try:
+        if request["method"] == "DELETE":
+            meta_response = await client.delete_edge_object(target["catalog_id"], plan["edge"], data=dict(request["data"]))
+        else:
+            meta_response = await client.create_edge_object(target["catalog_id"], plan["edge"], data=dict(request["data"]))
+    except MetaApiError as error:
+        if inputs["kind"] != "AGENCY":
+            raise
+        raise _partner_error(error) from error
     response = {**base, "sent": True, "request_sent": request}
     if inputs["kind"] == "AGENCY":
         response["meta_response"] = meta_response if isinstance(meta_response, dict) else None
