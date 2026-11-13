@@ -13,6 +13,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
@@ -24,9 +25,10 @@ from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError, Validatio
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.secret_scrub import (  # noqa: F401 - the length thresholds stay importable from here
+    ANYWHERE,
     ERROR,
     MIN_SECRET_SUBSTRING_LENGTH,
     MIN_SECRET_TOKEN_LENGTH,
@@ -264,7 +266,10 @@ class _CheckedClient:
     """The Graph client as the catalog tools use it: an unreadable answer is never read as one.
 
     A read whose answer cannot be read raises, so a tool that reads before it writes stops
-    before the write, and a list is never called complete from it. A write whose answer
+    before the write, and a list is never called complete from it. A list read (list_objects)
+    whose answer has no data list raises too: every edge these tools read with it is a
+    collection Meta documents with a data list (check_batch_request_status included), so
+    none is exempt, and an answer without one may have held rows. A write whose answer
     cannot be read raises with the outcome unknown, so the write is never reported as a
     plain success. Every other attribute is the client's own.
     """
@@ -281,10 +286,14 @@ class _CheckedClient:
             return method
         write = name in self._WRITES
 
+        collection = name == "list_objects"
+
         async def checked(*args: Any, **kwargs: Any) -> Any:
             answer = await method(*args, **kwargs)
             if _answer_unreadable(answer):
                 raise _unreadable_answer_error(answer, write=write)
+            if collection and read_collection_page(answer)[2]:
+                raise _unreadable_collection_error()
             return answer
 
         return checked
@@ -312,6 +321,30 @@ def _unreadable_answer_error(answer: Any, *, write: bool) -> MetaApiError:
         message="Meta's answer to a read was not JSON, so it could not be read; nothing was changed.",
         status_code=status if isinstance(status, int) else None,
         details=details,
+    )
+
+
+_UNREADABLE_COLLECTION = (
+    "Meta's answer to a list read had no data list, so what the list holds is not known; nothing "
+    "was changed."
+)
+
+
+def _unreadable_collection_error() -> MetaApiError:
+    """The error for a list answer without a data list (see _CheckedClient)."""
+    return MetaApiError(message=_UNREADABLE_COLLECTION, details={"unreadable_collection": True})
+
+
+def _is_unreadable_collection_error(error: BaseException) -> bool:
+    details = getattr(error, "details", None)
+    return isinstance(error, MetaApiError) and isinstance(details, dict) and details.get("unreadable_collection") is True
+
+
+def _unreadable_entries_reason(count: int) -> str:
+    """Why a list that held entries that are not objects is not complete."""
+    return (
+        f"Meta returned {count} entr{'y' if count == 1 else 'ies'} that could not be read as an object, so "
+        "what they hold is not known."
     )
 
 
@@ -396,54 +429,73 @@ async def _collect_edge(
     early, a plain-language reason is appended to stop_reasons if a list is given.
     A page identical to one already read is not added again, and a cursor already
     read is not followed: either stops the read as incomplete, so a page Meta keeps
-    returning is never counted twice.
+    returning is never counted twice. A page without a data list stops the read as
+    incomplete (it may have held rows), and entries that are not objects are left out,
+    counted, and make the read incomplete (normalize.read_collection_page).
     """
     items: list[dict[str, Any]] = []
     after: str | None = None
     cursors_read: set[str | None] = {None}
     pages_read: set[str] = set()
+    unreadable_entries = 0
 
     def stopped(reason: str) -> None:
         if stop_reasons is not None:
             stop_reasons.append(f"{edge} of {parent_id}: {reason}")
+
+    def finish(found: list[dict[str, Any]], complete: bool) -> tuple[list[dict[str, Any]], bool]:
+        if unreadable_entries:
+            stopped(_unreadable_entries_reason(unreadable_entries))
+            return found, False
+        return found, complete
 
     for _ in range(max_pages):
         params: dict[str, Any] = {**(extra_params or {}), "limit": page_size}
         if after:
             params["after"] = after
         payload = await client.list_objects(parent_id, edge, fields=fields, params=params)
-        page = normalize_collection(payload)
-        if page["items"]:
-            fingerprint = json.dumps(page["items"], sort_keys=True, default=str)
+        rows, skipped, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            stopped("Meta's answer had no data list, so the page could not be read and the read stopped.")
+            return finish(items, False)
+        unreadable_entries += skipped
+        if rows:
+            fingerprint = json.dumps(rows, sort_keys=True, default=str)
             if fingerprint in pages_read:
                 stopped(
                     "Meta returned the same page again; its rows were not counted a second time "
                     "and the read stopped, so later pages were not read."
                 )
-                return items, False
+                return finish(items, False)
             pages_read.add(fingerprint)
-        items.extend(page["items"])
-        has_next = bool(page["paging"].get("next"))
+        items.extend(rows)
+        paging = normalize_collection(payload)["paging"]
+        has_next = bool(paging.get("next"))
         if max_items is not None and len(items) >= max_items:
             more = len(items) > max_items or has_next
             if more:
                 stopped(f"stopped at the {max_items}-item cap; more items exist.")
-            return items[:max_items], not more
+            return finish(items[:max_items], not more)
         if not has_next:
-            return items, True
-        after = page["paging"].get("after")
+            return finish(items, True)
+        after = paging.get("after")
         if not after:
             stopped("Meta reported another page but gave no cursor to read it.")
-            return items, False
+            return finish(items, False)
         if after in cursors_read:
             stopped(
                 "Meta returned a cursor that was already read; the read stopped so no page is "
                 "counted twice, and later pages were not read."
             )
-            return items, False
+            return finish(items, False)
         cursors_read.add(after)
     stopped(f"stopped after {max_pages} pages; more pages exist.")
-    return items, False
+    return finish(items, False)
+
+
+def _rows_without_id(rows: list[dict[str, Any]]) -> int:
+    """How many rows carry no readable id, so cannot be told apart from the one being looked for."""
+    return sum(1 for row in rows if _object_id(row.get("id")) is None)
 
 
 def _object_id(value: Any) -> str | None:
@@ -980,6 +1032,7 @@ async def _read_upload_errors(
     # How many errors had been read, with samples, when Meta first refused them.
     sampled_before_refusal: int | None = None
     errors: list[dict[str, Any]] = []
+    unreadable_errors = 0
     cursor = after
     cursors_read: set[str | None] = {cursor}
     pages_read: set[str] = set()
@@ -1012,6 +1065,12 @@ async def _read_upload_errors(
                 )
             payload = await client.list_objects(upload_id, "errors", fields=fields, params=params)
         page = normalize_collection(payload)
+        rows, skipped, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            stop_reason = "Meta's answer had no data list, so that page of errors could not be read."
+            break
+        unreadable_errors += skipped
+        page["items"] = rows
         if page["items"]:
             fingerprint = json.dumps(page["items"], sort_keys=True, default=str)
             if fingerprint in pages_read:
@@ -1054,6 +1113,9 @@ async def _read_upload_errors(
             )
             break
         cursors_read.add(cursor)
+    if unreadable_errors:
+        complete = False
+        stop_reason = " ".join(filter(None, (stop_reason, _unreadable_entries_reason(unreadable_errors))))
     result: dict[str, Any] = {
         "errors": _sort_upload_errors(errors),
         "errors_complete": complete,
@@ -1549,6 +1611,21 @@ async def delete_product_feed(feed_id: str) -> dict[str, Any]:
     )
 
 
+# What an error or a result shows in place of a local file's path or name.
+_FILE_SHOWN = "<file>"
+
+
+def _local_file_names(file_path: Any, *names: str) -> tuple[str, ...]:
+    """A local feed file's path as given, trimmed and expanded, and its names, for scrubbing.
+
+    A file name can itself be private (an email address, a customer's name), so the same
+    forms creatives.py removes for image and video uploads are removed here, at any length
+    and wherever they occur (secret_scrub's ANYWHERE policy).
+    """
+    path = str(file_path)
+    return (path, path.strip(), str(Path(path.strip()).expanduser()), *names)
+
+
 def _read_feed_file(file_path: Any) -> tuple[str, bytes, str]:
     """Read a local feed file in the server, only from the operator's upload folder.
 
@@ -1632,7 +1709,15 @@ async def create_product_feed_upload(
     if files is None:
         created = await client.create_edge_object(feed_id, "uploads", data=data)
     else:
-        created = await client.create_edge_object(feed_id, "uploads", data=data, files=files)
+        local_names = _local_file_names(file_path, source["file_name"])
+        try:
+            created = await client.create_edge_object(feed_id, "uploads", data=data, files=files)
+        except Exception as exc:
+            # Meta's error text can repeat the file's name: no error or log line shows it.
+            scrub_exception(exc, local_names, policy=ANYWHERE, shown=_FILE_SHOWN)
+            raise
+        # Nor does Meta's answer; upload_source names the file the caller chose, as before.
+        created = scrub_value(created, local_names, policy=ANYWHERE, shown=_FILE_SHOWN)
     response = creation_response(
         action="create_product_feed_upload",
         target=target,
@@ -1685,11 +1770,24 @@ async def list_product_feed_uploads(
         feed_id, "uploads", fields=UPLOAD_FIELDS, params=_page_params(limit, after),
     )
     collection = _paged_collection(payload, after)
+    uploads, unreadable, _ = read_collection_page(payload)
     collection["items"] = [
         await _upload_with_errors(client, upload, include_samples=include_samples)
-        for upload in collection["items"]
+        for upload in uploads
     ]
+    _note_unreadable_entries(collection["summary"], unreadable, len(uploads))
     return collection
+
+
+def _note_unreadable_entries(summary: dict[str, Any], unreadable: int, readable: int) -> None:
+    """Say in a page's summary that it held entries that are not objects, which are left out."""
+    summary["count"] = readable
+    if unreadable:
+        summary["unreadable_entries"] = unreadable
+        summary["complete"] = False
+        summary["stop_reason"] = " ".join(filter(None, (
+            summary.get("stop_reason"), _unreadable_entries_reason(unreadable) + " They are left out.",
+        )))
 
 
 @mcp_server.tool()
@@ -1936,11 +2034,19 @@ async def list_event_source_catalogs(
     for catalog in catalogs:
         catalog_id = _object_id(catalog.get("id"))
         if catalog_id is None:
+            # A catalog Meta listed without an id cannot be checked, so it may be connected.
+            sources_complete = False
+            stop_reasons.append("Meta listed a catalog without an id, so its sources could not be checked.")
             continue
         sources, complete = await _connected_sources(client, catalog_id, stop_reasons)
         sources_complete = sources_complete and complete
         if any(_object_id(source.get("id")) == event_source_id for source in sources):
             matches.append(catalog)
+        elif _rows_without_id(sources):
+            sources_complete = False
+            stop_reasons.append(
+                f"Catalog {catalog_id} lists a connected source without an id, which may be this source."
+            )
     complete = catalogs_complete and sources_complete
     note = (
         "Every owned catalog of the business was checked."
@@ -2018,7 +2124,7 @@ async def get_catalog_event_source_health(
     sources = inputs["sources"]
     if scope_id is not None:
         sources = [source for source in sources if _object_id(source.get("id")) == scope_id]
-        if not sources and inputs["sources_complete"]:
+        if not sources and inputs["sources_complete"] and not _rows_without_id(inputs["sources"]):
             raise ValidationError(
                 f"Event source {scope_id} is not connected to catalog {catalog_id}; "
                 "list_catalog_event_sources shows the connected ones."
@@ -2026,12 +2132,15 @@ async def get_catalog_event_source_health(
         if not sources:
             sources = [{"id": scope_id}]
             missing.append(
-                f"Source {scope_id} was not among the connected sources read (that list is partial), "
-                "so its name and type are unknown."
+                f"Source {scope_id} was not among the connected sources read ("
+                + ("Meta listed a connected source without an id, which may be it"
+                   if inputs["sources_complete"] else "that list is partial")
+                + "), so its name and type are unknown."
             )
     for source in sources:
         source_id = _object_id(source.get("id"))
         if source_id is None:
+            missing.append("Meta listed a connected source without an id, so it could not be reported on.")
             continue
         source_type = str(source.get("source_type") or "").upper()
         stats = inputs["stats"].get(source_id)
@@ -2099,7 +2208,12 @@ async def get_catalog_event_source_health(
         if source_type in DA_CHECK_SOURCE_TYPES:
             checks_payload = await client.list_objects(source_id, "da_checks", fields=DA_CHECK_FIELDS)
             checks_page = normalize_collection(checks_payload)
-            checks = checks_page["items"]
+            checks, unreadable_checks, _ = read_collection_page(checks_payload)
+            if unreadable_checks:
+                missing.append(
+                    f"da_checks for source {source_id}: {_unreadable_entries_reason(unreadable_checks)} "
+                    "A failed check may be among them."
+                )
             failed = [check for check in checks if str(check.get("result") or "").lower() == "failed"]
             unevaluated = [
                 check for check in checks
@@ -2113,7 +2227,7 @@ async def get_catalog_event_source_health(
                     f"Meta's check {check.get('key')} for source {source_id} returned result "
                     f"{check.get('result')!r}, so it was neither passed nor failed and could not be evaluated."
                 )
-            if not checks:
+            if not checks and not unreadable_checks:
                 missing.append(f"Meta returned no Dynamic Ads checks for source {source_id}.")
             if checks_page["paging"].get("next"):
                 missing.append(f"da_checks for source {source_id} had more pages than were read.")
@@ -2204,7 +2318,7 @@ async def get_catalog_event_source_recommendations(
                 "The catalog has no readable business; pass business_id to choose whose pixels to consider."
             )
     inputs = await _catalog_signal_inputs(client, catalog_id)
-    connected_ids = {_object_id(source.get("id")) for source in inputs["sources"]}
+    connected_ids = {_object_id(source.get("id")) for source in inputs["sources"]} - {None}
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
     matched = _known_sum(stat["matched_content_ids"] for stat in inputs["stats"].values())
@@ -2218,6 +2332,13 @@ async def get_catalog_event_source_recommendations(
         )
     missing.extend(inputs["scan_gaps"])
     sources_complete = inputs["sources_complete"]
+    if sources_complete and _rows_without_id(inputs["sources"]):
+        # Any candidate pixel may be the connected source Meta listed without an id.
+        sources_complete = False
+        missing.append(
+            "Meta listed a connected source without an id, so whether a candidate pixel is already connected "
+            "is not known."
+        )
     stats_complete = inputs["stats_complete"]
     coverage_evidence: dict[str, Any] = {
         "connected_sources": len(inputs["sources"]),
@@ -2274,6 +2395,11 @@ async def get_catalog_event_source_recommendations(
     )
     if not pixels_complete:
         missing.append("The business has more pixels than were read; some candidates were not considered.")
+    if _rows_without_id(pixels):
+        missing.append(
+            f"{_rows_without_id(pixels)} pixel(s) Meta listed had no id, so they could not be considered."
+        )
+        pixels = [pixel for pixel in pixels if _object_id(pixel.get("id")) is not None]
     candidates = [
         pixel for pixel in pixels
         if _object_id(pixel.get("id")) not in connected_ids and not pixel.get("is_unavailable")
@@ -2304,7 +2430,9 @@ async def get_catalog_event_source_recommendations(
         if index < MAX_PIXEL_CANDIDATES_CHECKED:
             checks_payload = await client.list_objects(pixel_id, "da_checks", fields=DA_CHECK_FIELDS)
             checks_page = normalize_collection(checks_payload)
-            checks = checks_page["items"]
+            checks, unreadable_checks, _ = read_collection_page(checks_payload)
+            if unreadable_checks:
+                missing.append(f"da_checks for pixel {pixel_id}: {_unreadable_entries_reason(unreadable_checks)}")
             checks_paged = bool(checks_page["paging"].get("next"))
             if checks_paged:
                 missing.append(f"da_checks for pixel {pixel_id} had more pages than were read.")
@@ -2323,6 +2451,12 @@ async def get_catalog_event_source_recommendations(
                 reason = (
                     "Meta's check pixel_missing_dpa_event was not on the first page of checks read, "
                     "and more pages exist, so the result is unknown."
+                )
+            elif dpa_check is None and unreadable_checks:
+                strength = "unknown"
+                reason = (
+                    "Meta's check pixel_missing_dpa_event was not among the checks that could be read; it may be "
+                    "one of the entries that could not, so the result is unknown."
                 )
             else:
                 strength = "unknown"
@@ -2380,6 +2514,10 @@ async def _connection_state(
     reasons: list[str] = []
     sources, complete = await _connected_sources(client, catalog_id, reasons)
     ids = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    if len(ids) < len(sources):
+        # The source asked about may be the one Meta listed without an id.
+        complete = False
+        reasons.append(f"Meta listed {len(sources) - len(ids)} connected source(s) without an id.")
     gaps: list[str] = []
     if not complete:
         gaps.append(

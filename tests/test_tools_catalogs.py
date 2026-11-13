@@ -3394,3 +3394,119 @@ def test_a_non_json_answer_to_a_catalog_write_is_not_reported_as_done(monkeypatc
         _run(call())
     assert raised.value.mutation_outcome_unknown is True
     assert "busy" not in str(raised.value)
+
+
+# round thirteen --------------------------------------------------------------------------
+# R1: a collection answer that is not the collection it should be never decides anything.
+
+
+class _RawPages:
+    def __init__(self, *pages):
+        self.pages = list(pages)
+
+    async def list_objects(self, *args, **kwargs):
+        return self.pages.pop(0)
+
+
+@pytest.mark.parametrize("page", [{}, {"data": None}, {"data": {"id": "1"}}, {"summary": {"total_count": 0}}])
+def test_r1_other_aggregate_readers_do_not_call_a_missing_data_page_complete(page) -> None:
+    read = _run(catalogs._collect_edge(
+        _RawPages({"data": [{"id": "1"}], "paging": {"next": "n", "cursors": {"after": "a"}}}, page),
+        "10", "products", fields=["id"], params={}, max_pages=5,
+    ))
+    assert read["rows"] == [{"id": "1"}]
+    assert read["complete"] is False and "no data list" in read["stop_reason"]
+
+
+def test_catalog_edge_entries_that_are_not_objects_leave_the_read_incomplete() -> None:
+    read = _run(catalogs._collect_edge(
+        _RawPages({"data": [{"id": "1"}, None]}), "10", "products", fields=["id"], params={}, max_pages=1,
+    ))
+    assert read["rows"] == [{"id": "1"}] and read["unreadable_entries"] == 1
+    assert read["complete"] is False and "1 entry" in read["stop_reason"]
+
+
+_FULL_CREATE = {
+    "method": "create", "retailer_id": "sku", "name": "Example", "description": "Example product",
+    "url": "https://example.invalid/p", "image_url": "https://example.invalid/i.png", "brand": "Example",
+    "availability": "in stock", "condition": "new", "price": 10, "currency": "USD",
+}
+
+
+@pytest.mark.parametrize("products", [
+    {},                                            # no data list at all
+    {"data": None},
+    {"data": [None]},                              # an entry that is not an object
+    {"data": [{"id": "20", "name": "Shoe"}]},      # a product without a retailer_id
+    {"data": [{"id": "20", "retailer_id": ""}]},
+])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_r1_batch_does_not_write_after_missing_product_collection(monkeypatch, products, dry_run) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): products}))
+    result = _run(catalogs.batch_update_catalog_products(
+        "10", [dict(_FULL_CREATE)], allow_upsert=True, dry_run=dry_run, wait_seconds=0,
+    ))
+    assert "create" not in client.kinds()
+    assert result["ok"] is False and result["sent"] is False
+    assert "nothing was written" in result["reason"]
+
+
+def test_batch_still_skips_a_create_of_a_sku_read_as_existing(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): {"data": [
+        {"id": "20", "retailer_id": "sku", "name": "Shoe"},
+    ]}}))
+    result = _run(catalogs.batch_update_catalog_products("10", [dict(_FULL_CREATE)], wait_seconds=0))
+    assert result["items"][0]["outcome"] == "skipped_already_exists"
+    assert "create" not in client.kinds()
+
+
+@pytest.mark.parametrize("answer", [{}, {"data": None}])
+def test_every_catalog_list_read_refuses_an_answer_without_a_data_list(monkeypatch, answer) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): answer, ("10", "diagnostics"): answer}))
+    for call in (lambda: catalogs.list_catalog_products(catalog_id="10"),
+                 lambda: catalogs.get_catalog_diagnostics("10")):
+        with pytest.raises(MetaApiError, match="no data list"):
+            _run(call())
+
+
+def test_diagnostics_and_data_sources_count_unreadable_entries(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={
+        ("10", "diagnostics"): {"data": [{"type": "A", "severity": "MUST_FIX", "number_of_affected_items": 3}, None]},
+        ("10", "data_sources"): {"data": [{"id": "d1", "upload_type": "FEED"}, "x"]},
+    }))
+    diagnostics = _run(catalogs.get_catalog_diagnostics("10"))
+    assert diagnostics["summary"]["unreadable_entries"] == 1 and diagnostics["summary"]["complete"] is False
+    assert [group["type"] for group in diagnostics["items"]] == ["A"]
+    sources = _run(catalogs.list_catalog_data_sources("10"))
+    assert sources["summary"]["by_upload_type"] == {"FEED": 1}
+    assert sources["summary"]["unreadable_entries"] == 1 and sources["items"] == [{"id": "d1", "upload_type": "FEED"}]
+
+
+def test_health_with_a_diagnostic_of_unreadable_severity_is_inconclusive(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(
+        objects={"10": {"id": "10", "product_count": 5}},
+        edges={("10", "diagnostics"): {"data": [{"type": "A"}]},
+               ("10", "external_event_sources"): {"data": [{"id": "s1"}]}},
+    ))
+    result = _run(catalogs.get_catalog_dynamic_ads_health("10"))
+    assert result["status"] == "inconclusive"
+    assert any("no readable severity" in note for note in result["missing_signals"])
+
+
+def test_dpa_pixel_connection_is_unknown_when_a_source_has_no_id(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={
+        ("b1", "owned_product_catalogs"): {"data": [{"id": "c1", "product_count": 5}, {"name": "No id"}]},
+        ("c1", "external_event_sources"): {"data": [{"name": "unnamed source"}]},
+        ("c1", "product_sets"): {"data": [{"id": "ps"}]},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="b1", pixel_id="p1"))
+    [finding] = result["findings"]
+    assert finding["catalog_id"] == "c1"
+    assert finding["context_match"]["pixel"]["connected"] is None
+    assert result["metrics"]["complete"] is False and result["recommended_catalog_id"] is None
+    assert any("without an id" in note for note in result["missing_signals"])
+
+
+def test_page_catalog_list_with_an_unidentified_row_is_incomplete() -> None:
+    read = _run(catalogs._page_catalog_ids(_RawPages({"data": [{"id": "c1"}, {"name": "x"}]}), "p1"))
+    assert read["ids"] == {"c1"} and read["complete"] is False
