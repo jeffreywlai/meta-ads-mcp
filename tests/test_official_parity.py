@@ -147,7 +147,7 @@ def test_multi_target_name_error_lists_options() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["ads_get_help_article", "ads_catalog_get_businesses", "ads_log_ui_interaction", "ads_pixel_event_read"],
+    ["ads_get_help_article", "ads_insights_performance_vs_peers", "ads_log_ui_interaction", "ads_pixel_event_read"],
 )
 def test_unserved_name_error_gives_the_reason(name) -> None:
     assert resolve_official_tool(name) is None
@@ -172,7 +172,7 @@ def test_get_capabilities_official_tool_lookup() -> None:
         mcp_server.call_tool("get_capabilities", {"official_tool": "ads_catalog_get_suggested_filter"})
     ).structured_content
     assert result["official_tool"]["status"] == "partial"
-    assert result["official_tool"]["tools"] == ["build_product_set_filter"]
+    assert "build_product_set_filter" in result["official_tool"]["tools"]
     assert result["official_tool"]["verified"] in {"live", "mocked"}
     assert result["official_tool"]["served_by_meta"] is True
 

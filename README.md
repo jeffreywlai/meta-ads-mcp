@@ -299,15 +299,16 @@ for a small preflight or read-back. The other single-entity reads also accept `f
 Meta publishes a hosted Ads MCP server (`https://mcp.facebook.com/ads`). On
 2026-11-12 it served 106 tools: 87 of the 88 named in Meta's documentation plus
 19 undocumented ones. `meta_ads_mcp/official_parity.py` holds one entry for each
-served name, written from that tool's real description and parameter list. A
+served name, written from that tool's real description and parameter list and
+last checked against this code by an independent comparison on 2026-11-13. A
 test fails if a served name is missing or an entry points at a tool that is not
 registered.
 
 | Status | Meaning | Tools |
 |--------|---------|-------|
-| `covered` | A tool here does everything Meta's tool does, or more | 46 |
-| `partial` | A tool here does part of it; the entry says what Meta's tool can do that ours cannot | 35 |
-| `missing` | Nothing here yet, although Meta's public API appears to allow it | 8 |
+| `covered` | A tool here does everything Meta's tool does, or more | 60 |
+| `partial` | A tool here does part of it; the entry says what Meta's tool can do that ours cannot, and why that is still open | 29 |
+| `missing` | Nothing here yet, although Meta's public API appears to allow it | 0 |
 | `unavailable` | No public API route is known, so no tool is registered | 12 |
 | `app_internal` | Plumbing for Meta's own app (upload dialogs, telemetry); nothing to match | 6 |
 
