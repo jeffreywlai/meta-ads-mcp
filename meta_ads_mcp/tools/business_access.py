@@ -8,7 +8,7 @@ an email address.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, ValidationError
@@ -43,8 +43,24 @@ UNTOUCHED_ACCESS_NOTE = (
     "asset group or a partner business share is not affected and is not shown here."
 )
 
+EMPTY_BUSINESSES_NOTE = (
+    "Meta returned no businesses for this token. That is not an error: a system-user token may "
+    "list none here even when its system user belongs to a business. Read an ad account's owning "
+    'business with get_ad_account(fields=["business"]).'
+)
+
 USER_TYPES = ("EMPLOYEE", "SYSTEM_USER", "AGENCY")
-CATALOG_RECIPIENT_TYPES = ("PERSON", "AGENCY")
+# Meta's own user_type values on a catalog's assigned_users rows, mapped to the kinds
+# above. Meta's reference and the SDK (AssignedUser.user_type is a plain string) list no
+# allowed values, so only a value Meta has actually returned is mapped: business_user,
+# seen in a live read on 2026-11-13. Matching is case-insensitive, so Meta's system_user
+# also matches this server's own SYSTEM_USER.
+META_USER_TYPE_KINDS = {"BUSINESS_USER": "EMPLOYEE"}
+_USER_TYPE_ACCEPTED = (
+    "EMPLOYEE, SYSTEM_USER, AGENCY, or BUSINESS_USER (Meta's user_type for a person, "
+    "meaning EMPLOYEE); case does not matter"
+)
+_PERSON_KINDS = ("EMPLOYEE", "SYSTEM_USER")
 
 MAX_LIMIT = 100
 SCAN_PAGE_SIZE = 100
@@ -71,11 +87,39 @@ def _validate_limit(limit: int) -> None:
         raise ValidationError(f"limit must be between 1 and {MAX_LIMIT}.")
 
 
-def _choice(value: Any, name: str, allowed: tuple[str, ...]) -> str:
+def _known_kind(value: Any) -> str | None:
+    """Map this server's kinds and Meta's returned user_type values to one kind."""
     normalized = str(value or "").strip().upper()
-    if normalized not in allowed:
-        raise ValidationError(f"{name} must be one of: {', '.join(allowed)}.")
-    return normalized
+    if normalized in USER_TYPES:
+        return normalized
+    return META_USER_TYPE_KINDS.get(normalized)
+
+
+def _user_kind(value: Any) -> str:
+    """Return EMPLOYEE, SYSTEM_USER or AGENCY, or raise listing what is accepted."""
+    kind = _known_kind(value)
+    if kind is None:
+        raise ValidationError(f"user_type {str(value).strip()!r} is not recognised. Accepted values: {_USER_TYPE_ACCEPTED}.")
+    return kind
+
+
+def _catalog_recipient_kind(value: Any) -> str:
+    """Return PERSON or AGENCY for list_catalog_assigned_users, accepting the other tools' kinds."""
+    if str(value or "").strip().upper() == "PERSON":
+        return "PERSON"
+    try:
+        kind = _user_kind(value)
+    except ValidationError:
+        raise ValidationError(
+            f"user_type {str(value).strip()!r} is not recognised. Accepted values: PERSON, {_USER_TYPE_ACCEPTED}."
+        ) from None
+    return "AGENCY" if kind == "AGENCY" else "PERSON"
+
+
+def _row_kind(row: dict[str, Any]) -> str | None:
+    """The person kind of an assigned_users row, in the vocabulary the other tools accept."""
+    kind = _known_kind(row.get("user_type"))
+    return kind if kind in _PERSON_KINDS else None
 
 
 def _page_params(limit: int, after: str | None) -> dict[str, Any]:
@@ -219,22 +263,28 @@ async def list_businesses(
     search = blank_to_none(name_contains)
     if search is None:
         payload = await client.list_objects("me", "businesses", fields=BUSINESS_FIELDS, params=_page_params(limit, after))
-        return _page_response(payload, BUSINESS_FIELDS)
-    scan = await _scan(client, "me", "businesses", fields=BUSINESS_FIELDS, after=after)
-    return _search_response(scan, BUSINESS_FIELDS, search, ("name",), limit)
+        response = _page_response(payload, BUSINESS_FIELDS)
+        returned = len(response["items"])
+    else:
+        scan = await _scan(client, "me", "businesses", fields=BUSINESS_FIELDS, after=after)
+        response = _search_response(scan, BUSINESS_FIELDS, search, ("name",), limit)
+        returned = len(scan["rows"])
+    if returned == 0:
+        response["notes"] = [EMPTY_BUSINESSES_NOTE]
+    return response
 
 
 @mcp_server.tool()
 async def list_business_users(
     business_id: GraphId,
-    user_type: Literal["EMPLOYEE", "SYSTEM_USER", "AGENCY"] = "EMPLOYEE",
+    user_type: str = "EMPLOYEE",
     search: str | None = None,
     limit: int = 25,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """List a business's people (EMPLOYEE), system users (SYSTEM_USER) or partner businesses (AGENCY, Business Manager's Partners) with their role. Each person's id is the business-scoped id the catalog access tools take. Rows carry only id, name, business email where Meta returns it, and role. search matches an exact id, or a name (or a person's email) substring."""
+    """List a business's people (EMPLOYEE), system users (SYSTEM_USER) or partner businesses (AGENCY, Business Manager's Partners) with their role. Each person's id is the business-scoped id the catalog access tools take. Rows carry only id, name, business email where Meta returns it, and role. search matches an exact id, or a name (or a person's email) substring. user_type also accepts Meta's business_user, as list_catalog_assigned_users returns it."""
     business_id = _numeric_id(business_id, "business_id")
-    user_type = _choice(user_type, "user_type", USER_TYPES)
+    user_type = _user_kind(user_type)
     _validate_limit(limit)
     if user_type == "EMPLOYEE":
         edge, fields, text_fields = "business_users", BUSINESS_PERSON_FIELDS, ("name", "email")
@@ -307,16 +357,16 @@ async def _find_assignment(
 async def list_catalog_assigned_users(
     catalog_id: GraphId,
     business_id: GraphId | None = None,
-    user_type: Literal["PERSON", "AGENCY"] = "PERSON",
+    user_type: str = "PERSON",
     user_id: GraphId | None = None,
     limit: int = 25,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """List who has direct access to a Meta product catalog and with which tasks (MANAGE, ADVERTISE, MANAGE_AR, AA_ANALYZE), or with user_type=AGENCY the partner businesses it is shared with. Pass user_id to check one person. business_id defaults to the catalog's owning business. Access through a business role or business asset group is not listed."""
+    """List who has direct access to a Meta product catalog and with which tasks (MANAGE, ADVERTISE, MANAGE_AR, AA_ANALYZE), or with user_type=AGENCY the partner businesses it is shared with. Pass user_id to check one person. business_id defaults to the catalog's owning business. Access through a business role or business asset group is not listed. Each person row keeps Meta's user_type and adds user_kind (EMPLOYEE or SYSTEM_USER), the value the other access tools take."""
     catalog_id = _numeric_id(catalog_id, "catalog_id")
     business_id = _optional_numeric_id(business_id, "business_id")
     user_id = _optional_numeric_id(user_id, "user_id")
-    user_type = _choice(user_type, "user_type", CATALOG_RECIPIENT_TYPES)
+    user_type = _catalog_recipient_kind(user_type)
     _validate_limit(limit)
     if user_type == "AGENCY" and business_id is not None:
         raise ValidationError("business_id is not used with user_type=AGENCY; the partner list belongs to the catalog.")
@@ -349,7 +399,10 @@ async def list_catalog_assigned_users(
             status = "UNKNOWN"
         result: dict[str, Any] = {
             "scope": {**scope, "user_id": user_id},
-            "item": {**(row or {"id": user_id}), "tasks": tasks, "can": _task_meanings(tasks)},
+            "item": {
+                **(row or {"id": user_id}), "user_kind": _row_kind(row or {}),
+                "tasks": tasks, "can": _task_meanings(tasks),
+            },
             "access_status": status,
             "summary": {"scanned": found["scanned"], "requests": found["requests"], "complete": found["known"]},
             "notes": [UNTOUCHED_ACCESS_NOTE, TASK_MEANINGS_NOTE],
@@ -362,6 +415,7 @@ async def list_catalog_assigned_users(
     response = _page_response(payload, ASSIGNED_USER_FIELDS)
     for item in response["items"]:
         item["tasks"] = _row_tasks(item)
+        item["user_kind"] = _row_kind(item)
     response["scope"] = scope
     response["task_meanings"] = dict(TASK_MEANINGS)
     response["notes"] = [UNTOUCHED_ACCESS_NOTE, TASK_MEANINGS_NOTE]
@@ -371,14 +425,14 @@ async def list_catalog_assigned_users(
 @mcp_server.tool()
 async def list_user_assigned_catalogs(
     user_id: GraphId,
-    user_type: Literal["EMPLOYEE", "SYSTEM_USER", "AGENCY"] = "EMPLOYEE",
+    user_type: str = "EMPLOYEE",
     business_id: GraphId | None = None,
     limit: int = 25,
     after: str | None = None,
 ) -> dict[str, Any]:
-    """List the Meta product catalogs assigned to one person or system user (business-scoped id from list_business_users), or with user_type=AGENCY the catalogs your business (business_id, required) shares with that partner business. The partner view scans your owned catalogs one by one and reports how many it checked."""
+    """List the Meta product catalogs assigned to one person or system user (business-scoped id from list_business_users), or with user_type=AGENCY the catalogs your business (business_id, required) shares with that partner business. The partner view scans your owned catalogs one by one and reports how many it checked. user_type takes EMPLOYEE, SYSTEM_USER or AGENCY, or the user_type or user_kind a catalog listing returned."""
     user_id = _numeric_id(user_id, "user_id")
-    user_type = _choice(user_type, "user_type", USER_TYPES)
+    user_type = _user_kind(user_type)
     business_id = _optional_numeric_id(business_id, "business_id")
     _validate_limit(limit)
     if user_type == "AGENCY" and business_id is None:

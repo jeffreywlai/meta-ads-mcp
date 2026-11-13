@@ -723,3 +723,109 @@ def test_docstrings_have_no_plus_character() -> None:
         "list_user_assigned_catalogs", "preview_catalog_access_change", "set_catalog_access",
     ):
         assert "+" not in (inspect.getdoc(getattr(business_access, name)) or "")
+
+
+# Vocabulary shared between the access tools, and empty business lists -------------------
+
+
+def test_catalog_assigned_users_adds_user_kind_beside_metas_user_type(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={
+        (CATALOG, "assigned_users"): _page([
+            {"id": PERSON, "name": PERSON_NAME, "user_type": "business_user", "tasks": ["ADVERTISE"]},
+            {"id": "790", "name": "Robot", "user_type": "system_user", "tasks": ["MANAGE"]},
+            {"id": "791", "name": "Odd", "user_type": "something_new", "tasks": []},
+        ]),
+    }))
+    result = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS))
+    items = {item["id"]: item for item in result["items"]}
+    assert items[PERSON]["user_type"] == "business_user"
+    assert items[PERSON]["user_kind"] == "EMPLOYEE"
+    assert items["790"]["user_type"] == "system_user"
+    assert items["790"]["user_kind"] == "SYSTEM_USER"
+    assert items["791"]["user_type"] == "something_new"
+    assert items["791"]["user_kind"] is None
+
+
+def test_catalog_assigned_users_one_person_check_adds_user_kind(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={
+        (CATALOG, "assigned_users"): _page([{"id": PERSON, "name": PERSON_NAME, "user_type": "business_user", "tasks": ["MANAGE"]}]),
+    }))
+    result = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON))
+    assert result["item"]["user_type"] == "business_user"
+    assert result["item"]["user_kind"] == "EMPLOYEE"
+
+
+@pytest.mark.parametrize(("given", "edge"), [
+    ("business_user", "business_users"),
+    ("BUSINESS_USER", "business_users"),
+    ("employee", "business_users"),
+    ("system_user", "system_users"),
+    ("agency", "agencies"),
+])
+def test_business_user_listing_accepts_metas_user_type_values(monkeypatch, given, edge) -> None:
+    client = _use(monkeypatch, FakeClient())
+    run(business_access.list_business_users(business_id=BUSINESS, user_type=given))
+    assert client.calls[0]["edge"] == edge
+
+
+@pytest.mark.parametrize("given", ["business_user", "system_user", "EMPLOYEE"])
+def test_user_assigned_catalogs_accepts_the_user_type_list_catalog_assigned_users_returned(monkeypatch, given) -> None:
+    client = _use(monkeypatch, FakeClient())
+    result = run(business_access.list_user_assigned_catalogs(user_id=PERSON, user_type=given))
+    assert client.calls[0]["edge"] == "assigned_product_catalogs"
+    assert result["scope"]["user_type"] in {"EMPLOYEE", "SYSTEM_USER"}
+
+
+@pytest.mark.parametrize("given", ["business_user", "SYSTEM_USER", "person"])
+def test_catalog_assigned_users_accepts_person_kinds_as_user_type(monkeypatch, given) -> None:
+    client = _use(monkeypatch, FakeClient())
+    result = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS, user_type=given))
+    assert client.calls[0]["edge"] == "assigned_users"
+    assert result["scope"]["user_type"] == "PERSON"
+
+
+@pytest.mark.parametrize("tool", ["list_business_users", "list_user_assigned_catalogs", "list_catalog_assigned_users"])
+def test_unknown_user_type_lists_accepted_values_before_any_call(monkeypatch, tool) -> None:
+    _no_client(monkeypatch)
+    kwargs = {
+        "list_business_users": {"business_id": BUSINESS},
+        "list_user_assigned_catalogs": {"user_id": PERSON},
+        "list_catalog_assigned_users": {"catalog_id": CATALOG, "business_id": BUSINESS},
+    }[tool]
+    with pytest.raises(ValidationError) as error:
+        run(getattr(business_access, tool)(user_type="pending_user", **kwargs))
+    message = str(error.value)
+    assert "BUSINESS_USER" in message and "SYSTEM_USER" in message and "AGENCY" in message
+
+
+def test_user_type_from_list_catalog_assigned_users_passes_mcp_validation(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = _use(monkeypatch, FakeClient())
+    result = run(mcp_server.call_tool(
+        "list_user_assigned_catalogs", {"user_id": PERSON, "user_type": "business_user"},
+    ))
+    assert result.structured_content["scope"]["user_type"] == "EMPLOYEE"
+    assert client.calls[0]["edge"] == "assigned_product_catalogs"
+
+
+def test_list_businesses_explains_an_empty_list_without_failing(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={("me", "businesses"): {"data": []}}))
+    result = run(business_access.list_businesses())
+    assert result["items"] == []
+    assert result["summary"]["complete"] is True
+    note = " ".join(result["notes"])
+    assert "system-user token" in note
+    assert 'get_ad_account(fields=["business"])' in note
+
+
+def test_list_businesses_name_search_with_no_businesses_explains_too(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={("me", "businesses"): {"data": []}}))
+    result = run(business_access.list_businesses(name_contains="acme"))
+    assert 'get_ad_account(fields=["business"])' in " ".join(result["notes"])
+
+
+def test_list_businesses_with_results_has_no_empty_list_note(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={("me", "businesses"): _page([{"id": "1", "name": "Acme"}])}))
+    result = run(business_access.list_businesses())
+    assert "notes" not in result
