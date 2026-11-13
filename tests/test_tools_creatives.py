@@ -2773,3 +2773,296 @@ def test_boost_undocumented_video_billing_pairs_are_refused(monkeypatch, fixed_c
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(creatives.ValidationError, match=message):
         asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+
+
+# Round six: review findings K1 (boost part), K6, K9 and K15.
+
+
+def _encoded(secret: str, encoding: str) -> str:
+    """secret percent-encoded with the slash kept (quote's default), or every escape in lower-case hex."""
+    import re
+    from urllib.parse import quote
+
+    if encoding == "slash_preserved":
+        return quote(secret)
+    return re.sub(r"%[0-9A-F]{2}", lambda match: match[0].lower(), quote(secret, safe=""))
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("encoding", ["slash_preserved", "lowercase_escapes"])
+def test_boost_partnership_code_is_removed_from_encoded_errors(monkeypatch, caplog, encoding, routed) -> None:
+    """K1 reproduction: Meta's error repeats the creator's code, URL-encoded."""
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.errors import MetaApiError
+
+    secret = "".join(("R5+credential", "/part=9"))
+    encoded = _encoded(secret, encoding)
+
+    class Echo:
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("Rejected credential " + encoded, code=100, user_message="Invalid " + encoded)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Echo)
+    arguments = {
+        "account_id": "10", "instagram_account_id": "30", "page_id": "40", "adset_id": "20",
+        "partnership_ad_code": secret,
+    }
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        _call_tool("boost_instagram_post", arguments, routed)
+    assert encoded not in str(error.value)
+    assert encoded not in caplog.text
+    assert "<partnership_ad_code>" in str(error.value)
+
+
+def test_secret_scrub_ignores_case_only_in_escape_hex_digits() -> None:
+    """An escape's hex digits match in either case; the code's own letters stay case-sensitive."""
+    from urllib.parse import quote
+
+    secret = "".join(("Ab+cD", "/eF=9"))
+    pattern = creatives._secret_pattern(creatives._secret_forms(secret))
+    lower_escapes = quote(secret, safe="").replace("%2B", "%2b").replace("%2F", "%2f").replace("%3D", "%3d")
+    for repeated in (secret, quote(secret), quote(secret, safe=""), lower_escapes, f" {secret} "):
+        cleaned = creatives._scrub_value(f"x {repeated} y", pattern, "<code>")
+        assert secret not in cleaned and repeated.strip() not in cleaned and "<code>" in cleaned, repeated
+    # The same letters in a different case are a different code and are left alone.
+    for different in (secret.swapcase(), quote(secret.swapcase()), quote(secret.lower(), safe="")):
+        assert creatives._scrub_value(f"x {different} y", pattern, "<code>") == f"x {different} y", different
+
+
+def test_secret_scrub_treats_a_literal_percent_in_the_code_as_a_real_character() -> None:
+    """A '%' typed in the code is not an escape, so the letters after it keep their case."""
+    secret = "".join(("code%2F", "Tail"))
+    pattern = creatives._secret_pattern(creatives._secret_forms(secret))
+    assert creatives._scrub_value(f"x {secret} y", pattern, "<code>") == "x <code> y"
+    assert creatives._scrub_value("x code%2fTail y", pattern, "<code>") == "x code%2fTail y"
+
+
+@pytest.mark.parametrize("encoding", ["slash_preserved", "lowercase_escapes"])
+def test_video_upload_error_never_holds_an_encoded_path(monkeypatch, tmp_path, encoding) -> None:
+    """The same encoded forms of the caller's path and the file's name are removed from upload errors."""
+    from meta_ads_mcp.errors import MetaApiError
+
+    (tmp_path / "private folder").mkdir()
+    name = "".join(("café ", "private.mp4"))
+    (tmp_path / "private folder" / name).write_bytes(b"12345678")
+    given = f"private folder/{name}"
+    echoed = _encoded(given, encoding)
+
+    class Echo:
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("Rejected " + echoed + " and " + _encoded(name, encoding), code=100)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Echo)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("10", file_path=given))
+    assert echoed not in raised.value.message
+    assert "private" not in raised.value.message.lower()
+    assert "<file>" in raised.value.message
+
+
+@pytest.mark.parametrize("encoding", ["slash_preserved", "lowercase_escapes"])
+def test_image_upload_error_never_holds_an_encoded_path(monkeypatch, tmp_path, encoding) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    (tmp_path / "private folder").mkdir()
+    name = "".join(("café ", "private.png"))
+    (tmp_path / "private folder" / name).write_bytes(PNG_BYTES)
+    given = f"private folder/{name}"
+    echoed = _encoded(given, encoding)
+
+    class Echo:
+        async def upload_ad_image(self, account_id, **kwargs):
+            raise MetaApiError("Rejected " + echoed + " and " + _encoded(name, encoding), code=100)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Echo)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_creative_asset("10", file_path=given))
+    assert echoed not in raised.value.message
+    assert "private" not in raised.value.message.lower()
+    assert "<file>" in raised.value.message
+
+
+class _SlowPreparationClient(FakeOneStepClient):
+    """Moves a shared clock forward ten seconds while the campaign is created."""
+
+    def __init__(self, clock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.adset_submitted_at = None
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        from datetime import timedelta
+
+        if edge == "adsets":
+            self.adset_submitted_at = self.clock[0]
+        result = await super().create_edge_object(parent_id, edge, data=data, files=files)
+        if edge == "campaigns":
+            self.clock[0] += timedelta(seconds=10)
+        return result
+
+
+def _moving_clock(monkeypatch):
+    from datetime import datetime, timezone
+
+    clock = [datetime(2026, 11, 13, 12, 0, 0, 500000, tzinfo=timezone.utc)]
+    monkeypatch.setattr(creatives, "_utc_now", lambda: clock[0])
+    return clock
+
+
+@pytest.mark.parametrize("budget", ["daily_budget", "lifetime_budget", "campaign_daily_budget", "campaign_lifetime_budget"])
+@pytest.mark.parametrize("days", [1, 6, 365])
+def test_computed_one_day_boost_still_covers_a_day_when_preparation_takes_time(monkeypatch, budget, days) -> None:
+    """K6 reproduction: ten seconds of setup must not shorten a run Meta starts when it creates the ad set."""
+    from datetime import datetime, timedelta
+
+    client = _SlowPreparationClient(_moving_clock(monkeypatch))
+    _, result = _boost(monkeypatch, client, **{"daily_budget": None, budget: 10, "duration_days": days})
+    adset = _created(client, "adsets")
+    # Meta documents that an omitted start_time is the moment it creates the ad set.
+    assert "start_time" not in adset
+    end = datetime.fromisoformat(adset["end_time"])
+    run = end - client.adset_submitted_at
+    assert timedelta(days=days) <= run <= timedelta(days=days) + creatives._boost_end_margin() + timedelta(seconds=1)
+    assert end.microsecond == 0
+    assert result["defaults_applied"]["end_time"] == adset["end_time"]
+    assert result["schedule"]["end_time"] == adset["end_time"]
+    assert result["schedule"]["end_time_fixed_when_sent"] is True
+
+
+def test_boost_plan_says_the_computed_end_is_fixed_when_sent(monkeypatch, fixed_clock) -> None:
+    from datetime import datetime, timedelta
+
+    client, result = _boost(monkeypatch, duration_days=1, plan_only=True)
+    assert not [call for call in client.calls if call[0] == "create"]
+    shown = result["plan"]["requests"][1]["data"]["end_time"]
+    assert datetime.fromisoformat(shown) == fixed_clock + timedelta(days=1) + creatives._boost_end_margin()
+    schedule = result["plan"]["schedule"]
+    assert schedule["end_time"] == shown
+    assert schedule["end_time_fixed_when_sent"] is True
+    assert schedule["safety_margin_seconds"] == 300
+    assert "immediately before the ad set request is sent" in schedule["note"]
+    assert "if it were sent now" in schedule["note"]
+    assert result["plan"]["requests"][1]["end_time_note"] == schedule["note"]
+
+
+def test_boost_end_margin_covers_the_configured_request_timeout(monkeypatch) -> None:
+    from datetime import timedelta
+
+    from meta_ads_mcp.config import reload_settings
+
+    assert creatives._boost_end_margin() == timedelta(minutes=5)
+    monkeypatch.setenv("META_REQUEST_TIMEOUT", "600")
+    reload_settings()
+    assert creatives._boost_end_margin() == timedelta(seconds=660)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_end"),
+    [
+        ({"start_time": "2026-12-01T09:00:00-05:00", "duration_days": 2}, "2026-12-03T09:00:00-05:00"),
+        ({"end_time": "2026-11-20T00:00:00Z"}, "2026-11-20T00:00:00Z"),
+        ({"start_time": "2026-12-01T09:00:00-05:00", "end_time": "2026-12-03T09:00:00-05:00"}, "2026-12-03T09:00:00-05:00"),
+    ],
+)
+def test_boost_caller_times_are_sent_unchanged_after_slow_preparation(monkeypatch, arguments, expected_end) -> None:
+    """A start or end the caller gives is not moved by setup time and gets no margin."""
+    client = _SlowPreparationClient(_moving_clock(monkeypatch))
+    _, result = _boost(monkeypatch, client, **arguments)
+    adset = _created(client, "adsets")
+    if "start_time" in arguments:
+        assert adset["start_time"] == arguments["start_time"]
+    assert adset["end_time"] == expected_end
+    assert result["schedule"]["end_time"] == expected_end
+    assert result["schedule"]["end_time_fixed_when_sent"] is False
+
+
+def test_chunked_upload_checks_file_after_the_processing_status_read(monkeypatch, tmp_path) -> None:
+    """K9 reproduction: the file grows while the processing-status read is in flight."""
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"0123456789")
+
+    class Upload:
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            if data["upload_phase"] == "start":
+                return {"upload_session_id": "50", "video_id": "60", "start_offset": "0", "end_offset": "10"}
+            if data["upload_phase"] == "transfer":
+                return {"start_offset": "10", "end_offset": "10"}
+            return {"success": True}
+
+        async def get_object(self, object_id, *, fields=None, params=None):
+            with path.open("ab") as handle:
+                handle.write(b"additional-frame")
+            return {"id": object_id, "status": {"video_status": "ready"}}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Upload)
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert result.get("file_changed") is True
+    assert result.get("warnings") and len(result["warnings"]) == 1
+    assert "Video is ready to use." not in result["status_note"]
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_video_upload_sends_callers_basename_for_an_accepted_alias(monkeypatch, tmp_path, chunked) -> None:
+    """K15 reproduction: an accepted in-folder link hero.mp4 -> source.mp4 is sent as hero.mp4."""
+    (tmp_path / "source.mp4").write_bytes(b"0123456789")
+    (tmp_path / "hero.mp4").symlink_to(tmp_path / "source.mp4")
+    chunks: list[dict] = []
+
+    class Upload(FakeVideoClient):
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            if data["upload_phase"] == "start":
+                return {"upload_session_id": "50", "video_id": "60", "start_offset": "0", "end_offset": "10"}
+            if data["upload_phase"] == "transfer":
+                chunks.append(deepcopy(files))
+                return {"start_offset": "10", "end_offset": "10"}
+            return {"success": True}
+
+    client = Upload()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    if chunked:
+        monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="hero.mp4"))
+    files = chunks[0] if chunked else client.calls[0][4]
+    assert next(iter(files.values()))[0] == "hero.mp4"
+    assert result["upload"]["file_name"] == "hero.mp4"
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("given", ["hero.mp4", "  hero.mp4  ", "clips/hero.mp4"])
+def test_video_plan_names_the_callers_basename(monkeypatch, tmp_path, chunked, given) -> None:
+    (tmp_path / "clips").mkdir()
+    (tmp_path / "source.mp4").write_bytes(b"0123456789")
+    for link in (tmp_path / "hero.mp4", tmp_path / "clips" / "hero.mp4"):
+        link.symlink_to(tmp_path / "source.mp4")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    if chunked:
+        monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path=given, dry_run=True))
+    source = result["would_send"]["source"] if chunked else result["would_send"]["data"]["source"]
+    assert source["file_name"] == "hero.mp4"
+
+
+def test_video_type_is_still_judged_from_the_real_file(monkeypatch, tmp_path) -> None:
+    """A link with a video name pointing at a file that is not a video is refused, and no name is quoted."""
+    (tmp_path / "notes.txt").write_bytes(b"0123456789")
+    (tmp_path / "hero.mp4").symlink_to(tmp_path / "notes.txt")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.upload_ad_video("10", file_path="hero.mp4"))
+    assert "hero" not in str(raised.value) and "notes" not in str(raised.value)
+
+
+@pytest.mark.parametrize("link_name", ["bad\x07name.mp4", "back\\slash.mp4", "line\nbreak.mp4"])
+def test_video_link_with_an_unsafe_name_falls_back_to_the_real_name(monkeypatch, tmp_path, link_name) -> None:
+    (tmp_path / "source.mp4").write_bytes(b"0123456789")
+    (tmp_path / link_name).symlink_to(tmp_path / "source.mp4")
+    client = FakeVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path=link_name))
+    assert client.calls[0][4] == {"source": ("source.mp4", b"0123456789")}
+    assert result["upload"]["file_name"] == "source.mp4"
