@@ -14,6 +14,7 @@ from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validat
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import AccountId, CurrencyAmount, FieldList, GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 CREATIVE_FIELDS = [
     "id",
@@ -28,6 +29,41 @@ CREATIVE_FIELDS = [
     "image_hash",
     "thumbnail_url",
 ]
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """The error text a caller can act on, without assuming an error type."""
+    message = getattr(exc, "message", None)
+    return str(message if isinstance(message, str) and message else exc) or type(exc).__name__
+
+
+def _outcome_unknown(exc: BaseException) -> bool:
+    return bool(getattr(exc, "mutation_outcome_unknown", False))
+
+
+def _with_context(exc: Exception, prefix: str) -> Exception:
+    """Put what already happened in front of a later failure, whatever its type.
+
+    Meta and rate-limit errors keep their type (and retry guidance); anything else is
+    wrapped in a MetaApiError so the message still reaches the caller.
+    """
+    if isinstance(exc, (MetaApiError, RateLimitError)):
+        exc.message = f"{prefix} {exc.message}"
+        return exc
+    return MetaApiError(message=f"{prefix} {_failure_reason(exc)}")
+
+
+def _refuse_url_logins(value: Any, name: str) -> None:
+    """Refuse a login embedded in any URL inside a nested input, before any request is built."""
+    if isinstance(value, str):
+        if "://" in value or "@" in value:
+            refuse_url_credentials(value, name)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_url_logins(item, f"{name}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _refuse_url_logins(item, f"{name}[{index}]")
 
 
 def _ensure_v25_creative_payload(payload: Any) -> None:
@@ -177,7 +213,7 @@ async def _preview_many(
     client = get_graph_api_client()
     items: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    for ad_format in formats:
+    for position, ad_format in enumerate(formats):
         try:
             preview = await client.preview_ad(
                 ad_id=ad_id,
@@ -192,6 +228,14 @@ async def _preview_many(
         except UnsupportedFeatureError as exc:
             failed.append({"ad_format": ad_format, "error": str(exc), "code": None})
             continue
+        except RateLimitError as exc:
+            # Keep the previews already rendered; stop asking while Meta is throttling.
+            failed.append({"ad_format": ad_format, "error": exc.message, "code": exc.code, "rate_limited": True})
+            failed.extend(
+                {"ad_format": remaining, "error": "Not requested: Meta rate-limited an earlier format in this call.", "code": None}
+                for remaining in formats[position + 1:]
+            )
+            break
         items.append({"ad_format": ad_format, "preview": preview})
     return {
         "items": items,
@@ -319,6 +363,7 @@ async def upload_ad_video(
     files: dict[str, Any] | None = None
     shown: dict[str, Any]
     if url:
+        refuse_url_credentials(url, "video_url")
         if not url.startswith(("http://", "https://")):
             raise ValidationError("video_url must be a public http:// or https:// URL.")
         data["file_url"] = url
@@ -371,8 +416,12 @@ async def upload_ad_video(
                 "Video is ready to use." if processing_status == "ready"
                 else "Meta is still processing or reported a problem; check list_ad_videos(video_ids=...) before using it."
             )
-        except MetaApiError as exc:
-            status_note = f"The upload succeeded but its status could not be read: {exc.message}"
+        except Exception as exc:
+            # The video exists now; a failed status read must never hide its id.
+            status_note = (
+                f"The upload succeeded (video {video_id}) but its status could not be read: {_failure_reason(exc)} "
+                "Check list_ad_videos(video_ids=...) before using it."
+            )
     response = creation_response(action="upload_ad_video", target=target, result=uploaded)
     response.update({
         "video_id": video_id,
@@ -488,11 +537,25 @@ def _label_matches(existing: dict[str, Any], wanted: dict[str, str]) -> bool:
     return str(existing.get(key) or "") == value
 
 
-def _existing_labels(previous: dict[str, Any]) -> list[dict[str, Any]]:
+# One nested page of labels, read with the creative. AdCreative has no readable
+# adlabels edge to page through, so a creative with more labels than this cannot be
+# read completely, and a removal (which sends the full replacement set) is refused.
+ADLABEL_READ_LIMIT = 100
+ADLABEL_READ_FIELD = f"adlabels.limit({ADLABEL_READ_LIMIT}){{id,name}}"
+
+
+def _existing_labels(previous: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """The labels read and whether that read was the whole set (no further page)."""
     raw = previous.get("adlabels")
+    complete = True
     if isinstance(raw, dict):
+        paging = raw.get("paging")
+        if isinstance(paging, dict) and paging.get("next"):
+            complete = False
         raw = raw.get("data")
-    return [label for label in raw or [] if isinstance(label, dict)]
+    if raw is not None and not isinstance(raw, list):
+        return [], False
+    return [label for label in raw or [] if isinstance(label, dict)], complete
 
 
 async def _update_creative_labels(
@@ -503,10 +566,17 @@ async def _update_creative_labels(
     operation: str,
 ) -> dict[str, Any]:
     """Apply a label set, add or remove after reading the creative's current labels."""
-    previous = await client.get_object(creative_id, fields=[*CREATIVE_FIELDS, "adlabels{id,name}"])
-    previous_labels = _existing_labels(previous)
+    previous = await client.get_object(creative_id, fields=[*CREATIVE_FIELDS, ADLABEL_READ_FIELD])
+    previous_labels, read_complete = _existing_labels(previous)
     shown_previous = [{key: str(label[key]) for key in ("id", "name") if label.get(key)} for label in previous_labels]
+    expected: list[dict[str, Any]] | None
     if operation == "remove":
+        if not read_complete:
+            raise ValidationError(
+                f"Creative {creative_id} has more labels than one read returns ({ADLABEL_READ_LIMIT}), and removing a "
+                "label sends the full remaining set, so labels that were not read would be lost. Nothing was changed. "
+                "Use adlabels_operation=set with the complete list you want."
+            )
         missing = [label for label in labels if not any(_label_matches(existing, label) for existing in previous_labels)]
         if missing:
             raise ValidationError(f"These labels are not on creative {creative_id}, so nothing was changed: {missing}.")
@@ -514,7 +584,7 @@ async def _update_creative_labels(
         expected = [{"id": str(label["id"])} if label.get("id") else {"name": str(label.get("name"))} for label in remaining]
         payload["adlabels"] = expected
     elif operation == "add":
-        expected = [*shown_previous, *labels]
+        expected = [*shown_previous, *labels] if read_complete else None
     else:
         expected = labels
     if payload:
@@ -522,10 +592,17 @@ async def _update_creative_labels(
     if operation == "add":
         try:
             await client.create_edge_object(creative_id, "adlabels", data={"adlabels": labels})
-        except MetaApiError as exc:
-            if payload:
-                exc.message = f"The other fields of creative {creative_id} were updated but the labels were not added: {exc.message}"
-            raise
+        except Exception as exc:
+            if not payload:
+                raise
+            changed = ", ".join(sorted(payload))
+            note = f"Creative {creative_id} was already updated ({changed} changed) but the labels were not added:"
+            if _outcome_unknown(exc):
+                note = f"Creative {creative_id} was already updated ({changed} changed); the labels may or may not have been added:"
+            wrapped = _with_context(exc, note)
+            if wrapped is exc:
+                raise
+            raise wrapped from exc
     response = mutation_response(
         action="update_creative",
         target={"creative_id": creative_id},
@@ -539,6 +616,12 @@ async def _update_creative_labels(
         current={**payload, "adlabels": expected},
     )
     response["adlabels_operation"] = operation
+    response["adlabels_read_complete"] = read_complete
+    if not read_complete:
+        response["adlabels_note"] = (
+            f"Only the first {ADLABEL_READ_LIMIT} labels could be read, so previous.adlabels is partial"
+            + ("; the add only added labels, and the full resulting set is unknown." if operation == "add" else ".")
+        )
     return response
 
 
@@ -843,6 +926,7 @@ async def boost_instagram_post(
         if not isinstance(call_to_action, dict) or not blank_to_none(str(call_to_action.get("type") or "")):
             raise ValidationError("call_to_action must be an object with a type, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}.")
         _ensure_v25_creative_payload(call_to_action)
+        _refuse_url_logins(call_to_action, "call_to_action")
     if partnership_ad_format is not None:
         if partnership_ad_format not in BOOST_PARTNERSHIP_AD_FORMATS:
             raise ValidationError("partnership_ad_format must be 1 (both identities), 2 (first identity only) or 3 (automatic).")
@@ -953,12 +1037,22 @@ async def boost_instagram_post(
                 "status": "PAUSED",
             },
         )
-    except MetaApiError as exc:
-        exc.message = (
-            f"Creative {creative_id} was created but the ad was not: {exc.message} "
-            "Delete the creative with delete_creative or retry the ad with create_ad."
-        )
-        raise
+    except Exception as exc:
+        if _outcome_unknown(exc):
+            note = (
+                f"Creative {creative_id} was created; the ad may have been created too, because Meta's answer was lost. "
+                f"Check the ads in ad set {ids['adset_id']} (list_ads) before retrying, and delete the creative with "
+                "delete_creative only if no ad uses it."
+            )
+        else:
+            note = (
+                f"Creative {creative_id} was created but the ad was not. "
+                "Delete the creative with delete_creative or retry the ad with create_ad."
+            )
+        wrapped = _with_context(exc, f"{note} Reason:")
+        if wrapped is exc:
+            raise
+        raise wrapped from exc
     response = creation_response(
         action="boost_instagram_post",
         target=target,

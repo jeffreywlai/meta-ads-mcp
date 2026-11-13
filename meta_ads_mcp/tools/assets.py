@@ -113,6 +113,11 @@ def _require_id(value: str | None, name: str) -> str:
     return normalized
 
 
+def _requests_field(fields: list[str], name: str) -> bool:
+    """Whether a field list already asks for a field, with or without a sub-selection."""
+    return any(field.split("{", 1)[0].split(".", 1)[0].strip() == name for field in fields)
+
+
 def _validate_limit(limit: int, *, maximum: int | None = None) -> None:
     """Reject page sizes Meta would refuse or that would never terminate."""
     if limit < 1:
@@ -346,14 +351,23 @@ async def list_ad_videos(
         return await _lookup_videos(client(), ids, list(requested_fields))
     if title_filter:
         _validate_limit(limit, maximum=MAX_SCAN_PAGE_SIZE)
+        # The match runs here on each video's title, so the title must be read even when
+        # the caller's fields leave it out; it is dropped from the rows afterwards.
+        scan_fields = list(requested_fields)
+        title_added = not _requests_field(scan_fields, "title")
+        if title_added:
+            scan_fields.append("title")
         scan = await _scan_edge(
             client(), normalize_account_id(account_id), "advideos",
-            fields=list(requested_fields), params=_page_params(limit, after),
+            fields=scan_fields, params=_page_params(limit, after),
         )
         needle = title_filter.casefold()
         matched = [
-            _with_processing_status(video) for video in scan["items"]
-            if needle in str(video.get("title") or "").casefold()
+            _with_processing_status(
+                {key: value for key, value in video.items() if not (title_added and key == "title")}
+            )
+            for video in scan["items"]
+            if isinstance(video, dict) and needle in str(video.get("title") or "").casefold()
         ]
         return {
             "items": matched,
@@ -522,10 +536,10 @@ async def list_instagram_media(
         if edge == "stories" and "STORY" not in product_filter:
             raise ValidationError("source=stories returns stories only; include STORY or use source=media.")
     requested_fields = list(normalize_field_list(fields) or INSTAGRAM_MEDIA_FIELDS)
-    if not any(field.split("{", 1)[0].strip() == "boost_eligibility_info" for field in requested_fields):
+    if not _requests_field(requested_fields, "boost_eligibility_info"):
         requested_fields.append(BOOST_ELIGIBILITY_FIELD)
     for needed, active in (("timestamp", window), ("media_type", type_filter), ("media_product_type", product_filter)):
-        if active is not None and not any(field.split("{", 1)[0].strip() == needed for field in requested_fields):
+        if active is not None and not _requests_field(requested_fields, needed):
             requested_fields.append(needed)
     params = _page_params(limit, after)
     if window is not None and edge == "media":

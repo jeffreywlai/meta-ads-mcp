@@ -135,7 +135,7 @@ def test_list_ad_images_sends_hashes_and_default_fields(monkeypatch) -> None:
     call = client.list_calls[0]
     assert (call["parent_id"], call["edge"]) == ("act_123", "adimages")
     assert call["params"] == {"limit": 5, "hashes": ["h1", "h2"]}
-    assert call["fields"] == assets.AD_IMAGE_LIST_FIELDS
+    assert call["fields"] == ["id", "hash", "name", "url", "permalink_url", "width", "height", "original_width", "original_height", "status", "created_time", "updated_time"]
     assert result["items"][0]["hash"] == "h1"
     assert result["summary"]["complete"] is True
 
@@ -159,7 +159,7 @@ def test_list_ad_videos_reads_advideos_edge(monkeypatch) -> None:
     call = client.list_calls[0]
     assert (call["parent_id"], call["edge"]) == ("act_123", "advideos")
     assert call["params"] == {"limit": 50, "after": "n1"}
-    assert call["fields"] == assets.AD_VIDEO_LIST_FIELDS
+    assert call["fields"] == ["id", "title", "length", "picture", "permalink_url", "status", "created_time", "updated_time"]
     assert result["summary"] == {"count": 1, "complete": False, "truncated": True, "next_after": "n2"}
 
 
@@ -296,7 +296,7 @@ def test_list_instagram_media_filters_to_boost_eligible_by_default(monkeypatch) 
     call = client.list_calls[0]
     assert (call["parent_id"], call["edge"]) == ("ig_1", "media")
     assert call["params"] == {"limit": 3}
-    assert assets.BOOST_ELIGIBILITY_FIELD in call["fields"]
+    assert "boost_eligibility_info{eligible_to_boost,boost_ineligible_reason}" in call["fields"]
     assert [item["id"] for item in result["items"]] == ["m1"]
     assert result["items"][0]["boost_eligible"] is True
     summary = result["summary"]
@@ -323,7 +323,7 @@ def test_list_instagram_media_all_items_explain_ineligibility(monkeypatch) -> No
     assert by_id["m2"]["boost_ineligible_reason"] == "COPYRIGHTED_MUSIC"
     assert by_id["m3"]["boost_eligible"] is None
     assert by_id["m3"]["boost_ineligible_reason"] is None
-    assert client.list_calls[0]["fields"] == ["id", "caption", assets.BOOST_ELIGIBILITY_FIELD]
+    assert client.list_calls[0]["fields"] == ["id", "caption", "boost_eligibility_info{eligible_to_boost,boost_ineligible_reason}"]
 
 
 def test_list_instagram_media_reads_stories_edge(monkeypatch) -> None:
@@ -530,7 +530,7 @@ def test_list_ad_videos_by_id_names_missing_videos(monkeypatch) -> None:
     _patch(monkeypatch, client)
     result = asyncio.run(assets.list_ad_videos(account_id="123", video_ids="1, 2, 1"))
     assert [call["object_id"] for call in client.get_calls] == ["1", "2"]
-    assert client.get_calls[0]["fields"] == assets.AD_VIDEO_LIST_FIELDS
+    assert client.get_calls[0]["fields"] == ["id", "title", "length", "picture", "permalink_url", "status", "created_time", "updated_time"]
     assert result["items"] == [{"id": "1", "title": "Clip", "status": {"video_status": "processing"}, "processing_status": "processing"}]
     assert result["missing"] == [{"id": "2", "reason": "Unsupported get request", "code": 100}]
     assert result["summary"]["complete"] is False
@@ -548,6 +548,52 @@ def test_list_ad_videos_title_contains_scans_and_matches_locally(monkeypatch) ->
     assert len(client.list_calls) == 2
     assert result["summary"]["scanned_count"] == 3
     assert result["summary"]["complete"] is True
+
+
+class ProjectingVideoClient(FakeAssetsClient):
+    """Returns only the fields asked for, as Meta does."""
+
+    def __init__(self, videos) -> None:
+        super().__init__()
+        self.videos = videos
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        self.list_calls.append({"parent_id": parent_id, "edge": edge, "fields": fields, "params": dict(params or {})})
+        return {"data": [{key: value for key, value in video.items() if key in (fields or [])} for video in self.videos]}
+
+
+def test_g11_video_title_filter_reads_title_even_with_custom_fields(monkeypatch) -> None:
+    client = ProjectingVideoClient([{"id": "20", "title": "Spring launch", "length": 12}])
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_ad_videos("10", title_contains="Spring", fields=["id"]))
+    assert [row["id"] for row in result["items"]] == ["20"], result
+    assert client.list_calls[0]["fields"] == ["id", "title"]
+    # The title was read only to match on; the caller asked for ids.
+    assert result["items"] == [{"id": "20", "processing_status": None}]
+
+
+@pytest.mark.parametrize("fields", [["id", "title"], ["title", "id"]])
+def test_g11_title_field_given_by_the_caller_is_not_added_twice(monkeypatch, fields) -> None:
+    client = ProjectingVideoClient([{"id": "20", "title": "Spring launch"}])
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_ad_videos("10", title_contains="Spring", fields=fields))
+    assert client.list_calls[0]["fields"] == fields
+    assert result["items"][0]["title"] == "Spring launch"
+
+
+def test_g11_title_filter_with_default_fields_is_unchanged(monkeypatch) -> None:
+    client = ProjectingVideoClient([{"id": "20", "title": "Spring launch", "length": 12}])
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_ad_videos("10", title_contains="spring"))
+    assert client.list_calls[0]["fields"] == ["id", "title", "length", "picture", "permalink_url", "status", "created_time", "updated_time"]
+    assert result["items"] == [{"id": "20", "title": "Spring launch", "length": 12, "processing_status": None}]
+
+
+def test_g13_image_projection_contract_test_detects_invalid_field(monkeypatch) -> None:
+    """The request-contract test must not share its expectation with the production constant."""
+    monkeypatch.setattr(assets, "AD_IMAGE_LIST_FIELDS", ["this_field_does_not_exist"])
+    with pytest.raises(AssertionError):
+        test_list_ad_images_sends_hashes_and_default_fields(monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -591,7 +637,7 @@ def test_list_instagram_media_filters_by_type_product_and_dates(monkeypatch) -> 
 
     call = client.list_calls[0]
     assert call["params"] == {"limit": 25, "since": 1793491200, "until": 1794268800}
-    assert call["fields"] == ["id", "caption", assets.BOOST_ELIGIBILITY_FIELD, "timestamp", "media_type", "media_product_type"]
+    assert call["fields"] == ["id", "caption", "boost_eligibility_info{eligible_to_boost,boost_ineligible_reason}", "timestamp", "media_type", "media_product_type"]
     assert [item["id"] for item in result["items"]] == ["m1"]
     summary = result["summary"]
     assert summary["excluded_by_filters"] == 3
@@ -614,7 +660,7 @@ def test_list_instagram_media_without_filters_is_unchanged(monkeypatch) -> None:
     _patch(monkeypatch, client)
     result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1"))
     assert client.list_calls[0]["params"] == {"limit": 25}
-    assert client.list_calls[0]["fields"] == assets.INSTAGRAM_MEDIA_FIELDS
+    assert client.list_calls[0]["fields"] == ["id", "caption", "media_type", "media_product_type", "timestamp", "permalink", "media_url", "thumbnail_url", "boost_eligibility_info{eligible_to_boost,boost_ineligible_reason}"]
     assert "filters" not in result["summary"]
 
 
@@ -663,7 +709,7 @@ def test_audience_adsets_targeting_scan_finds_ad_sets_without_ads(monkeypatch) -
     assert client.get_calls == [{"object_id": "aud_1", "fields": ["id", "account_id"], "params": None}]
     adset_call = next(call for call in client.list_calls if call["edge"] == "adsets")
     assert adset_call["parent_id"] == "act_123"
-    assert adset_call["fields"] == assets.AUDIENCE_TARGETING_ADSET_FIELDS
+    assert adset_call["fields"] == ["id", "name", "effective_status", "campaign_id", "targeting"]
     by_id = {item["id"]: item for item in result["items"]}
     assert set(by_id) == {"s1", "s2"}
     assert by_id["s1"]["found_by"] == ["ads", "targeting"]
