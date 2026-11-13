@@ -156,3 +156,9 @@ def test_a_named_pipe_is_refused_without_blocking(upload_dir) -> None:
     os.mkfifo(upload_dir / "pipe.csv")
     with pytest.raises(ValidationError, match="does not point to a file"):
         read("pipe.csv")
+
+
+def test_the_size_message_can_carry_advice_for_the_caller(upload_dir) -> None:
+    (upload_dir / "big.csv").write_bytes(b"x" * 1_001)
+    with pytest.raises(ValidationError, match="1000-byte limit for this upload. Host it instead."):
+        read("big.csv", too_large_hint="Host it instead.")

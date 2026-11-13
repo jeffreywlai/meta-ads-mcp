@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
+from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
@@ -267,6 +267,21 @@ async def upload_creative_asset(
 
 
 MAX_DIRECT_VIDEO_BYTES = 25 * 1024 * 1024
+# Container formats Meta lists as supported for ad videos.
+VIDEO_FILE_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".wmv": "video/x-ms-wmv",
+    ".flv": "video/x-flv",
+    ".mpg": "video/mpeg",
+    ".mpeg": "video/mpeg",
+    ".3gp": "video/3gpp",
+    ".gif": "image/gif",
+}
 VIDEO_STATUS_FIELDS = ["id", "status"]
 AD_IMAGE_READ_FIELDS = ["id", "hash", "name", "url", "permalink_url", "width", "height", "status", "created_time"]
 
@@ -309,18 +324,19 @@ async def upload_ad_video(
         data["file_url"] = url
         shown = {"file_url": url}
     else:
-        path = Path(path_text).expanduser()
-        if not path.is_file():
-            raise ValidationError("file_path does not point to a readable file.")
-        size = path.stat().st_size
-        if size == 0:
-            raise ValidationError("file_path is empty.")
-        if size > MAX_DIRECT_VIDEO_BYTES:
-            raise ValidationError(
-                f"The file is {size} bytes; direct upload is limited to {MAX_DIRECT_VIDEO_BYTES} bytes here. "
-                "Larger files need Meta's chunked upload, which this tool does not do. Host the file and pass video_url."
-            )
-        shown = {"source": {"file_name": path.name, "bytes": size}}
+        # Only from the operator's upload folder: a path from the model must not be able
+        # to send some other file on this machine to Meta. Files above the limit need
+        # Meta's chunked upload, which this tool does not do; host them and pass video_url.
+        local_video = read_upload_file(
+            path_text,
+            allowed_types=VIDEO_FILE_TYPES,
+            max_bytes=MAX_DIRECT_VIDEO_BYTES,
+            too_large_hint=(
+                "Larger files need Meta's chunked upload, which this tool does not do. "
+                "Host the file and pass video_url."
+            ),
+        )
+        shown = {"source": {"file_name": local_video.name, "bytes": len(local_video.content)}}
     for key, value in (("name", blank_to_none(name)), ("title", title), ("description", blank_to_none(description))):
         if value is not None:
             data[key] = value
@@ -337,8 +353,7 @@ async def upload_ad_video(
             "would_send": {"method": "POST", "path": f"{resolved_account}/advideos", "data": shown},
         }
     if path_text:
-        path = Path(path_text).expanduser()
-        files = {"source": (path.name, path.read_bytes())}
+        files = {"source": (local_video.name, local_video.content)}
     client = get_graph_api_client()
     uploaded = await client.create_edge_object(resolved_account, "advideos", data=data, files=files)
     video_id = str(uploaded.get("id") or uploaded.get("video_id") or "") or None

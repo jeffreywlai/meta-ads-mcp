@@ -56,6 +56,7 @@ def read_upload_file(
     allowed_types: Mapping[str, str],
     max_bytes: int,
     parameter: str = "file_path",
+    too_large_hint: str = "",
 ) -> LocalUpload:
     """Return a file's name, bytes and content type, or refuse without quoting the path.
 
@@ -66,6 +67,10 @@ def read_upload_file(
     """
     if not isinstance(file_path, str) or not file_path.strip() or "\x00" in file_path:
         raise ValidationError(f"{parameter} must be a non-blank local file path.")
+    too_large = (
+        f"{parameter} is larger than this server's {max_bytes}-byte limit for this upload."
+        + (f" {too_large_hint}" if too_large_hint else "")
+    )
     folder = _upload_folder()
     candidate = Path(file_path.strip()).expanduser()
     if not candidate.is_absolute():
@@ -92,9 +97,7 @@ def read_upload_file(
         if details.st_size == 0:
             raise ValidationError(f"{parameter} points to an empty file.")
         if details.st_size > max_bytes:
-            raise ValidationError(
-                f"{parameter} is larger than this server's {max_bytes}-byte limit for this upload."
-            )
+            raise ValidationError(too_large)
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = None
             content = handle.read(max_bytes + 1)
@@ -104,7 +107,5 @@ def read_upload_file(
         if descriptor is not None:
             os.close(descriptor)
     if len(content) > max_bytes:
-        raise ValidationError(
-            f"{parameter} is larger than this server's {max_bytes}-byte limit for this upload."
-        )
+        raise ValidationError(too_large)
     return LocalUpload(name=resolved.name, content=content, content_type=content_type)

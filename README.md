@@ -598,8 +598,8 @@ Analysis agents using tool search need access to `search_tools`, `call_tool`, an
 The default remains writable; no existing server or dbt agent configuration is
 changed automatically.
 
-Tools that upload a local file (`add_audience_users`, `remove_audience_users` and
-`create_product_feed_upload` with `file_path`) read only from one folder you
+Tools that upload a local file (`add_audience_users`, `remove_audience_users`,
+`create_product_feed_upload` and `upload_ad_video` with `file_path`) read only from one folder you
 choose. Set `META_UPLOAD_DIR` in the launch environment to that folder and put
 the file there. Until it is set, these tools refuse to read any local file. A
 path that leads outside the folder, including through a link, is refused. This

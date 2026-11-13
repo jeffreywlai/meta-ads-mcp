@@ -600,7 +600,7 @@ def test_upload_ad_video_validation_makes_no_call(monkeypatch, tmp_path) -> None
         ({}, "exactly one"),
         ({"video_url": "https://x/v.mp4", "file_path": str(big)}, "exactly one"),
         ({"video_url": "ftp://x/v.mp4"}, "http"),
-        ({"file_path": str(tmp_path / "missing.mp4")}, "readable file"),
+        ({"file_path": str(tmp_path / "missing.mp4")}, "does not point to a file"),
         ({"file_path": str(big)}, "chunked upload"),
         ({"video_url": "https://x/v.mp4", "title": "t" * 255}, "255"),
     ]
@@ -806,3 +806,40 @@ def test_boost_with_adset_rejects_one_step_inputs(monkeypatch) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(creatives.ValidationError, match="only apply in one-step mode"):
         asyncio.run(creatives.boost_instagram_post(**ONE_STEP, adset_id="adset_1"))
+
+
+def test_upload_ad_video_only_reads_files_from_the_upload_folder(monkeypatch, tmp_path) -> None:
+    """A path from the model must not be able to send some other file on this machine to Meta."""
+    from meta_ads_mcp.config import reload_settings
+
+    allowed = tmp_path / "uploads"
+    allowed.mkdir()
+    monkeypatch.setenv("META_UPLOAD_DIR", str(allowed))
+    reload_settings()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    outside = tmp_path / "private-recording.mp4"
+    outside.write_bytes(b"private")
+    (allowed / "link.mp4").symlink_to(outside)
+    (allowed / "notes.txt").write_bytes(b"not a video")
+    for path, expected in (
+        (str(outside), "inside the upload folder"),
+        ("../private-recording.mp4", "inside the upload folder"),
+        ("link.mp4", "inside the upload folder"),
+        ("notes.txt", "must end in"),
+    ):
+        for dry_run in (False, True):
+            with pytest.raises(creatives.ValidationError, match=expected) as error:
+                asyncio.run(creatives.upload_ad_video(account_id="123", file_path=path, dry_run=dry_run))
+            assert "private-recording" not in str(error.value)
+
+
+def test_upload_ad_video_file_reading_is_off_without_an_upload_folder(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.config import reload_settings
+
+    monkeypatch.delenv("META_UPLOAD_DIR", raising=False)
+    reload_settings()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    target = tmp_path / "clip.mp4"
+    target.write_bytes(b"video")
+    with pytest.raises(creatives.ValidationError, match="META_UPLOAD_DIR"):
+        asyncio.run(creatives.upload_ad_video(account_id="123", file_path=str(target)))
