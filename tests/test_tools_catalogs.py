@@ -2985,3 +2985,177 @@ def test_batch_answer_that_is_not_an_object_leaves_every_item_unknown(monkeypatc
     assert "could not be read" in result["items"][0]["reason"]
     assert result["batch"] == {"complete": False, "handles": [], "response_unreadable": True}
     assert result["ok"] is False
+
+
+# round seven -----------------------------------------------------------------------------
+# L9: a status answer that cannot be read after a batch submission keeps the write's result.
+
+
+@pytest.mark.parametrize("status_reply", [None, "unreadable", 7])
+def test_l9_batch_malformed_status_preserves_postwrite_outcome(monkeypatch, status_reply) -> None:
+    """Through the real Graph client over an in-process transport (no socket)."""
+    import httpx
+
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.graph_api import GraphAPIClient
+
+    monkeypatch.setenv("META_ACCESS_TOKEN", "test-token")
+    graph = GraphAPIClient(reload_settings())
+
+    class Batch(FakeCatalogClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            if edge == "products":
+                return {"data": [{"id": "20", "retailer_id": "sku", "name": "Old"}]}
+            return await graph.list_objects(parent_id, edge, fields=fields, params=params)
+
+    client = _use(monkeypatch, Batch(create_responses={("10", "items_batch"): {"handles": ["h1"]}}))
+    _no_pause(monkeypatch)
+
+    async def scenario():
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, content=json.dumps(status_reply), headers={"content-type": "application/json"},
+        ))
+        async with httpx.AsyncClient(transport=transport) as http:
+            monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda self, *, base_url=None: http)
+            return await catalogs.batch_update_catalog_products(
+                "10", [{"method": "update", "retailer_id": "sku", "name": "New"}], wait_seconds=4,
+            )
+
+    result = _run(scenario())
+    assert "create" in client.kinds()
+    assert result["ok"] is False
+    assert result["items"][0]["outcome"] == "processing"
+    assert result["batch"]["handle"] == "h1"
+    assert result["batch"]["status_error"]
+    assert result["batch"]["status_checks"] == 1  # an unreadable status is not asked for again
+    assert result["retry"]["safe_now"] is False and "h1" in result["retry"]["how"]
+
+
+@pytest.mark.parametrize("status", [{"data": []}, {"data": [None]}, {"json_response": None},
+                                    {"text_response": "<html>", "content_type": "text/html", "status_code": 200}])
+def test_batch_status_without_a_readable_row_is_reported_unread(monkeypatch, status) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], status=status))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+    ))
+    item = result["items"][0]
+    assert item["outcome"] == "processing" and "could not be read" in item["reason"]
+    assert result["batch"]["handles"][0]["status_error"]
+
+
+def test_unexpected_failure_while_reading_status_keeps_the_handle(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _batch_client([_existing("SKU-1", "p1")], edge_errors={("123", "check_batch_request_status"): KeyError("x")})
+    _use(monkeypatch, client)
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+    ))
+    assert result["batch"]["handle"] == "h1"
+    assert "KeyError" in result["batch"]["status_error"]
+    assert result["items"][0]["outcome"] == "processing"
+
+
+def test_cancellation_while_reading_status_is_not_swallowed(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _batch_client(
+        [_existing("SKU-1", "p1")], edge_errors={("123", "check_batch_request_status"): asyncio.CancelledError()},
+    )
+    _use(monkeypatch, client)
+    with pytest.raises(asyncio.CancelledError):
+        _run(catalogs.batch_update_catalog_products(
+            catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+        ))
+
+
+def test_unexpected_failure_reading_the_submission_answer_keeps_items_unresolved(monkeypatch) -> None:
+    class Odd(dict):
+        def get(self, key, default=None):
+            raise RuntimeError("odd answer")
+
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], post=Odd(handles=["h1"])))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+    ))
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert "RuntimeError" in result["answer_error"] and result["ok"] is False
+
+
+@pytest.mark.parametrize("posted", [
+    {"json_response": None}, {"json_response": "accepted"}, {"json_response": 3},
+    {"text_response": "<html>ok</html>", "content_type": "text/html", "status_code": 200},
+])
+def test_wrapped_submission_answer_is_unreadable_not_nothing_ingested(monkeypatch, posted) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], post=posted))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+    ))
+    assert [item["outcome"] for item in result["items"]] == ["outcome_unknown"]
+    assert result["batch"]["response_unreadable"] is True
+    assert all(call["edge"] != "check_batch_request_status" for kind, call in client.calls if kind == "list")
+
+
+def test_handle_read_with_an_unreadable_status_says_so(monkeypatch) -> None:
+    _use(monkeypatch, _batch_client(status={"json_response": None}))
+    result = _run(catalogs.batch_update_catalog_products(catalog_id="123", handle="h1"))
+    assert result["ok"] is False and result["outcome"] == "status_unreadable"
+    assert result["batch"]["handle"] == "h1" and result["batch"]["status_error"]
+
+
+# L1: a credential passed as the JSON text of its documented object has the object's privacy.
+
+_INTEGRATION_SECRET = "".join(("R7integration", "Credential-987"))
+
+
+def _integration_text(secret: str = _INTEGRATION_SECRET) -> str:
+    from meta_ads_mcp.graph_api import GraphAPIClient
+
+    integration = {"external_access_token": secret, "external_merchant_id": "merchant-1"}
+    text = json.dumps(integration)
+    # Exactly the form value the real Graph client sends for the object.
+    assert GraphAPIClient._encode_value(integration) == text
+    return text
+
+
+@pytest.mark.parametrize("operation", ["successful_update", "failed_create"])
+def test_l1_serialized_integration_has_the_same_privacy_as_an_object(monkeypatch, operation) -> None:
+    text = _integration_text()
+    refusal = MetaApiError("Invalid external credential " + _INTEGRATION_SECRET, code=100)
+    client = _use(monkeypatch, FakeCatalogClient(create_errors={("10", "owned_product_catalogs"): refusal}))
+    if operation == "successful_update":
+        result = _run(catalogs.update_catalog("10", params={"partner_integration": text}))
+        assert _INTEGRATION_SECRET not in json.dumps(result)
+        # The request sent is unchanged; what is shown is that text with the token masked.
+        update = next(call for kind, call in client.calls if kind == "update")
+        assert update["data"] == {"partner_integration": text}
+        assert json.loads(result["current"]["partner_integration"]) == {
+            "external_access_token": "[redacted]", "external_merchant_id": "merchant-1",
+        }
+    else:
+        with pytest.raises(MetaApiError) as raised:
+            _run(catalogs.create_catalog("10", "Catalog", params={"partner_integration": text}))
+        assert _INTEGRATION_SECRET not in str(raised.value)
+
+
+def test_short_token_in_serialized_integration_is_masked_by_key(monkeypatch) -> None:
+    # Three characters: never removed by value from a result, so only the key masks it.
+    text = _integration_text("".join(("x", "9z")))
+    _use(monkeypatch, FakeCatalogClient())
+    result = _run(catalogs.update_catalog("10", params={"partner_integration": text}))
+    assert json.loads(result["current"]["partner_integration"])["external_access_token"] == "[redacted]"
+
+
+def test_integration_text_that_is_not_json_is_sent_and_shown_as_before(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    result = _run(catalogs.update_catalog("10", params={"partner_integration": "not json"}))
+    assert next(call for kind, call in client.calls if kind == "update")["data"] == {"partner_integration": "not json"}
+    assert result["current"]["partner_integration"] == "not json"
+
+
+def test_serialized_integration_token_is_collected_as_a_secret() -> None:
+    from meta_ads_mcp.tools.catalog_feeds import _caller_secrets
+
+    arguments = {"params": {"partner_integration": _integration_text(), "custom_data": json.dumps({"token": "Gold"})}}
+    assert _caller_secrets(arguments, catalogs._CATALOG_CREDENTIAL_PATHS) == [_INTEGRATION_SECRET]

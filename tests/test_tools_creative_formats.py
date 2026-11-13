@@ -1690,9 +1690,15 @@ ENCODED_SECRET = "R4-secret+code/with=suffix"
 
 
 def _code_forms(secret: str) -> list[str]:
+    import re
     from urllib.parse import quote, quote_plus
 
-    return [quote(secret, safe=""), quote_plus(secret), quote(secret), quote(secret, safe="").lower()]
+    # The fourth form writes the escapes' hex digits in lower case. (Before round seven it
+    # lower-cased the whole text, the code's own letters included, which the builder's
+    # case-insensitive scrubber accepted; the shared scrubber keeps a code's letters
+    # case-sensitive, as boost always did, so only the escapes are lower-cased here.)
+    lowercase_escapes = re.sub(r"%[0-9A-F]{2}", lambda match: match[0].lower(), quote(secret, safe=""))
+    return [quote(secret, safe=""), quote_plus(secret), quote(secret), lowercase_escapes]
 
 
 @pytest.mark.parametrize("tool", ["create_ad_creative_from_inputs", "update_ad_creative_enhancements"])
@@ -2012,3 +2018,61 @@ def test_every_explicit_story_setting_is_a_sub_field_of_object_story_spec_in_the
     # product_data, template_data, text_data, video_data, whats_app_business_phone_number.
     assert cf.EXPLICIT_STORY_SPEC_FIELDS == ("whats_app_business_phone_number",)
     assert cf.EXPLICIT_STORY_SPEC_READ == PHONE_READ
+
+
+# Round seven, L4: repeated URL encoding and JSON slash escaping no longer let a code through.
+
+
+@pytest.mark.parametrize("encoding", ["twice_url_encoded", "json_slash", "json_unicode_escapes"])
+@pytest.mark.parametrize("tool", ["create_ad_creative_from_inputs", "update_ad_creative_enhancements"])
+def test_l4_encoded_partnership_code_does_not_escape_errors(monkeypatch, caplog, encoding, tool) -> None:
+    import logging
+    from urllib.parse import quote
+
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.coordinator import mcp_server
+
+    secret = "".join(("R6+authorization", "/part=9"))
+    encoded = {
+        "twice_url_encoded": quote(quote(secret, safe=""), safe=""),
+        "json_slash": secret.replace("/", "\\/"),
+        "json_unicode_escapes": "".join(f"\\u{ord(char):04x}" if not char.isalnum() else char for char in secret),
+    }[encoding]
+
+    class Echo(FakeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("Rejected code " + encoded, code=100, user_message=encoded)
+
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    _patch(monkeypatch, Echo(objects={
+        "20": {"id": "20", "account_id": "10", "creative": {"id": "30"}},
+        "30": {"id": "30", "account_id": "10", "object_id": "40", "branded_content": {"instagram_boost_post_access_token": secret}},
+    }))
+    arguments = (
+        {"account_id": "10", "name": "Partnership", "page_id": "40", "sponsor_page_id": "50", "partnership_ad_code": secret}
+        if tool == "create_ad_creative_from_inputs" else {"ad_id": "20", "features": {"image_touchups": "OPT_OUT"}}
+    )
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as raised:
+        asyncio.run(mcp_server.call_tool(tool, arguments))
+    assert encoded not in str(raised.value)
+    assert encoded not in caplog.text
+    assert "<partnership_ad_code>" in str(raised.value)
+
+
+def test_a_code_in_a_different_letter_case_is_a_different_code(monkeypatch) -> None:
+    secret = "".join(("Ab+cD", "/eF=9"))
+
+    class Echo(FakeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("Rejected " + secret.swapcase() + " and " + secret, code=100)
+
+    _patch(monkeypatch, Echo())
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            account_id="10", name="C", page_id="40", sponsor_page_id="50", partnership_ad_code=secret,
+        ))
+    assert raised.value.message.endswith("Rejected " + secret.swapcase() + " and <partnership_ad_code>")

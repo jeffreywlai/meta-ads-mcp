@@ -11,7 +11,7 @@ import functools
 import inspect
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timezone
 from typing import Annotated, Any
 from urllib.parse import urlsplit
@@ -26,6 +26,16 @@ from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
+from meta_ads_mcp.secret_scrub import (  # noqa: F401 - the length thresholds stay importable from here
+    ERROR,
+    MIN_SECRET_SUBSTRING_LENGTH,
+    MIN_SECRET_TOKEN_LENGTH,
+    RESULT,
+    distinct_key,
+    rewrite_exception,
+    scrub_exception,
+    scrub_value,
+)
 from meta_ads_mcp.tool_types import GraphId, StringList, coerce_csv_string_list
 from meta_ads_mcp.url_secrets import refuse_url_credentials
 
@@ -210,11 +220,11 @@ FEED_FILE_TYPES = {
 }
 # This server's own limit on a local feed file read into memory; Meta publishes none.
 MAX_FEED_FILE_BYTES = 100 * 1024 * 1024
-# The login part of scheme://user:password@host anywhere in a string. It runs greedily to
-# the last @ before the path, query or fragment, which is where a URL parser ends the
-# login. A user name may itself contain @ (an email address), and a password may contain
-# @ or :, so the split into user and password is made at the first colon afterwards.
-_URL_LOGIN = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<login>[^\s/?#]*)@")
+# Where the login part of a URL ends at the latest: white space, or the start of the path,
+# query or fragment (see _url_logins).
+_LOGIN_STOP = re.compile(r"[\s/?#]")
+_SCHEME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-")
+_SCHEME_FIRST = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
 # Parameters that can carry a secret or pasted data. The framework accepts any value for
 # them and the tool validates it, because the framework's own type errors quote the input.
 _OptionalText = Annotated[Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})]
@@ -402,32 +412,88 @@ def _mask_text(text: str) -> str:
     return _mask_url_passwords(text)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _UrlLogin:
+    """The login part of one scheme://user:password@ in a text: [start, end) ends after the @."""
+
+    start: int
+    end: int
+    scheme: str
+    login: str
+
+
+def _url_logins(text: str) -> Iterator[_UrlLogin]:
+    """Every scheme://login@ in the text, left to right, in one pass.
+
+    The scheme is a letter followed by letters, digits, '+', '.' or '-', directly before
+    '://'. The login runs to the last @ before white space or the path, query or fragment,
+    which is where a URL parser ends it: a user name may itself contain @ (an email
+    address), and a password may contain @ or :, so the split into user and password is
+    made at the first colon afterwards (see _mask_url_passwords). A scan, not a regular
+    expression, so a long run of letters cannot make it slow: each character is looked at
+    a fixed number of times.
+    """
+    if "@" not in text or "://" not in text:
+        return
+    allowed_from = 0
+    search = 0
+    while (separator := text.find("://", search)) >= 0:
+        search = separator + 1
+        start = separator
+        while start > allowed_from and text[start - 1] in _SCHEME_CHARS:
+            start -= 1
+        while start < separator and text[start] not in _SCHEME_FIRST:
+            start += 1
+        if start == separator:
+            continue
+        login_from = separator + 3
+        stop = _LOGIN_STOP.search(text, login_from)
+        at = text.rfind("@", login_from, stop.start() if stop else len(text))
+        if at < 0:
+            continue
+        yield _UrlLogin(start, at + 1, text[start:login_from], text[login_from:at])
+        allowed_from = search = at + 1
+
+
 def _mask_url_passwords(text: str) -> str:
     """Mask the password of every URL login in the text, splitting it as a URL parser would."""
-    if "@" not in text or "://" not in text:
+    parts: list[str] = []
+    kept_from = 0
+    for login in _url_logins(text):
+        user, colon, _password = login.login.partition(":")
+        if colon:
+            parts.extend((text[kept_from:login.start], f"{login.scheme}{user}:[redacted]@"))
+            kept_from = login.end
+    if not parts:
         return text
-
-    def mask(match: re.Match[str]) -> str:
-        user, colon, _password = match.group("login").partition(":")
-        if not colon:
-            return match.group(0)
-        return f"{match.group('scheme')}{user}:[redacted]@"
-
-    return _URL_LOGIN.sub(mask, text)
+    parts.append(text[kept_from:])
+    return "".join(parts)
 
 
-def _distinct_key(shown: dict[Any, Any], key: Any) -> Any:
-    """key, or key with a number added when masking made it equal to a key already shown.
+def _json_object(value: Any) -> dict[str, Any] | None:
+    """The object a string holds as JSON text, or None when it holds none.
 
-    Two keys that differed only in a password become the same once it is masked; both
-    entries are kept, the later one as "<key> (2)", "<key> (3)" and so on.
+    Meta's reference documents some parameters as JSON objects (a catalog's
+    partner_integration, a feed's schedule), and the Graph client sends an object as its
+    JSON text, so a caller may pass either form. The text form is read only to find and
+    mask the credentials it carries; it is always sent as it was given.
     """
-    if key not in shown or not isinstance(key, str):
-        return key
-    number = 2
-    while f"{key} ({number})" in shown:
-        number += 1
-    return f"{key} ({number})"
+    if not isinstance(value, str) or not value.lstrip().startswith("{"):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _masked_json_text(value: str, mask: Callable[[Any], Any]) -> str:
+    """JSON text of an object with mask applied to it, or the text itself when nothing changed."""
+    parsed = _json_object(value)
+    if parsed is None:
+        return value
+    masked = mask(parsed)
+    return value if masked == parsed else json.dumps(masked)
 
 
 # Keys whose value is a data map: its own keys are the advertiser's data (a feed rule's
@@ -435,6 +501,9 @@ def _distinct_key(shown: dict[Any, Any], key: Any) -> Any:
 # A key inside one is never taken to name a password, so a mapping such as
 # {"password": "Kennwort"} is shown and sent as written. URL passwords are still masked.
 _FEED_DATA_MAP_KEYS = frozenset({"params"})
+# Feed parameters Meta documents as objects that can hold a password (ProductFeedSchedule's
+# username and password). Passed as JSON text, their password is masked inside the text.
+_FEED_SCHEDULE_KEYS = frozenset({"schedule", "update_schedule"})
 
 
 def _redact(value: Any, data_map_keys: frozenset[str] = _FEED_DATA_MAP_KEYS, *, in_data: bool = False) -> Any:
@@ -444,16 +513,19 @@ def _redact(value: Any, data_map_keys: frozenset[str] = _FEED_DATA_MAP_KEYS, *, 
     new field that carries a URL, such as an upload's url, cannot be missed. Keys are
     masked as well as values, since Meta can return a map keyed by a URL. A key is taken
     to name a password only where keys are field names: not inside a data map
-    (data_map_keys), whose keys are product values.
+    (data_map_keys), whose keys are product values. A schedule given as JSON text is
+    masked inside the text, as the object form is.
     """
     if isinstance(value, dict):
         shown: dict[Any, Any] = {}
         for key, item in value.items():
             if not in_data and str(key).lower() == "password" and item is not None:
                 masked: Any = "[redacted]"
+            elif not in_data and key in _FEED_SCHEDULE_KEYS and isinstance(item, str):
+                masked = _mask_text(_masked_json_text(item, lambda parsed: _redact(parsed, data_map_keys)))
             else:
                 masked = _redact(item, data_map_keys, in_data=in_data or key in data_map_keys)
-            shown[_distinct_key(shown, _mask_text(key) if isinstance(key, str) else key)] = masked
+            shown[distinct_key(shown, _mask_text(key) if isinstance(key, str) else key)] = masked
         return shown
     if isinstance(value, list):
         return [_redact(item, data_map_keys, in_data=in_data) for item in value]
@@ -464,73 +536,22 @@ def _redact(value: Any, data_map_keys: frozenset[str] = _FEED_DATA_MAP_KEYS, *, 
     return value
 
 
-def _error_attribute_names(exc: BaseException) -> list[str]:
-    """The data attributes an error carries: dataclass fields, slots and instance attributes."""
-    names: list[str] = [field.name for field in dataclasses.fields(exc)] if dataclasses.is_dataclass(exc) else []
-    for cls in type(exc).__mro__:
-        slots = cls.__dict__.get("__slots__", ())
-        names.extend([slots] if isinstance(slots, str) else list(slots))
-    names.extend(getattr(exc, "__dict__", {}))
-    return [name for name in dict.fromkeys(names) if not name.startswith("__")]
-
-
-def _mask_one_error(exc: BaseException) -> None:
-    """Mask URL passwords in one error's text and data, in place."""
-    for name in _error_attribute_names(exc):
-        try:
-            value = getattr(exc, name)
-        except AttributeError:
-            continue
-        if value is None or isinstance(value, BaseException):
-            continue
-        masked = _redact(value)
-        if masked != value:
-            try:
-                setattr(exc, name, masked)
-            except (AttributeError, TypeError):
-                pass
-    if exc.args:
-        exc.args = tuple(_redact(arg) for arg in exc.args)
-    notes = getattr(exc, "__notes__", None)
-    if isinstance(notes, list):
-        exc.__notes__ = [_redact(note) for note in notes]
-
-
 def _mask_error(exc: BaseException) -> None:
     """Mask URL passwords in a raised error and in every error behind it, in place.
 
     The Graph client raises a rate-limit or unsupported-feature error from the original
     Meta error, so the original stays reachable through __cause__ and __context__ and a
     traceback log prints it. Every error reachable that way, and every error inside an
-    exception group, is masked; each is visited once, so a cycle ends.
+    exception group, is masked (secret_scrub.rewrite_exception).
     """
-    pending: list[BaseException | None] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        _mask_one_error(current)
-        pending.extend([current.__cause__, current.__context__])
-        pending.extend(getattr(current, "exceptions", None) or ())
+    rewrite_exception(exc, _redact)
 
 
 # Secrets a caller supplies (a feed or upload password, a catalog integration token) are
-# removed from any text a tool hands back, in every form an upstream text can repeat them
-# (see _char_pattern). How much is removed depends on the secret's length:
-# - from an error, every supplied secret: one of MIN_SECRET_SUBSTRING_LENGTH characters or
-#   more wherever it occurs, a shorter one where it stands as a whole token;
-# - from a successful result, one of MIN_SECRET_SUBSTRING_LENGTH characters or more
-#   wherever it occurs, one of MIN_SECRET_TOKEN_LENGTH characters up to that where it stands
-#   as a whole token, and a shorter one not by value at all, because a password such as
-#   "csv" equals ordinary words a result has every right to contain.
-# Masking by key name (a password key, a URL password) applies whatever the length. A whole
-# token is one whose neighbouring characters are not letters or digits; the start and the
-# end of the text count as such neighbours.
-MIN_SECRET_SUBSTRING_LENGTH = 8
-MIN_SECRET_TOKEN_LENGTH = 4
-_SECRET_SHOWN = "[redacted]"
+# removed from any text a tool hands back by meta_ads_mcp.secret_scrub, in every form an
+# upstream text can repeat them and by the length rules described there: from an error with
+# its ERROR policy, from a successful result with its RESULT policy. Masking by key name (a
+# password key, a URL password) applies whatever the length.
 # An input key holding any of these (in any letter case) holds a secret; matches the
 # credential key parts errors.py strips from Meta's diagnostic data.
 _SECRET_KEY_PARTS = ("password", "secret", "token", "authorization", "credential", "api_key")
@@ -539,63 +560,14 @@ _SECRET_KEY_PARTS = ("password", "secret", "token", "authorization", "credential
 # (username, password), and the Graph params passed through to Meta with the schedules they
 # can carry. Every other mapping in an input is data (a feed rule's value mapping, a
 # product's custom_data, a filter), whose keys are the advertiser's own values: a key there
-# never makes its value a secret. A password inside a URL is found anywhere.
+# never makes its value a secret. A password inside a URL is found anywhere. A value at one
+# of these paths given as the JSON text of an object is read as that object.
 _FEED_CREDENTIAL_PATHS = frozenset({
     (), ("schedule",), ("update_schedule",),
     ("params",), ("params", "schedule"), ("params", "update_schedule"),
 })
 # For a tool whose params is itself a data map (a feed rule's params).
 _ARGUMENTS_ONLY = frozenset({()})
-_LETTER_OR_DIGIT = r"[^\W_]"
-
-
-def _hex_digits(text: str) -> str:
-    """The hex digits of an escape as a pattern, each letter matched in either case."""
-    return "".join(f"[{digit.upper()}{digit.lower()}]" if digit.isalpha() else digit for digit in text)
-
-
-def _char_pattern(char: str) -> str:
-    """Every way an upstream text can write one character of a secret, as a pattern.
-
-    A letter or digit only as itself, in its own case. Any other character as itself or as
-    a percent escape of its UTF-8 bytes, encoded once or more (%2F, %252F), with or without
-    '/' and the like left as they are, and with hex digits in either case; as a JSON escape
-    (a \\u escape in either case, or the short escapes \\" \\\\ \\/ \\n and the like); and a
-    space also as + (form encoding) and %2B (form encoding, then URL encoding).
-    """
-    if char.isascii() and char.isalnum():
-        return re.escape(char)
-    options = [re.escape(char)]
-    options.append("".join("%(?:25)*" + _hex_digits(f"{byte:02X}") for byte in char.encode("utf-8")))
-    code = ord(char)
-    units = [code] if code <= 0xFFFF else [0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF)]
-    options.append("".join(r"\\u" + _hex_digits(f"{unit:04X}") for unit in units))
-    short_escape = json.dumps(char)[1:-1]
-    if short_escape != char and not short_escape.startswith("\\u"):
-        options.append(re.escape(short_escape))
-    if char == "/":
-        options.append(re.escape("\\/"))
-    if char == " ":
-        options.extend([r"\+", "%(?:25)*2" + _hex_digits("B")])
-    return "(?:" + "|".join(options) + ")"
-
-
-def _secret_matcher(secrets: list[str], *, in_error: bool) -> re.Pattern[str] | None:
-    """One pattern that finds every given secret a text must not show, in every form, or None.
-
-    The length rules above decide which secrets it finds and where: in_error is true for
-    an error's text, false for a successful result. Longer secrets are tried first.
-    """
-    alternatives: list[str] = []
-    distinct = {secret.strip() for secret in secrets if isinstance(secret, str) and secret.strip()}
-    for secret in sorted(distinct, key=lambda text: (-len(text), text)):
-        if not in_error and len(secret) < MIN_SECRET_TOKEN_LENGTH:
-            continue
-        pattern = "".join(_char_pattern(char) for char in secret)
-        if len(secret) < MIN_SECRET_SUBSTRING_LENGTH:
-            pattern = f"(?<!{_LETTER_OR_DIGIT})(?:{pattern})(?!{_LETTER_OR_DIGIT})"
-        alternatives.append(f"(?:{pattern})")
-    return re.compile("|".join(alternatives)) if alternatives else None
 
 
 def _caller_secrets(
@@ -606,16 +578,17 @@ def _caller_secrets(
     A secret is a string under a key that names a password, token, secret, authorization,
     credential or api key, where keys are field names (credential_paths: the arguments
     themselves and the documented places a credential sits), or the password of a URL
-    login in any string or key at any depth.
+    login in any string or key at any depth. A value at one of credential_paths given as
+    the JSON text of an object (Meta's documented object, as the Graph client would send
+    it) is searched as that object.
     """
     found: set[str] = set()
 
     def add_url_passwords(text: str) -> None:
-        if "@" in text and "://" in text:
-            for match in _URL_LOGIN.finditer(text):
-                _user, colon, password = match.group("login").partition(":")
-                if colon and password.strip():
-                    found.add(password.strip())
+        for login in _url_logins(text):
+            _user, colon, password = login.login.partition(":")
+            if colon and password.strip():
+                found.add(password.strip())
 
     def add(value: Any) -> None:
         if isinstance(value, str) and value.strip():
@@ -634,70 +607,19 @@ def _caller_secrets(
                     add_url_passwords(key)
                     if fields and any(part in key.lower() for part in _SECRET_KEY_PARTS):
                         add(item)
-                visit(item, (*path, key) if fields and isinstance(key, str) else None)
+                child = (*path, key) if fields and isinstance(key, str) else None
+                parsed = _json_object(item) if child in credential_paths else None
+                if parsed is not None:
+                    visit(item, None)
+                    visit(parsed, child)
+                else:
+                    visit(item, child)
         elif isinstance(value, (list, tuple)):
             for item in value:
                 visit(item, None)
 
     visit(arguments, ())
     return sorted(found, key=lambda text: (-len(text), text))
-
-
-def _scrub_value(value: Any, matcher: re.Pattern[str] | None) -> Any:
-    """value with every secret matcher finds removed, from strings, mapping keys and values, lists and tuples."""
-    if matcher is None:
-        return value
-    if isinstance(value, str):
-        return matcher.sub(_SECRET_SHOWN, value)
-    if isinstance(value, dict):
-        shown: dict[Any, Any] = {}
-        for key, item in value.items():
-            shown[_distinct_key(shown, _scrub_value(key, matcher))] = _scrub_value(item, matcher)
-        return shown
-    if isinstance(value, list):
-        return [_scrub_value(item, matcher) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_scrub_value(item, matcher) for item in value)
-    return value
-
-
-def _scrub_known_secrets(exc: BaseException, secrets: list[str]) -> None:
-    """Remove the given secrets from a raised error and every error behind it, in place.
-
-    Every secret is removed, whatever its length (the error rules above). Like _mask_error:
-    every error reachable through __cause__, __context__ and exception groups is cleaned
-    (fields, args and notes), each once, so a cycle ends.
-    """
-    matcher = _secret_matcher(secrets, in_error=True)
-    if matcher is None:
-        return
-    pending: list[BaseException | None] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        for name in _error_attribute_names(current):
-            try:
-                value = getattr(current, name)
-            except AttributeError:
-                continue
-            if value is None or isinstance(value, BaseException):
-                continue
-            cleaned = _scrub_value(value, matcher)
-            if cleaned != value:
-                try:
-                    setattr(current, name, cleaned)
-                except (AttributeError, TypeError):
-                    pass
-        if current.args:
-            current.args = tuple(_scrub_value(arg, matcher) for arg in current.args)
-        notes = getattr(current, "__notes__", None)
-        if isinstance(notes, list):
-            current.__notes__ = [_scrub_value(note, matcher) for note in notes]
-        pending.extend([current.__cause__, current.__context__])
-        pending.extend(getattr(current, "exceptions", None) or ())
 
 
 def _call_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -717,8 +639,8 @@ def _guard_secrets(
 
     show masks the result (password keys and URL passwords); an error is masked the same
     way. Then every secret the caller supplied in this call (found where credential_paths
-    says keys are field names, and in any URL) is removed from both, by the length rules
-    above, so a secret Meta repeats as text cannot reach the response or a traceback log.
+    says keys are field names, and in any URL) is removed from both, by secret_scrub's
+    length rules, so a secret Meta repeats as text cannot reach the response or a traceback log.
     """
 
     @functools.wraps(fn)
@@ -727,10 +649,10 @@ def _guard_secrets(
             result = await fn(*args, **kwargs)
         except Exception as exc:
             _mask_error(exc)
-            _scrub_known_secrets(exc, _caller_secrets(_call_arguments(fn, args, kwargs), credential_paths))
+            scrub_exception(exc, _caller_secrets(_call_arguments(fn, args, kwargs), credential_paths), policy=ERROR)
             raise
         secrets = _caller_secrets(_call_arguments(fn, args, kwargs), credential_paths)
-        return _scrub_value(show(result), _secret_matcher(secrets, in_error=False))
+        return scrub_value(show(result), secrets, policy=RESULT)
 
     return wrapper
 
@@ -779,8 +701,8 @@ def _refuse_url_logins(value: Any, name: str, known_keys: frozenset[str] = froze
 
 def _refuse_url_login_text(text: str, name: str) -> None:
     refuse_url_credentials(text, name)
-    if (match := _URL_LOGIN.search(text)) is not None:
-        refuse_url_credentials(text[match.start():].split()[0], name)
+    if (login := next(_url_logins(text), None)) is not None:
+        refuse_url_credentials(text[login.start:].split()[0], name)
 
 
 def _bounded_int(value: Any, *, name: str, low: int, high: int | None) -> None:
@@ -1520,7 +1442,8 @@ async def update_product_feed(
         elif key not in previous:
             unavailable[key] = "Meta returned no value for it; it may have been unset"
     for key in ("schedule", "update_schedule"):
-        if isinstance(data.get(key), dict) and "password" in data[key]:
+        schedule_value = data.get(key) if isinstance(data.get(key), dict) else _json_object(data.get(key))
+        if schedule_value is not None and "password" in schedule_value:
             unavailable[f"{key}.password"] = "schedule passwords are never shown in responses"
     response = mutation_response(
         action="update_product_feed",

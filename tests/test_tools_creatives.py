@@ -2825,23 +2825,31 @@ def test_secret_scrub_ignores_case_only_in_escape_hex_digits() -> None:
     """An escape's hex digits match in either case; the code's own letters stay case-sensitive."""
     from urllib.parse import quote
 
+    # Rewritten in round seven: the boost scrubber's private helpers were replaced by the shared
+    # meta_ads_mcp.secret_scrub, used here with the policy and placeholder boost uses.
+    from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_text
+
     secret = "".join(("Ab+cD", "/eF=9"))
-    pattern = creatives._secret_pattern(creatives._secret_forms(secret))
+
+    def scrub(text: str) -> str:
+        return scrub_text(text, [secret], policy=ANYWHERE, shown="<code>")
+
     lower_escapes = quote(secret, safe="").replace("%2B", "%2b").replace("%2F", "%2f").replace("%3D", "%3d")
     for repeated in (secret, quote(secret), quote(secret, safe=""), lower_escapes, f" {secret} "):
-        cleaned = creatives._scrub_value(f"x {repeated} y", pattern, "<code>")
+        cleaned = scrub(f"x {repeated} y")
         assert secret not in cleaned and repeated.strip() not in cleaned and "<code>" in cleaned, repeated
     # The same letters in a different case are a different code and are left alone.
     for different in (secret.swapcase(), quote(secret.swapcase()), quote(secret.lower(), safe="")):
-        assert creatives._scrub_value(f"x {different} y", pattern, "<code>") == f"x {different} y", different
+        assert scrub(f"x {different} y") == f"x {different} y", different
 
 
 def test_secret_scrub_treats_a_literal_percent_in_the_code_as_a_real_character() -> None:
     """A '%' typed in the code is not an escape, so the letters after it keep their case."""
+    from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_text
+
     secret = "".join(("code%2F", "Tail"))
-    pattern = creatives._secret_pattern(creatives._secret_forms(secret))
-    assert creatives._scrub_value(f"x {secret} y", pattern, "<code>") == "x <code> y"
-    assert creatives._scrub_value("x code%2fTail y", pattern, "<code>") == "x code%2fTail y"
+    assert scrub_text(f"x {secret} y", [secret], policy=ANYWHERE, shown="<code>") == "x <code> y"
+    assert scrub_text("x code%2fTail y", [secret], policy=ANYWHERE, shown="<code>") == "x code%2fTail y"
 
 
 @pytest.mark.parametrize("encoding", ["slash_preserved", "lowercase_escapes"])
@@ -3069,3 +3077,84 @@ def test_video_link_with_an_unsafe_name_falls_back_to_the_real_name(monkeypatch,
     result = asyncio.run(creatives.upload_ad_video("10", file_path=link_name))
     assert client.calls[0][4] == {"source": ("source.mp4", b"0123456789")}
     assert result["upload"]["file_name"] == "source.mp4"
+
+
+# round seven -----------------------------------------------------------------------------
+
+
+def _l4_encoded(secret: str, encoding: str) -> str:
+    from urllib.parse import quote
+
+    return {
+        "twice_url_encoded": quote(quote(secret, safe=""), safe=""),
+        "json_slash": secret.replace("/", "\\/"),
+        "json_of_url_encoded": quote(secret).replace("/", "\\/"),
+        "form_then_url_encoded": quote(quote(secret, safe="").replace("%2B", "+"), safe=""),
+    }[encoding]
+
+
+@pytest.mark.parametrize("encoding", ["twice_url_encoded", "json_slash", "json_of_url_encoded", "form_then_url_encoded"])
+@pytest.mark.parametrize("routed", [False, True])
+def test_l4_encoded_partnership_code_does_not_escape_errors(monkeypatch, caplog, encoding, routed) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.errors import MetaApiError
+
+    secret = "".join(("R6+authorization", "/part=9"))
+    encoded = _l4_encoded(secret, encoding)
+
+    class Echo:
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("Rejected code " + encoded, code=100, user_message=encoded)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Echo)
+    arguments = {"account_id": "10", "instagram_account_id": "30", "page_id": "40", "adset_id": "20",
+                 "partnership_ad_code": secret}
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as raised:
+        _call_tool("boost_instagram_post", arguments, routed)
+    assert encoded not in str(raised.value)
+    assert encoded not in caplog.text
+    assert "<partnership_ad_code>" in str(raised.value)
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("where", ["call_to_action", "call_to_action.value", "promoted_object"])
+def test_l2_boost_error_does_not_repeat_a_fieldlike_unknown_key(monkeypatch, caplog, routed, where) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    secret = "".join(("R6MisplacedApiCredential", "0123456789"))
+    login = "https://user:pw@example.invalid/"
+    arguments: dict = {"account_id": "10", "instagram_media_id": "30", "instagram_account_id": "40", "page_id": "50"}
+    if where == "call_to_action":
+        arguments.update(adset_id="20", call_to_action={"type": "LEARN_MORE", secret: login})
+    elif where == "call_to_action.value":
+        arguments.update(adset_id="20", call_to_action={"type": "LEARN_MORE", "value": {secret: login}})
+    else:
+        arguments.update(
+            objective="OUTCOME_SALES", destination_type="WEBSITE", daily_budget=10,
+            targeting={"geo_locations": {"countries": ["US"]}},
+            call_to_action={"type": "LEARN_MORE", "value": {"link": "https://example.invalid/p"}},
+            promoted_object={"pixel_id": "123", "custom_event_type": "PURCHASE", secret: login},
+        )
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("Validation must precede all reads/writes"))
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as raised:
+        _call_tool("boost_instagram_post", arguments, routed)
+    assert secret not in str(raised.value)
+    assert secret not in caplog.text
+    assert f"{where}.<key>" in str(raised.value)
+
+
+def test_documented_nested_field_names_are_still_named_in_the_error(monkeypatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    cta = {"type": "LEARN_MORE", "value": {"link": "https://user:pw@example.invalid/"}}
+    with pytest.raises(creatives.ValidationError, match=r"call_to_action\.value\.link must not contain"):
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="1", instagram_media_id="40", instagram_account_id="50", adset_id="60", page_id="30",
+            call_to_action=cta,
+        ))

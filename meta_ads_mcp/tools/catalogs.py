@@ -35,7 +35,7 @@ from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 # is replaced, keeping user, host and path, and a password or token the caller supplied
 # is removed; the URL-login check on inputs is shared too. catalog_feeds imports nothing
 # from here.
-from meta_ads_mcp.tools.catalog_feeds import _count_keys, _guard_secrets, _redact
+from meta_ads_mcp.tools.catalog_feeds import _count_keys, _guard_secrets, _masked_json_text, _redact
 from meta_ads_mcp.tools.catalog_feeds import _refuse_url_logins as _refuse_url_logins_shared
 
 # Fields documented on the Product Catalog reference page.
@@ -63,10 +63,13 @@ CATALOG_EXTRA_READABLE = {
 _SECRET_SETTING_KEYS = frozenset({"external_access_token", "access_token", "password"})
 # Where a caller's input keys are field names, so that a key naming a password or token
 # holds one: the tool's named parameters, the Graph params passed through to Meta, and
-# params.partner_integration (external_access_token). Every other mapping (a product's
-# custom_data, a product set filter, a batch item's fields) is not searched by key name;
-# a password inside a URL is found anywhere.
+# params.partner_integration (external_access_token), as an object or as its JSON text.
+# Every other mapping (a product's custom_data, a product set filter, a batch item's
+# fields) is not searched by key name; a password inside a URL is found anywhere.
 _CATALOG_CREDENTIAL_PATHS = frozenset({(), ("params",), ("params", "partner_integration")})
+# Catalog settings Meta documents as objects that can hold a credential; passed as JSON
+# text, the credential is masked inside the text when shown, as in the object form.
+_CATALOG_CREDENTIAL_OBJECT_KEYS = frozenset({"partner_integration"})
 # Keys whose value is a data map whose own keys are the advertiser's values, never field
 # names: a product's custom data and variant attributes, and a product set filter (keyed by
 # whatever product fields and values the advertiser filters on). A key inside one is never
@@ -372,14 +375,20 @@ def _mask_secrets(value: Any, *, in_data: bool = False) -> Any:
     """Return value with credential keys replaced, for showing what was sent.
 
     A key is taken to name a credential only where keys are field names: not inside a
-    data map (_CATALOG_DATA_MAP_KEYS), whose keys are the advertiser's own values.
+    data map (_CATALOG_DATA_MAP_KEYS), whose keys are the advertiser's own values. A
+    partner_integration given as JSON text is shown as that text with its credentials
+    replaced; the text sent to Meta is unchanged.
     """
     if isinstance(value, dict):
-        return {
-            key: "[redacted]" if not in_data and str(key).lower() in _SECRET_SETTING_KEYS and item is not None
-            else _mask_secrets(item, in_data=in_data or key in _CATALOG_DATA_MAP_KEYS)
-            for key, item in value.items()
-        }
+        shown: dict[Any, Any] = {}
+        for key, item in value.items():
+            if not in_data and str(key).lower() in _SECRET_SETTING_KEYS and item is not None:
+                shown[key] = "[redacted]"
+            elif not in_data and key in _CATALOG_CREDENTIAL_OBJECT_KEYS and isinstance(item, str):
+                shown[key] = _masked_json_text(item, _mask_secrets)
+            else:
+                shown[key] = _mask_secrets(item, in_data=in_data or key in _CATALOG_DATA_MAP_KEYS)
+        return shown
     if isinstance(value, list):
         return [_mask_secrets(item, in_data=in_data) for item in value]
     return value
@@ -1968,18 +1977,39 @@ def _by_id(entries: Any) -> dict[str, list[str]]:
     return grouped
 
 
-def _batch_status_row(payload: dict[str, Any]) -> dict[str, Any]:
+# The Graph client's wrappers for an answer that was not a JSON object: a bare null, text or
+# number ({"json_response": ...}) or a body that was not JSON ({"text_response": ...}).
+_UNREADABLE_ANSWER_KEYS = ("json_response", "text_response")
+
+
+def _answer_unreadable(payload: Any) -> bool:
+    """Whether Meta's answer cannot be read as an object at all."""
+    return not isinstance(payload, dict) or any(key in payload for key in _UNREADABLE_ANSWER_KEYS)
+
+
+def _batch_status_row(payload: Any) -> dict[str, Any] | None:
+    """The status row in Meta's answer to a status check, or None when it cannot be read.
+
+    The documented answer is a data list whose first entry is the batch's status; an object
+    without a data list is read as that entry itself. Anything else (not an object, one of
+    the client's wrappers for a non-object answer, or a data list with no object in front)
+    holds no status this tool can read.
+    """
+    if _answer_unreadable(payload):
+        return None
     rows = payload.get("data")
+    if rows is None:
+        return payload
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         return rows[0]
-    return payload if isinstance(payload, dict) else {}
+    return None
 
 
 def _is_finished(row: dict[str, Any] | None) -> bool:
     return bool(row) and str(row.get("status") or "").strip().lower() == "finished"
 
 
-async def _check_batch(client, catalog_id: str, handle: str) -> dict[str, Any]:
+async def _check_batch(client, catalog_id: str, handle: str) -> dict[str, Any] | None:
     payload = await client.list_objects(
         catalog_id, "check_batch_request_status",
         params={"handle": handle, "load_ids_of_invalid_requests": True},
@@ -2057,6 +2087,10 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
 
 _UNFINISHED_REASON = (
     "Meta accepted the batch; it had not reported it finished when this tool stopped checking."
+)
+_STATUS_UNREADABLE = (
+    "Meta's answer to the status check could not be read as a batch status, so whether the batch "
+    "has finished is not known; it was not checked again."
 )
 
 
@@ -2187,6 +2221,17 @@ def _retry_statement(outcomes: set[str], handles: list[str] | str | None) -> dic
 
 async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, Any]:
     row = await _check_batch(client, catalog_id, handle)
+    if row is None:
+        return {
+            "ok": False,
+            "outcome": "status_unreadable",
+            "action": "batch_update_catalog_products",
+            "target": {"catalog_id": catalog_id},
+            "batch": {"handle": handle, "status": None, "complete": False, "status_checks": 1,
+                      "status_error": _STATUS_UNREADABLE},
+            "note": ("Nothing is known about the batch's outcome from this answer. Call again with the same "
+                     "handle to read it; do not resend the items until the batch is reported finished."),
+        }
     finished = _is_finished(row)
     # A single object given without a list is one entry, not a list of its keys.
     errors = [entry for entry in _entry_list(row.get("errors")) if isinstance(entry, dict)]
@@ -2235,7 +2280,8 @@ async def _poll_handles(
     """Check every batch handle until each is finished, its check fails, or the wait or request cap ends.
 
     Each round waits once, then checks every handle not yet finished; a handle
-    whose check fails is not checked again and keeps its error.
+    whose check fails, or whose answer holds no readable status, is not checked again
+    and keeps the reason as its error.
     """
     tracks = {handle: {"row": None, "checks": 0, "error": None} for handle in handles}
     requests = 0
@@ -2255,11 +2301,24 @@ async def _poll_handles(
                 break
             requests += 1
             try:
-                tracks[handle]["row"] = await _check_batch(client, catalog_id, handle)
+                row = await _check_batch(client, catalog_id, handle)
             except (MetaApiError, RateLimitError, UnsupportedFeatureError, NotFoundError) as error:
                 tracks[handle]["error"] = str(error)
                 continue
+            except Exception as error:
+                # The batch has been submitted: an unexpected failure while reading its status
+                # must not lose the handle and the items' outcomes. CancelledError is not an
+                # Exception, so a cancelled call still stops.
+                tracks[handle]["error"] = (
+                    f"The status check failed in this server ({type(error).__name__}), so whether the batch "
+                    "has finished is not known; it was not checked again."
+                )
+                continue
             tracks[handle]["checks"] += 1
+            if row is None:
+                tracks[handle]["error"] = _STATUS_UNREADABLE
+                continue
+            tracks[handle]["row"] = row
     if capped:
         for track in tracks.values():
             if not _is_finished(track["row"]) and track["error"] is None:
@@ -2433,108 +2492,131 @@ async def batch_update_catalog_products(
                                   if unknown else "Meta refused the whole request, so nothing was ingested.")
             response["error"] = error.to_public_dict()
         else:
-            # The write has gone out. An answer that is not an object says nothing about
-            # whether Meta ingested it, so it is never read as "no handle, nothing ingested".
-            response_unreadable = not isinstance(posted, dict)
-            if response_unreadable:
-                posted = {}
-            sent_ids = {item["retailer_id"] for item in to_send}
-            flagged: dict[str, list[dict[str, Any]]] = {}
-            unattributed: list[str] = []
-            # Evidence that cannot be read is counted, never skipped: a validation_status entry
-            # that is not an object (null, text, a number), and a null error inside an entry
-            # that names no item in this batch. Neither can be tied to an item.
-            validation_status = posted.get("validation_status")
-            unreadable_entries = _null_entries(validation_status)
-            unreadable_unattributed_errors = 0
-            for entry in _entry_list(validation_status):
-                if not isinstance(entry, dict):
-                    unreadable_entries += 1
-                    continue
-                raw_id = entry.get("retailer_id")
-                entry_id = str(raw_id).strip() if raw_id is not None else ""
-                if entry_id in sent_ids:
-                    flagged.setdefault(entry_id, []).append(entry)
-                else:
-                    unattributed.extend(_messages(entry.get("errors")))
-                    unreadable_unattributed_errors += _null_entries(entry.get("errors"))
-            for item in to_send:
-                statuses = flagged.get(item["retailer_id"], [])
-                item["errors"] = [text for status in statuses for text in _messages(status.get("errors"))]
-                item["warnings"] = [
-                    text for status in statuses for text in _messages(status.get("warnings"), _NO_MESSAGE_WARNING)
-                ]
-                # The count is kept apart from the texts, so an error is never lost for want of a message.
-                if item["errors"]:
-                    item["submission_error_count"] = len(item["errors"])
-                # A null error entry for this item cannot be read, but Meta listed it.
-                unreadable_errors = sum(_null_entries(status.get("errors")) for status in statuses)
-                if unreadable_errors:
-                    item["submission_unreadable_error_count"] = unreadable_errors
-            unreadable_submission = unreadable_entries + unreadable_unattributed_errors
-            if unattributed or unreadable_submission:
-                submission: dict[str, Any] = {}
-                if unattributed:
-                    submission.update({
-                        "unattributed_errors": unattributed[:20],
-                        "unattributed_error_count": len(unattributed),
-                    })
-                if unreadable_entries:
-                    submission["unreadable_entries"] = unreadable_entries
-                if unreadable_unattributed_errors:
-                    submission["unreadable_error_entries"] = unreadable_unattributed_errors
-                submission["note"] = (
-                    "Meta's answer to the submission listed "
-                    + ("errors without naming an item in this batch" if unattributed else "")
-                    + (" and " if unattributed and unreadable_submission else "")
-                    + ("entries that could not be read" if unreadable_submission else "")
-                    + ", so no item can be called applied."
-                )
-                response["submission"] = submission
-            raw_handles = posted.get("handles")
-            raw_handles = raw_handles if isinstance(raw_handles, list) else _entry_list(raw_handles)
-            # Meta documents handles as strings. Any other entry (an object, null, true, a
-            # list, a number, blank text) is a handle that cannot be checked; it is counted,
-            # and while one exists no item can be called applied.
-            handles = list(dict.fromkeys(
-                value.strip() for value in raw_handles if isinstance(value, str) and value.strip()
-            ))
-            unreadable_handles = sum(1 for value in raw_handles if not (isinstance(value, str) and value.strip()))
-            if response_unreadable:
+            try:
+                # The write has gone out. An answer that is not an object (including the Graph
+                # client's json_response and text_response wrappers for a bare null, text, number
+                # or non-JSON body) says nothing about whether Meta ingested it, so it is never
+                # read as "no handle, nothing ingested".
+                response_unreadable = _answer_unreadable(posted)
+                if response_unreadable:
+                    posted = {}
+                sent_ids = {item["retailer_id"] for item in to_send}
+                flagged: dict[str, list[dict[str, Any]]] = {}
+                unattributed: list[str] = []
+                # Evidence that cannot be read is counted, never skipped: a validation_status entry
+                # that is not an object (null, text, a number), and a null error inside an entry
+                # that names no item in this batch. Neither can be tied to an item.
+                validation_status = posted.get("validation_status")
+                unreadable_entries = _null_entries(validation_status)
+                unreadable_unattributed_errors = 0
+                for entry in _entry_list(validation_status):
+                    if not isinstance(entry, dict):
+                        unreadable_entries += 1
+                        continue
+                    raw_id = entry.get("retailer_id")
+                    entry_id = str(raw_id).strip() if raw_id is not None else ""
+                    if entry_id in sent_ids:
+                        flagged.setdefault(entry_id, []).append(entry)
+                    else:
+                        unattributed.extend(_messages(entry.get("errors")))
+                        unreadable_unattributed_errors += _null_entries(entry.get("errors"))
                 for item in to_send:
-                    item["outcome"] = "outcome_unknown"
-                    item["reason"] = ("Meta's answer to the submission could not be read, so whether it "
-                                      "ingested this item is not known. Read the product before retrying.")
-                response["batch"] = {"complete": False, "handles": [], "response_unreadable": True}
-            elif not handles and not unreadable_handles:
-                for item in to_send:
-                    item["outcome"] = "not_applied"
-                    item["reason"] = "Meta returned no batch handle, which it documents as meaning nothing was ingested."
-            elif not handles:
-                for item in to_send:
-                    item["outcome"] = "outcome_unknown"
-                    item["reason"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))
-                response["batch"] = {"complete": False, "handles": [], "unreadable_handles": unreadable_handles}
-            else:
-                tracks = await _poll_handles(client, catalog_id, handles, wait_seconds)
-                finished_rows = [track["row"] for track in tracks.values() if _is_finished(track["row"])]
-                unfinished = [handle for handle in handles if not _is_finished(tracks[handle]["row"])]
-                unfinished_reason = None
-                if unfinished:
-                    unfinished_reason = _UNFINISHED_REASON
-                    if len(handles) > 1:
-                        unfinished_reason = (
-                            f"Meta returned {len(handles)} handles for this batch and "
-                            f"{len(unfinished)} had not been reported finished when this tool stopped "
-                            "checking; Meta does not say which items each handle holds."
-                        )
-                for item in to_send:
-                    _settle(item, finished_rows, unfinished_reason=unfinished_reason,
-                            unattributed_submission_errors=len(unattributed),
-                            unreadable_submission_entries=unreadable_submission)
-                    if unreadable_handles and item["outcome"] == "applied":
+                    statuses = flagged.get(item["retailer_id"], [])
+                    item["errors"] = [text for status in statuses for text in _messages(status.get("errors"))]
+                    item["warnings"] = [
+                        text for status in statuses for text in _messages(status.get("warnings"), _NO_MESSAGE_WARNING)
+                    ]
+                    # The count is kept apart from the texts, so an error is never lost for want of a message.
+                    if item["errors"]:
+                        item["submission_error_count"] = len(item["errors"])
+                    # A null error entry for this item cannot be read, but Meta listed it.
+                    unreadable_errors = sum(_null_entries(status.get("errors")) for status in statuses)
+                    if unreadable_errors:
+                        item["submission_unreadable_error_count"] = unreadable_errors
+                unreadable_submission = unreadable_entries + unreadable_unattributed_errors
+                if unattributed or unreadable_submission:
+                    submission: dict[str, Any] = {}
+                    if unattributed:
+                        submission.update({
+                            "unattributed_errors": unattributed[:20],
+                            "unattributed_error_count": len(unattributed),
+                        })
+                    if unreadable_entries:
+                        submission["unreadable_entries"] = unreadable_entries
+                    if unreadable_unattributed_errors:
+                        submission["unreadable_error_entries"] = unreadable_unattributed_errors
+                    submission["note"] = (
+                        "Meta's answer to the submission listed "
+                        + ("errors without naming an item in this batch" if unattributed else "")
+                        + (" and " if unattributed and unreadable_submission else "")
+                        + ("entries that could not be read" if unreadable_submission else "")
+                        + ", so no item can be called applied."
+                    )
+                    response["submission"] = submission
+                raw_handles = posted.get("handles")
+                raw_handles = raw_handles if isinstance(raw_handles, list) else _entry_list(raw_handles)
+                # Meta documents handles as strings. Any other entry (an object, null, true, a
+                # list, a number, blank text) is a handle that cannot be checked; it is counted,
+                # and while one exists no item can be called applied.
+                handles = list(dict.fromkeys(
+                    value.strip() for value in raw_handles if isinstance(value, str) and value.strip()
+                ))
+                unreadable_handles = sum(1 for value in raw_handles if not (isinstance(value, str) and value.strip()))
+                if response_unreadable:
+                    for item in to_send:
+                        item["outcome"] = "outcome_unknown"
+                        item["reason"] = ("Meta's answer to the submission could not be read, so whether it "
+                                          "ingested this item is not known. Read the product before retrying.")
+                    response["batch"] = {"complete": False, "handles": [], "response_unreadable": True}
+                elif not handles and not unreadable_handles:
+                    for item in to_send:
+                        item["outcome"] = "not_applied"
+                        item["reason"] = "Meta returned no batch handle, which it documents as meaning nothing was ingested."
+                elif not handles:
+                    for item in to_send:
                         item["outcome"] = "outcome_unknown"
                         item["reason"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))
+                    response["batch"] = {"complete": False, "handles": [], "unreadable_handles": unreadable_handles}
+                else:
+                    tracks = await _poll_handles(client, catalog_id, handles, wait_seconds)
+                    finished_rows = [track["row"] for track in tracks.values() if _is_finished(track["row"])]
+                    unfinished = [handle for handle in handles if not _is_finished(tracks[handle]["row"])]
+                    unfinished_reason = None
+                    if unfinished:
+                        unfinished_reason = _UNFINISHED_REASON
+                        if any(tracks[handle]["error"] is not None for handle in unfinished):
+                            unfinished_reason = (
+                                "Meta accepted the batch, but its status could not be read (see the handle's "
+                                "status_error), so whether it has finished is not known."
+                            )
+                        if len(handles) > 1:
+                            unfinished_reason = (
+                                f"Meta returned {len(handles)} handles for this batch and "
+                                f"{len(unfinished)} had not been reported finished when this tool stopped "
+                                "checking; Meta does not say which items each handle holds."
+                            )
+                    for item in to_send:
+                        _settle(item, finished_rows, unfinished_reason=unfinished_reason,
+                                unattributed_submission_errors=len(unattributed),
+                                unreadable_submission_entries=unreadable_submission)
+                        if unreadable_handles and item["outcome"] == "applied":
+                            item["outcome"] = "outcome_unknown"
+                            item["reason"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))
+            except Exception as error:
+                # Nothing but the tool's deliberate results may leave after the write has gone
+                # out: a failure while reading Meta's answer keeps every item unresolved (or as
+                # Meta already named it) with the handles known so far. CancelledError is not an
+                # Exception, so a cancelled call still stops.
+                answer_error = (
+                    f"The request reached Meta, but this server failed while reading Meta's answer "
+                    f"({type(error).__name__}), so whether each item was applied is not known. Read the "
+                    "products before retrying."
+                )
+                for item in to_send:
+                    if item["outcome"] in (None, "applied", "not_applied"):
+                        item["outcome"] = "outcome_unknown"
+                        item["reason"] = answer_error
+                response["answer_error"] = answer_error
     for item in to_send:
         item.pop("request", None)
     if handles:
