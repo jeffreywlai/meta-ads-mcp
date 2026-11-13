@@ -19,7 +19,7 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, GraphId, StringList
+from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, GraphId, StrictCurrencyAmount, StringList
 
 
 def _encode_budget_field(
@@ -90,7 +90,7 @@ async def create_campaign(
     bid_strategy: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
-    spend_cap: CurrencyAmount | None = None,
+    spend_cap: StrictCurrencyAmount | None = None,
     start_time: str | None = None,
     stop_time: str | None = None,
     promoted_object: dict[str, Any] | None = None,
@@ -310,10 +310,10 @@ async def create_ad_set(
     frequency_control_specs: list[dict[str, Any]] | None = None,
     attribution_spec: list[dict[str, Any]] | None = None,
     adset_schedule: list[dict[str, Any]] | None = None,
-    daily_spend_cap: CurrencyAmount | None = None,
-    lifetime_spend_cap: CurrencyAmount | None = None,
-    daily_min_spend_target: CurrencyAmount | None = None,
-    lifetime_min_spend_target: CurrencyAmount | None = None,
+    daily_spend_cap: StrictCurrencyAmount | None = None,
+    lifetime_spend_cap: StrictCurrencyAmount | None = None,
+    daily_min_spend_target: StrictCurrencyAmount | None = None,
+    lifetime_min_spend_target: StrictCurrencyAmount | None = None,
     dsa_beneficiary: str | None = None,
     dsa_payor: str | None = None,
     adlabels: list[dict[str, Any]] | None = None,
@@ -492,10 +492,10 @@ async def update_adset(
     status: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
-    daily_spend_cap: CurrencyAmount | None = None,
-    lifetime_spend_cap: CurrencyAmount | None = None,
-    daily_min_spend_target: CurrencyAmount | None = None,
-    lifetime_min_spend_target: CurrencyAmount | None = None,
+    daily_spend_cap: StrictCurrencyAmount | None = None,
+    lifetime_spend_cap: StrictCurrencyAmount | None = None,
+    daily_min_spend_target: StrictCurrencyAmount | None = None,
+    lifetime_min_spend_target: StrictCurrencyAmount | None = None,
 ) -> dict[str, Any]:
     """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps or minimum spend targets, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     adset_id = blank_to_none(adset_id)

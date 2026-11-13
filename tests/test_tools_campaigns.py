@@ -1234,3 +1234,62 @@ def test_update_adset_names_a_params_field_meta_did_not_return(monkeypatch) -> N
         "not_a_readable_field": "Not a field this server reads back from an ad set.",
     }
     assert result["previous_not_read"] == ["not_a_readable_field"]
+
+
+class BoundaryRecordingClient:
+    """Fake client for MCP-boundary tests: a USD account and objects that record every call."""
+
+    def __init__(self, stored: dict | None = None) -> None:
+        self.calls: list[tuple] = []
+        self.stored = stored or {}
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        if object_id == "act_10":
+            return {"id": object_id, "currency": "USD"}
+        return {"id": object_id, "account_id": "10", **self.stored}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return {"id": "900"}
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+
+_G12_ADSET_ARGS = {
+    "account_id": "10", "campaign_id": "30", "name": "Ad set", "billing_event": "IMPRESSIONS",
+    "optimization_goal": "LINK_CLICKS", "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+_G12_CASES = [
+    ("create_campaign", "spend_cap", {"account_id": "10", "name": "Campaign", "objective": "OUTCOME_SALES"}),
+    *[("create_ad_set", key, _G12_ADSET_ARGS) for key in campaigns._ADSET_SPEND_FIELDS],
+    *[("update_adset", key, {"adset_id": "20"}) for key in campaigns._ADSET_SPEND_FIELDS],
+]
+
+
+@pytest.mark.parametrize("value", [True, False])
+@pytest.mark.parametrize(("tool", "field", "args"), _G12_CASES)
+def test_g12_new_money_arguments_reject_booleans_before_write(monkeypatch, tool, field, args, value) -> None:
+    """MCP would read true as 1.0 and send 100 minor units; the new money arguments refuse true and false."""
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises((ToolError, MCPValidationError)):
+        asyncio.run(mcp_server.call_tool(tool, {**args, field: value}))
+    assert not [call for call in client.calls if call[0] in {"create", "update"}], client.calls
+
+
+@pytest.mark.parametrize(("tool", "field", "args"), _G12_CASES)
+def test_g12_new_money_arguments_still_accept_numbers_at_the_mcp_boundary(monkeypatch, tool, field, args) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(mcp_server.call_tool(tool, {**args, field: 150.25}))
+    writes = [call for call in client.calls if call[0] in {"create", "update"}]
+    assert len(writes) == 1
+    assert writes[0][-1][field] == 15025
