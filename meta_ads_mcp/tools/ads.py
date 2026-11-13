@@ -15,7 +15,7 @@ from meta_ads_mcp.money import (
     to_minor_units,
     validate_positive_amount,
 )
-from meta_ads_mcp.normalize import blank_to_none
+from meta_ads_mcp.normalize import blank_to_none, read_collection_page
 from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
 from meta_ads_mcp.tools.campaigns import (
     WholeNumber,
@@ -31,6 +31,7 @@ from meta_ads_mcp.tools.campaigns import (
     validate_schedule_time,
 )
 from meta_ads_mcp.tool_types import CurrencyAmount, GraphId, StrictStringList, coerce_strict_csv_string_list
+from meta_ads_mcp.tools.creatives import PartnershipCodesHidden
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -226,10 +227,12 @@ async def create_ad(
             raise ValidationError("creative_spec must not be empty.")
         if {"creative_id", "id"} & set(creative_spec):
             raise ValidationError("creative_spec is for a new creative; to use an existing one, use creative_id.")
-        return await _create_ad(
-            account_id, name, adset_id, creative_spec, status, bid_amount, tracking_specs,
-            conversion_domain, adlabels, validate_only, params, later_fields,
-        )
+        # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
+        with PartnershipCodesHidden(creative_spec, params):
+            return await _create_ad(
+                account_id, name, adset_id, creative_spec, status, bid_amount, tracking_specs,
+                conversion_domain, adlabels, validate_only, params, later_fields,
+            )
     nested_creative_id: str | None = None
     if creative is not None:
         if not isinstance(creative, dict):
@@ -262,10 +265,11 @@ async def create_ad(
         alias_name="creative.creative_id",
         required=True,
     )
-    return await _create_ad(
-        account_id, name, adset_id, {"creative_id": resolved_creative_id}, status, bid_amount,
-        tracking_specs, conversion_domain, adlabels, validate_only, params, later_fields,
-    )
+    with PartnershipCodesHidden(params):
+        return await _create_ad(
+            account_id, name, adset_id, {"creative_id": resolved_creative_id}, status, bid_amount,
+            tracking_specs, conversion_domain, adlabels, validate_only, params, later_fields,
+        )
 
 
 async def _create_ad(
@@ -352,7 +356,14 @@ async def _get_ad_image(
             payload = await client.get_ad_images_by_hashes(account_id, hashes=missing, fields=AD_IMAGE_FIELDS)
             if (payload.get("paging") or {}).get("next"):
                 raise ValidationError("Image lookup returned more pages; a complete image result could not be obtained.")
-            found = {image["hash"]: image for image in payload.get("data", []) if image.get("hash")}
+            rows, unreadable_rows, page_unreadable = read_collection_page(payload)
+            if page_unreadable or unreadable_rows:
+                # An image that could not be read would otherwise be reported as unresolved.
+                raise ValidationError(
+                    "Image lookup returned an answer this server could not fully read; a complete image result could "
+                    "not be obtained."
+                )
+            found = {image["hash"]: image for image in rows if image.get("hash")}
             for image_hash in missing:
                 images[(cache_account, image_hash)] = found.get(image_hash)
         resolved_images = [

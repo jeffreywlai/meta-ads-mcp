@@ -22,6 +22,7 @@ from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_exception
 from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.tools.creatives import PARTNERSHIP_CODE_FIELDS, PARTNERSHIP_CODE_SHOWN, label_identity, read_label_set
 from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 # AdCreativeLinkDataCallToAction.type values from Meta's reference page, plus
@@ -1101,7 +1102,8 @@ def build_creative_spec(inputs: _Inputs) -> tuple[str, dict[str, Any], list[str]
     return creative_format, payload, notes
 
 
-_AD_CODE_FIELDS = ("instagram_boost_post_access_token", "facebook_boost_post_access_token")
+# The Partnership Ad code fields and how a hidden code is shown: one definition, in creatives.
+_AD_CODE_FIELDS = tuple(sorted(PARTNERSHIP_CODE_FIELDS))
 
 
 def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1111,11 +1113,8 @@ def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(branded, dict):
         for key in _AD_CODE_FIELDS:
             if key in branded:
-                branded[key] = _CODE_SHOWN
+                branded[key] = PARTNERSHIP_CODE_SHOWN
     return shown
-
-
-_CODE_SHOWN = "<partnership_ad_code>"
 
 
 def _scrub_codes(exc: BaseException, codes: list[Any]) -> None:
@@ -1126,7 +1125,7 @@ def _scrub_codes(exc: BaseException, codes: list[Any]) -> None:
     meta_ads_mcp.secret_scrub removes each code, at any length and wherever it occurs, from
     every error reachable that way.
     """
-    scrub_exception(exc, codes, policy=ANYWHERE, shown=_CODE_SHOWN)
+    scrub_exception(exc, codes, policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN)
 
 
 @mcp_server.tool()
@@ -1433,17 +1432,26 @@ def _holds_value(value: Any) -> bool:
     return value is not False and value not in (None, "", [], {})
 
 
+_LABELS_ON_MORE_PAGES = "Meta named a further page of labels, which this read does not follow"
+
+
 def _copy_value(field: str, value: Any) -> Any:
-    """The value to send for a copied field: ad labels go back by id (or name), as Meta's create takes them."""
-    if field == "adlabels" and isinstance(value, list):
-        labels = []
-        for label in value:
-            if isinstance(label, dict) and label.get("id"):
-                labels.append({"id": str(label["id"])})
-            elif isinstance(label, dict) and label.get("name"):
-                labels.append({"name": label["name"]})
-        return labels
+    """The value to send for a copied field: ad labels go back by id (or name), as Meta's create takes them.
+
+    The labels are sent as the copy's whole set, so _copied_labels_problem must be checked first:
+    a label that was not read would be missing from the copy.
+    """
+    if field == "adlabels":
+        labels, _ = read_label_set(value, more_pages=_LABELS_ON_MORE_PAGES)
+        return [label_identity(label) for label in labels]
     return value
+
+
+def _copied_labels_problem(creative: dict[str, Any]) -> str | None:
+    """Why the old creative's labels could not all be read for the copy (None when they were, or it has none)."""
+    if not _holds_value(creative.get("adlabels")):
+        return None
+    return read_label_set(creative["adlabels"], more_pages=_LABELS_ON_MORE_PAGES)[1]
 
 
 def _raise_step_failure(exc: Exception, *, definite: str, unknown: str) -> None:
@@ -1865,6 +1873,12 @@ async def _update_enhancements(
         f"{', '.join(not_read)} could not be read: {explicit_problem}. Meta returns it only when asked for by name, "
         "so a copy made without it could lose it. A real run would refuse and change nothing."
     ) if not_read else None
+    # The copy carries the old creative's labels as its whole set, so every label must have been read.
+    labels_problem = _copied_labels_problem(creative)
+    labels_note = (
+        f"adlabels could not all be read: {labels_problem}. The copy would carry only the labels read and lose the "
+        "rest. A real run would refuse and change nothing."
+    ) if labels_problem else None
     if dry_run:
         return {
             "ok": True,
@@ -1881,9 +1895,10 @@ async def _update_enhancements(
             "fields_not_copied": not_copied,
             "derived_fields_left_out": derived,
             "settings_that_cannot_be_copied": [*lost_settings, *(["call_to_action"] if call_to_action_lost else [])],
-            "settings_not_read": not_read,
+            "settings_not_read": [*not_read, *(["adlabels"] if labels_problem else [])],
             "notes": [
-                copy_note, review_note, *(note for note in (lost_note, call_to_action_note, not_read_note) if note),
+                copy_note, review_note,
+                *(note for note in (lost_note, call_to_action_note, not_read_note, labels_note) if note),
             ],
         }
     if lost_settings:
@@ -1899,6 +1914,12 @@ async def _update_enhancements(
         )
     if not_read:
         _refuse_unread_settings(explicit_error, not_read, explicit_problem, ad_id=ad_id, creative_id=old_creative_id)
+    if labels_problem:
+        raise ValidationError(
+            f"The labels of creative {old_creative_id} could not all be read: {labels_problem}. The copy this change "
+            f"needs would lose the labels not read. Nothing was created or attached; ad {ad_id} still uses creative "
+            f"{old_creative_id}."
+        )
     # A name the caller typed is free text, so the error points at it rather than repeating it.
     shown_name = "with the name given in this call" if new_name else f"named {payload['name']!r}"
     try:

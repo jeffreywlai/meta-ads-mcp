@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import unicodedata
@@ -19,7 +20,7 @@ from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_file
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_exception
 from meta_ads_mcp.tool_types import (
@@ -58,6 +59,71 @@ CREATIVE_FIELDS = [
     "image_hash",
     "thumbnail_url",
 ]
+
+
+# The creative fields that hold a creator's Partnership Ad code (branded_content
+# instagram_boost_post_access_token and facebook_boost_post_access_token, from Meta's Instagram and
+# Facebook Partnership Ads guides). The one list every tool in this package uses to hide those codes.
+PARTNERSHIP_CODE_FIELDS = frozenset({"instagram_boost_post_access_token", "facebook_boost_post_access_token"})
+PARTNERSHIP_CODE_SHOWN = "<partnership_ad_code>"
+# How deep a raw creative input is searched for codes, so a cyclic or absurdly nested value cannot stall a call.
+_CODE_SEARCH_DEPTH = 64
+
+
+def partnership_codes(*raw_inputs: Any) -> list[str]:
+    """Every Partnership Ad code in raw creative inputs: the text value of a code field at any depth.
+
+    Dicts and lists are walked, and a text value that is a JSON object or list is decoded and
+    walked too, since a caller may pass a spec (or part of one) as JSON text, which Meta reads the same.
+    """
+    codes: list[str] = []
+    pending: list[tuple[Any, int]] = [(value, 0) for value in raw_inputs]
+    while pending:
+        value, depth = pending.pop()
+        if depth > _CODE_SEARCH_DEPTH:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text[:1] in ("{", "["):
+                try:
+                    pending.append((json.loads(text), depth + 1))
+                except ValueError:
+                    pass
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                if key in PARTNERSHIP_CODE_FIELDS and isinstance(item, str):
+                    codes.append(item)
+                pending.append((item, depth + 1))
+        elif isinstance(value, (list, tuple)):
+            pending.extend((item, depth + 1) for item in value)
+    return list(dict.fromkeys(codes))
+
+
+class PartnershipCodesHidden:
+    """Keeps the Partnership Ad codes found in raw creative inputs out of every error a block raises.
+
+    Used as ``with PartnershipCodesHidden(spec, params): ...`` around a tool's whole body: an error
+    leaving the block has each code removed (meta_ads_mcp.secret_scrub, at any length, written plainly
+    or encoded) from its message, fields and the errors chained behind it, before the MCP error or a
+    traceback log is built from it. scrub() does the same for an error a tool catches and keeps.
+    """
+
+    __slots__ = ("codes",)
+
+    def __init__(self, *raw_inputs: Any) -> None:
+        self.codes = partnership_codes(*raw_inputs)
+
+    def __enter__(self) -> PartnershipCodesHidden:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: BaseException | None, traceback: Any) -> bool:
+        if exc is not None:
+            self.scrub(exc)
+        return False
+
+    def scrub(self, exc: BaseException) -> None:
+        if self.codes:
+            scrub_exception(exc, self.codes, policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN)
 
 
 def _failure_reason(exc: BaseException) -> str:
@@ -219,12 +285,14 @@ async def create_ad_creative(
         "image_hash": image_hash or OMIT,
         "degrees_of_freedom_spec": degrees_of_freedom_spec or OMIT,
     }
-    client = get_graph_api_client()
-    created = await client.create_edge_object(
-        normalize_account_id(account_id),
-        "adcreatives",
-        data=merge_graph_payload(payload, params),
-    )
+    # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
+    with PartnershipCodesHidden(object_story_spec, asset_feed_spec, degrees_of_freedom_spec, params):
+        client = get_graph_api_client()
+        created = await client.create_edge_object(
+            normalize_account_id(account_id),
+            "adcreatives",
+            data=merge_graph_payload(payload, params),
+        )
     return {
         "ok": True,
         "action": "create_ad_creative",
@@ -281,8 +349,13 @@ async def _preview_many(
     creative_id: str | None,
     creative: dict[str, Any] | None,
     formats: list[str],
+    hidden: PartnershipCodesHidden,
 ) -> dict[str, Any]:
-    """Request one preview per format, keeping the formats Meta refused."""
+    """Request one preview per format, keeping the formats Meta refused.
+
+    A refused format's error is kept as text in the result, so the creative's Partnership Ad
+    codes are removed from it first (hidden).
+    """
     client = get_graph_api_client()
     items: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -296,12 +369,15 @@ async def _preview_many(
                 ad_format=ad_format,
             )
         except MetaApiError as exc:
+            hidden.scrub(exc)
             failed.append({"ad_format": ad_format, "error": exc.message, "code": exc.code})
             continue
         except UnsupportedFeatureError as exc:
+            hidden.scrub(exc)
             failed.append({"ad_format": ad_format, "error": str(exc), "code": None})
             continue
         except RateLimitError as exc:
+            hidden.scrub(exc)
             # Keep the previews already rendered; stop asking while Meta is throttling.
             failed.append({"ad_format": ad_format, "error": exc.message, "code": exc.code, "rate_limited": True})
             failed.extend(
@@ -338,23 +414,26 @@ async def preview_ad(
         raise ValidationError("Provide ad_id, creative_id, or creative.")
     if (creative_id or creative) and not account_id and not ad_id:
         raise ValidationError("account_id is required when previewing from creative_id or creative.")
-    if ad_formats is not None:
-        formats = _preview_formats(ad_formats, ad_format)
-        return await _preview_many(
+    # A Partnership Ad code in the draft creative never reaches an error, a log or a failed format's text.
+    with PartnershipCodesHidden(creative) as hidden:
+        if ad_formats is not None:
+            formats = _preview_formats(ad_formats, ad_format)
+            return await _preview_many(
+                ad_id=ad_id,
+                account_id=normalize_account_id(account_id) if account_id else None,
+                creative_id=creative_id,
+                creative=creative,
+                formats=formats,
+                hidden=hidden,
+            )
+        client = get_graph_api_client()
+        result = await client.preview_ad(
             ad_id=ad_id,
             account_id=normalize_account_id(account_id) if account_id else None,
             creative_id=creative_id,
             creative=creative,
-            formats=formats,
+            ad_format=ad_format,
         )
-    client = get_graph_api_client()
-    result = await client.preview_ad(
-        ad_id=ad_id,
-        account_id=normalize_account_id(account_id) if account_id else None,
-        creative_id=creative_id,
-        creative=creative,
-        ad_format=ad_format,
-    )
     return {"item": result, "summary": {"count": 1}}
 
 
@@ -761,14 +840,17 @@ async def _read_video_status(client: Any, video_id: str | None) -> dict[str, Any
             ),
         }
     processing_status = _video_processing_status(video)
-    return {
-        "processing_status": processing_status,
-        "status": video.get("status"),
-        "status_note": (
-            "Video is ready to use." if processing_status == "ready"
-            else "Meta is still processing or reported a problem; check list_ad_videos(video_ids=...) before using it."
-        ),
-    }
+    if processing_status == "ready":
+        note = "Video is ready to use."
+    elif processing_status is None:
+        # Nothing was read about processing, so nothing is said about it.
+        note = (
+            f"The upload succeeded (video {video_id}) but Meta's answer did not include its processing status. "
+            "Check list_ad_videos(video_ids=...) before using it."
+        )
+    else:
+        note = "Meta is still processing or reported a problem; check list_ad_videos(video_ids=...) before using it."
+    return {"processing_status": processing_status, "status": video.get("status"), "status_note": note}
 
 
 @mcp_server.tool()
@@ -944,7 +1026,15 @@ async def delete_ad_image(
     resolved_account = normalize_account_id(account)
     client = get_graph_api_client()
     listing = await client.get_ad_images_by_hashes(resolved_account, hashes=[image_hash], fields=AD_IMAGE_READ_FIELDS)
-    matches = [item for item in listing.get("data", []) if isinstance(item, dict) and item.get("hash") == image_hash]
+    rows, unreadable_rows, page_unreadable = read_collection_page(listing)
+    matches = [item for item in rows if item.get("hash") == image_hash]
+    if not matches and (page_unreadable or unreadable_rows):
+        # What could not be read may be the image: "not found" would be a claim the read does not support.
+        what = "its answer" if page_unreadable else f"{unreadable_rows} of the entries in its answer"
+        raise ValidationError(
+            f"Meta's read of the image in {resolved_account} could not be used ({what} could not be read), so it is "
+            "not known whether the image exists. Nothing was deleted."
+        )
     if not matches:
         raise ValidationError(f"No image with the given image_hash was found in {resolved_account}; nothing was deleted.")
     previous = matches[0]
@@ -1014,11 +1104,11 @@ _ADLABEL_OPERATIONS = ("set", "add", "remove")
 
 
 def _normalize_adlabels(adlabels: Any) -> list[dict[str, str]]:
-    """Each label is {"id": digits} or {"name": text}."""
+    """Each label is {"id": digits} or {"name": text}. Errors count list positions from 0, as everywhere else."""
     if not isinstance(adlabels, list):
         raise ValidationError('adlabels must be a list of labels such as [{"name": "spring"}] or [{"id": "123"}].')
     labels: list[dict[str, str]] = []
-    for index, label in enumerate(adlabels, start=1):
+    for index, label in enumerate(adlabels):
         if not isinstance(label, dict) or set(label) - {"id", "name"} or len(label) != 1:
             raise ValidationError(f"adlabels[{index}] must have exactly one of id or name.")
         key, value = next(iter(label.items()))
@@ -1040,20 +1130,62 @@ def _label_matches(existing: dict[str, Any], wanted: dict[str, str]) -> bool:
 # read completely, and a removal (which sends the full replacement set) is refused.
 ADLABEL_READ_LIMIT = 100
 ADLABEL_READ_FIELD = f"adlabels.limit({ADLABEL_READ_LIMIT}){{id,name}}"
+_MORE_LABELS_THAN_ONE_READ = f"the creative has more labels than one read returns ({ADLABEL_READ_LIMIT})"
 
 
-def _existing_labels(previous: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-    """The labels read and whether that read was the whole set (no further page)."""
+def label_identity(label: Any) -> dict[str, str] | None:
+    """How a label read from Meta is sent back: {"id": ...}, else {"name": ...}; None when the row names no label.
+
+    Meta's adlabels inputs take a label by id or by name. A row that is not an object, or has
+    neither a usable id nor a nonblank name, cannot be sent back, so a full replacement or a copy
+    built without it would drop that label.
+    """
+    if not isinstance(label, dict):
+        return None
+    for key in ("id", "name"):
+        value = label.get(key)
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            continue
+        text = str(value).strip()
+        if text:
+            return {key: text}
+    return None
+
+
+def read_label_set(raw: Any, *, more_pages: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Labels read from Meta (a list, or a page with data and paging), and why they are not the whole set.
+
+    The reason is None only when every label was read: the page's data is a list, no further
+    page is named (more_pages is the reason given when one is), and every row is a label that
+    can be sent back (label_identity). Rows that cannot are counted, never dropped silently.
+    """
+    if isinstance(raw, list):
+        raw = {"data": raw}
+    rows, unreadable_rows, page_unreadable = read_collection_page(raw)
+    if page_unreadable:
+        return [], "Meta returned the labels in a shape this server could not read"
+    labels = [row for row in rows if label_identity(row) is not None]
+    unreadable_rows += len(rows) - len(labels)
+    paging = raw.get("paging")
+    if isinstance(paging, dict) and paging.get("next"):
+        return labels, more_pages
+    if unreadable_rows:
+        return labels, (
+            f"{unreadable_rows} of the {unreadable_rows + len(labels)} labels Meta returned "
+            f"{'is' if unreadable_rows == 1 else 'are'} not a label with an id or a name"
+        )
+    return labels, None
+
+
+def _existing_labels(previous: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    """The creative's labels read, and why that read is not the whole set (None when it is).
+
+    A creative with no labels comes back without adlabels; anything else is read by read_label_set.
+    """
     raw = previous.get("adlabels")
-    complete = True
-    if isinstance(raw, dict):
-        paging = raw.get("paging")
-        if isinstance(paging, dict) and paging.get("next"):
-            complete = False
-        raw = raw.get("data")
-    if raw is not None and not isinstance(raw, list):
-        return [], False
-    return [label for label in raw or [] if isinstance(label, dict)], complete
+    if raw is None:
+        return [], None
+    return read_label_set(raw, more_pages=_MORE_LABELS_THAN_ONE_READ)
 
 
 async def _update_creative_labels(
@@ -1065,13 +1197,14 @@ async def _update_creative_labels(
 ) -> dict[str, Any]:
     """Apply a label set, add or remove after reading the creative's current labels."""
     previous = await client.get_object(creative_id, fields=[*CREATIVE_FIELDS, ADLABEL_READ_FIELD])
-    previous_labels, read_complete = _existing_labels(previous)
+    previous_labels, unread_reason = _existing_labels(previous)
+    read_complete = unread_reason is None
     shown_previous = [{key: str(label[key]) for key in ("id", "name") if label.get(key)} for label in previous_labels]
     expected: list[dict[str, Any]] | None
     if operation == "remove":
         if not read_complete:
             raise ValidationError(
-                f"Creative {creative_id} has more labels than one read returns ({ADLABEL_READ_LIMIT}), and removing a "
+                f"The existing labels of creative {creative_id} could not all be read: {unread_reason}. Removing a "
                 "label sends the full remaining set, so labels that were not read would be lost. Nothing was changed. "
                 "Use adlabels_operation=set with the complete list you want."
             )
@@ -1082,7 +1215,7 @@ async def _update_creative_labels(
                 f"{creative_id}, so nothing was changed. Read the creative's labels with get_creative first."
             )
         remaining = [label for label in previous_labels if not any(_label_matches(label, wanted) for wanted in labels)]
-        expected = [{"id": str(label["id"])} if label.get("id") else {"name": str(label.get("name"))} for label in remaining]
+        expected = [label_identity(label) for label in remaining]
         payload["adlabels"] = expected
     elif operation == "add":
         expected = [*shown_previous, *labels] if read_complete else None
@@ -1096,7 +1229,7 @@ async def _update_creative_labels(
         except Exception as exc:
             if not payload:
                 raise
-            changed = ", ".join(sorted(payload))
+            changed = _changed_fields(payload)
             note = f"Creative {creative_id} was already updated ({changed} changed) but the labels were not added:"
             if _outcome_unknown(exc):
                 note = f"Creative {creative_id} was already updated ({changed} changed); the labels may or may not have been added:"
@@ -1119,11 +1252,30 @@ async def _update_creative_labels(
     response["adlabels_operation"] = operation
     response["adlabels_read_complete"] = read_complete
     if not read_complete:
+        partial = (
+            f"Only the first {ADLABEL_READ_LIMIT} labels could be read"
+            if unread_reason == _MORE_LABELS_THAN_ONE_READ
+            else f"The existing labels could not all be read ({unread_reason})"
+        )
         response["adlabels_note"] = (
-            f"Only the first {ADLABEL_READ_LIMIT} labels could be read, so previous.adlabels is partial"
+            f"{partial}, so previous.adlabels is partial"
             + ("; the add only added labels, and the full resulting set is unknown." if operation == "add" else ".")
         )
     return response
+
+
+# update_creative's named fields: the only payload keys an error may name. A key inside params
+# may be a misplaced value (a token pasted as a key), so those are counted instead.
+_UPDATE_CREATIVE_FIELDS = ("name", "title", "body", "status", "object_story_spec", "asset_feed_spec", "adlabels")
+
+
+def _changed_fields(payload: dict[str, Any]) -> str:
+    """The fields an update sent, for an error: named fields by name, any other key counted."""
+    named = [key for key in _UPDATE_CREATIVE_FIELDS if key in payload]
+    others = sum(1 for key in payload if key not in _UPDATE_CREATIVE_FIELDS)
+    if others:
+        named.append(f"{others} field{'' if others == 1 else 's'} from params")
+    return ", ".join(named)
 
 
 @mcp_server.tool()
@@ -1180,11 +1332,13 @@ async def update_creative(
     payload = merge_graph_payload(payload, params)
     if not payload and operation not in {"add", "remove"}:
         raise ValidationError("At least one field must be provided for update_creative.")
-    client = get_graph_api_client()
-    if labels is not None and operation is not None:
-        return await _update_creative_labels(client, creative_id, payload, labels, operation)
-    previous = await client.get_object(creative_id, fields=CREATIVE_FIELDS)
-    await client.update_object(creative_id, data=payload)
+    # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
+    with PartnershipCodesHidden(object_story_spec, asset_feed_spec, params):
+        client = get_graph_api_client()
+        if labels is not None and operation is not None:
+            return await _update_creative_labels(client, creative_id, payload, labels, operation)
+        previous = await client.get_object(creative_id, fields=CREATIVE_FIELDS)
+        await client.update_object(creative_id, data=payload)
     return mutation_response(
         action="update_creative",
         target={"creative_id": creative_id},
@@ -1277,7 +1431,6 @@ _DESTINATION_CALL_TO_ACTIONS = {"INSTAGRAM_MESSAGE": "INSTAGRAM_DIRECT", "WHATSA
 BOOST_LEAD_FORM_CALL_TO_ACTIONS = ("APPLY_NOW", "DOWNLOAD", "GET_QUOTE", "LEARN_MORE", "SIGN_UP", "SUBSCRIBE")
 _TEL_LINK = re.compile(r"^tel:\+[0-9]{6,15}$")
 BOOST_DEFAULT_OBJECTIVE = "OUTCOME_ENGAGEMENT"
-PARTNERSHIP_CODE_SHOWN = "<partnership_ad_code>"
 BOOST_DEFAULT_DURATION_DAYS = 6
 BOOST_MAX_DURATION_DAYS = 365
 BOOST_MIN_RUN = timedelta(hours=24)
@@ -1691,19 +1844,31 @@ async def _page_for_instagram_account(client: Any, instagram_account_id: str) ->
     requests = 0
     complete = False
     stop_reason = f"the read stopped at this server's {BOOST_PAGE_LOOKUP_MAX_REQUESTS}-request limit"
+    unreadable = 0
     while requests < BOOST_PAGE_LOOKUP_MAX_REQUESTS:
         payload = await client.list_objects("me", "accounts", fields=["id", "instagram_business_account"], params=dict(params))
         requests += 1
-        rows = payload.get("data") if isinstance(payload, dict) else None
-        for page in rows if isinstance(rows, list) else []:
-            if not isinstance(page, dict):
+        rows, unreadable_rows, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            # Pages may have been there: never read as an empty or last page.
+            stop_reason = "Meta returned a page of the list in a shape this server could not read"
+            break
+        unreadable += unreadable_rows
+        for page in rows:
+            linked = page.get("instagram_business_account")
+            if linked is not None and not isinstance(linked, dict):
+                unreadable += 1
+                continue
+            linked_id = linked.get("id") if isinstance(linked, dict) else None
+            if linked_id is None or str(linked_id) != instagram_account_id:
+                pages_read += 1
+                continue
+            if not blank_to_none(str(page.get("id") or "")):
+                unreadable += 1  # The matching Page, but without its id.
                 continue
             pages_read += 1
-            linked = page.get("instagram_business_account")
-            linked_id = linked.get("id") if isinstance(linked, dict) else None
-            if linked_id is not None and str(linked_id) == instagram_account_id and page.get("id"):
-                matches.append(str(page["id"]))
-        paging = payload.get("paging") if isinstance(payload, dict) else None
+            matches.append(str(page["id"]).strip())
+        paging = payload.get("paging")
         if not isinstance(paging, dict) or not paging.get("next"):
             complete = True
             break
@@ -1716,6 +1881,13 @@ async def _page_for_instagram_account(client: Any, instagram_account_id: str) ->
             break
         cursors.add(cursor)
         params["after"] = cursor
+    if complete and unreadable:
+        # An entry that could not be read may be another Page linked to this account.
+        complete = False
+        stop_reason = (
+            f"{unreadable} {'entry' if unreadable == 1 else 'entries'} in it could not be read, and any of them could "
+            "be a Page linked to this Instagram account"
+        )
     matches = list(dict.fromkeys(matches))
     lookup = {"source": "me/accounts instagram_business_account", "pages_read": pages_read, "requests": requests, "complete": complete}
     if complete and len(matches) == 1:
@@ -1784,9 +1956,10 @@ def _boost_creative_spec(
 def _without_ad_code(spec: dict[str, Any]) -> dict[str, Any]:
     """A creative spec for display: the creator's Partnership Ad code is never shown."""
     branded = spec.get("branded_content")
-    if not isinstance(branded, dict) or "instagram_boost_post_access_token" not in branded:
+    if not isinstance(branded, dict) or not PARTNERSHIP_CODE_FIELDS & set(branded):
         return spec
-    return {**spec, "branded_content": {**branded, "instagram_boost_post_access_token": PARTNERSHIP_CODE_SHOWN}}
+    hidden = {key: PARTNERSHIP_CODE_SHOWN for key in PARTNERSHIP_CODE_FIELDS if key in branded}
+    return {**spec, "branded_content": {**branded, **hidden}}
 
 
 def _boost_created_message(created: list[tuple[str, str]], failed_step: str, reason: str) -> str:
