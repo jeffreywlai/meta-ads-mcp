@@ -16,13 +16,33 @@ from meta_ads_mcp.argument_privacy import (
     schema_parameter_names,
     unknown_parameter_count,
 )
+from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.errors import MetaApiError, RateLimitError
+from meta_ads_mcp.official_parity import official_tool_guidance
 
 
 # The search transform's proxy tool, and the envelope keys that name its target
 # (name, and the compatibility alias tool_name). See coordinator.py.
 PROXY_TOOL_NAMES: frozenset[str] = frozenset({"call_tool"})
 _PROXY_TARGET_KEYS = ("name", "tool_name")
+# The search transform's own tools. The proxy refuses them with its own message.
+_SYNTHETIC_TOOL_NAMES: frozenset[str] = frozenset({"call_tool", "search_tools"})
+
+# Returned instead of FastMCP's "Unknown tool: '<name>'", which repeats the name:
+# a name that matches no tool may be a customer value put in the wrong place.
+UNKNOWN_TOOL_MESSAGE = (
+    "No tool here has the name given. The name is not repeated because it may hold "
+    "personal data. Find tool names with search_tools(query='what you want to do'), "
+    "or get_capabilities(intent=...), and call one of the names it returns."
+)
+# In read-only mode a name that is no tool was refused as not permitted; that stays
+# visible, still without the name.
+READ_ONLY_UNKNOWN_TOOL_MESSAGE = f"META_READ_ONLY is enabled; the tool named is not permitted. {UNKNOWN_TOOL_MESSAGE}"
+
+
+def unknown_tool_message() -> str:
+    """The refusal for a tool name that matches no tool, which never repeats the name."""
+    return READ_ONLY_UNKNOWN_TOOL_MESSAGE if get_settings().read_only else UNKNOWN_TOOL_MESSAGE
 
 
 class ToolParameterHelpMiddleware(Middleware):
@@ -37,6 +57,9 @@ class ToolParameterHelpMiddleware(Middleware):
     same handling unless every target it names is a registered tool outside
     that list: a customer value misplaced beside the nested arguments, or in
     name itself, must not be quoted back either.
+
+    A tool name that matches no tool, called directly or named as the proxy's
+    target, is refused with unknown_tool_message(), which does not repeat it.
     """
 
     @staticmethod
@@ -65,10 +88,33 @@ class ToolParameterHelpMiddleware(Middleware):
                 return True
         return False
 
+    async def _names_an_unknown_target(self, context: MiddlewareContext) -> bool:
+        """Whether a proxy call names a target that is no tool here.
+
+        Blank and wrongly typed targets are left to the proxy and the framework,
+        whose errors do not repeat them (see _envelope_is_private). An official
+        Meta name that several tools here serve, or none, is left to the proxy,
+        which explains it; the proxy's own tools are refused there too.
+        """
+        arguments = context.message.arguments or {}
+        for key in _PROXY_TARGET_KEYS:
+            value = arguments.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            target = value.strip()
+            if target in _SYNTHETIC_TOOL_NAMES or official_tool_guidance(target):
+                continue
+            if await self._tool_or_none(context, target) is None:
+                return True
+        return False
+
     async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext):
         tool = None
         if context.fastmcp_context is not None:
             tool = await self._tool_or_none(context, context.message.name)
+            if tool is None:
+                # The framework's own error would repeat the name.
+                raise ToolError(unknown_tool_message())
         proxy = tool is not None and tool.name in PROXY_TOOL_NAMES
         private = tool is not None and (
             tool.name in PRIVATE_ARGUMENT_TOOLS
@@ -93,6 +139,10 @@ class ToolParameterHelpMiddleware(Middleware):
                     f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
                     f"Inspect types and defaults with get_capabilities(tool_name='{tool.name}')."
                 )
+        if proxy and await self._names_an_unknown_target(context):
+            # Refused before dispatch: the nested call's "Unknown tool" error
+            # would repeat the target in the returned error and the log.
+            raise ToolError(unknown_tool_message())
         if not private:
             return await call_next(context)
         failure: ToolError | None = None

@@ -966,16 +966,15 @@ def _object_words(clause: str) -> list[str]:
     return [word.text for word in _object_phrase(clause)]
 
 
-def _destination_words(clause: str) -> list[str]:
-    """Return the phrase after the verb's destination preposition, if any.
+def _after_object(clause: str) -> tuple[list[_Word], int, int]:
+    """The clause's words, and the span after the object that can say where it goes.
 
-    "add audience users to the report" has the destination "the report". A
-    descriptor ("listed", "shown") ends the search: what follows says which
-    object is meant, not where it goes.
+    A descriptor ("listed", "shown") ends the span: what follows says which
+    object is meant, not where it goes or how it is laid out.
     """
     words = _phrase_words(clause)
     if not words:
-        return []
+        return [], 0, 0
     _object, start = _phrase(words, 1)
     end = next(
         (
@@ -986,11 +985,38 @@ def _destination_words(clause: str) -> list[str]:
         ),
         len(words),
     )
+    return words, start, end
+
+
+def _destination_words(clause: str) -> list[str]:
+    """Return the phrase after the verb's destination preposition, if any.
+
+    "add audience users to the report" has the destination "the report".
+    """
+    words, start, end = _after_object(clause)
+    if not words:
+        return []
     for prepositions in _DESTINATION_PREPOSITIONS.get(words[0].text, ()):
         for index in range(start, end):
             if words[index].text in prepositions:
                 return [word.text for word in _phrase(words, index + 1)[0]]
     return []
+
+
+# Prepositions that say how the object is laid out in a report, or what it is
+# for: "add audience users as a column", "per row", "by column", "at row 3",
+# "for each row", "for the report".
+_LAYOUT_PREPOSITIONS = frozenset({"as", "at", "by", "for", "per"})
+
+
+def _layout_phrases(clause: str) -> list[list[str]]:
+    """Return each phrase after a layout preposition that follows the object."""
+    words, start, end = _after_object(clause)
+    return [
+        [word.text for word in _phrase(words, index + 1)[0]]
+        for index in range(start, end)
+        if words[index].text in _LAYOUT_PREPOSITIONS
+    ]
 
 
 def _reporting_head(words: list[str], vocabulary: frozenset[str]) -> bool:
@@ -1013,10 +1039,24 @@ def _is_analytical(clause: str) -> bool:
     'duplicate campaign named "Reach"' or "duplicate the Reach campaign" the
     reporting word is part of the campaign's name. The clause may keep its
     original letter case, which is used only to recognise unquoted names.
+
+    A reporting container ending the object is what the verb acts on: in
+    "remove audience users column" the column is removed, not customers, and
+    so is one after a layout preposition ("add audience users as a column").
+    The exception is a destination that names what the tool acts on: in "add
+    the customer spreadsheet to the audience" the spreadsheet is where the
+    customers come from.
     """
-    return _reporting_head(_object_words(clause), _ANALYTICAL_WORDS) or _reporting_head(
-        _destination_words(clause), _ANALYTICAL_WORDS | _REPORTING_DESTINATIONS
+    object_words = _object_words(clause)
+    destination = _destination_words(clause)
+    if _reporting_head(object_words, _ANALYTICAL_WORDS) or _reporting_head(
+        destination, _ANALYTICAL_WORDS | _REPORTING_DESTINATIONS
+    ):
+        return True
+    container = _reporting_head(object_words, _REPORTING_DESTINATIONS) or any(
+        _reporting_head(phrase, _REPORTING_DESTINATIONS) for phrase in _layout_phrases(clause)
     )
+    return container and not any(_is_entity(word) for word in destination)
 
 
 def _acts_on_tool_subject(clause: str, name: str, *, required: int = 1) -> bool:

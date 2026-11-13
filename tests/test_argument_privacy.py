@@ -430,6 +430,12 @@ CREDENTIALS_INSIDE_NESTED_ARGUMENTS = {
     "batch_update_catalog_products": "items[].url, items[].image_url",
     # Card and media URLs can carry a login.
     "create_ad_creative_from_inputs": "cards[].link, multi_media[].url",
+    # Round-four review J3: tools that take Meta's raw creative fields, where a
+    # creator's Partnership Ad code sits in branded_content.instagram_boost_post_access_token.
+    "create_ad": "creative_spec.branded_content, creative.branded_content, params",
+    "create_ad_creative": "params.branded_content, object_story_spec, asset_feed_spec",
+    "preview_ad": "creative.branded_content",
+    "update_creative": "params.branded_content, object_story_spec, asset_feed_spec",
 }
 
 
@@ -601,3 +607,191 @@ def test_h14_tools_that_mask_or_refuse_their_own_credentials_are_private():
         "These tools mask, redact or refuse credentials in their own input, so their argument "
         f"errors must not quote values; add them to PRIVATE_ARGUMENT_TOOLS: {missing}"
     )
+
+
+# --- Round-four review J3: raw creative fields can hold a Partnership Ad code ------
+
+# Parameters that take Meta's raw ad creative fields (or a whole creative). Any of
+# them can carry branded_content.instagram_boost_post_access_token, a creator's
+# Partnership Ad code, nested where the parameter-name guard cannot see it.
+RAW_CREATIVE_PARAMETERS = frozenset({"creative", "creative_spec", "object_story_spec", "asset_feed_spec"})
+RAW_CREATIVE_TOOLS = ["create_ad", "create_ad_creative", "preview_ad", "update_creative"]
+
+
+def _partnership_code() -> str:
+    # Built at run time so the text appears only where the code under test puts it.
+    return "".join(("R4-private-", "partnership-code"))
+
+
+def _misplaced_code_arguments(tool: str, secret: str) -> dict:
+    spec = {"branded_content": {"instagram_boost_post_access_token": secret}}
+    misplaced = {"misplaced_code": secret}
+    if tool == "create_ad":
+        return {"account_id": misplaced, "name": "A", "adset_id": "20", "creative_spec": spec}
+    if tool == "create_ad_creative":
+        return {"account_id": misplaced, "name": "C", "params": spec}
+    if tool == "preview_ad":
+        return {"creative": spec, "account_id": misplaced}
+    return {"creative_id": misplaced, "params": spec}
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+@pytest.mark.parametrize("tool", RAW_CREATIVE_TOOLS)
+def test_nested_creative_code_tools_are_private_before_validation(tool, routed, caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = _partnership_code()
+    with pytest.raises((ToolError, MCPValidationError)) as error:
+        _call(tool, _misplaced_code_arguments(tool, secret), routed)
+    assert secret not in _rendered_chain(error.value)
+    assert str(error.value).startswith(f"Invalid arguments for {tool}: ")
+    _assert_not_logged(caplog, secret)
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+@pytest.mark.parametrize("tool", RAW_CREATIVE_TOOLS)
+def test_a_code_misplaced_as_a_parameter_name_of_a_raw_creative_tool_is_counted(tool, routed, caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = _partnership_code()
+    with pytest.raises(ToolError) as error:
+        _call(tool, {secret: "x"}, routed)
+    assert secret not in _rendered_chain(error.value)
+    assert "1 unknown parameter" in str(error.value)
+    _assert_not_logged(caplog, secret)
+
+
+def test_every_tool_that_takes_raw_creative_fields_is_private():
+    """Independent of the name guard: a new tool taking a raw creative is caught here."""
+    taking = {
+        name: sorted(RAW_CREATIVE_PARAMETERS & set(tool.parameters.get("properties", {})))
+        for name, tool in _tools().items()
+    }
+    taking = {name: parameters for name, parameters in taking.items() if parameters}
+    assert set(RAW_CREATIVE_TOOLS) <= set(taking), taking
+    missing = {name: parameters for name, parameters in taking.items() if name not in PRIVATE_ARGUMENT_TOOLS}
+    assert not missing, (
+        "These tools take raw creative fields, which can hold a Partnership Ad code; "
+        f"add them to PRIVATE_ARGUMENT_TOOLS and CREDENTIALS_INSIDE_NESTED_ARGUMENTS: {missing}"
+    )
+    unreviewed = set(taking) - set(CREDENTIALS_INSIDE_NESTED_ARGUMENTS)
+    assert not unreviewed, sorted(unreviewed)
+
+
+# --- Round-four review J9: a target that is no tool is never repeated -------------
+
+_MISPLACED_PERSON = "".join(("misplaced.person", "@proxy.invalid"))
+
+
+def _assert_unknown_tool_refusal(error: BaseException, secret: str) -> None:
+    from meta_ads_mcp.config import get_settings
+    from meta_ads_mcp.error_middleware import READ_ONLY_UNKNOWN_TOOL_MESSAGE, UNKNOWN_TOOL_MESSAGE
+
+    expected = READ_ONLY_UNKNOWN_TOOL_MESSAGE if get_settings().read_only else UNKNOWN_TOOL_MESSAGE
+    assert str(error) == expected
+    assert "search_tools" in str(error)
+    # No chained exception carries the target either.
+    assert error.__cause__ is None and error.__context__ is None
+    assert secret not in _rendered_chain(error)
+
+
+@pytest.mark.parametrize("target_key", ["name", "tool_name"])
+def test_unknown_proxy_target_keeps_misplaced_personal_data_private(target_key, caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = _MISPLACED_PERSON
+    with pytest.raises(ToolError) as error:
+        _call_proxy({target_key: secret, "arguments": {"audience_id": "20", "schema": ["EMAIL"], "rows": [[secret]]}})
+    _assert_unknown_tool_refusal(error.value, secret)
+    _assert_not_logged(caplog, secret)
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        pytest.param({"name": f"  {_MISPLACED_PERSON}  ", "arguments": {}}, id="padded"),
+        pytest.param({"name": _MISPLACED_PERSON}, id="no_arguments"),
+        pytest.param({"name": _MISPLACED_PERSON, "arguments": '{"audience_id": "20"}'}, id="string_arguments"),
+        pytest.param({"name": "add_audience_users", "tool_name": _MISPLACED_PERSON, "arguments": {}}, id="known_name_unknown_alias"),
+        pytest.param({"name": _MISPLACED_PERSON, "tool_name": "list_adsets", "arguments": {}}, id="unknown_name_known_alias"),
+        pytest.param({"name": _MISPLACED_PERSON, "tool_name": _MISPLACED_PERSON, "arguments": {}}, id="both_unknown"),
+        pytest.param({"name": f"ads_{_MISPLACED_PERSON}", "arguments": {}}, id="official_looking"),
+    ],
+)
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+def test_every_shape_of_an_unknown_proxy_target_is_refused_before_dispatch(envelope, locked, caplog, monkeypatch):
+    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
+    reload_settings()
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        _call_proxy(envelope)
+    _assert_unknown_tool_refusal(error.value, _MISPLACED_PERSON)
+    _assert_not_logged(caplog, _MISPLACED_PERSON)
+
+
+def test_an_unknown_direct_tool_name_is_not_repeated(caplog):
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        asyncio.run(mcp_server.call_tool(_MISPLACED_PERSON, {"rows": [[_MISPLACED_PERSON]]}))
+    _assert_unknown_tool_refusal(error.value, _MISPLACED_PERSON)
+    _assert_not_logged(caplog, _MISPLACED_PERSON)
+
+
+def test_a_registered_proxy_target_behaves_as_before():
+    # The nested call's own framework error, exactly as a direct call gets it.
+    with pytest.raises(MCPValidationError) as routed:
+        _call_proxy({"name": "list_adsets", "arguments": {"account_id": "act_1", "limit": "not-a-number"}})
+    assert "not-a-number" in str(routed.value)
+    with pytest.raises(MCPValidationError):
+        _call_proxy({"tool_name": " list_adsets ", "arguments": {"account_id": "act_1", "limit": "not-a-number"}})
+    # The proxy's own refusals keep their messages.
+    with pytest.raises(ToolError, match="synthetic search tool"):
+        _call_proxy({"name": "search_tools", "arguments": {"query": "x"}})
+    with pytest.raises(ToolError, match="get_auction_ranking_report"):
+        _call_proxy({"name": "ads_insights_industry_benchmark", "arguments": {}})
+    with pytest.raises(ToolError, match="Provide name or tool_name"):
+        _call_proxy({"name": "   ", "arguments": {}})
+
+
+def _protocol_call(name: str, arguments: dict):
+    """A tools/call as an MCP client sends it, through FastMCP's request handler."""
+    return asyncio.run(mcp_server._call_tool_mcp(name, arguments))
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        pytest.param(_MISPLACED_PERSON, {"rows": [[_MISPLACED_PERSON]]}, id="unknown_direct_name"),
+        pytest.param("call_tool", {"name": _MISPLACED_PERSON, "arguments": {}}, id="unknown_proxy_target"),
+        pytest.param("add_audience_users", {"audience_id": "1", "schema": ["EMAIL"], "rows": [[_MISPLACED_PERSON]]}, id="customer_rows"),
+    ],
+)
+def test_the_protocol_debug_log_never_repeats_values_or_a_name_that_is_no_tool(name, arguments, caplog):
+    from meta_ads_mcp.argument_privacy import FASTMCP_HANDLER_LOGGER
+
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger=FASTMCP_HANDLER_LOGGER)
+    with pytest.raises(Exception) as error:
+        _protocol_call(name, arguments)
+    assert _MISPLACED_PERSON not in _rendered_chain(error.value)
+    handler_records = [record for record in caplog.records if "Handler called: call_tool" in record.getMessage()]
+    assert handler_records, "FastMCP's DEBUG record of the call should still be logged"
+    if name != _MISPLACED_PERSON:
+        assert name in handler_records[0].getMessage()
+    _assert_not_logged(caplog, _MISPLACED_PERSON)
+
+
+def test_the_handler_filter_sits_on_the_logger_fastmcp_uses_for_the_call_record():
+    """If FastMCP moves or rewords the record, this fails instead of the filter silently missing it."""
+    import fastmcp.server.mixins.mcp_operations as operations
+
+    from meta_ads_mcp.argument_privacy import FASTMCP_HANDLER_LOGGER, HandlerLogPrivacyFilter
+
+    assert operations.logger.name == FASTMCP_HANDLER_LOGGER
+    assert any(isinstance(item, HandlerLogPrivacyFilter) for item in logging.getLogger(FASTMCP_HANDLER_LOGGER).filters)
+    source = Path(operations.__file__).read_text(encoding="utf-8")
+    assert 'Handler called: call_tool %s with %s", key, arguments' in source
+
+
+def test_a_registered_write_target_in_read_only_mode_keeps_the_read_only_refusal(monkeypatch):
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    with pytest.raises(ToolError, match="META_READ_ONLY is enabled; 'create_ad' is not permitted"):
+        _call_proxy({"name": "create_ad", "arguments": {}})
