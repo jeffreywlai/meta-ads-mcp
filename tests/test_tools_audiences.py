@@ -1149,3 +1149,129 @@ def test_audience_users_file_reading_is_off_without_an_upload_folder(monkeypatch
     target.write_text("EMAIL\na@example.com\n")
     with pytest.raises(audiences.ValidationError, match="META_UPLOAD_DIR"):
         asyncio.run(audiences.add_audience_users(audience_id="aud_1", schema=["EMAIL"], file_path=str(target)))
+
+
+# Round three (P4), G18: no exception raised while parsing customer data may keep that data
+# reachable through its chain (__cause__ or __context__), even when the chain is not displayed.
+
+SYNTHETIC_CUSTOMER = "synthetic.private.customer@example.invalid"
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Every exception reachable from error through __cause__ and __context__, cycles included once."""
+    found: list[BaseException] = []
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        pending += [current.__cause__, current.__context__]
+    return found
+
+
+def _assert_chain_holds_no_customer_data(error: BaseException, *values: str) -> None:
+    for link in _exception_chain(error):
+        rendered = "\n".join([
+            str(link), repr(link), repr(getattr(link, "args", ())), repr(getattr(link, "object", None)),
+        ])
+        for value in values:
+            assert value not in rendered, (type(link).__name__, rendered)
+            assert value.encode() not in rendered.encode("utf-8", "backslashreplace"), type(link).__name__
+
+
+def test_g18_customer_file_decode_error_never_retains_raw_customer(monkeypatch, tmp_path) -> None:
+    """The reviewer's case: a UTF-8 decode failure must not keep the file's bytes as __context__."""
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    path = tmp_path / "customers.csv"
+    path.write_bytes(b"EMAIL\n" + SYNTHETIC_CUSTOMER.encode() + b"\n\xff")
+    with pytest.raises(audiences.ValidationError, match="UTF-8") as info:
+        asyncio.run(audiences.add_audience_users("123", schema=["EMAIL"], file_path=str(path)))
+    _assert_chain_holds_no_customer_data(info.value, SYNTHETIC_CUSTOMER)
+    assert info.value.__context__ is None
+    assert info.value.__cause__ is None
+
+
+@pytest.mark.parametrize(("content", "match"), [
+    # Not UTF-8.
+    (b"EMAIL,FN\n" + SYNTHETIC_CUSTOMER.encode() + b",Ann\xe9\n", "UTF-8"),
+    # Malformed quoting: the csv module's own error is replaced.
+    (b'EMAIL,FN\n"' + SYNTHETIC_CUSTOMER.encode() + b',Ann\nnext@example.invalid,Bob\n', "not valid CSV"),
+    (b'EMAIL,FN\n"' + SYNTHETIC_CUSTOMER.encode() + b'"x,Ann\n', "not valid CSV"),
+    # No header row: the first customer row is read as the header and is not echoed.
+    (SYNTHETIC_CUSTOMER.encode() + b",Ann\n", "no column named"),
+    (SYNTHETIC_CUSTOMER.encode() + b"," + SYNTHETIC_CUSTOMER.encode() + b"\n", "repeats a column"),
+])
+@pytest.mark.parametrize("tool", USER_TOOLS)
+def test_g18_every_customer_file_parse_failure_has_a_clean_exception_chain(monkeypatch, tmp_path, tool, content, match) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    path = tmp_path / "customers.csv"
+    path.write_bytes(content)
+    with pytest.raises(audiences.ValidationError, match=match) as info:
+        asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL", "FN"], file_path=str(path)))
+    _assert_chain_holds_no_customer_data(info.value, SYNTHETIC_CUSTOMER, "Ann", "Bob")
+    assert info.value.__context__ is None
+    assert info.value.__cause__ is None
+    # Nor does any server frame on the error's traceback still hold the file's contents.
+    traceback = info.value.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if "meta_ads_mcp" in frame.f_code.co_filename:
+            assert SYNTHETIC_CUSTOMER not in repr(frame.f_locals), frame.f_code.co_name
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize(("rows", "kwargs", "match"), [
+    ([SYNTHETIC_CUSTOMER], {}, "must be a list"),
+    ([[SYNTHETIC_CUSTOMER, "extra"]], {}, "exactly 1 values"),
+    ([[{"email": SYNTHETIC_CUSTOMER}]], {}, "must be strings"),
+    ([[SYNTHETIC_CUSTOMER]], {"pre_hashed": True}, "SHA-256"),
+    # A value that cannot be encoded as UTF-8 (a lone surrogate) is invalid, never a raw codec error.
+    ([[SYNTHETIC_CUSTOMER.replace("@", "\ud800@")]], {}, "No valid values"),
+])
+@pytest.mark.parametrize("tool", USER_TOOLS)
+def test_g18_every_inline_row_failure_has_a_clean_exception_chain(monkeypatch, tool, rows, kwargs, match) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(audiences.ValidationError, match=match) as info:
+        asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=["EMAIL"], rows=rows, **kwargs))
+    _assert_chain_holds_no_customer_data(info.value, SYNTHETIC_CUSTOMER, SYNTHETIC_CUSTOMER.split("@")[0])
+    assert info.value.__context__ is None
+    assert info.value.__cause__ is None
+
+
+def test_g18_value_that_cannot_be_utf8_encoded_is_counted_invalid_not_raised(monkeypatch) -> None:
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.add_audience_users(
+        audience_id="aud_1", schema=["EMAIL"],
+        rows=[[SYNTHETIC_CUSTOMER.replace("@", "\ud800@")], ["ok@example.com"]],
+    ))
+    assert result["invalid_values"] == 1
+    assert result["rows_sent"] == 1
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha("ok@example.com")]]
+
+
+def test_g18_decode_failure_chain_is_clean_through_the_mcp_boundary(tmp_path, caplog) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    path = tmp_path / "customers.csv"
+    path.write_bytes(b"EMAIL\n" + SYNTHETIC_CUSTOMER.encode() + b"\n\xff")
+    with pytest.raises(ToolError) as info:
+        asyncio.run(mcp_server.call_tool(
+            "add_audience_users", {"audience_id": "123", "schema": ["EMAIL"], "file_path": str(path)},
+        ))
+    _assert_chain_holds_no_customer_data(info.value, SYNTHETIC_CUSTOMER)
+    assert SYNTHETIC_CUSTOMER not in caplog.text
+
+
+def test_g18_rule_that_is_not_json_has_a_clean_exception_chain(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    rule = '{"inclusions": "' + SYNTHETIC_CUSTOMER
+    with pytest.raises(audiences.ValidationError, match="rule must be") as info:
+        asyncio.run(audiences.update_custom_audience(audience_id="aud_1", rule=rule))
+    _assert_chain_holds_no_customer_data(info.value, SYNTHETIC_CUSTOMER)
+    assert info.value.__context__ is None
