@@ -953,30 +953,54 @@ _ID_WORDS = frozenset({"id", "ids"})
 _MIN_BARE_ID_DIGITS = 5
 
 
-def _without_trailing_id(phrase: list[_Word]) -> list[_Word]:
+# Words that say the number after them is a position: "page no. 2", "page number 2".
+_POSITION_WORDS = frozenset({"no", "nr", "num", "number"})
+# Words joining several numbers: "pages 2 and 3", "ids 1, 2 or 3".
+_NUMBER_JOINERS = frozenset({"and", "or"})
+
+
+def _without_trailing_id(phrase: list[_Word], *, any_number: bool = False) -> list[_Word]:
     """The phrase without the id that can follow its entity noun to say which one is meant.
 
     That is a number written after "id" or "ids", after "#" or as act_<digits>, or a bare
     number of at least _MIN_BARE_ID_DIGITS digits ("the dashboard's audience 1234567890").
     A short bare number is kept: "section 2" is a place in a report. A quoted name and
     punctuation are already gone (see _phrase_words).
+
+    any_number sets aside every trailing number with what marks it ("no. 2", "number 2",
+    "#2", "id 42", "2 and 3"), to find the noun the number follows (see _part_of_a_report).
     """
     end = len(phrase)
     while end:
         start = end
-        while start and phrase[start - 1].text.isdigit():
+        while start and (
+            phrase[start - 1].text.isdigit()
+            or (any_number and start < end and phrase[start - 1].text in _NUMBER_JOINERS)
+        ):
             start -= 1
+        while start < end and not phrase[start].text.isdigit():
+            start += 1  # a joiner before the first number belongs to the phrase
         numbers = phrase[start:end]
         if not numbers:
             break
         qualified = bool(start) and phrase[start - 1].text in _ID_WORDS
         marked = any(word.marked_id for word in numbers)
-        if not (qualified or marked or all(len(word.text) >= _MIN_BARE_ID_DIGITS for word in numbers)):
+        if not (any_number or qualified or marked or all(len(word.text) >= _MIN_BARE_ID_DIGITS for word in numbers)):
             break
         if qualified or (marked and start and phrase[start - 1].text == "act"):
             start -= 1
+        elif any_number and start and phrase[start - 1].text in _POSITION_WORDS:
+            start -= 1
         end = start
     return phrase[:end]
+
+
+# Nouns that name a part of a document. "page" is also an entity noun (a Facebook
+# Page), and the only one that names a document part; the others are not entities,
+# so a report owning them already makes them a place in the report.
+_DOCUMENT_PARTS = _REPORTING_DESTINATIONS | frozenset(
+    {"area", "block", "chapter", "page", "panel", "paragraph", "part", "section"}
+)
 
 
 def _is_entity(word: str) -> bool:
@@ -1081,19 +1105,39 @@ def _part_of_a_report(words: list[_Word], phrase: list[_Word], stop: int) -> boo
     audience section") or after "of" ("the audience section of the
     dashboard"), and the phrase's last word, which says what the phrase is, is
     not an entity noun. When it is one ("the dashboard's audience", like "the
-    dashboard audience"), the report only says which audience is meant. The last
-    word is judged without an id written after it ("the dashboard's audience
-    1234567890", "the report's catalog id 42", see _without_trailing_id).
+    dashboard audience"), the report only says which audience is meant.
+
+    The rule for a number after the noun (R6 L10, R7 M3):
+    - The noun is the last word before any trailing number and its marker
+      ("2", "#2", "no. 2", "number 2", "id 42", "act_42", "2 and 3"). A quoted
+      name is already gone.
+    - Without a report owner the phrase is never a part of a report, whatever
+      number follows: "the Page 123456789012345" is a Facebook Page.
+    - With a report owner, a document part ("page", "section", "tab" and the
+      rest of _DOCUMENT_PARTS) is a place in the report, and a number after it is
+      its position in any form: "page #2 of the report", "the report's page
+      1234567890". "page" is both a document part and a Facebook Page; a report
+      owner decides it is the report's page, also with no number or with a name
+      after it. A caller who means a Page names it without a report owner.
+    - With a report owner, an entity noun (audience, campaign, catalog) is that
+      entity, and a number after it identifies which one in any form: "the
+      dashboard's audience 1234567890", "the report's audience 2", "the audience
+      id 42 of the dashboard". The report only says which entity is meant.
     """
-    head = _without_trailing_id(phrase) or phrase
-    if not head or _is_entity(head[-1].text):
+    head = _without_trailing_id(phrase, any_number=True) or phrase
+    if not head:
         return False
     if any(word.possessive and _is_report_container(word.text) for word in head[:-1]):
-        return True
-    if stop < len(words) and words[stop].text == "of":
+        owned = True
+    elif stop < len(words) and words[stop].text == "of":
         owner = _phrase(words, stop + 1)[0]
-        return bool(owner) and _is_report_container(owner[-1].text)
-    return False
+        owned = bool(owner) and _is_report_container(owner[-1].text)
+    else:
+        owned = False
+    if not owned:
+        return False
+    noun = head[-1].text
+    return noun in _DOCUMENT_PARTS or _singular(noun) in _DOCUMENT_PARTS or not _is_entity(noun)
 
 
 # Prepositions that say how the object is laid out in a report, or what it is
