@@ -691,6 +691,7 @@ INTENT_GUIDE = {
             "Wait for list_ad_videos processing_status ready before using an uploaded video.",
             "preview_ad ad_formats previews several placements in one call.",
             "update_ad_creative_enhancements creates a copy of the creative and attaches it, so the ad goes back to review.",
+            "create_ad_creative_from_inputs also builds multi media asset pools, catalog carousels and Facebook partnership ads.",
         ],
     },
 }
