@@ -450,7 +450,7 @@ def test_h14_tools_with_credentials_inside_nested_arguments_are_private(tool_nam
 
 # Helpers a tool calls when its own input can hold a credential: masking what it
 # sent, redacting a request preview, or refusing a URL that carries a login.
-_CREDENTIAL_HELPERS = frozenset({"_mask_secrets", "_redacted", "refuse_url_credentials"})
+_CREDENTIAL_HELPERS = frozenset({"_mask_secrets", "_redacted", "refuse_url_credentials", "_refuse_url_logins", "_refuse_url_logins_in"})
 
 
 def _tools_using_credential_helpers() -> dict[str, set[str]]:

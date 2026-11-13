@@ -145,3 +145,27 @@ def test_every_write_classified_tool_is_in_the_writes_or_blocked_set() -> None:
     tools = [component for component in components if getattr(component, "name", None)]
     writes = {name for name, contract in build_tool_contracts(tools).items() if contract.effect == "write"}
     assert writes - READ_ONLY_WRITE_EXEMPTIONS <= set(BLOCKED_TOOLS)
+
+
+def test_read_only_refusal_repeats_a_real_tool_name_but_not_an_unknown_one(monkeypatch) -> None:
+    import asyncio
+
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.coordinator import mcp_server
+
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    try:
+        with pytest.raises(ToolError) as real:
+            asyncio.run(mcp_server.call_tool("delete_campaign", {"campaign_id": "1"}))
+        assert "'delete_campaign' is not permitted" in str(real.value)
+        misplaced = "someone" + "@example.invalid"
+        with pytest.raises(ToolError) as unknown:
+            asyncio.run(mcp_server.call_tool(misplaced, {}))
+        assert misplaced not in str(unknown.value)
+        assert "META_READ_ONLY" in str(unknown.value)
+    finally:
+        monkeypatch.delenv("META_READ_ONLY", raising=False)
+        reload_settings()

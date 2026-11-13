@@ -22,6 +22,13 @@ def read_only_tool_names() -> set[str]:
     }
 
 
+def _registered_tool_names() -> set[str]:
+    """Every tool name this server registers, in any group."""
+    from meta_ads_mcp.tools.utility import TOOL_GROUPS
+
+    return {tool for group in TOOL_GROUPS.values() for tool in group}
+
+
 class ReadOnlyAdvertisingMiddleware(Middleware):
     """Block both direct and routed mutations before the tool starts."""
 
@@ -29,7 +36,11 @@ class ReadOnlyAdvertisingMiddleware(Middleware):
         if get_settings().read_only:
             name = canonical_tool_name(context.message.name)
             if name not in read_only_tool_names():
-                raise ToolError(f"META_READ_ONLY is enabled; '{name}' is not permitted.")
+                # Repeat the name only when it is a real tool. A name that matches no
+                # tool is whatever the caller typed, which may be misplaced private data.
+                known = name in _registered_tool_names()
+                shown = f"'{name}'" if known else "the tool named"
+                raise ToolError(f"META_READ_ONLY is enabled; {shown} is not permitted.")
         return await call_next(context)
 
     async def on_list_tools(self, context, call_next):

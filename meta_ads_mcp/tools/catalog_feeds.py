@@ -652,7 +652,15 @@ def _guard_secrets(
             _mask_error(exc)
             _scrub_known_secrets(exc, _caller_secrets(_call_arguments(fn, args, kwargs)))
             raise
-        return _scrub_value(show(result), _caller_secrets(_call_arguments(fn, args, kwargs)))
+        # In a successful result only a long secret is removed wherever it occurs. A short
+        # one (a password such as "DAILY" or "csv") equals ordinary words the result has
+        # every right to contain; password keys and URL passwords are already masked by show.
+        secrets = [
+            secret
+            for secret in _caller_secrets(_call_arguments(fn, args, kwargs))
+            if len(secret.strip()) >= MIN_SECRET_SUBSTRING_LENGTH
+        ]
+        return _scrub_value(show(result), secrets)
 
     return wrapper
 
