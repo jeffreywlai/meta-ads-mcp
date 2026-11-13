@@ -38,6 +38,7 @@ _WRITE_NAMES = frozenset(
         "add_audience_users",
         "remove_audience_users",
         "boost_instagram_post",
+        "batch_update_catalog_products",
     }
 )
 _READ_TAGS = frozenset({"read", "read-only", "readonly"})

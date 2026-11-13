@@ -148,6 +148,7 @@ TOOL_GROUPS = {
         "add_audience_users",
         "remove_audience_users",
         "boost_instagram_post",
+        "batch_update_catalog_products",
     ],
     "creative_ops": [
         "get_ad_image",

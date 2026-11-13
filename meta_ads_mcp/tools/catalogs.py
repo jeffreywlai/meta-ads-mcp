@@ -1164,6 +1164,521 @@ async def delete_catalog_product(product_id: str) -> dict[str, Any]:
     return response
 
 
+# ------------------------------------------------------------ items batch
+#
+# POST /{catalog_id}/items_batch, documented at
+# developers.facebook.com/docs/marketing-api/reference/product-catalog/items_batch
+# and the "send product updates" guide. Products are keyed by `id` (the
+# retailer id), prices are "<amount> <ISO currency>", and Meta processes the
+# batch in the background: completion is read from
+# GET /{catalog_id}/check_batch_request_status?handle=..., where the only
+# documented status value is "finished".
+
+BATCH_MAX_ITEMS = 50
+BATCH_METHODS = {"create": "CREATE", "update": "UPDATE", "delete": "DELETE"}
+_BATCH_POLL_INTERVAL = 2
+_BATCH_MAX_WAIT = 60
+_BATCH_READ_PAGE_SIZE = 100
+_BATCH_READ_MAX_PAGES = 2
+_BATCH_ITEM_KEYS = frozenset({
+    "method", "retailer_id", "name", "description", "url", "image_url", "brand", "availability",
+    "condition", "price", "sale_price", "currency", "fields",
+})
+# Named item key -> PRODUCT_ITEM field in the items_batch request.
+_BATCH_NAMED_FIELDS = {
+    "name": "title", "description": "description", "url": "link", "image_url": "image",
+    "brand": "brand", "availability": "availability", "condition": "condition",
+    "price": "price", "sale_price": "sale_price",
+}
+# The guide's CREATE requirement for PRODUCT_ITEM: availability, brand, condition,
+# description, id, image, link, price, title.
+_BATCH_CREATE_REQUIRED = ("name", "description", "url", "image_url", "brand", "availability",
+                          "condition", "price", "currency")
+# Further PRODUCT_ITEM fields listed in the "send product updates" guide, passed
+# through `fields` unchanged. Fields with a named key above are not repeated here.
+BATCH_EXTRA_FIELDS = frozenset({
+    "rich_text_description", "mobile_link", "additional_image_link", "video",
+    "quantity_to_sell_on_facebook", "sale_price_effective_date", "color", "size", "material",
+    "pattern", "gender", "age_group", "mpn", "gtin", "item_group_id", "additional_variant_attribute",
+    "ordering_index", "origin_country", "expiration_date", "fb_product_category",
+    "google_product_category", "product_type", "custom_label_0", "custom_label_1",
+    "custom_label_2", "custom_label_3", "custom_label_4", "custom_number_0", "custom_number_1",
+    "custom_number_2", "custom_number_3", "custom_number_4", "internal_label", "shipping",
+    "shipping_weight", "applink", "disabled_capabilities", "importer_address", "importer_name",
+})
+# Batch request field -> readable product item field, for showing previous values.
+_BATCH_READ_FIELD = {
+    "title": "name", "description": "description", "link": "url", "image": "image_url",
+    "brand": "brand", "availability": "availability", "condition": "condition", "price": "price",
+    "sale_price": "sale_price", "mobile_link": "mobile_link", "additional_image_link": "additional_image_urls",
+    "color": "color", "size": "size", "material": "material", "pattern": "pattern", "gender": "gender",
+    "age_group": "age_group", "gtin": "gtin", "mpn": "manufacturer_part_number",
+    "item_group_id": "retailer_product_group_id", "ordering_index": "ordering_index",
+    "origin_country": "origin_country", "expiration_date": "expiration_date",
+    "fb_product_category": "fb_product_category", "product_type": "product_type",
+    "custom_label_0": "custom_label_0", "custom_label_1": "custom_label_1",
+    "custom_label_2": "custom_label_2", "custom_label_3": "custom_label_3",
+    "custom_label_4": "custom_label_4", "importer_address": "importer_address",
+    "importer_name": "importer_name",
+}
+_BATCH_BASE_READ_FIELDS = [
+    "id", "retailer_id", "name", "description", "price", "currency", "sale_price", "availability",
+    "condition", "url", "image_url", "brand", "visibility", "review_status",
+]
+_FEED_FIELD = "product_feed"
+_BATCH_RETRY_WHY = (
+    "This tool reads the catalog before every write, so on a resend creates of SKUs that already exist "
+    "and deletes of SKUs that are already gone are skipped, and updates send the same values again. "
+    "Meta keys catalog products by retailer id (its batch documentation calls it a unique content ID), "
+    "so the catalog holds one product per retailer id and a resend cannot add a duplicate. A resend "
+    "does overwrite any change someone else or a feed made to the same fields in between."
+)
+
+
+async def _pause(seconds: float) -> None:
+    """Wait between batch status checks; replaced in tests."""
+    await asyncio.sleep(seconds)
+
+
+def _batch_price(value: Any, currency: str, label: str) -> str:
+    """Encode a major-unit price as items_batch documents it: '9.99 USD', '14 GBP'."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        raise ValidationError(f"{label} must be a finite number in major units.")
+    minor = _catalog_price(value, label)
+    whole, cents = divmod(minor, 100)
+    amount = str(whole) if cents == 0 else f"{whole}.{cents:02d}"
+    return f"{amount} {currency}"
+
+
+def _batch_entry(index: int, item: Any) -> dict[str, Any]:
+    """Validate one caller item and build its items_batch request and caller-facing view."""
+    label = f"items[{index}]"
+    if not isinstance(item, dict):
+        raise ValidationError(f"{label} must be an object with method and retailer_id.")
+    unknown = sorted(set(item) - _BATCH_ITEM_KEYS)
+    if unknown:
+        raise ValidationError(
+            f"{label} has unsupported keys: {', '.join(unknown)}. Named keys: "
+            f"{', '.join(sorted(_BATCH_ITEM_KEYS))}; other documented product fields go in fields."
+        )
+    method = str(item.get("method") or "").strip().lower()
+    if method not in BATCH_METHODS:
+        raise ValidationError(f"{label}.method must be create, update or delete.")
+    retailer_id = item.get("retailer_id")
+    if not isinstance(retailer_id, str) or not retailer_id.strip():
+        raise ValidationError(f"{label}.retailer_id must be a nonblank string (the product's SKU).")
+    retailer_id = retailer_id.strip()
+    values = {key: value for key, value in item.items() if key not in {"method", "retailer_id"} and value is not None}
+    extra = values.pop("fields", None) or {}
+    if not isinstance(extra, dict):
+        raise ValidationError(f"{label}.fields must be an object of documented product fields.")
+    if method == "delete":
+        if values or extra:
+            raise ValidationError(f"{label}: a delete takes only retailer_id.")
+        return {"method": method, "retailer_id": retailer_id,
+                "request": {"method": "DELETE", "data": {"id": retailer_id}}, "changes": {}}
+    for key in extra:
+        if key in _BATCH_NAMED_FIELDS.values() or key in {"id", "image_link", "currency"}:
+            raise ValidationError(f"{label}.fields.{key}: use the item's named key for this field instead.")
+        if key not in BATCH_EXTRA_FIELDS:
+            raise ValidationError(
+                f"{label}.fields.{key} is not a PRODUCT_ITEM field Meta's batch documentation lists."
+            )
+    if method == "create":
+        missing = [key for key in _BATCH_CREATE_REQUIRED if values.get(key) in (None, "")]
+        if missing:
+            raise ValidationError(
+                f"{label}: a create is missing {', '.join(missing)} (Meta requires these for a new product)."
+            )
+    if not values and not extra:
+        raise ValidationError(f"{label}: an update needs at least one field to change.")
+    data: dict[str, Any] = {"id": retailer_id}
+    changes: dict[str, Any] = {}
+    currency = _currency(values["currency"]) if "currency" in values else None
+    if currency is not None and not any(key in values for key in ("price", "sale_price")):
+        raise ValidationError(f"{label}.currency is sent only with price or sale_price.")
+    for key, batch_field in _BATCH_NAMED_FIELDS.items():
+        if key not in values:
+            continue
+        value = values[key]
+        if key in {"price", "sale_price"}:
+            if currency is None:
+                raise ValidationError(f"{label}.{key} needs currency in the same item.")
+            data[batch_field] = _batch_price(value, currency, f"{label}.{key}")
+        elif key == "image_url":
+            data[batch_field] = [{"url": _require(value, f"{label}.image_url")}]
+        else:
+            if key == "availability":
+                _choice(value, PRODUCT_AVAILABILITY, f"{label}.availability")
+            elif key == "condition":
+                _choice(value, PRODUCT_CONDITIONS, f"{label}.condition")
+            elif not isinstance(value, str) or not value.strip():
+                raise ValidationError(f"{label}.{key} must be a nonblank string.")
+            data[batch_field] = value
+        changes[key] = value
+    if currency is not None:
+        changes["currency"] = currency
+    for key, value in extra.items():
+        data[key] = value
+        changes[key] = value
+    return {"method": method, "retailer_id": retailer_id,
+            "request": {"method": BATCH_METHODS[method], "data": data}, "changes": changes}
+
+
+def _batch_read_fields(entries: list[dict[str, Any]], *, with_feed: bool) -> list[str]:
+    fields = list(_BATCH_BASE_READ_FIELDS)
+    for entry in entries:
+        for key in entry["request"]["data"]:
+            read = _BATCH_READ_FIELD.get(key)
+            if read and read not in fields:
+                fields.append(read)
+    if with_feed:
+        fields.append(_FEED_FIELD)
+    return fields
+
+
+async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Read the current products for every retailer id in one filtered request.
+
+    If Meta rejects the product_feed field, the read is repeated once without it
+    and the feed check is reported as unavailable.
+    """
+    ids = [entry["retailer_id"] for entry in entries]
+    params = {"filter": {"retailer_id": {"is_any": ids}}, "limit": _BATCH_READ_PAGE_SIZE}
+    feed_check = {"status": "read", "method": "product_feed field on each product"}
+    try:
+        read = await _collect_edge(client, catalog_id, "products",
+                                   fields=_batch_read_fields(entries, with_feed=True),
+                                   params=params, max_pages=_BATCH_READ_MAX_PAGES)
+    except MetaApiError as error:
+        if error.code != 100:
+            raise
+        read = await _collect_edge(client, catalog_id, "products",
+                                   fields=_batch_read_fields(entries, with_feed=False),
+                                   params=params, max_pages=_BATCH_READ_MAX_PAGES)
+        feed_check = {"status": "unavailable", "method": "product_feed field on each product",
+                      "error": str(error)}
+    wanted = set(ids)
+    found = {
+        str(row.get("retailer_id")): row for row in read["rows"]
+        if isinstance(row, dict) and str(row.get("retailer_id")) in wanted
+    }
+    return {"found": found, "complete": read["complete"], "stop_reason": read["stop_reason"],
+            "feed_check": feed_check}
+
+
+def _previous_for(entry: dict[str, Any], product: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Return (previous values keyed as the caller wrote them, keys that cannot be read back)."""
+    if entry["method"] == "delete":
+        return {key: value for key, value in product.items() if key != _FEED_FIELD}, []
+    previous: dict[str, Any] = {}
+    unavailable: list[str] = []
+    named = {batch: key for key, batch in _BATCH_NAMED_FIELDS.items()}
+    for batch_field in entry["request"]["data"]:
+        if batch_field == "id":
+            continue
+        key = named.get(batch_field, batch_field)
+        read = _BATCH_READ_FIELD.get(batch_field)
+        if read is None:
+            unavailable.append(key)
+            continue
+        previous[key] = product.get(read)
+        if batch_field in {"price", "sale_price"}:
+            previous["currency"] = product.get("currency")
+    return previous, unavailable
+
+
+def _feed_warning(entry: dict[str, Any], product: dict[str, Any]) -> str | None:
+    feed = product.get(_FEED_FIELD)
+    feed_id = feed.get("id") if isinstance(feed, dict) else feed
+    if not feed_id:
+        return None
+    if entry["method"] == "delete":
+        return (f"This product is linked to product feed {feed_id}. The feed's next fetch or upload may add it "
+                "back unless it is removed from the feed too.")
+    return (f"This product is linked to product feed {feed_id}. The feed's next fetch or upload may overwrite "
+            "this change unless the feed is changed too.")
+
+
+def _messages(entries: Any) -> list[str]:
+    return [str(entry.get("message")) for entry in entries or [] if isinstance(entry, dict) and entry.get("message")]
+
+
+def _by_id(entries: Any) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for entry in entries or []:
+        if isinstance(entry, dict) and entry.get("id") is not None and entry.get("message"):
+            grouped.setdefault(str(entry["id"]), []).append(str(entry["message"]))
+    return grouped
+
+
+def _batch_status_row(payload: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("data")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return rows[0]
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_finished(row: dict[str, Any] | None) -> bool:
+    return bool(row) and str(row.get("status") or "").strip().lower() == "finished"
+
+
+async def _check_batch(client, catalog_id: str, handle: str) -> dict[str, Any]:
+    payload = await client.list_objects(
+        catalog_id, "check_batch_request_status",
+        params={"handle": handle, "load_ids_of_invalid_requests": True},
+    )
+    return _batch_status_row(payload)
+
+
+def _settle(item: dict[str, Any], row: dict[str, Any]) -> None:
+    """Set a sent item's final outcome from a finished batch status."""
+    invalid = {str(value) for value in row.get("ids_of_invalid_requests") or []}
+    errors = _by_id(row.get("errors"))
+    warnings = _by_id(row.get("warnings"))
+    error_total = to_int(row.get("errors_total_count"))
+    listed_errors = len([entry for entry in row.get("errors") or [] if isinstance(entry, dict)])
+    attributed = error_total == 0 or bool(invalid) or (error_total is not None and listed_errors >= error_total)
+    retailer_id = item["retailer_id"]
+    item["warnings"] = [*item["warnings"], *warnings.get(retailer_id, [])]
+    if retailer_id in invalid or retailer_id in errors:
+        item["outcome"] = "failed"
+        item["errors"] = [*item["errors"], *errors.get(retailer_id, [])] or ["Meta listed this item as invalid."]
+    elif attributed:
+        item["outcome"] = "applied"
+    else:
+        item["outcome"] = "outcome_unknown"
+        item["reason"] = (f"Meta reported {error_total if error_total is not None else 'an unknown number of'} "
+                          "error(s) for the batch but did not name every affected item.")
+
+
+def _retry_statement(outcomes: set[str], handle: str | None) -> dict[str, Any]:
+    if "processing" in outcomes:
+        return {
+            "safe_now": False,
+            "how": (f"Do not resend yet: Meta accepted the batch and is still processing it. Call this tool "
+                    f"again with catalog_id and handle={handle!r} to read the outcome, then resend only "
+                    "the items reported failed."),
+            "why": _BATCH_RETRY_WHY,
+        }
+    if "outcome_unknown" in outcomes:
+        return {
+            "safe_now": True,
+            "how": ("Wait a few minutes, then resend the same items with this tool; if the timeout repeats, "
+                    "split them into batches of about half the size. A batch still being processed when "
+                    "you resend is not visible to the re-read, so a create in it may then be reported "
+                    "by Meta as an error for that item."),
+            "why": _BATCH_RETRY_WHY,
+        }
+    if outcomes & {"failed", "not_applied"}:
+        return {
+            "safe_now": True,
+            "how": "Fix the reported errors and resend only the items that failed or were not applied.",
+            "why": _BATCH_RETRY_WHY,
+        }
+    return {"safe_now": True, "how": "Nothing needs resending.", "why": _BATCH_RETRY_WHY}
+
+
+async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, Any]:
+    row = await _check_batch(client, catalog_id, handle)
+    finished = _is_finished(row)
+    errors = [entry for entry in row.get("errors") or [] if isinstance(entry, dict)]
+    warnings = [entry for entry in row.get("warnings") or [] if isinstance(entry, dict)]
+    failed = sorted({str(value) for value in row.get("ids_of_invalid_requests") or []}
+                    | set(_by_id(errors)))
+    return {
+        "ok": finished and not failed and not to_int(row.get("errors_total_count")),
+        "action": "batch_update_catalog_products",
+        "target": {"catalog_id": catalog_id},
+        "batch": {
+            "handle": handle,
+            "status": row.get("status"),
+            "complete": finished,
+            "status_checks": 1,
+            "errors_total_count": to_int(row.get("errors_total_count")),
+            "warnings_total_count": to_int(row.get("warnings_total_count")),
+        },
+        "failed_retailer_ids": failed[:100],
+        "errors": errors[:50],
+        "warnings": warnings[:50],
+        "note": ("Meta documents only the status value 'finished'; any other value means the batch is not "
+                 "known to be done."),
+    }
+
+
+@mcp_server.tool()
+async def batch_update_catalog_products(
+    catalog_id: GraphId,
+    items: list[dict[str, Any]] | None = None,
+    allow_upsert: bool = False,
+    dry_run: bool = False,
+    wait_seconds: int = 10,
+    handle: str | None = None,
+) -> dict[str, Any]:
+    """Create, update or delete up to 50 products in one product catalog by retailer_id (SKU) with Meta's items batch endpoint. Each item: method (create, update, delete), retailer_id, and any of name, description, url, image_url, brand, availability, condition, price, sale_price, currency (prices in major units), plus fields for other documented product fields. Reads the products first: creates of existing SKUs and deletes of missing SKUs are skipped, so resending the same items is safe; updates of missing SKUs are skipped unless allow_upsert. Meta applies the batch in the background; the tool checks for up to wait_seconds and reports each item as applied, failed, processing or unknown, with a warning when a feed supplies the product. Pass handle alone to read an earlier batch. dry_run returns the exact request and writes nothing. Batch-created products are not held in staging."""
+    if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 0 <= wait_seconds <= _BATCH_MAX_WAIT:
+        raise ValidationError(f"wait_seconds must be a whole number from 0 to {_BATCH_MAX_WAIT}.")
+    handle = blank_to_none(handle) if isinstance(handle, str) else None
+    if (items is None) == (handle is None):
+        raise ValidationError("Pass either items or handle: items to send a batch, handle to read an earlier one.")
+    if handle is not None:
+        return await _batch_status_only(get_graph_api_client(), catalog_id, handle)
+    if not isinstance(items, list) or not 1 <= len(items) <= BATCH_MAX_ITEMS:
+        raise ValidationError(f"items must hold 1 to {BATCH_MAX_ITEMS} products per call; split larger edits.")
+    entries = [_batch_entry(index, item) for index, item in enumerate(items)]
+    seen: set[str] = set()
+    for entry in entries:
+        if entry["retailer_id"] in seen:
+            raise ValidationError(f"retailer_id {entry['retailer_id']!r} appears more than once; send one item per SKU.")
+        seen.add(entry["retailer_id"])
+
+    client = get_graph_api_client()
+    current = await _read_batch_products(client, catalog_id, entries)
+    if not current["complete"]:
+        return {
+            "ok": False,
+            "action": "batch_update_catalog_products",
+            "target": {"catalog_id": catalog_id},
+            "sent": False,
+            "reason": ("The current products could not be read completely, so nothing was written. "
+                       f"{current['stop_reason']}"),
+        }
+
+    results: list[dict[str, Any]] = []
+    to_send: list[dict[str, Any]] = []
+    for entry in entries:
+        product = current["found"].get(entry["retailer_id"])
+        item: dict[str, Any] = {
+            "retailer_id": entry["retailer_id"],
+            "method": entry["method"],
+            "outcome": None,
+            "changes": entry["changes"],
+            "errors": [],
+            "warnings": [],
+        }
+        if product is not None:
+            item["product_id"] = str(product.get("id")) if product.get("id") is not None else None
+        if entry["method"] == "create" and product is not None:
+            item["outcome"] = "skipped_already_exists"
+            item["reason"] = "A product with this retailer_id is already in the catalog; use method update to change it."
+        elif entry["method"] == "delete" and product is None:
+            item["outcome"] = "skipped_not_found"
+            item["reason"] = "No product with this retailer_id is in the catalog, so there is nothing to delete."
+        elif entry["method"] == "update" and product is None and not allow_upsert:
+            item["outcome"] = "skipped_not_found"
+            item["reason"] = ("No product with this retailer_id is in the catalog; pass allow_upsert=true to "
+                              "create it from this update.")
+        else:
+            if product is not None:
+                previous, unavailable = _previous_for(entry, product)
+                item["previous"] = previous
+                if unavailable:
+                    item["previous_unavailable"] = unavailable
+                if warning := _feed_warning(entry, product):
+                    item["feed_warning"] = warning
+            to_send.append(item)
+            item["request"] = entry["request"]
+        results.append(item)
+
+    request_data = {
+        "item_type": "PRODUCT_ITEM",
+        "allow_upsert": allow_upsert,
+        "requests": [item["request"] for item in to_send],
+    }
+    response: dict[str, Any] = {
+        "action": "batch_update_catalog_products",
+        "target": {"catalog_id": catalog_id},
+        "dry_run": dry_run,
+        "items": results,
+        "feed_check": {
+            **current["feed_check"],
+            "note": ("A feed_warning appears when Meta reports a product_feed on the product. Meta documents "
+                     "that field without describing it, so its absence is not a guarantee that no feed, "
+                     "partner integration or other source will overwrite the change."),
+        },
+    }
+    notes: list[str] = []
+    if any(entry["method"] == "create" for entry in entries):
+        notes.append("Meta's batch documentation lists no visibility field for products, so products created "
+                     "here are not held in staging; use create_catalog_product for one that must start hidden.")
+    handle_value: str | None = None
+    row: dict[str, Any] | None = None
+    checks = 0
+    status_error: str | None = None
+
+    if dry_run:
+        for item in to_send:
+            item["outcome"] = "would_send"
+        response["request"] = {"endpoint": f"POST /{catalog_id}/items_batch", "data": request_data}
+    elif to_send:
+        try:
+            posted = await client.create_edge_object(catalog_id, "items_batch", data=request_data)
+        except (MetaApiError, RateLimitError) as error:
+            unknown = isinstance(error, MetaApiError) and error.mutation_outcome_unknown
+            for item in to_send:
+                item["outcome"] = "outcome_unknown" if unknown else "not_applied"
+                item["reason"] = ("The request failed without a response, so Meta may have applied it."
+                                  if unknown else "Meta refused the whole request, so nothing was ingested.")
+            response["error"] = error.to_public_dict()
+        else:
+            validation = {}
+            for entry in posted.get("validation_status") or []:
+                if isinstance(entry, dict) and entry.get("retailer_id") is not None:
+                    validation[str(entry["retailer_id"])] = entry
+            for item in to_send:
+                status = validation.get(item["retailer_id"]) or {}
+                item["errors"] = _messages(status.get("errors"))
+                item["warnings"] = _messages(status.get("warnings"))
+            handles = [str(value) for value in posted.get("handles") or [] if value]
+            if not handles:
+                for item in to_send:
+                    item["outcome"] = "not_applied"
+                    item["reason"] = "Meta returned no batch handle, which it documents as meaning nothing was ingested."
+            else:
+                handle_value = handles[0]
+                for round_number in range(wait_seconds // _BATCH_POLL_INTERVAL):
+                    await _pause(_BATCH_POLL_INTERVAL)
+                    try:
+                        row = await _check_batch(client, catalog_id, handle_value)
+                    except (MetaApiError, RateLimitError, UnsupportedFeatureError, NotFoundError) as error:
+                        status_error = str(error)
+                        break
+                    checks += 1
+                    if _is_finished(row):
+                        break
+                for item in to_send:
+                    if _is_finished(row):
+                        _settle(item, row)
+                    else:
+                        item["outcome"] = "processing"
+                        item["reason"] = ("Meta accepted the batch; it had not reported it finished when this "
+                                          "tool stopped checking.")
+    for item in to_send:
+        item.pop("request", None)
+    if handle_value is not None or row is not None:
+        response["batch"] = {
+            "handle": handle_value,
+            "status": (row or {}).get("status"),
+            "complete": _is_finished(row),
+            "status_checks": checks,
+            "errors_total_count": to_int((row or {}).get("errors_total_count")),
+            "warnings_total_count": to_int((row or {}).get("warnings_total_count")),
+        }
+        if status_error:
+            response["batch"]["status_error"] = status_error
+    outcomes = Counter(item["outcome"] for item in results)
+    response["summary"] = {
+        "submitted": len(results),
+        "items_in_request": 0 if dry_run else len(to_send),
+        "outcomes": dict(outcomes),
+    }
+    response["ok"] = dry_run or set(outcomes) <= {"applied", "skipped_already_exists", "skipped_not_found"}
+    response["retry"] = _retry_statement(set(outcomes), handle_value)
+    if notes:
+        response["notes"] = notes
+    return response
+
+
 def _filter_condition(index: int, condition: Any) -> dict[str, Any]:
     """Validate one structured condition and return its Meta rule."""
     label = f"conditions[{index}]"
