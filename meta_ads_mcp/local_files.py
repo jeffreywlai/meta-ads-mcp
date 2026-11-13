@@ -33,22 +33,79 @@ class LocalUpload:
     content_type: str
 
 
-def _upload_folder() -> Path:
-    configured = get_settings().upload_directory
+@dataclass(frozen=True, slots=True)
+class _UploadFolder:
+    """The upload folder as established from configuration: its real path and identity."""
+
+    path: Path
+    device: int
+    inode: int
+
+
+# The folder established from the current settings, with the settings object it
+# came from. Settings are cached until reload_settings() builds a new object, so
+# a reload (a test changing META_UPLOAD_DIR, for example) establishes it afresh.
+_established: tuple[object, str, _UploadFolder] | None = None
+
+_FOLDER_REPLACED = (
+    "The upload folder set by META_UPLOAD_DIR has been replaced or moved since this server "
+    "first read it, so nothing is read from it. Put the original folder back, or restart the "
+    "server so it reads the setting afresh."
+)
+
+
+def _upload_folder() -> _UploadFolder:
+    """Return the upload folder, established once per loaded configuration.
+
+    The configured text is resolved (expanding ~ and following links such as
+    macOS's /tmp) the first time it is needed after configuration is loaded,
+    and the folder's device and inode are remembered. Later reads use that
+    resolved path and refuse when the folder found there is no longer the same
+    folder: otherwise renaming the folder and putting a link to another folder
+    in its place would make the link's target the allowed folder.
+    """
+    global _established
+    settings = get_settings()
+    configured = settings.upload_directory
     if not configured or not configured.strip():
         raise ValidationError(
             "Reading local files is off. Set the META_UPLOAD_DIR environment variable to the "
             "one folder this server may read uploads from, put the file there, and try again."
         )
+    configured = configured.strip()
+    established = _established
+    if established is not None and established[0] is settings and established[1] == configured:
+        folder = established[2]
+        if _identity_or_none(folder.path) != (folder.device, folder.inode):
+            raise ValidationError(_FOLDER_REPLACED)
+        return folder
     try:
-        folder = Path(configured.strip()).expanduser().resolve(strict=True)
+        resolved = Path(configured).expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
         raise ValidationError(
             "The folder named by META_UPLOAD_DIR does not exist or cannot be read."
         ) from None
-    if not folder.is_dir():
+    identity = _identity_or_none(resolved)
+    if identity is None:
         raise ValidationError("META_UPLOAD_DIR must name a folder.")
+    folder = _UploadFolder(path=resolved, device=identity[0], inode=identity[1])
+    _established = (settings, configured, folder)
     return folder
+
+
+def _identity_or_none(path: Path) -> tuple[int, int] | None:
+    """The (device, inode) of a real folder at path, not following a link; else None."""
+    try:
+        details = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(details.st_mode):
+        return None
+    return details.st_dev, details.st_ino
+
+
+class _FolderChanged(Exception):
+    """The folder opened on the way to the file is not the established upload folder."""
 
 
 # Folders on the way to the file are opened only to look up the next name, so
@@ -85,7 +142,7 @@ _FILE_FLAGS = (
 )
 
 
-def _open_without_links(resolved: Path) -> int:
+def _open_without_links(resolved: Path, folder: _UploadFolder) -> int:
     """Open an already-resolved absolute path one name at a time, refusing every link.
 
     The path was resolved and checked by name, and something could replace any
@@ -93,24 +150,38 @@ def _open_without_links(resolved: Path) -> int:
     folder opened before it, with O_NOFOLLOW, means a link anywhere on the path
     (the upload folder and its parents included) makes the open fail instead of
     being followed. The resolved path itself contains no links, so a legitimate
-    read never meets one. Raises OSError; every folder descriptor is closed.
+    read never meets one. The folder opened where the upload folder should be
+    must be that folder (same device and inode), or _FolderChanged is raised.
+    Raises OSError otherwise; every folder descriptor is closed.
     """
     if not _SAFE_OPEN_SUPPORTED:
         raise OSError("descriptor-relative opens are not available on this platform")
     anchor, *names = resolved.parts
     if not names:
         raise IsADirectoryError(resolved)
+    # Index in names of the upload folder's own name; -1 when the folder is the anchor.
+    folder_index = len(folder.path.parts) - 2
     current = os.open(anchor, _FOLDER_FLAGS)
     try:
-        for name in names[:-1]:
+        if folder_index < 0:
+            _check_folder(current, folder)
+        for index, name in enumerate(names[:-1]):
             following = os.open(name, _FOLDER_FLAGS, dir_fd=current)
             previous, current = current, following
             os.close(previous)
             if not stat.S_ISDIR(os.fstat(current).st_mode):
                 raise NotADirectoryError(name)
+            if index == folder_index:
+                _check_folder(current, folder)
         return os.open(names[-1], _FILE_FLAGS, dir_fd=current)
     finally:
         os.close(current)
+
+
+def _check_folder(descriptor: int, folder: _UploadFolder) -> None:
+    details = os.fstat(descriptor)
+    if (details.st_dev, details.st_ino) != (folder.device, folder.inode):
+        raise _FolderChanged
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +219,8 @@ def open_upload_file(
         f"{parameter} is larger than this server's {max_bytes}-byte limit for this upload."
         + (f" {too_large_hint}" if too_large_hint else "")
     )
-    folder = _upload_folder()
+    upload_folder = _upload_folder()
+    folder = upload_folder.path
     candidate = Path(file_path.strip()).expanduser()
     if not candidate.is_absolute():
         candidate = folder / candidate
@@ -162,13 +234,23 @@ def open_upload_file(
     content_type = allowed_types.get(resolved.suffix.lower()) if resolved.stem else None
     if content_type is None:
         raise ValidationError(f"{parameter} must end in one of: {', '.join(allowed_types)}.")
-    opened = _opened_or_none(resolved)
+    opened = _opened_or_none(resolved, upload_folder)
+    if opened is _FOLDER_CHANGED:
+        raise ValidationError(_FOLDER_REPLACED)
     if opened is None:
         raise ValidationError(unreadable)
     descriptor, details = opened
     problem = None
     if not stat.S_ISREG(details.st_mode):
         problem = unreadable
+    elif details.st_nlink != 1:
+        # A hard link is a second name for the same file, and the other name can
+        # be outside the upload folder; its contents are not the folder's to give.
+        problem = (
+            f"{parameter} points to a file that also has another name (a hard link) "
+            "elsewhere. Upload files must be independent copies: copy the file into the "
+            "upload folder set by META_UPLOAD_DIR and try again."
+        )
     elif details.st_size == 0:
         problem = f"{parameter} points to an empty file."
     elif details.st_size > max_bytes:
@@ -190,12 +272,23 @@ def _resolved_or_none(candidate: Path) -> Path | None:
         return None
 
 
-def _opened_or_none(resolved: Path) -> tuple[int, os.stat_result] | None:
-    """Open the resolved file and read its details, or None, closing on failure."""
+_FOLDER_CHANGED = object()
+
+
+def _opened_or_none(
+    resolved: Path, folder: _UploadFolder
+) -> tuple[int, os.stat_result] | object | None:
+    """Open the resolved file and read its details, closing on failure.
+
+    Returns None when it cannot be opened, or _FOLDER_CHANGED when the folder
+    found on the way is not the established upload folder.
+    """
     descriptor = None
     try:
-        descriptor = _open_without_links(resolved)
+        descriptor = _open_without_links(resolved, folder)
         return descriptor, os.fstat(descriptor)
+    except _FolderChanged:
+        return _FOLDER_CHANGED
     except OSError:
         if descriptor is not None:
             os.close(descriptor)

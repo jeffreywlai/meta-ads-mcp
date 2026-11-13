@@ -49,10 +49,15 @@ PRIVATE_ARGUMENT_TOOLS: frozenset[str] = frozenset(
         "list_catalog_partners",
         "set_catalog_access",
         "preview_catalog_access_change",
-        # Product and landing-page URLs can carry a login.
+        # Product and landing-page URLs can carry a login, in params or batch items.
         "create_catalog_product",
         "update_catalog_product",
+        "batch_update_catalog_products",
         "list_dpa_eligible_catalogs",
+        # Catalog settings in params can carry an integration access token
+        # (partner_integration.external_access_token).
+        "create_catalog",
+        "update_catalog",
         # App secrets, access tokens and OAuth codes.
         "exchange_code_for_token",
         "generate_system_user_token",

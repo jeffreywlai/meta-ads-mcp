@@ -393,3 +393,204 @@ def test_every_tool_with_a_sensitive_parameter_is_in_the_private_list():
 
 def test_the_private_list_names_only_registered_tools():
     assert PRIVATE_ARGUMENT_TOOLS <= set(_tools()), sorted(PRIVATE_ARGUMENT_TOOLS - set(_tools()))
+
+
+# --- Round-three review H14: credentials nested inside free-form arguments ---------
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+def test_h14_catalog_settings_tool_is_private_before_body_validation(routed, caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = "R3TOKEN7"
+    arguments = {
+        "catalog_id": {"misplaced_token": secret},
+        "params": {"partner_integration": {"external_access_token": secret}},
+    }
+    with pytest.raises((ToolError, MCPValidationError)) as info:
+        _call("update_catalog", arguments, routed)
+    assert secret not in _rendered_chain(info.value)
+    assert "catalog_id" in str(info.value)
+    _assert_not_logged(caplog, secret)
+
+
+# Tools whose credentials arrive inside free-form or nested arguments, where the
+# parameter-name guard above cannot see them. Reviewed by hand: when a tool
+# starts accepting a credential inside params or a nested object, add it here.
+CREDENTIALS_INSIDE_NESTED_ARGUMENTS = {
+    # params.partner_integration.external_access_token (catalogs.py masks it in current).
+    "update_catalog": "params.partner_integration.external_access_token",
+    # params is merged into the create request, which takes the same catalog settings.
+    "create_catalog": "params.partner_integration.external_access_token",
+    # schedule and update_schedule carry a feed host's username and password.
+    "create_product_feed": "schedule.password, update_schedule.password",
+    "update_product_feed": "schedule.password, update_schedule.password",
+    # Product and image URLs can carry a login, inside params or batch items.
+    "create_catalog_product": "params.url, params.image_url",
+    "update_catalog_product": "params.url, params.image_url",
+    "batch_update_catalog_products": "items[].url, items[].image_url",
+    # Card and media URLs can carry a login.
+    "create_ad_creative_from_inputs": "cards[].link, multi_media[].url",
+}
+
+
+@pytest.mark.parametrize("tool_name", sorted(CREDENTIALS_INSIDE_NESTED_ARGUMENTS))
+def test_h14_tools_with_credentials_inside_nested_arguments_are_private(tool_name):
+    assert tool_name in _tools(), f"{tool_name} is no longer registered; update the reviewed list"
+    assert tool_name in PRIVATE_ARGUMENT_TOOLS, (
+        f"{tool_name} carries {CREDENTIALS_INSIDE_NESTED_ARGUMENTS[tool_name]} and must be in "
+        "PRIVATE_ARGUMENT_TOOLS in meta_ads_mcp/argument_privacy.py"
+    )
+
+
+# Helpers a tool calls when its own input can hold a credential: masking what it
+# sent, redacting a request preview, or refusing a URL that carries a login.
+_CREDENTIAL_HELPERS = frozenset({"_mask_secrets", "_redacted", "refuse_url_credentials"})
+
+
+def _tools_using_credential_helpers() -> dict[str, set[str]]:
+    """Registered tools whose code reaches a credential helper, following module-level calls."""
+    import ast
+
+    import meta_ads_mcp.tools as tools_package
+
+    registered = set(_tools())
+    found: dict[str, set[str]] = {}
+    for path in sorted(Path(tools_package.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        direct = {
+            name: {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
+            for name, function in functions.items()
+        }
+
+        def reached(name: str, seen: set[str], direct=direct, functions=functions) -> set[str]:
+            helpers = direct[name] & _CREDENTIAL_HELPERS
+            for called in direct[name] & set(functions):
+                if called not in seen:
+                    seen.add(called)
+                    helpers |= reached(called, seen)
+            return helpers
+
+        for name in set(functions) & registered:
+            helpers = reached(name, {name})
+            if helpers:
+                found[name] = helpers
+    return found
+
+
+def _call_proxy(arguments: dict):
+    return asyncio.run(mcp_server.call_tool("call_tool", arguments))
+
+
+# --- Round-three review H19: the call_tool envelope of a private call -------------
+
+
+@pytest.mark.parametrize("malformed", ["unknown_outer_key", "wrong_name_type"])
+def test_h19_proxy_envelope_protects_private_target_before_dispatch(malformed, caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = "user@r3.invalid"
+    arguments = {"name": "add_audience_users", "arguments": {"audience_id": "20", "schema": ["EMAIL"], "rows": [[secret]]}}
+    if malformed == "unknown_outer_key":
+        arguments[secret] = "misplaced-column"
+    else:
+        arguments["tool_name"] = arguments["name"]
+        arguments["name"] = {"misplaced_customer": secret}
+    with pytest.raises((ToolError, MCPValidationError)) as error:
+        _call_proxy(arguments)
+    assert secret not in _rendered_chain(error.value), str(error.value)
+    _assert_not_logged(caplog, secret)
+
+
+_ENVELOPE_TARGETS = [
+    pytest.param({"name": "add_audience_users"}, id="name"),
+    pytest.param({"tool_name": "remove_audience_users"}, id="alias"),
+    pytest.param({"name": " update_catalog "}, id="padded_name"),
+    # Names from Meta's official server that resolve to a private tool here.
+    pytest.param({"name": "ads_catalog_update_catalog"}, id="official_name"),
+    pytest.param({"tool_name": "ads_permission_set_asset_permissions"}, id="official_alias"),
+    # An official name served by both customer-list tools: the target is not one tool.
+    pytest.param({"name": "ads_update_custom_audience_users"}, id="official_several_private"),
+    # One recognisable name is private: the other cannot make the call look ordinary.
+    pytest.param({"name": "list_adsets", "tool_name": "add_audience_users"}, id="mixed_names"),
+    # The target cannot be determined.
+    pytest.param({}, id="no_name"),
+    pytest.param({"name": None, "tool_name": None}, id="null_names"),
+    pytest.param({"name": "   "}, id="blank_name"),
+    pytest.param({"name": "no_such_tool_here"}, id="unknown_name"),
+    pytest.param({"name": "call_tool"}, id="proxy_itself"),
+]
+
+
+@pytest.mark.parametrize("target", _ENVELOPE_TARGETS)
+def test_unknown_envelope_keys_are_counted_when_the_target_is_private_or_unclear(target, caplog):
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        _call_proxy({**target, "arguments": {}, SECRET: "x", f"{SECRET}-2": "y"})
+    rendered = _rendered_chain(error.value)
+    assert SECRET not in rendered
+    assert "Unknown parameters for call_tool: 2 unknown parameters" in str(error.value)
+    assert "Accepted parameters: name, arguments, tool_name." in str(error.value)
+    _assert_not_logged(caplog, SECRET)
+
+
+@pytest.mark.parametrize(
+    ("envelope", "parameter"),
+    [
+        pytest.param({"name": {"k": SECRET}, "tool_name": "add_audience_users"}, "name", id="name_object"),
+        pytest.param({"name": [SECRET], "tool_name": "update_catalog"}, "name", id="name_list"),
+        pytest.param({"name": "add_audience_users", "tool_name": {"k": SECRET}}, "tool_name", id="alias_object"),
+        pytest.param({"name": {"k": SECRET}}, "name", id="name_only_object"),
+        pytest.param({"tool_name": [SECRET]}, "tool_name", id="alias_only_list"),
+    ],
+)
+def test_wrong_type_envelope_values_are_not_quoted_when_the_target_is_private_or_unclear(envelope, parameter, caplog):
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises((ToolError, MCPValidationError)) as error:
+        _call_proxy({**envelope, "arguments": {}})
+    message = str(error.value)
+    assert SECRET not in _rendered_chain(error.value)
+    assert message.startswith(f"Invalid arguments for call_tool: {parameter}: Input should be a valid string")
+    _assert_not_logged(caplog, SECRET)
+
+
+def test_an_ordinary_target_keeps_naming_unknown_envelope_keys_exactly():
+    with pytest.raises(ToolError) as info:
+        _call_proxy({"name": "list_adsets", "arguments": {"account_id": "act_1"}, "bogus": 1})
+    assert str(info.value) == (
+        "Unknown parameters for call_tool: bogus. Accepted parameters: name, arguments, tool_name. "
+        "Inspect types and defaults with get_capabilities(tool_name='call_tool')."
+    )
+    with pytest.raises(ToolError) as info:
+        _call_proxy({"tool_name": "list_adsets", "bogus": 1})
+    assert str(info.value).startswith("Unknown parameters for call_tool: bogus. ")
+
+
+def test_a_wrong_type_target_beside_an_ordinary_one_is_treated_as_unclear():
+    # Only name and tool_name have declared types, so a framework error on the
+    # envelope always leaves one target unreadable: the value is not quoted.
+    with pytest.raises((ToolError, MCPValidationError)) as info:
+        _call_proxy({"name": "list_adsets", "tool_name": 5})
+    assert str(info.value).startswith("Invalid arguments for call_tool: tool_name: Input should be a valid string")
+    assert "input_value" not in str(info.value)
+
+
+def test_a_private_target_reached_through_a_valid_envelope_still_runs_its_own_checks():
+    # The envelope is fine; the nested arguments go to the private tool's own handling.
+    with pytest.raises(ToolError) as info:
+        _call_proxy({"name": "add_audience_users", "arguments": {"audience_id": "1", "schema": ["EMAIL"], "rows": [["a@b.invalid"]], SECRET: 1}})
+    assert "Unknown parameters for add_audience_users: 1 unknown parameter" in str(info.value)
+    assert SECRET not in _rendered_chain(info.value)
+
+
+def test_h14_tools_that_mask_or_refuse_their_own_credentials_are_private():
+    found = _tools_using_credential_helpers()
+    assert {"update_catalog", "create_ad_creative_from_inputs"} <= set(found), found
+    missing = {name: sorted(helpers) for name, helpers in found.items() if name not in PRIVATE_ARGUMENT_TOOLS}
+    assert not missing, (
+        "These tools mask, redact or refuse credentials in their own input, so their argument "
+        f"errors must not quote values; add them to PRIVATE_ARGUMENT_TOOLS: {missing}"
+    )

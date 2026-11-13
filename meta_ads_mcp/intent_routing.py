@@ -722,7 +722,7 @@ class StructuredIntentRouter:
                         and (
                             direct_verb not in _SUBJECT_SCOPED_WRITE_VERBS
                             or _acts_on_tool_subject(
-                                clause,
+                                literal_clause,
                                 name,
                                 required=_SUBJECT_WORDS_REQUIRED.get(direct_verb, 1),
                             )
@@ -733,7 +733,7 @@ class StructuredIntentRouter:
                 negated is None
                 and direct_verb in _SUBJECT_SCOPED_WRITE_VERBS
                 and route in mutation_names
-                and _is_analytical(clause)
+                and _is_analytical(literal_clause)
             ):
                 # "boost instagram post engagement totals" starts with a tool's
                 # name but asks for numbers; leave it to the read tools.
@@ -834,36 +834,188 @@ _OBJECT_PHRASE_ENDINGS = frozenset(
 )
 # Reporting and arithmetic words. A clause that contains one is asking about
 # numbers ("add audience performance to the report"), not changing an object.
+# Count nouns ("event source counts", "audience size") are numbers too.
 _ANALYTICAL_WORDS = frozenset(
     {
-        "analysis", "average", "breakdown", "chart", "cpa", "cpc", "cpm", "ctr",
-        "engagement", "export", "insight", "metric", "noise", "outlier", "overlap",
-        "performance", "reach", "report", "reporting", "result", "roas", "spend",
-        "stat", "statistic", "sum", "summary", "table", "total", "trend",
+        "analysis", "average", "breakdown", "chart", "click", "count", "cpa", "cpc",
+        "cpm", "ctr", "engagement", "export", "figure", "frequency", "impression",
+        "insight", "kpi", "metric", "noise", "number", "outlier", "overlap",
+        "percent", "percentage", "performance", "rate", "ratio", "reach", "report",
+        "reporting", "result", "revenue", "roas", "roi", "size", "spend", "stat",
+        "statistic", "sum", "summary", "table", "tally", "total", "trend", "volume",
     }
 )
+# Places reporting output goes. Adding something to one of these, or removing
+# it from one, edits a report rather than the object ("add audience users to
+# the report"). "list" is not one: a customer list is an audience.
+_REPORTING_DESTINATIONS = frozenset(
+    {
+        "breakdown", "cell", "chart", "column", "dashboard", "deck", "doc",
+        "document", "export", "graph", "plot", "presentation", "readout", "recap",
+        "report", "row", "scorecard", "sheet", "slide", "spreadsheet", "summary",
+        "tab", "table", "visualization", "workbook", "worksheet",
+    }
+)
+# Nouns for the things the subject-scoped write tools act on. A reporting word
+# before one of them is part of its description or name ("the Reach campaign",
+# "the top engagement post"); a reporting word after the last of them is what
+# the request is about ("audience performance", "post engagement totals").
+_ENTITY_NOUNS = frozenset(
+    {
+        "account", "ad", "adset", "audience", "campaign", "catalog", "contact",
+        "creative", "customer", "dataset", "event", "feed", "image", "member",
+        "page", "people", "person", "pixel", "post", "product", "set", "source",
+        "study", "user", "video",
+    }
+)
+# Words after which the rest of an object or destination phrase is a name
+# ('the campaign named "Reach"'), not something acted on.
+_NAME_MARKERS = frozenset(
+    {"called", "entitled", "labeled", "labelled", "named", "nicknamed", "titled"}
+)
+# Words after which the rest of the clause describes which object is meant
+# ("the campaign listed in the report", "the study measuring reach"), so no
+# destination follows.
+_TARGET_DESCRIPTORS = frozenset(
+    {
+        "appear", "appearing", "appears", "containing", "featured", "flagged",
+        "having", "highlighted", "included", "listed", "measuring", "mentioned",
+        "running", "shown", "showing", "targeting", "testing", "tracking", "using",
+        "which", "who", "whose", "where",
+    }
+)
+# Prepositions that introduce where a verb puts its object or takes it from,
+# strongest first: in "add the customers in the spreadsheet to the audience"
+# the destination is the audience, so "in" counts only when "to" is absent.
+_DESTINATION_PREPOSITIONS: dict[str, tuple[frozenset[str], ...]] = {
+    "add": (frozenset({"to", "into", "onto"}), frozenset({"in"})),
+    "remove": (frozenset({"from"}), frozenset({"off", "out"})),
+    "connect": (frozenset({"to", "into", "onto"}), frozenset({"with"})),
+    "disconnect": (frozenset({"from"}),),
+    "duplicate": (frozenset({"to", "into", "onto"}), frozenset({"in"})),
+    "copy": (frozenset({"to", "into", "onto"}), frozenset({"in"})),
+    "clone": (frozenset({"to", "into", "onto"}), frozenset({"in"})),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _Word:
+    """One word of a clause, lowercased, and whether it was written as a Title-case name."""
+
+    text: str
+    titled: bool
+
+
+def _phrase_words(clause: str) -> list[_Word]:
+    """The clause's words with quoted text removed: a quoted name is never a subject.
+
+    In a clause that also has ordinary lowercase words, a word written in Title
+    case after the verb ("duplicate the campaign Reach") is marked as possibly
+    part of a name. All-capital words (CTR, ROAS) are not marked.
+    """
+    raw = re.findall(r"[A-Za-z0-9]+", re.sub(_QUOTED_VALUE, " ", clause))
+    mixed = any(word[:1].islower() for word in raw[1:])
+    return [
+        _Word(word.lower(), mixed and index > 0 and word[:1].isupper() and not word.isupper())
+        for index, word in enumerate(raw)
+    ]
+
+
+def _is_entity(word: str) -> bool:
+    return word in _ENTITY_NOUNS or _singular(word) in _ENTITY_NOUNS
+
+
+def _phrase(words: list[_Word], start: int) -> tuple[list[_Word], int]:
+    """Words from start up to a preposition, conjunction, name marker or descriptor.
+
+    A descriptor ends the phrase only after an entity noun: in "the campaign
+    listed in the report" it describes the campaign, while in "the running
+    studies" it is part of the phrase.
+    """
+    phrase: list[_Word] = []
+    index = start
+    while index < len(words):
+        word = words[index].text
+        if word in _OBJECT_PHRASE_ENDINGS or word in _NAME_MARKERS:
+            break
+        if word in _TARGET_DESCRIPTORS and any(_is_entity(item.text) for item in phrase):
+            break
+        phrase.append(words[index])
+        index += 1
+    return phrase, index
+
+
+def _object_phrase(clause: str) -> list[_Word]:
+    """The words right after the verb, without a name written after the entity noun.
+
+    The phrase ends at the first preposition, conjunction, name marker
+    ("named", "called") or descriptor ("listed"). Quoted text is removed first,
+    and Title-case words after the last entity noun ("the campaign Reach Test")
+    are dropped as the entity's name.
+    """
+    phrase = _phrase(_phrase_words(clause), 1)[0]
+    last_entity = max((index for index, word in enumerate(phrase) if _is_entity(word.text)), default=-1)
+    return [
+        word for index, word in enumerate(phrase)
+        if not (index > last_entity >= 0 and word.titled and not _is_entity(word.text))
+    ]
 
 
 def _object_words(clause: str) -> list[str]:
-    """Return the words right after a clause's verb, up to the first preposition or conjunction."""
-    object_words: list[str] = []
-    for word in re.findall(r"[a-z0-9]+", clause)[1:]:
-        if word in _OBJECT_PHRASE_ENDINGS:
-            break
-        object_words.append(word)
-    return object_words
+    """Return the lowercase words of the thing a clause's verb acts on (see _object_phrase)."""
+    return [word.text for word in _object_phrase(clause)]
+
+
+def _destination_words(clause: str) -> list[str]:
+    """Return the phrase after the verb's destination preposition, if any.
+
+    "add audience users to the report" has the destination "the report". A
+    descriptor ("listed", "shown") ends the search: what follows says which
+    object is meant, not where it goes.
+    """
+    words = _phrase_words(clause)
+    if not words:
+        return []
+    _object, start = _phrase(words, 1)
+    end = next(
+        (
+            index
+            for index in range(start, len(words))
+            if words[index].text in _TARGET_DESCRIPTORS
+            and any(_is_entity(word.text) for word in words[1:index])
+        ),
+        len(words),
+    )
+    for prepositions in _DESTINATION_PREPOSITIONS.get(words[0].text, ()):
+        for index in range(start, end):
+            if words[index].text in prepositions:
+                return [word.text for word in _phrase(words, index + 1)[0]]
+    return []
+
+
+def _reporting_head(words: list[str], vocabulary: frozenset[str]) -> bool:
+    """Whether a vocabulary word follows the phrase's last entity noun (or any, without one)."""
+    last_entity = max((index for index, word in enumerate(words) if _is_entity(word)), default=-1)
+    return any(
+        word in vocabulary or _singular(word) in vocabulary
+        for index, word in enumerate(words)
+        if index > last_entity
+    )
 
 
 def _is_analytical(clause: str) -> bool:
-    """Return whether the thing a clause's verb acts on is a reporting number.
+    """Return whether a clause's verb acts on a reporting number or puts it in a report.
 
-    Only the words right after the verb count. "boost instagram post engagement
-    totals" asks for numbers; "boost the post with the best engagement" is a
-    command whose target is described by a number.
+    Only the object right after the verb and the verb's destination count.
+    "boost instagram post engagement totals" asks for numbers, and so does
+    "add audience users to the report"; "boost the post with the best
+    engagement" is a command whose target is described by a number, and in
+    'duplicate campaign named "Reach"' or "duplicate the Reach campaign" the
+    reporting word is part of the campaign's name. The clause may keep its
+    original letter case, which is used only to recognise unquoted names.
     """
-    return any(
-        word in _ANALYTICAL_WORDS or _singular(word) in _ANALYTICAL_WORDS
-        for word in _object_words(clause)
+    return _reporting_head(_object_words(clause), _ANALYTICAL_WORDS) or _reporting_head(
+        _destination_words(clause), _ANALYTICAL_WORDS | _REPORTING_DESTINATIONS
     )
 
 
@@ -882,7 +1034,7 @@ def _acts_on_tool_subject(clause: str, name: str, *, required: int = 1) -> bool:
     object_words = _object_words(clause)
     if not object_words or not _names_tool_subject(" ".join(object_words), name):
         return False
-    return _names_tool_subject(clause, name, required=required)
+    return _names_tool_subject(clause.lower(), name, required=required)
 
 
 def is_compatible_name(name: str, decision: RouteDecision) -> bool:
