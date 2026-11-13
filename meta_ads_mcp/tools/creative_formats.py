@@ -2,10 +2,10 @@
 
 Every format here follows a request shape shown in Meta's public Marketing API
 documentation (ad creative reference, carousel guide, asset feed spec and
-placement asset customization guides, lead ads guide, click-to-Messenger and
-click-to-WhatsApp guides, Instagram post and Partnership Ads guides, the
-multi-media ads guide and the catalog ads get-started guide). Formats
-Meta does not document are not built.
+placement asset customization guides, lead ads guide, click-to-Messenger,
+click-to-WhatsApp and click-to-Instagram guides, Instagram post and Partnership
+Ads guides, the multi-media ads guide, the catalog ads get-started guide and the
+product extensions guide). Formats Meta does not document are not built.
 """
 
 from __future__ import annotations
