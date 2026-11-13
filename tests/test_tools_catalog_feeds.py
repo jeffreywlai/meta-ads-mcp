@@ -3543,3 +3543,179 @@ def test_unreadable_pre_read_stops_a_feed_delete_over_the_real_client(monkeypatc
 
     run(scenario())
     assert methods == ["GET"]
+
+
+# round thirteen --------------------------------------------------------------------------
+# R4: a local feed file's name never reaches an error, a log or Meta's echoed answer.
+
+_PRIVATE_FEED_NAME = "".join(["customer", ".person", "@r11.invalid", ".csv"])
+
+
+def _private_feed_file(monkeypatch, tmp_path):
+    local_file = tmp_path / _PRIVATE_FEED_NAME
+    local_file.write_text("id,title\nsku,Example\n")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(tmp_path))
+    reload_settings()
+    return local_file
+
+
+@pytest.mark.parametrize("echo", ["plain", "url_encoded", "path"])
+def test_r4_feed_upload_error_does_not_expose_private_local_filename(monkeypatch, tmp_path, echo) -> None:
+    local_file = _private_feed_file(monkeypatch, tmp_path)
+
+    class Client:
+        async def create_edge_object(self, *args, **kwargs):
+            filename = kwargs["files"]["file"][0]
+            shown = {"plain": filename, "url_encoded": quote(filename, safe=""), "path": str(local_file)}[echo]
+            raise MetaApiError(message="Could not parse uploaded file " + shown, code=100,
+                               user_message="File " + shown)
+
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", Client)
+    with pytest.raises(MetaApiError) as caught:
+        run(catalog_feeds.create_product_feed_upload("10", file_path=str(local_file)))
+    text = _all_error_text(caught.value) + json.dumps(caught.value.to_public_dict())
+    assert _PRIVATE_FEED_NAME not in text and quote(_PRIVATE_FEED_NAME, safe="") not in text
+    assert "<file>" in caught.value.message
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+def test_r4_mcp_feed_upload_errors_and_logs_scrub_filename(monkeypatch, tmp_path, caplog, routed) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    local_file = _private_feed_file(monkeypatch, tmp_path)
+
+    class Client:
+        async def create_edge_object(self, *args, **kwargs):
+            raise MetaApiError(message="Could not parse uploaded file " + kwargs["files"]["file"][0], code=100)
+
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", Client)
+    arguments = {"feed_id": "10", "file_path": str(local_file)}
+    name, payload = ("call_tool", {"name": "create_product_feed_upload", "arguments": arguments}) if routed \
+        else ("create_product_feed_upload", arguments)
+    with pytest.raises(ToolError) as caught:
+        run(mcp_server.call_tool(name, payload))
+    assert _PRIVATE_FEED_NAME not in str(caught.value)
+    assert _PRIVATE_FEED_NAME not in caplog.text
+
+
+def test_feed_upload_answer_repeating_the_file_name_is_scrubbed(monkeypatch, tmp_path) -> None:
+    local_file = _private_feed_file(monkeypatch, tmp_path)
+
+    class Client:
+        async def create_edge_object(self, *args, **kwargs):
+            return {"id": "20", "note": "received " + kwargs["files"]["file"][0]}
+
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", Client)
+    result = run(catalog_feeds.create_product_feed_upload("10", file_path=str(local_file)))
+    assert result["created"] == {"id": "20", "note": "received <file>"}
+    # The file the caller chose is still named in upload_source, as before.
+    assert result["upload_source"]["file_name"] == _PRIVATE_FEED_NAME
+
+
+# R1: a list answer without a data list, or with entries that are not objects, is never complete.
+
+
+class _RawEdgeClient:
+    def __init__(self, *pages):
+        self.pages = list(pages)
+
+    async def list_objects(self, *args, **kwargs):
+        return self.pages.pop(0)
+
+
+@pytest.mark.parametrize("page", [{}, {"data": None}, {"data": "x"}, {"paging": {}}])
+def test_r1_other_aggregate_readers_do_not_call_a_missing_data_page_complete(page) -> None:
+    reasons: list[str] = []
+    rows, complete = run(catalog_feeds._collect_edge(
+        _RawEdgeClient({"data": [{"id": "1"}], "paging": {"next": "n", "cursors": {"after": "a"}}}, page),
+        "10", "external_event_sources", fields=["id"], page_size=100, stop_reasons=reasons,
+    ))
+    assert rows == [{"id": "1"}] and complete is False
+    assert "no data list" in reasons[0]
+
+
+def test_feed_edge_entries_that_are_not_objects_are_counted_and_leave_the_read_incomplete() -> None:
+    reasons: list[str] = []
+    rows, complete = run(catalog_feeds._collect_edge(
+        _RawEdgeClient({"data": [{"id": "1"}, None, "x"]}), "10", "adspixels", fields=["id"], page_size=100,
+        stop_reasons=reasons,
+    ))
+    assert rows == [{"id": "1"}] and complete is False
+    assert "2 entries" in reasons[0]
+
+
+@pytest.mark.parametrize("answer", [{}, {"data": None}, {"items": []}])
+def test_every_feed_list_read_refuses_an_answer_without_a_data_list(monkeypatch, answer) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={("10", "rules"): answer, ("10", "external_event_sources"): answer}))
+    with pytest.raises(MetaApiError, match="no data list"):
+        run(catalog_feeds.list_feed_rules("10"))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("10", "external_event_sources"): answer}))
+    with pytest.raises(MetaApiError, match="no data list"):
+        run(catalog_feeds.connect_catalog_event_source("10", "30"))
+    assert "create_edge_object" not in client.methods()
+
+
+def test_upload_errors_with_unreadable_entries_are_not_complete(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"20": {"id": "20", "error_count": 3}},
+        edges={("20", "errors"): {"data": [{"id": "e1", "total_count": 2}, None, 7]}},
+    ))
+    item = run(catalog_feeds.list_product_feed_uploads("10", upload_id="20"))["item"]
+    assert [row["id"] for row in item["errors"]] == ["e1"]
+    assert item["errors_complete"] is False and "2 entries" in item["errors_stop_reason"]
+
+
+def test_upload_list_with_an_unreadable_entry_says_so(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "uploads"): {"data": [{"id": "u1", "error_count": 0, "warning_count": 0}, None]},
+    }))
+    result = run(catalog_feeds.list_product_feed_uploads("10"))
+    assert [item["id"] for item in result["items"]] == ["u1"]
+    assert result["summary"]["unreadable_entries"] == 1 and result["summary"]["complete"] is False
+
+
+def test_disconnect_does_not_call_a_source_missing_when_a_listed_source_has_no_id(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"name": "Pixel without id"}]},
+    }))
+    result = run(catalog_feeds.disconnect_catalog_event_source("10", "30"))
+    # Not refused as "not connected": the listed source may be it, so the request is sent and the gap stated.
+    assert "delete_edge_object" in client.methods()
+    assert result["previous_complete"] is False and any("without an id" in gap for gap in result["missing_signals"])
+
+
+def test_event_source_catalog_scan_with_an_unidentified_catalog_is_incomplete(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("b1", "owned_product_catalogs"): {"data": [{"name": "No id"}, {"id": "c2"}]},
+        ("c2", "external_event_sources"): {"data": [{"id": "s9"}]},
+    }))
+    result = run(catalog_feeds.list_event_source_catalogs("s1", business_id="b1"))
+    assert result["items"] == [] and result["summary"]["complete"] is False
+
+
+def test_health_scoped_to_a_source_is_not_refused_when_a_source_has_no_id(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={("10", "external_event_sources"): {"data": [{"name": "x"}]}}))
+    result = run(catalog_feeds.get_catalog_event_source_health("10", event_source_id="30"))
+    assert any("without an id" in note for note in result["missing_signals"])
+
+
+def test_unreadable_da_checks_are_reported_not_called_absent(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"id": "s1", "source_type": "PIXEL"}]},
+        ("s1", "da_checks"): {"data": [None, "x"]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health("10"))
+    notes = " ".join(result["missing_signals"])
+    assert "2 entries" in notes and "no Dynamic Ads checks" not in notes
+
+
+def test_pixel_strength_is_unknown_when_its_checks_cannot_all_be_read(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("b1", "adspixels"): {"data": [{"id": "p1"}, {"name": "No id"}]},
+        ("p1", "da_checks"): {"data": [None]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations("10", business_id="b1"))
+    [recommendation] = result["recommendations"]
+    assert recommendation["event_source_id"] == "p1" and recommendation["strength"] == "unknown"
+    assert any("without an id" in note or "had no id" in note for note in result["missing_signals"])

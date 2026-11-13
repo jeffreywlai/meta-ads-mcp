@@ -28,7 +28,7 @@ from meta_ads_mcp.errors import (
 )
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 # The feed tools' masking: a URL password in a result or in a raised error's text
@@ -39,6 +39,9 @@ from meta_ads_mcp.tools.catalog_feeds import (
     _CheckedClient,
     _count_keys,
     _is_unreadable_answer_error,
+    _is_unreadable_collection_error,
+    _note_unreadable_entries,
+    _unreadable_entries_reason,
     _guard_secrets,
     _masked_json_text,
     _redact,
@@ -494,9 +497,24 @@ async def _collect_edge(
     called a repeat. max_pages caps requests regardless of how many rows came
     back, so a run of empty pages cannot loop. With stop_at_total, the first
     summary total_count Meta returns ends the read. summary_total is the first
-    summary total_count Meta returned on any page, or None.
+    summary total_count Meta returned on any page, or None. A page without a data list stops
+    the read as incomplete (it may have held rows), and entries that are not objects are
+    left out, counted in unreadable_entries, and make the read incomplete
+    (normalize.read_collection_page).
     """
     rows: list[Any] = []
+    unreadable_entries = 0
+
+    def finish(read: dict[str, Any]) -> dict[str, Any]:
+        """Entries that are not objects leave the read incomplete, whatever else ended it."""
+        read["unreadable_entries"] = unreadable_entries
+        if unreadable_entries:
+            read["complete"] = False
+            read["stop_reason"] = " ".join(filter(None, (
+                read["stop_reason"], _unreadable_entries_reason(unreadable_entries),
+            )))
+        return read
+
     seen_cursors: set[str] = set()
     seen_ids: set[str] = set()
     seen_anonymous_pages: set[str] = set()
@@ -510,14 +528,20 @@ async def _collect_edge(
             seen_cursors.add(cursor)
         payload = await client.list_objects(parent_id, edge, fields=fields, params=page_params)
         pages += 1
-        data = payload.get("data") or []
+        data, skipped, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            return finish({"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                           "stop_reason": ("Meta's answer had no data list, so the page could not be read and "
+                                           "the read stopped."),
+                           "summary_total": summary_total})
+        unreadable_entries += skipped
         if data:
             identities = [_row_identity(row) for row in data]
             if all(identity is not None for identity in identities):
                 if all(identity in seen_ids for identity in identities):
-                    return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                    return finish({"rows": rows, "complete": False, "total_count": None, "pages": pages,
                             "stop_reason": "Meta returned a page whose rows had all already been read.",
-                            "summary_total": summary_total}
+                            "summary_total": summary_total})
                 for identity, row in zip(identities, data):
                     if identity not in seen_ids:
                         seen_ids.add(identity)
@@ -525,23 +549,23 @@ async def _collect_edge(
             else:
                 fingerprint = json.dumps(data, sort_keys=True, default=str)
                 if fingerprint in seen_anonymous_pages:
-                    return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                    return finish({"rows": rows, "complete": False, "total_count": None, "pages": pages,
                             "stop_reason": ("Meta returned a page identical to one already read; its rows carry "
                                             "no id, so whether it repeats that page or holds further identical "
                                             "rows cannot be told, and the read stopped."),
-                            "summary_total": summary_total}
+                            "summary_total": summary_total})
                 seen_anonymous_pages.add(fingerprint)
                 rows.extend(data)
         total = (payload.get("summary") or {}).get("total_count")
         if summary_total is None:
             summary_total = to_int(total)
         if stop_at_total and to_int(total) is not None:
-            return {"rows": rows, "complete": True, "total_count": to_int(total), "pages": pages,
-                    "stop_reason": None, "summary_total": summary_total}
+            return finish({"rows": rows, "complete": True, "total_count": to_int(total), "pages": pages,
+                    "stop_reason": None, "summary_total": summary_total})
         paging = payload.get("paging") or {}
         if not paging.get("next"):
-            return {"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None,
-                    "summary_total": summary_total}
+            return finish({"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None,
+                    "summary_total": summary_total})
         cursor = blank_to_none((paging.get("cursors") or {}).get("after"))
         if cursor is None:
             reason = "Meta reported another page but returned no cursor to read it."
@@ -553,8 +577,8 @@ async def _collect_edge(
             reason = f"Stopped after {pages} pages."
         else:
             continue
-        return {"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason,
-                "summary_total": summary_total}
+        return finish({"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason,
+                "summary_total": summary_total})
 
 
 async def _business_scope(client, business_id: str | None, account_id: str | None) -> dict[str, Any]:
@@ -729,8 +753,11 @@ async def _catalog_dpa_signals(
             note_partial("external_event_sources", sources, len(sources["rows"]))
             signals["event_source_count"] = len(sources["rows"]) or None
         if pixel_id is not None:
-            source_ids = {str(row.get("id")) for row in sources["rows"] if isinstance(row, dict)}
-            connected = True if pixel_id in source_ids else (False if sources["complete"] else None)
+            source_ids = {identity for row in sources["rows"] if (identity := _row_identity(row)) is not None}
+            unidentified = any(_row_identity(row) is None for row in sources["rows"])
+            connected = True if pixel_id in source_ids else (
+                False if sources["complete"] and not unidentified else None
+            )
             context["pixel"] = {"pixel_id": pixel_id, "connected": connected}
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("external_event_sources", error))
@@ -915,7 +942,11 @@ async def _page_catalog_ids(client, page_id: str) -> dict[str, Any]:
     except _SIGNAL_ERRORS as error:
         return {"ids": None, "complete": False, "error": _error_entry("page product_catalogs", error)}
     ids = {identity for row in read["rows"] if (identity := _row_identity(row)) is not None}
-    return {"ids": ids, "complete": read["complete"], "stop_reason": read["stop_reason"], "error": None}
+    complete, stop_reason = read["complete"], read["stop_reason"]
+    if len(ids) < len(read["rows"]):
+        complete = False
+        stop_reason = " ".join(filter(None, (stop_reason, "Meta listed a catalog without an id for the Page.")))
+    return {"ids": ids, "complete": complete, "stop_reason": stop_reason, "error": None}
 
 
 @mcp_server.tool()
@@ -959,8 +990,14 @@ async def list_dpa_eligible_catalogs(
         max_pages=_DPA_MAX_LIST_PAGES, max_items=_DPA_MAX_CATALOGS,
     )
     catalogs = [row for row in listing["rows"] if isinstance(row, dict)]
-    complete = listing["complete"] and len(catalogs) <= _DPA_MAX_CATALOGS
+    unidentified = sum(1 for row in catalogs if _row_identity(row) is None)
+    catalogs = [row for row in catalogs if _row_identity(row) is not None]
+    complete = listing["complete"] and len(catalogs) <= _DPA_MAX_CATALOGS and not unidentified
     catalogs = catalogs[:_DPA_MAX_CATALOGS]
+    if unidentified:
+        listing["stop_reason"] = " ".join(filter(None, (
+            listing["stop_reason"], f"Meta listed {unidentified} catalog(s) without an id, which could not be evaluated.",
+        )))
 
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
@@ -1198,7 +1235,9 @@ async def get_catalog_diagnostics(
         catalog_id, "diagnostics", fields=DIAGNOSTIC_FIELDS, params=params,
     )
     result = _paged(payload)
-    groups = sorted(result["items"], key=_diagnostic_sort_key)
+    readable, unreadable, _ = read_collection_page(payload)
+    _note_unreadable_entries(result["summary"], unreadable, len(readable))
+    groups = sorted(readable, key=_diagnostic_sort_key)
     result["summary"].update({
         "ordered_by": "number_of_affected_items",
         "order_scope": "page",
@@ -1295,6 +1334,13 @@ async def get_catalog_dynamic_ads_health(
         (group for group in diagnostics or [] if group.get("severity") == "MUST_FIX"),
         key=_diagnostic_sort_key,
     )
+    unrated = sum(1 for group in diagnostics or [] if group.get("severity") not in DIAGNOSTIC_SEVERITIES)
+    if unrated:
+        # A group whose severity cannot be read may be a must-fix one, so no-blockers cannot be claimed.
+        missing.append(
+            f"{unrated} diagnostic group(s) had no readable severity (MUST_FIX or OPPORTUNITY), so whether they "
+            "block catalog ads is not known."
+        )
     for group in must_fix:
         issues.append({
             "severity": "issue",
@@ -1373,8 +1419,11 @@ async def list_catalog_data_sources(
         catalog_id, "data_sources", fields=DATA_SOURCE_FIELDS, params=params,
     )
     result = _paged(payload)
+    readable, unreadable, _ = read_collection_page(payload)
+    result["items"] = readable
+    _note_unreadable_entries(result["summary"], unreadable, len(readable))
     result["summary"]["by_upload_type"] = dict(
-        Counter(item.get("upload_type") or "UNKNOWN" for item in result["items"])
+        Counter(item.get("upload_type") or "UNKNOWN" for item in readable)
     )
     return result
 
@@ -1893,6 +1942,12 @@ async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, 
     product_feed and without fields whose readability rests on the SDK alone;
     the feed check is reported as unavailable and those fields are returned in
     refused_fields, so their previous values are reported as unreadable.
+
+    Whether a SKU is in the catalog decides what is sent (a create of an existing SKU is
+    skipped, an update of a missing one too), so the read is complete only when every page
+    could be read, every entry is an object and every product carries a readable
+    retailer_id: a page without a data list, an entry that is not an object, or a product
+    whose retailer_id cannot be read may be the very SKU being written.
     """
     ids = [entry["retailer_id"] for entry in entries]
     params = {"filter": {"retailer_id": {"is_any": ids}}, "limit": _BATCH_READ_PAGE_SIZE}
@@ -1900,23 +1955,44 @@ async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, 
     first_fields = _batch_read_fields(entries, with_feed=True)
     refused: list[str] = []
     try:
-        read = await _collect_edge(client, catalog_id, "products", fields=first_fields,
-                                   params=params, max_pages=_BATCH_READ_MAX_PAGES)
+        try:
+            read = await _collect_edge(client, catalog_id, "products", fields=first_fields,
+                                       params=params, max_pages=_BATCH_READ_MAX_PAGES)
+        except MetaApiError as error:
+            if error.code != 100:
+                raise
+            fallback = _batch_read_fields(entries, with_feed=False, with_sdk_only=False)
+            refused = [name for name in first_fields if name not in fallback and name != _FEED_FIELD]
+            read = await _collect_edge(client, catalog_id, "products", fields=fallback,
+                                       params=params, max_pages=_BATCH_READ_MAX_PAGES)
+            feed_check = {"status": "unavailable", "method": "product_feed field on each product",
+                          "error": str(error)}
     except MetaApiError as error:
-        if error.code != 100:
+        if not _is_unreadable_collection_error(error):
             raise
-        fallback = _batch_read_fields(entries, with_feed=False, with_sdk_only=False)
-        refused = [name for name in first_fields if name not in fallback and name != _FEED_FIELD]
-        read = await _collect_edge(client, catalog_id, "products", fields=fallback,
-                                   params=params, max_pages=_BATCH_READ_MAX_PAGES)
-        feed_check = {"status": "unavailable", "method": "product_feed field on each product",
-                      "error": str(error)}
+        return {"found": {}, "complete": False, "feed_check": feed_check, "refused_fields": refused,
+                "stop_reason": ("Meta's answer to the read of the current products had no data list, so "
+                                "which SKUs already exist is not known.")}
     wanted = set(ids)
-    found = {
-        str(row.get("retailer_id")): row for row in read["rows"]
-        if isinstance(row, dict) and str(row.get("retailer_id")) in wanted
-    }
-    return {"found": found, "complete": read["complete"], "stop_reason": read["stop_reason"],
+    found: dict[str, Any] = {}
+    unidentified = 0
+    for row in read["rows"]:
+        if not isinstance(row, dict):
+            continue
+        retailer_id = row.get("retailer_id")
+        if not isinstance(retailer_id, (str, int)) or isinstance(retailer_id, bool) or not str(retailer_id).strip():
+            unidentified += 1
+            continue
+        if str(retailer_id) in wanted:
+            found[str(retailer_id)] = row
+    complete, stop_reason = read["complete"], read["stop_reason"]
+    if unidentified:
+        complete = False
+        stop_reason = " ".join(filter(None, (stop_reason, (
+            f"Meta returned {unidentified} product(s) without a readable retailer_id, so whether they are "
+            "SKUs in this batch is not known."
+        ))))
+    return {"found": found, "complete": complete, "stop_reason": stop_reason,
             "feed_check": feed_check, "refused_fields": refused}
 
 
