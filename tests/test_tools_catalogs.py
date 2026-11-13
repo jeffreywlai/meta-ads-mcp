@@ -2970,3 +2970,18 @@ def test_handle_read_reports_unreadable_invalid_ids_and_a_single_error_object(mo
     assert "could not be read" in result["error_attribution"]["reason"]
     assert result["errors"] == [{"id": "SKU-1", "message": "Bad"}]
     assert result["ok"] is False
+
+
+@pytest.mark.parametrize("answer", [[], ["h1"], "ok", 7, True])
+def test_batch_answer_that_is_not_an_object_leaves_every_item_unknown(monkeypatch, answer) -> None:
+    # The write has gone out; an answer that cannot be read says nothing about whether it was ingested.
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], post=answer))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")],
+    ))
+    assert client.kinds().count("create") == 1
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert "could not be read" in result["items"][0]["reason"]
+    assert result["batch"] == {"complete": False, "handles": [], "response_unreadable": True}
+    assert result["ok"] is False

@@ -2433,6 +2433,11 @@ async def batch_update_catalog_products(
                                   if unknown else "Meta refused the whole request, so nothing was ingested.")
             response["error"] = error.to_public_dict()
         else:
+            # The write has gone out. An answer that is not an object says nothing about
+            # whether Meta ingested it, so it is never read as "no handle, nothing ingested".
+            response_unreadable = not isinstance(posted, dict)
+            if response_unreadable:
+                posted = {}
             sent_ids = {item["retailer_id"] for item in to_send}
             flagged: dict[str, list[dict[str, Any]]] = {}
             unattributed: list[str] = []
@@ -2495,7 +2500,13 @@ async def batch_update_catalog_products(
                 value.strip() for value in raw_handles if isinstance(value, str) and value.strip()
             ))
             unreadable_handles = sum(1 for value in raw_handles if not (isinstance(value, str) and value.strip()))
-            if not handles and not unreadable_handles:
+            if response_unreadable:
+                for item in to_send:
+                    item["outcome"] = "outcome_unknown"
+                    item["reason"] = ("Meta's answer to the submission could not be read, so whether it "
+                                      "ingested this item is not known. Read the product before retrying.")
+                response["batch"] = {"complete": False, "handles": [], "response_unreadable": True}
+            elif not handles and not unreadable_handles:
                 for item in to_send:
                     item["outcome"] = "not_applied"
                     item["reason"] = "Meta returned no batch handle, which it documents as meaning nothing was ingested."
