@@ -15,6 +15,7 @@ from fastmcp.exceptions import ToolError
 
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.secret_scrub import ERROR, scrub_exception
 from meta_ads_mcp.tools import catalog_feeds
 
 
@@ -2854,13 +2855,13 @@ def test_known_secret_is_scrubbed_through_the_whole_error_chain(monkeypatch, too
 
 def test_short_secret_is_removed_only_as_a_whole_token() -> None:
     error = MetaApiError("Bad password abc for the feed; abcdef is fine; (abc) too", code=100)
-    catalog_feeds._scrub_known_secrets(error, ["abc"])
+    scrub_exception(error, ["abc"], policy=ERROR)
     assert error.message == "Bad password [redacted] for the feed; abcdef is fine; ([redacted]) too"
 
 
 def test_long_secret_is_removed_wherever_it_occurs() -> None:
     error = MetaApiError("prefix" + _KNOWN_SECRET + "suffix", code=100)
-    catalog_feeds._scrub_known_secrets(error, [_KNOWN_SECRET])
+    scrub_exception(error, [_KNOWN_SECRET], policy=ERROR)
     assert error.message == "prefix[redacted]suffix"
 
 
@@ -2872,7 +2873,7 @@ def test_secret_forms_cover_encoded_and_escaped_repeats() -> None:
     assert found == [secret.strip()]
     for form in (secret, secret.strip(), "pa%22ss%20word%2F1", "pa%22ss+word%2F1", 'pa\\"ss word/1'):
         error = MetaApiError("echo " + form + " end", code=100)
-        catalog_feeds._scrub_known_secrets(error, found)
+        scrub_exception(error, found, policy=ERROR)
         assert form.strip() not in error.message and "[redacted]" in error.message
     assert catalog_feeds._caller_secrets(
         {"params": {"partner_integration": {"api_key": "k" * 9}}}, catalogs._CATALOG_CREDENTIAL_PATHS,
@@ -3070,7 +3071,7 @@ def test_known_credentials_are_removed_from_encoded_errors(monkeypatch, caplog, 
 def test_known_secret_is_removed_from_an_error_in_every_encoding(form) -> None:
     text = _encoded_forms(_R6_ENCODED_SECRET)[form]
     error = MetaApiError("before " + text + " after", code=100, user_message="see " + text)
-    catalog_feeds._scrub_known_secrets(error, [_R6_ENCODED_SECRET])
+    scrub_exception(error, [_R6_ENCODED_SECRET], policy=ERROR)
     assert error.message == "before [redacted] after"
     assert error.user_message == "see [redacted]"
 
@@ -3087,7 +3088,7 @@ def test_letters_of_a_secret_stay_case_sensitive() -> None:
     other = _R6_SECRET.upper()
     for text in (other, quote(other, safe=""), _lowercase_escapes(quote(other, safe=""))):
         error = MetaApiError("echo " + text, code=100)
-        catalog_feeds._scrub_known_secrets(error, [_R6_SECRET])
+        scrub_exception(error, [_R6_SECRET], policy=ERROR)
         assert error.message == "echo " + text
 
 
@@ -3271,3 +3272,113 @@ def test_secrets_are_collected_only_where_keys_are_field_names() -> None:
     login = "https://u:" + url_password + "@h.invalid/x"
     for arguments in ({"params": {"custom_data": {"k": login}}}, {"filter": {login: 1}}, {"items": [["see " + login]]}):
         assert catalog_feeds._caller_secrets(arguments, catalogs._CATALOG_CREDENTIAL_PATHS) == [url_password]
+
+
+# round seven -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("surroundings", ["url", "message", "json_newlines"])
+def test_l6_short_secret_tokens_survive_encoded_surroundings_privately(monkeypatch, caplog, surroundings) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    secret = "".join(("Cr3d", "!9"))
+    if surroundings == "url":
+        echoed = quote("https://feed-user:" + secret + "@example.invalid/f.csv", safe="")
+    elif surroundings == "message":
+        echoed = quote("Invalid credential " + secret + " on import", safe="")
+    else:
+        echoed = json.dumps("Invalid credential\n" + secret + "\nretry")[1:-1]
+    exposed = secret if surroundings == "json_newlines" else quote(secret, safe="")
+
+    class Echo(FakeCatalogFeedClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            raise MetaApiError("Upstream detail " + echoed, code=100)
+
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    _use(monkeypatch, Echo())
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        run(mcp_server.call_tool("create_product_feed_upload", {
+            "feed_id": "10", "url": "https://example.invalid/f.csv", "username": "feed-user", "password": secret,
+        }))
+    assert exposed not in str(error.value)
+    assert exposed not in _all_error_text(error.value)
+    assert exposed not in caplog.text
+    assert "[redacted]" in str(error.value)
+
+
+def _within(seconds: float, call):
+    """Run call under a deadline that interrupts it, so a slow matcher fails rather than hangs."""
+    import signal
+    import time
+
+    def expired(_signum, _frame):
+        raise TimeoutError(f"took longer than {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    began = time.perf_counter()
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        assert time.perf_counter() - began < seconds
+
+
+@pytest.mark.parametrize("size", [32, 4000])
+def test_l7_secret_matcher_completes_a_small_nonmatch_in_bounded_time(monkeypatch, size) -> None:
+    # The reviewer's dry run (a 33-character password, a 65-character username of backslashes)
+    # and the same scaled up; before round seven 24 backslashes did not finish.
+    _no_client(monkeypatch)
+    password = "\\" * size + "Z"
+    username = "\\" * (2 * size) + "Y"
+    result = _within(2.0, lambda: run(catalog_feeds.create_product_feed_upload(
+        "10", url="https://example.invalid/f.csv", username=username, password=password, dry_run=True,
+    )))
+    assert result["sent"] is False
+    assert result["would_send"]["data"]["username"] == username
+    assert result["would_send"]["data"]["password"] == "[redacted]"
+
+
+_SCHEDULE_SECRET = "".join(("schedule-json-", "pass-7"))
+
+
+def _schedule_text(password: str = _SCHEDULE_SECRET) -> str:
+    return json.dumps({"url": "https://example.invalid/f.csv", "interval": "DAILY", "username": "u", "password": password})
+
+
+@pytest.mark.parametrize("tool", ["create_product_feed", "update_product_feed"])
+@pytest.mark.parametrize("key", ["schedule", "update_schedule"])
+def test_schedule_given_as_json_text_is_refused_without_repeating_it(monkeypatch, caplog, tool, key) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    _no_client(monkeypatch)
+    arguments = {"catalog_id": "1", "name": "F"} if tool == "create_product_feed" else {"feed_id": "1"}
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        run(mcp_server.call_tool(tool, {**arguments, key: _schedule_text()}))
+    assert "must be an object" in str(error.value)
+    assert _SCHEDULE_SECRET not in _all_error_text(error.value) and _SCHEDULE_SECRET not in caplog.text
+
+
+def test_schedule_json_text_is_searched_as_its_object_for_secrets() -> None:
+    for arguments in ({"schedule": _schedule_text()}, {"update_schedule": _schedule_text()},
+                      {"params": {"schedule": _schedule_text()}}, {"params": {"update_schedule": _schedule_text()}}):
+        assert catalog_feeds._caller_secrets(arguments) == [_SCHEDULE_SECRET]
+    # Elsewhere JSON text is data, as an object there would be.
+    assert catalog_feeds._caller_secrets({"params": {"custom": _schedule_text()}}) == []
+    assert catalog_feeds._caller_secrets({"schedule": "not json {"}) == []
+
+
+@pytest.mark.parametrize("password", ["".join(("x", "9")), _SCHEDULE_SECRET])
+def test_schedule_returned_as_json_text_has_its_password_masked(monkeypatch, password) -> None:
+    feed = {"id": "f1", "schedule": _schedule_text(password), "update_schedule": "no json"}
+    _use(monkeypatch, FakeCatalogFeedClient(objects={"f1": feed}))
+    result = run(catalog_feeds.list_product_feeds(feed_id="f1"))
+    shown = json.loads(result["item"]["schedule"])
+    assert shown["password"] == "[redacted]" and shown["username"] == "u"
+    assert result["item"]["update_schedule"] == "no json"

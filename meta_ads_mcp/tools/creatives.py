@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import re
 import unicodedata
@@ -22,7 +21,7 @@ from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tools.creative_formats import _code_forms
+from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_exception
 from meta_ads_mcp.tool_types import (
     AccountId,
     FieldList,
@@ -83,126 +82,58 @@ def _with_context(exc: Exception, prefix: str) -> Exception:
     return MetaApiError(message=f"{prefix} {_failure_reason(exc)}")
 
 
-_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# The field names a nested boost input can hold, so the only keys an error may name: a call to
+# action's own fields (AdCreativeLinkDataCallToAction: type and value) and its value's fields
+# (AdCreativeLinkDataCallToActionValue in SDK 26.0.2), and an ad set's promoted_object fields
+# (AdPromotedObject in SDK 26.0.2). Any other key may be a misplaced value, such as a token
+# pasted as a key, so an error shows it as <key>.
+_CALL_TO_ACTION_KEYS = frozenset({"type", "value"})
+_CALL_TO_ACTION_VALUE_KEYS = frozenset({
+    "android_url", "app_destination", "app_link", "application", "event_id", "ios_url",
+    "land_on_whatsapp_catalog", "land_on_whatsapp_profile", "lead_gen_form_id", "link", "link_caption",
+    "link_format", "object_store_urls", "page", "product_link", "whatsapp_number",
+})
+_PROMOTED_OBJECT_KEYS = frozenset({
+    "ads_signal_source_type", "application_id", "boosted_product_set_id", "conversion_goal_id",
+    "custom_attribution_source_ids", "custom_conversion_id", "custom_event_str", "custom_event_type",
+    "dataset_split_id", "dataset_split_ids", "event_id", "full_funnel_objective", "fundraiser_campaign_id",
+    "instagram_actor_id", "is_catalog_user_acknowledged", "job_listing_id", "lead_ads_custom_event_str",
+    "lead_ads_custom_event_type", "lead_ads_follow_up_event", "lead_ads_form_event_source_type",
+    "lead_ads_offsite_conversion_type", "lead_ads_quality_volume_setting", "lead_ads_selected_pixel_id",
+    "live_video_destination", "mcme_conversion_id", "multi_event_product", "object_store_url",
+    "object_store_urls", "offer_id", "offline_conversion_data_set_id", "offsite_conversion_event_id",
+    "omnichannel_object", "page_id", "passback_application_id", "passback_pixel_id", "pixel_aggregation_rule",
+    "pixel_id", "pixel_rule", "place_page_set", "place_page_set_id", "product_catalog_id", "product_item_id",
+    "product_set", "product_set_id", "product_set_optimization", "retention_days", "smart_pse_enabled",
+    "smart_pse_setting", "value_semantic_type", "variation", "whats_app_business_phone_number_id",
+    "whatsapp_phone_number",
+})
+# The keys an error may name at each place, by the path of the mapping that holds them.
+_NAMED_KEYS: dict[str, frozenset[str]] = {
+    "call_to_action": _CALL_TO_ACTION_KEYS,
+    "call_to_action.value": _CALL_TO_ACTION_VALUE_KEYS,
+    "promoted_object": _PROMOTED_OBJECT_KEYS,
+}
 
 
-def _key_label(key: Any) -> str:
-    """A nested key as it may appear in a message: a field-like name, or a placeholder for anything else."""
-    return key if isinstance(key, str) and _SAFE_KEY.match(key) else "<key>"
-
-
-def _error_attribute_names(exc: BaseException) -> list[str]:
-    """The data attributes an error carries: dataclass fields, slots and instance attributes."""
-    names: list[str] = [field.name for field in dataclasses.fields(exc)] if dataclasses.is_dataclass(exc) else []
-    for cls in type(exc).__mro__:
-        slots = cls.__dict__.get("__slots__", ())
-        names.extend([slots] if isinstance(slots, str) else list(slots))
-    names.extend(getattr(exc, "__dict__", {}))
-    return [name for name in dict.fromkeys(names) if not name.startswith("__")]
-
-
-def _scrub_value(value: Any, secrets: re.Pattern[str], shown: str) -> Any:
-    """value with every secret replaced, inside strings, dict keys and values, lists and tuples."""
-    if isinstance(value, str):
-        return secrets.sub(lambda _match: shown, value)
-    if isinstance(value, dict):
-        return {_scrub_value(key, secrets, shown): _scrub_value(item, secrets, shown) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return type(value)(_scrub_value(item, secrets, shown) for item in value)
-    return value
-
-
-def _secret_pattern(forms: list[str]) -> re.Pattern[str] | None:
-    """One pattern matching any of the given forms (regular-expression sources from _secret_forms), longest first."""
-    sources = sorted({form for form in forms if form}, key=len, reverse=True)
-    return re.compile("|".join(sources)) if sources else None
-
-
-def _scrub_error(exc: BaseException, secrets: list[str], shown: str) -> None:
-    """Remove secret text from a raised error and every error behind it, in place.
-
-    secrets are the forms _secret_forms gives. A traceback log prints the whole __cause__
-    and __context__ chain, and the MCP error shows the top error's public fields, so every
-    error reachable that way (and inside an exception group) is cleaned: its fields, args
-    and notes. Each error is visited once, so a cycle ends.
-    """
-    pattern = _secret_pattern(secrets)
-    if pattern is None:
-        return
-    pending: list[BaseException | None] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        for name in _error_attribute_names(current):
-            try:
-                value = getattr(current, name)
-            except AttributeError:
-                continue
-            if value is None or isinstance(value, BaseException):
-                continue
-            cleaned = _scrub_value(value, pattern, shown)
-            if cleaned != value:
-                try:
-                    setattr(current, name, cleaned)
-                except (AttributeError, TypeError):
-                    pass
-        if current.args:
-            current.args = tuple(_scrub_value(arg, pattern, shown) for arg in current.args)
-        notes = getattr(current, "__notes__", None)
-        if isinstance(notes, list):
-            current.__notes__ = [_scrub_value(note, pattern, shown) for note in notes]
-        pending.extend([current.__cause__, current.__context__])
-        pending.extend(getattr(current, "exceptions", None) or ())
-
-
-_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
-
-
-def _escape_insensitive_source(form: str) -> str:
-    """A pattern for an encoded form: its characters exactly, but each %XX escape's hex digits in either case."""
-    parts: list[str] = []
-    position = 0
-    for escape in _PERCENT_ESCAPE.finditer(form):
-        parts.append(re.escape(form[position:escape.start()]))
-        digits = escape.group()[1:]
-        parts.append("%" + "".join(f"[{digit.upper()}{digit.lower()}]" if digit.isalpha() else digit for digit in digits))
-        position = escape.end()
-    parts.append(re.escape(form[position:]))
-    return "".join(parts)
-
-
-def _secret_forms(secret: str | None) -> list[str]:
-    """Every way an error could repeat a secret, as regular-expression sources for _secret_pattern.
-
-    The forms are creative_formats._code_forms (shared with the creative builder): as given,
-    trimmed, percent-encoded with and without the slash kept, and form-encoded. The secret's
-    own characters match exactly, case included; only the hex digits of a percent escape
-    match in either case (%2f as well as %2F). A '%' typed in the secret itself is a real
-    character, not an escape: encoding turns it into %25, so only encoded forms have escapes.
-    """
-    if not isinstance(secret, str) or not secret.strip():
-        return []
-    plain = {secret, secret.strip()}
-    return [
-        re.escape(form) if form in plain else _escape_insensitive_source(form)
-        for form in _code_forms(secret)
-    ]
+def _key_label(key: Any, known: frozenset[str]) -> str:
+    """A nested key as an error may show it: a field name documented at that place, else a placeholder."""
+    return key if isinstance(key, str) and key in known else "<key>"
 
 
 def _refuse_url_logins(value: Any, name: str) -> None:
     """Refuse a login embedded in any URL inside a nested input, before any request is built.
 
-    The message names the location by field-like keys only, never by a key that may be pasted data.
+    The message names a key only when it is a field Meta documents at that place
+    (_NAMED_KEYS); any other key, which may be pasted data or a token, as <key>.
     """
     if isinstance(value, str):
         if "://" in value or "@" in value:
             refuse_url_credentials(value, name)
     elif isinstance(value, dict):
+        known = _NAMED_KEYS.get(name, frozenset())
         for key, item in value.items():
-            _refuse_url_logins(item, f"{name}.{_key_label(key)}")
+            _refuse_url_logins(item, f"{name}.{_key_label(key, known)}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _refuse_url_logins(item, f"{name}[{index}]")
@@ -465,12 +396,13 @@ def _legacy_image_file_name(file_path: str, resolved_name: str) -> str:
     return name
 
 
-def _local_file_forms(file_path: str, *names: str) -> list[str]:
-    """Every way an error could repeat a local file's path or names (image or video), for scrubbing."""
-    forms: list[str] = []
-    for text in (file_path, file_path.strip(), str(Path(file_path.strip()).expanduser()), *names):
-        forms.extend(_secret_forms(text))
-    return forms
+def _scrub_local_file(exc: BaseException, file_path: str, *names: str) -> None:
+    """Remove a local file's path and names (image or video) from an error and every error behind it.
+
+    meta_ads_mcp.secret_scrub finds each one wherever it occurs, written plainly or encoded.
+    """
+    paths = (file_path, file_path.strip(), str(Path(file_path.strip()).expanduser()), *names)
+    scrub_exception(exc, paths, policy=ANYWHERE, shown=FILE_SHOWN)
 
 
 @mcp_server.tool()
@@ -498,7 +430,7 @@ async def upload_creative_asset(
         except Exception as exc:
             # A file name can itself be private: no error or log line names the file or its
             # path, even when Meta's own error text repeats it.
-            _scrub_error(exc, _local_file_forms(file_path, image_file.name, file_name), FILE_SHOWN)
+            _scrub_local_file(exc, file_path, image_file.name, file_name)
             raise
     else:
         result = await client.upload_ad_image(
@@ -884,7 +816,7 @@ async def upload_ad_video(
     except Exception as exc:
         # A file name can itself be private: no error or log line names the file, even
         # when Meta's own error text repeats it.
-        _scrub_error(exc, _local_file_forms(path_text, video.name, video.sent_name), FILE_SHOWN)
+        _scrub_local_file(exc, path_text, video.name, video.sent_name)
         raise
     finally:
         os.close(video.descriptor)
@@ -2169,7 +2101,7 @@ async def boost_instagram_post(
         )
     except Exception as exc:
         # Meta's error text may repeat the creator's code; it never reaches the caller or a log.
-        _scrub_error(exc, _secret_forms(partnership_ad_code), PARTNERSHIP_CODE_SHOWN)
+        scrub_exception(exc, [partnership_ad_code], policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN)
         raise
 
 

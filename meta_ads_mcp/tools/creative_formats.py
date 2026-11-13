@@ -10,17 +10,17 @@ product extensions guide). Formats Meta does not document are not built.
 
 from __future__ import annotations
 
-import dataclasses
 import re
 from copy import deepcopy
 from typing import Any
-from urllib.parse import quote, quote_plus, urlsplit
+from urllib.parse import urlsplit
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
+from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_exception
 from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
 from meta_ads_mcp.url_secrets import refuse_url_credentials
 
@@ -1113,87 +1113,15 @@ def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
 _CODE_SHOWN = "<partnership_ad_code>"
 
 
-def _without_codes(value: Any, codes: re.Pattern[str]) -> Any:
-    """Copy a value with every Partnership Ad code in its text replaced."""
-    if isinstance(value, str):
-        return codes.sub(_CODE_SHOWN, value)
-    if isinstance(value, dict):
-        return {_without_codes(key, codes): _without_codes(item, codes) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_without_codes(item, codes) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_without_codes(item, codes) for item in value)
-    return value
-
-
-def _error_attribute_names(exc: BaseException) -> list[str]:
-    """The data attributes an error carries: dataclass fields, slots and instance attributes."""
-    names: list[str] = [field.name for field in dataclasses.fields(exc)] if dataclasses.is_dataclass(exc) else []
-    for cls in type(exc).__mro__:
-        slots = cls.__dict__.get("__slots__", ())
-        names.extend([slots] if isinstance(slots, str) else list(slots))
-    names.extend(getattr(exc, "__dict__", {}))
-    return [name for name in dict.fromkeys(names) if not name.startswith("__")]
-
-
-def _mask_codes_in_error(exc: BaseException, codes: list[str | None]) -> None:
+def _scrub_codes(exc: BaseException, codes: list[Any]) -> None:
     """Remove Partnership Ad codes from a raised error and from every error behind it, in place.
 
-    Meta's error text may repeat a code it was sent. The error is returned to the caller and a
-    traceback log prints it with its __cause__ and __context__ chain, so every error reachable
-    that way (and inside an exception group) has its message, arguments, notes and public
-    fields cleaned. Each error is visited once, so a cycle ends.
+    Meta's error text may repeat a code it was sent, plainly or encoded. The error is returned
+    to the caller and a traceback log prints it with its __cause__ and __context__ chain, so
+    meta_ads_mcp.secret_scrub removes each code, at any length and wherever it occurs, from
+    every error reachable that way.
     """
-    forms = sorted({code for code in codes if isinstance(code, str) and code}, key=len, reverse=True)
-    if not forms:
-        return
-    # Case is ignored so an escape written in lower case (%2b rather than %2B) is found too.
-    present = re.compile("|".join(re.escape(form) for form in forms), re.IGNORECASE)
-    pending: list[BaseException | None] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        for name in _error_attribute_names(current):
-            try:
-                value = getattr(current, name)
-            except AttributeError:
-                continue
-            if value is None or isinstance(value, BaseException):
-                continue
-            cleaned = _without_codes(value, present)
-            if cleaned != value:
-                try:
-                    setattr(current, name, cleaned)
-                except (AttributeError, TypeError):
-                    pass
-        if current.args:
-            current.args = tuple(_without_codes(arg, present) for arg in current.args)
-        notes = getattr(current, "__notes__", None)
-        if isinstance(notes, list):
-            current.__notes__ = [_without_codes(note, present) for note in notes]
-        pending.extend([current.__cause__, current.__context__])
-        pending.extend(getattr(current, "exceptions", None) or ())
-
-
-def _code_forms(code: Any) -> list[str]:
-    """An ad code as given, as sent (trimmed) and URL-encoded, every way an error could repeat it.
-
-    A code may hold plus, slash and equals characters, so Meta's error text can carry it
-    percent-encoded (with or without the slash kept) or form-encoded.
-    """
-    if not isinstance(code, str) or not code.strip():
-        return []
-    plain = {code, code.strip()}
-    encoded = {quote(form, safe="") for form in plain} | {quote(form) for form in plain} | {quote_plus(form) for form in plain}
-    return [form for form in plain | encoded if form]
-
-
-def _codes_given(*values: Any) -> list[str]:
-    """Every form of each ad code given (see _code_forms)."""
-    return [form for value in values for form in _code_forms(value)]
+    scrub_exception(exc, codes, policy=ANYWHERE, shown=_CODE_SHOWN)
 
 
 @mcp_server.tool()
@@ -1237,7 +1165,7 @@ async def create_ad_creative_from_inputs(
         return await _create_from_inputs(**arguments)
     except BaseException as exc:
         # The ad code is masked in results; an error can repeat it, so it is removed there too.
-        _mask_codes_in_error(exc, _codes_given(partnership_ad_code, facebook_partnership_ad_code))
+        _scrub_codes(exc, [partnership_ad_code, facebook_partnership_ad_code])
         raise
 
 
@@ -1631,17 +1559,17 @@ async def update_ad_creative_enhancements(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Turn Advantage creative enhancements on or off for a live ad. Meta does not edit a published creative, so this reads the ad's creative, creates a copy with features changed (for example {"image_touchups": "OPT_OUT", "text_optimizations": "OPT_IN"}), and attaches the copy. The copy carries every creative setting Meta accepts when a creative is created; if the creative has a setting Meta does not accept on create, nothing is changed. The ad is expected to go back to review because its creative changed. dry_run reads the ad and creative and returns the new creative, the ad update, fields_not_copied and settings_not_read without sending anything."""
-    codes: list[str] = []
+    codes: list[Any] = []
     try:
         return await _update_enhancements(ad_id, features, name, dry_run, codes)
     except BaseException as exc:
         # A Partnership Ad code read from the old creative is never shown, even when an error repeats it.
-        _mask_codes_in_error(exc, codes)
+        _scrub_codes(exc, codes)
         raise
 
 
 async def _update_enhancements(
-    ad_id: str, features: dict[str, str], name: str | None, dry_run: bool, codes: list[str]
+    ad_id: str, features: dict[str, str], name: str | None, dry_run: bool, codes: list[Any]
 ) -> dict[str, Any]:
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
@@ -1685,7 +1613,7 @@ async def _update_enhancements(
             )
         raise
     branded = creative.get("branded_content") if isinstance(creative.get("branded_content"), dict) else {}
-    codes.extend(_codes_given(*(branded.get(key) for key in _AD_CODE_FIELDS)))
+    codes.extend(branded.get(key) for key in _AD_CODE_FIELDS)
     account_id = account_id or blank_to_none(str(creative.get("account_id") or ""))
     if account_id is None:
         raise ValidationError("Meta did not return the ad's account_id, so nothing was changed.")
