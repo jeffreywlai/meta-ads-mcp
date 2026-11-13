@@ -8,9 +8,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaApiError, NotFoundError, UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import (
+    MetaApiError,
+    NotFoundError,
+    RateLimitError,
+    UnsupportedFeatureError,
+    ValidationError,
+)
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
+from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import StringList, coerce_csv_string_list
@@ -86,7 +93,7 @@ OBJECTIVE_SOURCE_KEYS = (
     "product_catalogs",
 )
 EVENT_NAMES_REQUIRED = frozenset({"adspixels", "applications"})
-AB_CELL_KEYS = frozenset({"name", "treatment_percentage", "campaign_ids", "adset_ids", "description"})
+AB_CELL_KEYS = frozenset({"name", "treatment_percentage", "campaign_ids", "adset_ids", "ad_ids", "description"})
 LIFT_CELL_KEYS = frozenset({
     "name", "treatment_percentage", "control_percentage", "campaign_ids", "ad_account_ids",
     "description",
@@ -100,6 +107,18 @@ MAX_ENTITIES_PER_CELL = 100
 MAX_CONCURRENT_STUDIES = 100
 CONCURRENCY_SCAN_PAGES = 10
 ENTITY_STUDY_SCAN_PAGES = 5
+# Request cap for reading one study's cells or objectives. 150 cells fit on one page when Meta
+# honours the requested page size; the cap leaves room for smaller pages.
+STUDY_EDGE_PAGE_CAP = 10
+NO_CURSOR_REASON = "Meta reported another page but returned no cursor to fetch it."
+REPEATED_CURSOR_REASON = "Meta returned a cursor already read, so paging stopped to avoid counting a page twice."
+# Creative tests (ad-level cells), from Meta's split testing guide: type SPLIT_TEST_V2, one ad per
+# cell, whole-number shares totalling 100, a creative_test_config budget, cooldown_start_time equal
+# to start_time and observation_end_time equal to end_time. The guide allows 2 to 7 cells; the Ad
+# Study reference describes creative_test_config as a 2 to 5 cell test.
+CREATIVE_TEST_TYPE = "SPLIT_TEST_V2"
+MAX_CREATIVE_TEST_CELLS = 7
+REFERENCE_CREATIVE_TEST_CELLS = 5
 MEMBERSHIP_EDGES = (("campaigns", "campaign_ids"), ("adsets", "adset_ids"), ("adaccounts", "ad_account_ids"))
 END_EARLY_GRACE_SECONDS = 60
 ACTIVE_STATES = frozenset({"scheduled", "running"})
@@ -311,7 +330,7 @@ def _build_ab_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 payload[meta_key] = ids
                 entity_count += len(ids)
         if entity_count == 0:
-            raise ValidationError(f"cells[{index}] needs campaign_ids or adset_ids.")
+            raise ValidationError(f"cells[{index}] needs campaign_ids or adset_ids (or, for a creative test, ad_ids).")
         if entity_count > MAX_ENTITIES_PER_CELL:
             raise ValidationError(f"Meta allows at most {MAX_ENTITIES_PER_CELL} ad objects per cell.")
         if cell.get("description"):
@@ -320,6 +339,86 @@ def _build_ab_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if round(total, 2) != 100:
         raise ValidationError(f"Cell treatment_percentage values must total 100; they total {round(total, 2):g}.")
     return built
+
+
+def _uses_ad_cells(cells: Any) -> bool:
+    return isinstance(cells, list) and any(isinstance(cell, dict) and cell.get("ad_ids") is not None for cell in cells)
+
+
+def _build_creative_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate ad-level (creative test) cells and convert them to Meta's cell payload."""
+    if len(cells) < 2 or len(cells) > MAX_CREATIVE_TEST_CELLS:
+        raise ValidationError(
+            f"A creative test has 2 to {MAX_CREATIVE_TEST_CELLS} cells (Meta's split testing guide); got {len(cells)}."
+        )
+    built: list[dict[str, Any]] = []
+    owners: dict[str, int] = {}
+    total = 0
+    for index, raw in enumerate(cells):
+        cell = _check_cell_keys(raw, index, AB_CELL_KEYS)
+        if cell.get("ad_ids") is None or cell.get("campaign_ids") is not None or cell.get("adset_ids") is not None:
+            raise ValidationError(
+                "Ad-level cells cannot be mixed with campaign or ad set cells: every cell of a creative test "
+                f"holds exactly one ad in ad_ids and nothing else (cells[{index}] does not)."
+            )
+        ad_ids = _id_list(cell["ad_ids"], label=f"cells[{index}].ad_ids")
+        if len(ad_ids) != 1:
+            raise ValidationError(
+                f"cells[{index}].ad_ids must hold exactly one ad id; Meta's creative test puts one ad in each cell."
+            )
+        ad_id = ad_ids[0]
+        if ad_id in owners:
+            raise ValidationError(
+                f"{ad_id} appears in cells[{owners[ad_id]}] and cells[{index}]; each ad can be in only one cell."
+            )
+        owners[ad_id] = index
+        share = _percentage(
+            cell.get("treatment_percentage"),
+            label=f"cells[{index}].treatment_percentage",
+            minimum=MIN_SPLIT_TREATMENT_PERCENTAGE,
+        )
+        if share != int(share):
+            raise ValidationError(
+                f"cells[{index}].treatment_percentage must be a whole number for a creative test "
+                f"(Meta's split testing guide); got {share}."
+            )
+        total += int(share)
+        payload: dict[str, Any] = {"name": cell["name"].strip(), "treatment_percentage": int(share), "ads": [ad_id]}
+        if cell.get("description"):
+            payload["description"] = cell["description"]
+        built.append(payload)
+    if total != 100:
+        raise ValidationError(f"Cell treatment_percentage values must total 100; they total {total}.")
+    return built
+
+
+def _creative_budget_choice(daily_budget: Any, lifetime_percentage: Any) -> tuple[str, Any]:
+    """Validate the creative test budget input before any network call: exactly one of the two."""
+    if daily_budget is None and lifetime_percentage is None:
+        raise ValidationError(
+            "A creative test (cells with ad_ids) needs a budget: pass creative_test_daily_budget or "
+            "creative_test_lifetime_budget_percentage."
+        )
+    if daily_budget is not None and lifetime_percentage is not None:
+        raise ValidationError(
+            "Pass creative_test_daily_budget or creative_test_lifetime_budget_percentage, not both."
+        )
+    if daily_budget is not None:
+        if isinstance(daily_budget, bool):
+            raise ValidationError("creative_test_daily_budget must be an amount in the account currency.")
+        validate_positive_amount(daily_budget, field_name="creative_test_daily_budget")
+        return "daily_budget", daily_budget
+    if (
+        isinstance(lifetime_percentage, bool)
+        or not isinstance(lifetime_percentage, (int, float))
+        or not math.isfinite(lifetime_percentage)
+        or not 0 < lifetime_percentage <= 100
+    ):
+        raise ValidationError(
+            "creative_test_lifetime_budget_percentage must be a number greater than 0 and at most 100."
+        )
+    value = int(lifetime_percentage) if lifetime_percentage == int(lifetime_percentage) else lifetime_percentage
+    return "lifetime_budget_percentage", value
 
 
 def _build_lift_cells(cells: list[dict[str, Any]], account_id: str) -> list[dict[str, Any]]:
@@ -451,11 +550,51 @@ async def _resolve_business_id(client: Any, account_id: str, business_id: str | 
 
 def _paged_summary(normalized: dict[str, Any]) -> dict[str, Any]:
     has_more = bool(normalized["paging"].get("next"))
+    next_after = normalized["paging"].get("after") if has_more else None
     return {
         "complete": not has_more,
         "truncated": has_more,
-        "next_after": normalized["paging"].get("after") if has_more else None,
+        "next_after": next_after,
+        "stop_reason": NO_CURSOR_REASON if has_more and not next_after else None,
     }
+
+
+async def _read_edge_pages(
+    client: Any,
+    parent: str,
+    edge: str,
+    *,
+    fields: list[str],
+    page_size: int,
+    max_pages: int,
+) -> dict[str, Any]:
+    """Read every page of an edge, within max_pages requests.
+
+    complete is true only when Meta's last page had no next link. A next link without a usable
+    cursor, a repeated cursor, or the page cap ends the read as incomplete with stop_reason saying why.
+    """
+    items: list[Any] = []
+    params: dict[str, Any] = {"limit": page_size}
+    seen_cursors: set[str] = set()
+    pages = 0
+    while True:
+        normalized = normalize_collection(await client.list_objects(parent, edge, fields=fields, params=params))
+        pages += 1
+        items.extend(normalized["items"])
+        if not normalized["paging"].get("next"):
+            return {"items": items, "pages_read": pages, "complete": True, "stop_reason": None}
+        cursor = normalized["paging"].get("after")
+        if not cursor:
+            reason = NO_CURSOR_REASON
+        elif cursor in seen_cursors:
+            reason = REPEATED_CURSOR_REASON
+        elif pages >= max_pages:
+            reason = f"Stopped at the {max_pages}-page read cap while Meta reported more pages."
+        else:
+            seen_cursors.add(cursor)
+            params = {"limit": page_size, "after": cursor}
+            continue
+        return {"items": items, "pages_read": pages, "complete": False, "stop_reason": reason}
 
 
 @mcp_server.tool()
@@ -516,7 +655,7 @@ async def list_ad_studies(
     return normalized
 
 
-def _normalize_cell(cell: dict[str, Any]) -> dict[str, Any]:
+def _normalize_cell(cell: dict[str, Any], *, with_ad_ids: bool = False) -> dict[str, Any]:
     normalized: dict[str, Any] = {
         "id": cell.get("id"),
         "name": cell.get("name"),
@@ -530,10 +669,17 @@ def _normalize_cell(cell: dict[str, Any]) -> dict[str, Any]:
         paging = value.get("paging") if isinstance(value, dict) else None
         if isinstance(paging, dict) and paging.get("next"):
             truncated.append(key)
+    if with_ad_ids:
+        # Creative tests hold one ad per cell; Meta's SDK names the cell field ad_ids.
+        normalized["ad_ids"] = _edge_ids(cell.get("ad_ids"))
     if truncated:
         # Meta expanded only the first page of these memberships; the remaining ids were not read.
         normalized["membership_truncated"] = truncated
     return normalized
+
+
+def _cell_members(cell: dict[str, Any]) -> list[str]:
+    return cell["campaign_ids"] + cell["adset_ids"] + cell["ad_account_ids"] + cell.get("ad_ids", [])
 
 
 def _parse_results(raw: Any) -> list[Any]:
@@ -579,15 +725,21 @@ def _split_outcome(objective: dict[str, Any], cells: list[dict[str, Any]]) -> di
             "high_performer_ids": entry.get("high_performer_ids"),
             "confidence_by_ad_object_id": entry.get("confidence_by_ad_object_id"),
         }
+        high_performers = entry.get("high_performer_ids")
+        if isinstance(high_performers, list) and any("ad_ids" in cell for cell in cells):
+            # Creative tests: Meta's guide calls high_performer_ids the authoritative outcome.
+            mapped = []
+            for ad_id in high_performers:
+                cell = next((cell for cell in cells if str(ad_id) in cell.get("ad_ids", [])), None)
+                mapped.append({
+                    "ad_id": str(ad_id),
+                    "cell_id": cell["id"] if cell else None,
+                    "cell_name": cell["name"] if cell else None,
+                })
+            response["high_performer_cells"] = mapped
         if winner_id not in (None, ""):
             winner_id = str(winner_id)
-            cell = next(
-                (
-                    cell for cell in cells
-                    if winner_id in cell["campaign_ids"] + cell["adset_ids"] + cell["ad_account_ids"]
-                ),
-                None,
-            )
+            cell = next((cell for cell in cells if winner_id in _cell_members(cell)), None)
             response["winner"] = {
                 "ad_object_id": winner_id,
                 "cell_id": cell["id"] if cell else None,
@@ -777,32 +929,57 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
 
     include_results adds the outcome: the winning cell and confidence for A/B tests (decided by the
     primary objective; with no unique primary, each objective's outcome and no single winner),
-    incremental conversions, lift and confidence for lift studies (whole-study aggregate and Meta's
-    per-cell breakdown, kept separate), or a plain not_ready status.
+    high_performer_ids mapped to cells for creative tests, incremental conversions, lift and
+    confidence for lift studies (whole-study aggregate and Meta's per-cell breakdown, kept
+    separate), or a plain not_ready status. Cells and objectives are read in full within a page
+    cap; summary says whether each read was complete and why not.
     """
     study_id = blank_to_none(study_id)
     if study_id is None:
         raise ValidationError("study_id is required.")
     client = get_graph_api_client()
     study = await client.get_object(study_id, fields=STUDY_FIELDS)
-    cells_payload = normalize_collection(
-        await client.list_objects(study_id, "cells", fields=CELL_FIELDS, params={"limit": MAX_CELLS_PER_STUDY})
-    )
+    is_creative_test = str(study.get("type") or "").upper() == CREATIVE_TEST_TYPE
+    ad_membership_note = None
+    if is_creative_test:
+        # ad_ids is in the SDK's AdStudyCell fields but not in Meta's reference pages, so a
+        # rejection falls back to the documented cell fields instead of failing the whole read.
+        try:
+            cells_read = await _read_edge_pages(
+                client, study_id, "cells", fields=[*CELL_FIELDS, "ad_ids"],
+                page_size=MAX_CELLS_PER_STUDY, max_pages=STUDY_EDGE_PAGE_CAP,
+            )
+        except MetaApiError as exc:
+            is_creative_test = False
+            ad_membership_note = (
+                f"Meta rejected the cell field ad_ids ({exc}), so each cell's ad is not shown and "
+                "high performers are not mapped to cells; high_performer_ids are ad ids."
+            )
+    if not is_creative_test:
+        cells_read = await _read_edge_pages(
+            client, study_id, "cells", fields=CELL_FIELDS,
+            page_size=MAX_CELLS_PER_STUDY, max_pages=STUDY_EDGE_PAGE_CAP,
+        )
     objective_fields = [*OBJECTIVE_FIELDS, "results"] if include_results else OBJECTIVE_FIELDS
-    objectives_payload = normalize_collection(
-        await client.list_objects(study_id, "objectives", fields=objective_fields, params={"limit": 100})
+    objectives_read = await _read_edge_pages(
+        client, study_id, "objectives", fields=objective_fields, page_size=100, max_pages=STUDY_EDGE_PAGE_CAP,
     )
     now = _now()
     state = _study_state(study, now)
-    cells = [_normalize_cell(cell) for cell in cells_payload["items"]]
+    cells = [
+        _normalize_cell(cell, with_ad_ids=is_creative_test)
+        for cell in cells_read["items"] if isinstance(cell, dict)
+    ]
     objectives = []
-    for objective in objectives_payload["items"]:
+    for objective in objectives_read["items"]:
+        if not isinstance(objective, dict):
+            continue
         parsed = _parse_results(objective.get("results")) if include_results else []
         objectives.append({
             **{key: value for key, value in objective.items() if key != "results"},
             "parsed_results": parsed,
         })
-    cell_nodes_complete = not cells_payload["paging"].get("next")
+    cell_nodes_complete = cells_read["complete"]
     memberships_complete = not any(cell.get("membership_truncated") for cell in cells)
     response: dict[str, Any] = {
         "item": {**study, "state": state},
@@ -818,9 +995,15 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             "cells_complete": cell_nodes_complete and memberships_complete,
             "cell_nodes_complete": cell_nodes_complete,
             "memberships_complete": memberships_complete,
-            "objectives_complete": not objectives_payload["paging"].get("next"),
+            "objectives_complete": objectives_read["complete"],
+            "cells_pages_read": cells_read["pages_read"],
+            "cells_stop_reason": cells_read["stop_reason"],
+            "objectives_pages_read": objectives_read["pages_read"],
+            "objectives_stop_reason": objectives_read["stop_reason"],
         },
     }
+    if ad_membership_note:
+        response["summary"]["ad_membership_note"] = ad_membership_note
     if not memberships_complete:
         response["summary"]["membership_note"] = (
             "Meta returned only the first page of some cells' campaigns, ad sets or ad accounts "
@@ -881,9 +1064,9 @@ async def _scan_active_studies(
             return {"active": active, "pages_read": pages, "complete": True, "stop_reason": None}
         cursor = normalized["paging"].get("after")
         if not cursor:
-            reason = "Meta reported another page but returned no cursor to fetch it."
+            reason = NO_CURSOR_REASON
         elif cursor in seen_cursors:
-            reason = "Meta returned a cursor already read, so paging stopped to avoid counting a page twice."
+            reason = REPEATED_CURSOR_REASON
         elif stop_at is not None and len(active) >= stop_at:
             reason = f"Stopped once {stop_at} scheduled or running studies were found."
         elif pages >= max_pages:
@@ -1013,22 +1196,38 @@ async def check_ab_test_eligibility(
                     "Meta decides at creation."
                 )
         entities.append(_with_outcome(result))
-    account_check = await _count_account_active_studies(client, account_id, now)
-    account_check["blockers"] = []
-    account_check["unresolved"] = []
-    account_check["warnings"] = []
-    if account_check["active_studies"] >= MAX_CONCURRENT_STUDIES:
-        account_check["blockers"].append(
-            f"The account already has {account_check['active_studies']} scheduled or running studies; "
-            f"Meta documents a maximum of {MAX_CONCURRENT_STUDIES} concurrent studies per advertiser."
-        )
-    elif not account_check["count_complete"]:
+    try:
+        account_check = await _count_account_active_studies(client, account_id, now)
+    except (NotFoundError, MetaApiError, UnsupportedFeatureError, RateLimitError) as exc:
         message = (
-            f"Counted active studies on the first {account_check['pages_read']} page(s) only: "
-            f"{account_check['stop_reason']} The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
+            f"The account's concurrent-study limit check was not performed: reading {account_id}'s "
+            f"impacting_ad_studies failed ({exc}). The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
         )
-        account_check["unresolved"].append(message)
+        account_check = {
+            "performed": False,
+            "active_studies": None,
+            "pages_read": None,
+            "count_complete": False,
+            "stop_reason": message,
+            "blockers": [],
+            "unresolved": [message],
+            "warnings": [],
+        }
         missing_signals.append(message)
+    else:
+        account_check = {"performed": True, **account_check, "blockers": [], "unresolved": [], "warnings": []}
+        if account_check["active_studies"] >= MAX_CONCURRENT_STUDIES:
+            account_check["blockers"].append(
+                f"The account already has {account_check['active_studies']} scheduled or running studies; "
+                f"Meta documents a maximum of {MAX_CONCURRENT_STUDIES} concurrent studies per advertiser."
+            )
+        elif not account_check["count_complete"]:
+            message = (
+                f"Counted active studies on the first {account_check['pages_read']} page(s) only: "
+                f"{account_check['stop_reason']} The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
+            )
+            account_check["unresolved"].append(message)
+            missing_signals.append(message)
     if len(ids) > 100 // MIN_SPLIT_TREATMENT_PERCENTAGE:
         account_check["warnings"].append(
             f"{len(ids)} entities cannot each get their own cell: Meta requires every cell's "
@@ -1097,18 +1296,36 @@ async def create_ab_test(
     hypothesis: str | None = None,
     business_id: str | None = None,
     params: dict[str, Any] | None = None,
+    creative_test_daily_budget: float | None = None,
+    creative_test_lifetime_budget_percentage: float | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Create an A/B test (Meta split test) comparing campaigns or ad sets. Run check_ab_test_eligibility first.
+    """Create an A/B test (Meta split test) comparing campaigns, ad sets, or single ads. Run check_ab_test_eligibility first.
 
     cells: at least two, each {name, treatment_percentage, campaign_ids or adset_ids, description?}.
     Shares are at least 10 each and must total 100; no campaign or ad set may be in two cells.
+    Creative test: give every cell ad_ids with exactly one ad (2 to 7 cells, whole-number shares) and
+    a budget, creative_test_daily_budget (account currency) or creative_test_lifetime_budget_percentage.
+    Meta decides the winner; its documented API offers no choice of winning metric.
     Times are ISO 8601 with offset or Unix seconds. Meta creates studies on the account's business;
     pass business_id if the account has none. hypothesis is stored as the study description.
+    dry_run returns the request and sends nothing.
     """
     account_id = _required_account_id(account_id)
     if not isinstance(name, str) or not name.strip():
         raise ValidationError("name is required.")
-    built_cells = _build_ab_cells(cells)
+    ad_level = _uses_ad_cells(cells)
+    built_cells = _build_creative_cells(cells) if ad_level else _build_ab_cells(cells)
+    budget_key = budget_value = None
+    if ad_level:
+        budget_key, budget_value = _creative_budget_choice(
+            creative_test_daily_budget, creative_test_lifetime_budget_percentage,
+        )
+    elif creative_test_daily_budget is not None or creative_test_lifetime_budget_percentage is not None:
+        raise ValidationError(
+            "creative_test_daily_budget and creative_test_lifetime_budget_percentage apply only to "
+            "creative tests, whose cells each hold one ad in ad_ids."
+        )
     start = _to_unix(start_time, "start_time")
     end = _to_unix(end_time, "end_time")
     if end <= start:
@@ -1117,26 +1334,74 @@ async def create_ab_test(
         isinstance(confidence_level, bool) or not math.isfinite(confidence_level) or confidence_level <= 0
     ):
         raise ValidationError("confidence_level must be a positive number.")
-    payload = merge_graph_payload(
-        {
-            "name": name.strip(),
-            "type": "SPLIT_TEST",
-            "cells": built_cells,
-            "start_time": start,
-            "end_time": end,
-            "confidence_level": OMIT if confidence_level is None else confidence_level,
-            "description": blank_to_none(hypothesis) or OMIT,
-        },
-        params,
-    )
+    typed: dict[str, Any] = {
+        "name": name.strip(),
+        "type": CREATIVE_TEST_TYPE if ad_level else "SPLIT_TEST",
+        "cells": built_cells,
+        "start_time": start,
+        "end_time": end,
+    }
+    if ad_level:
+        # Only creative tests own these keys, so params keeps reaching them for other tests as before.
+        typed.update({
+            "cooldown_start_time": start,
+            "observation_end_time": end,
+            "creative_test_config": {budget_key: budget_value},
+        })
+    typed.update({
+        "confidence_level": OMIT if confidence_level is None else confidence_level,
+        "description": blank_to_none(hypothesis) or OMIT,
+    })
+    payload = merge_graph_payload(typed, params)
     client = get_graph_api_client()
+    creative_test: dict[str, Any] | None = None
+    if ad_level:
+        creative_test = {
+            "type": CREATIVE_TEST_TYPE,
+            "budget": {budget_key: budget_value},
+            "notes": [
+                "cooldown_start_time and observation_end_time are set to start_time and end_time, as "
+                "Meta's split testing guide requires for creative tests.",
+                "Meta reports a creative test's outcome as high_performer_ids (read it with get_ad_study "
+                "include_results); winner_ad_object_id is always null for creative tests.",
+                "No winning-metric choice is sent: Meta's public Ad Study documentation describes no "
+                "parameter for it.",
+            ],
+            "warnings": [],
+        }
+        if budget_key == "daily_budget":
+            currency = await resolve_account_currency(client, account_id)
+            minor = to_minor_units(budget_value, currency, field_name="creative_test_daily_budget")
+            payload["creative_test_config"] = {"daily_budget": minor}
+            creative_test["budget"] = {"daily_budget": budget_value, "currency": currency, "sent_as": minor}
+            creative_test["notes"].append(
+                "Meta's creative test documentation does not state the unit of daily_budget; it is sent in "
+                "the account currency's minor units (cents for USD), the unit Meta uses for every other budget."
+            )
+        if len(built_cells) > REFERENCE_CREATIVE_TEST_CELLS:
+            creative_test["warnings"].append(
+                f"{len(built_cells)} cells: Meta's split testing guide allows 2 to {MAX_CREATIVE_TEST_CELLS}, "
+                f"but its Ad Study reference describes creative tests as 2 to {REFERENCE_CREATIVE_TEST_CELLS} "
+                "cells, so Meta may reject this."
+            )
     owner = await _resolve_business_id(client, account_id, blank_to_none(business_id))
-    result = await client.create_edge_object(owner, "ad_studies", data=payload)
-    return creation_response(
-        action="create_ab_test",
-        target={"account_id": account_id, "business_id": owner},
-        result=result,
-    )
+    target = {"account_id": account_id, "business_id": owner}
+    if dry_run:
+        response: dict[str, Any] = {
+            "ok": True,
+            "action": "create_ab_test",
+            "dry_run": True,
+            "target": target,
+            "created": None,
+            "would_send": {"method": "POST", "parent_id": owner, "edge": "ad_studies", "data": payload},
+            "message": "Nothing was sent. would_send is the exact request create_ab_test would make.",
+        }
+    else:
+        result = await client.create_edge_object(owner, "ad_studies", data=payload)
+        response = creation_response(action="create_ab_test", target=target, result=result)
+    if creative_test is not None:
+        response["creative_test"] = creative_test
+    return response
 
 
 @mcp_server.tool()

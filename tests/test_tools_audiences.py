@@ -1068,6 +1068,19 @@ def test_update_custom_audience_named_rule_reads_rule_first_and_sends_it(monkeyp
     assert result["current"] == {"name": "Checkout visitors", "rule": WEBSITE_RULE}
 
 
+@pytest.mark.parametrize("rule", [WEBSITE_RULE, json.dumps(WEBSITE_RULE)])
+def test_update_custom_audience_rule_through_mcp_boundary(monkeypatch, rule) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(mcp_server.call_tool(
+        "update_custom_audience", {"audience_id": "aud_1", "rule": rule},
+    )).structured_content
+    assert client.calls[-1] == ("update", "aud_1", {"rule": WEBSITE_RULE})
+    assert result["current"] == {"rule": WEBSITE_RULE}
+
+
 def test_update_custom_audience_rule_named_and_in_params_raises_before_network(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(audiences.ValidationError, match="rule") as excinfo:
