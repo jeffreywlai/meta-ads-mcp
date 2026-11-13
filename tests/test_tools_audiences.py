@@ -1349,7 +1349,7 @@ def test_create_custom_audience_named_values_through_the_mcp_boundary(monkeypatc
 @pytest.mark.parametrize(("kwargs", "match"), [
     ({"is_value_based": True, "params": {"is_value_based": 1}}, "is_value_based"),
     ({"audience_labels": ["AT_RISK"], "params": {"audience_labels": ["AT_RISK"]}}, "audience_labels"),
-    ({"audience_labels": ["NOT_A_LABEL"]}, "NOT_A_LABEL"),
+    ({"audience_labels": ["NOT_A_LABEL"]}, "audience_labels has 1 value that is not a recognised label"),
     ({"audience_labels": [" "]}, "audience_labels"),
     ({"audience_labels": []}, "audience_labels"),
     ({"is_value_based": True, "subtype": "WEBSITE"}, "CUSTOM"),
@@ -1441,8 +1441,8 @@ def test_update_custom_audience_labels_through_mcp_boundary(monkeypatch) -> None
 
 @pytest.mark.parametrize(("kwargs", "match"), [
     ({"audience_labels": ["AT_RISK"], "params": {"audience_labels": ["AT_RISK"]}}, "audience_labels"),
-    ({"audience_labels": ["NOT_A_LABEL"]}, "NOT_A_LABEL"),
-    ({"audience_labels": ["APP_INSTALLERS"]}, "APP_INSTALLERS"),
+    ({"audience_labels": ["NOT_A_LABEL"]}, "audience_labels has 1 value that is not a recognised label"),
+    ({"audience_labels": ["APP_INSTALLERS", "AT_RISK", "x"]}, "audience_labels has 2 values that are not"),
     ({"audience_labels": [" "]}, "audience_labels"),
     ({"audience_labels": []}, "audience_labels"),
     ({"audience_labels": ""}, "audience_labels"),
@@ -1471,3 +1471,37 @@ def test_audience_labels_match_metas_published_list_and_sdk_enum() -> None:
              "HIGH_VALUE_CUSTOMERS", "LOW_VALUE_CUSTOMERS", "AT_RISK", "DISENGAGED", "GENERAL_CUSTOMERS"}
     sdk_only = {"CART_ABANDONERS", "RECENT_PURCHASERS", "OTHER_1", "OTHER_2", "OTHER_3"}
     assert audiences.AUDIENCE_LABELS == guide | sdk_only
+
+
+# R4 J2: an unrecognised label is counted, never quoted back
+
+
+@pytest.mark.parametrize("tool", ["create_custom_audience", "update_custom_audience"])
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+def test_audience_label_error_does_not_echo_a_misplaced_person(monkeypatch, caplog, tool, routed) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    secret = "".join(("private.person", "@labels.invalid"))
+    args = {"account_id": "10", "name": "U"} if tool == "create_custom_audience" else {"audience_id": "20"}
+    arguments = {**args, "audience_labels": [secret]}
+    name, call_arguments = (("call_tool", {"name": tool, "arguments": arguments}) if routed else (tool, arguments))
+    with pytest.raises(ToolError) as error:
+        asyncio.run(mcp_server.call_tool(name, call_arguments))
+    assert "audience_labels has 1 value that is not a recognised label" in str(error.value)
+    assert "HIGH_VALUE_CUSTOMERS" in str(error.value)
+    assert secret.casefold() not in str(error.value).casefold()
+    assert secret.casefold() not in caplog.text.casefold()
+
+
+def test_audience_label_error_counts_every_unrecognised_value_without_quoting_any(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    values = ["Jordan Example", "AT_RISK", "jordan@example.com"]
+    with pytest.raises(audiences.ValidationError) as error:
+        asyncio.run(audiences.create_custom_audience(account_id="10", name="U", audience_labels=values))
+    message = str(error.value)
+    assert "2 values that are not" in message
+    assert "jordan" not in message.casefold()

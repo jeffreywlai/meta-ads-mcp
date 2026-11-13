@@ -1554,3 +1554,86 @@ def test_h18_owned_catalog_without_id_is_not_read_as_none_and_is_a_gap(monkeypat
     assert result["summary"]["catalogs_checked"] == 1
     assert result["summary"]["complete"] is False
     assert "no readable id" in result["summary"]["incomplete_reason"]
+
+
+# R4 J6: one canonical identity for every row id ---------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+@pytest.mark.parametrize("unreadable_id", ["unknown", " 30 ", -30])
+def test_access_unknown_recipient_identity_cannot_be_assumed_absent(monkeypatch, kind, unreadable_id) -> None:
+    """Reviewer reproduction: a MANAGE row with an odd id must never let the change pass as a new grant."""
+    edge, tasks_key = ("assigned_users", "tasks") if kind == "PERSON" else ("agencies", "permitted_tasks")
+    client = _use(monkeypatch, FakeClient(
+        objects={"10": {"id": "10", "business": {"id": "40"}}},
+        edges={("10", edge): {"data": [{"id": unreadable_id, tasks_key: ["MANAGE"]}]}},
+    ))
+    try:
+        run(business_access.set_catalog_access("10", "30", ["ADVERTISE"], user_type=kind))
+    except ValidationError:
+        pass
+    assert client.writes() == []
+    preview = run(business_access.preview_catalog_access_change("10", "30", ["ADVERTISE"], user_type=kind))
+    assert preview["would_be_refused"] is True, preview
+
+
+@pytest.mark.parametrize("odd_id", ["unknown", -30, "-30", "30.0", 30.0, True, "３０", "3 0", {"id": "30"}])
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+def test_row_whose_identity_cannot_be_read_makes_current_access_unknown(monkeypatch, kind, odd_id) -> None:
+    """Any id that is not a plain numeric id is unidentified, even with the caller fully readable."""
+    edge, tasks_key = ("assigned_users", "tasks") if kind == "PERSON" else ("agencies", "permitted_tasks")
+    recipient = PERSON if kind == "PERSON" else PARTNER
+    client = _use(monkeypatch, FakeClient(
+        objects={"me": {"id": "100"}},
+        edges={
+            (CATALOG, edge): {"data": [{"id": odd_id, tasks_key: ["MANAGE"]}]},
+            ("me", "business_users"): {"data": [{"id": CALLER, "business": {"id": OTHER_BUSINESS}}]},
+        },
+    ))
+    business = {"business_id": BUSINESS} if kind == "PERSON" else {}
+    preview = run(business_access.preview_catalog_access_change(
+        CATALOG, recipient, ["ADVERTISE"], user_type=kind, **business,
+    ))
+    assert preview["change"] == "unknown" and preview["would_be_refused"] is True
+    assert preview["previous"]["has_direct_access"] is None
+    assert "without a readable id" in preview["current_access_read"]["incomplete_reason"]
+    with pytest.raises(ValidationError, match="could not be read completely"):
+        run(business_access.set_catalog_access(CATALOG, recipient, ["ADVERTISE"], user_type=kind, **business))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("same_id", [f" {PERSON} ", int(PERSON), PERSON])
+def test_padded_or_whole_number_id_is_the_recipient_and_keeps_manage_protection(monkeypatch, same_id) -> None:
+    """A trimmed numeric id is the recipient's own row: the change replaces MANAGE, it is not a new grant."""
+    client = _access_client(["MANAGE"])
+    client.edges[(CATALOG, "assigned_users")] = {"data": [{"id": same_id, "tasks": ["MANAGE"]}]}
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
+    assert preview["change"] == "change"
+    assert preview["previous"]["has_direct_access"] is True and preview["previous"]["tasks"] == ["MANAGE"]
+    assert preview["self_check"]["checked"] is True and preview["self_check"]["is_caller"] is False
+    assert "MANAGE" in preview["can_no_longer"]
+
+
+def test_padded_caller_id_is_still_recognised_as_the_caller(monkeypatch) -> None:
+    """The caller's own ids go through the same identity: a padded id still blocks self-removal."""
+    client = _access_client(["MANAGE"], caller_ids=(f" {PERSON} ",))
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, [], business_id=BUSINESS))
+    assert preview["self_check"]["is_caller"] is True and preview["would_be_refused"] is True
+
+
+@pytest.mark.parametrize("odd_id", ["unknown", -30])
+def test_exact_id_search_with_an_unidentified_row_is_not_complete(monkeypatch, odd_id) -> None:
+    _use(monkeypatch, FakeClient(edges={(CATALOG, "agencies"): _page([{"id": "88"}, {"id": odd_id}])}))
+    result = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, user_type="AGENCY", user_id="30"))
+    assert result["items"] == []
+    assert result["summary"]["complete"] is False
+    assert "readable numeric id" in result["summary"]["incomplete_reason"]
+
+
+def test_name_search_with_a_non_object_row_is_not_complete(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={("me", "businesses"): _page([{"id": "1", "name": "Acme"}, "x"])}))
+    result = run(business_access.list_businesses(name_contains="acme"))
+    assert [item["id"] for item in result["items"]] == ["1"]
+    assert result["summary"]["complete"] is False

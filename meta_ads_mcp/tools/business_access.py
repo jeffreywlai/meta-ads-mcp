@@ -72,7 +72,7 @@ MAX_CATALOGS_SCANNED = 50
 def _numeric_id(value: Any, name: str) -> str:
     """Return a digits-only id or raise before any network call."""
     normalized = blank_to_none(value if isinstance(value, str) else None)
-    if normalized is None or not normalized.isdigit():
+    if normalized is None or not (normalized.isascii() and normalized.isdigit()):
         raise ValidationError(f"{name} must be a numeric Meta id passed as a string.")
     return normalized
 
@@ -225,35 +225,39 @@ async def _scan(
             "unreadable_rows": unreadable}
 
 
-def _readable_id(value: Any) -> str | None:
-    """An id Meta returned as a non-empty string or a whole number, as a string; otherwise None."""
+def _row_identity(value: Any) -> str | None:
+    """The one canonical identity of an id Meta returned, or None when it cannot be read.
+
+    Every id this server matches against is a plain numeric Graph id, so a row's id
+    counts only when it is a non-negative whole number, or a string of digits once
+    surrounding spaces are removed. Anything else (a word, a negative number, a
+    boolean, a decimal, an object) cannot be compared with the recipient or the
+    caller, so the row is unidentified. Used for matching the recipient, for
+    counting unidentified rows, and for the caller's own ids alike.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+        return str(value) if value >= 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped.isascii() and stripped.isdigit() else None
     return None
 
 
-def _usable_id(value: Any) -> str | None:
-    """A Graph id as a string only when Meta returned a plain numeric id, otherwise None.
-
-    Used for the caller's own identities, where a value in any other shape cannot be
-    compared with the numeric recipient id and so cannot clear a removal.
-    """
-    readable = _readable_id(value)
-    return readable if readable is not None and readable.isdigit() else None
+def _is_row(row: dict[str, Any], wanted_id: str) -> bool:
+    """True when the row's canonical identity is wanted_id."""
+    return _row_identity(row.get("id")) == wanted_id
 
 
 def _unidentified_rows(scan: dict[str, Any]) -> int:
-    """Rows of a scan whose own id cannot be read: not an object, or no id at all."""
-    return scan.get("unreadable_rows", 0) + sum(1 for row in scan["rows"] if _readable_id(row.get("id")) is None)
+    """Rows of a scan whose own id cannot be read: not an object, no id, or an id that is not a numeric id."""
+    return scan.get("unreadable_rows", 0) + sum(1 for row in scan["rows"] if _row_identity(row.get("id")) is None)
 
 
 def _matches(row: dict[str, Any], search: str, text_fields: tuple[str, ...]) -> bool:
     if search.isdigit():
-        return str(row.get("id", "")) == search
+        return _is_row(row, search)
     needle = search.casefold()
     return any(needle in str(row.get(field) or "").casefold() for field in text_fields)
 
@@ -267,12 +271,17 @@ def _search_response(
 ) -> dict[str, Any]:
     matches = [_project(row, fields) for row in scan["rows"] if _matches(row, search, text_fields)]
     items = matches[:limit]
+    # A row that could not be read could be the one searched for: a non-object row for
+    # any search, and a row without a readable id for an exact id search with no match.
+    unsearchable = scan.get("unreadable_rows", 0)
+    if search.isdigit() and not matches:
+        unsearchable = _unidentified_rows(scan)
     summary: dict[str, Any] = {
         "count": len(items),
         "matched": len(matches),
         "scanned": len(scan["rows"]),
         "requests": scan["requests"],
-        "complete": scan["complete"] and len(matches) <= limit,
+        "complete": scan["complete"] and len(matches) <= limit and not unsearchable,
         "search": (
             "exact id match" if search.isdigit()
             else f"case-insensitive substring of {' or '.join(text_fields)}, matched by this server"
@@ -282,6 +291,11 @@ def _search_response(
     reasons = []
     if not scan["complete"]:
         reasons.append(f"Not every row was read: {scan['reason']}")
+    if unsearchable:
+        reasons.append(
+            f"Meta returned {unsearchable} row(s) this server could not read (not an object, or without a "
+            "readable numeric id), so whether they match is unknown."
+        )
     if len(matches) > limit:
         reasons.append(f"{len(matches)} rows matched; only the first {limit} are returned. Narrow the search.")
     if reasons:
@@ -397,9 +411,9 @@ async def _find_assignment(
     scan = await _scan(
         client, catalog_id, "assigned_users", fields=ASSIGNED_USER_FIELDS,
         params={"business": business_id},
-        stop_when=lambda rows: any(str(row.get("id")) == user_id for row in rows),
+        stop_when=lambda rows: any(_is_row(row, user_id) for row in rows),
     )
-    row = next((row for row in scan["rows"] if str(row.get("id")) == user_id), None)
+    row = next((row for row in scan["rows"] if _is_row(row, user_id)), None)
     return _found(row, scan, ASSIGNED_USER_FIELDS, "tasks")
 
 
@@ -562,7 +576,7 @@ async def list_user_assigned_catalogs(
         gaps.append(f"{unidentified_catalogs} owned catalog row(s) had no readable id and could not be checked.")
     skipped = 0
     for catalog in catalogs:
-        usable = _readable_id(catalog.get("id"))
+        usable = _row_identity(catalog.get("id"))
         if usable is None:
             skipped += 1
             continue
@@ -573,7 +587,7 @@ async def list_user_assigned_catalogs(
             unreadable.append(catalog_id)
             continue
         requests += partners["requests"]
-        if any(str(row.get("id")) == user_id for row in partners["rows"]):
+        if any(_is_row(row, user_id) for row in partners["rows"]):
             items.append({**_project(catalog, OWNED_CATALOG_FIELDS), "access_type": "AGENCY"})
         elif not partners["complete"]:
             gaps.append(f"Catalog {catalog_id}: partner list not fully read ({partners['reason']}).")
@@ -643,13 +657,13 @@ async def _caller_ids(client: Any) -> set[str] | None:
     """
     try:
         me = await client.get_object("me", fields=["id"])
-        own_id = _usable_id(me.get("id")) if isinstance(me, dict) else None
+        own_id = _row_identity(me.get("id")) if isinstance(me, dict) else None
         scan = await _scan(client, "me", "business_users", fields=["id", "business"], max_pages=3)
     except MetaAdsError:
         return None
     if own_id is None or not scan["complete"] or scan.get("unreadable_rows"):
         return None
-    row_ids = [_usable_id(row.get("id")) for row in scan["rows"]]
+    row_ids = [_row_identity(row.get("id")) for row in scan["rows"]]
     if any(row_id is None for row_id in row_ids):
         return None
     return {own_id, *row_ids}  # type: ignore[arg-type]
@@ -657,7 +671,7 @@ async def _caller_ids(client: Any) -> set[str] | None:
 
 def _row_business_id(row: dict[str, Any]) -> str | None:
     business = row.get("business")
-    return _usable_id(business.get("id")) if isinstance(business, dict) else None
+    return _row_identity(business.get("id")) if isinstance(business, dict) else None
 
 
 async def _caller_business_ids(client: Any) -> set[str] | None:
@@ -896,11 +910,11 @@ async def _find_partner(client: Any, catalog_id: str, partner_id: str) -> dict[s
     async def read(fields: list[str]) -> dict[str, Any]:
         return await _scan(
             client, catalog_id, "agencies", fields=fields,
-            stop_when=lambda rows: any(str(row.get("id")) == partner_id for row in rows),
+            stop_when=lambda rows: any(_is_row(row, partner_id) for row in rows),
         )
 
     scan, rejected = await _read_partners(read)
-    row = next((row for row in scan["rows"] if str(row.get("id")) == partner_id), None)
+    row = next((row for row in scan["rows"] if _is_row(row, partner_id)), None)
     found = _found(row, scan, PARTNER_TASK_FIELDS, "permitted_tasks")
     if rejected and row is not None:
         found["reason"] = f"{PARTNER_TASKS_REJECTED_REASON}, so the current tasks are unknown"
