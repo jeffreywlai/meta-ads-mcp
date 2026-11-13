@@ -1,4 +1,12 @@
 {
-  "_about": "Deliberate changes to the call contract of tools that are on master. Each entry needs a real benefit and what a caller must change. tests/test_backward_compat.py fails on any undeclared change, and on any entry here that no longer matches a detected change. Kinds: removed_tool, removed_parameter, new_required_parameter, default_changed (all detected automatically), and behaviour (a change the signature does not show, such as stricter validation or a changed response field; not detected, so declare it by hand).",
-  "changes": []
+  "_about": "Deliberate changes to the call contract of tools that are on master. Each entry needs a real benefit and what a caller must change. tests/test_backward_compat.py fails on any undeclared change, and on any entry here that no longer matches a detected change. Kinds: removed_tool, removed_parameter, new_required_parameter, default_changed (all detected automatically), and behaviour (a change the signature does not show, such as stricter validation or a changed response field; not detected, so declare it by hand). A behaviour entry may use tool \"*\" when the change applies to every tool on master.",
+  "changes": [
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "An id that contains a slash, a question mark, a hash, two dots in a row or a space is now refused before any request is sent. Before, such an id was placed in the request address as written, so get_creative('123/') read creative 123 and an id like '123/ads' read a different object than the tool was meant to read.",
+      "why_better": "A tool can only reach the object type it was built for. An id copied from text that strangers wrote (an ad comment, a Page review) can no longer steer a read or a delete to a different object or attach extra options to the request.",
+      "migration": "Pass the plain id with nothing before or after it, for example '123' or 'act_123'. Trim a trailing slash or any address fragment before calling."
+    }
+  ]
 }

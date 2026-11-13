@@ -90,7 +90,8 @@ def test_no_declaration_is_stale() -> None:
 def test_every_declaration_says_why_and_how_to_migrate() -> None:
     for entry in DECLARED:
         label = f"{entry.get('tool')} {entry.get('kind')} {entry.get('parameter', '')}"
-        assert entry["tool"] in MASTER_CONTRACT, f"{label}: not a tool on master"
+        every_tool = entry["tool"] == "*" and entry["kind"] == "behaviour"
+        assert every_tool or entry["tool"] in MASTER_CONTRACT, f"{label}: not a tool on master"
         assert entry["kind"] in ALL_KINDS, f"{label}: unknown kind"
         assert len(entry.get("why_better", "").strip()) >= 40, f"{label}: say why this is better for the user"
         assert len(entry.get("migration", "").strip()) >= 20, f"{label}: say what a caller must change"
