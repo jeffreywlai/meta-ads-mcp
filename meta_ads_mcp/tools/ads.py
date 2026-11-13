@@ -22,6 +22,7 @@ from meta_ads_mcp.tools.campaigns import (
     build_copy_request,
     check_true_or_false,
     check_whole_number,
+    params_half_of_time_pair,
     read_adlabels,
     reject_money_in_params,
     reject_named_and_params,
@@ -203,6 +204,9 @@ async def create_ad(
     later_fields = {**schedule_times, **named_later}
     schedule_start = validate_schedule_time(ad_schedule_start_time, "ad_schedule_start_time")
     schedule_end = validate_schedule_time(ad_schedule_end_time, "ad_schedule_end_time")
+    # One bound named and the other inside params: compare the pair as it will be sent.
+    schedule_start = schedule_start or params_half_of_time_pair(ad_schedule_end_time, params, "ad_schedule_start_time")
+    schedule_end = schedule_end or params_half_of_time_pair(ad_schedule_start_time, params, "ad_schedule_end_time")
     if schedule_start is not None and schedule_end is not None and schedule_end <= schedule_start:
         raise ValidationError("ad_schedule_end_time must be after ad_schedule_start_time.")
     if bid_amount is not None:

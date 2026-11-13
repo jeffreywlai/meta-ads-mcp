@@ -785,6 +785,56 @@ def test_create_ad_schedule_time_errors_make_no_call(monkeypatch, arguments, mes
         asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", **arguments))
 
 
+# Round five: one schedule bound named and the other inside params is checked as the
+# pair that will be sent; both inside params stays an old-style call, sent unchanged.
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"ad_schedule_start_time": "2026-12-10T00:00:00Z",
+          "params": {"ad_schedule_end_time": "2026-12-05T00:00:00Z"}},
+         "ad_schedule_end_time must be after ad_schedule_start_time"),
+        ({"ad_schedule_end_time": "2026-12-05T00:00:00Z", "params": {"ad_schedule_start_time": 1796428800}},
+         "ad_schedule_end_time must be after ad_schedule_start_time"),
+        ({"ad_schedule_start_time": "2026-12-01T00:00:00Z",
+          "params": {"ad_schedule_end_time": "2026-12-31T00:00:00"}},
+         "ad_schedule_end_time inside params needs a UTC offset"),
+        ({"ad_schedule_start_time": "2026-12-01T00:00:00Z", "params": {"ad_schedule_end_time": True}},
+         "ad_schedule_end_time inside params must be"),
+    ],
+)
+def test_create_ad_mixed_schedule_pair_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match=message):
+        asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", **arguments))
+
+
+def test_create_ad_mixed_schedule_pair_in_order_is_sent_as_given(monkeypatch) -> None:
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(ads.create_ad(
+        **AD_BASE, creative_id="crt_123", ad_schedule_start_time="2026-12-01T09:00:00-05:00",
+        params={"ad_schedule_end_time": 1797000000},
+    ))
+    assert client.calls == [
+        ("create", "act_123", "ads", {
+            "name": "Ad", "adset_id": "adset_123", "creative": {"creative_id": "crt_123"}, "status": "PAUSED",
+            "ad_schedule_start_time": "2026-12-01T09:00:00-05:00", "ad_schedule_end_time": 1797000000,
+        }),
+    ]
+
+
+def test_create_ad_params_only_schedule_pair_out_of_order_is_sent_unchanged(monkeypatch) -> None:
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    params = {"ad_schedule_start_time": "1797000000", "ad_schedule_end_time": "1796000000"}
+    asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", params=dict(params)))
+    assert client.calls[-1][3] == {
+        "name": "Ad", "adset_id": "adset_123", "creative": {"creative_id": "crt_123"}, "status": "PAUSED", **params,
+    }
+
+
 def test_update_ad_named_adlabels_reads_first_and_returns_previous(monkeypatch) -> None:
     class LabelledClient(FakeUpdateAdClient):
         async def get_object(self, object_id, *, fields=None, params=None):
