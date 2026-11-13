@@ -460,10 +460,15 @@ async def _read_insights_pages(
         paging = extract_paging(payload)
         if not paging.get("next"):
             return rows
-        if len(rows) >= max_rows or pages >= INSIGHTS_MAX_PAGES:
+        if len(rows) >= max_rows:
             raise ValidationError(
                 f"Insights exceeded the {max_rows}-row scan limit; narrow the window or the number of objects. "
                 "No partial result was returned."
+            )
+        if pages >= INSIGHTS_MAX_PAGES:
+            raise ValidationError(
+                f"Insights needed more than {INSIGHTS_MAX_PAGES} pages ({len(rows)} rows so far); narrow the window "
+                "or the number of objects. No partial result was returned."
             )
         cursor = paging.get("after")
         if not cursor or cursor in seen:
@@ -2563,6 +2568,183 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
 
 
 MAX_CONTEXT_OBJECT_IDS = 50
+# The ad set read is bounded so a large account gives a partial briefing, never an error. As in the ranking
+# report (confirmed live), the highest-spending ad sets are chosen with one lean, spend-sorted request; their
+# full rows come from one request filtered to their ids (adset.id IN); the account's own total gives the share
+# of spend they cover. An unbounded read of every ad set failed live on an account with many ad sets.
+CONTEXT_MAX_ADSETS = 250
+CONTEXT_SORTED_FIELDS = ["adset_id", "spend"]
+_CONTEXT_READ_ERRORS = (MetaApiError, NotFoundError, UnsupportedFeatureError, ValidationError, RateLimitError)
+
+
+async def _read_one_page_with_results(
+    object_id: str, fields: list[str], params: dict[str, Any], *, level: str,
+) -> tuple[list[dict[str, Any]], bool, str | None]:
+    """Read one page with Meta's result fields (once more without them if Meta rejects them).
+
+    Returns the rows, whether Meta has more pages, and the error that made the result fields unavailable.
+    """
+    client = get_graph_api_client()
+    with_results = [*fields, *(field for field in _result_fields(level) if field not in fields)]
+    try:
+        payload = await client.get_insights(object_id, fields=with_results, params=params)
+        result_error = None
+    except (MetaApiError, UnsupportedFeatureError) as exc:
+        if isinstance(exc, MetaApiError) and exc.code not in RESULT_RETRY_CODES:
+            raise
+        result_error = str(_public_error(exc).get("message"))
+        payload = await client.get_insights(object_id, fields=fields, params=params)
+    return _normalize_with_results(payload), bool(extract_paging(payload).get("next")), result_error
+
+
+async def _context_account_spend(account_id: str, start: date, end: date) -> tuple[float | None, str | None]:
+    """The account's own spend in the window, for the share the examined ad sets cover. Never raises."""
+    params = insights_tools._insights_params(level="account", since=start.isoformat(), until=end.isoformat(), limit=1)
+    try:
+        payload = await get_graph_api_client().get_insights(account_id, fields=["spend"], params=params)
+    except _CONTEXT_READ_ERRORS as exc:
+        return None, str(_public_error(exc).get("message"))
+    rows = [row for row in payload.get("data", []) or [] if isinstance(row, dict)]
+    values = [to_float(row.get("spend")) for row in rows]
+    if not rows:
+        return 0.0, None
+    return (None, "Meta's account total had no spend value") if any(v is None for v in values) else (sum(values), None)
+
+
+async def _context_adset_rows(
+    account_id: str, start: date, end: date, scope_ids: list[str] | None,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
+    """Read a bounded set of ad set rows: the highest-spending ones, or those under the named objects.
+
+    Never raises for a read failure or a large account; the coverage block says what was read.
+    """
+    window = {"since": start.isoformat(), "until": end.isoformat()}
+    full_params = insights_tools._insights_params(level="adset", limit=CONTEXT_MAX_ADSETS, **window)
+    coverage: dict[str, Any] = {"max_adsets": CONTEXT_MAX_ADSETS, "status": "read", "error": None}
+    rows: list[dict[str, Any]] = []
+    result_error: str | None = None
+    more = False
+    if scope_ids is not None:
+        coverage.update({
+            "mode": "object_ids",
+            "method": (
+                "two ad set insights requests filtered to the named ids (campaign.id IN, adset.id IN), "
+                f"one page of at most {CONTEXT_MAX_ADSETS} rows each"
+            ),
+        })
+        reads = await asyncio.gather(*(
+            _read_one_page_with_results(
+                account_id, CONTEXT_INSIGHTS_FIELDS,
+                {**full_params, "filtering": [{"field": field, "operator": "IN", "value": list(scope_ids)}]},
+                level="adset",
+            )
+            for field in ("campaign.id", "adset.id")
+        ), return_exceptions=True)
+        errors = []
+        seen: set[str] = set()
+        for read in reads:
+            if isinstance(read, BaseException):
+                if not isinstance(read, _CONTEXT_READ_ERRORS):
+                    raise read
+                errors.append(str(_public_error(read).get("message")))
+                continue
+            read_rows, read_more, read_error = read
+            more = more or read_more
+            result_error = result_error or read_error
+            for row in read_rows:
+                key = str(row.get("adset_id") or "")
+                named = str(row.get("campaign_id") or "") in scope_ids or key in scope_ids
+                if named and key not in seen:
+                    seen.add(key)
+                    rows.append(row)
+        if errors:
+            coverage["error"] = "; ".join(errors)
+            coverage["status"] = "failed" if len(errors) == len(reads) else "partly_read"
+        account_spend, spend_error = await _context_account_spend(account_id, start, end)
+    else:
+        coverage.update({
+            "mode": "top_spenders",
+            "method": (
+                f"one lean ad set request sorted by spend, highest first (limit {CONTEXT_MAX_ADSETS}), then one "
+                "request for those ad sets' full rows filtered by adset.id IN"
+            ),
+        })
+        sorted_params = {**insights_tools._insights_params(level="adset", limit=CONTEXT_MAX_ADSETS, **window),
+                         "sort": ["spend_descending"]}
+
+        async def selection() -> dict[str, Any] | BaseException:
+            try:
+                return await get_graph_api_client().get_insights(
+                    account_id, fields=CONTEXT_SORTED_FIELDS, params=sorted_params,
+                )
+            except _CONTEXT_READ_ERRORS as exc:
+                return exc
+
+        picked, (account_spend, spend_error) = await asyncio.gather(
+            selection(), _context_account_spend(account_id, start, end),
+        )
+        if isinstance(picked, BaseException):
+            coverage.update({"status": "failed", "error": str(_public_error(picked).get("message"))})
+        else:
+            all_ids = list(dict.fromkeys(
+                str(row["adset_id"]) for row in picked.get("data", []) or []
+                if isinstance(row, dict) and row.get("adset_id") is not None
+            ))
+            ids = all_ids[:CONTEXT_MAX_ADSETS]
+            more = bool(extract_paging(picked).get("next")) or len(all_ids) > len(ids)
+            if ids:
+                try:
+                    read_rows, _, result_error = await _read_one_page_with_results(
+                        account_id, CONTEXT_INSIGHTS_FIELDS,
+                        {**full_params, "limit": len(ids),
+                         "filtering": [{"field": "adset.id", "operator": "IN", "value": ids}]},
+                        level="adset",
+                    )
+                except _CONTEXT_READ_ERRORS as exc:
+                    coverage.update({"status": "failed", "error": str(_public_error(exc).get("message"))})
+                else:
+                    wanted = set(ids)
+                    rows = [row for row in read_rows if str(row.get("adset_id") or "") in wanted]
+                    if len(rows) < len(ids):
+                        coverage["adsets_selected_without_rows"] = len(ids) - len(rows)
+    examined_spend = _known_total_spend(rows)
+    share = _ratio(examined_spend, account_spend)
+    coverage.update({
+        "adsets_examined": len(rows),
+        "more_adsets_exist": more,
+        "examined_spend": examined_spend,
+        "account_spend": account_spend,
+        "account_spend_error": spend_error,
+        "share_of_account_spend": None if share is None else min(share, 1.0),
+        "complete": coverage["status"] == "read" and not more,
+    })
+    return rows, result_error, coverage
+
+
+def _coverage_signal(coverage: dict[str, Any]) -> list[str]:
+    """Plain statements of how much of the account's ad set activity the briefing examined."""
+    if coverage["status"] == "failed":
+        return [
+            f"Ad set insights could not be read ({coverage['error']}), so spend by objective and goal, the funnel "
+            "and goal volume are empty; account settings and asset lists are still reported."
+        ]
+    signals = []
+    if coverage["status"] == "partly_read":
+        signals.append(f"One of the filtered ad set reads failed ({coverage['error']}); the other was used.")
+    if coverage["more_adsets_exist"]:
+        share = coverage["share_of_account_spend"]
+        covered = f", covering {share:.0%} of the account's spend in the window" if share is not None else ""
+        which = "highest-spending ad sets" if coverage["mode"] == "top_spenders" else "ad sets under the named objects"
+        signals.append(
+            f"Partial briefing: examined the {coverage['adsets_examined']} {which}{covered}; the remaining ad sets "
+            "were not examined, so spend, funnel and goal sections describe only the examined ones."
+        )
+    if coverage.get("account_spend_error"):
+        signals.append(
+            f"The account's total spend could not be read ({coverage['account_spend_error']}), so the share of spend "
+            "covered is unknown."
+        )
+    return signals
 
 
 @mcp_server.tool()
@@ -2584,38 +2766,29 @@ async def get_advertiser_context(
     )
     end = today - timedelta(days=1)
     start = end - timedelta(days=lookback_days - 1)
-    params = insights_tools._insights_params(
-        level="adset", since=start.isoformat(), until=end.isoformat(), limit=CONTEXT_INSIGHTS_PAGE_LIMIT,
-    )
-    (rows, result_error), *edge_sections = await asyncio.gather(
-        _read_with_results(resolved_account_id, CONTEXT_INSIGHTS_FIELDS, params, level="adset"),
+    (rows, result_error, adset_coverage), *edge_sections = await asyncio.gather(
+        _context_adset_rows(resolved_account_id, start, end, scope_ids),
         *(
             _optional_edge_section(client, resolved_account_id, edge, fields)
             for _, edge, fields in CONTEXT_EDGE_SECTIONS
         ),
     )
     missing_signals: list[str] = [timezone_signal] if timezone_signal else []
+    missing_signals.extend(_coverage_signal(adset_coverage))
     scope: dict[str, Any] = {"level": "account", "object_id": resolved_account_id}
     object_scope: dict[str, Any] | None = None
     if scope_ids is not None:
-        wanted = set(scope_ids)
-        account_rows = len(rows)
-        rows = [
-            row for row in rows
-            if str(row.get("campaign_id") or "") in wanted or str(row.get("adset_id") or "") in wanted
-        ]
         matched = {str(row.get(key)) for row in rows for key in ("campaign_id", "adset_id") if row.get(key)}
         unmatched = [value for value in scope_ids if value not in matched]
         scope["object_ids"] = scope_ids
         object_scope = {
             "object_ids": scope_ids,
             "matched_adset_rows": len(rows),
-            "account_adset_rows_read": account_rows,
             "unmatched_object_ids": unmatched,
-            "method": "one account-level ad set insights read, then kept ad set rows whose campaign_id or adset_id is listed",
+            "method": adset_coverage["method"],
             "account_wide_sections": ["account", "datasets", "custom_conversions", "pages", "instagram_accounts"],
         }
-        if unmatched:
+        if unmatched and adset_coverage["status"] != "failed":
             missing_signals.append(
                 "No ad set insights rows in the window matched " + ", ".join(unmatched)
                 + " (not a campaign or ad set of this account, or no delivery in the window)."
@@ -2630,7 +2803,7 @@ async def get_advertiser_context(
     business = account.get("business") if isinstance(account.get("business"), dict) else None
 
     total_spend = _known_total_spend(rows)
-    if not rows:
+    if not rows and adset_coverage["status"] != "failed":
         missing_signals.append("Meta returned no ad set insights rows for the lookback window.")
     elif total_spend is None:
         missing_signals.append(
@@ -2701,12 +2874,13 @@ async def get_advertiser_context(
         **sections,
         "section_errors": section_errors,
         "results_definition": RESULTS_DEFINITION,
+        "adset_coverage": adset_coverage,
     }
     if object_scope is not None:
         extra["object_scope"] = object_scope
     return analysis_response(
         scope=scope,
-        metrics={"spend": total_spend, "adset_rows": len(rows)},
+        metrics={"spend": total_spend, "adset_rows": len(rows), "account_spend": adset_coverage["account_spend"]},
         missing_signals=missing_signals,
         extra=extra,
     )
