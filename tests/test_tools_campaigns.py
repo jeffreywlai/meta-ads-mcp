@@ -1836,3 +1836,44 @@ def test_absolute_budget_increase_is_refused_until_metas_unit_is_confirmed(monke
 
 def test_absolute_budget_increase_is_off_by_default() -> None:
     assert _ABSOLUTE_CONFIRMED_AS_SHIPPED is False
+
+
+# create_ad_set with a schedule time that has no time zone: the request stays as
+# it was; the response warns and shows what Meta stored.
+
+ZONELESS_ADSET_ARGS = {
+    "account_id": "act_123",
+    "campaign_id": "cmp_123",
+    "name": "Black Friday",
+    "billing_event": "IMPRESSIONS",
+    "optimization_goal": "REACH",
+    "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+ZONELESS_ADSET_CREATE = {
+    "campaign_id": "cmp_123",
+    "name": "Black Friday",
+    "billing_event": "IMPRESSIONS",
+    "optimization_goal": "REACH",
+    "targeting": {"geo_locations": {"countries": ["US"]}},
+    "status": "PAUSED",
+}
+
+
+def test_create_ad_set_zoneless_start_time_request_is_unchanged(monkeypatch) -> None:
+    """The currency read and the create sent for a time with no zone are exactly what they were."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, daily_budget=20.0,
+        start_time="2026-11-27T00:00:00", end_time="2026-11-30T00:00:00",
+    ))
+    assert client.calls[:2] == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {
+            **ZONELESS_ADSET_CREATE,
+            "start_time": "2026-11-27T00:00:00",
+            "end_time": "2026-11-30T00:00:00",
+            "daily_budget": 2000,
+        }),
+    ]
+    assert list(client.calls[1][3]) == [*ZONELESS_ADSET_CREATE, "start_time", "end_time", "daily_budget"]
