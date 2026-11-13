@@ -1083,11 +1083,186 @@ def test_the_transport_filters_sit_where_the_mcp_library_logs():
     rewritten = {
         "Tool cache miss for %s, refreshing cache", "Tool '%s' not listed, no validation will be performed",
         "Received message: %s", "Warning: %s: %s",
+        # A request id is the client's choice: shown only when it is a number.
+        "Request %s cancelled - duplicate response suppressed", "Response for %s dropped - transport closed",
     }
-    # These carry the server's own name, a request type's name or a request id.
+    # These carry only the server's own name or a request or notification type's name, never a client value.
     harmless = {
         "Initializing server %r", "Processing request of type %s", "Dispatching request of type %s",
-        "Request %s cancelled - duplicate response suppressed", "Response for %s dropped - transport closed",
         "Dispatching notification of type %s",
     }
     assert templates == rewritten | harmless, templates ^ (rewritten | harmless)
+    assert set(LowLevelServerLogPrivacyFilter._REQUEST_ID_TEMPLATES) <= rewritten
+    # Every argument of a harmless template is a type's __name__ or the server's own name.
+    for template in harmless:
+        (call,) = re.findall(r"logger\.\w+\(\s*\"" + re.escape(template) + r"\",\s*([^\n]*)\)", source)
+        assert call.strip().rstrip(",") in {"name", "type(req).__name__", "type(notify).__name__"}, (template, call)
+
+
+# --- Round-six review L5: a request id is the client's choice ----------------------
+#
+# JSON-RPC allows a request id to be text, so a client can send anything as one.
+# The low-level server logs the id when a request is cancelled and when a reply
+# is dropped; the id is shown only when it is a number.
+
+
+def test_l5_cancelled_request_id_is_not_personal_data_in_a_log(monkeypatch, caplog):
+    """Reviewer reproduction: cancelling a call whose id was an email logged the email at INFO."""
+    from meta_ads_mcp.tools import catalogs
+
+    private_id = "".join(("private.person", "@r6-transport.invalid"))
+    started = None
+
+    class Waiting:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            started.set()
+            await anyio.sleep_forever()
+
+    monkeypatch.setattr(catalogs, "get_graph_api_client", Waiting)
+    _capture_transport_logs(caplog)
+
+    async def scenario():
+        nonlocal started
+        started = anyio.Event()
+        to_server, server_in = anyio.create_memory_object_stream(10)
+        server_out, from_server = anyio.create_memory_object_stream(10)
+        lowlevel = mcp_server._mcp_server
+
+        async def serve():
+            await lowlevel.run(server_in, server_out, lowlevel.create_initialization_options(), stateless=True)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(serve)
+            request = mcp_types.JSONRPCRequest(
+                jsonrpc="2.0", id=private_id, method="tools/call",
+                params={"name": "list_catalog_products", "arguments": {"catalog_id": "10"}},
+            )
+            await to_server.send(SessionMessage(mcp_types.JSONRPCMessage(root=request)))
+            with anyio.fail_after(5):
+                await started.wait()
+                notice = mcp_types.JSONRPCNotification(
+                    jsonrpc="2.0", method="notifications/cancelled", params={"requestId": private_id},
+                )
+                await to_server.send(SessionMessage(mcp_types.JSONRPCMessage(root=notice)))
+                await from_server.receive()
+                # A ping reply proves the queued cancellation has been processed.
+                await to_server.send(_ping())
+                await from_server.receive()
+            tasks.cancel_scope.cancel()
+
+    anyio.run(scenario)
+    assert private_id not in caplog.text
+    _assert_not_logged(caplog, private_id)
+    # The event is still logged, at its level, without the id.
+    (record,) = _transport_records(caplog, "Request ")
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == "Request <request id that is text, withheld> cancelled - duplicate response suppressed"
+
+
+@pytest.mark.parametrize("template", [
+    "Request %s cancelled - duplicate response suppressed",
+    "Response for %s dropped - transport closed",
+])
+@pytest.mark.parametrize(("request_id", "shown"), [
+    (7, "7"),
+    (0, "0"),
+    ("".join(("private.person", "@r6-id.invalid")), "<request id that is text, withheld>"),
+    ("42", "<request id that is text, withheld>"),
+    (True, "<request id that is text, withheld>"),
+    (None, "<request id that is text, withheld>"),
+])
+def test_l5_request_ids_are_shown_only_when_they_are_numbers(template, request_id, shown):
+    from meta_ads_mcp.argument_privacy import MCP_LOWLEVEL_LOGGER, LowLevelServerLogPrivacyFilter
+
+    record = logging.LogRecord(MCP_LOWLEVEL_LOGGER, logging.DEBUG, __file__, 1, template, (request_id,), None)
+    assert LowLevelServerLogPrivacyFilter(lambda: set()).filter(record) is True
+    assert record.getMessage() == template % shown
+    assert record.levelno == logging.DEBUG
+
+
+class _Unprintable:
+    def __str__(self) -> str:
+        raise RuntimeError("cannot be shown")
+
+    __repr__ = __str__
+
+
+def _malformed_records(logger: str, pathname: str, templates: list[str]) -> list[logging.LogRecord]:
+    """Records a filter may meet that cannot be read as written: missing, wrong or unprintable args."""
+    records = []
+    for template in templates:
+        # ({...},) is how logging is given mapping arguments: the record's args become the mapping.
+        for args in ((), ("one", "two", "three"), ({"key": "value"},), (_Unprintable(),), (_Unprintable(), _Unprintable())):
+            records.append(logging.LogRecord(logger, logging.WARNING, pathname, 1, template, args, None))
+        records.append(logging.LogRecord(logger, logging.WARNING, pathname, 1, _Unprintable(), (), None))
+        records.append(logging.LogRecord(logger, logging.WARNING, pathname, 1, "%d of %s", ("x",), None))
+    return records
+
+
+def _filters_and_records():
+    import mcp.shared.session as session
+
+    from meta_ads_mcp.argument_privacy import (
+        FASTMCP_HANDLER_LOGGER,
+        MCP_LOWLEVEL_LOGGER,
+        HandlerLogPrivacyFilter,
+        LowLevelServerLogPrivacyFilter,
+        SessionLogPrivacyFilter,
+    )
+
+    lowlevel = [
+        *LowLevelServerLogPrivacyFilter._UNKNOWN_TOOL_TEMPLATES, *LowLevelServerLogPrivacyFilter._REQUEST_ID_TEMPLATES,
+        "Received message: %s", "Warning: %s: %s", "Received exception from stream: %s", "Processing request of type %s",
+    ]
+    sessions = [
+        "Failed to validate request: %s", "Message that failed validation: %s", "Failed to validate notification: %s",
+        "Unhandled exception in receive loop: %s", "Progress callback raised an exception: %s",
+        "Response ID %r cannot be normalized to match pending requests", "Read stream closed by client",
+    ]
+    return [
+        ("lowlevel", LowLevelServerLogPrivacyFilter(lambda: {"list_adsets"}),
+         _malformed_records(MCP_LOWLEVEL_LOGGER, __file__, lowlevel), True),
+        ("session", SessionLogPrivacyFilter(), _malformed_records("root", session.__file__, sessions), True),
+        ("validation", ValidationLogPrivacyFilter(lambda: {"rows"}),
+         _malformed_records(FASTMCP_SERVER_LOGGER, __file__, ["Invalid arguments for tool %r: %s"]), False),
+        ("handler", HandlerLogPrivacyFilter(lambda: {"list_adsets"}),
+         _malformed_records(FASTMCP_HANDLER_LOGGER, __file__, ["Handler called: call_tool %s with %s"]), False),
+    ]
+
+
+@pytest.mark.parametrize("name", ["lowlevel", "session", "validation", "handler"])
+def test_l5_every_log_filter_returns_normally_for_a_record_it_cannot_read(name):
+    """A filter that raises breaks logging for the whole logger, so each one contains its own failure."""
+    (_name, log_filter, records, formattable), = [item for item in _filters_and_records() if item[0] == name]
+    for record in records:
+        assert log_filter.filter(record) is True
+        if formattable:
+            # The transport filters leave every record they look at in a form a handler can print.
+            record.getMessage()
+
+
+@pytest.mark.parametrize("name", ["lowlevel", "session", "validation", "handler"])
+def test_l5_a_filter_that_cannot_read_its_own_record_logs_a_fixed_message(name):
+    (_name, log_filter, records, _formattable), = [item for item in _filters_and_records() if item[0] == name]
+    unprintable = next(record for record in records if isinstance(record.msg, _Unprintable))
+    assert log_filter.filter(unprintable) is True
+    assert "withheld" in unprintable.getMessage()
+    assert unprintable.levelno == logging.WARNING
+
+
+def test_l5_a_real_logger_with_the_filters_keeps_logging_after_a_bad_record(caplog):
+    from meta_ads_mcp.argument_privacy import MCP_LOWLEVEL_LOGGER, LowLevelServerLogPrivacyFilter
+
+    _capture_transport_logs(caplog)
+    logger = logging.getLogger(MCP_LOWLEVEL_LOGGER)
+    # First on the logger, so FastMCP's own filter there (which formats each record) sees the safe record.
+    assert isinstance(logger.filters[0], LowLevelServerLogPrivacyFilter), logger.filters
+    logger.info("Request %s cancelled - duplicate response suppressed")
+    logger.info("Response for %s dropped - transport closed", _Unprintable())
+    logger.info("Processing request of type %s", "PingRequest")
+    messages = [record.getMessage() for record in caplog.records if record.name == MCP_LOWLEVEL_LOGGER]
+    assert "Request <request id that is text, withheld> cancelled - duplicate response suppressed" in messages
+    assert "Processing request of type PingRequest" in messages
