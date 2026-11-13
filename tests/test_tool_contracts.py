@@ -409,6 +409,10 @@ class UniversalFakeClient:
             }
         if edge == "insights":
             return {"data": [SAMPLE_INSIGHTS_ROW]}
+        if edge in {"assigned_users", "agencies"}:
+            # Catalog access rows carry numeric ids as Meta returns them; the access tools treat a
+            # row whose id is not numeric as unidentified and refuse to change access around it.
+            return {"data": [{"id": "321", "name": f"{edge} item", "tasks": ["ADVERTISE"], "permitted_tasks": ["ADVERTISE"]}]}
         return {"data": [{"id": f"{edge}_123", "name": f"{edge} item"}]}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
