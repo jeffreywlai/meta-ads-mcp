@@ -357,7 +357,14 @@ mcp_server = FastMCP(
         "detect_performance_anomalies, and for delivery-blocking errors use "
         "get_delivery_errors. If you know a tool name from Meta's own Ads MCP "
         "server (ads_...), call get_capabilities(official_tool='that name') to "
-        "find the tool here that serves it."
+        "find the tool here that serves it. To build a creative from plain inputs "
+        "use create_ad_creative_from_inputs with dry_run=true first. To copy a "
+        "campaign, ad set or ad use duplicate_campaign, duplicate_adset or "
+        "duplicate_ad; copies start paused. For many catalog products at once use "
+        "batch_update_catalog_products. For who can access a catalog use "
+        "list_catalog_assigned_users, and preview_catalog_access_change before "
+        "set_catalog_access. Tools that read a local file (customer lists, feed "
+        "files, videos) read only from the folder named by META_UPLOAD_DIR."
     ),
     transforms=[TOOL_SEARCH_TRANSFORM],
     mask_error_details=False,

@@ -76,6 +76,7 @@ LIVE_VERIFIED_TOOLS: frozenset[str] = frozenset(
         "list_catalog_attribute_values",
         "list_catalog_data_sources",
         "list_catalog_event_sources",
+        "list_catalog_partners",
         "list_catalog_products",
         "list_catalogs",
         "list_change_history",

@@ -13,7 +13,7 @@
 
 ## ✨ Features
 
-- 📊 **163 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, product catalogs, pixels and datasets, experiments, auth helpers, and controlled writes
+- 📊 **180 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, product catalogs, business and catalog access, pixels and datasets, experiments, auth helpers, and controlled writes
 - 🤝 **Parity with Meta's official Ads MCP server** — every one of the 106 tools it serves is mapped to a tool here, or recorded as partial, missing or unavailable with the reason; see [Parity with Meta's official server](#-parity-with-metas-official-server)
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, current v26 notes, and historical v25 notes available as tools and MCP resources
@@ -23,7 +23,7 @@
 - 🔎 **Tool Search** — FastMCP 3.4.8 tool search lets the LLM discover tools on demand instead of loading the full catalog up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (163)
+## 📋 Available Tools (180)
 
 ### 🔍 Discovery
 
@@ -171,6 +171,9 @@
 | `delete_feed_rule` | Delete a feed rule |
 | `connect_catalog_event_source` | Connect a pixel or other event source to a product catalog |
 | `disconnect_catalog_event_source` | Disconnect an event source from a product catalog |
+| `duplicate_campaign` | Copy a campaign, optionally with its ad sets and ads; the copy starts paused |
+| `duplicate_adset` | Copy an ad set, optionally into another campaign; the copy starts paused |
+| `duplicate_ad` | Copy an ad, optionally into another ad set; the copy starts paused |
 
 ### 🖼️ Creative Ops
 
@@ -180,6 +183,10 @@
 | `preview_ad` | Preview an ad in various formats |
 | `upload_creative_asset` | Upload an image or video asset |
 | `setup_ab_test` | Set up an A/B test |
+| `create_ad_creative_from_inputs` | Build a creative from named inputs: image, video, carousel, text variants, per-placement media, asset pools, catalog carousels, existing posts, click-to-message, lead forms and Partnership Ads; `dry_run` shows the request |
+| `update_ad_creative_enhancements` | Turn Advantage creative enhancements on or off for a live ad by attaching a changed copy of its creative |
+| `upload_ad_video` | Upload a video from a URL or from the upload folder (chunked above 25 MB, up to 4 GB) and report processing status |
+| `delete_ad_image` | Remove an image from the account's image library after reading it |
 
 ### 🔬 Public Research
 
@@ -247,6 +254,21 @@
 | `list_event_source_catalogs` | Catalogs connected to one event source |
 | `get_catalog_event_source_health` | Match rate and setup problems per connected event source, with 28-day history |
 | `get_catalog_event_source_recommendations` | Event sources worth connecting to a catalog, with the evidence |
+| `batch_update_catalog_products` | Create, update or delete up to 50 products by SKU in one call, with a per-item outcome and retry advice |
+| `list_catalog_attribute_values` | The values that actually occur for a product attribute, with counts, for building product set filters |
+| `update_feed_rule` | Change one feed rule and return before and after |
+
+### 🏢 Business & Catalog Access
+
+| Tool | Description |
+|------|-------------|
+| `list_businesses` | Businesses the token's user can access, with the user's roles |
+| `list_business_users` | A business's people, system users or partner businesses |
+| `list_catalog_assigned_users` | Who has direct access to a catalog, and with which tasks |
+| `list_user_assigned_catalogs` | The catalogs assigned to one person, system user or partner |
+| `list_catalog_partners` | Partner businesses a catalog is shared with (request shape not yet confirmed live for writes) |
+| `preview_catalog_access_change` | Read-only preview of a catalog access change: before, after and what would be sent |
+| `set_catalog_access` | Grant, change or remove catalog access for a person, system user or partner business, with lockout protection |
 
 ### 📖 Docs & Utility
 
@@ -347,6 +369,8 @@ No public API route is known for:
 | `meta://docs/v26-notes` | Current v26.0 API capabilities and migration notes |
 | `meta://docs/optimization-playbook` | Optimization best practices |
 | `meta://docs/tool-routing` | Tool routing guide |
+| `get_v26_notes` | Current v26 API fields, breakdowns, recommendation filters and migration notes |
+| `get_v25_notes` | Historical v25 implementation notes and deprecations |
 
 ## 🚀 Quick Start
 
