@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any, TypeAlias
+from urllib.parse import quote, quote_plus
+
+from pydantic import BeforeValidator
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
@@ -15,8 +20,26 @@ from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import AccountId, CurrencyAmount, FieldList, GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.tool_types import (
+    AccountId,
+    FieldList,
+    GraphId,
+    StrictCurrencyAmount,
+    StringList,
+    coerce_csv_string_list,
+)
 from meta_ads_mcp.url_secrets import refuse_url_credentials
+
+
+def _refuse_true_false(value: Any) -> Any:
+    """MCP clients may send true or false where a number belongs; never read them as 1 or 0."""
+    if isinstance(value, bool):
+        raise ValueError("must be a whole number, not true or false")
+    return value
+
+
+# A whole number that refuses true and false (which the lax int type reads as 1 and 0).
+_WholeNumber: TypeAlias = Annotated[int, BeforeValidator(_refuse_true_false)]
 
 CREATIVE_FIELDS = [
     "id",
@@ -55,14 +78,97 @@ def _with_context(exc: Exception, prefix: str) -> Exception:
     return MetaApiError(message=f"{prefix} {_failure_reason(exc)}")
 
 
+_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _key_label(key: Any) -> str:
+    """A nested key as it may appear in a message: a field-like name, or a placeholder for anything else."""
+    return key if isinstance(key, str) and _SAFE_KEY.match(key) else "<key>"
+
+
+def _error_attribute_names(exc: BaseException) -> list[str]:
+    """The data attributes an error carries: dataclass fields, slots and instance attributes."""
+    names: list[str] = [field.name for field in dataclasses.fields(exc)] if dataclasses.is_dataclass(exc) else []
+    for cls in type(exc).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        names.extend([slots] if isinstance(slots, str) else list(slots))
+    names.extend(getattr(exc, "__dict__", {}))
+    return [name for name in dict.fromkeys(names) if not name.startswith("__")]
+
+
+def _scrub_value(value: Any, secrets: list[str], shown: str) -> Any:
+    """value with every secret replaced, inside strings, dict keys and values, lists and tuples."""
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, shown)
+        return value
+    if isinstance(value, dict):
+        return {_scrub_value(key, secrets, shown): _scrub_value(item, secrets, shown) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_scrub_value(item, secrets, shown) for item in value)
+    return value
+
+
+def _scrub_error(exc: BaseException, secrets: list[str], shown: str) -> None:
+    """Remove secret text from a raised error and every error behind it, in place.
+
+    A traceback log prints the whole __cause__ and __context__ chain, and the MCP error
+    shows the top error's public fields, so every error reachable that way (and inside an
+    exception group) is cleaned: its fields, args and notes. Each error is visited once,
+    so a cycle ends.
+    """
+    secrets = sorted({secret for secret in secrets if secret}, key=len, reverse=True)
+    if not secrets:
+        return
+    pending: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        for name in _error_attribute_names(current):
+            try:
+                value = getattr(current, name)
+            except AttributeError:
+                continue
+            if value is None or isinstance(value, BaseException):
+                continue
+            cleaned = _scrub_value(value, secrets, shown)
+            if cleaned != value:
+                try:
+                    setattr(current, name, cleaned)
+                except (AttributeError, TypeError):
+                    pass
+        if current.args:
+            current.args = tuple(_scrub_value(arg, secrets, shown) for arg in current.args)
+        notes = getattr(current, "__notes__", None)
+        if isinstance(notes, list):
+            current.__notes__ = [_scrub_value(note, secrets, shown) for note in notes]
+        pending.extend([current.__cause__, current.__context__])
+        pending.extend(getattr(current, "exceptions", None) or ())
+
+
+def _secret_forms(secret: str | None) -> list[str]:
+    """A secret as given, trimmed, and URL-encoded, the ways an error could repeat it."""
+    if not isinstance(secret, str) or not secret.strip():
+        return []
+    forms = {secret, secret.strip()}
+    forms |= {quote(form, safe="") for form in list(forms)} | {quote_plus(form) for form in list(forms)}
+    return [form for form in forms if form]
+
+
 def _refuse_url_logins(value: Any, name: str) -> None:
-    """Refuse a login embedded in any URL inside a nested input, before any request is built."""
+    """Refuse a login embedded in any URL inside a nested input, before any request is built.
+
+    The message names the location by field-like keys only, never by a key that may be pasted data.
+    """
     if isinstance(value, str):
         if "://" in value or "@" in value:
             refuse_url_credentials(value, name)
     elif isinstance(value, dict):
         for key, item in value.items():
-            _refuse_url_logins(item, f"{name}.{key}")
+            _refuse_url_logins(item, f"{name}.{_key_label(key)}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _refuse_url_logins(item, f"{name}[{index}]")
@@ -379,6 +485,25 @@ class _OpenVideo:
     descriptor: int
     name: str
     size: int
+    modified_ns: int
+
+
+FILE_SHOWN = "<file>"
+_FILE_CHANGED = (
+    "The local file changed while it was being uploaded (its size or modification time is not what it was "
+    "when it was opened), so the bytes sent may not be the whole file."
+)
+
+
+def _video_file_change(video: _OpenVideo) -> str | None:
+    """Why the opened file no longer matches what was opened, or None when it is unchanged."""
+    try:
+        details = os.fstat(video.descriptor)
+    except OSError:
+        return "The local file could not be checked for changes while it was being uploaded."
+    if details.st_size != video.size or details.st_mtime_ns != video.modified_ns:
+        return _FILE_CHANGED
+    return None
 
 
 def _open_upload_video(file_path: str, parameter: str = "file_path") -> _OpenVideo:
@@ -398,7 +523,15 @@ def _open_upload_video(file_path: str, parameter: str = "file_path") -> _OpenVid
             "video uploads (Meta's limit for ad videos is 4 GB)."
         ),
     )
-    return _OpenVideo(descriptor=opened.descriptor, name=opened.name, size=opened.size)
+    try:
+        details = os.fstat(opened.descriptor)
+    except OSError:
+        os.close(opened.descriptor)
+        raise ValidationError(f"{parameter} could not be read.") from None
+    if details.st_size != opened.size:
+        os.close(opened.descriptor)
+        raise ValidationError(f"{parameter} changed size while it was being opened; try again once it is complete.")
+    return _OpenVideo(descriptor=opened.descriptor, name=opened.name, size=opened.size, modified_ns=details.st_mtime_ns)
 
 
 def _read_video_bytes(video: _OpenVideo, offset: int, length: int) -> bytes:
@@ -437,16 +570,22 @@ async def _chunked_video_upload(
     video: _OpenVideo,
     meta_fields: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run start, transfer and finish on the advideos edge; on failure name the session and what was sent."""
+    """Run start, transfer and finish on the advideos edge; on failure name the session and what was sent.
+
+    The upload is complete only when Meta's offsets reach the file size. Each answer must
+    continue exactly where the chunk just sent ended: no gap (bytes never sent) and no
+    step backwards. The opened file is checked for changes before each transfer and before
+    the finish. Messages never name the local file.
+    """
     try:
         started = await client.post_ad_video_upload_phase(
             account, data={"upload_phase": "start", "file_size": video.size},
         )
     except Exception as exc:
-        prefix = f"Starting the chunked upload of {video.name} failed, so nothing was transferred."
+        prefix = "Starting the chunked upload failed, so nothing was transferred."
         if _outcome_unknown(exc):
             prefix = (
-                f"Starting the chunked upload of {video.name} may or may not have opened an upload session; "
+                "Starting the chunked upload may or may not have opened an upload session; "
                 "no video bytes were sent."
             )
         wrapped = _with_context(exc, f"{prefix} Reason:")
@@ -456,12 +595,12 @@ async def _chunked_video_upload(
     session_id = str(started.get("upload_session_id") or "") if isinstance(started, dict) else ""
     video_id = str(started.get("video_id") or "") if isinstance(started, dict) else ""
     if not session_id:
-        raise MetaApiError(message=f"Meta did not return an upload session for {video.name}; nothing was transferred.")
+        raise MetaApiError(message="Meta did not return an upload session for the chunked upload; nothing was transferred.")
     progress = {"phase": "transfer", "confirmed": 0, "requests": 0}
 
     def stopped_message(reason: str) -> str:
         message = (
-            f"The chunked upload of {video.name} stopped during the {progress['phase']} step: upload session {session_id}, "
+            f"The chunked upload stopped during the {progress['phase']} step: upload session {session_id}, "
             f"video {video_id or 'not returned'}. Meta confirmed {progress['confirmed']} of {video.size} bytes "
             f"({progress['requests']} transfer requests sent)."
         )
@@ -479,14 +618,30 @@ async def _chunked_video_upload(
     try:
         start = _offset(started.get("start_offset"))
         end = _offset(started.get("end_offset"))
+        sent_end: int | None = None
         while True:
             if start is None or end is None or not 0 <= start <= end <= video.size:
                 raise _ChunkedUploadStopped(
                     f"Meta asked for bytes {started.get('start_offset') if start is None else start} to "
                     f"{started.get('end_offset') if end is None else end}, outside the {video.size}-byte file."
                 )
+            expected = 0 if sent_end is None else sent_end
+            if start < expected:
+                raise _ChunkedUploadStopped(
+                    f"Meta's next chunk (from byte {start}) did not move forward to byte {expected}, "
+                    "where the bytes already sent end."
+                )
+            if start > expected:
+                raise _ChunkedUploadStopped(
+                    f"Meta's next chunk starts at byte {start}, but only bytes 0 to {expected} were sent in this "
+                    f"session, so bytes {expected} to {start} would never be sent."
+                )
             progress["confirmed"] = start
             if start == end:
+                if end != video.size:
+                    raise _ChunkedUploadStopped(
+                        f"Meta ended the transfer at byte {end} of the {video.size}-byte file, so the rest was never sent."
+                    )
                 break
             if end - start > MAX_VIDEO_CHUNK_BYTES:
                 raise _ChunkedUploadStopped(
@@ -496,6 +651,9 @@ async def _chunked_video_upload(
                 raise _ChunkedUploadStopped(
                     f"The upload reached this server's {MAX_CHUNKED_TRANSFER_REQUESTS}-request limit for one video."
                 )
+            changed = _video_file_change(video)
+            if changed:
+                raise _ChunkedUploadStopped(changed)
             chunk = _read_video_bytes(video, start, end - start)
             progress["requests"] += 1
             answer = await client.post_ad_video_upload_phase(
@@ -503,15 +661,14 @@ async def _chunked_video_upload(
                 data={"upload_phase": "transfer", "upload_session_id": session_id, "start_offset": start},
                 files={"video_file_chunk": (video.name, chunk)},
             )
-            next_start = _offset(answer.get("start_offset")) if isinstance(answer, dict) else None
-            next_end = _offset(answer.get("end_offset")) if isinstance(answer, dict) else None
-            if next_start is not None and next_end is not None and next_start != next_end and next_start <= start:
-                raise _ChunkedUploadStopped(
-                    f"Meta's next chunk (from byte {next_start}) did not move forward from byte {start}."
-                )
+            sent_end = end
             started = answer if isinstance(answer, dict) else {}
-            start, end = next_start, next_end
+            start = _offset(started.get("start_offset"))
+            end = _offset(started.get("end_offset"))
         progress["phase"] = "finish"
+        changed = _video_file_change(video)
+        if changed:
+            raise _ChunkedUploadStopped(changed)
         finished = await client.post_ad_video_upload_phase(
             account, data={"upload_phase": "finish", "upload_session_id": session_id, **meta_fields},
         )
@@ -558,7 +715,10 @@ def _chunked_plan(account: str, video: _OpenVideo, meta_fields: dict[str, Any]) 
                 "path": path,
                 "data": {"upload_phase": "transfer", "upload_session_id": "<from start>", "start_offset": "<from Meta>"},
                 "files": {"video_file_chunk": "<the bytes from start_offset to end_offset that Meta names>"},
-                "repeats": "until Meta answers with start_offset equal to end_offset",
+                "repeats": (
+                    "while each answer continues exactly where the chunk sent ended, until start_offset and "
+                    "end_offset both equal the file size"
+                ),
             },
             {"method": "POST", "path": path, "data": {"upload_phase": "finish", "upload_session_id": "<from start>", **meta_fields}},
         ],
@@ -636,26 +796,50 @@ async def upload_ad_video(
     # to send some other file on this machine to Meta.
     video = _open_upload_video(path_text)
     try:
-        if video.size <= MAX_DIRECT_VIDEO_BYTES:
-            source = {"file_name": video.name, "bytes": video.size}
-            content = b"" if dry_run else _read_video_bytes(video, 0, video.size)
-            return await _upload_video_request(
-                resolved_account, target, data=dict(meta_fields), files={"source": (video.name, content)},
-                shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
-            )
-        if dry_run:
-            return {
-                "ok": True,
-                "action": "upload_ad_video",
-                "dry_run": True,
-                "sent": False,
-                "target": target,
-                "would_send": _chunked_plan(resolved_account, video, meta_fields),
-            }
-        client = get_graph_api_client()
-        outcome = await _chunked_video_upload(client, resolved_account, video, meta_fields)
+        return await _upload_video_file(resolved_account, target, video, meta_fields, dry_run=dry_run)
+    except Exception as exc:
+        # A file name can itself be private: no error or log line names the file, even
+        # when Meta's own error text repeats it.
+        _scrub_error(exc, [*_secret_forms(video.name), *_secret_forms(path_text)], FILE_SHOWN)
+        raise
     finally:
         os.close(video.descriptor)
+
+
+async def _upload_video_file(
+    account: str,
+    target: dict[str, Any],
+    video: _OpenVideo,
+    meta_fields: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Upload an opened local video in one request or in chunks; the caller closes it."""
+    if video.size <= MAX_DIRECT_VIDEO_BYTES:
+        source = {"file_name": video.name, "bytes": video.size}
+        content = b""
+        if not dry_run:
+            content = _read_video_bytes(video, 0, video.size)
+            if _video_file_change(video):
+                raise ValidationError(
+                    "file_path changed while it was being read (its size or modification time differs from when it "
+                    "was opened), so nothing was sent. Upload it again once it is complete."
+                )
+        return await _upload_video_request(
+            account, target, data=dict(meta_fields), files={"source": (video.name, content)},
+            shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
+        )
+    if dry_run:
+        return {
+            "ok": True,
+            "action": "upload_ad_video",
+            "dry_run": True,
+            "sent": False,
+            "target": target,
+            "would_send": _chunked_plan(account, video, meta_fields),
+        }
+    client = get_graph_api_client()
+    outcome = await _chunked_video_upload(client, account, video, meta_fields)
     response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
     response.update(await _read_video_status(client, outcome["video_id"]))
@@ -707,7 +891,7 @@ async def delete_ad_image(
     listing = await client.get_ad_images_by_hashes(resolved_account, hashes=[image_hash], fields=AD_IMAGE_READ_FIELDS)
     matches = [item for item in listing.get("data", []) if isinstance(item, dict) and item.get("hash") == image_hash]
     if not matches:
-        raise ValidationError(f"No image with hash {image_hash} was found in {resolved_account}; nothing was deleted.")
+        raise ValidationError(f"No image with the given image_hash was found in {resolved_account}; nothing was deleted.")
     previous = matches[0]
     target = {"account_id": resolved_account, "image_hash": image_hash}
     if dry_run:
@@ -838,7 +1022,10 @@ async def _update_creative_labels(
             )
         missing = [label for label in labels if not any(_label_matches(existing, label) for existing in previous_labels)]
         if missing:
-            raise ValidationError(f"These labels are not on creative {creative_id}, so nothing was changed: {missing}.")
+            raise ValidationError(
+                f"{len(missing)} of the adlabels to remove {'is' if len(missing) == 1 else 'are'} not on creative "
+                f"{creative_id}, so nothing was changed. Read the creative's labels with get_creative first."
+            )
         remaining = [label for label in previous_labels if not any(_label_matches(label, wanted) for wanted in labels)]
         expected = [{"id": str(label["id"])} if label.get("id") else {"name": str(label.get("name"))} for label in remaining]
         payload["adlabels"] = expected
@@ -1278,20 +1465,73 @@ async def boost_instagram_post(
     call_to_action: dict[str, Any] | None = None,
     validate_only: bool = False,
     page_id: str | None = None,
-    daily_budget: CurrencyAmount | None = None,
-    duration_days: int | None = None,
+    daily_budget: StrictCurrencyAmount | None = None,
+    duration_days: _WholeNumber | None = None,
     targeting: dict[str, Any] | None = None,
     objective: str | None = None,
     plan_only: bool = False,
     url_tags: str | None = None,
     sponsor_page_id: GraphId | None = None,
     sponsor_instagram_account_id: GraphId | None = None,
-    partnership_ad_format: int | None = None,
+    partnership_ad_format: _WholeNumber | None = None,
     destination_type: str | None = None,
     promoted_object: dict[str, Any] | None = None,
     partnership_ad_code: str | None = None,
 ) -> dict[str, Any]:
     """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, from daily_budget (major units, never defaulted), targeting, duration_days (default 6) and objective: OUTCOME_ENGAGEMENT (default; destination_type ON_POST or ON_VIDEO), OUTCOME_AWARENESS, OUTCOME_TRAFFIC (INSTAGRAM_PROFILE profile visits by default, or WEBSITE), OUTCOME_SALES or OUTCOME_LEADS (WEBSITE, with promoted_object pixel_id and custom_event_type). Website destinations need call_to_action with value.link. Every default is stated; plan_only returns the plan and creates nothing. If a later step fails the error names every object already created. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3; for a creator's post, partnership_ad_code (the code the creator issued) instead of instagram_media_id. Check list_instagram_media boost_eligible first."""
+    try:
+        return await _boost_instagram_post(
+            account_id=account_id,
+            instagram_media_id=instagram_media_id,
+            instagram_account_id=instagram_account_id,
+            adset_id=adset_id,
+            name=name,
+            call_to_action=call_to_action,
+            validate_only=validate_only,
+            page_id=page_id,
+            daily_budget=daily_budget,
+            duration_days=duration_days,
+            targeting=targeting,
+            objective=objective,
+            plan_only=plan_only,
+            url_tags=url_tags,
+            sponsor_page_id=sponsor_page_id,
+            sponsor_instagram_account_id=sponsor_instagram_account_id,
+            partnership_ad_format=partnership_ad_format,
+            destination_type=destination_type,
+            promoted_object=promoted_object,
+            partnership_ad_code=partnership_ad_code,
+        )
+    except Exception as exc:
+        # Meta's error text may repeat the creator's code; it never reaches the caller or a log.
+        _scrub_error(exc, _secret_forms(partnership_ad_code), PARTNERSHIP_CODE_SHOWN)
+        raise
+
+
+async def _boost_instagram_post(
+    *,
+    account_id: str,
+    instagram_media_id: str | None,
+    instagram_account_id: str | None,
+    adset_id: str | None,
+    name: str | None,
+    call_to_action: dict[str, Any] | None,
+    validate_only: bool,
+    page_id: str | None,
+    daily_budget: float | None,
+    duration_days: int | None,
+    targeting: dict[str, Any] | None,
+    objective: str | None,
+    plan_only: bool,
+    url_tags: str | None,
+    sponsor_page_id: str | None,
+    sponsor_instagram_account_id: str | None,
+    partnership_ad_format: int | None,
+    destination_type: str | None,
+    promoted_object: dict[str, Any] | None,
+    partnership_ad_code: str | None,
+) -> dict[str, Any]:
+    """The boost itself; boost_instagram_post wraps it so no error shows the Partnership Ad code."""
     ids = {
         "account_id": blank_to_none(account_id),
         "instagram_account_id": blank_to_none(instagram_account_id),

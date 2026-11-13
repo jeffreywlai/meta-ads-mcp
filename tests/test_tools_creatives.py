@@ -1680,3 +1680,348 @@ def test_g20_boost_call_to_action_link_with_login_is_refused(monkeypatch) -> Non
         with pytest.raises(creatives.ValidationError) as raised:
             asyncio.run(creatives.boost_instagram_post(**{**base, **arguments, "call_to_action": cta}))
         assert secret not in str(raised.value)
+
+
+# Round-four review fixes (R3 findings H1 to H5).
+
+
+def _call_tool(name: str, arguments: dict, routed: bool):
+    from meta_ads_mcp.coordinator import mcp_server
+
+    if routed:
+        return asyncio.run(mcp_server.call_tool("call_tool", {"name": name, "arguments": arguments}))
+    return asyncio.run(mcp_server.call_tool(name, arguments))
+
+
+class EchoCodeClient:
+    """Meta refuses one edge and repeats the code it was sent, in every error field."""
+
+    def __init__(self, *, fail_edge: str = "adcreatives", cycle: bool = False) -> None:
+        self.calls: list[tuple] = []
+        self.fail_edge = fail_edge
+        self.cycle = cycle
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        return {"id": object_id, "currency": "USD", "promoted_object": {"page_id": "20"}}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        from meta_ads_mcp.errors import MetaApiError
+
+        self.calls.append(("create", parent_id, edge, data))
+        if edge != self.fail_edge:
+            return {"id": "900"}
+        code = "synthetic-private-code"
+        cause = ValueError(f"upstream said {code}")
+        error = MetaApiError(
+            f"Invalid authorization code {code}", code=100, user_message=f"Rejected {code}",
+            user_title=f"Code {code}", details={"error": {"message": f"bad {code}", "list": [code]}},
+            error_data={"blame": code},
+        )
+        error.__cause__ = cause
+        if self.cycle:
+            # The cleaning must end on a cycle. (Not used through the MCP server: its
+            # traceback logger, rich, does not end on a cycle itself.)
+            cause.__context__ = error
+        raise error
+
+
+H1_CASES = [
+    {"instagram_account_id": "40", "adset_id": "50", "partnership_ad_code": "synthetic-private-code"},
+    {"instagram_account_id": "40", "adset_id": "50", "partnership_ad_code": "synthetic-private-code", "validate_only": True},
+    {"instagram_account_id": "40", "daily_budget": 12.5, "targeting": {"geo_locations": {"countries": ["US"]}},
+     "partnership_ad_code": "synthetic-private-code"},
+]
+
+
+@pytest.mark.parametrize("extra", H1_CASES)
+@pytest.mark.parametrize("routed", [False, True])
+def test_h1_partnership_upstream_error_never_discloses_code(monkeypatch, caplog, extra, routed) -> None:
+    from fastmcp.exceptions import ToolError
+
+    client = EchoCodeClient(fail_edge="ads" if extra.get("validate_only") else "adcreatives")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(ToolError) as info:
+        _call_tool("boost_instagram_post", {"account_id": "10", "page_id": "20", **extra}, routed)
+    assert "synthetic-private-code" not in str(info.value)
+    assert "synthetic-private-code" not in caplog.text
+    assert any(call[0] == "create" for call in client.calls)
+
+
+def test_h1_direct_call_error_chain_and_fields_never_hold_the_code(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    client = EchoCodeClient(cycle=True)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="10", page_id="20", instagram_account_id="40", adset_id="50",
+            partnership_ad_code="synthetic-private-code",
+        ))
+    error = info.value
+    for item in (error, error.__cause__, error.__cause__.__context__):
+        assert "synthetic-private-code" not in repr(item.args) + str(item)
+    assert "synthetic-private-code" not in repr(error.to_public_dict())
+    assert "synthetic-private-code" not in repr(error.details)
+    assert "<partnership_ad_code>" in error.message
+
+
+def test_h1_code_url_encoded_in_an_error_is_removed_too(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    class Encoded(EchoCodeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("bad token=AC%2F1%2B2")
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Encoded)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="10", page_id="20", instagram_account_id="40", adset_id="50", partnership_ad_code="AC/1+2",
+        ))
+    assert "AC%2F1%2B2" not in str(info.value)
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_h2_video_body_error_does_not_echo_private_filename(monkeypatch, tmp_path, caplog, routed) -> None:
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.errors import RateLimitError
+
+    secret = "private.person@r3.invalid"
+    (tmp_path / f"{secret}.mp4").write_bytes(b"0123456789")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+
+    class Refused:
+        async def post_ad_video_upload_phase(self, *args, **kwargs):
+            raise RateLimitError("Synthetic limit", code=4)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Refused)
+    with pytest.raises(ToolError) as error:
+        _call_tool("upload_ad_video", {"account_id": "10", "file_path": str(tmp_path / f"{secret}.mp4")}, routed)
+    assert secret not in str(error.value)
+    assert secret not in caplog.text
+
+
+@pytest.mark.parametrize("step", ["start", "transfer", "finish", "no_session"])
+def test_h2_no_chunked_upload_error_names_the_file_even_when_meta_repeats_it(monkeypatch, tmp_path, step) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    secret = "private-family-holiday"
+    (tmp_path / f"{secret}.mp4").write_bytes(b"0123456789")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+
+    class Client:
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            phase = data["upload_phase"]
+            if step == "no_session" and phase == "start":
+                return {}
+            if phase == step:
+                raise MetaApiError(f"Could not process {secret}.mp4", user_message=f"{secret}.mp4 refused")
+            if phase == "start":
+                return {"upload_session_id": "1", "video_id": "2", "start_offset": "0", "end_offset": "10"}
+            if phase == "transfer":
+                return {"start_offset": "10", "end_offset": "10"}
+            return {"success": True}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Client)
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(creatives.upload_ad_video("10", file_path=f"{secret}.mp4"))
+    assert secret not in str(error.value)
+    assert secret not in repr(error.value.to_public_dict())
+
+
+async def _mcp_call(name, arguments):
+    from meta_ads_mcp.coordinator import mcp_server
+
+    return await mcp_server.call_tool(name, arguments)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("daily_budget", True), ("daily_budget", False), ("duration_days", True), ("partnership_ad_format", True)],
+)
+def test_h3_boost_budget_bool_is_rejected_at_mcp_boundary(monkeypatch, field, value) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    arguments = {"account_id": "10", "instagram_media_id": "30", "instagram_account_id": "40", "page_id": "20",
+                 "daily_budget": 12.5, "targeting": {"geo_locations": {"countries": ["US"]}}, "sponsor_page_id": "22",
+                 field: value}
+    with pytest.raises((ToolError, MCPValidationError)):
+        asyncio.run(_mcp_call("boost_instagram_post", arguments))
+    assert client.calls == []
+
+
+class OffsetScriptClient:
+    """Answers start with the given range, and each transfer with the next scripted range."""
+
+    def __init__(self, initial, answers) -> None:
+        self.initial = initial
+        self.answers = list(answers)
+        self.calls: list[tuple] = []
+
+    async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+        self.calls.append((data["upload_phase"], dict(data)))
+        if data["upload_phase"] == "start":
+            return {"upload_session_id": "session-90", "video_id": "91",
+                    "start_offset": str(self.initial[0]), "end_offset": str(self.initial[1])}
+        if data["upload_phase"] == "transfer":
+            start, end = self.answers.pop(0)
+            return {"start_offset": str(start), "end_offset": str(end)}
+        return {"success": True}
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        return {"id": object_id, "status": {"video_status": "processing"}}
+
+
+def _ten_byte_video(monkeypatch, tmp_path):
+    (tmp_path / "video.mp4").write_bytes(b"0123456789")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+
+
+@pytest.mark.parametrize("terminal", [(0, 0), (2, 2), (5, 5)])
+def test_h4_chunked_upload_cannot_finish_before_all_bytes_confirmed(monkeypatch, tmp_path, terminal) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _ten_byte_video(monkeypatch, tmp_path)
+    client = OffsetScriptClient((0, 5), [terminal])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert not any(call[0] == "finish" for call in client.calls), client.calls
+    message = str(raised.value)
+    for expected in ("upload session session-90", "video 91", "of 10 bytes", "transfer step"):
+        assert expected in message, message
+
+
+@pytest.mark.parametrize("initial,answers", [((3, 10), [(10, 10)]), ((0, 3), [(6, 10), (10, 10)])])
+def test_h4_chunked_upload_must_not_skip_file_ranges(monkeypatch, tmp_path, initial, answers) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _ten_byte_video(monkeypatch, tmp_path)
+    client = OffsetScriptClient(initial, answers)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert not any(call[0] == "finish" for call in client.calls), client.calls
+    assert "would never be sent" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("initial", "answers", "confirmed"),
+    [
+        ((0, 0), [], 0),  # a fresh session that claims to be done already
+        ((0, 4), [(4, 8), (2, 10)], 4),  # a step backwards after progress
+        ((0, 4), [(4, 8), (8, 8)], 8),  # stops short of the file size
+        ((0, 4), [(5, 10)], 0),  # a gap of one byte
+    ],
+)
+def test_h4_chunked_upload_offset_rules_beyond_the_reproduction(monkeypatch, tmp_path, initial, answers, confirmed) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _ten_byte_video(monkeypatch, tmp_path)
+    client = OffsetScriptClient(initial, answers)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert not any(call[0] == "finish" for call in client.calls)
+    assert f"Meta confirmed {confirmed} of 10 bytes" in str(raised.value)
+
+
+def test_h4_offsets_advancing_chunk_by_chunk_still_finish(monkeypatch, tmp_path) -> None:
+    _ten_byte_video(monkeypatch, tmp_path)
+    client = OffsetScriptClient((0, 4), [(4, 8), (8, 10), (10, 10)])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert [call[1].get("start_offset") for call in client.calls if call[0] == "transfer"] == [0, 4, 8]
+    assert result["upload"]["bytes_confirmed"] == 10
+    assert result["upload"]["transfer_requests"] == 3
+
+
+def test_h5_chunked_upload_detects_growing_file(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"0123456789")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+
+    class Growth(OffsetScriptClient):
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            if data["upload_phase"] == "transfer":
+                with path.open("ab") as handle:
+                    handle.write(b"more-data")
+            return await super().post_ad_video_upload_phase(account_id, data=data, files=files)
+
+    client = Growth((0, 10), [(10, 10)])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    message = str(raised.value)
+    assert not any(call[0] == "finish" for call in client.calls)
+    for expected in ("changed while it was being uploaded", "upload session session-90", "video 91", "10 of 10 bytes", "finish step"):
+        assert expected in message, message
+
+
+def test_h5_file_rewritten_between_chunks_stops_before_the_next_transfer(monkeypatch, tmp_path) -> None:
+    import os
+
+    from meta_ads_mcp.errors import MetaApiError
+
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"0123456789")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+
+    class Rewrite(OffsetScriptClient):
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            if data["upload_phase"] == "transfer":
+                stat = path.stat()
+                os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+            return await super().post_ad_video_upload_phase(account_id, data=data, files=files)
+
+    client = Rewrite((0, 5), [(5, 10)])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="changed while it was being uploaded") as raised:
+        asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert [call[0] for call in client.calls] == ["start", "transfer"]
+    assert "5 of 10 bytes" in str(raised.value)
+
+
+def test_h5_small_file_that_grows_while_read_is_not_sent(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"12345678")
+    original = creatives._read_video_bytes
+
+    def read_then_grow(video, offset, length):
+        content = original(video, offset, length)
+        with path.open("ab") as handle:
+            handle.write(b"tail")
+        return content
+
+    monkeypatch.setattr(creatives, "_read_video_bytes", read_then_grow)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match="nothing was sent"):
+        asyncio.run(creatives.upload_ad_video("10", file_path="clip.mp4"))
+
+
+def test_nested_login_url_error_never_quotes_a_pasted_key(monkeypatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    secret_key = "someone@example.invalid"
+    cta = {"type": "LEARN_MORE", "value": {secret_key: "https://u:p@example.invalid/x"}}
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="1", instagram_media_id="40", instagram_account_id="50", adset_id="60", page_id="30", call_to_action=cta,
+        ))
+    assert secret_key not in str(raised.value)
+    assert "call_to_action.value.<key>" in str(raised.value)
+
+
+def test_delete_ad_image_not_found_does_not_quote_the_hash(monkeypatch) -> None:
+    class Empty:
+        async def get_ad_images_by_hashes(self, account_id, *, hashes, fields):
+            return {"data": []}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Empty)
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.delete_ad_image("10", "pasted-private-value"))
+    assert "pasted-private-value" not in str(raised.value)

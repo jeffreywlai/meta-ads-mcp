@@ -509,7 +509,7 @@ def _media_filter(values: Any, name: str, allowed: frozenset[str]) -> set[str] |
     normalized = {_PRODUCT_TYPE_WORDS.get(item.strip().upper(), item.strip().upper()) for item in items}
     unknown = sorted(normalized - allowed)
     if unknown:
-        raise ValidationError(f"{name} has unknown values {', '.join(unknown)}; use {', '.join(sorted(allowed))}.")
+        raise ValidationError(f"{name} has {len(unknown)} unknown value(s); use {', '.join(sorted(allowed))}.")
     return normalized
 
 
@@ -1034,7 +1034,10 @@ async def get_field_reference(
         if not requested:
             raise ValidationError("field_names is required with object_id, so only the named fields are read.")
         if not known:
-            raise ValidationError(f"No known fields to read for level {normalized_level}; unknown: {', '.join(unknown)}.")
+            raise ValidationError(
+                f"No known fields to read for level {normalized_level}: none of the {len(unknown)} field_names is known. "
+                f"Call get_field_reference(level=\"{normalized_level}\") for the list."
+            )
         current = await get_graph_api_client().get_object(object_id, fields=known)
     items = []
     for name in known:
