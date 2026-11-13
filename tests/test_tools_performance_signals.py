@@ -2344,3 +2344,14 @@ def test_advertiser_context_object_ids_validation_makes_no_calls(monkeypatch, ob
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.get_advertiser_context(account_id="act_1", object_ids=object_ids))
     assert client.calls == []
+
+
+def test_child_level_with_no_delivering_children_says_so(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=lambda object_id, fields, params: {"data": []}))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="cmp_1", child_level="ad", since="2026-11-01", until="2026-11-02",
+    ))
+    assert len(_calls(client, "get_insights")) == 1
+    assert result["entities"] == []
+    assert result["coverage"]["complete"] is True
+    assert any("no ad with insights" in signal for signal in result["missing_signals"])

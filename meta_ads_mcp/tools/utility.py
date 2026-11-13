@@ -590,6 +590,30 @@ INTENT_GUIDE = {
             "For customer lists prefer file_path to a local CSV so personal data never passes through the model; inline rows are limited to 1,000.",
         ],
     },
+    "rank_entities_by_a_metric": {
+        "description": "List the top or bottom campaigns, ad sets or ads by a metric such as spend, impressions or link clicks, ranked by Meta.",
+        "recommended_order": ["get_entity_insights", "compare_performance"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass sort, such as spend_descending, with level and a limit; Meta accepts one sort key per request.",
+            "Keep fields lean on account-wide sorted requests; heavy sorted requests with action arrays fail on large accounts.",
+        ],
+    },
+    "trend_or_anomalies_for_several_entities": {
+        "description": "Trend or screen for unusual days across several campaigns, ad sets or ads in one call.",
+        "recommended_order": ["get_performance_trend", "detect_performance_anomalies", "get_auction_ranking_report"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass object_ids (up to 10 numeric ids) or child_level with one object_id to cover its highest-spending children.",
+            "Results follow Meta's own result for each entity; the response names any entity that could not be read.",
+        ],
+    },
+    "research_an_advertisers_ads_in_the_ad_library": {
+        "description": "See the ads a specific Page or competitor is running in the public Meta Ad Library, active or inactive.",
+        "recommended_order": ["search_ads_archive"],
+        "avoid_unless_needed": [],
+        "notes": ["Pass search_page_ids (up to 10 Page ids) with or without search_terms, and ad_active_status ACTIVE, ALL or INACTIVE."],
+    },
 }
 
 ROUTING_HINTS = {

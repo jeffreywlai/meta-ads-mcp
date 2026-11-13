@@ -20,7 +20,6 @@ from meta_ads_mcp.tool_types import StringList, coerce_csv_string_list
 from meta_ads_mcp.tools import diagnostics as diagnostics_tools
 from meta_ads_mcp.tools import insights as insights_tools
 from meta_ads_mcp.tools import recommendations as recommendation_tools
-from meta_ads_mcp.tools.insights import get_entity_insights
 
 OPPORTUNITY_SCORE_ACCOUNT_FIELDS = ["id", "name", "currency", "opportunity_score"]
 OPPORTUNITY_SCORE_HISTORY_MAX_DAYS = 45
@@ -988,6 +987,11 @@ async def _read_targets(
 def _coverage_signals(coverage: dict[str, Any]) -> list[str]:
     """Name every entity that could not be read or had no rows; never omit one silently."""
     signals = []
+    if coverage.get("selection") is not None and coverage["entities_requested"] == 0:
+        signals.append(
+            f"Meta returned no {coverage.get('child_level', 'child')} with insights in the window, so there is "
+            "nothing to report."
+        )
     for item in coverage["entities_unreadable"]:
         signals.append(f"{item['object_id']} could not be read ({item['error']}); the other entities are reported.")
     if coverage["entities_without_rows"]:
