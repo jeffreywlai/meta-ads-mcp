@@ -72,6 +72,13 @@
       "what_changed": "When start_time or stop_time is sent, named or inside params, the tool now reads the campaign's start_time and stop_time once after the update and adds stored_schedule to the response. A sent time that Meta did not store is no longer listed under current; it moves to a new field, sent, and warnings says Meta did not store it. A sent time Meta did store stays in current, and every other field of current is unchanged. If the read fails, the update is still reported as a success, the times are listed under sent, and a warning says the stored times could not be read.",
       "why_better": "Meta accepts a campaign's start_time and stop_time and stores neither (seen live on 2026-11-13), and the tool used to report the times it sent as the campaign's current values, which was false. The response now shows what the campaign really holds.",
       "migration": "Read the times you sent from sent instead of current when Meta did not store them, and read what Meta holds from stored_schedule. Set schedules on the ad sets (update_adset) instead of the campaign. A call without start_time or stop_time makes the same requests and returns the same fields as before."
+    },
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "When Meta answers with a success status but the body cannot be read as a JSON object (it is not JSON, or it is a bare null, text or number), the tool now raises a Meta API error saying the answer could not be read. After a write the error says the outcome is not known. Before, a body that was not JSON was handed to the tool as an object, so a write was reported as done and a tool that reads before it writes went on to write; a bare null or number crashed the tool.",
+      "why_better": "An answer that cannot be read is no longer presented as a result. A caller is told plainly that a write may or may not have happened, and no tool acts on a read it could not read.",
+      "migration": "Nothing to change for a normal answer. Where a caller handled this case, treat the error like any other Meta error; when it says the outcome is not known, read the object before retrying."
     }
   ]
 }

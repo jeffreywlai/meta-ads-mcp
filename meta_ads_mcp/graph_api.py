@@ -409,7 +409,21 @@ class GraphAPIClient:
                             and response.status_code in TRANSIENT_HTTP_STATUSES
                         ),
                     )
-                return payload
+                # A success status with a body that is not JSON cannot be read as an
+                # answer. It is an error, never an object handed to the caller: a tool
+                # that reads before it writes must stop, and after a write the outcome
+                # is not known. The body is not carried; it can hold anything.
+                raise MetaApiError(
+                    message="Meta's answer was not JSON, so it could not be read.",
+                    status_code=response.status_code,
+                    details={
+                        "unreadable_answer": True,
+                        "content_type": response.headers.get("content-type"),
+                        "status_code": response.status_code,
+                    },
+                    operation=operation,
+                    mutation_outcome_unknown=not safe_to_retry,
+                )
 
             if isinstance(payload, bool):
                 payload = {"success": payload}
@@ -423,7 +437,7 @@ class GraphAPIClient:
                 raise MetaApiError(
                     message="Meta's answer was not a JSON object, so it could not be read.",
                     status_code=response.status_code,
-                    details={"json_type": type(payload).__name__},
+                    details={"unreadable_answer": True, "json_type": type(payload).__name__},
                     operation=operation,
                     is_transient=response.is_error and transient_status,
                     mutation_outcome_unknown=(

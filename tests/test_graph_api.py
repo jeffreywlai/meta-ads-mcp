@@ -1234,3 +1234,43 @@ def test_bool_and_list_answers_keep_their_existing_wrappers(monkeypatch) -> None
     client = _client()
     assert asyncio.run(client.request("GET", "123")) == {"success": True}
     assert asyncio.run(client.request("GET", "123")) == {"data": [{"id": "1"}]}
+
+
+class _TextResponse(FakeResponse):
+    """A response whose body is not JSON."""
+
+    def __init__(self, status_code: int, text: str, content_type: str = "text/html") -> None:
+        super().__init__(status_code, {})
+        self.text = text
+        self.headers = {**getattr(self, "headers", {}), "content-type": content_type}
+
+    def json(self):
+        raise ValueError("not JSON")
+
+
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+@pytest.mark.parametrize("text", ["<html>busy</html>", "", "ok"])
+def test_a_success_status_with_a_body_that_is_not_json_is_an_error(monkeypatch, method, text) -> None:
+    # Before, this reached the caller as an object ({"text_response": ...}); a tool that
+    # reads before it writes then wrote, and a write was reported as done.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([_TextResponse(200, text)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data=None if method == "GET" else {"name": "x"}))
+    public = error.value.to_public_dict()
+    assert "was not JSON" in public["message"]
+    assert error.value.status_code == 200
+    assert public["mutation_outcome_unknown"] is (method != "GET")
+    assert public["retryable"] is False
+    assert len(FakeAsyncClient.requests) == 1
+    # the body is never carried in the error: it can hold anything
+    assert text == "" or text not in json.dumps(public)
+
+
+def test_an_error_status_with_a_body_that_is_not_json_is_unchanged(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([_TextResponse(400, "<html>bad</html>")])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.message == "Non-JSON error response from Meta API"
+    assert error.value.to_public_dict()["mutation_outcome_unknown"] is False

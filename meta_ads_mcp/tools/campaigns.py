@@ -429,6 +429,7 @@ def _campaign_schedule_report(sent: dict[str, Any], stored: dict[str, Any] | Non
         value = stored.get(key)
         shown[key] = None if value in (None, "") or _is_unset_time(_schedule_instant(value)) else value
     missing = []
+    uncomparable = []
     for key, value in sent.items():
         sent_at = _schedule_instant(value)
         if shown[key] is None:
@@ -436,18 +437,33 @@ def _campaign_schedule_report(sent: dict[str, Any], stored: dict[str, Any] | Non
                 missing.append(key)
             continue
         held = _schedule_instant(shown[key])
-        if sent_at is not None and held is not None and held != sent_at:
+        if sent_at is None or held is None:
+            # A time inside params is sent as given and may carry no time zone, so it cannot
+            # be compared with what Meta holds. Not comparable is not the same as stored.
+            uncomparable.append(key)
+        elif held != sent_at:
             missing.append(key)
     fields: dict[str, Any] = {"stored_schedule": shown}
+    warnings = []
     if missing:
         names = " and ".join(missing)
         what = "this time" if len(missing) == 1 else "these times"
-        fields["warnings"] = [
+        warnings.append(
             f"{names}: Meta accepted the request but did not store {what}. A campaign's schedule comes from its "
             "ad sets, so set start and end times on the ad sets (create_ad_set or update_adset); stored_schedule "
             "shows what Meta holds."
-        ]
-    return fields, missing
+        )
+    if uncomparable:
+        names = " and ".join(uncomparable)
+        what = "this time" if len(uncomparable) == 1 else "these times"
+        warnings.append(
+            f"{names}: {what} has no time zone or could not be read, so it cannot be compared with what Meta "
+            "holds. stored_schedule shows what Meta holds; a campaign's schedule comes from its ad sets, so set "
+            "start and end times on the ad sets, with a UTC offset."
+        )
+    if warnings:
+        fields["warnings"] = warnings
+    return fields, missing + uncomparable
 
 
 _ROTATION_PAIR = ("time_based_ad_rotation_id_blocks", "time_based_ad_rotation_intervals")

@@ -3235,3 +3235,41 @@ def test_campaign_schedule_docstrings_say_the_schedule_comes_from_ad_sets() -> N
     for tool in (campaigns.create_campaign, campaigns.update_campaign):
         assert "Meta takes a campaign's schedule from its ad sets" in tool.__doc__
         assert "+" not in tool.__doc__
+
+
+@pytest.mark.parametrize("sent_time", ["2026-12-08T00:00:00", "next tuesday"])
+def test_update_campaign_time_that_cannot_be_compared_is_not_claimed_stored(monkeypatch, sent_time) -> None:
+    # A time inside params is sent as given and may have no time zone (R8 N1). It cannot be
+    # compared with what Meta holds, so it must not be shown as the campaign's current value.
+    client = ScheduleReadbackClient(stored={"start_time": "2026-12-01T00:00:00-0500", "stop_time": None})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", name="Renamed", params={"start_time": sent_time}))
+    assert ("update", "cmp_123", {"name": "Renamed", "start_time": sent_time}) in client.calls
+    assert result["current"] == {"name": "Renamed"}
+    assert result["sent"] == {"start_time": sent_time}
+    assert result["stored_schedule"]["start_time"] == "2026-12-01T00:00:00-0500"
+    (warning,) = result["warnings"]
+    assert warning.startswith("start_time: this time has no time zone or could not be read")
+    assert "stored_schedule" in warning
+
+
+def test_create_campaign_time_that_cannot_be_compared_gets_a_warning(monkeypatch) -> None:
+    client = ScheduleReadbackClient(stored={"start_time": "2026-12-01T00:00:00-0500", "stop_time": None})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_campaign(
+        **CAMPAIGN_BASE, daily_budget=5, params={"start_time": "2026-12-08T00:00:00"},
+    ))
+    assert result["ok"] is True
+    (warning,) = result["warnings"]
+    assert warning.startswith("start_time: this time has no time zone or could not be read")
+
+
+def test_campaign_schedule_report_keeps_the_two_reasons_apart() -> None:
+    fields, unconfirmed = campaigns._campaign_schedule_report(
+        {"start_time": "2026-12-08T00:00:00", "stop_time": "2026-12-28T00:00:00-05:00"},
+        {"start_time": "2026-12-01T00:00:00-0500", "stop_time": None},
+    )
+    assert unconfirmed == ["stop_time", "start_time"]
+    assert len(fields["warnings"]) == 2
+    assert fields["warnings"][0].startswith("stop_time: Meta accepted the request but did not store")
+    assert fields["warnings"][1].startswith("start_time: this time has no time zone or could not be read")
