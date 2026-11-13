@@ -667,17 +667,31 @@ _DPA_REQUIRED_SIGNALS = (
 )
 
 
+# ad_format values Meta's own catalog tool accepts. A_PLUS_CA is Advantage
+# catalog ads (the default rules here). PE is product extensions, whose
+# documented eligibility (developers.facebook.com/docs/marketing-api/
+# advantage-catalog-ads/product-extensions) asks for a catalog and a product
+# set (creative_sourcing_spec.associated_product_set_id) and names no event
+# source, so a connected event source is reported but not required.
+DPA_AD_FORMATS = ("A_PLUS_CA", "PE")
+
+
 def _assess_catalog(
     signals: dict[str, Any],
     unavailable: list[dict[str, Any]],
     partial: list[dict[str, Any]] | None = None,
+    *,
+    ad_format: str = "A_PLUS_CA",
 ) -> tuple[str, list[str]]:
     """Apply the stated readiness rules to one catalog's signals.
 
     A signal that is unknown (not read, or only partly read without a deciding
-    row) can never let a catalog count as ready.
+    row) can never let a catalog count as ready. With ad_format PE an event
+    source is not required, so its absence or unreadability is reported
+    without deciding readiness.
     """
     partial = partial or []
+    needs_event_source = ad_format != "PE"
     reasons: list[str] = []
     product_count = signals["product_count"]
     if product_count == 0:
@@ -687,7 +701,12 @@ def _assess_catalog(
     else:
         reasons.append(f"Catalog has {product_count} products.")
     problems = False
-    if signals["event_source_count"] == 0:
+    if signals["event_source_count"] == 0 and not needs_event_source:
+        reasons.append(
+            "No pixel, app or other event source is connected; Meta's product extensions documentation does "
+            "not list one as a requirement."
+        )
+    elif signals["event_source_count"] == 0:
         problems = True
         reasons.append(
             "No pixel, app or other event source is connected; catalog ads cannot match product events "
@@ -713,12 +732,18 @@ def _assess_catalog(
             f"{entry['signal']} was only partly read ({entry['reason']})"
             + ("; its count is a lower bound." if entry["count_is_lower_bound"] else "; nothing was found before the read stopped.")
         )
+    deciding_unavailable = [
+        entry for entry in unavailable
+        if needs_event_source or entry["signal"] != "external_event_sources"
+    ]
     if unavailable:
         reasons.append(
             "Could not read: " + ", ".join(entry["signal"] for entry in unavailable) + "."
         )
+    if deciding_unavailable:
         return "unknown", reasons
-    unknown = [edge for key, edge in _DPA_REQUIRED_SIGNALS if signals.get(key) is None]
+    unknown = [edge for key, edge in _DPA_REQUIRED_SIGNALS if signals.get(key) is None
+               and (needs_event_source or key != "event_source_count")]
     if unknown:
         reasons.append("Not established: " + ", ".join(unknown) + ", so the catalog cannot be called ready.")
         return "unknown", reasons
@@ -752,6 +777,14 @@ def _context_reasons(context: dict[str, Any]) -> list[str]:
             reasons.append(f"Not connected to pixel {pixel['pixel_id']}.")
         else:
             reasons.append(f"Whether pixel {pixel['pixel_id']} is connected could not be established.")
+    page = context.get("page")
+    if page is not None:
+        if page["linked"] is True:
+            reasons.append(f"Listed among Page {page['page_id']}'s product catalogs.")
+        elif page["linked"] is False:
+            reasons.append(f"Not listed among Page {page['page_id']}'s product catalogs.")
+        else:
+            reasons.append(f"Whether Page {page['page_id']} lists this catalog could not be established.")
     return reasons
 
 
@@ -764,7 +797,25 @@ def _context_score(context: dict[str, Any]) -> tuple[int, int]:
     if (pixel := context.get("pixel")) is not None:
         supplied += 1
         matched += pixel["connected"] is True
+    if (page := context.get("page")) is not None:
+        supplied += 1
+        matched += page["linked"] is True
     return matched, supplied
+
+
+async def _page_catalog_ids(client, page_id: str) -> dict[str, Any]:
+    """Read the catalogs a Page lists (GET /{page_id}/product_catalogs), within the page cap.
+
+    Meta documents this edge as the product catalogs owned by the Page, with no
+    parameters. ids is None when the edge could not be read at all.
+    """
+    try:
+        read = await _collect_edge(client, page_id, "product_catalogs", fields=["id"], params={},
+                                   max_pages=_SIGNAL_MAX_PAGES)
+    except _SIGNAL_ERRORS as error:
+        return {"ids": None, "complete": False, "error": _error_entry("page product_catalogs", error)}
+    ids = {identity for row in read["rows"] if (identity := _row_identity(row)) is not None}
+    return {"ids": ids, "complete": read["complete"], "stop_reason": read["stop_reason"], "error": None}
 
 
 @mcp_server.tool()
@@ -773,8 +824,10 @@ async def list_dpa_eligible_catalogs(
     account_id: str | None = None,
     ad_url: str | None = None,
     pixel_id: GraphId | None = None,
+    page_id: GraphId | None = None,
+    ad_format: str | None = None,
 ) -> dict[str, Any]:
-    """Rank a business's product catalogs (or an ad account's owning business's) by readiness for Advantage catalog (dynamic) ads, with the reasons and a recommended catalog when exactly one is ready. Optional ad_url and pixel_id put first the eligible catalogs whose sampled product URLs are on the ad's domain or that are connected to that pixel, and say why. Derived locally from documented catalog data; Meta publishes no eligibility endpoint."""
+    """Rank a business's product catalogs (or an ad account's owning business's) by readiness for Advantage catalog (dynamic) ads, with the reasons and a recommended catalog when exactly one is ready. Optional ad_url, pixel_id and page_id put first the eligible catalogs whose sampled product URLs are on the ad's domain, that are connected to that pixel, or that the Page lists as its catalogs, and say why. ad_format PE (product extensions) applies that format's documented needs, a catalog with a product set, instead of A_PLUS_CA, the default. Derived locally from documented catalog data; Meta publishes no eligibility endpoint."""
     scope_name, scope_value = _one_scope(business_id=business_id, account_id=account_id)
     ad_domain = None
     if ad_url is not None:
@@ -782,13 +835,22 @@ async def list_dpa_eligible_catalogs(
         if ad_domain is None:
             raise ValidationError("ad_url must be a web address such as https://shop.example.com/product.")
     pixel_id = blank_to_none(pixel_id) if isinstance(pixel_id, str) else None
-    has_context = ad_domain is not None or pixel_id is not None
+    page_id = blank_to_none(page_id) if isinstance(page_id, str) else None
+    normalized_format = "A_PLUS_CA"
+    if ad_format is not None:
+        normalized_format = ad_format.strip().upper() if isinstance(ad_format, str) else ""
+        if normalized_format not in DPA_AD_FORMATS:
+            raise ValidationError(
+                "ad_format must be A_PLUS_CA (Advantage catalog ads) or PE (product extensions)."
+            )
+    has_context = ad_domain is not None or pixel_id is not None or page_id is not None
     client = get_graph_api_client()
     scope = await _business_scope(
         client,
         scope_value if scope_name == "business_id" else None,
         scope_value if scope_name == "account_id" else None,
     )
+    page_read = await _page_catalog_ids(client, page_id) if page_id is not None else None
     listing = await _collect_edge(
         client, scope["business_id"], "owned_product_catalogs",
         fields=CATALOG_FIELDS, params={"limit": _DPA_PAGE_SIZE},
@@ -802,8 +864,17 @@ async def list_dpa_eligible_catalogs(
     missing_signals: list[str] = []
     for catalog in catalogs:
         collected = await _catalog_dpa_signals(client, catalog, ad_domain=ad_domain, pixel_id=pixel_id)
+        if page_read is not None:
+            catalog_key = str(catalog.get("id"))
+            if page_read["ids"] is None:
+                linked = None
+            elif catalog_key in page_read["ids"]:
+                linked = True
+            else:
+                linked = False if page_read["complete"] else None
+            collected["context"]["page"] = {"page_id": page_id, "linked": linked}
         assessment, reasons = _assess_catalog(
-            collected["signals"], collected["unavailable"], collected["partial"],
+            collected["signals"], collected["unavailable"], collected["partial"], ad_format=normalized_format,
         )
         for entry in collected["unavailable"]:
             missing_signals.append(f"{catalog.get('id')}: {entry['signal']} could not be read ({entry['error']}).")
@@ -840,7 +911,19 @@ async def list_dpa_eligible_catalogs(
     for rank, finding in enumerate(findings, start=1):
         finding["rank"] = rank
     ready = [finding for finding in findings if finding["assessment"] == "ready"]
-    supplied = ", ".join(name for name, value in (("ad_url", ad_domain), ("pixel_id", pixel_id)) if value)
+    supplied = ", ".join(
+        name for name, value in (("ad_url", ad_domain), ("pixel_id", pixel_id), ("page_id", page_id)) if value
+    )
+    if page_read is not None:
+        if page_read["error"] is not None:
+            missing_signals.append(
+                f"Page {page_id}'s product catalogs could not be read ({page_read['error']['error']}), so no "
+                "catalog could be matched to the Page."
+            )
+        elif not page_read["complete"]:
+            missing_signals.append(
+                f"Page {page_id}'s product catalogs were only partly read. {page_read['stop_reason']}"
+            )
     if has_context:
         matched_ready = [
             finding for finding in ready
@@ -855,8 +938,8 @@ async def list_dpa_eligible_catalogs(
                       "campaign should promote.")
         else:
             recommended = None
-            reason = (f"No ready catalog matched {supplied}; check that the ad's site and pixel belong to "
-                      "one of these catalogs.")
+            reason = (f"No ready catalog matched {supplied}; check that the ad's site, pixel and Page belong "
+                      "to one of these catalogs.")
     elif len(ready) == 1:
         recommended = ready[0]["catalog_id"]
         reason = "It is the only catalog that passed every readiness rule."
@@ -896,9 +979,31 @@ async def list_dpa_eligible_catalogs(
                            "the ad's domain or a subdomain of it; a small sample, not every product.")
     if pixel_id is not None:
         rules["pixel_id"] = "Matches when the pixel is among the catalog's connected event sources."
+    extra_basis: dict[str, Any] = {}
+    if page_id is not None:
+        signals_used.append("page/product_catalogs (catalogs the Page lists)")
+        rules["page_id"] = ("Matches when the catalog is among the product catalogs Meta lists for the Page "
+                            "(GET /{page_id}/product_catalogs, documented as the catalogs the Page owns).")
+        if page_read is not None and page_read["ids"]:
+            evaluated = {str(catalog.get("id")) for catalog in catalogs}
+            outside = sorted(page_read["ids"] - evaluated)
+            if outside:
+                extra_basis["page_catalogs_not_evaluated"] = outside[:20]
+                extra_basis["page_catalogs_not_evaluated_note"] = (
+                    "The Page lists these catalogs, but they are not among this business's owned catalogs that "
+                    "were evaluated."
+                )
+    if normalized_format == "PE":
+        rules["ready"] = ("Has products, at least one product set, and no must-fix dynamic-ads diagnostics. "
+                          "Meta's product extensions documentation asks for a catalog and a product set "
+                          "(associated_product_set_id) and names no event source, so event sources are reported "
+                          "but not required. The must-fix rule is kept as a precaution; Meta does not say "
+                          "whether dynamic-ads diagnostics apply to product extensions.")
+        rules["ad_format"] = ("PE also needs a SALES or TRAFFIC campaign and a single image or video ad, which "
+                              "this catalog check cannot see.")
     if has_context:
-        ordering = ("eligible catalogs first, then the most context checks matched (ad_url, pixel_id), then "
-                    "assessment, fewest items affected by must-fix diagnostics, and most products.")
+        ordering = ("eligible catalogs first, then the most context checks matched (ad_url, pixel_id, page_id), "
+                    "then assessment, fewest items affected by must-fix diagnostics, and most products.")
         rules["recommended"] = "The only ready catalog that matched every context check supplied."
     return analysis_response(
         scope={**scope, "ownership": "owned"},
@@ -916,9 +1021,11 @@ async def list_dpa_eligible_catalogs(
             "basis": {
                 "note": ("This ranking is derived here from documented catalog data; Meta publishes no "
                          "catalog-ad eligibility endpoint."),
+                "ad_format": normalized_format,
                 "signals_used": signals_used,
                 "rules": rules,
                 "ordering": ordering,
+                **extra_basis,
             },
         },
     )

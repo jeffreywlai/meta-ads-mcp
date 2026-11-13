@@ -2093,6 +2093,87 @@ def test_dpa_context_validation(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="ad_url"):
         _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_url="not a url"))
+    with pytest.raises(ValidationError, match="ad_format"):
+        _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_format="CAROUSEL"))
+
+
+def test_dpa_page_id_prefers_catalogs_the_page_lists(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client(edges={
+        ("cat_nosrc", "external_event_sources"): {"data": [{"id": "px_2"}]},
+        ("555", "product_catalogs"): {"data": [{"id": "cat_nosrc"}, {"id": "cat_elsewhere"}]},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", page_id="555"))
+    page_read = next(call for kind, call in client.calls if kind == "list" and call["edge"] == "product_catalogs")
+    assert page_read == {"parent_id": "555", "edge": "product_catalogs", "fields": ["id"], "params": {}}
+    assert [f["catalog_id"] for f in result["findings"]][:2] == ["cat_nosrc", "cat_ready"]
+    top = result["findings"][0]
+    assert top["context_match"]["page"] == {"page_id": "555", "linked": True}
+    assert any("Page 555" in reason for reason in top["reasons"])
+    other = result["findings"][1]
+    assert other["context_match"]["page"] == {"page_id": "555", "linked": False}
+    assert result["recommended_catalog_id"] == "cat_nosrc"
+    assert "page_id" in result["recommendation_reason"]
+    assert result["basis"]["page_catalogs_not_evaluated"] == ["cat_elsewhere"]
+    assert "page_id" in result["basis"]["rules"]
+
+
+def test_dpa_page_read_failure_is_unknown_and_recommends_nothing(monkeypatch) -> None:
+    _use(monkeypatch, _dpa_client(edge_errors={("555", "product_catalogs"): _permission_error()}))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", page_id="555"))
+    ready = next(f for f in result["findings"] if f["catalog_id"] == "cat_ready")
+    assert ready["context_match"]["page"] == {"page_id": "555", "linked": None}
+    assert result["recommended_catalog_id"] is None
+    assert any("Page 555" in entry and "could not be read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_partly_read_page_catalogs_leave_unlisted_catalogs_unknown(monkeypatch) -> None:
+    _use(monkeypatch, _dpa_client(edges={
+        ("555", "product_catalogs"): {"data": [{"id": "cat_nosrc"}], "paging": {"next": "n"}},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", page_id="555"))
+    by_id = {f["catalog_id"]: f for f in result["findings"]}
+    assert by_id["cat_nosrc"]["context_match"]["page"]["linked"] is True
+    assert by_id["cat_ready"]["context_match"]["page"]["linked"] is None
+    assert any("partly read" in entry for entry in result["missing_signals"])
+
+
+def test_dpa_product_extensions_do_not_require_an_event_source(monkeypatch) -> None:
+    _use(monkeypatch, _dpa_client())
+    default = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert {f["catalog_id"]: f["assessment"] for f in default["findings"]}["cat_nosrc"] == "needs_attention"
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_format="pe"))
+    by_id = {f["catalog_id"]: f for f in result["findings"]}
+    assert by_id["cat_nosrc"]["assessment"] == "ready"
+    assert any("does not list one as a requirement" in reason for reason in by_id["cat_nosrc"]["reasons"])
+    assert by_id["cat_empty"]["assessment"] == "blocked"
+    assert result["basis"]["ad_format"] == "PE"
+    assert "product set" in result["basis"]["rules"]["ready"]
+    assert result["recommended_catalog_id"] is None
+    assert result["metrics"]["ready_count"] == 2
+
+
+def test_dpa_product_extensions_still_need_a_product_set_and_readable_sets(monkeypatch) -> None:
+    _use(monkeypatch, _dpa_client(
+        edges={("cat_nosrc", "product_sets"): {"data": [], "summary": {"total_count": 0}}},
+        edge_errors={("cat_ready", "external_event_sources"): _permission_error()},
+    ))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_format="PE"))
+    by_id = {f["catalog_id"]: f for f in result["findings"]}
+    assert by_id["cat_nosrc"]["assessment"] == "needs_attention"
+    # An unreadable event source does not decide PE readiness, but is still reported.
+    assert by_id["cat_ready"]["assessment"] == "ready"
+    assert any("external_event_sources" in entry for entry in result["missing_signals"])
+    assert result["recommended_catalog_id"] == "cat_ready"
+
+
+def test_dpa_default_format_matches_an_explicit_a_plus_ca_call(monkeypatch) -> None:
+    first = _use(monkeypatch, _dpa_client())
+    default = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    second = _use(monkeypatch, _dpa_client())
+    explicit = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_format="A_PLUS_CA"))
+    assert first.calls == second.calls
+    assert default == explicit
+    assert default["basis"]["ad_format"] == "A_PLUS_CA"
 
 
 # ---------------------------------------------------------------- registry
