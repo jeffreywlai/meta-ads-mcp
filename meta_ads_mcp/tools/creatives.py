@@ -1000,19 +1000,146 @@ async def delete_creative(creative_id: str) -> dict[str, Any]:
     }
 
 
-# One-step boost: objective -> ad set destination and goal, from the objective
-# mapping table on Meta's campaign reference page. Only these two are built.
-BOOST_OBJECTIVES: dict[str, dict[str, Any]] = {
-    "OUTCOME_ENGAGEMENT": {"destination_type": "ON_POST", "optimization_goal": "POST_ENGAGEMENT", "promoted_page": False},
-    "OUTCOME_AWARENESS": {"destination_type": None, "optimization_goal": "REACH", "promoted_page": True},
+# One-step boost: objective and destination -> ad set optimization goal and what the ad
+# set promotes. Engagement (post and video), awareness, and sales and leads with a pixel
+# come from the objective mapping table on Meta's campaign reference page. Profile visits
+# (INSTAGRAM_PROFILE with VISIT_INSTAGRAM_PROFILE) and website traffic (WEBSITE with
+# LINK_CLICKS) use values listed on Meta's ad set create reference; the table does not
+# pair them, so they rest on that reference plus Meta's own boost tool. The first
+# destination listed for each objective is its default.
+BOOST_OBJECTIVES: dict[str, dict[str | None, dict[str, Any]]] = {
+    "OUTCOME_ENGAGEMENT": {
+        "ON_POST": {"optimization_goal": "POST_ENGAGEMENT"},
+        "ON_VIDEO": {"optimization_goal": "THRUPLAY"},
+    },
+    "OUTCOME_AWARENESS": {
+        None: {"optimization_goal": "REACH", "promoted_page": True},
+    },
+    "OUTCOME_TRAFFIC": {
+        "INSTAGRAM_PROFILE": {"optimization_goal": "VISIT_INSTAGRAM_PROFILE"},
+        "WEBSITE": {"optimization_goal": "LINK_CLICKS", "needs_link": True},
+    },
+    "OUTCOME_SALES": {
+        "WEBSITE": {"optimization_goal": "OFFSITE_CONVERSIONS", "needs_link": True, "needs_pixel": True},
+    },
+    "OUTCOME_LEADS": {
+        "WEBSITE": {"optimization_goal": "OFFSITE_CONVERSIONS", "needs_link": True, "needs_pixel": True},
+    },
 }
 BOOST_DEFAULT_OBJECTIVE = "OUTCOME_ENGAGEMENT"
+PARTNERSHIP_CODE_SHOWN = "<partnership_ad_code>"
 BOOST_DEFAULT_DURATION_DAYS = 6
 BOOST_MAX_DURATION_DAYS = 365
 BOOST_BILLING_EVENT = "IMPRESSIONS"
 BOOST_BID_STRATEGY = "LOWEST_COST_WITHOUT_CAP"
 BOOST_PARTNERSHIP_AD_FORMATS = (1, 2, 3)
 _DELETE_TOOL = {"campaign": "delete_campaign", "ad set": "delete_adset", "creative": "delete_creative", "ad": "delete_ad"}
+
+
+def _boost_goal(
+    objective: str | None,
+    destination_type: str | None,
+    promoted_object: dict[str, Any] | None,
+    call_to_action: dict[str, Any] | None,
+) -> tuple[str, str | None, dict[str, Any]]:
+    """Resolve objective and destination to Meta's ad set settings, or refuse before any request."""
+    resolved_objective = (blank_to_none(objective) or BOOST_DEFAULT_OBJECTIVE).upper()
+    if resolved_objective not in BOOST_OBJECTIVES:
+        raise ValidationError(
+            f"objective must be one of {', '.join(BOOST_OBJECTIVES)} in one-step mode; other objectives need their own "
+            "destination and goal, so create the campaign and ad set first and pass adset_id."
+        )
+    destinations = BOOST_OBJECTIVES[resolved_objective]
+    requested = blank_to_none(destination_type)
+    if requested is None:
+        destination = next(iter(destinations))
+    else:
+        destination = requested.upper()
+        if None in destinations:
+            raise ValidationError(f"{resolved_objective} takes no destination_type in one-step mode; leave it out.")
+        if destination not in destinations:
+            raise ValidationError(
+                f"destination_type for {resolved_objective} must be one of {', '.join(str(key) for key in destinations)} "
+                "in one-step mode."
+            )
+    mapping = destinations[destination]
+    if mapping.get("needs_pixel"):
+        if not isinstance(promoted_object, dict) or not promoted_object.get("pixel_id") or not blank_to_none(str(promoted_object.get("custom_event_type") or "")):
+            raise ValidationError(
+                f"{resolved_objective} needs promoted_object with pixel_id and custom_event_type, for example "
+                "{\"pixel_id\": \"123\", \"custom_event_type\": \"PURCHASE\"}."
+            )
+        if not str(promoted_object["pixel_id"]).strip().isdigit():
+            raise ValidationError("promoted_object.pixel_id must be a numeric pixel id.")
+        _refuse_url_logins(promoted_object, "promoted_object")
+    elif promoted_object is not None:
+        raise ValidationError("promoted_object applies to OUTCOME_SALES and OUTCOME_LEADS in one-step mode.")
+    if mapping.get("needs_link"):
+        value = call_to_action.get("value") if isinstance(call_to_action, dict) else None
+        link = value.get("link") if isinstance(value, dict) else None
+        if not isinstance(link, str) or not link.strip().startswith(("http://", "https://")):
+            raise ValidationError(
+                f"{resolved_objective} with destination {destination} sends people to a website, so call_to_action "
+                "needs a website link, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}."
+            )
+    return resolved_objective, destination, mapping
+
+
+def _boost_creative_spec(
+    *,
+    page_id: str | None,
+    instagram_account_id: str,
+    media_id: str | None,
+    ad_code: str | None,
+    call_to_action: dict[str, Any] | None,
+    url_tags: str | None,
+    sponsor_page_id: str | None,
+    sponsor_instagram_account_id: str | None,
+    partnership_ad_format: int | None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """The creative for the post, and any Partnership Ad defaults applied.
+
+    With a creator's Partnership Ad code the post is named by the code (branded_content
+    instagram_boost_post_access_token) and the brand is named as sponsor on Facebook and
+    Instagram, as in Meta's "Boost Existing Instagram Media as Partnership Ads" guide.
+    """
+    spec: dict[str, Any] = {"object_id": page_id}
+    defaults: dict[str, str] = {}
+    if ad_code is None:
+        spec["instagram_user_id"] = instagram_account_id
+        spec["source_instagram_media_id"] = media_id
+    if call_to_action is not None:
+        spec["call_to_action"] = call_to_action
+    if blank_to_none(url_tags):
+        spec["url_tags"] = blank_to_none(url_tags)
+    sponsor_page = blank_to_none(sponsor_page_id)
+    sponsor_instagram = blank_to_none(sponsor_instagram_account_id)
+    if ad_code is not None:
+        if sponsor_page is None:
+            sponsor_page = page_id
+            defaults["sponsor_page_id"] = f"{page_id} (page_id)"
+        if sponsor_instagram is None:
+            sponsor_instagram = instagram_account_id
+            defaults["sponsor_instagram_account_id"] = f"{instagram_account_id} (instagram_account_id)"
+        branded: dict[str, Any] = {"instagram_boost_post_access_token": ad_code}
+        if partnership_ad_format is not None:
+            branded["ad_format"] = partnership_ad_format
+        spec["branded_content"] = branded
+    if sponsor_page:
+        spec["facebook_branded_content"] = {"sponsor_page_id": sponsor_page}
+    if sponsor_instagram:
+        spec["instagram_branded_content"] = {"sponsor_id": sponsor_instagram}
+    if ad_code is None and partnership_ad_format is not None:
+        spec["branded_content"] = {"ad_format": partnership_ad_format}
+    return spec, defaults
+
+
+def _without_ad_code(spec: dict[str, Any]) -> dict[str, Any]:
+    """A creative spec for display: the creator's Partnership Ad code is never shown."""
+    branded = spec.get("branded_content")
+    if not isinstance(branded, dict) or "instagram_boost_post_access_token" not in branded:
+        return spec
+    return {**spec, "branded_content": {**branded, "instagram_boost_post_access_token": PARTNERSHIP_CODE_SHOWN}}
 
 
 def _boost_created_message(created: list[tuple[str, str]], failed_step: str, reason: str) -> str:
@@ -1039,6 +1166,10 @@ async def _boost_one_step(
     duration_days: int | None,
     targeting: dict[str, Any] | None,
     objective: str | None,
+    destination_type: str | None,
+    promoted_object: dict[str, Any] | None,
+    call_to_action: dict[str, Any] | None,
+    partnership_defaults: dict[str, str],
     plan_only: bool,
 ) -> dict[str, Any]:
     """Create campaign, ad set, creative and ad, all paused, or return the plan."""
@@ -1047,18 +1178,12 @@ async def _boost_one_step(
     validate_positive_amount(daily_budget, field_name="daily_budget")
     if not isinstance(targeting, dict) or not targeting:
         raise ValidationError("targeting is required when adset_id is omitted, for example {\"geo_locations\": {\"countries\": [\"US\"]}}.")
-    resolved_objective = (blank_to_none(objective) or BOOST_DEFAULT_OBJECTIVE).upper()
-    if resolved_objective not in BOOST_OBJECTIVES:
-        raise ValidationError(
-            f"objective must be one of {', '.join(BOOST_OBJECTIVES)} in one-step mode; other objectives need their own "
-            "destination and goal, so create the campaign and ad set first and pass adset_id."
-        )
+    resolved_objective, destination, mapping = _boost_goal(objective, destination_type, promoted_object, call_to_action)
     days = BOOST_DEFAULT_DURATION_DAYS if duration_days is None else duration_days
     if not isinstance(days, int) or not 1 <= days <= BOOST_MAX_DURATION_DAYS:
         raise ValidationError(f"duration_days must be a whole number from 1 to {BOOST_MAX_DURATION_DAYS}.")
     if page_id is None:
         raise ValidationError("page_id is required when adset_id is omitted: the creative needs the Facebook Page linked to the Instagram account.")
-    mapping = BOOST_OBJECTIVES[resolved_objective]
     client = client_factory()
     currency = await resolve_account_currency(client, account_id)
     budget_minor = to_minor_units(daily_budget, currency, field_name="daily_budget")
@@ -1081,17 +1206,18 @@ async def _boost_one_step(
         "end_time": end_time,
         "status": "PAUSED",
     }
-    if mapping["destination_type"]:
-        adset_data["destination_type"] = mapping["destination_type"]
-    if mapping["promoted_page"]:
+    if destination:
+        adset_data["destination_type"] = destination
+    if mapping.get("promoted_page"):
         adset_data["promoted_object"] = {"page_id": page_id}
+    elif mapping.get("needs_pixel"):
+        adset_data["promoted_object"] = promoted_object
     creative_data = {"name": f"{ad_name} creative", **creative_spec}
     ad_data = {"name": ad_name, "adset_id": "<ad set id>", "creative": {"creative_id": "<creative id>"}, "status": "PAUSED"}
     defaults = {
         "objective": resolved_objective if objective is None else None,
         "duration_days": days if duration_days is None else None,
         "optimization_goal": mapping["optimization_goal"],
-        "destination_type": mapping["destination_type"],
         "billing_event": BOOST_BILLING_EVENT,
         "bid_strategy": BOOST_BID_STRATEGY,
         "special_ad_categories": [],
@@ -1100,20 +1226,25 @@ async def _boost_one_step(
         "end_time": end_time,
         "status": "PAUSED for all four objects",
         "names": f"derived from '{ad_name}'",
+        **partnership_defaults,
     }
-    defaults = {key: value for key, value in defaults.items() if value is not None or key == "destination_type"}
+    defaults = {key: value for key, value in defaults.items() if value is not None}
+    if blank_to_none(destination_type) is None:
+        defaults["destination_type"] = destination
     plan = {
         "currency": currency,
         "daily_budget": {"major_units": daily_budget, "sent_minor_units": budget_minor},
         "requests": [
             {"step": "campaign", "method": "POST", "path": f"{account_id}/campaigns", "data": campaign_data},
             {"step": "ad set", "method": "POST", "path": f"{account_id}/adsets", "data": adset_data},
-            {"step": "creative", "method": "POST", "path": f"{account_id}/adcreatives", "data": creative_data},
+            {"step": "creative", "method": "POST", "path": f"{account_id}/adcreatives", "data": _without_ad_code(creative_data)},
             {"step": "ad", "method": "POST", "path": f"{account_id}/ads", "data": ad_data},
         ],
         "defaults_applied": defaults,
     }
     target = {"account_id": account_id, "instagram_media_id": media_id, "instagram_account_id": instagram_account_id, "page_id": page_id}
+    if media_id is None:
+        target["partnership_ad_code"] = "<given, not shown>"
     if plan_only:
         return {
             "ok": True,
@@ -1171,8 +1302,8 @@ async def _boost_one_step(
 @mcp_server.tool()
 async def boost_instagram_post(
     account_id: str,
-    instagram_media_id: str,
-    instagram_account_id: str,
+    instagram_media_id: str | None = None,
+    instagram_account_id: str | None = None,
     adset_id: str | None = None,
     name: str | None = None,
     call_to_action: dict[str, Any] | None = None,
@@ -1187,16 +1318,27 @@ async def boost_instagram_post(
     sponsor_page_id: GraphId | None = None,
     sponsor_instagram_account_id: GraphId | None = None,
     partnership_ad_format: int | None = None,
+    destination_type: str | None = None,
+    promoted_object: dict[str, Any] | None = None,
+    partnership_ad_code: str | None = None,
 ) -> dict[str, Any]:
-    """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, from daily_budget (major units), targeting, objective (OUTCOME_ENGAGEMENT default, or OUTCOME_AWARENESS) and duration_days (default 6), stating every default; plan_only returns the plan and creates nothing. If a later step fails the error names every object already created. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3. Check list_instagram_media boost_eligible first."""
+    """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, from daily_budget (major units, never defaulted), targeting, duration_days (default 6) and objective: OUTCOME_ENGAGEMENT (default; destination_type ON_POST or ON_VIDEO), OUTCOME_AWARENESS, OUTCOME_TRAFFIC (INSTAGRAM_PROFILE profile visits by default, or WEBSITE), OUTCOME_SALES or OUTCOME_LEADS (WEBSITE, with promoted_object pixel_id and custom_event_type). Website destinations need call_to_action with value.link. Every default is stated; plan_only returns the plan and creates nothing. If a later step fails the error names every object already created. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3; for a creator's post, partnership_ad_code (the code the creator issued) instead of instagram_media_id. Check list_instagram_media boost_eligible first."""
     ids = {
         "account_id": blank_to_none(account_id),
-        "instagram_media_id": blank_to_none(instagram_media_id),
         "instagram_account_id": blank_to_none(instagram_account_id),
     }
     for field_name, value in ids.items():
         if value is None:
             raise ValidationError(f"{field_name} is required.")
+    media_id = blank_to_none(instagram_media_id)
+    ad_code = blank_to_none(partnership_ad_code)
+    if (media_id is None) == (ad_code is None):
+        raise ValidationError(
+            "Give exactly one of instagram_media_id or partnership_ad_code: the media id for a post this account can "
+            "boost, or the Partnership Ad code a creator issued for their post."
+        )
+    if ad_code is not None and (len(ad_code) > 512 or any(character.isspace() for character in ad_code)):
+        raise ValidationError("partnership_ad_code must be the code exactly as the creator issued it, without spaces.")
     ids["adset_id"] = blank_to_none(adset_id)
     one_step = ids["adset_id"] is None
     if one_step and validate_only:
@@ -1205,7 +1347,8 @@ async def boost_instagram_post(
         extra = [
             label for label, value in (
                 ("daily_budget", daily_budget), ("duration_days", duration_days), ("targeting", targeting),
-                ("objective", objective),
+                ("objective", objective), ("destination_type", blank_to_none(destination_type)),
+                ("promoted_object", promoted_object),
             ) if value is not None
         ]
         if plan_only:
@@ -1217,35 +1360,34 @@ async def boost_instagram_post(
             raise ValidationError("call_to_action must be an object with a type, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}.")
         _ensure_v25_creative_payload(call_to_action)
         _refuse_url_logins(call_to_action, "call_to_action")
+    if promoted_object is not None and not isinstance(promoted_object, dict):
+        raise ValidationError("promoted_object must be an object, for example {\"pixel_id\": \"123\", \"custom_event_type\": \"PURCHASE\"}.")
     if partnership_ad_format is not None:
         if partnership_ad_format not in BOOST_PARTNERSHIP_AD_FORMATS:
             raise ValidationError("partnership_ad_format must be 1 (both identities), 2 (first identity only) or 3 (automatic).")
-        if not (blank_to_none(sponsor_page_id) or blank_to_none(sponsor_instagram_account_id)):
-            raise ValidationError("partnership_ad_format needs sponsor_page_id or sponsor_instagram_account_id.")
+        if not (blank_to_none(sponsor_page_id) or blank_to_none(sponsor_instagram_account_id) or ad_code):
+            raise ValidationError("partnership_ad_format needs sponsor_page_id, sponsor_instagram_account_id or partnership_ad_code.")
     if targeting is not None:
         _ensure_v25_creative_payload(targeting)
     resolved_account_id = normalize_account_id(ids["account_id"])
-    media_id = ids["instagram_media_id"]
-    ad_name = blank_to_none(name) or f"Instagram post {media_id}"
-    partnership: dict[str, Any] = {}
-    if blank_to_none(sponsor_page_id):
-        partnership["facebook_branded_content"] = {"sponsor_page_id": blank_to_none(sponsor_page_id)}
-    if blank_to_none(sponsor_instagram_account_id):
-        partnership["instagram_branded_content"] = {"sponsor_id": blank_to_none(sponsor_instagram_account_id)}
-    if partnership_ad_format is not None:
-        partnership["branded_content"] = {"ad_format": partnership_ad_format}
+    ad_name = blank_to_none(name) or (f"Instagram post {media_id}" if media_id else "Partnership ad")
     resolved_page_id = blank_to_none(page_id)
+
+    def creative_for(page: str | None) -> tuple[dict[str, Any], dict[str, str]]:
+        return _boost_creative_spec(
+            page_id=page,
+            instagram_account_id=ids["instagram_account_id"],
+            media_id=media_id,
+            ad_code=ad_code,
+            call_to_action=call_to_action,
+            url_tags=url_tags,
+            sponsor_page_id=sponsor_page_id,
+            sponsor_instagram_account_id=sponsor_instagram_account_id,
+            partnership_ad_format=partnership_ad_format,
+        )
+
     if one_step:
-        creative_spec: dict[str, Any] = {
-            "object_id": resolved_page_id,
-            "instagram_user_id": ids["instagram_account_id"],
-            "source_instagram_media_id": media_id,
-        }
-        if call_to_action is not None:
-            creative_spec["call_to_action"] = call_to_action
-        if blank_to_none(url_tags):
-            creative_spec["url_tags"] = blank_to_none(url_tags)
-        creative_spec.update(partnership)
+        creative_spec, partnership_defaults = creative_for(resolved_page_id)
         return await _boost_one_step(
             get_graph_api_client,
             account_id=resolved_account_id,
@@ -1258,29 +1400,24 @@ async def boost_instagram_post(
             duration_days=duration_days,
             targeting=targeting,
             objective=objective,
+            destination_type=destination_type,
+            promoted_object=promoted_object,
+            call_to_action=call_to_action,
+            partnership_defaults=partnership_defaults,
             plan_only=plan_only,
         )
     client = get_graph_api_client()
     if resolved_page_id is None:
         adset = await client.get_object(ids["adset_id"], fields=["id", "promoted_object"])
-        promoted_object = adset.get("promoted_object")
-        if isinstance(promoted_object, dict):
-            resolved_page_id = blank_to_none(str(promoted_object.get("page_id") or ""))
+        adset_promoted = adset.get("promoted_object")
+        if isinstance(adset_promoted, dict):
+            resolved_page_id = blank_to_none(str(adset_promoted.get("page_id") or ""))
         if resolved_page_id is None:
             raise ValidationError(
                 "page_id is required: Meta's Instagram post creative needs the Facebook Page id, "
                 "and the ad set's promoted_object has no page_id."
             )
-    creative_spec: dict[str, Any] = {
-        "object_id": resolved_page_id,
-        "instagram_user_id": ids["instagram_account_id"],
-        "source_instagram_media_id": media_id,
-    }
-    if call_to_action is not None:
-        creative_spec["call_to_action"] = call_to_action
-    if blank_to_none(url_tags):
-        creative_spec["url_tags"] = blank_to_none(url_tags)
-    creative_spec.update(partnership)
+    creative_spec, partnership_defaults = creative_for(resolved_page_id)
     target = {
         "account_id": resolved_account_id,
         "adset_id": ids["adset_id"],
@@ -1288,6 +1425,8 @@ async def boost_instagram_post(
         "instagram_account_id": ids["instagram_account_id"],
         "page_id": resolved_page_id,
     }
+    if ad_code is not None:
+        target["partnership_ad_code"] = "<given, not shown>"
     if validate_only:
         validation = await client.create_edge_object(
             resolved_account_id,
@@ -1307,6 +1446,8 @@ async def boost_instagram_post(
             validate_only=True,
         )
         response.update({"creative_id": None, "ad_id": None, "status": "PAUSED"})
+        if partnership_defaults:
+            response["partnership_defaults_applied"] = partnership_defaults
         return response
     creative = await client.create_edge_object(
         resolved_account_id,
@@ -1349,4 +1490,6 @@ async def boost_instagram_post(
         result={"creative": creative, "ad": ad},
     )
     response.update({"creative_id": creative_id, "ad_id": str(ad.get("id") or "") or None, "status": "PAUSED"})
+    if partnership_defaults:
+        response["partnership_defaults_applied"] = partnership_defaults
     return response

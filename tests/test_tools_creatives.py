@@ -790,7 +790,7 @@ def test_boost_partnership_inputs_reach_the_creative(monkeypatch) -> None:
     [
         ({"daily_budget": None}, "daily_budget"),
         ({"targeting": None}, "targeting is required"),
-        ({"objective": "OUTCOME_SALES"}, "objective must be one of"),
+        ({"objective": "OUTCOME_APP_PROMOTION"}, "objective must be one of"),
         ({"duration_days": 0}, "duration_days"),
         ({"duration_days": 366}, "duration_days"),
         ({"page_id": None}, "page_id is required"),
@@ -1088,6 +1088,158 @@ def test_g20_video_url_with_login_is_refused_before_any_request(monkeypatch) -> 
             asyncio.run(creatives.upload_ad_video("10", video_url=url, dry_run=dry_run))
         assert secret not in str(raised.value)
         assert "username or password" in str(raised.value)
+
+
+# boost_instagram_post: more objectives and Partnership Ad codes
+
+
+WEBSITE_CTA = {"type": "LEARN_MORE", "value": {"link": "https://shop.example.com/spring"}}
+PIXEL = {"pixel_id": "888", "custom_event_type": "PURCHASE"}
+
+
+def _created(client, edge):
+    return next(call[3] for call in client.calls if call[0] == "create" and call[2] == edge)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "objective", "destination", "goal", "promoted"),
+    [
+        ({"objective": "OUTCOME_TRAFFIC"}, "OUTCOME_TRAFFIC", "INSTAGRAM_PROFILE", "VISIT_INSTAGRAM_PROFILE", None),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "website", "call_to_action": WEBSITE_CTA},
+         "OUTCOME_TRAFFIC", "WEBSITE", "LINK_CLICKS", None),
+        ({"objective": "OUTCOME_ENGAGEMENT", "destination_type": "ON_VIDEO"}, "OUTCOME_ENGAGEMENT", "ON_VIDEO", "THRUPLAY", None),
+        ({"objective": "OUTCOME_SALES", "promoted_object": PIXEL, "call_to_action": WEBSITE_CTA},
+         "OUTCOME_SALES", "WEBSITE", "OFFSITE_CONVERSIONS", PIXEL),
+        ({"objective": "OUTCOME_LEADS", "promoted_object": {"pixel_id": "888", "custom_event_type": "LEAD"}, "call_to_action": WEBSITE_CTA},
+         "OUTCOME_LEADS", "WEBSITE", "OFFSITE_CONVERSIONS", {"pixel_id": "888", "custom_event_type": "LEAD"}),
+    ],
+)
+def test_boost_one_step_objectives_set_the_matching_destination_and_goal(
+    monkeypatch, arguments, objective, destination, goal, promoted,
+) -> None:
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+    campaign, adset = _created(client, "campaigns"), _created(client, "adsets")
+    assert campaign["objective"] == objective
+    assert adset["destination_type"] == destination
+    assert adset["optimization_goal"] == goal
+    assert adset.get("promoted_object") == promoted
+    assert adset["status"] == "PAUSED" and campaign["status"] == "PAUSED"
+    assert result["defaults_applied"]["optimization_goal"] == goal
+    if "destination_type" not in arguments:
+        assert result["defaults_applied"]["destination_type"] == destination
+
+
+def test_boost_one_step_default_objective_is_unchanged(monkeypatch) -> None:
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    asyncio.run(creatives.boost_instagram_post(**ONE_STEP))
+    adset = _created(client, "adsets")
+    assert (_created(client, "campaigns")["objective"], adset["destination_type"], adset["optimization_goal"]) == (
+        "OUTCOME_ENGAGEMENT", "ON_POST", "POST_ENGAGEMENT",
+    )
+    assert "promoted_object" not in adset
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "MESSENGER"}, "destination_type for OUTCOME_TRAFFIC must be one of"),
+        ({"objective": "OUTCOME_AWARENESS", "destination_type": "WEBSITE"}, "OUTCOME_AWARENESS takes no destination_type"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "WEBSITE"}, "website link"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "WEBSITE", "call_to_action": {"type": "LEARN_MORE"}}, "website link"),
+        ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA}, "pixel_id and custom_event_type"),
+        ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA, "promoted_object": {"pixel_id": "abc", "custom_event_type": "PURCHASE"}}, "pixel_id"),
+        ({"objective": "OUTCOME_ENGAGEMENT", "promoted_object": PIXEL}, "promoted_object applies to OUTCOME_SALES and OUTCOME_LEADS"),
+        ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA, "promoted_object": {**PIXEL, "object_store_url": "https://u:p@x.example/app"}}, "username or password"),
+    ],
+)
+def test_boost_one_step_objective_validation_makes_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+
+
+def test_boost_with_adset_rejects_destination_and_promoted_object(monkeypatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    base = {key: value for key, value in ONE_STEP.items() if key not in {"daily_budget", "targeting"}}
+    with pytest.raises(creatives.ValidationError, match="destination_type, promoted_object only apply in one-step mode"):
+        asyncio.run(creatives.boost_instagram_post(**base, adset_id="60", destination_type="ON_POST", promoted_object=PIXEL))
+
+
+def test_boost_with_a_partnership_ad_code_names_the_post_by_code(monkeypatch) -> None:
+    client = FakeBoostClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        account_id="123", instagram_account_id="ig_1", adset_id="adset_1", page_id="page_1",
+        partnership_ad_code="AC-998877", partnership_ad_format=2,
+    ))
+    creative = client.calls[0][3]
+    assert creative == {
+        "name": "Partnership ad creative",
+        "object_id": "page_1",
+        "branded_content": {"instagram_boost_post_access_token": "AC-998877", "ad_format": 2},
+        "facebook_branded_content": {"sponsor_page_id": "page_1"},
+        "instagram_branded_content": {"sponsor_id": "ig_1"},
+    }
+    assert "AC-998877" not in str(result)
+    assert result["target"]["partnership_ad_code"] == "<given, not shown>"
+    assert result["partnership_defaults_applied"] == {
+        "sponsor_page_id": "page_1 (page_id)", "sponsor_instagram_account_id": "ig_1 (instagram_account_id)",
+    }
+
+
+def test_boost_partnership_ad_code_uses_given_sponsors(monkeypatch) -> None:
+    client = FakeBoostClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    asyncio.run(creatives.boost_instagram_post(
+        account_id="123", instagram_account_id="ig_1", adset_id="adset_1", page_id="page_1",
+        partnership_ad_code="AC-1", sponsor_page_id="222", sponsor_instagram_account_id="333",
+    ))
+    creative = client.calls[0][3]
+    assert creative["facebook_branded_content"] == {"sponsor_page_id": "222"}
+    assert creative["instagram_branded_content"] == {"sponsor_id": "333"}
+    assert creative["branded_content"] == {"instagram_boost_post_access_token": "AC-1"}
+    assert "source_instagram_media_id" not in creative and "instagram_user_id" not in creative
+
+
+def test_boost_one_step_plan_with_a_partnership_ad_code_never_shows_the_code(monkeypatch) -> None:
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "instagram_media_id"}
+    plan = asyncio.run(creatives.boost_instagram_post(**arguments, partnership_ad_code="AC-SECRET-1", plan_only=True))
+    assert "AC-SECRET-1" not in str(plan)
+    creative = plan["plan"]["requests"][2]["data"]
+    assert creative["branded_content"] == {"instagram_boost_post_access_token": "<partnership_ad_code>"}
+    asyncio.run(creatives.boost_instagram_post(**arguments, partnership_ad_code="AC-SECRET-1"))
+    sent = _created(client, "adcreatives")
+    assert sent["branded_content"] == {"instagram_boost_post_access_token": "AC-SECRET-1"}
+    assert sent["name"] == "Partnership ad creative"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"instagram_media_id": "555", "partnership_ad_code": "AC-1"}, "exactly one of instagram_media_id or partnership_ad_code"),
+        ({}, "exactly one of instagram_media_id or partnership_ad_code"),
+        ({"partnership_ad_code": "has space"}, "partnership_ad_code"),
+        ({"partnership_ad_code": "AC-1", "instagram_account_id": None}, "instagram_account_id is required"),
+    ],
+)
+def test_boost_partnership_ad_code_validation_makes_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    base = {"account_id": "123", "instagram_account_id": "ig_1", "adset_id": "adset_1", "page_id": "page_1"}
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**base, **arguments}))
+
+
+def test_boost_one_step_never_defaults_a_budget(monkeypatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "daily_budget"}
+    for objective in ("OUTCOME_TRAFFIC", "OUTCOME_ENGAGEMENT"):
+        with pytest.raises(creatives.ValidationError, match="does not pick a budget"):
+            asyncio.run(creatives.boost_instagram_post(**arguments, objective=objective, plan_only=True))
 
 
 # upload_ad_video: chunked upload for local files above the direct-upload limit
