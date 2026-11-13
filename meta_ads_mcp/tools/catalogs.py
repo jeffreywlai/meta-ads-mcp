@@ -35,6 +35,24 @@ CATALOG_FIELDS = ["id", "name", "vertical", "product_count", "feed_count", "is_c
 CATALOG_UPDATE_READ_FIELDS = [
     "id", "name", "vertical", "da_display_settings", "default_image_url", "fallback_image_url",
 ]
+# Catalog update parameters whose prior value can be read back, beyond the
+# fixed projection above: update parameter -> readable field. Each is read
+# only when it is being changed, and Meta refusing one of these reads makes
+# its previous value unavailable instead of blocking the update.
+#   store_catalog_settings: readable on ProductCatalog and accepted by its
+#     api_update in SDK 26.0.2 (Meta's reference lists it as an update
+#     parameter only).
+#   checkout_url, checkout_country: Meta's Product Catalog reference documents
+#     the readable checkout_urls field, one entry per sell-to country, matching
+#     these update parameters.
+CATALOG_EXTRA_READABLE = {
+    "store_catalog_settings": "store_catalog_settings",
+    "checkout_url": "checkout_urls",
+    "checkout_country": "checkout_urls",
+}
+# Keys inside a catalog setting that hold credentials (partner_integration's
+# external_access_token); they are sent but never shown back.
+_SECRET_SETTING_KEYS = frozenset({"external_access_token", "access_token", "password"})
 # Allowed `vertical` values on POST /{business_id}/owned_product_catalogs.
 CATALOG_VERTICALS = (
     "adoptable_pets", "apps_and_software", "articles_and_publications", "commerce",
@@ -67,7 +85,19 @@ PRODUCT_READABLE_UPDATE_FIELDS = frozenset({
     "product_type", "retailer_id", "sale_price", "sale_price_end_date", "sale_price_start_date",
     "short_description", "size", "start_date", "url", "visibility", "wa_compliance_category",
 })
+# Product item fields readable on ProductItem and accepted by its api_update in
+# SDK 26.0.2 that Meta's reference does not list as readable. They are read
+# before a change, and Meta refusing the read makes only their previous value
+# unavailable.
+PRODUCT_SDK_READABLE_UPDATE_FIELDS = frozenset({
+    "custom_number_0", "custom_number_1", "custom_number_2", "custom_number_3", "custom_number_4",
+    "quantity_to_sell_on_facebook", "rich_text_description",
+})
 _UNREADABLE_PREVIOUS = "Meta does not document this field as readable, so its prior value could not be read."
+_REFUSED_PREVIOUS = (
+    "Meta refused to read {field} before the update, so its prior value could not be read; the update "
+    "was still sent."
+)
 FILTER_SAMPLE_FIELDS = ["id", "retailer_id", "name", "price", "availability"]
 PRODUCT_AVAILABILITY = (
     "in stock", "out of stock", "preorder", "available for order", "discontinued",
@@ -298,6 +328,49 @@ def _error_entry(signal: str, error: Exception) -> dict[str, Any]:
     return entry
 
 
+async def _read_previous(
+    client, object_id: str, base_fields: list[str], extra_fields: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Read an object before an update; return (values, extra fields Meta refused to read).
+
+    extra_fields are read only because a change touches them. If Meta rejects
+    the request as an invalid parameter (code 100, as for a field it will not
+    read), it is repeated once with base_fields alone and every extra field is
+    reported as refused. Any other failure, or a failed repeat, is raised, so
+    nothing is written without a previous value.
+    """
+    extra = [name for name in extra_fields if name not in base_fields]
+    try:
+        return await client.get_object(object_id, fields=[*base_fields, *extra]), []
+    except MetaApiError as error:
+        if not extra or error.code != 100:
+            raise
+    return await client.get_object(object_id, fields=list(base_fields)), extra
+
+
+def _mask_secrets(value: Any) -> Any:
+    """Return value with credential keys replaced, for showing what was sent."""
+    if isinstance(value, dict):
+        return {
+            key: "[redacted]" if str(key).lower() in _SECRET_SETTING_KEYS and item is not None else _mask_secrets(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_secrets(item) for item in value]
+    return value
+
+
+def _row_identity(row: Any) -> str | None:
+    """Return a row's Meta id, or None when the row carries none."""
+    if not isinstance(row, dict):
+        return None
+    value = row.get("id")
+    if value is None or isinstance(value, (bool, dict, list)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 async def _collect_edge(
     client,
     parent_id: str,
@@ -312,16 +385,22 @@ async def _collect_edge(
     """Read an edge page by page until Meta reports no next page, or a cap or paging fault stops it.
 
     complete is true only when Meta's paging has no next link. A next link with
-    no cursor, a cursor already requested, or a page identical to one already
-    read stops the scan with a stated reason, and that page's rows are not added
-    twice. max_pages caps requests regardless of how many rows came back, so a
-    run of empty pages cannot loop. With stop_at_total, the first summary
-    total_count Meta returns ends the read. summary_total is the first
+    no cursor, a cursor already requested, or a page already read stops the scan
+    with a stated reason, and that page's rows are not added twice. Pages are
+    compared by identity, never by the values a narrow field selection
+    returns: rows carrying an id are kept once per id, and a page whose rows
+    were all read before is a repeat. Rows without an id cannot be told apart,
+    so a page of them identical to an earlier one stops the read as
+    incomplete, saying it is ambiguous, rather than being counted twice or
+    called a repeat. max_pages caps requests regardless of how many rows came
+    back, so a run of empty pages cannot loop. With stop_at_total, the first
+    summary total_count Meta returns ends the read. summary_total is the first
     summary total_count Meta returned on any page, or None.
     """
     rows: list[Any] = []
     seen_cursors: set[str] = set()
-    seen_pages: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_anonymous_pages: set[str] = set()
     cursor: str | None = None
     pages = 0
     summary_total: int | None = None
@@ -334,12 +413,26 @@ async def _collect_edge(
         pages += 1
         data = payload.get("data") or []
         if data:
-            fingerprint = json.dumps(data, sort_keys=True, default=str)
-            if fingerprint in seen_pages:
-                return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
-                        "stop_reason": "Meta returned a page that had already been read.", "summary_total": summary_total}
-            seen_pages.add(fingerprint)
-            rows.extend(data)
+            identities = [_row_identity(row) for row in data]
+            if all(identity is not None for identity in identities):
+                if all(identity in seen_ids for identity in identities):
+                    return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                            "stop_reason": "Meta returned a page whose rows had all already been read.",
+                            "summary_total": summary_total}
+                for identity, row in zip(identities, data):
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        rows.append(row)
+            else:
+                fingerprint = json.dumps(data, sort_keys=True, default=str)
+                if fingerprint in seen_anonymous_pages:
+                    return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                            "stop_reason": ("Meta returned a page identical to one already read; its rows carry "
+                                            "no id, so whether it repeats that page or holds further identical "
+                                            "rows cannot be told, and the read stopped."),
+                            "summary_total": summary_total}
+                seen_anonymous_pages.add(fingerprint)
+                rows.extend(data)
         total = (payload.get("summary") or {}).get("total_count")
         if summary_total is None:
             summary_total = to_int(total)
@@ -1105,18 +1198,33 @@ async def update_catalog(
         raise ValidationError("At least one field must be provided for update_catalog.")
     if "name" in payload and not blank_to_none(str(payload["name"])):
         raise ValidationError("name must not be blank.")
+    extra_reads = list(dict.fromkeys(
+        CATALOG_EXTRA_READABLE[key] for key in payload if key in CATALOG_EXTRA_READABLE
+    ))
     client = get_graph_api_client()
-    previous = await client.get_object(catalog_id, fields=CATALOG_UPDATE_READ_FIELDS)
+    previous, refused = await _read_previous(client, catalog_id, CATALOG_UPDATE_READ_FIELDS, extra_reads)
     await client.update_object(catalog_id, data=payload)
+    previous_values = {key: previous.get(key) for key in CATALOG_UPDATE_READ_FIELDS if key != "id"}
+    for field_name in extra_reads:
+        if field_name not in refused:
+            previous_values[field_name] = previous.get(field_name)
     response = mutation_response(
         action="update_catalog",
         target={"catalog_id": catalog_id},
-        previous={key: previous.get(key) for key in CATALOG_UPDATE_READ_FIELDS if key != "id"},
-        current=payload,
+        previous=previous_values,
+        current=_mask_secrets(payload),
     )
-    unreadable = sorted(key for key in payload if key not in CATALOG_UPDATE_READ_FIELDS)
-    if unreadable:
-        response["previous_unavailable"] = {key: _UNREADABLE_PREVIOUS for key in unreadable}
+    unavailable: dict[str, str] = {}
+    for key in sorted(payload):
+        if key in CATALOG_UPDATE_READ_FIELDS:
+            continue
+        read_as = CATALOG_EXTRA_READABLE.get(key)
+        if read_as is None:
+            unavailable[key] = _UNREADABLE_PREVIOUS
+        elif read_as in refused:
+            unavailable[key] = _REFUSED_PREVIOUS.format(field=read_as)
+    if unavailable:
+        response["previous_unavailable"] = unavailable
     return response
 
 
@@ -1297,21 +1405,24 @@ async def update_catalog_product(
         raise ValidationError("At least one field must be provided for update_catalog_product.")
     if params:
         shown.update(params)
-    readable = [key for key in payload if key in PRODUCT_READABLE_UPDATE_FIELDS]
-    read_fields = [*PRODUCT_DETAIL_FIELDS, *(key for key in readable if key not in PRODUCT_DETAIL_FIELDS)]
-    unreadable = sorted(key for key in payload if key not in PRODUCT_READABLE_UPDATE_FIELDS)
+    readable_fields = PRODUCT_READABLE_UPDATE_FIELDS | PRODUCT_SDK_READABLE_UPDATE_FIELDS
+    readable = [key for key in payload if key in readable_fields]
     client = get_graph_api_client()
-    previous = await client.get_object(product_id, fields=read_fields)
+    previous, refused = await _read_previous(
+        client, product_id, PRODUCT_DETAIL_FIELDS, [key for key in readable if key not in PRODUCT_DETAIL_FIELDS],
+    )
     await client.update_object(product_id, data=payload)
     response = mutation_response(
         action="update_catalog_product",
         target={"product_id": product_id},
         # Each field here was requested in the pre-read; Meta omits fields that hold no value.
-        previous={key: previous.get(key) for key in readable},
+        previous={key: previous.get(key) for key in readable if key not in refused},
         current=shown,
     )
-    if unreadable:
-        response["previous_unavailable"] = {key: _UNREADABLE_PREVIOUS for key in unreadable}
+    unavailable = {key: _UNREADABLE_PREVIOUS for key in sorted(payload) if key not in readable_fields}
+    unavailable.update({key: _REFUSED_PREVIOUS.format(field=key) for key in refused})
+    if unavailable:
+        response["previous_unavailable"] = unavailable
     response["sent"] = payload
     return response
 
@@ -1390,6 +1501,11 @@ _BATCH_READ_FIELD = {
     "custom_label_4": "custom_label_4", "importer_address": "importer_address",
     "importer_name": "importer_name",
 }
+# Batch fields whose readable product item field rests on SDK 26.0.2 alone
+# (PRODUCT_SDK_READABLE_UPDATE_FIELDS); Meta refusing to read them leaves only
+# their previous value unavailable.
+_BATCH_SDK_READ_FIELD = {name: name for name in PRODUCT_SDK_READABLE_UPDATE_FIELDS}
+_BATCH_READ_FIELD.update(_BATCH_SDK_READ_FIELD)
 _BATCH_BASE_READ_FIELDS = [
     "id", "retailer_id", "name", "description", "price", "currency", "sale_price", "availability",
     "condition", "url", "image_url", "brand", "visibility", "review_status",
@@ -1494,11 +1610,13 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
             "request": {"method": BATCH_METHODS[method], "data": data}, "changes": changes}
 
 
-def _batch_read_fields(entries: list[dict[str, Any]], *, with_feed: bool) -> list[str]:
+def _batch_read_fields(entries: list[dict[str, Any]], *, with_feed: bool, with_sdk_only: bool = True) -> list[str]:
     fields = list(_BATCH_BASE_READ_FIELDS)
     for entry in entries:
         for key in entry["request"]["data"]:
             read = _BATCH_READ_FIELD.get(key)
+            if not with_sdk_only and key in _BATCH_SDK_READ_FIELD:
+                continue
             if read and read not in fields:
                 fields.append(read)
     if with_feed:
@@ -1509,21 +1627,25 @@ def _batch_read_fields(entries: list[dict[str, Any]], *, with_feed: bool) -> lis
 async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
     """Read the current products for every retailer id in one filtered request.
 
-    If Meta rejects the product_feed field, the read is repeated once without it
-    and the feed check is reported as unavailable.
+    If Meta rejects the read as an invalid parameter, it is repeated once without
+    product_feed and without fields whose readability rests on the SDK alone;
+    the feed check is reported as unavailable and those fields are returned in
+    refused_fields, so their previous values are reported as unreadable.
     """
     ids = [entry["retailer_id"] for entry in entries]
     params = {"filter": {"retailer_id": {"is_any": ids}}, "limit": _BATCH_READ_PAGE_SIZE}
     feed_check = {"status": "read", "method": "product_feed field on each product"}
+    first_fields = _batch_read_fields(entries, with_feed=True)
+    refused: list[str] = []
     try:
-        read = await _collect_edge(client, catalog_id, "products",
-                                   fields=_batch_read_fields(entries, with_feed=True),
+        read = await _collect_edge(client, catalog_id, "products", fields=first_fields,
                                    params=params, max_pages=_BATCH_READ_MAX_PAGES)
     except MetaApiError as error:
         if error.code != 100:
             raise
-        read = await _collect_edge(client, catalog_id, "products",
-                                   fields=_batch_read_fields(entries, with_feed=False),
+        fallback = _batch_read_fields(entries, with_feed=False, with_sdk_only=False)
+        refused = [name for name in first_fields if name not in fallback and name != _FEED_FIELD]
+        read = await _collect_edge(client, catalog_id, "products", fields=fallback,
                                    params=params, max_pages=_BATCH_READ_MAX_PAGES)
         feed_check = {"status": "unavailable", "method": "product_feed field on each product",
                       "error": str(error)}
@@ -1533,10 +1655,12 @@ async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, 
         if isinstance(row, dict) and str(row.get("retailer_id")) in wanted
     }
     return {"found": found, "complete": read["complete"], "stop_reason": read["stop_reason"],
-            "feed_check": feed_check}
+            "feed_check": feed_check, "refused_fields": refused}
 
 
-def _previous_for(entry: dict[str, Any], product: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def _previous_for(
+    entry: dict[str, Any], product: dict[str, Any], refused: frozenset[str] | set[str] = frozenset(),
+) -> tuple[dict[str, Any], list[str]]:
     """Return (previous values keyed as the caller wrote them, keys that cannot be read back)."""
     if entry["method"] == "delete":
         return {key: value for key, value in product.items() if key != _FEED_FIELD}, []
@@ -1548,7 +1672,7 @@ def _previous_for(entry: dict[str, Any], product: dict[str, Any]) -> tuple[dict[
             continue
         key = named.get(batch_field, batch_field)
         read = _BATCH_READ_FIELD.get(batch_field)
-        if read is None:
+        if read is None or read in refused:
             unavailable.append(key)
             continue
         previous[key] = product.get(read)
@@ -1600,25 +1724,73 @@ async def _check_batch(client, catalog_id: str, handle: str) -> dict[str, Any]:
     return _batch_status_row(payload)
 
 
+# A batch error entry names its item by the request's id (the retailer id).
+_identified = _row_identity
+
+
+def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
+    """Read a finished batch status once, with one set of rules for every caller.
+
+    failed_ids are the items Meta names as failed (ids_of_invalid_requests, or an
+    error entry carrying the item's id). complete is true only when every error
+    in the batch is known to belong to a named item, so an item not named can be
+    called applied: Meta gave an explicit zero error count, or Meta listed the
+    invalid requests by id, or every error counted is listed with an item id.
+    An error entry that names no item, or a missing error count, leaves every
+    item not named unknown; reason says which.
+    """
+    invalid = {str(value).strip() for value in row.get("ids_of_invalid_requests") or []
+               if value is not None and str(value).strip()}
+    listed = row.get("errors") or []
+    if not isinstance(listed, list):
+        listed = [listed]
+    named = [entry for entry in listed if _identified(entry) is not None]
+    unnamed = len(listed) - len(named)
+    error_total = to_int(row.get("errors_total_count"))
+    failed_ids = invalid | {_identified(entry) for entry in named}
+    reason: str | None = None
+    if error_total is None:
+        complete = False
+        reason = ("Meta did not report how many errors the batch had"
+                  + (", and listed errors" if listed else "")
+                  + ", so items it did not name cannot be called applied.")
+    elif unnamed:
+        complete = False
+        reason = (f"Meta listed {unnamed} error(s) that name no item, so any item it did not name "
+                  "may be among them.")
+    elif error_total == 0:
+        complete = True
+    elif invalid or len(named) >= error_total:
+        complete = True
+    else:
+        complete = False
+        reason = (f"Meta reported {error_total} error(s) for the batch but named the item for only "
+                  f"{len(named)}, so any item it did not name may be among them.")
+    errors_by_id: dict[str, list[str]] = {}
+    for entry in named:
+        message = entry.get("message")
+        errors_by_id.setdefault(_identified(entry), []).append(
+            str(message) if message else "Meta reported an error for this item."
+        )
+    return {"failed_ids": failed_ids, "errors_by_id": errors_by_id, "complete": complete,
+            "reason": reason, "errors_total_count": error_total, "unattributed_errors": unnamed}
+
+
 def _settle(item: dict[str, Any], row: dict[str, Any]) -> None:
     """Set a sent item's final outcome from a finished batch status."""
-    invalid = {str(value) for value in row.get("ids_of_invalid_requests") or []}
-    errors = _by_id(row.get("errors"))
+    attribution = _batch_attribution(row)
+    errors = attribution["errors_by_id"]
     warnings = _by_id(row.get("warnings"))
-    error_total = to_int(row.get("errors_total_count"))
-    listed_errors = len([entry for entry in row.get("errors") or [] if isinstance(entry, dict)])
-    attributed = error_total == 0 or bool(invalid) or (error_total is not None and listed_errors >= error_total)
     retailer_id = item["retailer_id"]
     item["warnings"] = [*item["warnings"], *warnings.get(retailer_id, [])]
-    if retailer_id in invalid or retailer_id in errors:
+    if retailer_id in attribution["failed_ids"]:
         item["outcome"] = "failed"
         item["errors"] = [*item["errors"], *errors.get(retailer_id, [])] or ["Meta listed this item as invalid."]
-    elif attributed:
+    elif attribution["complete"]:
         item["outcome"] = "applied"
     else:
         item["outcome"] = "outcome_unknown"
-        item["reason"] = (f"Meta reported {error_total if error_total is not None else 'an unknown number of'} "
-                          "error(s) for the batch but did not name every affected item.")
+        item["reason"] = attribution["reason"]
 
 
 def _retry_statement(outcomes: set[str], handle: str | None) -> dict[str, Any]:
@@ -1653,10 +1825,24 @@ async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, 
     finished = _is_finished(row)
     errors = [entry for entry in row.get("errors") or [] if isinstance(entry, dict)]
     warnings = [entry for entry in row.get("warnings") or [] if isinstance(entry, dict)]
-    failed = sorted({str(value) for value in row.get("ids_of_invalid_requests") or []}
-                    | set(_by_id(errors)))
+    attribution = _batch_attribution(row)
+    failed = sorted(attribution["failed_ids"])
+    if not finished:
+        outcome = "processing"
+    elif failed:
+        outcome = "some_failed" if attribution["complete"] else "some_failed_others_unknown"
+    else:
+        outcome = "all_applied" if attribution["complete"] else "outcome_unknown"
+    attribution_view: dict[str, Any] = {
+        "complete": attribution["complete"] if finished else None,
+        "unattributed_errors": attribution["unattributed_errors"],
+    }
+    if finished and attribution["reason"]:
+        attribution_view["reason"] = attribution["reason"]
     return {
-        "ok": finished and not failed and not to_int(row.get("errors_total_count")),
+        "ok": outcome == "all_applied",
+        "outcome": outcome,
+        "error_attribution": attribution_view,
         "action": "batch_update_catalog_products",
         "target": {"catalog_id": catalog_id},
         "batch": {
@@ -1739,7 +1925,7 @@ async def batch_update_catalog_products(
                               "create it from this update.")
         else:
             if product is not None:
-                previous, unavailable = _previous_for(entry, product)
+                previous, unavailable = _previous_for(entry, product, set(current["refused_fields"]))
                 item["previous"] = previous
                 if unavailable:
                     item["previous_unavailable"] = unavailable
@@ -1767,6 +1953,9 @@ async def batch_update_catalog_products(
         },
     }
     notes: list[str] = []
+    if current["refused_fields"]:
+        notes.append("Meta refused the first read of the current products, so it was repeated without "
+                     f"{', '.join(current['refused_fields'])}; their previous values are listed as unavailable.")
     if any(entry["method"] == "create" for entry in entries):
         notes.append("Meta's batch documentation lists no visibility field for products, so products created "
                      "here are not held in staging; use create_catalog_product for one that must start hidden.")
@@ -1969,8 +2158,10 @@ async def list_catalog_attribute_values(
         raise ValidationError(f"verify_top must be from 0 to {_ATTRIBUTE_MAX_VERIFY}.")
     parent = product_set_id or catalog_id
     client = get_graph_api_client()
+    # id is requested so pages are compared by product, not by attribute value:
+    # two pages of different products can hold identical values.
     scan = await _collect_edge(
-        client, parent, "products", fields=[normalized],
+        client, parent, "products", fields=["id", normalized],
         params={"limit": min(_ATTRIBUTE_PAGE_SIZE, max_products), "summary": "total_count"},
         max_pages=-(-max_products // _ATTRIBUTE_PAGE_SIZE), max_items=max_products,
     )
