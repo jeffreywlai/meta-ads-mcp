@@ -1907,6 +1907,25 @@ def test_get_ad_study_unreadable_objective_row_is_not_taken_as_the_only_objectiv
     assert "not every objective was read" in result["results"]["message"]
 
 
+@pytest.mark.parametrize("adsets", [{"paging": {}}, {"data": None}, "as_9", {"data": [{"name": "No id"}]}])
+def test_get_ad_study_unreadable_cell_membership_is_incomplete(monkeypatch, adsets) -> None:
+    results = [json.dumps({"winner_ad_object_id": "as_9", "winner_confidence": 0.9})]
+    cells = {"data": [SPLIT_CELLS["data"][0], {"id": "cell_b", "name": "Group B", "treatment_percentage": 50,
+                                               "adsets": adsets}]}
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): cells,
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "is_primary": True, "results": results}]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    assert result["cells"][1]["membership_unreadable"] == ["adset_ids"]
+    summary = result["summary"]
+    assert summary["memberships_complete"] is False and summary["cells_complete"] is False
+    assert "membership_unreadable_note" in summary and "membership_note" not in summary
+    winner = result["results"]["winner"]
+    assert winner["cell_id"] is None and "could not be read" in winner["cell_mapping_note"]
+
+
 def test_get_ad_study_without_a_type_does_not_guess_the_result_kind(monkeypatch) -> None:
     results = [json.dumps({"winner_ad_object_id": "as_1", "winner_confidence": 0.9})]
     use(monkeypatch, FakeStudyClient(

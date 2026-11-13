@@ -787,19 +787,49 @@ def _normalize_cell(cell: dict[str, Any], *, with_ad_ids: bool = False) -> dict[
         "control_percentage": cell.get("control_percentage"),
     }
     truncated: list[str] = []
+    unreadable: list[str] = []
     for edge, key in MEMBERSHIP_EDGES:
         value = cell.get(edge)
         normalized[key] = _edge_ids(value)
         paging = value.get("paging") if isinstance(value, dict) else None
         if isinstance(paging, dict) and paging.get("next"):
             truncated.append(key)
+        if not _membership_readable(value):
+            unreadable.append(key)
     if with_ad_ids:
         # Creative tests hold one ad per cell; Meta's SDK names the cell field ad_ids.
         normalized["ad_ids"] = _edge_ids(cell.get("ad_ids"))
+        if not _membership_readable(cell.get("ad_ids")):
+            unreadable.append("ad_ids")
     if truncated:
         # Meta expanded only the first page of these memberships; the remaining ids were not read.
         normalized["membership_truncated"] = truncated
+    if unreadable:
+        # Meta returned these memberships in a shape that cannot be read, so their ids are unknown.
+        normalized["membership_unreadable"] = unreadable
     return normalized
+
+
+def _membership_readable(value: Any) -> bool:
+    """Whether a cell's membership can be read: absent (no members), or ids in a list or an expanded edge.
+
+    An expanded edge without a data list, or an entry without a usable id, could hide a member.
+    """
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        value = value.get("data")
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        candidate = item.get("id") if isinstance(item, dict) else item
+        if isinstance(candidate, bool) or not isinstance(candidate, (str, int)) or not str(candidate).strip():
+            return False
+    return True
+
+
+def _membership_incomplete(cell: dict[str, Any]) -> bool:
+    return bool(cell.get("membership_truncated") or cell.get("membership_unreadable"))
 
 
 def _cell_members(cell: dict[str, Any]) -> list[str]:
@@ -886,10 +916,11 @@ def _split_outcome(
                     "The winner was not found in the cells read, which are incomplete: not every cell could be "
                     "read, so it may belong to a cell that was not read."
                 )
-            elif cell is None and any(item.get("membership_truncated") for item in cells):
+            elif cell is None and any(_membership_incomplete(item) for item in cells):
                 response["winner"]["cell_mapping_note"] = (
                     "The winner was not found in the cell memberships read, which are incomplete; "
-                    "it may belong to a cell whose later membership pages were not returned."
+                    "it may belong to a cell whose later membership pages were not returned, or whose "
+                    "membership could not be read."
                 )
         return response
     return None
@@ -1121,7 +1152,7 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             "parsed_results": parsed,
         })
     cell_nodes_complete = cells_read["complete"]
-    memberships_complete = not any(cell.get("membership_truncated") for cell in cells)
+    memberships_complete = not any(_membership_incomplete(cell) for cell in cells)
     response: dict[str, Any] = {
         "item": {**study, "state": state},
         "cells": cells,
@@ -1148,10 +1179,15 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
             response["summary"][f"{key}_unreadable_rows"] = read["unreadable_rows"]
     if ad_membership_note:
         response["summary"]["ad_membership_note"] = ad_membership_note
-    if not memberships_complete:
+    if any(cell.get("membership_truncated") for cell in cells):
         response["summary"]["membership_note"] = (
             "Meta returned only the first page of some cells' campaigns, ad sets or ad accounts "
             "(see membership_truncated on those cells); the ids listed for them are incomplete."
+        )
+    if any(cell.get("membership_unreadable") for cell in cells):
+        response["summary"]["membership_unreadable_note"] = (
+            "Meta returned some cells' memberships in a shape this server cannot read (see "
+            "membership_unreadable on those cells); the ids listed for them are incomplete."
         )
     if not include_results:
         return response
