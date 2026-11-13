@@ -103,6 +103,76 @@ def test_upload_creative_asset_supports_file_path(monkeypatch, tmp_path) -> None
     assert result["uploaded"]["account_id"] == "act_123"
 
 
+class _RecordedResponse:
+    status_code = 200
+    is_error = False
+    headers = {"content-type": "application/json"}
+    text = ""
+
+    def json(self):
+        return {"images": {"creative.png": {"hash": "abc123"}}}
+
+
+def _record_graph_requests(monkeypatch) -> list[dict[str, object]]:
+    """Run the real Graph client with the network replaced; return every request it sends."""
+    from meta_ads_mcp import graph_api
+
+    requests: list[dict[str, object]] = []
+
+    class RecordingAsyncClient:
+        is_closed = False
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def request(self, **kwargs):
+            requests.append(kwargs)
+            return _RecordedResponse()
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    monkeypatch.setattr(graph_api, "_CLIENT_POOL", {})
+    monkeypatch.setattr(graph_api.httpx, "AsyncClient", RecordingAsyncClient)
+    return requests
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n-synthetic-image"
+
+
+@pytest.mark.parametrize("name", [None, "Hero image"])
+def test_upload_creative_asset_file_inside_folder_sends_the_same_request(monkeypatch, tmp_path, name) -> None:
+    """The request Meta receives for a file in the upload folder is the one sent before the folder rule."""
+    requests = _record_graph_requests(monkeypatch)
+    image = tmp_path / "creative.png"
+    image.write_bytes(PNG_BYTES)
+
+    result = asyncio.run(creatives.upload_creative_asset(account_id="123", file_path=str(image), name=name))
+
+    assert result["uploaded"] == {"images": {"creative.png": {"hash": "abc123"}}}
+    assert len(requests) == 1
+    sent = requests[0]
+    assert sent["method"] == "POST"
+    assert sent["url"].endswith("/act_123/adimages")
+    assert sent["files"] == {"filename": ("creative.png", PNG_BYTES)}
+    assert sent["data"] == ({"name": name} if name else {})
+
+
+def test_upload_creative_asset_image_url_sends_the_same_request(monkeypatch) -> None:
+    requests = _record_graph_requests(monkeypatch)
+
+    asyncio.run(
+        creatives.upload_creative_asset(account_id="123", image_url="https://example.com/x.png", name="Hero")
+    )
+
+    assert len(requests) == 1
+    sent = requests[0]
+    assert sent["method"] == "POST"
+    assert sent["url"].endswith("/act_123/adimages")
+    assert sent["files"] is None
+    assert sent["data"] == {"url": "https://example.com/x.png", "name": "Hero"}
+
+
 def test_setup_ab_test_shapes_payload(monkeypatch) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: FakeCreativeClient())
     result = asyncio.run(
