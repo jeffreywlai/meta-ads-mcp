@@ -2576,3 +2576,44 @@ def test_p1_same_call_to_action_accounts_for_every_reported_value(inner, destina
 def test_p1_a_top_level_view_with_no_value_needs_only_the_type() -> None:
     assert cf._same_call_to_action({"type": "LEARN_MORE"}, {"type": "learn_more", "value": {"link": _P1_LINK}}) is True
     assert cf._same_call_to_action({"type": "LEARN_MORE", "value": "x"}, {"type": "LEARN_MORE"}) is False
+
+
+# Round thirteen (R3 class): the enhancement copy carries the old creative's labels as its whole set,
+# so it is never built from labels that were not all read.
+
+UNREAD_COPY_LABELS = {
+    "row-not-an-object": ([{"id": "71"}, None], "1 of the 2 labels"),
+    "row-without-id-or-name": ([{"id": "71"}, {"created_time": "2026-01-01"}], "not a label with an id or a name"),
+    "page-without-data": ({"paging": {"cursors": {}}}, "shape this server could not read"),
+    "further-page": ({"data": [{"id": "71"}], "paging": {"next": "https://graph.facebook.com/next"}}, "further page"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNREAD_COPY_LABELS))
+def test_enhancement_copy_refuses_when_the_labels_could_not_all_be_read(monkeypatch, case) -> None:
+    labels, reason = UNREAD_COPY_LABELS[case]
+    client = ProjectingClient({
+        "id": "20", "account_id": "123", "name": "C", "adlabels": deepcopy(labels),
+        "object_story_spec": {"page_id": "40", "link_data": {"link": "https://example.invalid", "image_hash": "hash"}},
+    })
+    _patch(monkeypatch, client)
+    with pytest.raises(ValidationError, match=reason) as raised:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    assert "Nothing was created or attached" in str(raised.value)
+    assert not [call for call in client.calls if call[0] in {"create", "update"}]
+
+
+@pytest.mark.parametrize("case", sorted(UNREAD_COPY_LABELS))
+def test_enhancement_dry_run_names_labels_that_could_not_all_be_read(monkeypatch, case) -> None:
+    labels, reason = UNREAD_COPY_LABELS[case]
+    client, result = _projected_enhancement(monkeypatch, {"adlabels": labels}, dry_run=True)
+    assert "adlabels" in result["settings_not_read"]
+    assert any(reason in note and "A real run would refuse" in note for note in result["notes"])
+    assert not [call for call in client.calls if call[0] in {"create", "update"}]
+
+
+def test_enhancement_copy_reads_labels_given_as_a_complete_page(monkeypatch) -> None:
+    client, result = _projected_enhancement(monkeypatch, {"adlabels": {"data": [{"id": "71", "name": "Spring"}, {"name": "Named"}]}})
+    posted = next(call[3] for call in client.calls if call[0] == "create")
+    assert posted["adlabels"] == [{"id": "71"}, {"name": "Named"}]
+    assert result["fields_not_copied"] == []

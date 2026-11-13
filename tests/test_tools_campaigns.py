@@ -3273,3 +3273,55 @@ def test_campaign_schedule_report_keeps_the_two_reasons_apart() -> None:
     assert len(fields["warnings"]) == 2
     assert fields["warnings"][0].startswith("stop_time: Meta accepted the request but did not store")
     assert fields["warnings"][1].startswith("start_time: this time has no time zone or could not be read")
+
+
+# Round thirteen sweep: previous labels and copy results never pass unread rows off as the whole set.
+
+
+@pytest.mark.parametrize(
+    ("stored", "shown", "note"),
+    [
+        ({"data": [{"id": "1", "name": "A"}, None, "x"]}, [{"id": "1", "name": "A"}], "2 of the labels Meta returned are not"),
+        ([{"id": 1}, {"created_time": "2026-01-01"}], [{"id": "1"}], "1 of the labels Meta returned is not"),
+        ({"data": [{"id": "1"}, 7], "paging": {"next": "https://graph.example/next"}}, [{"id": "1"}], "first page only"),
+        ({"paging": {}}, None, "could not read"),
+        ({"data": None}, None, "could not read"),
+    ],
+)
+def test_update_campaign_previous_labels_count_rows_that_could_not_be_read(monkeypatch, stored, shown, note) -> None:
+    client = StoredCampaignClient(extra={"adlabels": stored})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", adlabels=[{"id": "2"}]))
+    assert result["previous"]["adlabels"] == shown
+    assert note in result["previous_incomplete"]["adlabels"]
+    assert client.calls[-1] == ("update", "cmp_123", {"adlabels": [{"id": "2"}]})
+
+
+def test_read_adlabels_both_notes_when_a_page_is_partial_and_has_unread_rows() -> None:
+    labels, note = campaigns.read_adlabels({"data": [{"id": "1"}, None], "paging": {"next": "n"}})
+    assert labels == [{"id": "1"}]
+    assert campaigns.ADLABELS_PREVIOUS_INCOMPLETE in note and "1 of the labels" in note
+    assert campaigns.read_adlabels([{"id": 3, "name": "C"}]) == ([{"id": "3", "name": "C"}], None)
+    assert campaigns.read_adlabels(None) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("copied", "note"),
+    [
+        ([{"ad_object_type": "campaign", "source_id": "111", "copied_id": "222"}, "junk"], "1 of the 2 copied objects"),
+        ({"campaign": "222"}, "could not read; copied_objects is empty"),
+    ],
+)
+def test_duplicate_says_when_copied_objects_could_not_all_be_read(monkeypatch, copied, note) -> None:
+    client = CopyClient(result={"copied_campaign_id": "222", "ad_object_ids": copied})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111"))
+    assert result["new_id"] == "222"
+    assert note in result["copied_objects_note"]
+
+
+def test_duplicate_with_every_copied_object_read_has_no_note(monkeypatch) -> None:
+    client = CopyClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111"))
+    assert "copied_objects_note" not in result

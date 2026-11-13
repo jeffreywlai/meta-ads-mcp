@@ -3158,3 +3158,420 @@ def test_documented_nested_field_names_are_still_named_in_the_error(monkeypatch)
             account_id="1", instagram_media_id="40", instagram_account_id="50", adset_id="60", page_id="30",
             call_to_action=cta,
         ))
+
+
+# Round thirteen (review R11): R2, Partnership Ad codes in the raw creative tools' errors.
+
+import json  # noqa: E402
+import logging  # noqa: E402
+
+from meta_ads_mcp.errors import MetaApiError, RateLimitError  # noqa: E402
+from meta_ads_mcp.tools import ads  # noqa: E402
+
+R2_CODE = "".join(["R11", "Creator", "Authorization", "Code", "x7y9"])
+R2_FACEBOOK_CODE = "".join(["FB", "Partnership", "Code", "q4w8"])
+RAW_CREATIVE_TOOLS = ["create_ad_creative", "update_creative", "preview_ad", "create_ad"]
+
+
+class EchoingRawClient:
+    """Meta refuses every write and preview and repeats in its error what it was sent."""
+
+    def __init__(self, *codes: str) -> None:
+        self.codes = codes or (R2_CODE,)
+
+    def _error(self) -> MetaApiError:
+        error = MetaApiError(
+            message="Invalid creator authorization: " + " ".join(self.codes), code=100,
+            user_message="Rejected " + self.codes[0], details={"error": {"message": "bad " + self.codes[0]}},
+        )
+        error.__cause__ = ValueError("upstream said " + self.codes[-1])
+        return error
+
+    async def get_object(self, *args, **kwargs):
+        return {"id": "30"}
+
+    async def create_edge_object(self, *args, **kwargs):
+        raise self._error()
+
+    async def update_object(self, *args, **kwargs):
+        raise self._error()
+
+    async def preview_ad(self, *args, **kwargs):
+        raise self._error()
+
+
+def _raw_tool_call(tool_name: str, spec: dict, *, where: str = "spec"):
+    """Call one raw creative tool with spec in its raw creative input (or inside params)."""
+    if tool_name == "create_ad_creative":
+        return creatives.create_ad_creative("10", "Example", **({"params": spec} if where == "params" else {"object_story_spec": spec}))
+    if tool_name == "update_creative":
+        return creatives.update_creative("30", **({"params": spec} if where == "params" else {"object_story_spec": spec}))
+    if tool_name == "preview_ad":
+        return creatives.preview_ad(account_id="10", creative=spec)
+    if where == "params":
+        return ads.create_ad("10", "Example", "20", creative_id="40", params=spec)
+    return ads.create_ad("10", "Example", "20", creative_spec=spec)
+
+
+@pytest.mark.parametrize("tool_name", RAW_CREATIVE_TOOLS)
+def test_r2_raw_creative_tools_scrub_supplied_partnership_code_from_errors(monkeypatch, tool_name) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", EchoingRawClient)
+    monkeypatch.setattr(ads, "get_graph_api_client", EchoingRawClient)
+    secret_fields = {"branded_content": {"instagram_boost_post_access_token": R2_CODE}}
+    if tool_name == "create_ad_creative":
+        coroutine = creatives.create_ad_creative("10", "Example", params=secret_fields)
+    elif tool_name == "update_creative":
+        coroutine = creatives.update_creative("30", params=secret_fields)
+    elif tool_name == "preview_ad":
+        coroutine = creatives.preview_ad(account_id="10", creative=secret_fields)
+    else:
+        coroutine = ads.create_ad("10", "Example", "20", creative_spec=secret_fields)
+    with pytest.raises(MetaApiError) as caught:
+        asyncio.run(coroutine)
+    assert R2_CODE not in json.dumps(caught.value.to_public_dict())
+    assert creatives.PARTNERSHIP_CODE_SHOWN in caught.value.message
+
+
+R2_CODE_PLACES = {
+    # Nested where Meta's Partnership Ads guides put it, beside the story.
+    "nested": {"page_id": "1", "branded_content": {"instagram_boost_post_access_token": R2_CODE}},
+    # The Facebook code field, from the same shared list.
+    "facebook": {"branded_content": {"facebook_boost_post_access_token": R2_FACEBOOK_CODE}},
+    # A part of the spec passed as JSON text, which Meta reads the same way.
+    "json_text": {"branded_content": json.dumps({"instagram_boost_post_access_token": R2_CODE})},
+    # Deeper inside a list.
+    "in_a_list": {"items": [{"x": {"branded_content": {"instagram_boost_post_access_token": R2_CODE}}}]},
+}
+
+
+@pytest.mark.parametrize("place", sorted(R2_CODE_PLACES))
+@pytest.mark.parametrize("tool_name", RAW_CREATIVE_TOOLS)
+def test_r2_codes_anywhere_in_the_raw_inputs_never_reach_the_error_or_its_chain(monkeypatch, tool_name, place) -> None:
+    spec = R2_CODE_PLACES[place]
+    code = R2_FACEBOOK_CODE if place == "facebook" else R2_CODE
+    client = lambda: EchoingRawClient(code)  # noqa: E731
+    monkeypatch.setattr(creatives, "get_graph_api_client", client)
+    monkeypatch.setattr(ads, "get_graph_api_client", client)
+    with pytest.raises(MetaApiError) as caught:
+        asyncio.run(_raw_tool_call(tool_name, spec))
+    error = caught.value
+    assert code not in json.dumps(error.to_public_dict())
+    assert code not in str(error) and code not in repr(error.args)
+    assert code not in str(error.__cause__)
+
+
+@pytest.mark.parametrize("tool_name", ["create_ad_creative", "update_creative", "create_ad"])
+def test_r2_a_code_inside_params_is_hidden_too(monkeypatch, tool_name) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", EchoingRawClient)
+    monkeypatch.setattr(ads, "get_graph_api_client", EchoingRawClient)
+    spec = {"branded_content": {"instagram_boost_post_access_token": R2_CODE}}
+    with pytest.raises(MetaApiError) as caught:
+        asyncio.run(_raw_tool_call(tool_name, spec, where="params"))
+    assert R2_CODE not in json.dumps(caught.value.to_public_dict())
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("tool_name", RAW_CREATIVE_TOOLS)
+def test_r2_mcp_errors_and_logs_scrub_raw_creative_authorization(monkeypatch, caplog, tool_name, routed) -> None:
+    from fastmcp.exceptions import ToolError
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(creatives, "get_graph_api_client", EchoingRawClient)
+    monkeypatch.setattr(ads, "get_graph_api_client", EchoingRawClient)
+    spec = {"branded_content": {"instagram_boost_post_access_token": R2_CODE}}
+    arguments = {
+        "create_ad_creative": {"account_id": "10", "name": "Example", "params": spec},
+        "update_creative": {"creative_id": "30", "params": spec},
+        "preview_ad": {"account_id": "10", "creative": spec},
+        "create_ad": {"account_id": "10", "name": "Example", "adset_id": "20", "creative_spec": spec},
+    }[tool_name]
+    with pytest.raises(ToolError) as caught:
+        _call_tool(tool_name, arguments, routed)
+    # Check both outward errors and every emitted record even if one is unsafe.
+    leaks = {"mcp_error": R2_CODE in str(caught.value), "logs": R2_CODE in caplog.text}
+    assert not any(leaks.values()), leaks
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+def test_r2_multi_preview_result_scrubs_authorization_from_failed_formats(monkeypatch, routed) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", EchoingRawClient)
+    arguments = {
+        "account_id": "10",
+        "creative": {"branded_content": {"instagram_boost_post_access_token": R2_CODE}},
+        "ad_formats": ["MOBILE_FEED_STANDARD", "DESKTOP_FEED_STANDARD"],
+    }
+    result = _call_tool("preview_ad", arguments, routed)
+    assert R2_CODE not in json.dumps(result.structured_content)
+    content = result.structured_content
+    content = content.get("result", content)
+    assert [entry["ad_format"] for entry in content["failed"]] == ["MOBILE_FEED_STANDARD", "DESKTOP_FEED_STANDARD"]
+
+
+def test_r2_multi_preview_rate_limit_text_is_scrubbed_too(monkeypatch) -> None:
+    class Throttled:
+        async def preview_ad(self, **kwargs):
+            raise RateLimitError("Throttled while reading " + R2_CODE, code=4)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Throttled)
+    result = asyncio.run(creatives.preview_ad(
+        account_id="10", creative={"branded_content": {"instagram_boost_post_access_token": R2_CODE}},
+        ad_formats=["MOBILE_FEED_STANDARD", "DESKTOP_FEED_STANDARD"],
+    ))
+    assert R2_CODE not in json.dumps(result)
+    assert result["failed"][0]["rate_limited"] is True
+
+
+def test_r2_partnership_codes_reads_every_code_field_once() -> None:
+    found = creatives.partnership_codes(
+        {"branded_content": {"instagram_boost_post_access_token": "a-code", "ad_format": 1}},
+        [{"facebook_boost_post_access_token": "b-code"}],
+        json.dumps({"branded_content": {"instagram_boost_post_access_token": "a-code"}}),
+        "not json {", None, {"instagram_boost_post_access_token": 123},
+    )
+    assert sorted(found) == ["a-code", "b-code"]
+    assert creatives.PARTNERSHIP_CODE_FIELDS == {"instagram_boost_post_access_token", "facebook_boost_post_access_token"}
+
+
+class SuccessfulRawClient:
+    """Answers every raw creative request successfully and records what was sent."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple] = []
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.requests.append(("get", object_id, list(fields or [])))
+        return {"id": object_id, "name": "Old", "title": "T", "body": "B", "status": "PAUSED"}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.requests.append(("create", parent_id, edge, deepcopy(data)))
+        return {"id": "900"}
+
+    async def update_object(self, object_id, *, data):
+        self.requests.append(("update", object_id, deepcopy(data)))
+        return {"success": True}
+
+    async def preview_ad(self, **kwargs):
+        self.requests.append(("preview", deepcopy(kwargs)))
+        return {"data": [{"body": "<iframe></iframe>"}]}
+
+
+@pytest.mark.parametrize("tool_name", RAW_CREATIVE_TOOLS)
+def test_r2_a_successful_call_with_a_code_sends_and_returns_what_it_did_before(monkeypatch, tool_name) -> None:
+    spec = {"object_id": "1", "branded_content": {"instagram_boost_post_access_token": R2_CODE}}
+    client = SuccessfulRawClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    if tool_name == "create_ad_creative":
+        result = asyncio.run(creatives.create_ad_creative("10", "Example", params=spec))
+        assert client.requests == [("create", "act_10", "adcreatives", {"name": "Example", **spec})]
+        assert result == {"ok": True, "action": "create_ad_creative", "target": {"account_id": "act_10"}, "created": {"id": "900"}}
+    elif tool_name == "update_creative":
+        result = asyncio.run(creatives.update_creative("30", params=spec))
+        assert client.requests == [("get", "30", CREATIVE_FIELDS_LITERAL), ("update", "30", spec)]
+        assert result == {
+            "ok": True, "action": "update_creative", "target": {"creative_id": "30"},
+            "previous": {"name": "Old", "title": "T", "body": "B", "status": "PAUSED"}, "current": spec,
+        }
+    elif tool_name == "preview_ad":
+        single = asyncio.run(creatives.preview_ad(account_id="10", creative=spec))
+        many = asyncio.run(creatives.preview_ad(account_id="10", creative=spec, ad_formats=["MOBILE_FEED_STANDARD"]))
+        sent = {"ad_id": None, "account_id": "act_10", "creative_id": None, "creative": spec}
+        assert client.requests == [
+            ("preview", {**sent, "ad_format": "DESKTOP_FEED_STANDARD"}),
+            ("preview", {**sent, "ad_format": "MOBILE_FEED_STANDARD"}),
+        ]
+        assert single == {"item": {"data": [{"body": "<iframe></iframe>"}]}, "summary": {"count": 1}}
+        assert many == {
+            "items": [{"ad_format": "MOBILE_FEED_STANDARD", "preview": {"data": [{"body": "<iframe></iframe>"}]}}],
+            "failed": [],
+            "summary": {"count": 1, "requested_formats": ["MOBILE_FEED_STANDARD"], "failed_count": 0, "complete": True},
+        }
+    else:
+        result = asyncio.run(ads.create_ad("10", "Example", "20", creative_spec=spec))
+        assert client.requests == [
+            ("create", "act_10", "ads", {"name": "Example", "adset_id": "20", "creative": spec, "status": "PAUSED"}),
+        ]
+        assert result == {
+            "ok": True, "action": "create_ad", "target": {"account_id": "act_10", "adset_id": "20"},
+            "validation_only": False, "created": {"id": "900"},
+        }
+
+
+# Round thirteen (review R11): R3, a label replacement is never built from labels that were not read.
+
+
+class R3LabelClient:
+    def __init__(self, adlabels) -> None:
+        self.adlabels = adlabels
+        self.writes: list[tuple] = []
+
+    async def get_object(self, *args, **kwargs):
+        return {"id": "10", "name": "Old", "adlabels": self.adlabels}
+
+    async def update_object(self, object_id, *, data):
+        self.writes.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.writes.append(("create", parent_id, edge, dict(data)))
+        return {"success": True}
+
+
+def test_r3_unreadable_label_rows_prevent_full_replacement_on_removal(monkeypatch) -> None:
+    fake = R3LabelClient({"data": [{"id": "11"}, None, {"id": "12"}]})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    with pytest.raises(creatives.ValidationError, match="could not all be read"):
+        asyncio.run(creatives.update_creative("10", adlabels=[{"id": "11"}], adlabels_operation="remove"))
+    assert fake.writes == []
+
+
+@pytest.mark.parametrize(
+    ("adlabels", "reason"),
+    [
+        ({"data": [{"id": "11"}, "12"]}, "1 of the 2 labels"),
+        ({"data": [{"id": "11"}, {"created_time": "2026-01-01"}]}, "not a label with an id or a name"),
+        ({"data": [{"id": "11"}, {"id": None, "name": " "}]}, "not a label with an id or a name"),
+        ({"paging": {"cursors": {}}}, "shape this server could not read"),
+        ({"data": None}, "shape this server could not read"),
+        ({"data": {"id": "11"}}, "shape this server could not read"),
+        ("11", "shape this server could not read"),
+        ([{"id": "11"}, 12], "1 of the 2 labels"),
+    ],
+)
+def test_r3_any_unread_label_refuses_a_removal_with_or_without_other_changes(monkeypatch, adlabels, reason) -> None:
+    for extra in ({}, {"name": "New"}):
+        fake = R3LabelClient(adlabels)
+        monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+        with pytest.raises(creatives.ValidationError, match=reason) as raised:
+            asyncio.run(creatives.update_creative("10", adlabels=[{"id": "11"}], adlabels_operation="remove", **extra))
+        assert "Nothing was changed" in str(raised.value)
+        assert fake.writes == []
+
+
+def test_r3_a_complete_read_still_removes_and_sends_labels_back_by_id_or_name(monkeypatch) -> None:
+    fake = R3LabelClient({"data": [{"id": "11", "name": "a"}, {"id": 12}, {"name": "named-only"}]})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.update_creative("10", adlabels=[{"id": "11"}], adlabels_operation="remove"))
+    assert fake.writes == [("update", "10", {"adlabels": [{"id": "12"}, {"name": "named-only"}]})]
+    assert result["adlabels_read_complete"] is True
+
+
+@pytest.mark.parametrize("operation", ["add", "set"])
+def test_r3_unread_label_rows_are_reported_for_add_and_set(monkeypatch, operation) -> None:
+    fake = R3LabelClient({"data": [{"id": "11", "name": "keep"}, None]})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.update_creative("10", adlabels=[{"id": "30"}], adlabels_operation=operation))
+    assert result["adlabels_read_complete"] is False
+    assert result["previous"]["adlabels"] == [{"id": "11", "name": "keep"}]
+    assert "could not all be read (1 of the 2 labels" in result["adlabels_note"]
+    if operation == "add":
+        # Only an add was sent; the resulting set is not stated, since one label was not read.
+        assert fake.writes == [("create", "10", "adlabels", {"adlabels": [{"id": "30"}]})]
+        assert result["current"]["adlabels"] is None
+    else:
+        assert fake.writes == [("update", "10", {"adlabels": [{"id": "30"}]})]
+
+
+def test_creative_without_labels_reads_as_an_empty_complete_set(monkeypatch) -> None:
+    fake = R3LabelClient(None)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.update_creative("10", adlabels=[{"id": "30"}], adlabels_operation="add"))
+    assert result["adlabels_read_complete"] is True
+    assert result["current"]["adlabels"] == [{"id": "30"}]
+
+
+@pytest.mark.parametrize(
+    ("adlabels", "message"),
+    [
+        ([{"name": "a"}, {"id": "1", "name": "b"}], r"adlabels\[1\] must have exactly one"),
+        ([{"id": "abc"}], r"adlabels\[0\] id must be a numeric label id"),
+        ([{"name": "ok"}, {"name": "ok"}, {"name": " "}], r"adlabels\[2\] name must be nonblank"),
+    ],
+)
+def test_normalize_adlabels_counts_list_positions_from_zero(monkeypatch, adlabels, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.update_creative("10", adlabels=adlabels))
+
+
+def test_label_add_failure_after_an_update_does_not_name_params_keys(monkeypatch) -> None:
+    pasted = "".join(["someone", "@example.invalid"])
+
+    class FailingAdd(R3LabelClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("Label add refused", code=100)
+
+    fake = FailingAdd([])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.update_creative(
+            "10", name="New", params={pasted: "x", "url_tags": "a=b"}, adlabels=[{"id": "30"}], adlabels_operation="add",
+        ))
+    assert pasted not in str(raised.value)
+    assert "(name, 2 fields from params changed)" in str(raised.value)
+
+
+# Round thirteen sweep: reads that decide a write never pass an unreadable answer as empty.
+
+
+@pytest.mark.parametrize(
+    ("listing", "unread"),
+    [({"paging": {}}, "its answer"), ({"data": None}, "its answer"), ({"data": ["h1", {"hash": "other"}]}, "1 of the entries")],
+)
+def test_delete_ad_image_does_not_call_an_unreadable_read_not_found(monkeypatch, listing, unread) -> None:
+    class Client(FakeImageClient):
+        async def get_ad_images_by_hashes(self, account_id, *, hashes, fields=None):
+            self.calls.append(("list", account_id))
+            return listing
+
+    client = Client([])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match="not known whether the image exists") as raised:
+        asyncio.run(creatives.delete_ad_image(account_id="123", image_hash="h1"))
+    assert unread in str(raised.value) and "No image" not in str(raised.value)
+    assert [call[0] for call in client.calls] == ["list"]
+
+
+def test_delete_ad_image_found_beside_an_unreadable_entry_still_deletes(monkeypatch) -> None:
+    client = FakeImageClient(["junk", {"hash": "h1", "name": "Hero"}])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.delete_ad_image(account_id="123", image_hash="h1"))
+    assert [call[0] for call in client.calls] == ["list", "delete"]
+    assert result["previous"]["name"] == "Hero"
+
+
+@pytest.mark.parametrize(
+    ("pages", "reason"),
+    [
+        # A matching Page beside an entry that could not be read: that entry could be a second match.
+        ({None: {"data": [{"id": "777", "instagram_business_account": {"id": "666"}}, "junk"]}}, "1 entry in it could not be read"),
+        ({None: {"data": [{"id": "777", "instagram_business_account": {"id": "666"}}, {"instagram_business_account": {"id": "666"}}]}},
+         "1 entry in it could not be read"),
+        ({None: {"data": [{"id": "777", "instagram_business_account": {"id": "666"}}, {"id": "8", "instagram_business_account": "666"}]}},
+         "1 entry in it could not be read"),
+        # A page with no data list is never an empty last page.
+        ({None: {"paging": {}}}, "shape this server could not read"),
+        ({None: {"data": [{"id": "777", "instagram_business_account": {"id": "666"}}],
+                 "paging": {"next": "https://graph.facebook.com/next", "cursors": {"after": "c1"}}},
+          "c1": {"data": None}}, "shape this server could not read"),
+    ],
+)
+def test_boost_page_lookup_refuses_when_part_of_the_list_could_not_be_read(monkeypatch, fixed_clock, pages, reason) -> None:
+    client = FakePageLookupClient(pages)
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "page_id"}
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match=reason) as raised:
+        asyncio.run(creatives.boost_instagram_post(**arguments))
+    assert "page_id is required" in str(raised.value)
+    assert not [call for call in client.calls if call[0] == "create"]
+
+
+def test_video_status_without_a_processing_status_says_so(monkeypatch) -> None:
+    class Client:
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": object_id}
+
+    status = asyncio.run(creatives._read_video_status(Client(), "55"))
+    assert status["processing_status"] is None
+    assert "did not include its processing status" in status["status_note"]
+    assert "still processing" not in status["status_note"]

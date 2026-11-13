@@ -1017,3 +1017,34 @@ def test_create_ad_old_style_nested_creative_call_is_unchanged(monkeypatch, crea
             "status": "PAUSED", "execution_options": ["validate_only"],
         }),
     ]
+
+
+# Round thirteen sweep: an unreadable image answer is never reported as images that do not exist.
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{}, {"data": None}, {"data": [{"hash": "hash_123"}, "junk"]}],
+    ids=["no-data", "null-data", "row-not-an-object"],
+)
+def test_get_ad_image_refuses_an_image_answer_it_cannot_fully_read(monkeypatch, answer) -> None:
+    class Client(FakeAdsClient):
+        async def get_ad_images_by_hashes(self, account_id, *, hashes, fields=None):
+            return answer
+
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: Client())
+    with pytest.raises(ads.ValidationError, match="could not fully read"):
+        asyncio.run(ads.get_ad_image(ad_id="ad_123"))
+
+
+def test_update_ad_previous_labels_count_rows_that_could_not_be_read(monkeypatch) -> None:
+    class LabelledClient(FakeUpdateAdClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            stored = await super().get_object(object_id, fields=fields, params=params)
+            return {**stored, "adlabels": {"data": [{"id": 9, "name": "Old"}, None]}}
+
+    client = LabelledClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.update_ad(ad_id="ad_1", adlabels=[{"id": "9"}]))
+    assert result["previous"] == {"adlabels": [{"id": "9", "name": "Old"}]}
+    assert "1 of the labels Meta returned is not a label" in result["previous_incomplete"]["adlabels"]
