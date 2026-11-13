@@ -24,6 +24,7 @@ from meta_ads_mcp.tools import (
     catalogs,
     catalog_feeds,
     creatives,
+    creative_formats,
     datasets,
     diagnostics,
     discovery,
@@ -239,6 +240,15 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
 }
 # search_terms became optional (search_page_ids is the other route), so the smoke run names it.
 TOOL_OVERRIDES["search_ads_archive"] = {**TOOL_OVERRIDES["search_ads_archive"], "search_terms": "shirts"}
+
+# Phase two, stream P1 (creatives, media and assets).
+TOOL_OVERRIDES["boost_instagram_post"] = {**TOOL_OVERRIDES["boost_instagram_post"], "adset_id": "adset_123"}
+TOOL_OVERRIDES.update({
+    "create_ad_creative_from_inputs": {"page_id": "111", "image_hash": "hash_123", "link_url": "https://example.com"},
+    "update_ad_creative_enhancements": {"features": {"image_touchups": "OPT_OUT"}},
+    "upload_ad_video": {"video_url": "https://example.com/video.mp4"},
+    "delete_ad_image": {"image_hash": "hash_123"},
+})
 
 
 class UniversalFakeClient:
@@ -612,6 +622,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         catalogs,
         catalog_feeds,
         creatives,
+        creative_formats,
         datasets,
         diagnostics,
         discovery,

@@ -196,4 +196,8 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "duplicate_adset",
         "duplicate_ad",
         "batch_update_catalog_products",
+        "create_ad_creative_from_inputs",
+        "update_ad_creative_enhancements",
+        "upload_ad_video",
+        "delete_ad_image",
     }
