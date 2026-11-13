@@ -1113,7 +1113,6 @@ ROUND_FOUR_INVALID = [
     ({"page_id": "111", "link_url": "https://x", "page_welcome_message": "hi", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "INSTAGRAM_MESSAGE"),
     ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "sponsor_page_id": "5", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "single image or single video"),
     # click-to-message on an existing Instagram post
-    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "MESSAGE_PAGE"}, "not built"),
     ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "WHATSAPP_MESSAGE", "link_url": "https://x"}, "link_url is not used"),
     ({"source_instagram_media_id": "4", "page_id": "111", "sponsor_page_id": "5", "call_to_action_type": "WHATSAPP_MESSAGE"}, "Partnership"),
     ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "WHATSAPP_MESSAGE", "page_welcome_message": "hi"}, "does not accept page_welcome_message"),
@@ -1198,6 +1197,11 @@ ROUND_TRIP_SHAPES = {
                                 "call_to_action_type": "WHATSAPP_MESSAGE"},
     "instagram_post_instagram_direct": {"source_instagram_media_id": "444", "page_id": "111", "instagram_account_id": "333",
                                         "call_to_action_type": "INSTAGRAM_MESSAGE"},
+    "instagram_post_messenger": {"source_instagram_media_id": "444", "page_id": "111", "instagram_account_id": "333",
+                                 "call_to_action_type": "MESSAGE_PAGE"},
+    "click_to_instagram_video": {"page_id": "111", "instagram_account_id": "333", "video_id": "555",
+                                 "image_url": "https://cdn.example.com/t.png", "message": "Chat",
+                                 "call_to_action_type": "INSTAGRAM_MESSAGE", "page_welcome_message": "Hi"},
     "click_to_whatsapp_image": {"page_id": "111", "image_hash": "h1", "call_to_action_type": "WHATSAPP_MESSAGE", "page_welcome_message": "Hi"},
     "click_to_messenger_video": {"page_id": "111", "video_id": "555", "image_hash": "t", "call_to_action_type": "MESSAGE_PAGE",
                                  "description": "Chat"},
@@ -1479,3 +1483,339 @@ def test_h2_enhancement_feature_names_are_counted_not_quoted(monkeypatch) -> Non
         asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={PRIVATE: "OPT_IN", "image_touchups": "OPT_OUT"}))
     assert PRIVATE not in str(info.value)
     assert "1 name" in str(info.value)
+
+
+# Round five, J1: an enhancement copy keeps every setting Meta accepts on create, and names the rest.
+
+
+def _projected_enhancement(monkeypatch, extra: dict[str, Any], *, dry_run: bool = False):
+    client = ProjectingClient({
+        "id": "20", "account_id": "123", "name": "C",
+        "object_story_spec": {"page_id": "40", "link_data": {"link": "https://example.invalid", "image_hash": "hash"}},
+        **deepcopy(extra),
+    })
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}, dry_run=dry_run))
+    return client, result
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("image_crops", {"100x100": [[0, 0], [500, 500]]}),
+    ("contextual_multi_ads", {"enroll_status": "OPT_OUT"}),
+    ("dynamic_ad_voice", "STORY_OWNER"),
+])
+def test_enhancement_copy_preserves_other_writable_creative_settings(monkeypatch, field, value) -> None:
+    client, result = _projected_enhancement(monkeypatch, {field: value})
+    posted = next(call[3] for call in client.calls if call[0] == "create")
+    assert posted.get(field) == value, (result, client.calls)
+    assert field not in result["fields_not_copied"]
+
+
+ROUND_TRIP_COPIED_BEFORE_ROUND_FIVE = [
+    "object_story_spec", "asset_feed_spec", "object_story_id", "source_instagram_media_id", "instagram_user_id",
+    "object_id", "url_tags", "call_to_action", "facebook_branded_content", "instagram_branded_content",
+    "product_set_id", "media_sourcing_spec", "branded_content", "creative_sourcing_spec",
+]
+
+# One example value per newly copied setting, in the shape Meta's reference gives for it.
+NEWLY_COPIED_SETTINGS = {
+    "ad_disclaimer_spec": {"title": "TERMS_AND_CONDITIONS", "text": "Terms apply", "url": "https://example.invalid/t"},
+    "applink_treatment": "deeplink_with_web_fallback",
+    "authorization_category": "POLITICAL",
+    "branded_content_sponsor_page_id": "61",
+    "bundle_folder_id": "62",
+    "categorization_criteria": "brand",
+    "category_media_source": "MIXED",
+    "contextual_multi_ads": {"enroll_status": "OPT_IN"},
+    "destination_set_id": "63",
+    "destination_spec": {"destination_type": "WEBSITE"},
+    "dynamic_ad_voice": "DYNAMIC",
+    "enable_direct_install": True,
+    "enable_launch_instant_app": True,
+    "existing_post_title": "Old title",
+    "format_transformation_spec": [{"format": "da_collection", "data_source": ["catalog"]}],
+    "generative_asset_spec": {"music": {"enroll_status": "OPT_IN"}},
+    "image_crops": {"191x100": [[0, 0], [191, 100]]},
+    "interactive_components_spec": {"components": [{"type": "poll"}]},
+    "link_og_id": "64",
+    "marketing_message_structured_spec": {"buttons": [{"type": "url"}]},
+    "omnichannel_link_spec": {"web": {"url": "https://example.invalid"}},
+    "page_welcome_message": "Hello",
+    "place_page_set_id": "65",
+    "platform_customizations": {"instagram": {"image_hash": "ig-hash"}},
+    "playable_asset_id": "66",
+    "portrait_customizations": {"specifications": [{"background_color": {"bottom": "000000"}}]},
+    "product_suggestion_settings": {"enroll_status": "OPT_IN"},
+    "recommender_settings": {"preferred_events": ["Purchase"]},
+    "regional_regulation_disclaimer_spec": {"taiwan_finserv": {"taiwan_finserv_funder_id": "67"}},
+    "source_facebook_post_id": "68",
+    "template_url": "https://example.invalid/template",
+    "template_url_spec": {"web": {"url": "https://example.invalid/{{product.id}}"}},
+    "use_page_actor_override": True,
+    "wamo_whatsapp_identity_spec": {"whatsapp_phone_number_id": "69"},
+}
+
+
+def test_every_newly_copied_setting_has_a_round_trip_case() -> None:
+    newly_copied = set(cf.COPYABLE_CREATIVE_FIELDS) - set(ROUND_TRIP_COPIED_BEFORE_ROUND_FIVE) - {"adlabels"}
+    assert newly_copied == set(NEWLY_COPIED_SETTINGS)
+
+
+@pytest.mark.parametrize("field", sorted(NEWLY_COPIED_SETTINGS))
+def test_enhancement_copy_keeps_each_newly_covered_setting(monkeypatch, field) -> None:
+    client, result = _projected_enhancement(monkeypatch, {field: NEWLY_COPIED_SETTINGS[field]})
+    posted = next(call[3] for call in client.calls if call[0] == "create")
+    assert posted[field] == NEWLY_COPIED_SETTINGS[field]
+    assert result["fields_not_copied"] == []
+    read = next(call[2] for call in client.calls if call[:2] == ("get", "20"))
+    assert field in read
+
+
+def test_enhancement_copy_sends_ad_labels_by_id(monkeypatch) -> None:
+    labels = [{"id": "71", "name": "Spring", "created_time": "2026-01-01T00:00:00+0000"}, {"name": "Unsaved"}]
+    client, result = _projected_enhancement(monkeypatch, {"adlabels": labels})
+    posted = next(call[3] for call in client.calls if call[0] == "create")
+    assert posted["adlabels"] == [{"id": "71"}, {"name": "Unsaved"}]
+    assert result["fields_not_copied"] == []
+
+
+def test_enhancement_copy_leaves_false_switches_at_their_default(monkeypatch) -> None:
+    client, result = _projected_enhancement(monkeypatch, {"use_page_actor_override": False, "enable_direct_install": False})
+    posted = next(call[3] for call in client.calls if call[0] == "create")
+    assert "use_page_actor_override" not in posted and "enable_direct_install" not in posted
+    assert result["fields_not_copied"] == []
+
+
+def test_enhancement_read_covers_every_readable_and_creatable_creative_field() -> None:
+    # AdCreative fields that are readable (SDK 26.0.2 Field list) and accepted by POST /act_{id}/adcreatives
+    # (SDK create_ad_creative parameters or Meta's reference). Fields Meta fills in from the copied
+    # content are listed separately, with the reason they are not sent.
+    readable_and_creatable = {
+        "actor_id", "ad_disclaimer_spec", "adlabels", "applink_treatment", "asset_feed_spec", "authorization_category",
+        "body", "branded_content", "branded_content_sponsor_page_id", "bundle_folder_id", "call_to_action",
+        "categorization_criteria", "category_media_source", "contextual_multi_ads", "creative_sourcing_spec",
+        "degrees_of_freedom_spec", "destination_set_id", "destination_spec", "dynamic_ad_voice", "enable_direct_install",
+        "enable_launch_instant_app", "existing_post_title", "facebook_branded_content", "format_transformation_spec",
+        "generative_asset_spec", "image_crops", "image_hash", "image_url", "instagram_branded_content",
+        "instagram_permalink_url", "instagram_user_id", "interactive_components_spec", "link_og_id", "link_url",
+        "marketing_message_structured_spec", "media_sourcing_spec", "name", "object_id", "object_story_id",
+        "object_story_spec", "object_type", "object_url", "omnichannel_link_spec", "page_welcome_message",
+        "place_page_set_id", "platform_customizations", "playable_asset_id", "portrait_customizations", "product_set_id",
+        "product_suggestion_settings", "recommender_settings", "regional_regulation_disclaimer_spec",
+        "source_facebook_post_id", "source_instagram_media_id", "template_url", "template_url_spec", "thumbnail_url",
+        "title", "url_tags", "use_page_actor_override", "wamo_whatsapp_identity_spec",
+    }
+    copied = set(cf.COPYABLE_CREATIVE_FIELDS) | {"name", "degrees_of_freedom_spec"}
+    rebuilt = set(cf.FIELDS_REBUILT_FROM_COPIED_CONTENT)
+    assert readable_and_creatable <= copied | rebuilt
+    assert not copied & rebuilt
+    assert set(cf.COPYABLE_CREATIVE_FIELDS) | set(cf.READ_ONLY_CREATIVE_SETTINGS) <= set(cf.ENHANCEMENT_READ_FIELDS)
+    assert not rebuilt & set(cf.ENHANCEMENT_READ_FIELDS)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("messenger_sponsored_message", "{\"text\": \"hi\"}"),
+    ("collaborative_ads_lsb_image_bank_id", "81"),
+    ("link_destination_display_url", "example.invalid/display"),
+    ("product_data", [{"product_id": "82", "product_source": "CATALOG"}]),
+])
+def test_a_setting_the_copy_cannot_carry_is_named_in_dry_run_and_stops_a_real_run(monkeypatch, field, value) -> None:
+    client, result = _projected_enhancement(monkeypatch, {field: value}, dry_run=True)
+    assert field in result["fields_not_copied"]
+    assert result["settings_that_cannot_be_copied"] == [field]
+    assert any("refuse" in note for note in result["notes"])
+    assert [call[0] for call in client.calls] == ["get", "get"]
+
+    client = ProjectingClient({
+        "id": "20", "account_id": "123", "name": "C", field: value,
+        "object_story_spec": {"page_id": "40", "link_data": {"link": "https://example.invalid", "image_hash": "hash"}},
+    })
+    _patch(monkeypatch, client)
+    with pytest.raises(ValidationError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    assert field in str(info.value)
+    assert "nothing was created or attached" in str(info.value).lower()
+    assert [call[0] for call in client.calls] == ["get", "get"]
+
+
+def test_dry_run_without_lost_settings_reports_none(monkeypatch) -> None:
+    _, result = _projected_enhancement(monkeypatch, {}, dry_run=True)
+    assert result["settings_that_cannot_be_copied"] == []
+
+
+def test_refused_creative_read_stops_without_a_narrower_copy(monkeypatch) -> None:
+    class Refusing(ProjectingClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            if object_id == "20":
+                self.calls.append(("get", object_id, fields))
+                raise MetaApiError("(#100) Tried accessing nonexisting field (dynamic_ad_voice)", status_code=400, code=100)
+            return await super().get_object(object_id, fields=fields, params=params)
+
+    client = Refusing({"id": "20"})
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    message = str(info.value)
+    assert "creative 20" in message
+    assert "nothing was created or attached" in message.lower()
+    assert "dynamic_ad_voice" in message
+    assert [call[0] for call in client.calls] == ["get", "get"]
+    assert info.value.code == 100
+
+
+# Round five, J5: every encoded form of a Partnership Ad code is removed from an error.
+
+ENCODED_SECRET = "R4-secret+code/with=suffix"
+
+
+def _code_forms(secret: str) -> list[str]:
+    from urllib.parse import quote, quote_plus
+
+    return [quote(secret, safe=""), quote_plus(secret), quote(secret), quote(secret, safe="").lower()]
+
+
+@pytest.mark.parametrize("tool", ["create_ad_creative_from_inputs", "update_ad_creative_enhancements"])
+@pytest.mark.parametrize("routed", [False, True])
+def test_encoded_partnership_code_is_removed_from_upstream_error(monkeypatch, caplog, tool, routed) -> None:
+    from urllib.parse import quote
+
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.coordinator import mcp_server
+
+    encoded = quote(ENCODED_SECRET, safe="")
+
+    class Echo(FakeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            raise MetaApiError("Rejected code " + encoded, code=100, user_message="Invalid " + encoded)
+
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    _patch(monkeypatch, Echo(objects={
+        "20": {"id": "20", "account_id": "10", "creative": {"id": "30"}},
+        "30": {"id": "30", "account_id": "10", "object_id": "40", "branded_content": {"instagram_boost_post_access_token": ENCODED_SECRET}},
+    }))
+    args = (
+        {"account_id": "10", "name": "C", "page_id": "40", "sponsor_page_id": "50", "partnership_ad_code": ENCODED_SECRET}
+        if tool == "create_ad_creative_from_inputs" else {"ad_id": "20", "features": {"image_touchups": "OPT_OUT"}}
+    )
+    name, args = ("call_tool", {"name": tool, "arguments": args}) if routed else (tool, args)
+    with pytest.raises(ToolError) as error:
+        asyncio.run(mcp_server.call_tool(name, args))
+    assert encoded not in str(error.value)
+    assert encoded not in caplog.text
+
+
+@pytest.mark.parametrize("form", range(4))
+@pytest.mark.parametrize("given", [ENCODED_SECRET, f"  {ENCODED_SECRET} "])
+def test_each_encoded_code_form_is_scrubbed_from_every_error_field(monkeypatch, form, given) -> None:
+    import traceback
+
+    shown = _code_forms(ENCODED_SECRET)[form]
+
+    class Echo(FakeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            error = MetaApiError(f"bad {shown}", code=100, user_message=f"bad {shown}", error_data={"blame": shown})
+            error.__cause__ = RuntimeError(f"upstream {shown}")
+            raise error
+
+    _patch(monkeypatch, Echo())
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            account_id="10", name="C", page_id="40", sponsor_page_id="50", partnership_ad_code=given,
+        ))
+    text = "".join(traceback.format_exception(info.value)) + json.dumps(info.value.to_public_dict())
+    assert shown not in text
+    assert "<partnership_ad_code>" in str(info.value)
+
+
+# Round five additions: an Instagram Direct button on a single video, a Messenger button on an Instagram post.
+
+
+def test_click_to_instagram_direct_video_spec(monkeypatch) -> None:
+    result, data = _create(
+        monkeypatch, page_id="111", instagram_account_id="333", video_id="555", image_url="https://cdn.example.com/t.png",
+        message="Chat with us", page_welcome_message="Hi there", call_to_action_type="INSTAGRAM_MESSAGE",
+    )
+    assert data == {
+        "name": "Creative",
+        "object_story_spec": {
+            "page_id": "111",
+            "instagram_user_id": "333",
+            "video_data": {
+                "video_id": "555",
+                "image_url": "https://cdn.example.com/t.png",
+                "page_welcome_message": "Hi there",
+                "call_to_action": {"type": "INSTAGRAM_MESSAGE", "value": {"app_destination": "INSTAGRAM_DIRECT"}},
+                "message": "Chat with us",
+            },
+        },
+    }
+    assert result["format"] == "single_video"
+    assert any("INSTAGRAM_DIRECT" in note and "IMPRESSIONS" in note for note in result["notes"])
+
+
+def test_click_to_instagram_direct_video_dry_run_sends_nothing(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="Video", page_id="111", instagram_account_id="333", video_id="555", image_hash="t",
+        call_to_action_type="INSTAGRAM_MESSAGE", dry_run=True,
+    ))
+    assert result["sent"] is False
+    assert result["would_send"]["data"]["object_story_spec"]["video_data"]["call_to_action"] == {
+        "type": "INSTAGRAM_MESSAGE", "value": {"app_destination": "INSTAGRAM_DIRECT"},
+    }
+
+
+def test_messenger_button_on_instagram_post_spec(monkeypatch) -> None:
+    result, data = _create(
+        monkeypatch, source_instagram_media_id="444", page_id="111", instagram_account_id="333", call_to_action_type="MESSAGE_PAGE",
+    )
+    assert data == {
+        "name": "Creative",
+        "object_id": "111",
+        "source_instagram_media_id": "444",
+        "instagram_user_id": "333",
+        "call_to_action": {"type": "MESSAGE_PAGE", "value": {"app_destination": "MESSENGER"}},
+    }
+    assert result["format"] == "instagram_post"
+    assert any("MESSENGER" in note and "destination_type" in note for note in result["notes"])
+
+
+def test_messenger_button_on_instagram_post_dry_run_sends_nothing(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="Post", source_instagram_media_id="444", page_id="111", instagram_account_id="333",
+        call_to_action_type="MESSAGE_PAGE", dry_run=True,
+    ))
+    assert result["sent"] is False
+    assert result["would_send"]["data"]["call_to_action"] == {"type": "MESSAGE_PAGE", "value": {"app_destination": "MESSENGER"}}
+
+
+ROUND_FIVE_INVALID = [
+    # Instagram Direct button on a single video
+    ({"page_id": "111", "video_id": "5", "image_hash": "t", "call_to_action_type": "INSTAGRAM_MESSAGE"}, "instagram_account_id"),
+    ({"page_id": "111", "instagram_account_id": "3", "video_id": "5", "image_hash": "t", "call_to_action_type": "INSTAGRAM_MESSAGE", "link_url": "https://x"}, "link_url is not used"),
+    ({"page_id": "111", "instagram_account_id": "3", "video_id": "5", "call_to_action_type": "INSTAGRAM_MESSAGE"}, "thumbnail"),
+    ({"page_id": "111", "instagram_account_id": "3", "video_id": "5", "image_hash": "t", "call_to_action_type": "INSTAGRAM_MESSAGE", "headline": "H"}, "headline"),
+    ({"page_id": "111", "instagram_account_id": "3", "video_id": "5", "image_hash": "t", "call_to_action_type": "INSTAGRAM_MESSAGE", "description": "D"}, "description"),
+    ({"page_id": "111", "instagram_account_id": "3", "video_id": "5", "image_hash": "t", "call_to_action_type": "INSTAGRAM_MESSAGE", "lead_gen_form_id": "8"}, "lead_gen_form_id"),
+    ({"page_id": "111", "instagram_account_id": "3", "video_id": "5", "image_hash": "t", "call_to_action_type": "INSTAGRAM_MESSAGE", "sponsor_page_id": "9"}, "Partnership"),
+    ({"page_id": "111", "instagram_account_id": "3", "video_id": "5", "image_hash": "t", "call_to_action_type": "INSTAGRAM_MESSAGE", "display_link": "example.com"}, "display_link"),
+    # A WhatsApp button on a single video stays refused
+    ({"page_id": "111", "video_id": "5", "image_hash": "t", "call_to_action_type": "WHATSAPP_MESSAGE"}, "no video request"),
+    # A Messenger button on an existing Instagram post
+    ({"source_instagram_media_id": "4", "page_id": "111", "call_to_action_type": "MESSAGE_PAGE"}, "instagram_account_id is required"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "MESSAGE_PAGE", "link_url": "https://x"}, "link_url is not used"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "MESSAGE_PAGE", "page_welcome_message": "hi"}, "does not accept page_welcome_message"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "sponsor_page_id": "5", "call_to_action_type": "MESSAGE_PAGE"}, "Partnership"),
+    ({"source_instagram_media_id": "4", "page_id": "111", "instagram_account_id": "3", "call_to_action_type": "MESSAGE_PAGE", "lead_gen_form_id": "8"}, "lead_gen_form_id is built for a single image or single video"),
+]
+
+
+@pytest.mark.parametrize(("arguments", "message"), ROUND_FIVE_INVALID)
+def test_round_five_invalid_combinations_raise_before_any_call(monkeypatch, arguments, message) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=message):
+        asyncio.run(cf.create_ad_creative_from_inputs(account_id="123", name="Creative", **arguments))

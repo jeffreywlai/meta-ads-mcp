@@ -14,7 +14,7 @@ import dataclasses
 import re
 from copy import deepcopy
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, ValidationError
@@ -392,13 +392,21 @@ def _build_single_video(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
         raise ValidationError("A single video creative needs a thumbnail: give image_hash or image_url with video_id.")
     video_data: dict[str, Any] = {"video_id": inputs.video_id, **thumbnail}
     call_to_action: dict[str, Any] | None = None
+    notes: list[str] = []
     messaging = _messaging(inputs)
     if messaging:
         _check_messaging(inputs, messaging)
-        if messaging != "MESSAGE_PAGE":
+        if messaging == "WHATSAPP_MESSAGE":
             raise ValidationError(
-                f"{messaging} on a video is not built: Meta's guides show a click-to-message video example for "
-                "Messenger (MESSAGE_PAGE) only. Use a single image for WhatsApp or Instagram Direct."
+                "WHATSAPP_MESSAGE on a video is not built: Meta's click-to-WhatsApp guide says video is supported but "
+                "shows no video request, only image and carousel ones. Use a single image for WhatsApp."
+            )
+        if messaging == "INSTAGRAM_MESSAGE":
+            _check_instagram_direct_video(inputs)
+            notes.append(
+                "Built as the Video Creative example in Meta's click-to-Instagram guide, with message inside video_data "
+                "and instagram_user_id, the fields Meta's reference has. Pair it with an ad set whose destination_type "
+                "is INSTAGRAM_DIRECT, billing_event IMPRESSIONS and promoted_object page_id, as that guide requires."
             )
         call_to_action = {"type": messaging, "value": {"app_destination": MESSAGING_DESTINATIONS[messaging]}}
         if inputs.page_welcome_message:
@@ -428,7 +436,23 @@ def _build_single_video(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
         video_data["link_description"] = inputs.description
     spec = _story_spec(inputs, page_id)
     spec["video_data"] = video_data
-    return {"object_story_spec": spec}, []
+    return {"object_story_spec": spec}, notes
+
+
+def _check_instagram_direct_video(inputs: _Inputs) -> None:
+    """Meta's click-to-Instagram video example has a video, thumbnail, text, welcome message and the
+    chat button; the inputs that would add anything else are refused."""
+    extra = [name for name in ("headline", "description") if getattr(inputs, name)]
+    if extra:
+        raise ValidationError(
+            f"INSTAGRAM_MESSAGE on a video does not take {' or '.join(extra)}: Meta's click-to-Instagram video "
+            "example has no title or link description."
+        )
+    if _has_partnership(inputs):
+        raise ValidationError(
+            "INSTAGRAM_MESSAGE on a video is not built for a Partnership Ad: Meta's click-to-Instagram video example "
+            "is the advertiser's own creative."
+        )
 
 
 def _build_carousel(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
@@ -747,27 +771,31 @@ def _build_instagram_post(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
 
 def _instagram_post_messaging(inputs: _Inputs, spec: dict[str, Any], partnership: dict[str, Any]) -> list[str]:
     """A click-to-message button on an existing Instagram post, as Meta's click-to-WhatsApp and
-    click-to-Instagram guides show (a top-level call_to_action beside source_instagram_media_id)."""
+    click-to-Instagram guides and its Use Posts as Instagram Ads guide (Messenger) show: a
+    top-level call_to_action beside source_instagram_media_id."""
     cta = inputs.call_to_action_type
     if partnership:
         raise ValidationError(
             "Click-to-message buttons on a Partnership Ad from an Instagram post are not built: Meta's guides show "
             "them on the advertiser's own post only."
         )
-    if cta == "MESSAGE_PAGE":
-        raise ValidationError(
-            "MESSAGE_PAGE on an existing Instagram post is not built: Meta's guides show WHATSAPP_MESSAGE and "
-            "INSTAGRAM_MESSAGE buttons on an Instagram post, not Messenger."
-        )
     _check_messaging(inputs, cta)
     if cta == "WHATSAPP_MESSAGE":
         spec["call_to_action"] = {"type": cta, "value": {"link": WHATSAPP_LINK, "app_destination": "WHATSAPP"}}
+        guide = "click-to-WhatsApp guide"
+    elif cta == "MESSAGE_PAGE":
+        spec["call_to_action"] = {"type": cta, "value": {"app_destination": "MESSENGER"}}
+        guide = "Use Posts as Instagram Ads guide"
     else:
         spec["call_to_action"] = {"type": cta, "value": {"link": INSTAGRAM_LINK}}
-    return [
-        f"Built as Meta's {'click-to-WhatsApp' if cta == 'WHATSAPP_MESSAGE' else 'click-to-Instagram'} guide shows "
-        f"for an existing Instagram post. Pair it with an ad set whose destination_type is {MESSAGING_DESTINATIONS[cta]}."
-    ]
+        guide = "click-to-Instagram guide"
+    note = (
+        f"Built as Meta's {guide} shows for an existing Instagram post. Pair it with an ad set whose destination_type "
+        f"is {MESSAGING_DESTINATIONS[cta]}."
+    )
+    if cta == "MESSAGE_PAGE":
+        note += " (Meta's guide does not name the destination_type for this button; MESSENGER is from its click-to-Messenger guide.)"
+    return [note]
 
 
 def _build_partnership_ad_code(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
@@ -1085,12 +1113,10 @@ def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
 _CODE_SHOWN = "<partnership_ad_code>"
 
 
-def _without_codes(value: Any, codes: list[str]) -> Any:
+def _without_codes(value: Any, codes: re.Pattern[str]) -> Any:
     """Copy a value with every Partnership Ad code in its text replaced."""
     if isinstance(value, str):
-        for code in codes:
-            value = value.replace(code, _CODE_SHOWN)
-        return value
+        return codes.sub(_CODE_SHOWN, value)
     if isinstance(value, dict):
         return {_without_codes(key, codes): _without_codes(item, codes) for key, item in value.items()}
     if isinstance(value, list):
@@ -1118,9 +1144,11 @@ def _mask_codes_in_error(exc: BaseException, codes: list[str | None]) -> None:
     that way (and inside an exception group) has its message, arguments, notes and public
     fields cleaned. Each error is visited once, so a cycle ends.
     """
-    present = sorted({code for code in codes if isinstance(code, str) and code}, key=len, reverse=True)
-    if not present:
+    forms = sorted({code for code in codes if isinstance(code, str) and code}, key=len, reverse=True)
+    if not forms:
         return
+    # Case is ignored so an escape written in lower case (%2b rather than %2B) is found too.
+    present = re.compile("|".join(re.escape(form) for form in forms), re.IGNORECASE)
     pending: list[BaseException | None] = [exc]
     seen: set[int] = set()
     while pending:
@@ -1150,13 +1178,22 @@ def _mask_codes_in_error(exc: BaseException, codes: list[str | None]) -> None:
         pending.extend(getattr(current, "exceptions", None) or ())
 
 
+def _code_forms(code: Any) -> list[str]:
+    """An ad code as given, as sent (trimmed) and URL-encoded, every way an error could repeat it.
+
+    A code may hold plus, slash and equals characters, so Meta's error text can carry it
+    percent-encoded (with or without the slash kept) or form-encoded.
+    """
+    if not isinstance(code, str) or not code.strip():
+        return []
+    plain = {code, code.strip()}
+    encoded = {quote(form, safe="") for form in plain} | {quote(form) for form in plain} | {quote_plus(form) for form in plain}
+    return [form for form in plain | encoded if form]
+
+
 def _codes_given(*values: Any) -> list[str]:
-    """Each ad code as given and as sent (stripped), so either form is found in an error."""
-    codes: list[str] = []
-    for value in values:
-        if isinstance(value, str) and value.strip():
-            codes.extend([value, value.strip()])
-    return codes
+    """Every form of each ad code given (see _code_forms)."""
+    return [form for value in values for form in _code_forms(value)]
 
 
 @mcp_server.tool()
@@ -1194,7 +1231,7 @@ async def create_ad_creative_from_inputs(
     display_link: str | None = None,
     product_extensions_product_set_id: GraphId | None = None,
 ) -> dict[str, Any]:
-    """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image or video; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash, image_url or video_id with publisher_platforms and positions; all images or all videos; at most one entry without platforms), multi_media asset pool (2 to 10 entries, images and videos may mix, each image_hash, image_url or video_id with optional thumbnail_url; the first is the main media; Meta mixes them with the text variants), catalog carousel (product_set_id with link_url; texts may use tags like {{product.name}}), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on a single image; MESSAGE_PAGE on a video; INSTAGRAM_MESSAGE on a carousel, every card opening the same chat; WHATSAPP_MESSAGE or INSTAGRAM_MESSAGE on an existing Instagram post), instant form (lead_gen_form_id) and Partnership Ads: sponsor ids on an Instagram post, on a Facebook post (object_story_id, sponsor_page_id required) or on a new single image or video; or an ad code (partnership_ad_code for Instagram, facebook_partnership_ad_code for Facebook). display_link is the address shown on the ad (Meta's caption) and needs link_url. product_extensions_product_set_id shows products from that product set below a single image or video link ad. dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
+    """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image or video; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash, image_url or video_id with publisher_platforms and positions; all images or all videos; at most one entry without platforms), multi_media asset pool (2 to 10 entries, images and videos may mix, each image_hash, image_url or video_id with optional thumbnail_url; the first is the main media; Meta mixes them with the text variants), catalog carousel (product_set_id with link_url; texts may use tags like {{product.name}}), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on a single image; MESSAGE_PAGE or INSTAGRAM_MESSAGE on a video; INSTAGRAM_MESSAGE on a carousel, every card opening the same chat; WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on an existing Instagram post), instant form (lead_gen_form_id) and Partnership Ads: sponsor ids on an Instagram post, on a Facebook post (object_story_id, sponsor_page_id required) or on a new single image or video; or an ad code (partnership_ad_code for Instagram, facebook_partnership_ad_code for Facebook). display_link is the address shown on the ad (Meta's caption) and needs link_url. product_extensions_product_set_id shows products from that product set below a single image or video link ad. dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
     arguments = dict(locals())
     try:
         return await _create_from_inputs(**arguments)
@@ -1344,11 +1381,16 @@ ADVANTAGE_CREATIVE_FEATURES = frozenset({
 })
 ENROLL_STATUSES = frozenset({"OPT_IN", "OPT_OUT"})
 
-# Creative fields read and copied into the replacement creative: every top-level field
-# create_ad_creative_from_inputs can write (all are AdCreative fields in Meta's SDK 26.0.2),
-# so a copy of a creative this server built keeps every part of it. media_sourcing_spec holds
-# an asset pool, branded_content a Partnership Ad's format and ad code, and
-# creative_sourcing_spec a product extensions product set.
+# Creative fields read and copied into the replacement creative: every AdCreative field that is
+# both readable (Meta's SDK 26.0.2 AdCreative.Field list) and accepted when a creative is created
+# (the SDK's create_ad_creative parameters, or Meta's adcreatives reference), apart from name,
+# degrees_of_freedom_spec (changed here) and the fields in FIELDS_REBUILT_FROM_COPIED_CONTENT.
+# So a copy keeps settings made in Ads Manager or with create_ad_creative, not only those this
+# server's builder writes. media_sourcing_spec holds an asset pool, branded_content a Partnership
+# Ad's format and ad code, and creative_sourcing_spec a product extensions product set.
+# Not read: threads_user_id, threads_media_id and referral_id appear in Meta's current (v27.0)
+# reference but not in SDK 26.0.2, which this server's default API version matches, so reading
+# them could make Meta refuse the whole read.
 COPYABLE_CREATIVE_FIELDS = [
     "object_story_spec",
     "asset_feed_spec",
@@ -1364,8 +1406,101 @@ COPYABLE_CREATIVE_FIELDS = [
     "media_sourcing_spec",
     "branded_content",
     "creative_sourcing_spec",
+    # Added in round five; none of these has been read or sent against a live account yet.
+    "ad_disclaimer_spec",
+    "adlabels",
+    "applink_treatment",
+    "authorization_category",
+    "branded_content_sponsor_page_id",
+    "bundle_folder_id",
+    "categorization_criteria",
+    "category_media_source",
+    "contextual_multi_ads",
+    "destination_set_id",
+    "destination_spec",
+    "dynamic_ad_voice",
+    "enable_direct_install",
+    "enable_launch_instant_app",
+    "existing_post_title",
+    "format_transformation_spec",
+    "generative_asset_spec",
+    "image_crops",
+    "interactive_components_spec",
+    "link_og_id",
+    "marketing_message_structured_spec",
+    "omnichannel_link_spec",
+    "page_welcome_message",
+    "place_page_set_id",
+    "platform_customizations",
+    "playable_asset_id",
+    "portrait_customizations",
+    "product_suggestion_settings",
+    "recommender_settings",
+    "regional_regulation_disclaimer_spec",
+    "source_facebook_post_id",
+    "template_url",
+    "template_url_spec",
+    "use_page_actor_override",
+    "wamo_whatsapp_identity_spec",
 ]
-ENHANCEMENT_READ_FIELDS = ["id", "name", "account_id", *COPYABLE_CREATIVE_FIELDS, "degrees_of_freedom_spec"]
+
+# Readable settings Meta does not accept when a creative is created, so a copy cannot carry them.
+# They are read; when one holds a value, a dry run names it and a real run stops before writing.
+READ_ONLY_CREATIVE_SETTINGS = [
+    "collaborative_ads_lsb_image_bank_id",
+    "link_destination_display_url",
+    "messenger_sponsored_message",
+    "product_data",
+]
+
+# Fields that are readable (and some writable) but describe the content the copy already carries:
+# Meta fills them in from object_story_spec, the existing post, or the asset feed. Sending them
+# beside that content would repeat it or conflict with it, so they are not read or copied. The
+# rest are identifiers or state Meta assigns (id, account_id, status, effective_* ids).
+FIELDS_REBUILT_FROM_COPIED_CONTENT = [
+    "actor_id",
+    "body",
+    "call_to_action_type",
+    "effective_authorization_category",
+    "effective_instagram_media_id",
+    "effective_object_story_id",
+    "image_hash",
+    "image_url",
+    "instagram_permalink_url",
+    "link_deep_link_url",
+    "link_url",
+    "object_store_url",
+    "object_type",
+    "object_url",
+    "photo_album_source_object_story_id",
+    "status",
+    "thumbnail_id",
+    "thumbnail_url",
+    "title",
+    "video_id",
+]
+
+ENHANCEMENT_READ_FIELDS = [
+    "id", "name", "account_id", *COPYABLE_CREATIVE_FIELDS, *READ_ONLY_CREATIVE_SETTINGS, "degrees_of_freedom_spec",
+]
+
+
+def _holds_value(value: Any) -> bool:
+    """Whether a read field carries a setting. False is every copied switch's default, so it is not one."""
+    return value is not False and value not in (None, "", [], {})
+
+
+def _copy_value(field: str, value: Any) -> Any:
+    """The value to send for a copied field: ad labels go back by id (or name), as Meta's create takes them."""
+    if field == "adlabels" and isinstance(value, list):
+        labels = []
+        for label in value:
+            if isinstance(label, dict) and label.get("id"):
+                labels.append({"id": str(label["id"])})
+            elif isinstance(label, dict) and label.get("name"):
+                labels.append({"name": label["name"]})
+        return labels
+    return value
 
 
 def _raise_step_failure(exc: Exception, *, definite: str, unknown: str) -> None:
@@ -1417,7 +1552,7 @@ async def update_ad_creative_enhancements(
     name: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Turn Advantage creative enhancements on or off for a live ad. Meta does not edit a published creative, so this reads the ad's creative, creates a copy with features changed (for example {"image_touchups": "OPT_OUT", "text_optimizations": "OPT_IN"}), and attaches the copy. The ad is expected to go back to review because its creative changed. dry_run reads the ad and creative and returns the new creative and ad update without sending them."""
+    """Turn Advantage creative enhancements on or off for a live ad. Meta does not edit a published creative, so this reads the ad's creative, creates a copy with features changed (for example {"image_touchups": "OPT_OUT", "text_optimizations": "OPT_IN"}), and attaches the copy. The copy carries every creative setting Meta accepts when a creative is created; if the creative has a setting Meta does not accept on create, nothing is changed. The ad is expected to go back to review because its creative changed. dry_run reads the ad and creative and returns the new creative, the ad update and fields_not_copied without sending anything."""
     codes: list[str] = []
     try:
         return await _update_enhancements(ad_id, features, name, dry_run, codes)
@@ -1459,13 +1594,27 @@ async def _update_enhancements(
     if not old_creative_id:
         raise ValidationError("Meta returned no creative for this ad, so nothing was changed.")
     account_id = blank_to_none(str(ad.get("account_id") or ""))
-    creative = await client.get_object(old_creative_id, fields=ENHANCEMENT_READ_FIELDS)
+    try:
+        creative = await client.get_object(old_creative_id, fields=ENHANCEMENT_READ_FIELDS)
+    except MetaApiError as exc:
+        if exc.code == 100:
+            # Never fall back to a narrower read: a copy built from it would silently drop settings.
+            exc.message = (
+                f"Meta refused the read of creative {old_creative_id} with the fields a complete copy needs "
+                f"({len(ENHANCEMENT_READ_FIELDS)} fields), so nothing was created or attached and ad {ad_id} still "
+                f"uses creative {old_creative_id}. A copy is not built from fewer fields, since it could lose "
+                f"settings. Meta's error: {exc.message}"
+            )
+        raise
     branded = creative.get("branded_content") if isinstance(creative.get("branded_content"), dict) else {}
     codes.extend(_codes_given(*(branded.get(key) for key in _AD_CODE_FIELDS)))
     account_id = account_id or blank_to_none(str(creative.get("account_id") or ""))
     if account_id is None:
         raise ValidationError("Meta did not return the ad's account_id, so nothing was changed.")
-    copied = {field: creative[field] for field in COPYABLE_CREATIVE_FIELDS if creative.get(field) not in (None, "", [], {})}
+    copied = {
+        field: _copy_value(field, creative[field]) for field in COPYABLE_CREATIVE_FIELDS if _holds_value(creative.get(field))
+    }
+    copied = {field: value for field, value in copied.items() if _holds_value(value)}
     if "object_story_spec" in copied:
         copied.pop("object_story_id", None)
     has_ad_code = any(isinstance(branded.get(key), str) and branded[key] for key in _AD_CODE_FIELDS)
@@ -1497,8 +1646,13 @@ async def _update_enhancements(
     previous = {"creative_id": old_creative_id, "creative_features": _features_of(old_spec)}
     not_copied = sorted(
         key for key, value in creative.items()
-        if key not in {"id", "name", "account_id", "degrees_of_freedom_spec", *copied} and value not in (None, "", [], {})
+        if key not in {"id", "name", "account_id", "degrees_of_freedom_spec", *copied} and _holds_value(value)
     )
+    lost_settings = [field for field in READ_ONLY_CREATIVE_SETTINGS if _holds_value(creative.get(field))]
+    lost_note = (
+        f"The old creative has {', '.join(lost_settings)}, which Meta does not accept when a creative is created, so "
+        "a copy would lose it. A real run would refuse and change nothing; make this change in Ads Manager instead."
+    ) if lost_settings else None
     review_note = (
         "The ad now uses a new creative, so expect it to go back to review before it delivers with the change. "
         "The old creative is left in the library."
@@ -1521,8 +1675,15 @@ async def _update_enhancements(
             ],
             "proposed_features": _features_of(new_spec),
             "fields_not_copied": not_copied,
-            "notes": [copy_note, review_note],
+            "settings_that_cannot_be_copied": lost_settings,
+            "notes": [copy_note, review_note, *([lost_note] if lost_note else [])],
         }
+    if lost_settings:
+        raise ValidationError(
+            f"Creative {old_creative_id} has {', '.join(lost_settings)}, which Meta does not accept when a creative "
+            f"is created, so the copy this change needs would lose it. Nothing was created or attached; ad {ad_id} "
+            f"still uses creative {old_creative_id}. Make this change in Ads Manager instead."
+        )
     try:
         created = await client.create_edge_object(resolved_account, "adcreatives", data=payload)
     except Exception as exc:
