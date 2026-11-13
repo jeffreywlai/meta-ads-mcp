@@ -84,6 +84,23 @@ def test_list_audiences_supports_empty_collection(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: EmptyAudienceClient())
     result = asyncio.run(audiences.list_audiences(account_id="123"))
     assert result["items"] == []
+    assert result["summary"]["complete"] is True
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": None}, {"data": "x"}, {"data": {"id": "aud_1"}}])
+def test_list_audiences_unreadable_page_is_not_an_empty_complete_list(monkeypatch, payload) -> None:
+    class UnreadableAudienceClient(FakeAudienceClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            return payload
+
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: UnreadableAudienceClient())
+    result = asyncio.run(audiences.list_audiences(account_id="123"))
+    assert result["items"] == []
+    assert result["paging"] == {"before": None, "after": None, "next": None}
+    summary = result["summary"]
+    assert summary["count"] == 0 and summary["complete"] is False
+    assert summary["truncated"] is False and summary["next_after"] is None
+    assert "readable data list" in summary["incomplete_reason"]
 
 
 def test_get_audience_returns_detailed_single_object(monkeypatch) -> None:
