@@ -663,6 +663,15 @@ INTENT_GUIDE = {
             "Results follow Meta's own result for each entity; the response names any entity that could not be read.",
         ],
     },
+    "track_reach_or_unique_people_over_time": {
+        "description": "See how many people the ads reached each day, week or month, for one object or several side by side.",
+        "recommended_order": ["get_performance_trend", "get_entity_insights"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass metrics=['reach'] to get_performance_trend; a week's or month's reach is read over that whole period, never added up from days.",
+            "With object_ids or child_level, each entity returns a period series; series_periods asks for more periods than the default fits.",
+        ],
+    },
     "research_an_advertisers_ads_in_the_ad_library": {
         "description": "See the ads a specific Page or competitor is running in the public Meta Ad Library, active or inactive.",
         "recommended_order": ["search_ads_archive"],
