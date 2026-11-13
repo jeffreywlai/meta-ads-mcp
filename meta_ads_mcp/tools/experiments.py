@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import BeforeValidator
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import (
@@ -20,7 +22,21 @@ from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
-from meta_ads_mcp.tool_types import StringList, coerce_csv_string_list
+from meta_ads_mcp.tool_types import StrictCurrencyAmount, StringList, coerce_csv_string_list
+
+
+def _refuse_true_false(value: Any) -> Any:
+    """Refuse true or false where a number or time is expected; MCP would otherwise read true as 1."""
+    if isinstance(value, bool):
+        raise ValueError("expected a number or time, not true or false")
+    return value
+
+
+# Numeric and time parameters of these tools. MCP validation turns true into 1 (or 1.0) before a
+# tool's own checks run, so each one refuses true and false first.
+StrictNumber = Annotated[float, BeforeValidator(_refuse_true_false)]
+StrictCount = Annotated[int, BeforeValidator(_refuse_true_false)]
+StudyTime = Annotated[str | int, BeforeValidator(_refuse_true_false)]
 
 STUDY_LIST_FIELDS = [
     "id",
@@ -112,6 +128,26 @@ ENTITY_STUDY_SCAN_PAGES = 5
 STUDY_EDGE_PAGE_CAP = 10
 NO_CURSOR_REASON = "Meta reported another page but returned no cursor to fetch it."
 REPEATED_CURSOR_REASON = "Meta returned a cursor already read, so paging stopped to avoid counting a page twice."
+REPEATED_PAGE_REASON = (
+    "Meta returned a page that had already been read; it was not counted again and paging stopped."
+)
+
+
+def _page_fingerprint(items: list[Any]) -> str:
+    return json.dumps(items, sort_keys=True, default=str)
+
+
+def _new_rows(items: list[Any], seen_ids: set[str]) -> list[Any]:
+    """Rows whose id has not been seen on an earlier page; rows without an id are kept."""
+    fresh: list[Any] = []
+    for item in items:
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if item_id not in (None, ""):
+            if str(item_id) in seen_ids:
+                continue
+            seen_ids.add(str(item_id))
+        fresh.append(item)
+    return fresh
 # Creative tests (ad-level cells), from Meta's split testing guide: type SPLIT_TEST_V2, one ad per
 # cell, whole-number shares totalling 100, a creative_test_config budget, cooldown_start_time equal
 # to start_time and observation_end_time equal to end_time. The guide allows 2 to 7 cells; the Ad
@@ -134,7 +170,10 @@ ELIGIBILITY_RULES = [
     {
         "rule": "Split test cells hold campaigns, ad sets or ad accounts.",
         "source": AD_STUDY_DOC,
-        "applied_as": "level must be campaign or adset.",
+        "applied_as": (
+            "level must be campaign, adset or ad; ads only as a creative test, which Meta's split "
+            "testing guide describes."
+        ),
     },
     {
         "rule": "Each cell's treatment_percentage must be at least 10 and all cells together at most 100.",
@@ -166,6 +205,30 @@ ELIGIBILITY_NOT_CHECKED = [
     "Deliverable state: not performed as a rule, because Meta states none for studies. A DELETED or "
     "ARCHIVED entity makes the outcome inconclusive.",
     "Test duration limits appear only in Help Center pages that could not be confirmed, so they are not checked.",
+]
+ENTITY_FIELDS = {
+    "campaign": ["id", "name", "account_id", "effective_status", "objective", "buying_type"],
+    "adset": ["id", "name", "account_id", "campaign_id", "effective_status", "optimization_goal", "billing_event"],
+    "ad": ["id", "name", "account_id", "adset_id", "campaign_id", "effective_status"],
+}
+AD_PARENTS = (
+    ("adset", "adset_id", "ad set", ENTITY_FIELDS["adset"]),
+    ("campaign", "campaign_id", "campaign", ENTITY_FIELDS["campaign"]),
+)
+AD_ELIGIBILITY_RULES = [
+    {
+        "rule": "A creative test has 2 to 7 cells, each holding exactly one ad.",
+        "source": SPLIT_TEST_GUIDE,
+        "applied_as": "warning when more than 7 ads are checked, because they cannot each get their own cell.",
+    },
+]
+AD_ELIGIBILITY_NOT_CHECKED = [
+    "Studies holding the ad itself (an earlier creative test): not checked. Meta documents no ad_studies "
+    "edge on ads, so only studies containing each ad's parent ad set and campaign were read.",
+    "Whether the ads must share an ad set or campaign: Meta's split testing guide does not say, so it is "
+    "not judged; each ad's adset_id and campaign_id are shown for review.",
+    "Budget type: Meta's guide does not state which parent budget each creative_test_config budget option "
+    "needs, so the parents' budgets are not judged.",
 ]
 ELIGIBILITY_SUGGESTIONS = {
     "passed": (
@@ -571,16 +634,24 @@ async def _read_edge_pages(
     """Read every page of an edge, within max_pages requests.
 
     complete is true only when Meta's last page had no next link. A next link without a usable
-    cursor, a repeated cursor, or the page cap ends the read as incomplete with stop_reason saying why.
+    cursor, a repeated cursor, a page already read, or the page cap ends the read as incomplete
+    with stop_reason saying why. A repeated page is not added, and an id is kept only once.
     """
     items: list[Any] = []
     params: dict[str, Any] = {"limit": page_size}
     seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    seen_ids: set[str] = set()
     pages = 0
     while True:
         normalized = normalize_collection(await client.list_objects(parent, edge, fields=fields, params=params))
         pages += 1
-        items.extend(normalized["items"])
+        if normalized["items"]:
+            fingerprint = _page_fingerprint(normalized["items"])
+            if fingerprint in seen_pages:
+                return {"items": items, "pages_read": pages, "complete": False, "stop_reason": REPEATED_PAGE_REASON}
+            seen_pages.add(fingerprint)
+        items.extend(_new_rows(normalized["items"], seen_ids))
         if not normalized["paging"].get("next"):
             return {"items": items, "pages_read": pages, "complete": True, "stop_reason": None}
         cursor = normalized["paging"].get("after")
@@ -603,7 +674,7 @@ async def list_ad_studies(
     business_id: str | None = None,
     study_type: str | None = None,
     entity_id: str | None = None,
-    limit: int = 50,
+    limit: StrictCount = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
     """List A/B tests (split tests) and lift studies with a derived state (scheduled, running, ended, canceled).
@@ -1043,21 +1114,29 @@ async def _scan_active_studies(
     """Page a study edge for scheduled or running studies.
 
     complete is true only when Meta's last page had no next link. A next link without a usable
-    cursor, a repeated cursor, the page cap, or reaching stop_at ends the scan as incomplete with
-    stop_reason saying why.
+    cursor, a repeated cursor, a page already read, the page cap, or reaching stop_at ends the scan
+    as incomplete with stop_reason saying why. A repeated page is not counted, and each study id
+    is counted once.
     """
     active: list[dict[str, Any]] = []
     pages = 0
     params: dict[str, Any] = {"limit": 100}
     seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    seen_ids: set[str] = set()
     while True:
         normalized = normalize_collection(
             await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
         )
         pages += 1
+        if normalized["items"]:
+            fingerprint = _page_fingerprint(normalized["items"])
+            if fingerprint in seen_pages:
+                return {"active": active, "pages_read": pages, "complete": False, "stop_reason": REPEATED_PAGE_REASON}
+            seen_pages.add(fingerprint)
         active.extend(
             {"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state}
-            for study in normalized["items"]
+            for study in _new_rows(normalized["items"], seen_ids)
             if isinstance(study, dict) and (state := _study_state(study, now)) in ACTIVE_STATES
         )
         if not normalized["paging"].get("next"):
@@ -1103,36 +1182,152 @@ def _with_outcome(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _check_account_and_status(
+    result: dict[str, Any], entity: dict[str, Any], entity_id: str, account_number: str, *, subject: str = "",
+) -> None:
+    """Block an entity of another account; leave a non-delivering status unsettled."""
+    entity_account = str(entity.get("account_id") or "").removeprefix("act_")
+    if not entity_account:
+        result["unresolved"].append(
+            f"Meta returned no account_id{' for ' + subject if subject else ''}, so the account match was not checked."
+        )
+    elif entity_account != account_number:
+        result["blockers"].append(
+            f"{subject or entity_id} belongs to ad account {entity_account}, not {account_number}."
+        )
+    status = str(entity.get("effective_status") or "").upper()
+    if status in NON_DELIVERING_STATUSES:
+        result["unresolved"].append(
+            f"{'The ' + subject + ' has ' if subject else ''}effective_status {status}, so it cannot deliver. "
+            "Meta's developer documentation states no study rule for this, so this pre-check cannot say "
+            "whether it blocks the test."
+        )
+
+
+async def _studies_containing(
+    client: Any, entity_id: str, now: datetime, cache: dict[tuple[str, str], Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Scan one campaign's or ad set's ad_studies edge once; (scan, None) or (None, failure text)."""
+    key = ("studies", entity_id)
+    if key not in cache:
+        try:
+            cache[key] = (
+                await _scan_active_studies(client, entity_id, "ad_studies", now, max_pages=ENTITY_STUDY_SCAN_PAGES),
+                None,
+            )
+        except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
+            cache[key] = (None, str(exc))
+    return cache[key]
+
+
+def _note_studies(
+    result: dict[str, Any],
+    subject: str,
+    lead: str,
+    scan: dict[str, Any] | None,
+    error: str | None,
+    missing_signals: list[str],
+) -> list[dict[str, Any]] | None:
+    """Record what a study scan of subject settled; return its active studies, or None when unread."""
+    if scan is None:
+        message = f"Could not read the studies containing {subject}: {error}"
+        result["unresolved"].append(message)
+        missing_signals.append(message)
+        return None
+    active = scan["active"]
+    if not scan["complete"]:
+        message = f"Read only {scan['pages_read']} page(s) of the studies containing {subject}: {scan['stop_reason']}"
+        result["unresolved"].append(message)
+        missing_signals.append(message)
+    if active:
+        result["unresolved"].append(
+            f"{lead} {len(active)} scheduled or running study(ies): "
+            f"{', '.join(str(study['id']) for study in active)}. Meta's developer documentation "
+            "does not say whether this blocks a new test, so this pre-check cannot pass it; "
+            "Meta decides at creation."
+        )
+    return active
+
+
+async def _check_ad_parents(
+    client: Any,
+    result: dict[str, Any],
+    ad: dict[str, Any],
+    account_number: str,
+    now: datetime,
+    missing_signals: list[str],
+    cache: dict[tuple[str, str], Any],
+) -> None:
+    """Read an ad's parent ad set and campaign, check their state, and scan the studies containing them."""
+    parents: dict[str, Any] = {}
+    active_studies: list[dict[str, Any]] = []
+    complete = True
+    for kind, id_field, noun, fields in AD_PARENTS:
+        parent_id = blank_to_none(str(ad.get(id_field) or ""))
+        if parent_id is None:
+            parents[kind] = None
+            complete = False
+            result["unresolved"].append(
+                f"Meta returned no {id_field}, so the parent {noun} and the studies containing it were not checked."
+            )
+            continue
+        subject = f"parent {noun} {parent_id}"
+        if ("object", parent_id) not in cache:
+            try:
+                cache[("object", parent_id)] = (await client.get_object(parent_id, fields=fields), None)
+            except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
+                cache[("object", parent_id)] = (None, str(exc))
+        parent, read_error = cache[("object", parent_id)]
+        if parent is None:
+            parents[kind] = {"id": parent_id, "read_error": read_error}
+            result["unresolved"].append(f"Could not read the {subject}, so its state was not checked: {read_error}")
+        else:
+            parents[kind] = {key: parent.get(key) for key in fields if key != "account_id"}
+            parents[kind]["id"] = parent_id
+            _check_account_and_status(result, parent, parent_id, account_number, subject=subject)
+        scan, error = await _studies_containing(client, parent_id, now, cache)
+        active = _note_studies(result, subject, f"Its {subject} is already in", scan, error, missing_signals)
+        if active is None or not scan["complete"]:
+            complete = False
+        active_studies.extend({**study, "found_on": kind, "found_on_id": parent_id} for study in active or [])
+    result["parents"] = parents
+    result["active_studies"] = active_studies
+    result["active_studies_complete"] = complete
+    result["own_study_membership"] = (
+        "not_checked: Meta documents no ad_studies edge on ads; only the parents' studies were read."
+    )
+
+
 @mcp_server.tool()
 async def check_ab_test_eligibility(
     account_id: str,
     level: str,
     entity_ids: StringList,
 ) -> dict[str, Any]:
-    """Pre-check whether campaigns or ad sets (level campaign or adset) can go into an A/B test.
+    """Pre-check whether campaigns, ad sets or ads (level campaign, adset or ad) can go into an A/B test.
 
     This is a local pre-check against Meta's documented rules, not Meta's verdict: Meta has no
     public eligibility endpoint. precheck_outcome is passed, failed, or inconclusive when a check
     could not be performed or settled. Reports per entity: exists, belongs to the account, status,
-    objective, buying type, and any scheduled or running study it is already in.
+    objective, buying type, and any scheduled or running study it is already in. Level ad is for
+    creative tests (create_ab_test cells with ad_ids): each ad's parent ad set and campaign are
+    read and checked, but studies holding the ad itself cannot be read (see not_checked).
     """
     account_id = _required_account_id(account_id)
     normalized_level = (blank_to_none(level) or "").lower().replace("ad_set", "adset")
-    if normalized_level not in {"campaign", "adset"}:
-        raise ValidationError("level must be campaign or adset.")
+    if normalized_level not in {"campaign", "adset", "ad"}:
+        raise ValidationError("level must be campaign, adset or ad.")
     ids = _id_list(entity_ids, label="entity_ids")
     if not ids:
-        raise ValidationError("entity_ids needs at least one campaign or ad set id.")
+        raise ValidationError("entity_ids needs at least one campaign, ad set or ad id.")
     if len(ids) > MAX_CELLS_PER_STUDY:
         raise ValidationError(f"Check at most {MAX_CELLS_PER_STUDY} entities, Meta's documented maximum cells per study.")
     account_number = account_id.removeprefix("act_")
-    fields = (
-        ["id", "name", "account_id", "effective_status", "objective", "buying_type"]
-        if normalized_level == "campaign"
-        else ["id", "name", "account_id", "campaign_id", "effective_status", "optimization_goal", "billing_event"]
-    )
+    fields = ENTITY_FIELDS[normalized_level]
     client = get_graph_api_client()
     now = _now()
+    # Parent objects and their study scans, read once even when several ads share them.
+    cache: dict[tuple[str, str], Any] = {}
     entities: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
@@ -1155,46 +1350,16 @@ async def check_ab_test_eligibility(
         result["exists"] = True
         for key in fields[1:]:
             result[key] = entity.get(key)
-        entity_account = str(entity.get("account_id") or "").removeprefix("act_")
-        if not entity_account:
-            result["unresolved"].append("Meta returned no account_id, so the account match was not checked.")
-        elif entity_account != account_number:
-            result["blockers"].append(
-                f"{entity_id} belongs to ad account {entity_account}, not {account_number}."
-            )
-        status = str(entity.get("effective_status") or "").upper()
-        if status in NON_DELIVERING_STATUSES:
-            result["unresolved"].append(
-                f"effective_status is {status}, so it cannot deliver. Meta's developer documentation states "
-                "no study rule for this, so this pre-check cannot say whether it blocks the test."
-            )
-        try:
-            scan = await _scan_active_studies(
-                client, entity_id, "ad_studies", now, max_pages=ENTITY_STUDY_SCAN_PAGES,
-            )
-        except (NotFoundError, MetaApiError, UnsupportedFeatureError) as exc:
-            result["active_studies"] = None
-            message = f"Could not read the studies containing {entity_id}: {exc}"
-            result["unresolved"].append(message)
-            missing_signals.append(message)
-        else:
-            active = scan["active"]
-            result["active_studies"] = active
+        _check_account_and_status(result, entity, entity_id, account_number)
+        if normalized_level == "ad":
+            await _check_ad_parents(client, result, entity, account_number, now, missing_signals, cache)
+            entities.append(_with_outcome(result))
+            continue
+        scan, error = await _studies_containing(client, entity_id, now, cache)
+        active = _note_studies(result, entity_id, "Already in", scan, error, missing_signals)
+        result["active_studies"] = active
+        if scan is not None:
             result["active_studies_complete"] = scan["complete"]
-            if not scan["complete"]:
-                message = (
-                    f"Read only {scan['pages_read']} page(s) of the studies containing {entity_id}: "
-                    f"{scan['stop_reason']}"
-                )
-                result["unresolved"].append(message)
-                missing_signals.append(message)
-            if active:
-                result["unresolved"].append(
-                    f"Already in {len(active)} scheduled or running study(ies): "
-                    f"{', '.join(str(study['id']) for study in active)}. Meta's developer documentation "
-                    "does not say whether this blocks a new test, so this pre-check cannot pass it; "
-                    "Meta decides at creation."
-                )
         entities.append(_with_outcome(result))
     try:
         account_check = await _count_account_active_studies(client, account_id, now)
@@ -1228,7 +1393,13 @@ async def check_ab_test_eligibility(
             )
             account_check["unresolved"].append(message)
             missing_signals.append(message)
-    if len(ids) > 100 // MIN_SPLIT_TREATMENT_PERCENTAGE:
+    if normalized_level == "ad":
+        if len(ids) > MAX_CREATIVE_TEST_CELLS:
+            account_check["warnings"].append(
+                f"{len(ids)} ads cannot each get their own cell: Meta's split testing guide allows a creative "
+                f"test 2 to {MAX_CREATIVE_TEST_CELLS} cells with exactly one ad each."
+            )
+    elif len(ids) > 100 // MIN_SPLIT_TREATMENT_PERCENTAGE:
         account_check["warnings"].append(
             f"{len(ids)} entities cannot each get their own cell: Meta requires every cell's "
             f"treatment_percentage to be at least {MIN_SPLIT_TREATMENT_PERCENTAGE}, so at most "
@@ -1279,8 +1450,10 @@ async def check_ab_test_eligibility(
             "eligible_by_local_precheck": {"passed": True, "failed": False}.get(outcome),
             "entities": entities,
             "account": account_check,
-            "rules_applied": ELIGIBILITY_RULES,
-            "not_checked": ELIGIBILITY_NOT_CHECKED,
+            "rules_applied": [*ELIGIBILITY_RULES, *(AD_ELIGIBILITY_RULES if normalized_level == "ad" else [])],
+            "not_checked": [
+                *ELIGIBILITY_NOT_CHECKED, *(AD_ELIGIBILITY_NOT_CHECKED if normalized_level == "ad" else []),
+            ],
         },
     )
 
@@ -1290,14 +1463,14 @@ async def create_ab_test(
     account_id: str,
     name: str,
     cells: list[dict[str, Any]],
-    start_time: str | int,
-    end_time: str | int,
-    confidence_level: float | None = None,
+    start_time: StudyTime,
+    end_time: StudyTime,
+    confidence_level: StrictNumber | None = None,
     hypothesis: str | None = None,
     business_id: str | None = None,
     params: dict[str, Any] | None = None,
-    creative_test_daily_budget: float | None = None,
-    creative_test_lifetime_budget_percentage: float | None = None,
+    creative_test_daily_budget: StrictCurrencyAmount | None = None,
+    creative_test_lifetime_budget_percentage: StrictNumber | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Create an A/B test (Meta split test) comparing campaigns, ad sets, or single ads. Run check_ab_test_eligibility first.
@@ -1410,11 +1583,11 @@ async def create_lift_study(
     name: str,
     cells: list[dict[str, Any]],
     objectives: list[dict[str, Any]],
-    start_time: str | int,
-    end_time: str | int,
+    start_time: StudyTime,
+    end_time: StudyTime,
     business_id: str | None = None,
     description: str | None = None,
-    observation_end_time: str | int | None = None,
+    observation_end_time: StudyTime | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a conversion lift study (holdout test). Meta limits lift studies to approved advertisers.
@@ -1525,8 +1698,8 @@ async def update_ad_study(
     study_id: str,
     name: str | None = None,
     description: str | None = None,
-    start_time: str | int | None = None,
-    end_time: str | int | None = None,
+    start_time: StudyTime | None = None,
+    end_time: StudyTime | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Edit an A/B test or lift study and return previous and current values.

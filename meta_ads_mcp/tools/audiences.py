@@ -135,6 +135,32 @@ async def get_audience(
     return {"item": audience, "summary": {"count": 1}}
 
 
+# Labels Meta accepts on custom audience creation (AdAccount create_custom_audience,
+# audience_labels: list<audience_labels_enum>, facebook-python-business-sdk 26.0.2).
+AUDIENCE_LABELS = frozenset({
+    "APP_USERS", "AT_RISK", "CART_ABANDONERS", "DISENGAGED", "DISQUALIFIED_LEADS", "ENGAGED_USERS",
+    "GENERAL_CUSTOMERS", "HIGH_VALUE_CUSTOMERS", "LOW_VALUE_CUSTOMERS", "OTHER_1", "OTHER_2", "OTHER_3",
+    "QUALIFIED_LEADS", "RECENT_PURCHASERS", "TRIAL_USERS",
+})
+
+
+def _audience_labels(value: Any) -> list[str]:
+    labels = coerce_csv_string_list(value)
+    if (
+        not isinstance(labels, list)
+        or not labels
+        or any(not isinstance(label, str) or not label.strip() for label in labels)
+    ):
+        raise ValidationError("audience_labels must be one or more nonblank labels, as a list or comma-separated string.")
+    normalized = list(dict.fromkeys(label.strip().upper() for label in labels))
+    unknown = [label for label in normalized if label not in AUDIENCE_LABELS]
+    if unknown:
+        raise ValidationError(
+            f"Unknown audience_labels: {', '.join(unknown)}. Meta accepts: {', '.join(sorted(AUDIENCE_LABELS))}."
+        )
+    return normalized
+
+
 @mcp_server.tool()
 async def create_custom_audience(
     account_id: str,
@@ -146,8 +172,14 @@ async def create_custom_audience(
     rule: dict[str, Any] | None = None,
     prefill: bool = False,
     params: dict[str, Any] | None = None,
+    is_value_based: bool | None = None,
+    audience_labels: StringList | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a first-party or rule-based custom audience."""
+    """Use this when the user wants to create a first-party or rule-based custom audience.
+
+    is_value_based=true makes a value-based customer list (subtype CUSTOM) for value optimization.
+    audience_labels tags the audience, for example HIGH_VALUE_CUSTOMERS or QUALIFIED_LEADS.
+    """
     payload: dict[str, Any] = {
         "name": name,
         "subtype": subtype,
@@ -157,6 +189,17 @@ async def create_custom_audience(
         "retention_days": OMIT if retention_days is None else retention_days,
         "rule": rule or OMIT,
     }
+    # Added only when named, so a call that passes these through params (as callers did
+    # before they were named) sends exactly what it sent before, while giving one both
+    # ways is rejected by merge_graph_payload.
+    if is_value_based is not None:
+        if not isinstance(is_value_based, bool):
+            raise ValidationError("is_value_based must be true or false.")
+        if is_value_based and str(subtype or "").strip().upper() != "CUSTOM":
+            raise ValidationError("is_value_based applies only to customer list audiences (subtype CUSTOM).")
+        payload["is_value_based"] = is_value_based
+    if audience_labels is not None:
+        payload["audience_labels"] = _audience_labels(audience_labels)
     payload = merge_graph_payload(payload, params)
     client = get_graph_api_client()
     created = await client.create_edge_object(
@@ -224,9 +267,13 @@ def _audience_rule(rule: Any) -> dict[str, Any]:
     """Accept a website audience rule as an object or a JSON-encoded object string."""
     value = rule
     if isinstance(rule, str):
+        parsed = True
         try:
             value = json.loads(rule)
         except ValueError:
+            parsed = False
+        if not parsed:
+            # Raised after the except block, so the decoder's error (which holds the text) is not chained.
             raise ValidationError(
                 "rule must be a JSON object, or a string holding one, in Meta's website audience rule "
                 "format (the same format create_custom_audience takes)."
@@ -499,41 +546,76 @@ def _read_customer_csv(file_path: str, schema: list[str]) -> list[list[Any]]:
         allowed_types=CUSTOMER_FILE_TYPES,
         max_bytes=MAX_CUSTOMER_FILE_BYTES,
     )
-    lines_read = 0
+    rows, problem = _parse_customer_csv(upload.content, schema)
+    del upload
+    if problem is not None:
+        # Raised here, after the parser has returned: the decoder's and the csv module's own
+        # exceptions (which hold the file's bytes or text) are neither this error's __cause__
+        # nor its __context__, and no frame on its traceback still holds the file's contents.
+        raise ValidationError(problem) from None
+    return rows
+
+
+def _parse_customer_csv(content: bytes, schema: list[str]) -> tuple[list[list[Any]], str | None]:
+    """Parse a customer CSV into the schema columns; on failure return a message that quotes no value."""
+    text: str | None = None
     try:
-        with io.StringIO(upload.content.decode("utf-8-sig"), newline="") as handle:
-            # strict rejects malformed quoting (such as an unclosed quote) instead of
-            # silently merging the following lines into one different record.
-            reader = csv.reader(handle, strict=True)
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    if text is None:
+        return [], "file_path must be a UTF-8 encoded CSV file."
+    lines_read = 0
+    malformed = False
+    rows: list[list[Any]] = []
+    with io.StringIO(text, newline="") as handle:
+        # strict rejects malformed quoting (such as an unclosed quote) instead of
+        # silently merging the following lines into one different record.
+        reader = csv.reader(handle, strict=True)
+        try:
             header = next(reader, None)
+        except csv.Error:
+            header, malformed = None, True
+        if not malformed:
             if not header:
-                raise ValidationError("file_path has no header row.")
+                return [], "file_path has no header row."
             columns = [name.strip().upper() for name in header]
             if len(set(columns)) != len(columns):
-                raise ValidationError("file_path header repeats a column name.")
+                return [], "file_path header repeats a column name."
             missing = [key for key in schema if key not in columns]
             if missing:
-                raise ValidationError(
+                return [], (
                     f"file_path header has no column named {', '.join(missing)}; header columns must be named after the schema keys."
                 )
             positions = [columns.index(key) for key in schema]
-            rows: list[list[Any]] = []
             lines_read = reader.line_num
-            for record in reader:
-                lines_read = reader.line_num
-                if not any(cell.strip() for cell in record):
-                    continue
-                rows.append([record[index] if index < len(record) else "" for index in positions])
-            return rows
-    except UnicodeDecodeError:
-        raise ValidationError("file_path must be a UTF-8 encoded CSV file.") from None
-    except csv.Error:
+            try:
+                for record in reader:
+                    lines_read = reader.line_num
+                    if not any(cell.strip() for cell in record):
+                        continue
+                    rows.append([record[index] if index < len(record) else "" for index in positions])
+            except csv.Error:
+                malformed = True
+    if malformed:
         # Report only where the bad record starts; the parser's own message and the
         # record's content are withheld because they can contain customer values.
-        raise ValidationError(
+        return [], (
             f"file_path is not valid CSV: the record starting on line {lines_read + 1} is malformed "
             "(for example an unclosed or misplaced quote). Nothing was uploaded."
-        ) from None
+        )
+    return rows, None
+
+
+def _utf8_or_none(value: str) -> bytes | None:
+    """UTF-8 bytes of a normalized value, or None when it cannot be encoded (a lone surrogate).
+
+    The codec's exception holds the whole value, so it is discarded here and never raised.
+    """
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
 
 
 def _hash_rows(
@@ -581,11 +663,12 @@ def _hash_rows(
             else:
                 normalizer = _AUDIENCE_KEY_NORMALIZERS[key]
                 normalized = normalizer(value, country) if key in _COUNTRY_AWARE_KEYS else normalizer(value)
-                if not normalized:
+                encoded = _utf8_or_none(normalized) if normalized else None
+                if encoded is None:
                     invalid += 1
                     sent.append("")
                     continue
-                digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+                digest = hashlib.sha256(encoded).hexdigest()
             sent.append(digest)
         if any(sent):
             prepared.append(sent)
