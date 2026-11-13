@@ -162,3 +162,194 @@ def test_the_size_message_can_carry_advice_for_the_caller(upload_dir) -> None:
     (upload_dir / "big.csv").write_bytes(b"x" * 1_001)
     with pytest.raises(ValidationError, match="1000-byte limit for this upload. Host it instead."):
         read("big.csv", too_large_hint="Host it instead.")
+
+
+# A folder on the checked path can be replaced with a link between the check and
+# the read. Each test below makes that replacement at a chosen moment, through the
+# module's own os.open, and the read must then either fail or return the file
+# that really is inside the upload folder.
+
+
+def _nested_layout(tmp_path, monkeypatch):
+    root = tmp_path / "uploads"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    (nested / "feed.csv").write_bytes(b"inside-upload-folder")
+    (outside / "feed.csv").write_bytes(b"synthetic-outside-secret")
+    (outside / "nested" / "feed.csv").write_bytes(b"synthetic-outside-secret")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(root))
+    reload_settings()
+    return root, nested, outside
+
+
+def _count_opens(monkeypatch, path):
+    import meta_ads_mcp.local_files as local_files
+
+    calls = []
+    original = local_files.os.open
+
+    def counting(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(local_files.os, "open", counting)
+    read(path)
+    monkeypatch.setattr(local_files.os, "open", original)
+    return len(calls)
+
+
+def _swap_before_open(monkeypatch, moment, swap):
+    import meta_ads_mcp.local_files as local_files
+
+    original = local_files.os.open
+    seen = 0
+
+    def swapping(*args, **kwargs):
+        nonlocal seen
+        if seen == moment:
+            swap()
+        seen += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(local_files.os, "open", swapping)
+
+
+def _read_inside_or_refused(path):
+    try:
+        uploaded = read(path)
+    except ValidationError as error:
+        assert "synthetic" not in str(error) and error.__cause__ is None
+        return None
+    assert uploaded.content == b"inside-upload-folder", uploaded
+    return uploaded
+
+
+def test_g1_directory_swap_cannot_escape_upload_folder(tmp_path, monkeypatch) -> None:
+    root, nested, outside = _nested_layout(tmp_path, monkeypatch)
+
+    def swap():
+        nested.rename(root / "saved-nested")
+        nested.symlink_to(outside, target_is_directory=True)
+
+    # The first open after the path was checked: the old code opened the full
+    # path here and read the outside file.
+    _swap_before_open(monkeypatch, 0, swap)
+    assert _read_inside_or_refused("nested/feed.csv") is None
+
+
+def test_a_parent_folder_swapped_at_any_moment_cannot_escape(tmp_path, monkeypatch) -> None:
+    probe_root, _, _ = _nested_layout(tmp_path / "probe", monkeypatch)
+    moments = _count_opens(monkeypatch, "nested/feed.csv")
+    assert moments >= 2
+    for moment in range(moments):
+        base = tmp_path / f"moment-{moment}"
+        root, nested, outside = _nested_layout(base, monkeypatch)
+
+        def swap(root=root, nested=nested, outside=outside):
+            nested.rename(root / "saved-nested")
+            nested.symlink_to(outside, target_is_directory=True)
+
+        _swap_before_open(monkeypatch, moment, swap)
+        _read_inside_or_refused("nested/feed.csv")
+
+
+def test_the_upload_folder_itself_swapped_for_a_link_cannot_escape(tmp_path, monkeypatch) -> None:
+    _nested_layout(tmp_path / "probe", monkeypatch)
+    moments = _count_opens(monkeypatch, "nested/feed.csv")
+    for moment in range(moments):
+        base = tmp_path / f"moment-{moment}"
+        root, _, outside = _nested_layout(base, monkeypatch)
+
+        def swap(root=root, outside=outside, base=base):
+            root.rename(base / "saved-uploads")
+            root.symlink_to(outside, target_is_directory=True)
+
+        _swap_before_open(monkeypatch, moment, swap)
+        _read_inside_or_refused("nested/feed.csv")
+
+
+def test_a_file_swapped_for_a_link_at_the_last_moment_is_refused(tmp_path, monkeypatch) -> None:
+    root, nested, outside = _nested_layout(tmp_path, monkeypatch)
+    moments = _count_opens(monkeypatch, "nested/feed.csv")
+
+    def swap():
+        (nested / "feed.csv").unlink()
+        (nested / "feed.csv").symlink_to(outside / "feed.csv")
+
+    _swap_before_open(monkeypatch, moments - 1, swap)
+    assert _read_inside_or_refused("nested/feed.csv") is None
+
+
+def _track_descriptors(monkeypatch):
+    import meta_ads_mcp.local_files as local_files
+
+    opened = []
+    original = local_files.os.open
+
+    def tracking(*args, **kwargs):
+        descriptor = original(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(local_files.os, "open", tracking)
+    return opened
+
+
+def _assert_all_closed(descriptors):
+    assert descriptors
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_every_descriptor_is_closed_after_a_read(upload_dir, monkeypatch) -> None:
+    (upload_dir / "sub").mkdir()
+    (upload_dir / "sub" / "feed.csv").write_bytes(b"x")
+    opened = _track_descriptors(monkeypatch)
+    assert read("sub/feed.csv").content == b"x"
+    _assert_all_closed(opened)
+
+
+@pytest.mark.parametrize("case", ["empty", "oversized", "folder", "swapped"])
+def test_every_descriptor_is_closed_after_a_refusal(upload_dir, tmp_path, monkeypatch, case) -> None:
+    sub = upload_dir / "sub"
+    sub.mkdir()
+    if case == "empty":
+        (sub / "feed.csv").write_bytes(b"")
+    elif case == "oversized":
+        (sub / "feed.csv").write_bytes(b"x" * 1_001)
+    elif case == "folder":
+        (sub / "feed.csv").mkdir()
+    else:
+        (sub / "feed.csv").write_bytes(b"x")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "feed.csv").write_bytes(b"secret")
+        _swap_before_open(
+            monkeypatch,
+            0,
+            lambda: (sub.rename(upload_dir / "saved"), sub.symlink_to(outside, target_is_directory=True)),
+        )
+    opened = _track_descriptors(monkeypatch)
+    with pytest.raises(ValidationError):
+        read("sub/feed.csv")
+    _assert_all_closed(opened)
+
+
+def test_a_folder_on_the_path_needs_only_search_permission(tmp_path, monkeypatch) -> None:
+    # An ordinary open by path needs only search (x) permission on parent folders.
+    locked = tmp_path / "locked"
+    folder = locked / "uploads"
+    folder.mkdir(parents=True)
+    (folder / "feed.csv").write_bytes(b"x")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(folder))
+    reload_settings()
+    locked.chmod(0o311)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("running with permissions that ignore folder modes")
+        assert read("feed.csv").content == b"x"
+    finally:
+        locked.chmod(0o755)
