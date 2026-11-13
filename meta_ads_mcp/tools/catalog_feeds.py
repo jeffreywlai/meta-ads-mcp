@@ -6,6 +6,7 @@ server's own tool catalog.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import re
 from collections.abc import Awaitable, Callable
@@ -354,13 +355,56 @@ def _redact(value: Any) -> Any:
     return value
 
 
-def _mask_error(exc: BaseException) -> None:
-    """Mask URL passwords in a raised error's text and data, in place."""
-    for name in ("message", "user_title", "user_message", "details", "error_data"):
-        if hasattr(exc, name) and getattr(exc, name, None) is not None:
-            setattr(exc, name, _redact(getattr(exc, name)))
+def _error_attribute_names(exc: BaseException) -> list[str]:
+    """The data attributes an error carries: dataclass fields, slots and instance attributes."""
+    names: list[str] = [field.name for field in dataclasses.fields(exc)] if dataclasses.is_dataclass(exc) else []
+    for cls in type(exc).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        names.extend([slots] if isinstance(slots, str) else list(slots))
+    names.extend(getattr(exc, "__dict__", {}))
+    return [name for name in dict.fromkeys(names) if not name.startswith("__")]
+
+
+def _mask_one_error(exc: BaseException) -> None:
+    """Mask URL passwords in one error's text and data, in place."""
+    for name in _error_attribute_names(exc):
+        try:
+            value = getattr(exc, name)
+        except AttributeError:
+            continue
+        if value is None or isinstance(value, BaseException):
+            continue
+        masked = _redact(value)
+        if masked != value:
+            try:
+                setattr(exc, name, masked)
+            except (AttributeError, TypeError):
+                pass
     if exc.args:
         exc.args = tuple(_redact(arg) for arg in exc.args)
+    notes = getattr(exc, "__notes__", None)
+    if isinstance(notes, list):
+        exc.__notes__ = [_redact(note) for note in notes]
+
+
+def _mask_error(exc: BaseException) -> None:
+    """Mask URL passwords in a raised error and in every error behind it, in place.
+
+    The Graph client raises a rate-limit or unsupported-feature error from the original
+    Meta error, so the original stays reachable through __cause__ and __context__ and a
+    traceback log prints it. Every error reachable that way, and every error inside an
+    exception group, is masked; each is visited once, so a cycle ends.
+    """
+    pending: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        _mask_one_error(current)
+        pending.extend([current.__cause__, current.__context__])
+        pending.extend(getattr(current, "exceptions", None) or ())
 
 
 def _secrets_masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:

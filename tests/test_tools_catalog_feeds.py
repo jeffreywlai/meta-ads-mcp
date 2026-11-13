@@ -1986,3 +1986,119 @@ def test_feed_file_upload_from_the_upload_folder_is_sent(monkeypatch, tmp_path) 
     assert sent["files"]["file"][0] == "feed.csv"
     assert sent["files"]["file"][1] == b"id\n1\n"
     assert result["ok"] is True
+
+
+# round three: G6, a masked error must not keep the password further down its chain ---------------
+
+
+G6_SECRET = "synthetic-url-password-6061"
+G6_URL = f"https://user:{G6_SECRET}@example.invalid/feed.csv"
+
+
+def _error_chain(error: BaseException) -> list[BaseException]:
+    """Every error reachable through __cause__ and __context__, each once."""
+    pending: list[BaseException | None] = [error]
+    seen: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is known for known in seen):
+            continue
+        seen.append(current)
+        pending.extend([current.__cause__, current.__context__])
+    return seen
+
+
+def _assert_chain_clean(error: BaseException, secret: str) -> None:
+    import traceback
+
+    chain = _error_chain(error)
+    for link in chain:
+        assert secret not in str(link), repr(link)
+        assert secret not in repr(link), repr(link)
+        assert secret not in repr(link.args), repr(link)
+        if hasattr(link, "to_public_dict"):
+            assert secret not in repr(link.to_public_dict()), link.to_public_dict()
+    assert secret not in "".join(traceback.format_exception(error))
+
+
+class _ChainedErrorClient(FakeCatalogFeedClient):
+    """Raises the way GraphAPIClient does: a rate-limit or unsupported error from a Meta error."""
+
+    def __init__(self, kind: str = "rate_limit", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.kind = kind
+
+    def _fail(self) -> None:
+        from meta_ads_mcp.errors import RateLimitError, UnsupportedFeatureError
+
+        try:
+            raise MetaApiError(
+                message=f"Fetch {G6_URL} failed",
+                code=4,
+                user_message=f"Check {G6_URL}",
+                error_data={"url": G6_URL},
+                details={"error": {"message": f"Fetch {G6_URL} failed"}},
+            )
+        except MetaApiError as original:
+            if self.kind == "rate_limit":
+                raise RateLimitError(f"Rate limit fetching {G6_URL}", code=4, operation="GET feed") from original
+            if self.kind == "unsupported":
+                raise UnsupportedFeatureError(original.message) from original
+            # An error raised while handling another, with no explicit cause.
+            raise RuntimeError(f"wrapper around {G6_URL}")
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append({"method": "get_object", "object_id": object_id})
+        self._fail()
+
+
+def test_g6_feed_error_chain_never_contains_url_password(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    _use(monkeypatch, _ChainedErrorClient())
+    with pytest.raises(RateLimitError) as info:
+        run(catalog_feeds.list_product_feeds(feed_id="10"))
+    assert len(_error_chain(info.value)) == 2
+    _assert_chain_clean(info.value, G6_SECRET)
+    # The host and path stay readable, so the failing source can still be found.
+    assert "example.invalid/feed.csv" in str(info.value.__cause__)
+
+
+@pytest.mark.parametrize("kind", ["unsupported", "context"])
+def test_g6_every_kind_of_chained_error_is_masked(monkeypatch, kind) -> None:
+    _use(monkeypatch, _ChainedErrorClient(kind))
+    with pytest.raises(Exception) as info:
+        run(catalog_feeds.update_product_feed(feed_id="10", name="New"))
+    assert len(_error_chain(info.value)) == 2
+    _assert_chain_clean(info.value, G6_SECRET)
+
+
+def test_g6_error_chain_with_a_cycle_is_masked_and_ends(monkeypatch) -> None:
+    class CyclingClient(FakeCatalogFeedClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            first = MetaApiError(message=f"first {G6_URL}")
+            second = RuntimeError(f"second {G6_URL}")
+            first.__context__ = second
+            second.__context__ = first
+            raise first
+
+    _use(monkeypatch, CyclingClient())
+    with pytest.raises(MetaApiError) as info:
+        run(catalog_feeds.list_product_feeds(feed_id="10"))
+    _assert_chain_clean(info.value, G6_SECRET)
+
+
+def test_g6_chained_error_password_reaches_no_mcp_error_or_log(monkeypatch, caplog) -> None:
+    import logging
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    _use(monkeypatch, _ChainedErrorClient())
+    with pytest.raises(ToolError) as info:
+        run(mcp_server.call_tool("list_product_feeds", {"feed_id": "10"}))
+    _assert_chain_clean(info.value, G6_SECRET)
+    assert G6_SECRET not in caplog.text
+    for record in caplog.records:
+        if record.exc_info:
+            _assert_chain_clean(record.exc_info[1], G6_SECRET)
