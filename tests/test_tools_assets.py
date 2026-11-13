@@ -360,7 +360,7 @@ def test_list_audience_adsets_groups_ads_from_the_audience_ads_edge(monkeypatch)
     ]})
     _patch(monkeypatch, client)
 
-    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", limit=2))
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", limit=2, source="ads"))
 
     assert [call["edge"] for call in client.list_calls] == ["ads", "ads"]
     assert client.list_calls[0]["parent_id"] == "aud_1"
@@ -387,7 +387,7 @@ def test_list_audience_adsets_reports_incomplete_scan(monkeypatch) -> None:
 
     client = EndlessClient()
     _patch(monkeypatch, client)
-    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", limit=1))
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", limit=1, source="ads"))
     assert result["summary"]["complete"] is False
     assert result["summary"]["scanned_ads"] == assets.MAX_SCAN_PAGES
     assert result["summary"]["next_after"] == f"cur{assets.MAX_SCAN_PAGES}"
@@ -503,3 +503,268 @@ def test_get_field_reference_accepts_ad_set_alias(monkeypatch) -> None:
     _no_client(monkeypatch)
     result = asyncio.run(assets.get_field_reference(level="ad_set", field_names=["billing_event"]))
     assert result["summary"]["level"] == "adset"
+
+
+# Phase two: list_ad_videos lookups and processing status
+
+
+def test_list_ad_videos_adds_processing_status(monkeypatch) -> None:
+    client = FakeAssetsClient(pages={("act_123", "advideos"): [_paged([
+        {"id": "v1", "status": {"video_status": "ready"}}, {"id": "v2"},
+    ])]})
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_ad_videos(account_id="123"))
+    assert [item["processing_status"] for item in result["items"]] == ["ready", None]
+    assert result["summary"] == {"count": 2, "complete": True, "truncated": False, "next_after": None}
+
+
+def test_list_ad_videos_by_id_names_missing_videos(monkeypatch) -> None:
+    class LookupClient(FakeAssetsClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            self.get_calls.append({"object_id": object_id, "fields": fields})
+            if object_id == "2":
+                raise MetaApiError(message="Unsupported get request", status_code=400, code=100)
+            return {"id": object_id, "title": "Clip", "status": {"video_status": "processing"}}
+
+    client = LookupClient()
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_ad_videos(account_id="123", video_ids="1, 2, 1"))
+    assert [call["object_id"] for call in client.get_calls] == ["1", "2"]
+    assert client.get_calls[0]["fields"] == assets.AD_VIDEO_LIST_FIELDS
+    assert result["items"] == [{"id": "1", "title": "Clip", "status": {"video_status": "processing"}, "processing_status": "processing"}]
+    assert result["missing"] == [{"id": "2", "reason": "Unsupported get request", "code": 100}]
+    assert result["summary"]["complete"] is False
+    assert client.list_calls == []
+
+
+def test_list_ad_videos_title_contains_scans_and_matches_locally(monkeypatch) -> None:
+    client = FakeAssetsClient(pages={("act_123", "advideos"): [
+        _paged([{"id": "v1", "title": "Spring Sale"}, {"id": "v2", "title": "Winter"}], after="c1"),
+        _paged([{"id": "v3", "title": "spring teaser"}]),
+    ]})
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_ad_videos(account_id="123", title_contains="SPRING", limit=2))
+    assert [item["id"] for item in result["items"]] == ["v1", "v3"]
+    assert len(client.list_calls) == 2
+    assert result["summary"]["scanned_count"] == 3
+    assert result["summary"]["complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"video_ids": ["abc"]}, "numeric"),
+        ({"video_ids": [str(index) for index in range(26)]}, "at most 25"),
+        ({"video_ids": ["1"], "title_contains": "x"}, "do not combine"),
+        ({"video_ids": ["1"], "after": "c"}, "do not combine"),
+        ({"title_contains": "x", "limit": 1000}, "limit"),
+    ],
+)
+def test_list_ad_videos_lookup_validation_makes_no_call(monkeypatch, arguments, message) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=message):
+        asyncio.run(assets.list_ad_videos(account_id="123", **arguments))
+
+
+# Phase two: list_instagram_media filters
+
+
+def test_list_instagram_media_filters_by_type_product_and_dates(monkeypatch) -> None:
+    def media(media_id, media_type, product, timestamp):
+        return {
+            "id": media_id, "media_type": media_type, "media_product_type": product, "timestamp": timestamp,
+            "boost_eligibility_info": {"eligible_to_boost": True},
+        }
+
+    client = FakeAssetsClient(pages={("ig_1", "media"): [_paged([
+        media("m1", "VIDEO", "REELS", "2026-11-05T10:00:00+0000"),
+        media("m2", "IMAGE", "FEED", "2026-11-05T10:00:00+0000"),
+        media("m3", "VIDEO", "REELS", "2026-10-30T23:59:59+0000"),
+        media("m4", "VIDEO", "REELS", "2026-11-10T00:00:00+0000"),
+    ], after="n1")]})
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(assets.list_instagram_media(
+        instagram_account_id="ig_1", since="2026-11-01", until="2026-11-09",
+        media_types="video", media_product_types=["reel"], fields="id,caption",
+    ))
+
+    call = client.list_calls[0]
+    assert call["params"] == {"limit": 25, "since": 1793491200, "until": 1794268800}
+    assert call["fields"] == ["id", "caption", assets.BOOST_ELIGIBILITY_FIELD, "timestamp", "media_type", "media_product_type"]
+    assert [item["id"] for item in result["items"]] == ["m1"]
+    summary = result["summary"]
+    assert summary["excluded_by_filters"] == 3
+    assert summary["filters"]["media_product_types"] == ["REELS"]
+    assert summary["filters"]["date_range_sent_to_meta"] is True
+    assert summary["complete"] is False
+    assert summary["next_after"] == "n1"
+
+
+def test_list_instagram_media_stories_filter_dates_locally(monkeypatch) -> None:
+    client = FakeAssetsClient()
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", source="stories", since="2026-11-01"))
+    assert "since" not in client.list_calls[0]["params"]
+    assert result["summary"]["filters"]["date_range_sent_to_meta"] is False
+
+
+def test_list_instagram_media_without_filters_is_unchanged(monkeypatch) -> None:
+    client = FakeAssetsClient(pages={("ig_1", "media"): [_paged([_media("m1", True)])]})
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1"))
+    assert client.list_calls[0]["params"] == {"limit": 25}
+    assert client.list_calls[0]["fields"] == assets.INSTAGRAM_MEDIA_FIELDS
+    assert "filters" not in result["summary"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"since": "11/01/2026"}, "YYYY-MM-DD"),
+        ({"since": "2026-11-05", "until": "2026-11-01"}, "on or after"),
+        ({"media_types": ["GIF"]}, "unknown values"),
+        ({"media_product_types": ["story"]}, "source=stories"),
+        ({"media_product_types": ["FEED"], "source": "stories"}, "stories only"),
+    ],
+)
+def test_list_instagram_media_filter_validation_makes_no_call(monkeypatch, arguments, message) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=message):
+        asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", **arguments))
+
+
+# Phase two: list_audience_adsets targeting scan
+
+
+def _adset(adset_id: str, included=(), excluded=()) -> dict[str, Any]:
+    targeting: dict[str, Any] = {"geo_locations": {"countries": ["US"]}}
+    if included:
+        targeting["custom_audiences"] = [{"id": value, "name": "A"} for value in included]
+    if excluded:
+        targeting["excluded_custom_audiences"] = [{"id": value, "name": "A"} for value in excluded]
+    return {"id": adset_id, "name": f"Set {adset_id}", "effective_status": "PAUSED", "campaign_id": "c9", "targeting": targeting}
+
+
+def test_audience_adsets_targeting_scan_finds_ad_sets_without_ads(monkeypatch) -> None:
+    client = FakeAssetsClient(
+        objects={"aud_1": {"id": "aud_1", "account_id": "123"}},
+        pages={
+            ("aud_1", "ads"): [_paged([{"id": "a1", "adset_id": "s1", "campaign_id": "c1"}])],
+            ("act_123", "adsets"): [_paged([
+                _adset("s1", included=["aud_1"]), _adset("s2", excluded=["aud_1"]), _adset("s3", included=["other"]),
+            ])],
+        },
+    )
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1"))
+
+    assert client.get_calls == [{"object_id": "aud_1", "fields": ["id", "account_id"], "params": None}]
+    adset_call = next(call for call in client.list_calls if call["edge"] == "adsets")
+    assert adset_call["parent_id"] == "act_123"
+    assert adset_call["fields"] == assets.AUDIENCE_TARGETING_ADSET_FIELDS
+    by_id = {item["id"]: item for item in result["items"]}
+    assert set(by_id) == {"s1", "s2"}
+    assert by_id["s1"]["found_by"] == ["ads", "targeting"]
+    assert by_id["s1"]["targeting_use"] == ["included"]
+    assert by_id["s2"]["found_by"] == ["targeting"]
+    assert by_id["s2"]["targeting_use"] == ["excluded"]
+    assert by_id["s2"]["ad_count"] == 0
+    summary = result["summary"]
+    assert summary["complete"] is True
+    assert summary["targeting_scan"]["scanned_adsets"] == 3
+    assert summary["targeting_scan"]["matched_adsets"] == 2
+
+
+def test_audience_adsets_targeting_scan_reports_incomplete_scan(monkeypatch) -> None:
+    class EndlessAdsets(FakeAssetsClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            self.list_calls.append({"parent_id": parent_id, "edge": edge, "params": dict(params or {})})
+            page = len(self.list_calls)
+            return _paged([_adset(f"s{page}", included=["aud_1"])], after=f"t{page}")
+
+    client = EndlessAdsets()
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting", account_id="123", limit=1))
+
+    summary = result["summary"]
+    assert len(client.list_calls) == assets.MAX_SCAN_PAGES
+    assert summary["complete"] is False
+    assert summary["targeting_scan"]["complete"] is False
+    assert summary["targeting_scan"]["scan_capped"] is True
+    assert summary["targeting_scan"]["scanned_adsets"] == assets.MAX_SCAN_PAGES
+    assert "incomplete" in summary["targeting_scan"]["scan_note"]
+    assert summary["targeting_next_after"] == f"t{assets.MAX_SCAN_PAGES}"
+    assert summary["ads_scan"]["ran"] is False
+    assert client.get_calls == []
+
+
+def test_audience_adsets_without_account_reports_skipped_targeting_scan(monkeypatch) -> None:
+    client = FakeAssetsClient(pages={("aud_1", "ads"): [_paged([])]})
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1"))
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["targeting_scan"]["ran"] is False
+    assert "account_id" in result["summary"]["targeting_scan"]["skipped_reason"]
+
+
+def test_audience_adsets_targeting_continuation_uses_targeting_after(monkeypatch) -> None:
+    client = FakeAssetsClient()
+    _patch(monkeypatch, client)
+    asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting", account_id="act_9", targeting_after="t5"))
+    assert client.list_calls[0]["params"] == {"limit": 200, "after": "t5"}
+    assert client.list_calls[0]["parent_id"] == "act_9"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"source": "everything"}, "source must be one of"),
+        ({"source": "ads", "targeting_after": "t"}, "targeting_after"),
+        ({"source": "targeting", "after": "a"}, "targeting_after"),
+    ],
+)
+def test_audience_adsets_source_validation_makes_no_call(monkeypatch, arguments, message) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=message):
+        asyncio.run(assets.list_audience_adsets(audience_id="aud_1", **arguments))
+
+
+# Phase two: get_field_reference metrics
+
+
+def test_get_field_reference_metrics_default_lists_core_and_derived(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(assets.get_field_reference(level="metric"))
+    by_name = {item["name"]: item for item in result["items"]}
+    assert set(assets.SERVER_CORE_METRICS) <= set(by_name)
+    assert by_name["spend"]["meta_sort_values"] == ["spend_ascending", "spend_descending"]
+    assert by_name["actions"]["value_shape"] == "action_list"
+    assert by_name["actions"]["meta_sort_values"][0] == "actions:<action_type>_ascending"
+    assert by_name["roas"]["kind"] == "server_derived"
+    assert by_name["roas"]["formula"] == "conversion_value / spend"
+    assert by_name["roas"]["meta_filterable"] is False
+    summary = result["summary"]
+    assert "GREATER_THAN" in summary["filter_operators"]
+    assert "cost_per_result" in summary["all_insights_fields"]
+    assert len(summary["all_insights_fields"]) == 229
+    assert len(str(result)) < 20000
+
+
+def test_get_field_reference_metrics_named_fields(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(assets.get_field_reference(level="insights", field_names="cost_per_result, inline_link_clicks, bogus"))
+    by_name = {item["name"]: item for item in result["items"]}
+    assert by_name["cost_per_result"]["value_shape"] == "list"
+    assert by_name["cost_per_result"]["meta_sort_values"] is None
+    assert by_name["inline_link_clicks"]["in_server_metrics_reference"] is False
+    assert result["summary"]["unknown_fields"] == ["bogus"]
+    assert "all_insights_fields" not in result["summary"]
+
+
+def test_get_field_reference_metrics_reject_object_id(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="object_id"):
+        asyncio.run(assets.get_field_reference(level="metrics", field_names=["spend"], object_id="1"))
