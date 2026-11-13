@@ -36,6 +36,13 @@
       "what_changed": "daily_spend_cap, lifetime_spend_cap, daily_min_spend_target and lifetime_min_spend_target inside params are now refused before any request is sent, with a message pointing to the named parameter of the same name. Before, they were sent to Meta as written and read in minor units, while the named parameters take major units. bid_amount, daily_budget and lifetime_budget inside params were already refused; only their message changed.",
       "why_better": "The same field no longer has two units, so an amount cannot silently be 100 times too small (or too large) because it was put in params instead of the named parameter.",
       "migration": "Move each amount to the named parameter of the same name in major units: divide the minor-unit amount you sent in params by the currency's minor-unit factor, 100 for most currencies and 1 for currencies without minor units such as JPY or KRW. params={'daily_spend_cap': 9000} in USD becomes daily_spend_cap=90."
+    },
+    {
+      "tool": "update_custom_audience",
+      "kind": "behaviour",
+      "what_changed": "When a call changes the audience rule, whether through the named rule parameter or through params={'rule': ...}, the tool now also asks Meta for the audience's current rule in the read it already makes before updating, and returns it as previous.rule. Before, a params-only rule change read and returned the other fields but not the old rule.",
+      "why_better": "The rule decides who is in the audience, and Meta does not keep the old one. Returning it before it is replaced is the only way to put it back if the new rule turns out to be wrong.",
+      "migration": "No change to how the tool is called. The response has one more field, previous.rule; the read before the update asks for one more field."
     }
   ]
 }
