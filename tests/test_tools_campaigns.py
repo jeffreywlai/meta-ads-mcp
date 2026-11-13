@@ -1385,3 +1385,420 @@ def test_update_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
         },
         "current": {"name": "Renamed", **params},
     }
+
+
+@pytest.mark.parametrize(
+    ("named", "params_value"),
+    [
+        ({"destination_type": "WHATSAPP"}, "WHATSAPP"),
+        ({"pacing_type": ["day_parting"]}, ["standard"]),
+        ({"is_dynamic_creative": False}, False),
+        ({"optimization_sub_event": "VIDEO_SOUND_ON"}, "NONE"),
+        ({"budget_schedule_specs": [{"time_start": 1795000000, "time_end": 1795086400, "budget_value": 20,
+                                     "budget_value_type": "ABSOLUTE"}]}, BUDGET_SCHEDULE_PARAMS),
+    ],
+)
+def test_create_ad_set_round_three_named_parameter_and_same_params_key_together_raise(
+    monkeypatch, named, params_value,
+) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    (key, _value), = named.items()
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **named, params={key: params_value}))
+
+
+def test_create_campaign_budget_schedule_named_and_in_params_together_raise(monkeypatch) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match="budget_schedule_specs was given both.*minor units"):
+        asyncio.run(campaigns.create_campaign(
+            **CAMPAIGN_BASE, budget_schedule_specs=[{"time_start": 1795000000, "time_end": 1795086400,
+                                                     "budget_value": 20, "budget_value_type": "ABSOLUTE"}],
+            params={"budget_schedule_specs": BUDGET_SCHEDULE_PARAMS},
+        ))
+
+
+def test_create_ad_set_round_three_named_parameters_are_sent(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    schedule = [{"start_minute": 540, "end_minute": 1020, "days": [1, 2, 3]}]
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE,
+        daily_budget=20,
+        adset_schedule=schedule,
+        destination_type=" whatsapp ",
+        pacing_type="day_parting",
+        is_dynamic_creative=False,
+        optimization_sub_event="video_sound_on",
+        budget_schedule_specs=[
+            {"time_start": "2026-12-24T00:00:00-05:00", "time_end": "2026-12-24T06:00:00-05:00",
+             "budget_value": 12.5, "budget_value_type": "ABSOLUTE"},
+            {"time_start": 1798000000, "time_end": "1798010800", "budget_value": 140, "budget_value_type": "multiplier"},
+        ],
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {
+            "campaign_id": "cmp_123",
+            "name": "S",
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "REACH",
+            "targeting": {"geo_locations": {"countries": ["DE"]}},
+            "status": "PAUSED",
+            "daily_budget": 2000,
+            "adset_schedule": schedule,
+            "destination_type": "WHATSAPP",
+            "pacing_type": ["day_parting"],
+            "is_dynamic_creative": False,
+            "optimization_sub_event": "VIDEO_SOUND_ON",
+            "budget_schedule_specs": [
+                {"time_start": 1798088400, "time_end": 1798110000, "budget_value": 1250, "budget_value_type": "ABSOLUTE"},
+                {"time_start": 1798000000, "time_end": 1798010800, "budget_value": 140, "budget_value_type": "MULTIPLIER"},
+            ],
+        }),
+    ]
+
+
+def test_create_ad_set_multiplier_schedule_alone_does_not_read_currency(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE, is_dynamic_creative=True,
+        budget_schedule_specs=[{"time_start": 1798000000, "time_end": 1798010800, "budget_value": 2,
+                                "budget_value_type": "MULTIPLIER"}],
+    ))
+    assert [call[0] for call in client.calls] == ["create"]
+    assert client.calls[0][3]["is_dynamic_creative"] is True
+    assert client.calls[0][3]["budget_schedule_specs"][0]["budget_value"] == 2
+
+
+def test_create_campaign_budget_schedule_uses_major_units(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_campaign(
+        **CAMPAIGN_BASE, daily_budget=100,
+        budget_schedule_specs=[{"time_start": "2026-11-28T00:00:00Z", "time_end": "2026-11-30T00:00:00Z",
+                                "budget_value": 20, "budget_value_type": "ABSOLUTE"}],
+    ))
+    assert client.calls[-1][3]["daily_budget"] == 10000
+    assert client.calls[-1][3]["budget_schedule_specs"] == [
+        {"time_start": 1795824000, "time_end": 1795996800, "budget_value": 2000, "budget_value_type": "ABSOLUTE"},
+    ]
+
+
+def test_create_campaign_budget_schedule_zero_decimal_currency(monkeypatch) -> None:
+    client = FakeZeroDecimalCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_campaign(
+        **CAMPAIGN_BASE,
+        budget_schedule_specs=[{"time_start": 1798000000, "time_end": 1798010800, "budget_value": 3000,
+                                "budget_value_type": "ABSOLUTE"}],
+    ))
+    assert client.created_payload["data"]["budget_schedule_specs"][0]["budget_value"] == 3000
+
+
+_GOOD_PERIOD = {"time_start": 1798000000, "time_end": 1798010800, "budget_value": 20, "budget_value_type": "ABSOLUTE"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"budget_schedule_specs": []}, "budget_schedule_specs must not be empty"),
+        ({"budget_schedule_specs": [_GOOD_PERIOD] * 51}, "at most 50"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "recurrence_type": "WEEKLY"}]}, "one-time periods only"),
+        ({"budget_schedule_specs": [{k: v for k, v in _GOOD_PERIOD.items() if k != "time_end"}]}, "missing time_end"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value_type": "PERCENT"}]}, "budget_value_type must be one of"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 1798010799}]}, "at least 3 hours"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": "2026-12-01T00:00:00"}]}, "UTC offset"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": True}]}, "time_start"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": True}]}, "must be a number"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": "20"}]}, "must be a number"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": 0}]}, "greater than 0"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": 1.5, "budget_value_type": "MULTIPLIER"}]},
+         "positive whole number"),
+        ({"budget_schedule_specs": [_GOOD_PERIOD], "lifetime_budget": 500}, "daily budget only"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": 2000}], "daily_budget": 20}, "8 times"),
+    ],
+)
+def test_budget_schedule_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    for tool, base in ((campaigns.create_campaign, CAMPAIGN_BASE), (campaigns.create_ad_set, ADSET_BASE)):
+        with pytest.raises(campaigns.ValidationError, match=message):
+            asyncio.run(tool(**base, **arguments))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"destination_type": "PHONE_CALLS"}, "destination_type must be one of"),
+        ({"destination_type": "PHONE_CALLS"}, "inside params"),
+        ({"optimization_sub_event": "SOUND"}, "optimization_sub_event must be one of"),
+        ({"pacing_type": []}, "pacing_type must not be empty"),
+        ({"pacing_type": [" "]}, "pacing_type must be a list of non-blank strings"),
+        ({"is_dynamic_creative": "yes"}, "is_dynamic_creative must be true or false"),
+    ],
+)
+def test_create_ad_set_round_three_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **arguments))
+
+
+def test_create_ad_set_day_parting_advice_names_the_pacing_type_parameter() -> None:
+    doc = campaigns.create_ad_set.__doc__
+    assert 'pacing_type parameter set to ["day_parting"]' in doc
+    assert "in params" not in doc.split("adset_schedule (day parting)")[1].split(".")[0]
+
+
+def test_create_ad_set_adset_schedule_without_pacing_type_is_still_sent(monkeypatch) -> None:
+    """Today's behaviour is kept: adset_schedule alone is sent and Meta decides."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    schedule = [{"start_minute": 0, "end_minute": 60, "days": [0]}]
+    asyncio.run(campaigns.create_ad_set(**ADSET_BASE, adset_schedule=schedule))
+    assert client.calls[-1][3]["adset_schedule"] == schedule
+    assert "pacing_type" not in client.calls[-1][3]
+
+
+@pytest.mark.parametrize("field", ["destination_type", "optimization_sub_event"])
+def test_create_ad_set_enum_lists_match_meta_sdk_26(field) -> None:
+    """The documented values, as listed by AdAccount.create_ad_set in the Meta SDK at tag 26.0.2."""
+    sdk = {
+        "destination_type": {
+            "APP", "APPLINKS_AUTOMATIC", "FACEBOOK", "FACEBOOK_LIVE", "FACEBOOK_PAGE", "IMAGINE",
+            "INSTAGRAM_DIRECT", "INSTAGRAM_LIVE", "INSTAGRAM_PROFILE", "INSTAGRAM_PROFILE_AND_FACEBOOK_PAGE",
+            "MESSAGING_INSTAGRAM_DIRECT_MESSENGER", "MESSAGING_INSTAGRAM_DIRECT_MESSENGER_WHATSAPP",
+            "MESSAGING_INSTAGRAM_DIRECT_WHATSAPP", "MESSAGING_MESSENGER_WHATSAPP", "MESSENGER", "ON_AD",
+            "ON_EVENT", "ON_PAGE", "ON_POST", "ON_VIDEO", "SHOP_AUTOMATIC", "WEBSITE", "WHATSAPP",
+        },
+        "optimization_sub_event": {
+            "NONE", "POST_INTERACTION", "TRAVEL_INTENT", "TRAVEL_INTENT_BUCKET_01", "TRAVEL_INTENT_BUCKET_02",
+            "TRAVEL_INTENT_BUCKET_03", "TRAVEL_INTENT_BUCKET_04", "TRAVEL_INTENT_BUCKET_05",
+            "TRAVEL_INTENT_NO_DESTINATION_INTENT", "TRIP_CONSIDERATION", "VIDEO_SOUND_ON",
+        },
+    }[field]
+    values = {"destination_type": campaigns.ADSET_DESTINATION_TYPES,
+              "optimization_sub_event": campaigns.ADSET_OPTIMIZATION_SUB_EVENTS}[field]
+    assert set(values) == sdk and len(values) == len(sdk)
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("create_campaign", {"account_id": "10", "name": "C", "objective": "OUTCOME_SALES"}),
+        ("create_ad_set", _G12_ADSET_ARGS),
+    ],
+)
+def test_budget_schedule_value_rejects_booleans_at_the_mcp_boundary(monkeypatch, tool, args) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    spec = {**_GOOD_PERIOD, "budget_value": True}
+    with pytest.raises((ToolError, MCPValidationError, campaigns.ValidationError)):
+        asyncio.run(mcp_server.call_tool(tool, {**args, "budget_schedule_specs": [spec]}))
+    assert client.calls == []
+
+
+# update_campaign named spend_cap, start_time, stop_time, adlabels.
+
+
+class StoredCampaignClient(RecordingCampaignClient):
+    """A campaign with a stored cap, schedule and labels."""
+
+    def __init__(self, extra: dict | None = None) -> None:
+        super().__init__()
+        self.extra = {
+            "spend_cap": "50000",
+            "start_time": "2026-12-01T00:00:00+0000",
+            "stop_time": "2026-12-31T00:00:00+0000",
+            "adlabels": {"data": [{"id": 77, "name": "Q4"}]},
+        } if extra is None else extra
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        payload = await super().get_object(object_id, fields=fields, params=params)
+        if object_id == "act_123":
+            return payload
+        return {**payload, **{key: value for key, value in self.extra.items() if key in (fields or [])}}
+
+
+def test_update_campaign_named_fields_read_first_and_return_previous(monkeypatch) -> None:
+    client = StoredCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(
+        campaign_id="cmp_123", spend_cap=750.5, start_time="2026-12-05T00:00:00Z",
+        stop_time="2027-01-15T00:00:00-05:00", adlabels=[{"name": "Holiday"}],
+    ))
+    assert client.calls == [
+        ("get", "cmp_123", [
+            "id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget",
+            "spend_cap", "start_time", "stop_time", "adlabels",
+        ]),
+        ("get", "act_123", ["currency"]),
+        ("update", "cmp_123", {
+            "spend_cap": 75050, "start_time": "2026-12-05T00:00:00Z",
+            "stop_time": "2027-01-15T00:00:00-05:00", "adlabels": [{"name": "Holiday"}],
+        }),
+    ]
+    assert result["previous"] == {
+        "name": "Old name", "status": "PAUSED", "objective": "OUTCOME_SALES",
+        "daily_budget": 50.0, "lifetime_budget": None,
+        "spend_cap": 500.0, "start_time": "2026-12-01T00:00:00+0000", "stop_time": "2026-12-31T00:00:00+0000",
+        "adlabels": [{"id": "77", "name": "Q4"}],
+    }
+    assert result["current"] == {
+        "spend_cap": 750.5, "start_time": "2026-12-05T00:00:00Z",
+        "stop_time": "2027-01-15T00:00:00-05:00", "adlabels": [{"name": "Holiday"}],
+    }
+    assert result["money_units"] == "major units of the ad account currency (USD)"
+    assert "previous_unavailable" not in result
+
+
+def test_update_campaign_spend_cap_alone_is_a_change(monkeypatch) -> None:
+    client = StoredCampaignClient(extra={})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", spend_cap=100))
+    assert client.calls[-1] == ("update", "cmp_123", {"spend_cap": 10000})
+    assert result["previous"]["spend_cap"] is None
+    assert result["previous_unavailable"] == {"spend_cap": "Meta returned no value for it; it may not have been set."}
+
+
+def test_update_campaign_labels_on_an_unread_page_are_flagged(monkeypatch) -> None:
+    client = StoredCampaignClient(extra={"adlabels": {
+        "data": [{"id": "1", "name": "A"}], "paging": {"next": "https://graph.example/next"},
+    }})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", adlabels=[{"id": "2"}]))
+    assert result["previous"]["adlabels"] == [{"id": "1", "name": "A"}]
+    assert "first page only" in result["previous_incomplete"]["adlabels"]
+
+
+def test_update_campaign_one_sided_start_is_checked_against_stored_stop(monkeypatch) -> None:
+    client = StoredCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="stored stop_time"):
+        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", start_time="2027-01-02T00:00:00Z"))
+    assert client.calls == [
+        ("get", "cmp_123", [
+            "id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget",
+            "start_time", "stop_time",
+        ]),
+    ]
+
+
+def test_update_campaign_one_sided_stop_is_checked_against_stored_start(monkeypatch) -> None:
+    client = StoredCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="stored start_time"):
+        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", stop_time="2026-11-30T00:00:00Z"))
+    assert not [call for call in client.calls if call[0] == "update"]
+
+
+def test_update_campaign_failed_read_writes_nothing(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    class GoneClient(RecordingCampaignClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            raise MetaApiError(message="Object does not exist", status_code=400, code=100)
+
+    client = GoneClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError):
+        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", spend_cap=200))
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("named", "params_value"),
+    [
+        ({"spend_cap": 250.0}, 25000),
+        ({"start_time": "2026-12-01T00:00:00Z"}, "2026-12-01T00:00:00Z"),
+        ({"stop_time": "2026-12-31T00:00:00Z"}, "2026-12-31T00:00:00Z"),
+        ({"adlabels": [{"name": "Q4"}]}, [{"name": "Q4"}]),
+    ],
+)
+def test_update_campaign_named_parameter_and_same_params_key_together_raise(monkeypatch, named, params_value) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    (key, _value), = named.items()
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", **named, params={key: params_value}))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"spend_cap": 0}, "spend_cap must be greater than 0"),
+        ({"spend_cap": float("nan")}, "spend_cap"),
+        ({"start_time": "tomorrow"}, "start_time"),
+        ({"stop_time": "2026-12-31T00:00:00"}, "UTC offset"),
+        ({"stop_time": "0"}, "positive"),
+        ({"start_time": "2026-12-31T00:00:00Z", "stop_time": "2026-12-01T00:00:00Z"}, "stop_time must be after start_time"),
+        ({"adlabels": [{"color": "red"}]}, "adlabels"),
+        ({"adlabels": []}, "adlabels must not be empty"),
+    ],
+)
+def test_update_campaign_named_parameter_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", **arguments))
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_update_campaign_spend_cap_rejects_booleans_at_the_mcp_boundary(monkeypatch, value) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises((ToolError, MCPValidationError)):
+        asyncio.run(mcp_server.call_tool("update_campaign", {"campaign_id": "20", "spend_cap": value}))
+    assert not [call for call in client.calls if call[0] == "update"]
+
+
+def test_update_campaign_spend_cap_accepts_numbers_at_the_mcp_boundary(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(mcp_server.call_tool("update_campaign", {"campaign_id": "20", "spend_cap": 150.25}))
+    assert client.calls[-1] == ("update", "20", {"spend_cap": 15025})
+
+
+# update_adset named adlabels.
+
+
+def test_update_adset_named_adlabels_reads_first_and_returns_previous(monkeypatch) -> None:
+    client = MoneyAdsetClient(stored={"adlabels": {"data": [{"id": "5", "name": "Old"}]}})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="adset_1", adlabels=[{"name": "New"}]))
+    assert client.calls == [
+        ("get", "adset_1", ["id", "adlabels"]),
+        ("update", "adset_1", {"adlabels": [{"name": "New"}]}),
+    ]
+    assert result["previous"] == {"adlabels": [{"id": "5", "name": "Old"}]}
+    assert result["current"] == {"adlabels": [{"name": "New"}]}
+    assert "replaces the ad set's whole label set" in campaigns.update_adset.__doc__
+
+
+def test_update_adset_params_only_adlabels_call_is_unchanged(monkeypatch) -> None:
+    client = MoneyAdsetClient(stored={})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.update_adset(adset_id="adset_1", params={"adlabels": [{"name": "Q4"}]}))
+    assert client.calls == [
+        ("get", "adset_1", ["id", "adlabels"]),
+        ("update", "adset_1", {"adlabels": [{"name": "Q4"}]}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"adlabels": [{"name": "A"}], "params": {"adlabels": [{"name": "A"}]}}, "adlabels was given both"),
+        ({"adlabels": [{}]}, "adlabels"),
+        ({"adlabels": []}, "adlabels must not be empty"),
+    ],
+)
+def test_update_adset_adlabels_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.update_adset(adset_id="adset_1", **arguments))

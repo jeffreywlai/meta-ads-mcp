@@ -19,7 +19,14 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, GraphId, StrictCurrencyAmount, StringList
+from meta_ads_mcp.tool_types import (
+    BidConstraints,
+    CurrencyAmount,
+    GraphId,
+    StrictCurrencyAmount,
+    StringList,
+    coerce_csv_string_list,
+)
 
 
 def _encode_budget_field(
@@ -77,6 +84,157 @@ def _nonblank_text(value: str, field_name: str) -> str:
     return value
 
 
+def read_adlabels(value: Any) -> tuple[list[dict[str, Any]] | None, bool]:
+    """Shape labels read from Meta as a list of {id, name}; the flag is False when Meta reported another page."""
+    if value is None:
+        return None, True
+    complete = True
+    items = value
+    if isinstance(value, dict):
+        items = value.get("data")
+        complete = not (value.get("paging") or {}).get("next")
+    if not isinstance(items, list):
+        return None, False
+    labels = [
+        {key: str(item[key]) if key == "id" else item[key] for key in ("id", "name") if item.get(key) is not None}
+        for item in items
+        if isinstance(item, dict)
+    ]
+    return labels, complete
+
+
+ADLABELS_PREVIOUS_INCOMPLETE = (
+    "Meta returned more labels than one page; previous lists the first page only. "
+    "The update replaced the whole label set."
+)
+
+# Values from Meta's ad set reference (POST /act_{id}/adsets) and
+# AdAccount.create_ad_set in facebook-python-business-sdk 26.0.2.
+ADSET_DESTINATION_TYPES = (
+    "WEBSITE", "APP", "MESSENGER", "APPLINKS_AUTOMATIC", "WHATSAPP", "INSTAGRAM_DIRECT", "FACEBOOK",
+    "MESSAGING_MESSENGER_WHATSAPP", "MESSAGING_INSTAGRAM_DIRECT_MESSENGER",
+    "MESSAGING_INSTAGRAM_DIRECT_MESSENGER_WHATSAPP", "MESSAGING_INSTAGRAM_DIRECT_WHATSAPP",
+    "SHOP_AUTOMATIC", "ON_AD", "ON_POST", "ON_EVENT", "ON_VIDEO", "ON_PAGE", "INSTAGRAM_PROFILE",
+    "FACEBOOK_PAGE", "INSTAGRAM_PROFILE_AND_FACEBOOK_PAGE", "INSTAGRAM_LIVE", "FACEBOOK_LIVE", "IMAGINE",
+)
+ADSET_OPTIMIZATION_SUB_EVENTS = (
+    "NONE", "VIDEO_SOUND_ON", "TRIP_CONSIDERATION", "TRAVEL_INTENT", "TRAVEL_INTENT_NO_DESTINATION_INTENT",
+    "TRAVEL_INTENT_BUCKET_01", "TRAVEL_INTENT_BUCKET_02", "TRAVEL_INTENT_BUCKET_03",
+    "TRAVEL_INTENT_BUCKET_04", "TRAVEL_INTENT_BUCKET_05", "POST_INTERACTION",
+)
+# Scheduled budget increases (Meta's high demand periods): the budget_schedules
+# reference and the budget_schedule_specs parameter on campaign and ad set creation.
+BUDGET_SCHEDULE_VALUE_TYPES = ("ABSOLUTE", "MULTIPLIER")
+_BUDGET_SCHEDULE_KEYS = ("time_start", "time_end", "budget_value", "budget_value_type")
+MAX_BUDGET_SCHEDULE_SPECS = 50
+_MIN_HIGH_DEMAND_SECONDS = 3 * 60 * 60
+_MAX_SCHEDULED_BUDGET_MULTIPLE = 8
+
+
+def _enum_value(value: Any, allowed: tuple[str, ...], field_name: str, *, params_hint: bool = False) -> str:
+    """Check one of Meta's documented values; case and surrounding spaces are forgiven."""
+    text = value.strip().upper() if isinstance(value, str) else ""
+    if text not in allowed:
+        hint = (
+            f" A value Meta added after v26.0 can be sent as {field_name} inside params instead."
+            if params_hint
+            else ""
+        )
+        raise ValidationError(f"{field_name} must be one of {list(allowed)}, the values Meta's v26.0 reference lists.{hint}")
+    return text
+
+
+def _nonblank_string_list(value: Any, field_name: str) -> list[str]:
+    """Check a non-empty list of non-blank strings."""
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValidationError(f"{field_name} must be a list of non-blank strings, for example [\"day_parting\"].")
+    if not value:
+        raise ValidationError(f"{field_name} must not be empty; omit it instead.")
+    return [item.strip() for item in value]
+
+
+def _schedule_seconds(value: Any, field_name: str) -> int:
+    """Read a high demand period bound (ISO 8601 with a UTC offset, or Unix seconds) as Unix seconds."""
+    if isinstance(value, bool):
+        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.")
+    if isinstance(value, int):
+        value = str(value)
+    parsed = _validate_adset_time(value, field_name)
+    assert parsed is not None  # Only an end_time named exactly "end_time" may be 0.
+    return int(parsed.timestamp())
+
+
+def check_budget_schedule_specs(
+    specs: Any,
+    *,
+    daily_budget: float | None,
+    lifetime_budget: float | None,
+) -> list[dict[str, Any]]:
+    """Validate scheduled budget increases before any network call; amounts stay in major units here."""
+    _nonempty_object_list(specs, "budget_schedule_specs")
+    if len(specs) > MAX_BUDGET_SCHEDULE_SPECS:
+        raise ValidationError(f"budget_schedule_specs takes at most {MAX_BUDGET_SCHEDULE_SPECS} periods.")
+    if lifetime_budget is not None:
+        raise ValidationError("budget_schedule_specs works with a daily budget only, not lifetime_budget.")
+    checked: list[dict[str, Any]] = []
+    for index, spec in enumerate(specs):
+        label = f"budget_schedule_specs[{index}]"
+        unknown = sorted(set(spec) - set(_BUDGET_SCHEDULE_KEYS))
+        if unknown:
+            raise ValidationError(
+                f"{label} takes only time_start, time_end, budget_value and budget_value_type "
+                f"(Meta supports one-time periods only); unexpected: {', '.join(unknown)}."
+            )
+        missing = [key for key in _BUDGET_SCHEDULE_KEYS if key not in spec]
+        if missing:
+            raise ValidationError(f"{label} is missing {', '.join(missing)}.")
+        value_type = _enum_value(spec["budget_value_type"], BUDGET_SCHEDULE_VALUE_TYPES, f"{label}.budget_value_type")
+        start = _schedule_seconds(spec["time_start"], f"{label}.time_start")
+        end = _schedule_seconds(spec["time_end"], f"{label}.time_end")
+        if end - start < _MIN_HIGH_DEMAND_SECONDS:
+            raise ValidationError(f"{label} must end at least 3 hours after it starts.")
+        value = spec["budget_value"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValidationError(f"{label}.budget_value must be a number, not {type(value).__name__}.")
+        if value_type == "ABSOLUTE":
+            validate_positive_amount(value, field_name=f"{label}.budget_value")
+            if daily_budget is not None and daily_budget + value > _MAX_SCHEDULED_BUDGET_MULTIPLE * daily_budget:
+                raise ValidationError(
+                    f"{label}.budget_value {value} would take the daily budget {daily_budget} past 8 times "
+                    "its size, which Meta does not allow. budget_value is the increase in major units "
+                    "(20 means 20.00), not cents."
+                )
+        else:
+            if value != value or value <= 0 or not float(value).is_integer():
+                raise ValidationError(
+                    f"{label}.budget_value must be a positive whole number for MULTIPLIER "
+                    "(Meta's example: 140 means 140 percent)."
+                )
+            value = int(value)
+        checked.append({"time_start": start, "time_end": end, "budget_value": value, "budget_value_type": value_type})
+    return checked
+
+
+def budget_schedule_needs_currency(checked: list[dict[str, Any]] | None) -> bool:
+    """True when a checked schedule carries an absolute amount to convert."""
+    return any(spec["budget_value_type"] == "ABSOLUTE" for spec in checked or [])
+
+
+def encode_budget_schedule_specs(checked: list[dict[str, Any]], currency: str | None) -> list[dict[str, Any]]:
+    """Convert absolute increases to Meta's minor units; multipliers are sent unchanged."""
+    return [
+        {
+            **spec,
+            "budget_value": to_minor_units(
+                spec["budget_value"], currency, field_name=f"budget_schedule_specs[{index}].budget_value"
+            ),
+        }
+        if spec["budget_value_type"] == "ABSOLUTE"
+        else dict(spec)
+        for index, spec in enumerate(checked)
+    ]
+
+
 @mcp_server.tool()
 async def create_campaign(
     account_id: str,
@@ -96,8 +254,9 @@ async def create_campaign(
     promoted_object: dict[str, Any] | None = None,
     special_ad_category_country: StringList | None = None,
     adlabels: list[dict[str, Any]] | None = None,
+    budget_schedule_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. A named parameter and the same key inside params cannot both be given."""
+    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours, account permission required): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type ABSOLUTE or MULTIPLIER, and budget_value, which for ABSOLUTE is the increase in major units of the account currency (20 means 20.00; converted to minor units) and for MULTIPLIER is a whole number sent unchanged (Meta's example: 140 means 140 percent). A named parameter and the same key inside params cannot both be given."""
     reject_named_and_params(
         {
             "spend_cap": spend_cap,
@@ -106,9 +265,10 @@ async def create_campaign(
             "promoted_object": promoted_object,
             "special_ad_category_country": special_ad_category_country,
             "adlabels": adlabels,
+            "budget_schedule_specs": budget_schedule_specs,
         },
         params,
-        money=("spend_cap",),
+        money=("spend_cap", "budget_schedule_specs"),
     )
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
@@ -134,6 +294,13 @@ async def create_campaign(
             raise ValidationError("special_ad_category_country takes two-letter country codes such as US or CA.")
     if adlabels is not None:
         validate_adlabels(adlabels)
+    schedule = (
+        None
+        if budget_schedule_specs is None
+        else check_budget_schedule_specs(
+            budget_schedule_specs, daily_budget=daily_budget, lifetime_budget=lifetime_budget
+        )
+    )
     payload: dict[str, Any] = {
         "name": name,
         "objective": objective,
@@ -153,6 +320,7 @@ async def create_campaign(
         ("promoted_object", promoted_object),
         ("special_ad_category_country", countries),
         ("adlabels", adlabels),
+        ("budget_schedule_specs", schedule),
     ):
         if value is not None:
             payload[key] = value
@@ -161,12 +329,17 @@ async def create_campaign(
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
     currency = None
-    if any(value is not None for value in (daily_budget, lifetime_budget, spend_cap)):
+    if (
+        any(value is not None for value in (daily_budget, lifetime_budget, spend_cap))
+        or budget_schedule_needs_currency(schedule)
+    ):
         currency = await resolve_account_currency(client, account_id)
     _encode_budget_field(payload, "daily_budget", daily_budget, currency=currency)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget, currency=currency)
     if spend_cap is not None:
         payload["spend_cap"] = to_minor_units(spend_cap, currency, field_name="spend_cap")
+    if schedule is not None:
+        payload["budget_schedule_specs"] = encode_budget_schedule_specs(schedule, currency)
     result = await client.create_edge_object(
         account_id,
         "campaigns",
@@ -189,19 +362,32 @@ async def update_campaign(
     daily_budget: CurrencyAmount | None = None,
     lifetime_budget: CurrencyAmount | None = None,
     params: dict[str, Any] | None = None,
+    spend_cap: StrictCurrencyAmount | None = None,
+    start_time: str | None = None,
+    stop_time: str | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user already has a campaign id and wants to change core campaign settings."""
+    """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given."""
+    named = {"spend_cap": spend_cap, "start_time": start_time, "stop_time": stop_time, "adlabels": adlabels}
+    reject_named_and_params(named, params, money=("spend_cap",))
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
         ("daily_budget", daily_budget),
         ("lifetime_budget", lifetime_budget),
+        ("spend_cap", spend_cap),
     ):
         if value is not None:
             validate_positive_amount(value, field_name=field_name)
+    new_start = _validate_adset_time(start_time, "start_time")
+    new_stop = _validate_adset_time(stop_time, "stop_time")
+    if new_start is not None and new_stop is not None and new_stop <= new_start:
+        raise ValidationError("stop_time must be after start_time.")
+    if adlabels is not None:
+        validate_adlabels(adlabels)
     if all(
         value is None
-        for value in (name, status, objective, daily_budget, lifetime_budget)
+        for value in (name, status, objective, daily_budget, lifetime_budget, *named.values())
     ) and not params:
         raise ValidationError("At least one field must be provided for update_campaign.")
     payload: dict[str, Any] = {
@@ -211,7 +397,18 @@ async def update_campaign(
         "daily_budget": OMIT,
         "lifetime_budget": OMIT,
     }
+    # New named fields join the payload and the pre-read only when given, so a
+    # call that puts them in params (as callers did before) is sent unchanged.
+    named_given = [key for key, value in named.items() if value is not None]
+    for key in named_given:
+        payload[key] = named[key]
     merge_graph_payload(payload, params)
+    other_bound = None
+    if new_start is not None and stop_time is None:
+        other_bound = "stop_time"
+    elif new_stop is not None and start_time is None:
+        other_bound = "start_time"
+    extra_reads = [*named_given, *([other_bound] if other_bound else [])]
     client = get_graph_api_client()
     previous = await client.get_object(
         campaign_id,
@@ -223,8 +420,20 @@ async def update_campaign(
             "objective",
             "daily_budget",
             "lifetime_budget",
+            *extra_reads,
         ],
     )
+    stored = _stored_adset_time(previous.get(other_bound)) if other_bound else None
+    if stored is not None and other_bound == "stop_time" and new_start is not None and new_start >= stored:
+        raise ValidationError(
+            f"start_time must be before the campaign's stored stop_time {previous.get('stop_time')}; "
+            "nothing was changed. Pass a later stop_time as well."
+        )
+    if stored is not None and other_bound == "start_time" and new_stop is not None and new_stop <= stored:
+        raise ValidationError(
+            f"stop_time must be after the campaign's stored start_time {previous.get('start_time')}; "
+            "nothing was changed."
+        )
     has_money = any(
         value is not None
         for value in (
@@ -232,6 +441,7 @@ async def update_campaign(
             lifetime_budget,
             previous.get("daily_budget"),
             previous.get("lifetime_budget"),
+            spend_cap,
         )
     )
     currency = (
@@ -252,6 +462,10 @@ async def update_campaign(
         current["daily_budget"] = daily_budget
     if lifetime_budget is not None:
         current["lifetime_budget"] = lifetime_budget
+    if spend_cap is not None:
+        payload["spend_cap"] = to_minor_units(spend_cap, currency, field_name="spend_cap")
+    for key in named_given:
+        current[key] = named[key]
     payload = merge_graph_payload(payload, params)
     if params:
         current.update(params)
@@ -266,13 +480,35 @@ async def update_campaign(
             previous.get("lifetime_budget"), currency, field_name="lifetime_budget"
         ),
     }
+    unavailable: dict[str, str] = {}
+    incomplete: dict[str, str] = {}
+    for key in named_given:
+        if key not in previous:
+            previous_response[key] = None
+            unavailable[key] = _OMITTED_PREVIOUS
+        elif key == "spend_cap":
+            previous_response[key] = from_minor_units(previous.get(key), currency, field_name=key)
+        elif key == "adlabels":
+            labels, complete = read_adlabels(previous.get(key))
+            previous_response[key] = labels
+            if not complete:
+                incomplete[key] = ADLABELS_PREVIOUS_INCOMPLETE
+        else:
+            previous_response[key] = previous.get(key)
     await client.update_object(campaign_id, data=payload)
-    return mutation_response(
+    response = mutation_response(
         action="update_campaign",
         target={"campaign_id": campaign_id},
         previous=previous_response,
         current=current,
     )
+    if unavailable:
+        response["previous_unavailable"] = unavailable
+    if incomplete:
+        response["previous_incomplete"] = incomplete
+    if spend_cap is not None:
+        response["money_units"] = f"major units of the ad account currency ({currency})"
+    return response
 
 
 @mcp_server.tool()
@@ -317,8 +553,13 @@ async def create_ad_set(
     dsa_beneficiary: str | None = None,
     dsa_payor: str | None = None,
     adlabels: list[dict[str, Any]] | None = None,
+    destination_type: str | None = None,
+    pacing_type: StringList | None = None,
+    is_dynamic_creative: bool | None = None,
+    optimization_sub_event: str | None = None,
+    budget_schedule_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and pacing_type ["day_parting"] in params. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type ABSOLUTE or MULTIPLIER, and budget_value, which for ABSOLUTE is the increase in major units of the account currency (converted to minor units) and for MULTIPLIER a whole number sent unchanged (Meta's example: 140 means 140 percent). dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
     named_spend = {
         "daily_spend_cap": daily_spend_cap,
         "lifetime_spend_cap": lifetime_spend_cap,
@@ -330,10 +571,20 @@ async def create_ad_set(
         "attribution_spec": attribution_spec,
         "adset_schedule": adset_schedule,
     }
+    named_delivery = {
+        "destination_type": destination_type,
+        "pacing_type": pacing_type,
+        "is_dynamic_creative": is_dynamic_creative,
+        "optimization_sub_event": optimization_sub_event,
+        "budget_schedule_specs": budget_schedule_specs,
+    }
     reject_named_and_params(
-        {**named_other, **named_spend, "dsa_beneficiary": dsa_beneficiary, "dsa_payor": dsa_payor, "adlabels": adlabels},
+        {
+            **named_other, **named_spend, "dsa_beneficiary": dsa_beneficiary, "dsa_payor": dsa_payor,
+            "adlabels": adlabels, **named_delivery,
+        },
         params,
-        money=_ADSET_SPEND_FIELDS,
+        money=(*_ADSET_SPEND_FIELDS, "budget_schedule_specs"),
     )
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
@@ -355,6 +606,26 @@ async def create_ad_set(
             _nonblank_text(value, field_name)
     if adlabels is not None:
         validate_adlabels(adlabels)
+    if destination_type is not None:
+        named_delivery["destination_type"] = _enum_value(
+            destination_type, ADSET_DESTINATION_TYPES, "destination_type", params_hint=True
+        )
+    if pacing_type is not None:
+        named_delivery["pacing_type"] = _nonblank_string_list(coerce_csv_string_list(pacing_type), "pacing_type")
+    if is_dynamic_creative is not None and not isinstance(is_dynamic_creative, bool):
+        raise ValidationError("is_dynamic_creative must be true or false.")
+    if optimization_sub_event is not None:
+        named_delivery["optimization_sub_event"] = _enum_value(
+            optimization_sub_event, ADSET_OPTIMIZATION_SUB_EVENTS, "optimization_sub_event", params_hint=True
+        )
+    schedule = (
+        None
+        if budget_schedule_specs is None
+        else check_budget_schedule_specs(
+            budget_schedule_specs, daily_budget=daily_budget, lifetime_budget=lifetime_budget
+        )
+    )
+    named_delivery["budget_schedule_specs"] = schedule
     validate_targeting_placements(targeting)
     payload: dict[str, Any] = {
         "campaign_id": campaign_id,
@@ -380,6 +651,7 @@ async def create_ad_set(
         ("dsa_beneficiary", dsa_beneficiary),
         ("dsa_payor", dsa_payor),
         ("adlabels", adlabels),
+        *named_delivery.items(),
     ):
         if value is not None:
             payload[key] = value
@@ -388,8 +660,13 @@ async def create_ad_set(
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
     currency = None
-    if any(value is not None for value in (bid_amount, daily_budget, lifetime_budget, *named_spend.values())):
+    if (
+        any(value is not None for value in (bid_amount, daily_budget, lifetime_budget, *named_spend.values()))
+        or budget_schedule_needs_currency(schedule)
+    ):
         currency = await resolve_account_currency(client, account_id)
+    if schedule is not None:
+        payload["budget_schedule_specs"] = encode_budget_schedule_specs(schedule, currency)
     if bid_amount is not None:
         payload["bid_amount"] = to_minor_units(
             bid_amount,
@@ -468,6 +745,11 @@ def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
     return parsed
 
 
+def validate_schedule_time(value: str | None, field_name: str) -> datetime | None:
+    """Check a schedule time for another tool module: ISO 8601 with a UTC offset, or Unix seconds."""
+    return _validate_adset_time(value, field_name)
+
+
 def _stored_adset_time(value: Any) -> datetime | None:
     """Read a stored ad set time such as 2026-12-01T00:00:00+0000; None when absent or unreadable."""
     if not isinstance(value, str) or not value.strip():
@@ -496,11 +778,15 @@ async def update_adset(
     lifetime_spend_cap: StrictCurrencyAmount | None = None,
     daily_min_spend_target: StrictCurrencyAmount | None = None,
     lifetime_min_spend_target: StrictCurrencyAmount | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps or minimum spend targets, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec. A changed field whose prior value Meta did not return is named in previous_unavailable."""
+    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps, minimum spend targets or labels, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad set's whole label set, so include any label to keep. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     adset_id = blank_to_none(adset_id)
     if adset_id is None:
         raise ValidationError("adset_id is required.")
+    reject_named_and_params({"adlabels": adlabels}, params)
+    if adlabels is not None:
+        validate_adlabels(adlabels)
     for field_name, tool_name in _ADSET_MONEY_FIELD_TOOLS.items():
         if params and field_name in params:
             raise ValidationError(f"{field_name} cannot be changed with update_adset; use {tool_name}.")
@@ -544,6 +830,9 @@ async def update_adset(
         **{field_name: spend.get(field_name) for field_name in _ADSET_SPEND_FIELDS},
     }
     payload: dict[str, Any] = {key: OMIT if value is None else value for key, value in typed.items()}
+    # adlabels joins the payload only when given, so a params-only call is sent unchanged.
+    if adlabels is not None:
+        payload["adlabels"] = adlabels
     add_validate_only(payload, validate_only=validate_only)
     payload = merge_graph_payload(payload, params)
     changes = {key: value for key, value in payload.items() if key != "execution_options"}
@@ -571,6 +860,11 @@ async def update_adset(
             previous_values[field_name] = from_minor_units(
                 previous_values[field_name], currency, field_name=field_name
             )
+    incomplete: dict[str, str] = {}
+    if "adlabels" in previous_values:
+        previous_values["adlabels"], labels_complete = read_adlabels(previous_values["adlabels"])
+        if not labels_complete:
+            incomplete["adlabels"] = ADLABELS_PREVIOUS_INCOMPLETE
     unavailable = {key: _OMITTED_PREVIOUS for key in read_fields if key not in previous}
     unavailable.update({key: _UNREAD_ADSET_PREVIOUS for key in not_read})
     stored = _stored_adset_time(previous.get(other_bound)) if other_bound else None
@@ -599,6 +893,8 @@ async def update_adset(
     })
     if unavailable:
         response["previous_unavailable"] = unavailable
+    if incomplete:
+        response["previous_incomplete"] = incomplete
     if spend:
         response["money_units"] = f"major units of the ad account currency ({currency})"
     return response
