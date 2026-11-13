@@ -816,3 +816,89 @@ def test_update_ad_adlabels_errors_make_no_call(monkeypatch, arguments, message)
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(ads.ValidationError, match=message):
         asyncio.run(ads.update_ad(ad_id="ad_1", **arguments))
+
+
+# Round four: display_sequence and engagement_audience.
+
+ROUND_FOUR_AD_PARAMS = {"display_sequence": 2, "engagement_audience": True}
+
+
+@pytest.mark.parametrize("creative", [{"creative_id": "crt_123"}, {"creative_spec": INLINE_SPEC}])
+def test_create_ad_params_only_round_four_call_is_unchanged(monkeypatch, creative) -> None:
+    """display_sequence and engagement_audience inside params are sent exactly as before they had named parameters."""
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.create_ad(**AD_BASE, **creative, params=dict(ROUND_FOUR_AD_PARAMS)))
+    sent_creative = INLINE_SPEC if "creative_spec" in creative else {"creative_id": "crt_123"}
+    assert client.calls == [
+        ("create", "act_123", "ads", {
+            "name": "Ad", "adset_id": "adset_123", "creative": sent_creative, "status": "PAUSED",
+            **ROUND_FOUR_AD_PARAMS,
+        }),
+    ]
+    assert list(client.calls[0][3]) == ["name", "adset_id", "creative", "status", *ROUND_FOUR_AD_PARAMS]
+    assert result["created"] == {"id": "ad_created"}
+
+
+@pytest.mark.parametrize("key", list(ROUND_FOUR_AD_PARAMS))
+def test_create_ad_round_four_named_parameter_and_same_params_key_together_raise(monkeypatch, key) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    value = ROUND_FOUR_AD_PARAMS[key]
+    with pytest.raises(ads.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", **{key: value}, params={key: value}))
+
+
+@pytest.mark.parametrize("creative", [{"creative_id": "crt_123"}, {"creative_spec": INLINE_SPEC}])
+def test_create_ad_round_four_named_parameters_are_sent(monkeypatch, creative) -> None:
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(ads.create_ad(**AD_BASE, **creative, display_sequence=0, engagement_audience=False))
+    sent = client.calls[-1][3]
+    assert sent["display_sequence"] == 0
+    assert sent["engagement_audience"] is False
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"display_sequence": -1}, "display_sequence must be a whole number"),
+        ({"display_sequence": True}, "display_sequence must be a whole number"),
+        ({"display_sequence": 1.5}, "display_sequence must be a whole number"),
+        ({"engagement_audience": "yes"}, "engagement_audience must be true or false"),
+        ({"engagement_audience": 1}, "engagement_audience must be true or false"),
+    ],
+)
+def test_create_ad_round_four_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match=message):
+        asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", **arguments))
+
+
+@pytest.mark.parametrize("bad", [True, "2", 2.0])
+def test_create_ad_display_sequence_is_checked_at_the_mcp_boundary(monkeypatch, bad) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    with pytest.raises((ToolError, MCPValidationError, ads.ValidationError)):
+        asyncio.run(mcp_server.call_tool("create_ad", {**AD_BASE, "creative_id": "1", "display_sequence": bad}))
+    assert client.calls == []
+
+
+def test_create_ad_round_four_fields_are_accepted_at_the_mcp_boundary(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(mcp_server.call_tool(
+        "create_ad", {**AD_BASE, "creative_id": "1", "display_sequence": 3, "engagement_audience": True},
+    ))
+    assert client.calls[-1][3]["display_sequence"] == 3
+    assert client.calls[-1][3]["engagement_audience"] is True
+
+
+def test_create_ad_docstring_names_the_round_four_fields() -> None:
+    doc = ads.create_ad.__doc__
+    assert "display_sequence" in doc and "engagement_audience" in doc
+    assert "+" not in doc
