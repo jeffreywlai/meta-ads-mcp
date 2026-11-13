@@ -2726,3 +2726,259 @@ def test_list_product_feed_uploads_new_options_are_validated_before_any_call(mon
     _no_client(monkeypatch)
     with pytest.raises(ValidationError):
         run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", **kwargs))
+
+
+# round five: known secrets in Meta's error text, feed error reads, caller text in messages -------
+
+
+_KNOWN_SECRET = "".join(("R5-sensitive-", "credential-x9"))
+
+
+class _EchoingSecretClient(FakeCatalogFeedClient):
+    """Refuses every write with an error that repeats the secret, in its text and behind it."""
+
+    def __init__(self, secret: str, *, cycle: bool = False, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.secret = secret
+        # Python never builds a cause/context cycle itself, and the rich log handler cannot
+        # print one, so only the direct calls use it to prove the scrub ends.
+        self.cycle = cycle
+
+    def _refusal(self) -> MetaApiError:
+        from urllib.parse import quote
+
+        inner = MetaApiError(
+            "Inner refusal for " + quote(self.secret, safe=""), code=100,
+            error_data={"blame": self.secret, self.secret: "key"},
+        )
+        try:
+            raise inner
+        except MetaApiError:
+            error = MetaApiError(
+                "Rejected supplied credential " + self.secret, code=100,
+                user_message="Invalid " + self.secret, details={"error": {"message": self.secret}},
+            )
+            error.__cause__ = inner
+            if self.cycle:
+                inner.__context__ = error
+            return error
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        await super().create_edge_object(parent_id, edge, data=data, files=files)
+        raise self._refusal()
+
+    async def update_object(self, object_id: str, *, data):
+        await super().update_object(object_id, data=data)
+        raise self._refusal()
+
+
+def _secret_arguments(tool: str, secret: str) -> dict[str, Any]:
+    integration = {"params": {"partner_integration": {"external_access_token": secret}}}
+    schedule = {"url": "https://example.invalid/feed.csv", "interval": "DAILY", "username": "user", "password": secret}
+    return {
+        "create_catalog": {"business_id": "10", "name": "C", **integration},
+        "update_catalog": {"catalog_id": "10", **integration},
+        "create_product_feed": {"catalog_id": "10", "name": "F", "schedule": schedule},
+        "update_product_feed": {"feed_id": "10", "schedule": schedule},
+        "create_product_feed_upload": {
+            "feed_id": "10", "url": "https://example.invalid/feed.csv", "username": "user", "password": secret,
+        },
+    }[tool]
+
+
+def _all_error_text(error: BaseException) -> str:
+    texts: list[str] = []
+    pending: list[BaseException | None] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        texts.append(repr(current))
+        texts.append(str(current))
+        if isinstance(current, MetaApiError):
+            texts.append(repr(current.to_public_dict()))
+            texts.append(repr(current.details))
+        pending.extend([current.__cause__, current.__context__])
+    return "\n".join(texts)
+
+
+_SECRET_TOOLS = ["create_catalog", "update_catalog", "create_product_feed", "update_product_feed", "create_product_feed_upload"]
+
+
+@pytest.mark.parametrize("tool", _SECRET_TOOLS)
+@pytest.mark.parametrize("routed", [False, True])
+def test_known_password_or_integration_token_is_scrubbed_from_error_text(monkeypatch, caplog, tool, routed) -> None:
+    import logging
+
+    from meta_ads_mcp.coordinator import mcp_server
+    from meta_ads_mcp.tools import catalogs
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    client = _EchoingSecretClient(_KNOWN_SECRET)
+    monkeypatch.setattr(catalogs, "get_graph_api_client", lambda: client)
+    _use(monkeypatch, client)
+    arguments = _secret_arguments(tool, _KNOWN_SECRET)
+    name, payload = ("call_tool", {"name": tool, "arguments": arguments}) if routed else (tool, arguments)
+    with pytest.raises(ToolError) as error:
+        run(mcp_server.call_tool(name, payload))
+    assert _KNOWN_SECRET not in _all_error_text(error.value)
+    assert _KNOWN_SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("tool", _SECRET_TOOLS)
+def test_known_secret_is_scrubbed_through_the_whole_error_chain(monkeypatch, tool) -> None:
+    from urllib.parse import quote, quote_plus
+
+    from meta_ads_mcp.tools import catalogs
+
+    secret = " " + _KNOWN_SECRET + " & more/"
+    client = _EchoingSecretClient(secret, cycle=True)
+    monkeypatch.setattr(catalogs, "get_graph_api_client", lambda: client)
+    _use(monkeypatch, client)
+    module = catalogs if tool in {"create_catalog", "update_catalog"} else catalog_feeds
+    with pytest.raises(MetaApiError) as error:
+        run(getattr(module, tool)(**_secret_arguments(tool, secret)))
+    text = _all_error_text(error.value)
+    for form in (secret, secret.strip(), quote(secret, safe=""), quote_plus(secret), quote(secret.strip(), safe="")):
+        assert form not in text
+    assert "[redacted]" in error.value.message
+
+
+def test_short_secret_is_removed_only_as_a_whole_token() -> None:
+    error = MetaApiError("Bad password abc for the feed; abcdef is fine; (abc) too", code=100)
+    catalog_feeds._scrub_known_secrets(error, ["abc"])
+    assert error.message == "Bad password [redacted] for the feed; abcdef is fine; ([redacted]) too"
+
+
+def test_long_secret_is_removed_wherever_it_occurs() -> None:
+    error = MetaApiError("prefix" + _KNOWN_SECRET + "suffix", code=100)
+    catalog_feeds._scrub_known_secrets(error, [_KNOWN_SECRET])
+    assert error.message == "prefix[redacted]suffix"
+
+
+def test_secret_forms_cover_encoded_and_escaped_repeats() -> None:
+    secret = ' pa"ss word/1 '
+    forms = catalog_feeds._caller_secrets({"schedule": {"password": secret}})
+    for form in (secret, secret.strip(), "pa%22ss%20word%2F1", "pa%22ss+word%2F1", 'pa\\"ss word/1'):
+        assert form in forms
+    assert catalog_feeds._caller_secrets({"params": {"partner_integration": {"api_key": "k" * 9}}}) == ["k" * 9]
+    assert catalog_feeds._caller_secrets({"name": "plain", "params": {"note": "text"}}) == []
+    url_password = catalog_feeds._caller_secrets({"params": {"x": "see https://u:" + _KNOWN_SECRET + "@h.invalid/"}})
+    assert _KNOWN_SECRET in url_password
+
+
+def test_known_secret_echoed_in_a_successful_result_is_removed(monkeypatch) -> None:
+    class Echo(FakeCatalogFeedClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            await super().create_edge_object(parent_id, edge, data=data, files=files)
+            return {"id": "u1", "note": "fetched with " + _KNOWN_SECRET}
+
+    _use(monkeypatch, Echo())
+    result = run(catalog_feeds.create_product_feed_upload(
+        feed_id="10", url="https://example.invalid/feed.csv", username="user", password=_KNOWN_SECRET,
+    ))
+    assert _KNOWN_SECRET not in repr(result)
+
+
+def test_feed_params_with_a_login_url_key_or_value_are_refused(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    login = "https://user:" + _KNOWN_SECRET + "@example.invalid/x"
+    for params in ({"custom": {login: 1}}, {"custom": ["see " + login]}):
+        with pytest.raises(ValidationError, match="username or password") as error:
+            run(catalog_feeds.create_product_feed(catalog_id="1", name="F", params=params))
+        assert _KNOWN_SECRET not in str(error.value)
+        with pytest.raises(ValidationError, match="username or password"):
+            run(catalog_feeds.update_product_feed(feed_id="1", params=params))
+
+
+def test_feed_masking_covers_passwords_in_mapping_keys(monkeypatch) -> None:
+    login = "https://user:" + _KNOWN_SECRET + "@example.invalid/x"
+    _use(monkeypatch, FakeCatalogFeedClient(objects={"f1": {"id": "f1", "schedule": {login: "x"}}}))
+    result = run(catalog_feeds.list_product_feeds(feed_id="f1"))
+    assert _KNOWN_SECRET not in repr(result)
+
+
+def test_schedule_unknown_keys_are_counted_not_named(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    private = "".join(("private_person", "_r5"))
+    schedule = {**SCHEDULE, private: 1, "a@b.invalid": 2}
+    with pytest.raises(ValidationError) as error:
+        run(catalog_feeds.create_product_feed(catalog_id="1", name="F", schedule=schedule))
+    message = str(error.value)
+    assert private not in message and "a@b.invalid" not in message
+    assert "2 unsupported keys" in message and "interval" in message
+
+
+def test_invalid_regex_error_does_not_quote_the_pattern(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    private = "".join(("privateperson", "r5"))
+    with pytest.raises(ValidationError, match="character 4") as error:
+        run(catalog_feeds.create_feed_rule(
+            feed_id="1", attribute="title", rule_type="regex_replace_rule",
+            params={"regex": "(?P<" + private + "!>x)", "replace": "y"},
+        ))
+    assert private not in str(error.value)
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+@pytest.mark.parametrize("mode", ["later_page_sample_refusal", "no_upload_identity"])
+def test_feed_error_read_never_loses_available_errors_or_claims_unknown_complete(monkeypatch, mode) -> None:
+    class Feed(FakeCatalogFeedClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": "20", "error_count": 2} if mode == "later_page_sample_refusal" else {"error_count": 2}
+
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            self.calls.append({"method": "list_objects", "parent_id": parent_id, "fields": fields, "params": params})
+            if params.get("after") and any(field.startswith("samples") for field in fields):
+                raise MetaApiError("Samples unavailable for this page", code=100)
+            if params.get("after"):
+                return {"data": [{"id": "e2", "total_count": 1}]}
+            return {
+                "data": [{"id": "e1", "total_count": 1, "samples": {"data": [{"id": "s1", "row_number": 4}]}}],
+                "paging": {"next": "more", "cursors": {"after": "a"}},
+            }
+
+    client = _use(monkeypatch, Feed())
+    result = run(catalog_feeds.list_product_feed_uploads("10", upload_id="20", include_samples=True, error_limit=200))
+    item = result["item"]
+    if mode == "later_page_sample_refusal":
+        assert [row["id"] for row in item["errors"]] == ["e1", "e2"]
+        assert item["errors_complete"] is True
+        assert item["samples_unavailable"]
+        by_id = {row["id"]: row for row in item["errors"]}
+        assert by_id["e1"]["sample"] == {"id": "s1", "row_number": 4}
+        assert by_id["e2"].get("sample_unavailable") is True and "sample" not in by_id["e2"]
+        assert item["samples_unavailable_after_errors"] == 1
+    else:
+        # Meta's row has no id, so the requested upload id is used to read the errors.
+        assert [row["id"] for row in item["errors"]] == ["e1", "e2"]
+        assert {call.get("parent_id") for call in client.calls if call.get("method") == "list_objects"} == {"20"}
+
+
+def test_upload_without_id_in_a_list_is_not_reported_complete(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("feed_1", "uploads"): {"data": [{"error_count": 2}, {"error_count": 0, "warning_count": 0}]},
+    }))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1"))
+    first, second = result["items"]
+    assert first["errors"] == [] and first["errors_complete"] is False
+    assert "id" in first["errors_stop_reason"]
+    assert second["errors_complete"] is True
+    assert [call for call in client.calls if call.get("edge") == "errors"] == []
+
+
+def test_later_page_refusal_without_samples_still_raises(monkeypatch) -> None:
+    def pages(params):
+        if params.get("after"):
+            raise MetaApiError("Gone", code=190)
+        return {"data": [{"id": "e1"}], "paging": {"next": "more", "cursors": {"after": "a"}}}
+
+    _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"20": {"id": "20", "error_count": 2}}, edges={("20", "errors"): pages},
+    ))
+    with pytest.raises(MetaApiError):
+        run(catalog_feeds.list_product_feed_uploads("10", upload_id="20", include_samples=True, error_limit=200))

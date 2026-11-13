@@ -1093,7 +1093,9 @@ def test_filter_builder_rejects_unknown_operator_listing_accepted_ones(monkeypat
             catalog_id="cat_1", conditions=[{"field": "brand", "operator": "like", "value": "A"}],
         ))
     message = str(raised.value)
-    assert "like" in message
+    # The operator given is not repeated (it could be a misplaced personal value); its position is.
+    assert "like" not in message
+    assert "conditions[0].operator" in message
     for operator in catalogs.FILTER_OPERATORS:
         assert operator in message
 
@@ -1690,9 +1692,9 @@ def test_batch_products_extra_fields_pass_through_from_the_documented_list(monke
     ([{"method": "delete", "retailer_id": "S1", "name": "a"}], "delete"),
     ([{"method": "create", "retailer_id": "S1", "name": "a"}], "missing"),
     ([{"method": "update", "retailer_id": "S1", "price": 5}], "currency"),
-    ([{"method": "update", "retailer_id": "S1", "colour": "red"}], "colour"),
-    ([{"method": "update", "retailer_id": "S1", "fields": {"title": "x"}}], "title"),
-    ([{"method": "update", "retailer_id": "S1", "fields": {"not_a_field": "x"}}], "not_a_field"),
+    ([{"method": "update", "retailer_id": "S1", "colour": "red"}], r"items\[0\] has 1 unsupported key "),
+    ([{"method": "update", "retailer_id": "S1", "fields": {"title": "x"}}], r"title \(use name\)"),
+    ([{"method": "update", "retailer_id": "S1", "fields": {"not_a_field": "x"}}], r"items\[0\]\.fields has 1 key"),
     ([{"method": "update", "retailer_id": "S1", "availability": "maybe"}], "availability"),
     (["S1"], "object"),
 ])
@@ -2616,3 +2618,177 @@ def test_create_product_set_without_retailer_id_sends_the_same_request(monkeypat
     client = _use(monkeypatch, FakeCatalogClient())
     _run(catalogs.create_product_set(catalog_id="cat_1", name="Shoes", filter={"brand": {"eq": "A"}}))
     assert client.calls[0][1]["data"] == {"name": "Shoes", "filter": {"brand": {"eq": "A"}}}
+
+
+# round five: caller text in validation errors, login URLs as keys, unreadable batch handles ------
+
+
+_PRIVATE_KEY = "".join(("private.person", "@r5.invalid"))
+
+
+def _private_body_case(mode: str) -> tuple[str, dict[str, Any]]:
+    if mode == "nested_login_key":
+        return "update_catalog", {"catalog_id": "10", "params": {_PRIVATE_KEY: "https://u:p@example.invalid/x"}}
+    if mode == "bad_filter_operator":
+        return "build_product_set_filter", {
+            "catalog_id": "10", "conditions": [{"field": "brand", "operator": _PRIVATE_KEY, "value": "A"}],
+        }
+    item: dict[str, Any] = {"method": "update", "retailer_id": "sku", "name": "New"}
+    if mode == "unknown_batch_key":
+        item[_PRIVATE_KEY] = "x"
+    else:
+        item["fields"] = {_PRIVATE_KEY: "x"}
+    return "batch_update_catalog_products", {"catalog_id": "10", "items": [item], "dry_run": True}
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("mode", ["unknown_batch_key", "unknown_batch_field", "nested_login_key", "bad_filter_operator"])
+def test_catalog_body_errors_never_echo_private_keys(monkeypatch, caplog, mode, routed) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+    from fastmcp.exceptions import ValidationError as MCPValidationError
+
+    from meta_ads_mcp.config import reload_settings
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    _no_client(monkeypatch)
+    tool, arguments = _private_body_case(mode)
+    with pytest.raises((ToolError, MCPValidationError)) as error:
+        _call_mcp(tool, arguments, routed=routed)
+    assert _PRIVATE_KEY not in str(error.value)
+    assert _PRIVATE_KEY not in caplog.text
+
+
+@pytest.mark.parametrize(("call", "expected"), [
+    (lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "s", "name": "n", _PRIVATE_KEY: "x", "b@x": 1}]),
+     ["items[0]", "2 unsupported keys", "fields"]),
+    (lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "s", "fields": {"color": "red", _PRIVATE_KEY: "x"}}]),
+     ["items[0].fields", "1 key", "color"]),
+    (lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": _PRIVATE_KEY, "name": "a"},
+                     {"method": "update", "retailer_id": _PRIVATE_KEY, "name": "b"}]),
+     ["items[0]", "items[1]", "retailer_id"]),
+    (lambda: catalogs.build_product_set_filter(
+        "10", [{"field": "brand", "operator": "eq", "value": "A"}, {"field": "b", "operator": _PRIVATE_KEY, "value": 1}]),
+     ["conditions[1].operator", "eq"]),
+    (lambda: catalogs.update_catalog("10", params={"a": {_PRIVATE_KEY: "https://u:p@example.invalid/x"}}),
+     ["params", "username or password"]),
+    (lambda: catalogs.update_catalog("10", params={"a": {"b": ["https://u:p@example.invalid/" + _PRIVATE_KEY]}}),
+     ["params", "username or password"]),
+])
+def test_catalog_validation_messages_name_position_and_accepted_values(monkeypatch, call, expected) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError) as error:
+        _run(call())
+    message = str(error.value)
+    assert _PRIVATE_KEY not in message
+    for part in expected:
+        assert part in message, message
+
+
+_KEY_LOGIN_SECRET = "".join(("R5-url-", "credential-x9"))
+_KEY_LOGIN_URL = "https://user:" + _KEY_LOGIN_SECRET + "@example.invalid/x"
+
+
+@pytest.mark.parametrize("case", [
+    lambda: catalogs.update_catalog_product("20", params={"custom_data": {_KEY_LOGIN_URL: "x"}}),
+    lambda: catalogs.update_catalog_product("20", params={"custom_data": [{"note": {_KEY_LOGIN_URL: "x"}}]}),
+    lambda: catalogs.create_catalog_product(**{**_CREATE_PRODUCT_ARGUMENTS, "params": {_KEY_LOGIN_URL: "x"}}),
+    lambda: catalogs.update_catalog("10", params={"x": {"see " + _KEY_LOGIN_URL + " now": 1}}),
+    lambda: catalogs.create_product_set("10", name="S", filter={_KEY_LOGIN_URL: {"eq": "x"}}),
+    lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "s", "fields": {"color": {_KEY_LOGIN_URL: 1}}}]),
+])
+def test_catalog_login_url_in_custom_data_key_is_refused_before_write(monkeypatch, case) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="username or password") as error:
+        _run(case())
+    assert _KEY_LOGIN_SECRET not in str(error.value)
+    assert "example.invalid" not in str(error.value)
+
+
+@pytest.mark.parametrize("channel", ["response", "error_attribute"])
+def test_catalog_masking_covers_passwords_in_mapping_keys(monkeypatch, channel) -> None:
+    class Data(FakeCatalogClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            if channel == "error_attribute":
+                raise MetaApiError("Refused", code=100, error_data={_KEY_LOGIN_URL: "invalid"})
+            return {"id": "20", "custom_data": {_KEY_LOGIN_URL: "invalid"}}
+
+    _use(monkeypatch, Data())
+    if channel == "error_attribute":
+        with pytest.raises(MetaApiError) as error:
+            _run(catalogs.list_catalog_products(product_id="20", fields=["id", "custom_data"]))
+        assert _KEY_LOGIN_SECRET not in repr(error.value.to_public_dict())
+        assert _KEY_LOGIN_SECRET not in repr(error.value.error_data)
+    else:
+        result = _run(catalogs.list_catalog_products(product_id="20", fields=["id", "custom_data"]))
+        assert _KEY_LOGIN_SECRET not in json.dumps(result)
+        assert result["items"][0]["custom_data"] == {"https://user:[redacted]@example.invalid/x": "invalid"}
+
+
+def test_masked_mapping_keys_that_collide_keep_every_entry(monkeypatch) -> None:
+    first = "https://user:one-" + _KEY_LOGIN_SECRET + "@example.invalid/x"
+    second = "https://user:two-" + _KEY_LOGIN_SECRET + "@example.invalid/x"
+    data = {first: "a", second: "b", "https://user:[redacted]@example.invalid/x": "c"}
+    _use(monkeypatch, FakeCatalogClient(objects={"20": {"id": "20", "custom_data": data}}))
+    result = _run(catalogs.list_catalog_products(product_id="20", fields=["id", "custom_data"]))
+    shown = result["items"][0]["custom_data"]
+    assert _KEY_LOGIN_SECRET not in json.dumps(result)
+    assert sorted(shown.values()) == ["a", "b", "c"]
+    assert len(shown) == 3
+
+
+@pytest.mark.parametrize("malformed", [{}, None, True, [], ["h2"], {"id": "h2"}, 7.5, " "])
+def test_unreadable_batch_handle_is_not_silently_discarded(monkeypatch, malformed) -> None:
+    class Batch(FakeCatalogClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            self.calls.append(("create", {"parent_id": parent_id, "edge": edge, "data": data}))
+            return {"handles": ["h1", malformed]}
+
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            self.calls.append(("list", {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}))
+            if edge == "products":
+                return {"data": [{"id": "20", "retailer_id": "sku", "name": "Old"}]}
+            return {"data": [{"status": "finished", "errors_total_count": 0}]}
+
+    async def no_pause(seconds):
+        return None
+
+    monkeypatch.setattr(catalogs, "_pause", no_pause)
+    _use(monkeypatch, Batch())
+    result = _run(catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku", "name": "New"}], wait_seconds=2,
+    ))
+    assert result["ok"] is False
+    item = result["items"][0]
+    assert item["outcome"] == "outcome_unknown", result
+    assert "could not be read" in item["reason"]
+    assert result["batch"]["unreadable_handles"] == 1
+    assert result["batch"]["complete"] is False
+    assert [entry["handle"] for entry in result["batch"]["handles"]] == ["h1"]
+    assert result["retry"]["safe_now"] is True
+
+
+def test_only_unreadable_batch_handles_do_not_claim_nothing_was_ingested(monkeypatch) -> None:
+    class Batch(FakeCatalogClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            self.calls.append(("create", {"parent_id": parent_id, "edge": edge, "data": data}))
+            return {"handles": [{"x": 1}]}
+
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            self.calls.append(("list", {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}))
+            return {"data": [{"id": "20", "retailer_id": "sku", "name": "Old"}]}
+
+    _use(monkeypatch, Batch())
+    result = _run(catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku", "name": "New"}], wait_seconds=0,
+    ))
+    assert result["ok"] is False
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert result["batch"]["unreadable_handles"] == 1
