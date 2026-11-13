@@ -2399,3 +2399,377 @@ def test_boost_one_step_failure_after_a_campaign_budget_names_what_was_created(m
         asyncio.run(creatives.boost_instagram_post(**_without("daily_budget"), campaign_daily_budget=20, destination_type="MESSENGER"))
     message = raised.value.message
     assert "campaign 1 (PAUSED, remove with delete_campaign)" in message and "ad set 2 (PAUSED" in message
+
+
+# Round five: review findings J11, J16, J2 (image upload) and J10, and the two-second video billing event.
+
+
+def _fractional_clock(monkeypatch, microsecond: int):
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 11, 13, 12, 0, 0, microsecond, tzinfo=timezone.utc)
+    monkeypatch.setattr(creatives, "_utc_now", lambda: now)
+    return now
+
+
+def test_boost_one_day_duration_works_with_normal_fractional_clock(monkeypatch) -> None:
+    """J11 reproduction: a real clock has a fractional second, and a one-day plan must still pass."""
+    _fractional_clock(monkeypatch, 500000)
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        "10", instagram_media_id="30", instagram_account_id="40", page_id="20",
+        daily_budget=10, duration_days=1, targeting={"geo_locations": {"countries": ["US"]}}, plan_only=True,
+    ))
+    assert result["ok"] and result["sent"] is False
+    assert all(call[0] != "create" for call in client.calls)
+
+
+@pytest.mark.parametrize("microsecond", [1, 250000, 500000, 999999])
+@pytest.mark.parametrize("days", [1, 6, 365])
+@pytest.mark.parametrize("budget", ["daily_budget", "lifetime_budget"])
+def test_boost_computed_end_is_never_shorter_than_the_days_asked(monkeypatch, microsecond, days, budget) -> None:
+    from datetime import datetime, timedelta
+
+    now = _fractional_clock(monkeypatch, microsecond)
+    client, result = _boost(monkeypatch, **{"daily_budget": None, budget: 10, "duration_days": days})
+    sent = _created(client, "adsets")["end_time"]
+    end = datetime.fromisoformat(sent)
+    assert sent == (now.replace(microsecond=0) + timedelta(days=days, seconds=1)).isoformat()
+    assert timedelta(days=days) <= end - now < timedelta(days=days, seconds=1)
+    assert "start_time" not in _created(client, "adsets")
+    assert result["defaults_applied"]["end_time"] == sent
+
+
+def test_boost_computed_end_on_a_whole_second_clock_is_exact(monkeypatch, fixed_clock) -> None:
+    client, _ = _boost(monkeypatch, duration_days=1)
+    assert _created(client, "adsets")["end_time"] == "2026-11-14T12:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("start", "days", "end"),
+    [
+        ("2026-12-01T09:00:00.250-05:00", 1, "2026-12-02T09:00:01-05:00"),
+        ("2026-12-01T09:00:00.999999+00:00", 365, "2027-12-01T09:00:01+00:00"),
+        ("2026-12-01T09:00:00-05:00", 1, "2026-12-02T09:00:00-05:00"),
+    ],
+)
+def test_boost_fractional_start_time_with_duration_is_never_shorter(monkeypatch, start, days, end) -> None:
+    _fractional_clock(monkeypatch, 500000)
+    client, _ = _boost(monkeypatch, start_time=start, duration_days=days)
+    adset = _created(client, "adsets")
+    assert (adset["start_time"], adset["end_time"]) == (start, end)
+
+
+@pytest.mark.parametrize(
+    ("end_time", "accepted"),
+    [
+        ("2026-11-14T12:00:01Z", True),  # 24 hours and half a second after now
+        ("2026-11-14T12:00:00Z", False),  # half a second short of 24 hours
+        ("2027-11-13T12:00:00Z", True),  # just under 365 days
+        ("2027-11-13T12:00:01Z", False),  # just over 365 days
+    ],
+)
+def test_boost_explicit_end_time_is_compared_with_the_fractional_clock_exactly(monkeypatch, end_time, accepted) -> None:
+    _fractional_clock(monkeypatch, 500000)
+    if accepted:
+        client, _ = _boost(monkeypatch, end_time=end_time)
+        assert _created(client, "adsets")["end_time"] == end_time
+        return
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match="at least 24 hours|at most 365 days"):
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, "end_time": end_time}))
+
+
+@pytest.mark.parametrize("microsecond", [1, 500000, 999999])
+def test_boost_start_time_a_moment_ago_is_not_refused_on_a_fractional_clock(monkeypatch, microsecond) -> None:
+    _fractional_clock(monkeypatch, microsecond)
+    client, _ = _boost(monkeypatch, start_time="2026-11-13T12:00:00Z", duration_days=1)
+    assert _created(client, "adsets")["end_time"] == "2026-11-14T12:00:00+00:00"
+
+
+def test_chunked_upload_detects_growth_while_finish_is_in_flight(monkeypatch, tmp_path) -> None:
+    """J16 reproduction: Meta finished the upload, but the local file grew while the finish was in flight."""
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"0123456789")
+
+    class Upload:
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            if data["upload_phase"] == "start":
+                return {"upload_session_id": "50", "video_id": "60", "start_offset": "0", "end_offset": "10"}
+            if data["upload_phase"] == "transfer":
+                return {"start_offset": "10", "end_offset": "10"}
+            with path.open("ab") as handle:
+                handle.write(b"additional-frame")
+            return {"success": True}
+
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": object_id, "status": {"video_status": "ready"}}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Upload)
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert result["ok"] is True
+    assert result["video_id"] == "60"
+    assert result["upload"]["upload_session_id"] == "50"
+    assert result["upload"]["bytes"] == result["upload"]["bytes_confirmed"] == 10
+    assert result["file_changed"] is True
+    warning = " ".join(result["warnings"])
+    for expected in ("changed after its last bytes were sent", "may be missing the end", "video 60", "list_ad_videos"):
+        assert expected in warning, warning
+    assert "video.mp4" not in str(result["warnings"])
+    assert "Video is ready to use." not in result["status_note"]
+
+
+def test_chunked_upload_detects_a_rewrite_while_finish_is_in_flight(monkeypatch, tmp_path) -> None:
+    import os
+
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"0123456789")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 1)
+
+    class Rewrite(OffsetScriptClient):
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            if data["upload_phase"] == "finish":
+                stat = path.stat()
+                os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+            return await super().post_ad_video_upload_phase(account_id, data=data, files=files)
+
+    client = Rewrite((0, 10), [(10, 10)])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert result["file_changed"] is True and result["video_id"] == "91"
+    assert [call[0] for call in client.calls] == ["start", "transfer", "finish"]
+
+
+def test_chunked_upload_unchanged_file_has_no_change_warning(monkeypatch, tmp_path) -> None:
+    _ten_byte_video(monkeypatch, tmp_path)
+    client = OffsetScriptClient((0, 10), [(10, 10)])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="video.mp4"))
+    assert "file_changed" not in result and "warnings" not in result
+
+
+def test_direct_video_upload_detects_growth_while_the_request_is_in_flight(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"12345678")
+
+    class Growing(FakeVideoClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            with path.open("ab") as handle:
+                handle.write(b"tail")
+            return await super().create_edge_object(parent_id, edge, data=data, files=files)
+
+    client = Growing()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="clip.mp4"))
+    assert client.calls[0][4] == {"source": ("clip.mp4", b"12345678")}
+    assert result["ok"] is True and result["video_id"] == "777"
+    assert result["file_changed"] is True
+    assert "video 777" in " ".join(result["warnings"])
+
+
+def test_direct_video_upload_unchanged_file_has_no_change_warning(monkeypatch, tmp_path) -> None:
+    (tmp_path / "clip.mp4").write_bytes(b"12345678")
+    client = FakeVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path="clip.mp4"))
+    assert "file_changed" not in result and "warnings" not in result
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_image_upload_error_does_not_echo_private_filename(monkeypatch, tmp_path, routed, caplog) -> None:
+    """J2 reproduction for images: Meta's error repeats the private file name."""
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.errors import MetaApiError
+
+    secret = "".join(("private.person", "@image.invalid"))
+    (tmp_path / (secret + ".png")).write_bytes(b"image bytes")
+
+    class Upload:
+        async def upload_ad_image(self, account_id, *, file_name=None, file_content=None, name=None, image_url=None):
+            raise MetaApiError("Rejected image " + file_name, code=100)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Upload)
+    with pytest.raises(ToolError) as error:
+        _call_tool("upload_creative_asset", {"account_id": "10", "file_path": str(tmp_path / (secret + ".png"))}, routed)
+    assert secret not in str(error.value)
+    assert secret not in caplog.text
+
+
+@pytest.mark.parametrize("form", ["given", "basename", "resolved", "quoted", "quoted_plus", "padded"])
+def test_image_upload_error_chain_never_holds_the_file_name_or_path(monkeypatch, tmp_path, form) -> None:
+    from urllib.parse import quote, quote_plus
+
+    from meta_ads_mcp.errors import MetaApiError
+
+    secret = "".join(("private person+", "family@image.invalid"))
+    (tmp_path / "real-holiday-private.png").write_bytes(b"image bytes")
+    (tmp_path / f"{secret}.jpg").symlink_to(tmp_path / "real-holiday-private.png")
+    given = f"  {tmp_path / (secret + '.jpg')}  "
+    echoed = {
+        "given": given, "basename": f"{secret}.jpg", "resolved": "real-holiday-private.png",
+        "quoted": quote(f"{secret}.jpg", safe=""), "quoted_plus": quote_plus(f"{secret}.jpg"),
+        "padded": given.strip(),
+    }[form]
+
+    class Upload:
+        async def upload_ad_image(self, account_id, **kwargs):
+            cause = ValueError(f"cause {echoed}")
+            error = MetaApiError(
+                f"Rejected {echoed}", code=100, user_message=f"Bad {echoed}", user_title=echoed,
+                details={"error": {"message": echoed, "list": [echoed]}}, error_data={echoed: echoed},
+            )
+            error.add_note(f"note {echoed}")
+            raise error from cause
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Upload)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_creative_asset("10", file_path=given))
+    error = raised.value
+    shown = repr(error.args) + str(error) + repr(error.to_public_dict()) + repr(error.details) + repr(error.__notes__)
+    shown += repr(error.__cause__.args)
+    for private in ("private person", "private%20person", "private+person", "real-holiday-private", str(tmp_path)):
+        assert private not in shown, (private, shown)
+    assert "<file>" in error.message
+
+
+def test_image_url_upload_error_is_not_altered(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    class Upload:
+        async def upload_ad_image(self, account_id, **kwargs):
+            raise MetaApiError("Could not fetch https://cdn.example.com/x.png", code=100)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Upload)
+    with pytest.raises(MetaApiError, match="Could not fetch https://cdn.example.com/x.png"):
+        asyncio.run(creatives.upload_creative_asset("10", image_url="https://cdn.example.com/x.png"))
+
+
+def test_accepted_image_symlink_preserves_legacy_multipart_filename(monkeypatch, tmp_path) -> None:
+    """J10 reproduction: master sent the last part of the caller's path as the file name."""
+    (tmp_path / "source.png").write_bytes(b"image bytes")
+    alias = tmp_path / "hero.jpg"
+    alias.symlink_to(tmp_path / "source.png")
+    calls: list[tuple] = []
+
+    class Image:
+        async def upload_ad_image(self, account_id, *, file_name=None, file_content=None, name=None, image_url=None):
+            calls.append((file_name, file_content))
+            return {"images": {file_name: {"hash": "hash"}}}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Image)
+    result = asyncio.run(creatives.upload_creative_asset("10", file_path=str(alias)))
+    assert calls == [("hero.jpg", b"image bytes")], (calls, result)
+    assert "hero.jpg" in result["uploaded"]["images"]
+
+
+@pytest.mark.parametrize("given", ["hero.jpg", "  hero.jpg  ", "assets/hero.jpg"])
+def test_accepted_image_symlink_request_is_the_legacy_request(monkeypatch, tmp_path, given) -> None:
+    """The exact request master's Graph client sent for the same accepted link: Path(file_path).name."""
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "source.png").write_bytes(PNG_BYTES)
+    for link in (tmp_path / "hero.jpg", tmp_path / "assets" / "hero.jpg"):
+        link.symlink_to(tmp_path / "source.png")
+    requests = _record_graph_requests(monkeypatch)
+    asyncio.run(creatives.upload_creative_asset(account_id="123", file_path=given, name="Hero"))
+    assert len(requests) == 1
+    assert requests[0]["url"].endswith("/act_123/adimages")
+    assert requests[0]["files"] == {"filename": ("hero.jpg", PNG_BYTES)}
+    assert requests[0]["data"] == {"name": "Hero"}
+
+
+@pytest.mark.parametrize("link_name", ["bad\x07name.jpg", "back\\slash.jpg", "line\nbreak.jpg", "zero​width.jpg"])
+def test_accepted_image_link_with_an_unsafe_name_falls_back_to_the_real_name(monkeypatch, tmp_path, link_name) -> None:
+    (tmp_path / "source.png").write_bytes(PNG_BYTES)
+    (tmp_path / link_name).symlink_to(tmp_path / "source.png")
+    requests = _record_graph_requests(monkeypatch)
+    asyncio.run(creatives.upload_creative_asset(account_id="123", file_path=link_name))
+    assert requests[0]["files"] == {"filename": ("source.png", PNG_BYTES)}
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("hero.jpg", "hero.jpg"), ("a/b/hero.jpg", "hero.jpg"), ("  a/hero.jpg ", "hero.jpg"), ("..", "real.png"),
+        (".", "real.png"), ("", "real.png"), ("a/\x00.jpg", "real.png"), ("tab\t.jpg", "real.png"),
+        ("ok name (1).jpg", "ok name (1).jpg"), ("café.png", "café.png"),
+    ],
+)
+def test_legacy_image_file_name_is_a_single_safe_component(given, expected) -> None:
+    assert creatives._legacy_image_file_name(given, "real.png") == expected
+
+
+def _two_second_boost(monkeypatch, **arguments):
+    return _boost(monkeypatch, optimization_goal="TWO_SECOND_CONTINUOUS_VIDEO_VIEWS", **arguments)
+
+
+@pytest.mark.parametrize(
+    ("objective", "destination"),
+    [("OUTCOME_ENGAGEMENT", "ON_VIDEO"), ("OUTCOME_AWARENESS", None)],
+)
+def test_boost_two_second_video_goal_may_bill_on_two_second_views(monkeypatch, fixed_clock, objective, destination) -> None:
+    arguments = {"objective": objective, "billing_event": "two_second_continuous_video_views"}
+    if destination:
+        arguments["destination_type"] = destination
+    client, result = _two_second_boost(monkeypatch, **arguments)
+    adset = _created(client, "adsets")
+    expected = {
+        "name": "Instagram post 555 ad set", "campaign_id": "1", "daily_budget": 1250,
+        "billing_event": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS", "optimization_goal": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS",
+        "bid_strategy": "LOWEST_COST_WITHOUT_CAP", "targeting": {"geo_locations": {"countries": ["AU"]}},
+        "end_time": "2026-11-19T12:00:00+00:00", "status": "PAUSED",
+    }
+    if destination:
+        expected["destination_type"] = destination
+    else:
+        expected["promoted_object"] = {"page_id": "777"}
+    assert adset == expected
+    assert "billing_event" not in result["defaults_applied"]
+
+
+def test_boost_two_second_video_goal_still_defaults_to_impressions(monkeypatch, fixed_clock) -> None:
+    client, result = _two_second_boost(monkeypatch, destination_type="ON_VIDEO")
+    assert _created(client, "adsets")["billing_event"] == "IMPRESSIONS"
+    assert result["defaults_applied"]["billing_event"] == "IMPRESSIONS"
+
+
+def test_boost_two_second_video_billing_plan_only_sends_nothing(monkeypatch, fixed_clock) -> None:
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        **ONE_STEP, destination_type="ON_VIDEO", optimization_goal="TWO_SECOND_CONTINUOUS_VIDEO_VIEWS",
+        billing_event="TWO_SECOND_CONTINUOUS_VIDEO_VIEWS", plan_only=True,
+    ))
+    assert [call[0] for call in client.calls] == ["get"]
+    assert result["sent"] is False
+    data = result["plan"]["requests"][1]["data"]
+    assert (data["optimization_goal"], data["billing_event"]) == ("TWO_SECOND_CONTINUOUS_VIDEO_VIEWS",) * 2
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        # Meta's table pairs this billing event only with its own goal.
+        ({"destination_type": "ON_VIDEO", "billing_event": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"},
+         "billing_event for optimization_goal THRUPLAY must be IMPRESSIONS or THRUPLAY"),
+        ({"billing_event": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"}, "optimization_goal POST_ENGAGEMENT must be IMPRESSIONS"),
+        ({"objective": "OUTCOME_AWARENESS", "billing_event": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"}, "optimization_goal REACH must be IMPRESSIONS"),
+        ({"destination_type": "ON_VIDEO", "optimization_goal": "THRUPLAY", "billing_event": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"}, "THRUPLAY"),
+        # Neither is documented as a billing event for these goals.
+        ({"destination_type": "ON_VIDEO", "optimization_goal": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS", "billing_event": "VIDEO_VIEWS"},
+         "must be IMPRESSIONS or TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"),
+        ({"destination_type": "ON_VIDEO", "optimization_goal": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS", "billing_event": "POST_ENGAGEMENT"},
+         "must be IMPRESSIONS or TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"),
+        ({"destination_type": "ON_VIDEO", "optimization_goal": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS", "billing_event": "THRUPLAY"},
+         "must be IMPRESSIONS or TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"),
+        ({"destination_type": "ON_VIDEO", "billing_event": "VIDEO_VIEWS"}, "must be IMPRESSIONS or THRUPLAY"),
+        ({"billing_event": "POST_ENGAGEMENT"}, "must be IMPRESSIONS"),
+        ({"objective": "OUTCOME_AWARENESS", "optimization_goal": "THRUPLAY", "billing_event": "VIDEO_VIEWS"}, "must be IMPRESSIONS or THRUPLAY"),
+    ],
+)
+def test_boost_undocumented_video_billing_pairs_are_refused(monkeypatch, fixed_clock, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
