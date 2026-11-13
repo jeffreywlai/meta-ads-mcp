@@ -351,9 +351,8 @@ Each `covered` or `partial` entry also carries `verified`: `live` when every
 serving tool has been run against a real ad account and Meta accepted the
 request, otherwise `mocked`. Mocked tests use a fake client that accepts any
 endpoint name, so they cannot catch a wrong endpoint or field name. A write tool
-is `live` only if it ran in the live write test of 2026-11-13, on a throwaway ad
-account and a test catalog. Tools that create an ad could not be run there (Meta
-refuses an ad on an account with no payment method) and stay `mocked`.
+is `live` only if it ran in the live write tests of 2026-11-13, on a throwaway ad
+account and a test catalog, with everything created paused and deleted afterwards.
 
 To find the tool for one of Meta's names, call
 `get_capabilities(official_tool="ads_get_opportunity_score")`. A Meta name

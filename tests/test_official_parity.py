@@ -129,7 +129,7 @@ def test_read_and_write_live_lists_hold_only_their_own_kind() -> None:
 
 
 def test_tools_meta_refused_live_are_not_marked_verified() -> None:
-    not_run = {"create_ad", "update_ad", "duplicate_ad", "update_ad_creative_enhancements", "boost_instagram_post", "delete_feed_rule"}
+    not_run = {"update_ad_creative_enhancements", "delete_feed_rule"}
     assert not LIVE_VERIFIED_WRITE_TOOLS & not_run
 
 

@@ -101,19 +101,21 @@ LIVE_VERIFIED_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# Write tools run on 2026-11-13 against a throwaway ad account (no payment method,
-# everything created paused and then deleted) and a test catalog, with Meta
-# accepting the request and a read-back agreeing where one was possible. Not here:
-# anything that creates an ad (Meta refuses one on an account with no payment
-# method, so create_ad, update_ad, duplicate_ad, update_ad_creative_enhancements and
-# the last step of boost_instagram_post are untested live), delete_feed_rule (Meta
-# answers that the endpoint is retired), and the tools not exercised.
+# Write tools run on 2026-11-13 against a throwaway ad account (everything created
+# paused and then deleted; nothing spent) and a test catalog, with Meta accepting
+# the request and a read-back agreeing where one was possible. Not here:
+# update_ad_creative_enhancements (Meta accepted its copy of an existing-post
+# creative and refused its copy of image, video and asset-pool creatives),
+# delete_feed_rule (Meta answers that the endpoint is retired), and the tools not
+# exercised.
 LIVE_VERIFIED_WRITE_TOOLS: frozenset[str] = frozenset(
     {
         "add_audience_users",
         "batch_update_catalog_products",
+        "boost_instagram_post",
         "cancel_ad_study",
         "create_ab_test",
+        "create_ad",
         "create_ad_creative_from_inputs",
         "create_ad_set",
         "create_campaign",
@@ -124,6 +126,7 @@ LIVE_VERIFIED_WRITE_TOOLS: frozenset[str] = frozenset(
         "create_product_feed",
         "create_product_feed_upload",
         "create_product_set",
+        "delete_ad",
         "delete_ad_image",
         "delete_adset",
         "delete_audience",
@@ -132,17 +135,26 @@ LIVE_VERIFIED_WRITE_TOOLS: frozenset[str] = frozenset(
         "delete_creative",
         "delete_product_feed",
         "delete_product_set",
+        "duplicate_ad",
         "duplicate_adset",
         "duplicate_campaign",
         "remove_audience_users",
+        "set_ad_status",
+        "set_adset_status",
         "set_campaign_status",
+        "update_ad",
+        "update_ad_creative",
         "update_ad_study",
         "update_adset",
+        "update_adset_bid_amount",
+        "update_adset_bid_strategy",
         "update_adset_budget",
         "update_campaign",
+        "update_campaign_bid_strategy",
         "update_campaign_budget",
         "update_catalog",
         "update_catalog_product",
+        "update_creative",
         "update_custom_audience",
         "update_feed_rule",
         "update_product_feed",
