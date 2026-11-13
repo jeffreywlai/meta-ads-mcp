@@ -2705,3 +2705,75 @@ def test_create_ad_set_messenger_lead_destinations_stay_params_only(monkeypatch,
 def test_create_ad_set_docstring_names_phone_call() -> None:
     assert "PHONE_CALL" in campaigns.create_ad_set.__doc__
     assert "+" not in campaigns.create_ad_set.__doc__
+
+
+# Round six, K7. update_adset has always had start_time and end_time as named parameters, so
+# neither is accepted inside params: a mixed call (one bound named, the other inside params) is
+# refused before any request, pointing at the named parameter. It is never checked against a
+# stored bound. Only a one-sided named edit is, and there the stored bound is the one that stays.
+
+
+class StoredScheduleAdsetClient(FakeUpdateAdsetClient):
+    """An ad set stored with the interval 2026-12-01 to 2026-12-02."""
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        return {"id": object_id, "start_time": "2026-12-01T00:00:00+0000", "end_time": "2026-12-02T00:00:00+0000"}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "in_params"),
+    [
+        ({"start_time": "2026-12-03T00:00:00+00:00", "params": {"end_time": "2026-12-04T00:00:00+00:00"}}, "end_time"),
+        ({"end_time": "2026-11-29T00:00:00+00:00", "params": {"start_time": "2026-11-28T00:00:00+00:00"}}, "start_time"),
+        ({"params": {"start_time": "2026-12-03T00:00:00+00:00", "end_time": "2026-12-04T00:00:00+00:00"}}, "end_time, start_time"),
+    ],
+)
+def test_adset_schedule_inside_params_is_refused_before_any_read(monkeypatch, arguments, in_params) -> None:
+    client = StoredScheduleAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError) as info:
+        asyncio.run(campaigns.update_adset("20", **arguments))
+    message = str(info.value)
+    assert f"params cannot override typed fields or supply omitted tool-managed fields: {in_params}" in message
+    assert "Use the named tool parameters instead" in message
+    assert "stored" not in message
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("named_half", ["start", "end"])
+def test_adset_schedule_moved_past_the_stored_other_bound_with_both_named_is_sent(monkeypatch, named_half) -> None:
+    """The reviewer's two moves, given as the tool takes them: both bounds named are compared with each other only."""
+    client = StoredScheduleAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    times = (
+        {"start_time": "2026-12-03T00:00:00+00:00", "end_time": "2026-12-04T00:00:00+00:00"}
+        if named_half == "start"
+        else {"start_time": "2026-11-28T00:00:00+00:00", "end_time": "2026-11-29T00:00:00+00:00"}
+    )
+    result = asyncio.run(campaigns.update_adset("20", **times))
+    assert result["ok"] is True
+    assert client.calls == [("get", "20", ["id", "start_time", "end_time"]), ("update", "20", times)]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "sent", "refused"),
+    [
+        ({"start_time": "2026-12-04T00:00:00Z", "end_time": "2026-12-03T00:00:00Z"}, None, "end_time must be after start_time"),
+        # One half named alone: checked against the stored other half, which stays.
+        ({"start_time": "2026-12-03T00:00:00Z"}, None, "stored end_time"),
+        ({"end_time": "2026-11-30T00:00:00Z"}, None, "stored start_time"),
+        ({"start_time": "2026-11-30T00:00:00Z"}, {"start_time": "2026-11-30T00:00:00Z"}, None),
+        ({"start_time": "2026-12-05T00:00:00Z", "end_time": "0"}, {"start_time": "2026-12-05T00:00:00Z", "end_time": "0"}, None),
+    ],
+)
+def test_adset_named_schedule_calls_are_sent_and_checked_as_before(monkeypatch, arguments, sent, refused) -> None:
+    client = StoredScheduleAdsetClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    if refused:
+        with pytest.raises(campaigns.ValidationError, match=refused):
+            asyncio.run(campaigns.update_adset("20", **arguments))
+        assert all(call[0] != "update" for call in client.calls)
+        return
+    asyncio.run(campaigns.update_adset("20", **arguments))
+    assert client.calls[-1] == ("update", "20", sent)
