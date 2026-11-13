@@ -328,8 +328,8 @@ registered.
 
 | Status | Meaning | Tools |
 |--------|---------|-------|
-| `covered` | A tool here does everything Meta's tool does, or more | 60 |
-| `partial` | A tool here does part of it; the entry says what Meta's tool can do that ours cannot, and why that is still open | 29 |
+| `covered` | A tool here does everything Meta's tool does, or more | 59 |
+| `partial` | A tool here does part of it; the entry says what Meta's tool can do that ours cannot, and why that is still open | 30 |
 | `missing` | Nothing here yet, although Meta's public API appears to allow it | 0 |
 | `unavailable` | No public API route is known, so no tool is registered | 12 |
 | `app_internal` | Plumbing for Meta's own app (upload dialogs, telemetry); nothing to match | 6 |
