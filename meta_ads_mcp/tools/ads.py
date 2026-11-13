@@ -17,7 +17,13 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
-from meta_ads_mcp.tool_types import CurrencyAmount, StrictStringList, coerce_strict_csv_string_list
+from meta_ads_mcp.tools.campaigns import (
+    build_copy_request,
+    reject_named_and_params,
+    run_copy,
+    validate_adlabels,
+)
+from meta_ads_mcp.tool_types import CurrencyAmount, GraphId, StrictStringList, coerce_strict_csv_string_list
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -38,6 +44,9 @@ CREATIVE_IMAGE_FIELDS = [
 ]
 
 VALID_AD_STATUSES = {"ACTIVE", "PAUSED"}
+UPDATABLE_AD_STATUSES = {"ACTIVE", "PAUSED", "ARCHIVED"}
+_OMITTED_PREVIOUS = "Meta returned no value for it; it may not have been set."
+_UNREAD_AD_PREVIOUS = "Not a field this server reads back from an ad."
 
 
 def _append_image_candidate(
@@ -164,12 +173,34 @@ async def create_ad(
     tracking_specs: list[dict[str, Any]] | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    conversion_domain: str | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
+    creative_spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad from a top-level or nested creative id."""
+    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. A named parameter and the same key inside params cannot both be given."""
+    reject_named_and_params({"conversion_domain": conversion_domain, "adlabels": adlabels}, params)
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
     if bid_amount is not None:
         validate_positive_amount(bid_amount, field_name="bid_amount")
+    if conversion_domain is not None:
+        if not isinstance(conversion_domain, str) or not conversion_domain.strip():
+            raise ValidationError("conversion_domain must not be blank.")
+        if any(character in conversion_domain for character in ":/?# "):
+            raise ValidationError("conversion_domain takes the domain only, such as example.com, not a URL.")
+    if adlabels is not None:
+        validate_adlabels(adlabels)
+    if creative_spec is not None:
+        if creative_id is not None or creative is not None:
+            raise ValidationError("Provide exactly one of creative_id, creative or creative_spec.")
+        if not isinstance(creative_spec, dict) or not creative_spec:
+            raise ValidationError("creative_spec must not be empty.")
+        if {"creative_id", "id"} & set(creative_spec):
+            raise ValidationError("creative_spec is for a new creative; to use an existing one, use creative_id.")
+        return await _create_ad(
+            account_id, name, adset_id, creative_spec, status, bid_amount, tracking_specs,
+            conversion_domain, adlabels, validate_only, params,
+        )
     nested_creative_id: str | None = None
     if creative is not None:
         unknown_keys = sorted(set(creative) - {"creative_id", "id"})
@@ -198,14 +229,39 @@ async def create_ad(
         alias_name="creative.creative_id",
         required=True,
     )
+    return await _create_ad(
+        account_id, name, adset_id, {"creative_id": resolved_creative_id}, status, bid_amount,
+        tracking_specs, conversion_domain, adlabels, validate_only, params,
+    )
+
+
+async def _create_ad(
+    account_id: str,
+    name: str,
+    adset_id: str,
+    creative: dict[str, Any],
+    status: str,
+    bid_amount: float | None,
+    tracking_specs: list[dict[str, Any]] | None,
+    conversion_domain: str | None,
+    adlabels: list[dict[str, Any]] | None,
+    validate_only: bool,
+    params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Send one validated ad creation."""
     payload: dict[str, Any] = {
         "name": name,
         "adset_id": adset_id,
-        "creative": {"creative_id": resolved_creative_id},
+        "creative": creative,
         "status": status,
         "bid_amount": OMIT,
         "tracking_specs": tracking_specs or OMIT,
     }
+    # New named fields join the payload only when given, so a call that puts
+    # them in params (as callers did before they existed) is sent unchanged.
+    for key, value in (("conversion_domain", conversion_domain), ("adlabels", adlabels)):
+        if value is not None:
+            payload[key] = value
     add_validate_only(payload, validate_only=validate_only)
     merge_graph_payload(payload, params)
     client = get_graph_api_client()
@@ -334,6 +390,7 @@ async def get_ad_image(ad_id: str | None = None, ad_ids: StrictStringList | None
 
 _AD_PARAMS_REJECTED = {
     "bid_amount": "bid_amount is a money field in minor units and is not supported by update_ad.",
+    "bid_info": "bid_info is a legacy bid field in minor units and is not supported by update_ad.",
     "adset_id": "adset_id cannot be changed on an existing ad; Meta does not allow it.",
     "creative": "Use creative_id instead of params.creative.",
 }
@@ -349,7 +406,7 @@ async def update_ad(
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad's name, creative, tracking specs or status (ACTIVE or PAUSED), with before/after. Use validate_only to have Meta check the change without applying it."""
+    """Edit an ad's name, creative, tracking specs or status (ACTIVE, PAUSED or ARCHIVED), with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
         raise ValidationError("ad_id is required.")
@@ -358,8 +415,8 @@ async def update_ad(
     for key, message in _AD_PARAMS_REJECTED.items():
         if params and key in params:
             raise ValidationError(message)
-    if status is not None and status not in VALID_AD_STATUSES:
-        raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}; delete with delete_ad.")
+    if status is not None and status not in UPDATABLE_AD_STATUSES:
+        raise ValidationError(f"status must be one of {sorted(UPDATABLE_AD_STATUSES)}; delete with delete_ad.")
     resolved_creative_id = blank_to_none(creative_id)
     payload: dict[str, Any] = {
         "name": OMIT if name is None else name,
@@ -383,10 +440,17 @@ async def update_ad(
     previous = await client.get_object(ad_id, fields=["id", *read_fields])
     result = await client.update_object(ad_id, data=payload)
 
+    unavailable: dict[str, str] = {}
+
     def _public(values: dict[str, Any], *, before: bool) -> dict[str, Any]:
         shaped: dict[str, Any] = {}
         for key in changes:
+            public_key = "creative_id" if key == "creative" else key
             if before and key not in readable:
+                unavailable[public_key] = _UNREAD_AD_PREVIOUS
+                continue
+            if before and key not in values:
+                unavailable[public_key] = _OMITTED_PREVIOUS
                 continue
             if key == "creative":
                 creative = values.get("creative")
@@ -410,4 +474,32 @@ async def update_ad(
         "previous_not_read": not_read,
         "result": result,
     })
+    if unavailable:
+        response["previous_unavailable"] = unavailable
     return response
+
+
+@mcp_server.tool()
+async def duplicate_ad(
+    ad_id: GraphId,
+    adset_id: GraphId | None = None,
+    status_option: str = "PAUSED",
+    new_name: str | None = None,
+    rename_strategy: str | None = None,
+    rename_prefix: str | None = None,
+    rename_suffix: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Copy an ad with Meta's copy endpoint and return the new ad id. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE, and it keeps the same creative. adset_id puts the copy in another ad set; omitted, it stays in the original ad set. new_name renames the copy after it is made; rename_strategy, rename_prefix and rename_suffix control Meta's renaming, which by default appends " - Copy". dry_run returns the exact requests and sends nothing."""
+    source_id = blank_to_none(ad_id) if isinstance(ad_id, str) else None
+    if source_id is None:
+        raise ValidationError("ad_id is required.")
+    data = build_copy_request(
+        deep_copy=None, status_option=status_option, rename_strategy=rename_strategy,
+        rename_prefix=rename_prefix, rename_suffix=rename_suffix, new_name=new_name,
+        parent=("adset_id", adset_id),
+    )
+    return await run_copy(
+        get_graph_api_client, action="duplicate_ad", object_type="ad",
+        source_id=source_id, data=data, new_name=new_name, dry_run=dry_run,
+    )

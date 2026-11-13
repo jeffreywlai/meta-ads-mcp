@@ -7,7 +7,7 @@ from typing import Any
 
 from meta_ads_mcp.api_compat import validate_targeting_placements
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaAdsError, ValidationError
 from meta_ads_mcp.field_reference import FIELD_REFERENCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
@@ -19,7 +19,7 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, StringList
+from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, GraphId, StringList
 
 
 def _encode_budget_field(
@@ -37,6 +37,46 @@ def _encode_budget_field(
     )
 
 
+def reject_named_and_params(named: dict[str, Any], params: dict[str, Any] | None, *, money: tuple[str, ...] = ()) -> None:
+    """Refuse a field given both as a named parameter and inside params, before any network call."""
+    for key, value in named.items():
+        if value is not None and params and key in params:
+            unit_note = (
+                " The named parameter takes major currency units; a params value is sent to Meta as minor units."
+                if key in money
+                else ""
+            )
+            raise ValidationError(
+                f"{key} was given both as a named parameter and inside params; give it once, "
+                f"preferably as the named {key} parameter.{unit_note}"
+            )
+
+
+def _nonempty_object_list(value: Any, field_name: str) -> list[dict[str, Any]]:
+    """Check a list of JSON objects, such as frequency_control_specs."""
+    if not isinstance(value, list) or any(not isinstance(item, dict) or not item for item in value):
+        raise ValidationError(f"{field_name} must be a list of non-empty objects.")
+    if not value:
+        raise ValidationError(f"{field_name} must not be empty; omit it instead.")
+    return value
+
+
+def validate_adlabels(adlabels: Any) -> list[dict[str, Any]]:
+    """Check Meta ad labels: objects naming an existing label by id or a label by name."""
+    labels = _nonempty_object_list(adlabels, "adlabels")
+    for label in labels:
+        if not any(isinstance(label.get(key), str) and label[key].strip() for key in ("id", "name")):
+            raise ValidationError('adlabels entries need an "id" or a "name", for example [{"name": "Q4"}].')
+    return labels
+
+
+def _nonblank_text(value: str, field_name: str) -> str:
+    """Check a free-text field that must not be blank."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field_name} must not be blank.")
+    return value
+
+
 @mcp_server.tool()
 async def create_campaign(
     account_id: str,
@@ -50,16 +90,50 @@ async def create_campaign(
     bid_strategy: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    spend_cap: CurrencyAmount | None = None,
+    start_time: str | None = None,
+    stop_time: str | None = None,
+    promoted_object: dict[str, Any] | None = None,
+    special_ad_category_country: StringList | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a new campaign shell before adding ad sets or ads."""
+    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. A named parameter and the same key inside params cannot both be given."""
+    reject_named_and_params(
+        {
+            "spend_cap": spend_cap,
+            "start_time": start_time,
+            "stop_time": stop_time,
+            "promoted_object": promoted_object,
+            "special_ad_category_country": special_ad_category_country,
+            "adlabels": adlabels,
+        },
+        params,
+        money=("spend_cap",),
+    )
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
         ("daily_budget", daily_budget),
         ("lifetime_budget", lifetime_budget),
+        ("spend_cap", spend_cap),
     ):
         if value is not None:
             validate_positive_amount(value, field_name=field_name)
+    new_start = _validate_adset_time(start_time, "start_time")
+    new_stop = _validate_adset_time(stop_time, "stop_time")
+    if new_start is not None and new_stop is not None and new_stop <= new_start:
+        raise ValidationError("stop_time must be after start_time.")
+    if promoted_object is not None and not promoted_object:
+        raise ValidationError("promoted_object must not be empty; omit it instead.")
+    countries = None
+    if special_ad_category_country is not None:
+        if not special_ad_category_country:
+            raise ValidationError("special_ad_category_country must not be empty; omit it instead.")
+        countries = [str(code).strip().upper() for code in special_ad_category_country]
+        if any(len(code) != 2 or not code.isalpha() for code in countries):
+            raise ValidationError("special_ad_category_country takes two-letter country codes such as US or CA.")
+    if adlabels is not None:
+        validate_adlabels(adlabels)
     payload: dict[str, Any] = {
         "name": name,
         "objective": objective,
@@ -70,15 +144,29 @@ async def create_campaign(
         "daily_budget": OMIT,
         "lifetime_budget": OMIT,
     }
+    # New named fields join the payload only when given, so a call that puts
+    # them in params (as callers did before they existed) is sent unchanged.
+    for key, value in (
+        ("spend_cap", spend_cap),
+        ("start_time", start_time),
+        ("stop_time", stop_time),
+        ("promoted_object", promoted_object),
+        ("special_ad_category_country", countries),
+        ("adlabels", adlabels),
+    ):
+        if value is not None:
+            payload[key] = value
     add_validate_only(payload, validate_only=validate_only)
     merge_graph_payload(payload, params)
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
     currency = None
-    if daily_budget is not None or lifetime_budget is not None:
+    if any(value is not None for value in (daily_budget, lifetime_budget, spend_cap)):
         currency = await resolve_account_currency(client, account_id)
     _encode_budget_field(payload, "daily_budget", daily_budget, currency=currency)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget, currency=currency)
+    if spend_cap is not None:
+        payload["spend_cap"] = to_minor_units(spend_cap, currency, field_name="spend_cap")
     result = await client.create_edge_object(
         account_id,
         "campaigns",
@@ -219,19 +307,54 @@ async def create_ad_set(
     end_time: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    frequency_control_specs: list[dict[str, Any]] | None = None,
+    attribution_spec: list[dict[str, Any]] | None = None,
+    adset_schedule: list[dict[str, Any]] | None = None,
+    daily_spend_cap: CurrencyAmount | None = None,
+    lifetime_spend_cap: CurrencyAmount | None = None,
+    daily_min_spend_target: CurrencyAmount | None = None,
+    lifetime_min_spend_target: CurrencyAmount | None = None,
+    dsa_beneficiary: str | None = None,
+    dsa_payor: str | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and pacing_type ["day_parting"] in params. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
+    named_spend = {
+        "daily_spend_cap": daily_spend_cap,
+        "lifetime_spend_cap": lifetime_spend_cap,
+        "daily_min_spend_target": daily_min_spend_target,
+        "lifetime_min_spend_target": lifetime_min_spend_target,
+    }
+    named_other = {
+        "frequency_control_specs": frequency_control_specs,
+        "attribution_spec": attribution_spec,
+        "adset_schedule": adset_schedule,
+    }
+    reject_named_and_params(
+        {**named_other, **named_spend, "dsa_beneficiary": dsa_beneficiary, "dsa_payor": dsa_payor, "adlabels": adlabels},
+        params,
+        money=_ADSET_SPEND_FIELDS,
+    )
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
         ("bid_amount", bid_amount),
         ("daily_budget", daily_budget),
         ("lifetime_budget", lifetime_budget),
+        *named_spend.items(),
     ):
         if value is not None:
             validate_positive_amount(value, field_name=field_name)
     if bid_constraints and not bid_strategy:
         raise ValidationError("bid_strategy is required when bid_constraints is provided.")
+    for field_name, value in named_other.items():
+        if value is not None:
+            _nonempty_object_list(value, field_name)
+    for field_name, value in (("dsa_beneficiary", dsa_beneficiary), ("dsa_payor", dsa_payor)):
+        if value is not None:
+            _nonblank_text(value, field_name)
+    if adlabels is not None:
+        validate_adlabels(adlabels)
     validate_targeting_placements(targeting)
     payload: dict[str, Any] = {
         "campaign_id": campaign_id,
@@ -249,12 +372,23 @@ async def create_ad_set(
         "daily_budget": OMIT,
         "lifetime_budget": OMIT,
     }
+    # New named fields join the payload only when given, so a call that puts
+    # them in params (as callers did before they existed) is sent unchanged.
+    for key, value in (
+        *named_other.items(),
+        *named_spend.items(),
+        ("dsa_beneficiary", dsa_beneficiary),
+        ("dsa_payor", dsa_payor),
+        ("adlabels", adlabels),
+    ):
+        if value is not None:
+            payload[key] = value
     add_validate_only(payload, validate_only=validate_only)
     merge_graph_payload(payload, params)
     client = get_graph_api_client()
     account_id = normalize_account_id(account_id)
     currency = None
-    if any(value is not None for value in (bid_amount, daily_budget, lifetime_budget)):
+    if any(value is not None for value in (bid_amount, daily_budget, lifetime_budget, *named_spend.values())):
         currency = await resolve_account_currency(client, account_id)
     if bid_amount is not None:
         payload["bid_amount"] = to_minor_units(
@@ -264,6 +398,9 @@ async def create_ad_set(
         )
     _encode_budget_field(payload, "daily_budget", daily_budget, currency=currency)
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget, currency=currency)
+    for field_name, value in named_spend.items():
+        if value is not None:
+            payload[field_name] = to_minor_units(value, currency, field_name=field_name)
     result = await client.create_edge_object(
         account_id,
         "adsets",
@@ -281,16 +418,27 @@ _ADSET_MONEY_FIELD_TOOLS = {
     "daily_budget": "update_adset_budget",
     "lifetime_budget": "update_adset_budget",
     "bid_amount": "update_adset_bid_amount",
+    "bid_info": "update_adset_bid_amount",
     "bid_strategy": "update_adset_bid_strategy",
     "bid_constraints": "update_adset_bid_strategy",
 }
-_ADSET_MINOR_UNIT_FIELDS = {
+# Ad set spend caps and minimum spend targets: Meta stores them in the account
+# currency's minor units, like budgets. update_adset takes them as named
+# parameters in major units; inside params they would bypass that conversion.
+_ADSET_SPEND_FIELDS = (
     "daily_spend_cap",
     "lifetime_spend_cap",
     "daily_min_spend_target",
     "lifetime_min_spend_target",
+)
+_ADSET_UNSUPPORTED_MONEY_PARAMS = {
+    "budget_schedule_specs": (
+        "budget_schedule_specs carries budget amounts in minor units and is not supported by update_adset."
+    ),
 }
-_UPDATABLE_ADSET_STATUSES = {"ACTIVE", "PAUSED"}
+_UPDATABLE_ADSET_STATUSES = {"ACTIVE", "PAUSED", "ARCHIVED"}
+_OMITTED_PREVIOUS = "Meta returned no value for it; it may not have been set."
+_UNREAD_ADSET_PREVIOUS = "Not a field this server reads back from an ad set."
 _ADSET_TIME_FORMAT = "an ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00) or Unix seconds"
 
 
@@ -344,19 +492,36 @@ async def update_adset(
     status: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    daily_spend_cap: CurrencyAmount | None = None,
+    lifetime_spend_cap: CurrencyAmount | None = None,
+    daily_min_spend_target: CurrencyAmount | None = None,
+    lifetime_min_spend_target: CurrencyAmount | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object or status, with before/after. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec."""
+    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps or minimum spend targets, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     adset_id = blank_to_none(adset_id)
     if adset_id is None:
         raise ValidationError("adset_id is required.")
     for field_name, tool_name in _ADSET_MONEY_FIELD_TOOLS.items():
         if params and field_name in params:
             raise ValidationError(f"{field_name} cannot be changed with update_adset; use {tool_name}.")
-    blocked = sorted(_ADSET_MINOR_UNIT_FIELDS.intersection(params or {}))
-    if blocked:
-        raise ValidationError(
-            f"{', '.join(blocked)}: money fields in minor units are not supported by update_adset."
-        )
+    for field_name in _ADSET_SPEND_FIELDS:
+        if params and field_name in params:
+            raise ValidationError(
+                f"{field_name} in params would be read as minor units; use the named {field_name} "
+                "parameter, which takes major units of the account currency."
+            )
+    for field_name, message in _ADSET_UNSUPPORTED_MONEY_PARAMS.items():
+        if params and field_name in params:
+            raise ValidationError(message)
+    spend = {
+        "daily_spend_cap": daily_spend_cap,
+        "lifetime_spend_cap": lifetime_spend_cap,
+        "daily_min_spend_target": daily_min_spend_target,
+        "lifetime_min_spend_target": lifetime_min_spend_target,
+    }
+    spend = {key: value for key, value in spend.items() if value is not None}
+    for field_name, value in spend.items():
+        validate_positive_amount(value, field_name=field_name)
     if status is not None and status not in _UPDATABLE_ADSET_STATUSES:
         raise ValidationError(
             f"status must be one of {sorted(_UPDATABLE_ADSET_STATUSES)}; delete with delete_adset."
@@ -376,6 +541,7 @@ async def update_adset(
         "billing_event": billing_event,
         "promoted_object": promoted_object,
         "status": status,
+        **{field_name: spend.get(field_name) for field_name in _ADSET_SPEND_FIELDS},
     }
     payload: dict[str, Any] = {key: OMIT if value is None else value for key, value in typed.items()}
     add_validate_only(payload, validate_only=validate_only)
@@ -393,8 +559,20 @@ async def update_adset(
     elif new_end is not None and start_time is None:
         other_bound = "start_time"
     bound_reads = [other_bound] if other_bound and other_bound not in read_fields else []
+    account_read = ["account_id"] if spend else []
     client = get_graph_api_client()
-    previous = await client.get_object(adset_id, fields=["id", *read_fields, *bound_reads])
+    previous = await client.get_object(adset_id, fields=["id", *read_fields, *bound_reads, *account_read])
+    currency = await resolve_account_currency(client, previous.get("account_id")) if spend else None
+    for field_name, value in spend.items():
+        payload[field_name] = to_minor_units(value, currency, field_name=field_name)
+    previous_values = {key: previous[key] for key in read_fields if key in previous}
+    for field_name in _ADSET_SPEND_FIELDS:
+        if field_name in previous_values:
+            previous_values[field_name] = from_minor_units(
+                previous_values[field_name], currency, field_name=field_name
+            )
+    unavailable = {key: _OMITTED_PREVIOUS for key in read_fields if key not in previous}
+    unavailable.update({key: _UNREAD_ADSET_PREVIOUS for key in not_read})
     stored = _stored_adset_time(previous.get(other_bound)) if other_bound else None
     if stored is not None and other_bound == "end_time" and new_start is not None and new_start >= stored:
         raise ValidationError(
@@ -410,7 +588,7 @@ async def update_adset(
     response = mutation_response(
         action="update_adset",
         target={"adset_id": adset_id},
-        previous={key: previous.get(key) for key in read_fields},
+        previous=previous_values,
         current=changes,
     )
     response.update({
@@ -419,4 +597,197 @@ async def update_adset(
         "previous_not_read": not_read,
         "result": result,
     })
+    if unavailable:
+        response["previous_unavailable"] = unavailable
+    if spend:
+        response["money_units"] = f"major units of the ad account currency ({currency})"
     return response
+
+
+# Meta's copies edge on campaigns, ad sets and ads (POST /{id}/copies).
+COPY_STATUS_OPTIONS = ("PAUSED", "ACTIVE", "INHERITED_FROM_SOURCE")
+COPY_RENAME_STRATEGIES = ("DEEP_RENAME", "ONLY_TOP_LEVEL_RENAME", "NO_RENAME")
+_NEW_COPY_PLACEHOLDER = "<id of the new copy>"
+
+
+def _required_id(value: str | None, field_name: str) -> str:
+    """Check a required object id that must not be blank."""
+    text = blank_to_none(value) if isinstance(value, str) else None
+    if text is None:
+        raise ValidationError(f"{field_name} is required.")
+    return text
+
+
+def build_copy_request(
+    *,
+    deep_copy: bool | None,
+    status_option: str,
+    rename_strategy: str | None,
+    rename_prefix: str | None,
+    rename_suffix: str | None,
+    new_name: str | None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    parent: tuple[str, str | None] | None = None,
+) -> dict[str, Any]:
+    """Validate copy options and build the body for POST /{id}/copies."""
+    if status_option not in COPY_STATUS_OPTIONS:
+        raise ValidationError(f"status_option must be one of {list(COPY_STATUS_OPTIONS)}.")
+    if rename_strategy is not None and rename_strategy not in COPY_RENAME_STRATEGIES:
+        raise ValidationError(f"rename_strategy must be one of {list(COPY_RENAME_STRATEGIES)}.")
+    if new_name is not None:
+        _nonblank_text(new_name, "new_name")
+    new_start = _validate_adset_time(start_time, "start_time")
+    new_end = _validate_adset_time(end_time, "end_time")
+    if new_start is not None and new_end is not None and new_end <= new_start:
+        raise ValidationError("end_time must be after start_time.")
+    data: dict[str, Any] = {}
+    if deep_copy:
+        data["deep_copy"] = True
+    data["status_option"] = status_option
+    rename_options = {
+        key: value
+        for key, value in (
+            ("rename_strategy", rename_strategy),
+            ("rename_prefix", rename_prefix),
+            ("rename_suffix", rename_suffix),
+        )
+        if value is not None
+    }
+    if rename_options:
+        data["rename_options"] = rename_options
+    if start_time is not None:
+        data["start_time"] = start_time
+    if end_time is not None:
+        data["end_time"] = end_time
+    if parent is not None and parent[1] is not None:
+        data[parent[0]] = _required_id(parent[1], parent[0])
+    return data
+
+
+async def run_copy(
+    client_factory: Any,
+    *,
+    action: str,
+    object_type: str,
+    source_id: str,
+    data: dict[str, Any],
+    new_name: str | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Send a copy request (or show it under dry_run), then apply new_name to the copy."""
+    id_key = f"{object_type}_id"
+    response: dict[str, Any] = {
+        "ok": True,
+        "action": action,
+        "target": {id_key: source_id},
+        "dry_run": dry_run,
+        "status_option": data["status_option"],
+    }
+    requests = [{"method": "POST", "path": f"{source_id}/copies", "data": data}]
+    if new_name is not None:
+        requests.append({"method": "POST", "path": _NEW_COPY_PLACEHOLDER, "data": {"name": new_name}})
+    if dry_run:
+        response.update({"sent": False, "requests": requests})
+        return response
+    client = client_factory()
+    result = await client.create_edge_object(source_id, "copies", data=data)
+    raw_new_id = result.get(f"copied_{object_type}_id") if isinstance(result, dict) else None
+    new_id = str(raw_new_id) if raw_new_id not in (None, "") else None
+    copied = result.get("ad_object_ids") if isinstance(result, dict) else None
+    response.update({
+        "sent": True,
+        "new_id": new_id,
+        "new_ids": {id_key: new_id},
+        "copied_objects": [
+            {
+                "type": item.get("ad_object_type"),
+                "source_id": None if item.get("source_id") is None else str(item.get("source_id")),
+                "copied_id": None if item.get("copied_id") is None else str(item.get("copied_id")),
+            }
+            for item in (copied if isinstance(copied, list) else [])
+            if isinstance(item, dict)
+        ],
+        "result": result,
+    })
+    if new_id is None:
+        response["warning"] = (
+            "Meta's response did not include the new copy's id; find the copy under its parent "
+            "before acting on it."
+        )
+    if new_name is None:
+        return response
+    rename: dict[str, Any] = {"requested": new_name, "applied": False}
+    if new_id is None:
+        rename["reason"] = "The copy's id is unknown, so it was not renamed."
+    else:
+        try:
+            await client.update_object(new_id, data={"name": new_name})
+        except MetaAdsError as exc:
+            public = getattr(exc, "to_public_dict", None)
+            rename["error"] = public() if callable(public) else {"type": type(exc).__name__}
+        except Exception as exc:  # The copy exists; keep its id in the answer whatever the rename did.
+            rename["error"] = {"type": type(exc).__name__}
+        else:
+            rename["applied"] = True
+        if not rename["applied"]:
+            rename["next_step"] = (
+                f"The copy {new_id} exists with Meta's default name; rename it with update_{object_type}."
+            )
+    response["rename"] = rename
+    return response
+
+
+@mcp_server.tool()
+async def duplicate_campaign(
+    campaign_id: GraphId,
+    deep_copy: bool = False,
+    status_option: str = "PAUSED",
+    new_name: str | None = None,
+    rename_strategy: str | None = None,
+    rename_prefix: str | None = None,
+    rename_suffix: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Copy a campaign with Meta's copy endpoint and return the new ids. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE. deep_copy also copies its ad sets and ads; Meta allows at most 3 ads in total for a deep copy made this way. start_time and end_time (deep copy only) set the copied ad sets' schedule. new_name renames the copy after it is made; rename_strategy (DEEP_RENAME, ONLY_TOP_LEVEL_RENAME, NO_RENAME), rename_prefix and rename_suffix control Meta's renaming, which by default appends " - Copy". dry_run returns the exact requests and sends nothing."""
+    source_id = _required_id(campaign_id, "campaign_id")
+    if not deep_copy and (start_time is not None or end_time is not None):
+        raise ValidationError("start_time and end_time apply to a campaign copy only with deep_copy=true.")
+    data = build_copy_request(
+        deep_copy=deep_copy, status_option=status_option, rename_strategy=rename_strategy,
+        rename_prefix=rename_prefix, rename_suffix=rename_suffix, new_name=new_name,
+        start_time=start_time, end_time=end_time,
+    )
+    return await run_copy(
+        get_graph_api_client, action="duplicate_campaign", object_type="campaign",
+        source_id=source_id, data=data, new_name=new_name, dry_run=dry_run,
+    )
+
+
+@mcp_server.tool()
+async def duplicate_adset(
+    adset_id: GraphId,
+    campaign_id: GraphId | None = None,
+    deep_copy: bool = False,
+    status_option: str = "PAUSED",
+    new_name: str | None = None,
+    rename_strategy: str | None = None,
+    rename_prefix: str | None = None,
+    rename_suffix: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Copy an ad set with Meta's copy endpoint and return the new ids. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE. campaign_id puts the copy under another campaign, whose settings such as budget it then follows; omitted, it stays in the original campaign. deep_copy also copies its ads; Meta allows at most 3 ads for a deep copy made this way. start_time and end_time (ISO 8601 with a UTC offset, or Unix seconds; end_time 0 means no end) override the copied schedule. new_name renames the copy after it is made; rename_strategy, rename_prefix and rename_suffix control Meta's renaming. dry_run returns the exact requests and sends nothing."""
+    source_id = _required_id(adset_id, "adset_id")
+    data = build_copy_request(
+        deep_copy=deep_copy, status_option=status_option, rename_strategy=rename_strategy,
+        rename_prefix=rename_prefix, rename_suffix=rename_suffix, new_name=new_name,
+        start_time=start_time, end_time=end_time, parent=("campaign_id", campaign_id),
+    )
+    return await run_copy(
+        get_graph_api_client, action="duplicate_adset", object_type="adset",
+        source_id=source_id, data=data, new_name=new_name, dry_run=dry_run,
+    )

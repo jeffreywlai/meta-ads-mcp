@@ -15,10 +15,15 @@ from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount
 
 
+SETTABLE_STATUSES = ("ACTIVE", "PAUSED", "ARCHIVED")
+
+
 def _validate_status(status: str) -> str:
     """Validate mutable status input."""
-    if status not in {"ACTIVE", "PAUSED"}:
-        raise ValidationError("status must be ACTIVE or PAUSED.")
+    if status not in SETTABLE_STATUSES:
+        raise ValidationError(
+            "status must be ACTIVE, PAUSED or ARCHIVED; delete with the matching delete tool."
+        )
     return status
 
 
@@ -31,10 +36,11 @@ def _validate_bid_strategy(bid_strategy: str) -> str:
 
 async def _set_status(object_id: str, object_type: str, status: str) -> dict[str, object]:
     """Update a status field."""
+    _validate_status(status)
     client = get_graph_api_client()
     fields = ["id", "status", "effective_status"]
     previous = await client.get_object(object_id, fields=fields)
-    await client.update_object(object_id, data={"status": _validate_status(status)})
+    await client.update_object(object_id, data={"status": status})
     return mutation_response(
         action=f"set_{object_type}_status",
         target={f"{object_type}_id": object_id},
@@ -45,19 +51,19 @@ async def _set_status(object_id: str, object_type: str, status: str) -> dict[str
 
 @mcp_server.tool()
 async def set_campaign_status(campaign_id: str, status: str) -> dict[str, object]:
-    """Use this for a simple campaign pause or resume without changing any other campaign fields."""
+    """Use this for a simple campaign pause or resume without changing any other campaign fields. status is ACTIVE, PAUSED or ARCHIVED. ARCHIVED stops delivery for good: an archived object cannot be restored to active from this server, so archive only on an explicit request."""
     return await _set_status(campaign_id, "campaign", status)
 
 
 @mcp_server.tool()
 async def set_adset_status(adset_id: str, status: str) -> dict[str, object]:
-    """Use this for pause ad set, resume ad set, or simple ad set status changes without changing targeting or budget fields."""
+    """Use this for pause ad set, resume ad set, or simple ad set status changes without changing targeting or budget fields. status is ACTIVE, PAUSED or ARCHIVED. ARCHIVED stops delivery for good: an archived object cannot be restored to active from this server, so archive only on an explicit request."""
     return await _set_status(adset_id, "adset", status)
 
 
 @mcp_server.tool()
 async def set_ad_status(ad_id: str, status: str) -> dict[str, object]:
-    """Use this for a simple ad pause or resume without editing the ad creative or placement."""
+    """Use this for a simple ad pause or resume without editing the ad creative or placement. status is ACTIVE, PAUSED or ARCHIVED. ARCHIVED stops delivery for good: an archived object cannot be restored to active from this server, so archive only on an explicit request."""
     return await _set_status(ad_id, "ad", status)
 
 
