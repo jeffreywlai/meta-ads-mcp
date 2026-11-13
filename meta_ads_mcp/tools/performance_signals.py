@@ -1008,6 +1008,23 @@ def _coverage_signals(coverage: dict[str, Any]) -> list[str]:
     return signals
 
 
+def _group_entity_signals(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move each entity's missing signals into one list, each signal once with the entities it applies to."""
+    grouped: dict[str, list[str]] = {}
+    for entity in entities:
+        for signal in entity.pop("missing_signals", []) or []:
+            grouped.setdefault(signal, []).append(entity["object_id"])
+    return [{"signal": signal, "object_ids": ids} for signal, ids in grouped.items()]
+
+
+def _compact_result(basis: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {"status": basis["status"]}
+    for key in ("indicator", "additive", "indicators", "error"):
+        if key in basis:
+            compact[key] = basis[key]
+    return compact
+
+
 def _multi_scope(level: str, targets: dict[str, Any]) -> dict[str, Any]:
     if targets["mode"] == "object_ids":
         return {"level": level, "object_ids": list(targets["ids"])}
@@ -1136,7 +1153,7 @@ async def get_performance_trend(
         periods = _trend_periods(rows, basis, start, end, resolved_granularity, metric_names)
         totals_inputs = _period_inputs(rows, basis) if rows else None
         entity["daily_rows_returned"] = len(rows)
-        entity["result"] = _result_summary(basis)
+        entity["result"] = _compact_result(basis)
         entity["totals"] = None if totals_inputs is None else {
             "inputs": totals_inputs,
             "metrics": {name: _derived_metrics(totals_inputs, basis)[name] for name in metric_names},
@@ -1154,6 +1171,7 @@ async def get_performance_trend(
         missing_signals=missing_signals,
         extra={
             **common,
+            "entity_signals": _group_entity_signals(entities),
             "entities": entities,
             "coverage": coverage,
             "method": TREND_METHOD + " With several entities, each entity's window totals and first-to-last changes "
@@ -1170,7 +1188,8 @@ MIN_BASELINE_VALUES = 7
 MAX_LOOKBACK_DAYS = 31
 MIN_BASELINE_DAYS = 7
 MAX_BASELINE_DAYS = 90
-MULTI_ENTITY_MAX_FINDINGS = 20
+MULTI_ENTITY_MAX_FINDINGS = 10
+MULTI_ENTITY_ANOMALIES_PER_ENTITY = 2
 
 
 def _median(values: list[float]) -> float:
@@ -1381,7 +1400,7 @@ _COMPACT_ANOMALY_KEYS = (
     "day", "metric", "value", "baseline_median", "baseline_mad", "threshold_low", "threshold_high",
     "robust_score", "direction", "assessment", "baseline_type", "baseline_points",
 )
-_COMPACT_STATUS_KEYS = ("status", "days_examined", "flagged_days", "baseline_median", "baseline_values_count")
+_ENTITY_ANOMALY_KEYS = ("day", "metric", "value", "baseline_median", "robust_score", "direction")
 
 
 @mcp_server.tool()
@@ -1502,18 +1521,16 @@ async def detect_performance_anomalies(
         basis = _result_basis(rows, result_error=result_error)
         analysis = _anomaly_analysis(rows, basis, metric_names, **analysis_kwargs)
         reference = {"level": entity["level"], "object_id": entity["object_id"], "name": entity["name"]}
-        entity["result"] = _result_summary(basis)
+        entity["result"] = _compact_result(basis)
         entity["baseline_rows"] = analysis["baseline_rows"]
         entity["lookback_rows"] = analysis["lookback_rows"]
         entity["judged"] = not analysis["insufficient"]
         entity["anomaly_count"] = len(analysis["anomalies"])
         entity["anomalies"] = [
-            {key: anomaly[key] for key in _COMPACT_ANOMALY_KEYS} for anomaly in analysis["anomalies"][:5]
+            {key: anomaly[key] for key in _ENTITY_ANOMALY_KEYS}
+            for anomaly in analysis["anomalies"][:MULTI_ENTITY_ANOMALIES_PER_ENTITY]
         ]
-        entity["metric_status"] = {
-            metric: {key: status[key] for key in _COMPACT_STATUS_KEYS if key in status}
-            for metric, status in analysis["metric_status"].items()
-        }
+        entity["metric_status"] = {metric: status["status"] for metric, status in analysis["metric_status"].items()}
         entity["missing_signals"] = [
             *_result_signals(basis, entity["level"], rows_exist=bool(rows)), *analysis["missing_signals"],
         ]
@@ -1522,12 +1539,18 @@ async def detect_performance_anomalies(
     findings = []
     for anomaly, reference in scored[:MULTI_ENTITY_MAX_FINDINGS]:
         compact = {key: anomaly[key] for key in _COMPACT_ANOMALY_KEYS}
-        findings.append(_anomaly_finding(compact, multiplier, reference))
+        finding = _anomaly_finding(compact, multiplier, reference)
+        finding["evidence"][0]["inputs"] = {
+            key: finding["evidence"][0]["inputs"][key]
+            for key in ("day", "baseline_median", "robust_score", "threshold_low", "threshold_high")
+        }
+        findings.append(finding)
     missing_signals = [*timezone_signals, *_coverage_signals(coverage)]
     if len(scored) > MULTI_ENTITY_MAX_FINDINGS:
         missing_signals.append(
             f"{len(scored)} anomalies were found; findings list the {MULTI_ENTITY_MAX_FINDINGS} furthest from their "
-            "baselines. Each entity lists its count and its five largest."
+            f"baselines. Each entity lists its count and its {MULTI_ENTITY_ANOMALIES_PER_ENTITY} largest; call with "
+            "that entity's object_id for the full detail."
         )
     return analysis_response(
         scope=_multi_scope(resolved_level, targets),
@@ -1537,6 +1560,7 @@ async def detect_performance_anomalies(
         extra={
             **windows,
             "rule": rule,
+            "entity_signals": _group_entity_signals(entities),
             "entities": entities,
             "coverage": coverage,
             "metric_definitions": {name: METRIC_DEFINITIONS[name] for name in metric_names},

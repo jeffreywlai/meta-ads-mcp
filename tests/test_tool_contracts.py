@@ -218,6 +218,9 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
+    "get_performance_trend": {"object_id": "cmp_123"},
+    "detect_performance_anomalies": {"object_id": "cmp_123"},
+    "get_auction_ranking_report": {"object_id": "cmp_123"},
 }
 
 
