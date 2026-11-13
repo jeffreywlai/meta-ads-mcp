@@ -7,6 +7,14 @@
       "what_changed": "An id that contains a slash, a question mark, a hash, two dots in a row or a space is now refused before any request is sent. Before, such an id was placed in the request address as written, so get_creative('123/') read creative 123 and an id like '123/ads' read a different object than the tool was meant to read.",
       "why_better": "A tool can only reach the object type it was built for. An id copied from text that strangers wrote (an ad comment, a Page review) can no longer steer a read or a delete to a different object or attach extra options to the request.",
       "migration": "Pass the plain id with nothing before or after it, for example '123' or 'act_123'. Trim a trailing slash or any address fragment before calling."
+    },
+    {
+      "tool": "upload_creative_asset",
+      "kind": "behaviour",
+      "parameter": "file_path",
+      "what_changed": "file_path is now read only from the one folder named by the META_UPLOAD_DIR environment variable, the same rule every other upload tool follows. A path outside that folder, a link inside it that points outside, a file that is not .jpg, .jpeg or .png, an empty file and a file over 30 MB are refused before anything is sent to Meta, and every local path is refused while META_UPLOAD_DIR is unset. Before, any file anywhere on the machine was read and sent to Meta, whatever its type or size. The request sent for an accepted file is unchanged, and image_url calls are unchanged.",
+      "why_better": "The model that calls this tool also reads text written by strangers, such as ad comments and Page reviews. Before, a path slipped into that text could make the tool send any private file on your computer, such as a key or a document, to a Meta ad account. Now only images you have put in your chosen upload folder can ever leave the machine, and a wrong path gets a clear message that never repeats the path.",
+      "migration": "Set META_UPLOAD_DIR in the server's environment to one folder, put the images to upload there, and pass a path inside that folder or a file name relative to it. Use .jpg, .jpeg or .png files of at most 30 MB. Calls that pass image_url need no change."
     }
   ]
 }

@@ -1027,3 +1027,48 @@ def test_an_ordinary_error_code_is_not_a_rate_limit(monkeypatch) -> None:
         asyncio.run(_client().request("GET", "123/products"))
     assert not isinstance(error.value, RateLimitError)
     asyncio.run(close_graph_api_clients())
+
+
+def test_upload_ad_image_sends_checked_bytes_and_never_reads_a_path(monkeypatch) -> None:
+    """The client receives a file's name and bytes already checked by the tool; it has no path to read."""
+    import inspect
+
+    calls = []
+
+    async def fake_request(self, method, endpoint, **kwargs):
+        calls.append((method, endpoint, kwargs))
+        return {"images": {}}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    client = _client()
+    assert "file_path" not in inspect.signature(GraphAPIClient.upload_ad_image).parameters
+
+    asyncio.run(client.upload_ad_image("123", file_name="hero.png", file_content=b"image-bytes", name="Hero"))
+    asyncio.run(client.upload_ad_image("act_123", file_name="hero.png", file_content=b"image-bytes"))
+    asyncio.run(client.upload_ad_image("123", image_url="https://example.com/x.png", name="Hero"))
+
+    assert calls == [
+        ("POST", "act_123/adimages", {"data": {"name": "Hero"}, "files": {"filename": ("hero.png", b"image-bytes")}}),
+        ("POST", "act_123/adimages", {"data": {}, "files": {"filename": ("hero.png", b"image-bytes")}}),
+        ("POST", "act_123/adimages", {"data": {"url": "https://example.com/x.png", "name": "Hero"}, "files": None}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"file_name": "hero.png"},
+        {"file_content": b"image-bytes"},
+        {"file_name": "hero.png", "file_content": b""},
+        {"file_name": "", "file_content": b"image-bytes"},
+        {"file_name": "hero.png", "file_content": b"image-bytes", "image_url": "https://example.com/x.png"},
+    ],
+)
+def test_upload_ad_image_needs_exactly_one_complete_source(monkeypatch, arguments) -> None:
+    async def fake_request(self, method, endpoint, **kwargs):
+        pytest.fail("Nothing should be sent")
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    with pytest.raises(UnsupportedFeatureError):
+        asyncio.run(_client().upload_ad_image("123", **arguments))
