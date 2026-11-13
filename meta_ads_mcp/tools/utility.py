@@ -13,6 +13,7 @@ from meta_ads_mcp.coordinator import (
     mcp_server,
 )
 from meta_ads_mcp.graph_api import get_graph_api_client
+from meta_ads_mcp.official_parity import OFFICIAL_TOOLS, parity_summary
 from meta_ads_mcp.overflow import (
     DEFAULT_ARTIFACT_CHUNK_BYTES,
     DEFAULT_ARTIFACT_ITEM_LIMIT,
@@ -74,6 +75,12 @@ TOOL_GROUPS = {
         "get_audience_opportunities",
         "get_delivery_opportunities",
         "get_bidding_opportunities",
+        "get_opportunity_score",
+        "get_performance_trend",
+        "detect_performance_anomalies",
+        "get_auction_ranking_report",
+        "get_advertiser_context",
+        "get_delivery_errors",
     ],
     "social_feedback": [
         "get_ad_social_context",
@@ -116,6 +123,41 @@ TOOL_GROUPS = {
         "update_creative",
         "update_ad_creative",
         "delete_creative",
+        "create_ab_test",
+        "create_lift_study",
+        "update_ad_study",
+        "cancel_ad_study",
+        "create_catalog",
+        "update_catalog",
+        "create_catalog_product",
+        "update_catalog_product",
+        "delete_catalog_product",
+        "create_product_set",
+        "update_product_set",
+        "delete_product_set",
+        "create_product_feed",
+        "update_product_feed",
+        "delete_product_feed",
+        "create_product_feed_upload",
+        "create_feed_rule",
+        "delete_feed_rule",
+        "connect_catalog_event_source",
+        "disconnect_catalog_event_source",
+        "update_feed_rule",
+        "update_adset",
+        "update_ad",
+        "add_audience_users",
+        "remove_audience_users",
+        "boost_instagram_post",
+        "set_catalog_access",
+        "duplicate_campaign",
+        "duplicate_adset",
+        "duplicate_ad",
+        "batch_update_catalog_products",
+        "create_ad_creative_from_inputs",
+        "update_ad_creative_enhancements",
+        "upload_ad_video",
+        "delete_ad_image",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -125,6 +167,53 @@ TOOL_GROUPS = {
     ],
     "research": [
         "search_ads_archive",
+    ],
+    "assets": [
+        "list_pages",
+        "list_ad_images",
+        "list_ad_videos",
+        "list_creative_ads",
+        "list_instagram_media",
+        "list_audience_adsets",
+        "get_field_reference",
+    ],
+    "signals": [
+        "list_datasets",
+        "get_dataset",
+        "get_dataset_stats",
+        "get_dataset_quality",
+        "list_custom_conversions",
+    ],
+    "experiments": [
+        "list_ad_studies",
+        "get_ad_study",
+        "check_ab_test_eligibility",
+    ],
+    "catalog": [
+        "list_catalogs",
+        "list_dpa_eligible_catalogs",
+        "get_catalog_diagnostics",
+        "get_catalog_dynamic_ads_health",
+        "list_catalog_data_sources",
+        "list_catalog_products",
+        "build_product_set_filter",
+        "list_product_sets",
+        "list_product_feeds",
+        "list_product_feed_uploads",
+        "list_feed_rules",
+        "list_catalog_event_sources",
+        "list_event_source_catalogs",
+        "get_catalog_event_source_health",
+        "get_catalog_event_source_recommendations",
+        "list_catalog_attribute_values",
+    ],
+    "access": [
+        "list_businesses",
+        "list_business_users",
+        "list_catalog_assigned_users",
+        "list_user_assigned_catalogs",
+        "preview_catalog_access_change",
+        "list_catalog_partners",
     ],
     "auth": [
         "generate_auth_url",
@@ -262,6 +351,42 @@ INTENT_GUIDE = {
             "Use typed opportunity tools only when the user asks for one category specifically.",
         ],
     },
+    "check_opportunity_score": {
+        "description": "Read Meta's 0-100 account opportunity score, its recent history, and the recommendations that would raise it.",
+        "recommended_order": ["get_opportunity_score", "get_recommendations"],
+        "avoid_unless_needed": [],
+        "notes": ["Recommendations are ranked by Meta's estimated score gain (opportunity_score_lift)."],
+    },
+    "track_performance_trends_or_anomalies": {
+        "description": "See how CPC, CPM, cost per result, ROAS, CTR or conversion rate moved over days, weeks or months, or find unusual days.",
+        "recommended_order": ["get_performance_trend", "detect_performance_anomalies", "get_budget_pacing_report"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "detect_performance_anomalies compares each recent day with the object's own baseline using median and median absolute deviation; it is a rule-based screen, not a statistical test.",
+        ],
+    },
+    "compare_ads_to_benchmarks_or_competitors": {
+        "description": "Compare ads with ads competing for the same audience using Meta's quality, engagement-rate and conversion-rate rankings.",
+        "recommended_order": ["get_auction_ranking_report", "get_ad_feedback_signals"],
+        "avoid_unless_needed": [],
+        "notes": [
+            "Industry benchmarks from similar advertisers are not available through Meta's public API; Meta's rankings are the nearest comparison.",
+        ],
+    },
+    "brief_on_advertiser_context": {
+        "description": "Get a briefing on the advertiser: account settings, spend by objective and optimization goal, funnel volumes, datasets, Pages and Instagram identities.",
+        "recommended_order": ["get_advertiser_context", "get_account_optimization_snapshot"],
+        "avoid_unless_needed": [],
+        "notes": ["get_advertiser_context is derived from account data by this server, not Meta's own summary."],
+    },
+    "troubleshoot_delivery_errors": {
+        "description": "Find why the account, campaigns, ad sets or ads are not delivering: disapprovals, review feedback, issues, failed delivery checks, account status.",
+        "recommended_order": ["get_delivery_errors", "get_native_optimization_signals", "get_learning_phase_report"],
+        "avoid_unless_needed": [],
+        "notes": [
+            "get_delivery_errors says when its scan stopped before the end; continue with after=scan.next_after.",
+        ],
+    },
     "read_ad_comments_or_quality_signals": {
         "description": (
             "Handle asks for ad comments, reviews, testimonials, customer feedback, negative feedback, "
@@ -323,6 +448,24 @@ INTENT_GUIDE = {
         "avoid_unless_needed": [],
         "notes": ["This still requires Ads Library API app access even though it does not depend on an ad account id."],
     },
+    "inspect_pixels_datasets_or_tracking": {
+        "description": (
+            "Check pixels, datasets, Conversions API setup, event volume, event match quality, "
+            "and custom conversions."
+        ),
+        "recommended_order": [
+            "list_datasets",
+            "get_dataset",
+            "get_dataset_stats",
+            "get_dataset_quality",
+            "list_custom_conversions",
+        ],
+        "avoid_unless_needed": [],
+        "notes": [
+            "Use get_dataset_quality for event match quality and match-key coverage; it flags weak scores and states the threshold used.",
+            "get_dataset_stats covers at most 28 days per call and totals hourly counts per event, device, source, or other aggregation.",
+        ],
+    },
     "writes_after_confirmation": {
         "description": "Mutate campaign, ad set, ad, creative, or audience state after explicit user confirmation.",
         "recommended_order": [
@@ -342,7 +485,269 @@ INTENT_GUIDE = {
         "avoid_unless_needed": [],
         "notes": ["Write operations require ads_management-level permissions and should follow discovery or diagnostics reads."],
     },
+    "run_ab_tests_or_lift_studies": {
+        "description": "Find, inspect, check eligibility for, create, edit or stop A/B tests (split tests) and conversion lift studies, and read a test's winner or lift.",
+        "recommended_order": [
+            "list_ad_studies",
+            "get_ad_study",
+            "check_ab_test_eligibility",
+            "create_ab_test",
+            "create_lift_study",
+            "update_ad_study",
+            "cancel_ad_study",
+        ],
+        "avoid_unless_needed": ["setup_ab_test"],
+        "notes": [
+            "Use get_ad_study with include_results=true for the split test winner and confidence, or lift and confidence per cell; it says plainly when results are not ready.",
+            "check_ab_test_eligibility is a local pre-check, not Meta's verdict; Meta decides when the test is created.",
+            "Meta creates studies on a business; pass business_id when the ad account has no owning business.",
+            "Lift studies are limited by Meta to approved advertisers.",
+            "For a creative test (ad against ad), give create_ab_test cells with one ad each in ad_ids and a creative test budget.",
+        ],
+    },
+    "manage_product_catalogs_and_product_sets": {
+        "description": (
+            "Find Meta product catalogs (Commerce Manager shop/product feeds for dynamic or Advantage+ catalog ads), "
+            "check whether they can run catalog ads, inspect products and product sets, and build product set filters."
+        ),
+        "recommended_order": [
+            "list_catalogs",
+            "list_dpa_eligible_catalogs",
+            "get_catalog_dynamic_ads_health",
+            "get_catalog_diagnostics",
+            "list_catalog_data_sources",
+            "list_catalog_products",
+            "list_product_sets",
+            "build_product_set_filter",
+            "list_catalog_attribute_values",
+        ],
+        "avoid_unless_needed": [
+            "batch_update_catalog_products",
+            "create_product_set",
+            "update_product_set",
+            "create_catalog_product",
+            "update_catalog_product",
+            "create_catalog",
+            "update_catalog",
+            "delete_product_set",
+            "delete_catalog_product",
+        ],
+        "notes": [
+            "Catalog reads need the catalog_management permission; a permission error means the token lacks it, not that there are no catalogs.",
+            "Turn a plain-English product selection into conditions and test it with build_product_set_filter before create_product_set.",
+            "Product prices are major units (12.5 means 12.50); new products are created with visibility=staging.",
+            "list_dpa_eligible_catalogs and get_catalog_dynamic_ads_health are derived from documented signals and state the rules they use.",
+            "Use list_catalog_attribute_values to see which brands, categories or custom labels actually occur before writing filter conditions.",
+            "batch_update_catalog_products edits up to 50 products by SKU in one call; check its per-item outcomes, feed warnings and retry statement.",
+        ],
+    },
+    "manage_product_catalog_feeds_and_event_sources": {
+        "description": (
+            "Inspect or change product catalog data feeds, feed uploads and upload errors, feed rules, "
+            "and the pixels or apps connected to a product catalog, including match-rate health."
+        ),
+        "recommended_order": [
+            "list_product_feeds",
+            "list_product_feed_uploads",
+            "list_feed_rules",
+            "list_catalog_event_sources",
+            "get_catalog_event_source_health",
+            "get_catalog_event_source_recommendations",
+            "list_event_source_catalogs",
+        ],
+        "avoid_unless_needed": [
+            "create_product_feed",
+            "update_product_feed",
+            "create_product_feed_upload",
+            "create_feed_rule",
+            "update_feed_rule",
+            "connect_catalog_event_source",
+            "delete_feed_rule",
+            "delete_product_feed",
+            "disconnect_catalog_event_source",
+        ],
+        "notes": [
+            "These tools work on Meta product catalogs and need the catalog_management permission.",
+            "Deleting a feed removes the products it supplied unless another source also supplies them.",
+            "Health and recommendations are derived here from event_stats, connected sources and Meta's Dynamic Ads checks.",
+            "Upload a local feed file with create_product_feed_upload(file_path=...) so its rows never pass through the conversation; compare a pixel's match rate across catalogs with list_event_source_catalogs(include_match_rates=true).",
+        ],
+    },
+    "find_pages_media_and_asset_usage": {
+        "description": (
+            "List Pages by user, ad account or business; browse the image and video library; find which ads "
+            "use a creative or which ad sets use a custom audience; list boostable Instagram posts; look up "
+            "field types and allowed values."
+        ),
+        "recommended_order": [
+            "list_pages",
+            "list_ad_images",
+            "list_ad_videos",
+            "list_creative_ads",
+            "list_audience_adsets",
+            "list_instagram_media",
+            "get_field_reference",
+        ],
+        "avoid_unless_needed": [],
+        "notes": [
+            "list_creative_ads and list_audience_adsets scan with a page cap; check summary.complete and continue with summary.next_after.",
+            "list_instagram_media marks each post boost_eligible with Meta's reason when it is not; boost with boost_instagram_post.",
+            "get_field_reference comes from Meta's SDK field list because Meta no longer serves live field introspection.",
+        ],
+    },
+    "edit_ad_sets_ads_and_customer_lists": {
+        "description": (
+            "Edit ad set or ad settings with before/after, add or remove people in a customer list audience, "
+            "or boost an Instagram post as a paused ad, after explicit user confirmation."
+        ),
+        "recommended_order": [
+            "update_adset",
+            "update_ad",
+            "add_audience_users",
+            "remove_audience_users",
+            "boost_instagram_post",
+        ],
+        "avoid_unless_needed": [],
+        "notes": [
+            "update_adset rejects budgets and bids; use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy.",
+            "validate_only on update_adset, update_ad and boost_instagram_post has Meta check the change without applying it.",
+            "For customer lists prefer file_path to a local CSV so personal data never passes through the model; inline rows are limited to 1,000.",
+        ],
+    },
+    "manage_business_people_and_catalog_access": {
+        "description": (
+            "List the businesses you can access, a business's people, system users or partner agencies, "
+            "who can use a product catalog and with which permissions, or which catalogs one person or partner "
+            "can use; preview or grant, change or remove a person's catalog access; see, share or unshare a "
+            "catalog with a partner business."
+        ),
+        "recommended_order": [
+            "list_businesses",
+            "list_business_users",
+            "list_catalog_assigned_users",
+            "list_user_assigned_catalogs",
+            "preview_catalog_access_change",
+            "list_catalog_partners",
+        ],
+        "avoid_unless_needed": ["set_catalog_access"],
+        "notes": [
+            "Catalog access tools take a person's business-scoped id from list_business_users, not a personal Facebook id.",
+            "Run preview_catalog_access_change first and show the user what the person would lose before set_catalog_access.",
+            "set_catalog_access refuses to remove the token's own access unless allow_self_removal=true.",
+            "Share a catalog with a partner business, or remove the share, with user_type=AGENCY and the partner's business id as user_id; list_catalog_partners shows current shares. The partner request shape is not yet confirmed against Meta's live API.",
+        ],
+    },
+    "duplicate_campaigns_ad_sets_or_ads": {
+        "description": (
+            "Copy, clone or duplicate a campaign, ad set or ad, optionally with its children, into a new "
+            "parent, with a new name or schedule, after explicit user confirmation."
+        ),
+        "recommended_order": ["duplicate_campaign", "duplicate_adset", "duplicate_ad"],
+        "avoid_unless_needed": [],
+        "notes": [
+            "Copies are PAUSED unless status_option says otherwise; dry_run shows the exact request first.",
+            "Meta allows a deep copy of at most 3 ads in one call; copy larger structures level by level.",
+        ],
+    },
+    "rank_entities_by_a_metric": {
+        "description": "List the top or bottom campaigns, ad sets or ads by a metric such as spend, impressions or link clicks, ranked by Meta.",
+        "recommended_order": ["get_entity_insights", "compare_performance"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass sort, such as spend_descending, with level and a limit; Meta accepts one sort key per request.",
+            "Keep fields lean on account-wide sorted requests; heavy sorted requests with action arrays fail on large accounts.",
+        ],
+    },
+    "trend_or_anomalies_for_several_entities": {
+        "description": "Trend or screen for unusual days across several campaigns, ad sets or ads in one call.",
+        "recommended_order": ["get_performance_trend", "detect_performance_anomalies", "get_auction_ranking_report"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass object_ids (up to 10 numeric ids) or child_level with one object_id to cover its highest-spending children.",
+            "Results follow Meta's own result for each entity; the response names any entity that could not be read.",
+        ],
+    },
+    "track_reach_or_unique_people_over_time": {
+        "description": "See how many people the ads reached each day, week or month, for one object or several side by side.",
+        "recommended_order": ["get_performance_trend", "get_entity_insights"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass metrics=['reach'] to get_performance_trend; a week's or month's reach is read over that whole period, never added up from days.",
+            "With object_ids or child_level, each entity returns a period series; series_periods asks for more periods than the default fits.",
+        ],
+    },
+    "research_an_advertisers_ads_in_the_ad_library": {
+        "description": "See the ads a specific Page or competitor is running in the public Meta Ad Library, active or inactive.",
+        "recommended_order": ["search_ads_archive"],
+        "avoid_unless_needed": [],
+        "notes": ["Pass search_page_ids (up to 10 Page ids) with or without search_terms, and ad_active_status ACTIVE, ALL or INACTIVE."],
+    },
+    "build_creatives_and_upload_media": {
+        "description": (
+            "Build a carousel, single image or video, text variants, placement-specific media, click-to-WhatsApp, "
+            "Messenger or Instagram Direct, instant form or Partnership Ad creative from named inputs; upload a "
+            "video; remove a library image; switch Advantage creative enhancements on a live ad; label creatives."
+        ),
+        "recommended_order": [
+            "upload_creative_asset",
+            "upload_ad_video",
+            "list_ad_videos",
+            "create_ad_creative_from_inputs",
+            "preview_ad",
+            "update_ad_creative_enhancements",
+            "update_creative",
+            "delete_ad_image",
+        ],
+        "avoid_unless_needed": ["create_ad_creative"],
+        "notes": [
+            "create_ad_creative_from_inputs dry_run returns the exact spec without creating anything.",
+            "Wait for list_ad_videos processing_status ready before using an uploaded video.",
+            "preview_ad ad_formats previews several placements in one call.",
+            "update_ad_creative_enhancements creates a copy of the creative and attaches it, so the ad goes back to review.",
+            "create_ad_creative_from_inputs also builds multi media asset pools, catalog carousels and Facebook partnership ads.",
+        ],
+    },
 }
+
+# The full manifest is sent as both text and structured data, so it has to stay well
+# under half the response limit. Intents in this original set keep their full entry and
+# their routing hint there. Intents added since appear with their description and tool
+# order only; their notes come from get_capabilities(intent=...).
+FULL_DETAIL_MANIFEST_INTENTS = frozenset(
+    {
+        "check_connectivity_or_auth",
+        "discover_accounts_or_ids",
+        "inspect_single_entity_performance",
+        "compare_multiple_entities",
+        "compare_current_vs_previous_window",
+        "read_change_history",
+        "export_reporting_data",
+        "retrieve_oversized_response",
+        "find_optimization_opportunities",
+        "read_ad_comments_or_quality_signals",
+        "plan_targeting_or_audiences",
+        "creative_workflows",
+        "research_competitor_ads",
+        "writes_after_confirmation",
+    }
+)
+
+
+def _manifest_intent_guide() -> dict[str, dict[str, object]]:
+    """Return the intent guide sized for the full manifest."""
+    return {
+        intent: (
+            route
+            if intent in FULL_DETAIL_MANIFEST_INTENTS
+            else {
+                "description": route["description"],
+                "recommended_order": route["recommended_order"],
+                "avoid_unless_needed": route["avoid_unless_needed"],
+            }
+        )
+        for intent, route in INTENT_GUIDE.items()
+    }
+
 
 ROUTING_HINTS = {
     intent: list(route["recommended_order"]) + list(route["avoid_unless_needed"])
@@ -370,6 +775,7 @@ INTENT_SEARCH_SYNONYMS = {
     "history": "activity changes changelog audit log",
     "audit": "activity changes changelog history",
     "log": "activity changes changelog history",
+    "boost": "boost_instagram_post edit paused ad",
 }
 
 
@@ -551,8 +957,23 @@ async def get_capabilities(
     intent: str | None = None,
     include_full_manifest: bool = False,
     tool_name: str | None = None,
+    official_tool: str | None = None,
 ) -> dict[str, object]:
-    """Get routing guidance or a named tool's complete input schema via tool_name; the full manifest lists workflows, not parameter schemas."""
+    """Get routing guidance or a named tool's complete input schema via tool_name; the full manifest lists workflows, not parameter schemas. Pass official_tool with a tool name from Meta's own Ads MCP server (ads_...) to learn which tool here serves it."""
+    if official_tool is not None:
+        if not official_tool.strip() or intent is not None or include_full_manifest or tool_name is not None:
+            raise ValidationError("Provide official_tool alone to look up one of Meta's official tool names.")
+        entry = OFFICIAL_TOOLS.get(official_tool.strip())
+        if entry is None:
+            raise ValidationError(
+                f"'{official_tool}' is not one of Meta's official Ads MCP tool names. "
+                "Use search_tools to find a tool by what it does."
+            )
+        return {
+            "server": _server_metadata(),
+            "official_tool": entry.to_dict(official_tool.strip()),
+            "official_parity": parity_summary(),
+        }
     if tool_name is not None:
         if not tool_name.strip() or intent is not None or include_full_manifest:
             raise ValidationError("Provide tool_name alone to inspect one tool's input schema.")
@@ -608,6 +1029,7 @@ async def get_capabilities(
             "META_EXPORT_MAX_FILES",
             "META_EXPORT_MAX_BYTES",
             "META_READ_ONLY",
+            "META_UPLOAD_DIR",
         ],
     }
     notes = [
@@ -640,10 +1062,17 @@ async def get_capabilities(
             "server": _server_metadata(),
             "auth": auth,
             "tool_groups": tool_groups,
-            "routing_hints": ROUTING_HINTS,
-            "intent_guide": INTENT_GUIDE,
+            "routing_hints": {
+                intent: hint for intent, hint in ROUTING_HINTS.items() if intent in FULL_DETAIL_MANIFEST_INTENTS
+            },
+            "intent_guide": _manifest_intent_guide(),
             "resources": RESOURCE_URIS,
-            "notes": notes,
+            "official_parity": parity_summary(),
+            "notes": [
+                *notes,
+                "Newer intents are listed here with their description and tool order only; call "
+                "get_capabilities(intent='<intent key>') for an intent's notes.",
+            ],
         }
 
     return {
@@ -678,6 +1107,24 @@ async def list_mutation_tools() -> dict[str, object]:
             "creation": ["create_campaign", "create_ad_set", "create_ad", "create_ad_creative"],
             "deletion": ["delete_campaign", "delete_adset", "delete_ad", "delete_creative"],
             "audiences": ["create_custom_audience", "create_lookalike_audience", "update_custom_audience", "delete_audience"],
+            "experiments": ["create_ab_test", "create_lift_study", "update_ad_study", "cancel_ad_study"],
+            "product_catalogs": ["create_catalog", "update_catalog"],
+            "catalog_products": ["create_catalog_product", "update_catalog_product", "delete_catalog_product"],
+            "product_sets": ["create_product_set", "update_product_set", "delete_product_set"],
+            "product_catalog_feeds": [
+                "create_product_feed", "update_product_feed", "delete_product_feed",
+                "create_product_feed_upload", "create_feed_rule", "delete_feed_rule",
+                "update_feed_rule",
+            ],
+            "product_catalog_event_sources": ["connect_catalog_event_source", "disconnect_catalog_event_source"],
+            "general_edits": ["update_adset", "update_ad"],
+            "customer_list_users": ["add_audience_users", "remove_audience_users"],
+            "instagram_boost": ["boost_instagram_post"],
+            "product_catalog_access": ["set_catalog_access"],
+            "duplication": ["duplicate_campaign", "duplicate_adset", "duplicate_ad"],
+            "catalog_product_batches": ["batch_update_catalog_products"],
+            "creative_building": ["create_ad_creative_from_inputs", "update_ad_creative_enhancements"],
+            "media_library": ["upload_creative_asset", "upload_ad_video", "delete_ad_image"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",

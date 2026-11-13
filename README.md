@@ -13,7 +13,8 @@
 
 ## ✨ Features
 
-- 📊 **102 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, auth helpers, and controlled writes
+- 📊 **180 Tools** — Discovery, reporting, activity history, diagnostics, social feedback, targeting, research, product catalogs, business and catalog access, pixels and datasets, experiments, auth helpers, and controlled writes
+- 🤝 **Parity with Meta's official Ads MCP server** — every one of the 106 tools it serves is mapped to a tool here, or recorded as partial, missing or unavailable with the reason; see [Parity with Meta's official server](#-parity-with-metas-official-server)
 - 🔍 **Optimization-First** — Not just CRUD: pacing, fatigue, audience, and snapshot diagnostics built in
 - 📖 **Built-in Docs** — Object model, metrics, optimization playbook, current v26 notes, and historical v25 notes available as tools and MCP resources
 - 🎯 **Full Targeting Suite** — Interest, behavior, demographic, and geo search with audience size estimation
@@ -22,7 +23,7 @@
 - 🔎 **Tool Search** — FastMCP 3.4.8 tool search lets the LLM discover tools on demand instead of loading the full catalog up front
 - 🖥️ **Works Everywhere** — Claude Code, Claude Desktop, Gemini CLI, or any MCP client
 
-## 📋 Available Tools (102)
+## 📋 Available Tools (180)
 
 ### 🔍 Discovery
 
@@ -81,6 +82,12 @@
 | `get_audience_opportunities` | Audience and targeting opportunities |
 | `get_delivery_opportunities` | Delivery and reach opportunities |
 | `get_bidding_opportunities` | Bid strategy opportunities |
+| `get_opportunity_score` | The account's 0 to 100 opportunity score, its daily history, and top recommendations by estimated score gain |
+| `get_performance_trend` | CPC, CPM, cost per result, ROAS, CTR and conversion rate per day, week or month, with first-to-last change |
+| `detect_performance_anomalies` | Flag days far from an entity's own recent baseline, showing the rule, baseline and threshold used |
+| `get_auction_ranking_report` | Rank ads by Meta's quality, engagement and conversion rankings and say whether weak ads point at creative or at bid and budget |
+| `get_advertiser_context` | Account briefing derived from settings, spend mix, funnel events and tracking setup |
+| `get_delivery_errors` | Delivery-blocking problems across an account or named objects, ordered by severity and spend |
 
 ### 💬 Social Feedback
 
@@ -139,6 +146,34 @@
 | `update_creative` | Update an ad creative |
 | `update_ad_creative` | Attach a prepared replacement creative to an existing ad |
 | `delete_creative` | Delete an ad creative |
+| `update_adset` | Edit ad set name, targeting, schedule and other settings, with before and after values |
+| `update_ad` | Edit ad name, creative and tracking, with before and after values |
+| `add_audience_users` | Add people to a customer list audience from a local CSV; values are hashed on this machine |
+| `remove_audience_users` | Remove people from a customer list audience |
+| `boost_instagram_post` | Turn an existing Instagram post into a paused ad under an existing ad set |
+| `create_ab_test` | Create an A/B test from cells of campaigns or ad sets |
+| `create_lift_study` | Create a conversion lift study |
+| `update_ad_study` | Edit an A/B test or lift study |
+| `cancel_ad_study` | End or cancel an A/B test or lift study |
+| `create_catalog` | Create a product catalog |
+| `update_catalog` | Edit product catalog settings |
+| `create_catalog_product` | Create a product (starts in staging visibility) |
+| `update_catalog_product` | Edit product fields such as name, price and availability |
+| `delete_catalog_product` | Delete a product |
+| `create_product_set` | Create a product set from a filter |
+| `update_product_set` | Edit a product set's name or filter |
+| `delete_product_set` | Delete a product set; products remain |
+| `create_product_feed` | Register a product feed, optionally fetched from a URL on a schedule |
+| `update_product_feed` | Edit a feed's name, defaults or schedules |
+| `delete_product_feed` | Delete a feed; its products are removed unless another source supplies them |
+| `create_product_feed_upload` | Start an upload for a feed from a URL |
+| `create_feed_rule` | Create an attribute mapping or transformation rule on a feed |
+| `delete_feed_rule` | Delete a feed rule |
+| `connect_catalog_event_source` | Connect a pixel or other event source to a product catalog |
+| `disconnect_catalog_event_source` | Disconnect an event source from a product catalog |
+| `duplicate_campaign` | Copy a campaign, optionally with its ad sets and ads; the copy starts paused |
+| `duplicate_adset` | Copy an ad set, optionally into another campaign; the copy starts paused |
+| `duplicate_ad` | Copy an ad, optionally into another ad set; the copy starts paused |
 
 ### 🖼️ Creative Ops
 
@@ -148,6 +183,10 @@
 | `preview_ad` | Preview an ad in various formats |
 | `upload_creative_asset` | Upload an image or video asset |
 | `setup_ab_test` | Set up an A/B test |
+| `create_ad_creative_from_inputs` | Build a creative from named inputs: image, video, carousel, text variants, per-placement media, asset pools, catalog carousels, existing posts, click-to-message, lead forms and Partnership Ads; `dry_run` shows the request |
+| `update_ad_creative_enhancements` | Turn Advantage creative enhancements on or off for a live ad by attaching a changed copy of its creative |
+| `upload_ad_video` | Upload a video from a URL or from the upload folder (chunked above 25 MB, up to 4 GB) and report processing status |
+| `delete_ad_image` | Remove an image from the account's image library after reading it |
 
 ### 🔬 Public Research
 
@@ -165,6 +204,71 @@
 | `generate_system_user_token` | Generate a system user access token |
 | `get_token_info` | Get info about the current token |
 | `validate_token` | Validate token scopes and expiry |
+
+### 🗂️ Pages, Media & Asset Usage
+
+| Tool | Description |
+|------|-------------|
+| `list_pages` | Pages the user can advertise with, Pages used on an ad account, or Pages owned by a business |
+| `list_ad_images` | The ad account's image library |
+| `list_ad_videos` | The ad account's video library |
+| `list_creative_ads` | Ads that use one creative, with how many ads were scanned and whether the scan was complete |
+| `list_instagram_media` | Recent Instagram posts, reels or stories, each marked boostable or not with Meta's reason |
+| `list_audience_adsets` | Ad sets that target one custom audience |
+| `get_field_reference` | Field types, updatability and allowed values for campaigns, ad sets and ads |
+
+### 📡 Pixels & Datasets
+
+| Tool | Description |
+|------|-------------|
+| `list_datasets` | Pixels and datasets on an ad account or business |
+| `get_dataset` | One dataset's settings |
+| `get_dataset_stats` | Event volume for up to 28 days, split by event, device or source |
+| `get_dataset_quality` | Event match quality, match-key coverage and data freshness, with weak scores flagged |
+| `list_custom_conversions` | Custom conversions on an ad account |
+
+### 🧪 Experiments
+
+| Tool | Description |
+|------|-------------|
+| `list_ad_studies` | A/B tests and lift studies on an account, a business, or one campaign, ad set or ad |
+| `get_ad_study` | One study's settings, cells and objectives, and its winner or lift when results are ready |
+| `check_ab_test_eligibility` | Local pre-check of campaigns or ad sets against Meta's documented A/B test limits |
+
+### 🛍️ Product Catalogs
+
+| Tool | Description |
+|------|-------------|
+| `list_catalogs` | Product catalogs for a business or ad account, or one catalog with counts |
+| `list_dpa_eligible_catalogs` | Catalogs ranked by readiness for catalog ads, with the reasons |
+| `get_catalog_diagnostics` | Catalog errors and opportunities ordered by products affected |
+| `get_catalog_dynamic_ads_health` | Whether a catalog or product set can serve catalog ads, and what blocks it |
+| `list_catalog_data_sources` | Feeds, uploads and API sources that supply a catalog |
+| `list_catalog_products` | Products in a catalog or product set, filtered, or one product |
+| `build_product_set_filter` | Build a valid product set filter from conditions and count the products that match |
+| `list_product_sets` | Product sets in a catalog, one set, or the sets containing a product |
+| `list_product_feeds` | Feeds on a catalog, or one feed with settings, schedule and latest upload |
+| `list_product_feed_uploads` | Feed uploads with status, counts and errors ordered by rows affected |
+| `list_feed_rules` | Attribute mapping and transformation rules on a feed |
+| `list_catalog_event_sources` | Pixels, apps and offline datasets connected to a catalog |
+| `list_event_source_catalogs` | Catalogs connected to one event source |
+| `get_catalog_event_source_health` | Match rate and setup problems per connected event source, with 28-day history |
+| `get_catalog_event_source_recommendations` | Event sources worth connecting to a catalog, with the evidence |
+| `batch_update_catalog_products` | Create, update or delete up to 50 products by SKU in one call, with a per-item outcome and retry advice |
+| `list_catalog_attribute_values` | The values that actually occur for a product attribute, with counts, for building product set filters |
+| `update_feed_rule` | Change one feed rule and return before and after |
+
+### 🏢 Business & Catalog Access
+
+| Tool | Description |
+|------|-------------|
+| `list_businesses` | Businesses the token's user can access, with the user's roles |
+| `list_business_users` | A business's people, system users or partner businesses |
+| `list_catalog_assigned_users` | Who has direct access to a catalog, and with which tasks |
+| `list_user_assigned_catalogs` | The catalogs assigned to one person, system user or partner |
+| `list_catalog_partners` | Partner businesses a catalog is shared with (request shape not yet confirmed live for writes) |
+| `preview_catalog_access_change` | Read-only preview of a catalog access change: before, after and what would be sent |
+| `set_catalog_access` | Grant, change or remove catalog access for a person, system user or partner business, with lockout protection |
 
 ### 📖 Docs & Utility
 
@@ -212,6 +316,60 @@ wrappers; inner tools are then invoked through `call_tool(name=..., arguments=..
 Use `get_adset(fields=["id","name","effective_status","daily_budget","bid_amount"])`
 for a small preflight or read-back. The other single-entity reads also accept `fields`.
 
+## 🤝 Parity with Meta's official server
+
+Meta publishes a hosted Ads MCP server (`https://mcp.facebook.com/ads`). On
+2026-11-12 it served 106 tools: 87 of the 88 named in Meta's documentation plus
+19 undocumented ones. `meta_ads_mcp/official_parity.py` holds one entry for each
+served name, written from that tool's real description and parameter list and
+last checked against this code by an independent comparison on 2026-11-13. A
+test fails if a served name is missing or an entry points at a tool that is not
+registered.
+
+| Status | Meaning | Tools |
+|--------|---------|-------|
+| `covered` | A tool here does everything Meta's tool does, or more | 58 |
+| `partial` | A tool here does part of it; the entry says what Meta's tool can do that ours cannot, and why that is still open | 30 |
+| `missing` | Nothing here yet, although Meta's public API appears to allow it | 0 |
+| `unavailable` | No working public API route is known | 13 |
+| `app_internal` | Plumbing for Meta's own app (upload dialogs, telemetry); nothing to match | 6 |
+
+The `covered` count includes `ads_update_custom_audience_users`, which Meta
+documents but does not serve.
+
+One `unavailable` entry does have a tool: `delete_feed_rule` sends the request
+Meta's reference documents, but Meta's live API answers that the endpoint is
+retired (tested 2026-11-13). The tool reports that plainly and says what to do
+instead.
+
+Of the 30 `partial` entries, 21 are open because no public API route is known
+for what Meta's own tool does, and 9 are built differently on purpose (for
+example, a stated rule in place of Meta's private detector, or rarely used ad
+set fields left to `params`). None is waiting to be built.
+
+Each `covered` or `partial` entry also carries `verified`: `live` when every
+serving tool has been run against a real ad account and Meta accepted the
+request, otherwise `mocked`. Mocked tests use a fake client that accepts any
+endpoint name, so they cannot catch a wrong endpoint or field name. A write tool
+is `live` only if it ran in the live write tests of 2026-11-13, on a throwaway ad
+account and a test catalog, with everything created paused and deleted afterwards.
+
+To find the tool for one of Meta's names, call
+`get_capabilities(official_tool="ads_get_opportunity_score")`. A Meta name
+served by exactly one tool here can also be used directly as a tool name. A name
+served by several tools, or by none, returns an explanation instead.
+
+No public API route is known for:
+
+- Benchmarks against similar advertisers (`ads_insights_industry_benchmark`,
+  `ads_insights_performance_vs_peers`).
+- Business Help Center article search (`ads_get_help_article`).
+- Partner store integration health (`ads_catalog_list_partner_integrations`).
+- Pixel event rules and parameter extractors (the eight `ads_pixel_event_*` and
+  `ads_pixel_parameter_*` tools): Meta's own server limits them to first-party
+  clients, the public reference marks changes as unsupported, and the live API
+  rejected the documented reads.
+
 ## 📚 MCP Resources
 
 | Resource | Description |
@@ -222,6 +380,8 @@ for a small preflight or read-back. The other single-entity reads also accept `f
 | `meta://docs/v26-notes` | Current v26.0 API capabilities and migration notes |
 | `meta://docs/optimization-playbook` | Optimization best practices |
 | `meta://docs/tool-routing` | Tool routing guide |
+| `get_v26_notes` | Current v26 API fields, breakdowns, recommendation filters and migration notes |
+| `get_v25_notes` | Historical v25 implementation notes and deprecations |
 
 ## 🚀 Quick Start
 
@@ -473,6 +633,16 @@ Analysis agents using tool search need access to `search_tools`, `call_tool`, an
 `get_capabilities`; allowing only underlying tool names is not sufficient.
 The default remains writable; no existing server or dbt agent configuration is
 changed automatically.
+
+Tools that upload a local file (`add_audience_users`, `remove_audience_users`,
+`create_product_feed_upload`, `upload_ad_video` and `upload_creative_asset` for images, each with
+`file_path`) read only from one folder you
+choose. Set `META_UPLOAD_DIR` in the launch environment to that folder and put
+the file there. Until it is set, these tools refuse to read any local file. A
+path that leads outside the folder, including through a link, is refused. This
+matters because the model also reads text written by other people, such as ad
+comments, and a file path it supplies should not be able to send some other file
+on your machine to Meta.
 
 For click/view attribution comparisons, use `get_entity_insights` with explicit
 dates, `fields=["actions","action_values"]`,

@@ -32,10 +32,12 @@ transforms enabled to reduce upfront tool-context usage in compatible clients.
 
 ## Non-Goals
 
-- Replicate the entire Meta Marketing API in v1.
+- Replicate the entire Meta Marketing API. The exception, decided 2026-11-12, is
+  the surface Meta's official Ads MCP server exposes: this server covers every
+  capability of that server that Meta's public API allows. See
+  `docs/superpowers/specs/2026-11-12-official-mcp-parity-design.md`.
 - Rebuild browser-first auth or hosted SaaS auth flows in v1.
 - Optimize first for HTTP clients instead of local MCP clients.
-- Support every mutation on day one.
 - Build a vendor-specific remote auth product.
 
 ## Product Principles
@@ -65,11 +67,13 @@ The server should not merely proxy raw Graph API payloads. It should return:
 
 ### 3. Thin Execution Layer
 
-Mutation tools are useful, but narrow:
+Mutation tools cover what Meta's official Ads MCP server can change (ads,
+audiences, experiments, pixels, catalogs) and nothing beyond it. Each one stays
+thin and safe:
 
-- pause / enable
-- small budget updates
-- targeted bid or status changes only when safe
+- creates start paused or inactive where the object has such a state
+- updates and deletes read the object first and return it as `previous`
+- every mutation is blocked when `META_READ_ONLY` is set
 
 The server should help the LLM decide what to change before it changes anything.
 

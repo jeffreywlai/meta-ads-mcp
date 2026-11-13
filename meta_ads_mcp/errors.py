@@ -91,6 +91,11 @@ class UnsupportedFeatureError(MetaAdsError):
     """Raised when a Meta surface is unavailable or unsupported."""
 
 
+def _whole_number_or_none(value: Any) -> int | None:
+    """Meta documents error codes as whole numbers; anything else is treated as absent."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 @dataclass(slots=True)
 class MetaApiError(MetaAdsError):
     """Structured Graph API error."""
@@ -162,8 +167,8 @@ class MetaApiError(MetaAdsError):
         return cls(
             message=str(error.get("message", "Unknown Meta API error")),
             status_code=status_code,
-            code=error.get("code"),
-            subcode=error.get("error_subcode"),
+            code=_whole_number_or_none(error.get("code")),
+            subcode=_whole_number_or_none(error.get("error_subcode")),
             details=payload,
             user_title=error.get("error_user_title"),
             user_message=error.get("error_user_msg"),

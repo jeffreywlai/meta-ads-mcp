@@ -9,7 +9,6 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -41,6 +40,58 @@ USAGE_HEADER_NAMES = (
     "x-app-usage",
     "x-business-use-case-usage",
 )
+
+
+# One Graph path segment: an object id, "me", "act_<id>", or an edge name.
+_ENDPOINT_SEGMENT = re.compile(r"[A-Za-z0-9_.:\-]+")
+
+
+def _validate_endpoint(endpoint: str) -> None:
+    """Refuse an endpoint that could add a query string or change the path.
+
+    Object ids come from tool callers. An id such as ``123?method=delete``
+    would otherwise turn a read into a delete, because Graph honors a
+    ``method`` query parameter as an HTTP method override.
+    """
+    segments = endpoint.strip("/").split("/") if isinstance(endpoint, str) else [""]
+    if any(
+        segment in {".", ".."} or _ENDPOINT_SEGMENT.fullmatch(segment) is None
+        for segment in segments
+    ):
+        raise ValidationError(
+            "Graph object ids and edge names may contain only letters, digits, "
+            "'_', '-', '.' and ':'."
+        )
+
+
+def _segment(value: str) -> str:
+    """Return one caller-supplied path segment, refusing anything that is not one.
+
+    Object ids and edge names come from tool callers. An id such as
+    ``123/products`` would turn an update of object 123 into a write on its
+    ``products`` edge, so node and edge helpers accept a single segment only.
+    """
+    if (
+        not isinstance(value, str)
+        or value in {".", ".."}
+        or _ENDPOINT_SEGMENT.fullmatch(value) is None
+    ):
+        raise ValidationError(
+            "A Graph object id or edge name must be a single value containing only "
+            "letters, digits, '_', '-', '.' and ':'."
+        )
+    return value
+
+
+def _reject_method_override(mapping: dict[str, Any] | None, kind: str) -> None:
+    """Refuse a ``method`` parameter, which Graph treats as an HTTP method override."""
+    if not mapping:
+        return
+    if any(isinstance(key, str) and key.strip().casefold() == "method" for key in mapping):
+        raise ValidationError(
+            f"A 'method' entry is not allowed in request {kind}: Graph would treat it "
+            "as an HTTP method override."
+        )
 
 
 def normalize_account_id(account_id: str) -> str:
@@ -83,10 +134,18 @@ def _is_unsupported_surface_error(error: MetaApiError) -> bool:
     return False
 
 
+# Meta's documented throttling codes (Graph API "Rate Limits" page): the platform
+# limits, then one code per product for business use case limits, including catalog
+# management (80009) and catalog batch (80014).
+_RATE_LIMIT_CODES = frozenset(
+    {4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014}
+)
+
+
 def _is_rate_limit_error(error: MetaApiError) -> bool:
     """Decide whether a Graph API error is actually throttling."""
     message = error.message.lower()
-    if error.code in {4, 17, 32, 613}:
+    if error.code in _RATE_LIMIT_CODES:
         return True
     return "rate limit" in message or "limit reached" in message or "too many calls" in message
 
@@ -154,6 +213,19 @@ def _retry_timing(response: Any, attempt: int) -> RetryTiming:
         delay_seconds=delay,
         server_retry_after_seconds=server_delay,
     )
+
+
+# Meta's per-object edit limit (code 613) states its window only in the message,
+# for example "... the concurrent request rate limit of 1 calls per 30 seconds."
+_STATED_RATE_LIMIT_WINDOW = re.compile(r"rate limit of [1-9][0-9]{0,5} calls? per ([1-9][0-9]{0,5}) seconds?\b")
+
+
+def _with_stated_window(timing: RetryTiming, error: MetaApiError) -> RetryTiming:
+    """Wait at least the window a code 613 message states; unchanged when the message states none."""
+    match = _STATED_RATE_LIMIT_WINDOW.search(error.message) if error.code == 613 else None
+    if match is None or float(match.group(1)) <= timing.delay_seconds:
+        return timing
+    return RetryTiming(delay_seconds=float(match.group(1)), server_retry_after_seconds=timing.server_retry_after_seconds)
 
 
 def _usage_headers(response: Any) -> dict[str, Any] | None:
@@ -232,6 +304,9 @@ class GraphAPIClient:
         use_auth_header: bool = True,
     ) -> dict[str, Any]:
         """Make a Graph API request with basic retries."""
+        _validate_endpoint(endpoint)
+        _reject_method_override(params, "params")
+        _reject_method_override(data, "data")
         headers = {"User-Agent": USER_AGENT}
         effective_access_token: str | None = None
         if use_auth_header:
@@ -334,12 +409,41 @@ class GraphAPIClient:
                             and response.status_code in TRANSIENT_HTTP_STATUSES
                         ),
                     )
-                return payload
+                # A success status with a body that is not JSON cannot be read as an
+                # answer. It is an error, never an object handed to the caller: a tool
+                # that reads before it writes must stop, and after a write the outcome
+                # is not known. The body is not carried; it can hold anything.
+                raise MetaApiError(
+                    message="Meta's answer was not JSON, so it could not be read.",
+                    status_code=response.status_code,
+                    details={
+                        "unreadable_answer": True,
+                        "content_type": response.headers.get("content-type"),
+                        "status_code": response.status_code,
+                    },
+                    operation=operation,
+                    mutation_outcome_unknown=not safe_to_retry,
+                )
 
             if isinstance(payload, bool):
                 payload = {"success": payload}
             elif isinstance(payload, list):
                 payload = {"data": payload}
+            elif not isinstance(payload, dict):
+                # A bare null, text or number cannot be read as an answer. It is an error,
+                # never something shaped like an object: a caller that reads before it
+                # writes must stop, and after a write the outcome is not known.
+                transient_status = response.status_code in TRANSIENT_HTTP_STATUSES
+                raise MetaApiError(
+                    message="Meta's answer was not a JSON object, so it could not be read.",
+                    status_code=response.status_code,
+                    details={"unreadable_answer": True, "json_type": type(payload).__name__},
+                    operation=operation,
+                    is_transient=response.is_error and transient_status,
+                    mutation_outcome_unknown=(
+                        not safe_to_retry and (transient_status if response.is_error else True)
+                    ),
+                )
             if response.is_error or "error" in payload:
                 error = MetaApiError.from_payload(payload, status_code=response.status_code)
                 error.operation = operation
@@ -353,6 +457,9 @@ class GraphAPIClient:
                     and bool(error.is_transient)
                 )
                 if response.status_code == 429 or _is_rate_limit_error(error):
+                    # The automatic wait for a safe read keeps its cap: can_automatically_wait.
+                    retry_timing = _with_stated_window(retry_timing, error)
+                    delay = retry_timing.delay_seconds
                     if (
                         safe_to_retry
                         and attempt + 1 < retries
@@ -394,7 +501,7 @@ class GraphAPIClient:
         query = dict(params or {})
         if serialized_fields := _serialize_fields(fields):
             query["fields"] = serialized_fields
-        return await self.request("GET", object_id, params=query)
+        return await self.request("GET", _segment(object_id), params=query)
 
     async def list_objects(
         self,
@@ -408,7 +515,7 @@ class GraphAPIClient:
         query = dict(params or {})
         if serialized_fields := _serialize_fields(fields):
             query["fields"] = serialized_fields
-        return await self.request("GET", f"{parent_id}/{edge}", params=query)
+        return await self.request("GET", f"{_segment(parent_id)}/{_segment(edge)}", params=query)
 
     async def update_object(
         self,
@@ -417,7 +524,7 @@ class GraphAPIClient:
         data: dict[str, Any],
     ) -> dict[str, Any]:
         """Send an object update."""
-        return await self.request("POST", object_id, data=data)
+        return await self.request("POST", _segment(object_id), data=data)
 
     async def create_edge_object(
         self,
@@ -428,11 +535,11 @@ class GraphAPIClient:
         files: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create an object on a collection edge."""
-        return await self.request("POST", f"{parent_id}/{edge}", data=data, files=files)
+        return await self.request("POST", f"{_segment(parent_id)}/{_segment(edge)}", data=data, files=files)
 
     async def delete_object(self, object_id: str) -> dict[str, Any]:
         """Delete an object."""
-        return await self.request("DELETE", object_id)
+        return await self.request("DELETE", _segment(object_id))
 
     async def get_insights(
         self,
@@ -444,7 +551,7 @@ class GraphAPIClient:
         """Fetch insights for an object."""
         query = dict(params or {})
         query["fields"] = _serialize_fields(fields) or ""
-        return await self.request("GET", f"{object_id}/insights", params=query)
+        return await self.request("GET", f"{_segment(object_id)}/insights", params=query)
 
     async def create_async_insights_report(
         self,
@@ -459,7 +566,7 @@ class GraphAPIClient:
         query = dict(params or {})
         query["fields"] = _serialize_fields(fields) or ""
         query["async"] = "true"
-        return await self.request("POST", f"{object_id}/insights", data=query)
+        return await self.request("POST", f"{_segment(object_id)}/insights", data=query)
 
     async def get_async_report(
         self,
@@ -598,7 +705,7 @@ class GraphAPIClient:
             params["after"] = cursor
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/broadtargetingcategories",
+            f"{_segment(normalize_account_id(account_id))}/broadtargetingcategories",
             params=params,
         )
 
@@ -612,7 +719,7 @@ class GraphAPIClient:
         """Fetch reach estimate data for a targeting spec."""
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/reachestimate",
+            f"{_segment(normalize_account_id(account_id))}/reachestimate",
             params={
                 "targeting_spec": json.dumps(targeting_spec),
                 **({"optimization_goal": optimization_goal} if optimization_goal else {}),
@@ -713,7 +820,7 @@ class GraphAPIClient:
             params["appsecret_proof"] = appsecret_proof
         return await self.request(
             "POST",
-            f"{system_user_id}/access_tokens",
+            f"{_segment(system_user_id)}/access_tokens",
             data={"business_app": business_app, "scope": scope},
             use_auth_header=False,
             params=params,
@@ -740,7 +847,7 @@ class GraphAPIClient:
             params["creative"] = creative
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/generatepreviews",
+            f"{_segment(normalize_account_id(account_id))}/generatepreviews",
             params=params,
         )
 
@@ -748,20 +855,27 @@ class GraphAPIClient:
         self,
         account_id: str,
         *,
-        file_path: str | None = None,
+        file_name: str | None = None,
+        file_content: bytes | None = None,
         image_url: str | None = None,
         name: str | None = None,
     ) -> dict[str, Any]:
-        """Upload an image asset for creative use."""
-        if bool(file_path) == bool(image_url):
-            raise UnsupportedFeatureError("Provide exactly one of file_path or image_url.")
+        """Upload an image asset for creative use, from a link or from a file's name and bytes.
+
+        This client never reads a local path: the caller reads and checks the file
+        (meta_ads_mcp.local_files) and passes its name and bytes.
+        """
+        has_file = file_name is not None or file_content is not None
+        if has_file == bool(image_url):
+            raise UnsupportedFeatureError("Provide exactly one of a file or image_url.")
+        if has_file and (not file_name or not file_content):
+            raise UnsupportedFeatureError("An image file needs both a file name and its bytes.")
         data: dict[str, Any] = {}
         files: dict[str, Any] | None = None
         if image_url:
             data["url"] = image_url
-        if file_path:
-            path = Path(file_path).expanduser()
-            files = {"filename": (path.name, path.read_bytes())}
+        if has_file:
+            files = {"filename": (file_name, file_content)}
         if name:
             data["name"] = name
         return await self.create_edge_object(normalize_account_id(account_id), "adimages", data=data, files=files)
@@ -779,7 +893,7 @@ class GraphAPIClient:
             params["fields"] = serialized_fields
         return await self.request(
             "GET",
-            f"{normalize_account_id(account_id)}/adimages",
+            f"{_segment(normalize_account_id(account_id))}/adimages",
             params=params,
         )
 
@@ -806,6 +920,70 @@ class GraphAPIClient:
         if cursor:
             params["after"] = cursor
         return await self.request("GET", "ads_archive", params=params)
+
+    async def delete_edge_object(
+        self,
+        parent_id: str,
+        edge: str,
+        *,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Send a DELETE to a collection edge with form-encoded parameters in the body."""
+        return await self.request("DELETE", f"{_segment(parent_id)}/{_segment(edge)}", data=data)
+
+    async def search_ads_library(
+        self,
+        *,
+        ad_reached_countries: list[str],
+        ad_type: str = "ALL",
+        limit: int = 25,
+        fields: FieldList | None = None,
+        after: str | None = None,
+        search_terms: str | None = None,
+        search_page_ids: list[str] | None = None,
+        ad_active_status: str | None = None,
+    ) -> dict[str, Any]:
+        """Search the Ads Library (/ads_archive) by Page ids and active status as well as keywords.
+
+        Meta documents search_page_ids as up to ten Page ids "separated by commas", and ad_active_status as
+        ACTIVE, ALL or INACTIVE. Optional parameters are sent only when given.
+        """
+        params: dict[str, Any] = {
+            "ad_reached_countries": ad_reached_countries,
+            "ad_type": ad_type,
+            "limit": limit,
+        }
+        if serialized_fields := _serialize_fields(fields):
+            params["fields"] = serialized_fields
+        if search_terms is not None:
+            params["search_terms"] = search_terms
+        if search_page_ids:
+            params["search_page_ids"] = ",".join(search_page_ids)
+        if ad_active_status is not None:
+            params["ad_active_status"] = ad_active_status
+        if cursor := _normalize_cursor(after):
+            params["after"] = cursor
+        return await self.request("GET", "ads_archive", params=params)
+
+    async def post_ad_video_upload_phase(
+        self,
+        account_id: str,
+        *,
+        data: dict[str, Any],
+        files: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Send one phase (start, transfer or finish) of a chunked upload to an ad account's advideos edge.
+
+        Parameters are on Meta's ad account advideos reference. The video host is the one
+        the facebook-python-business SDK 26.0.2 uses for this upload (video_uploader.py).
+        """
+        return await self.request(
+            "POST",
+            f"{_segment(normalize_account_id(account_id))}/advideos",
+            data=data,
+            files=files,
+            base_url=f"https://graph-video.facebook.com/{self.settings.api_version}",
+        )
 
 
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:

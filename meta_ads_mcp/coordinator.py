@@ -30,7 +30,10 @@ except ModuleNotFoundError as exc:
 
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.tools.tool import Tool, ToolResult
+from pydantic import WithJsonSchema
 
+from meta_ads_mcp.argument_privacy import install_validation_log_privacy
+from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.error_middleware import (
     StructuredMetaErrorMiddleware,
     ToolParameterHelpMiddleware,
@@ -139,9 +142,21 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
 
         async def call_tool(
             name: Annotated[str | None, "Canonical tool name"] = None,
+            # Declared as Any so a wrongly shaped value reaches the check below:
+            # the framework's own validation error and log would quote it, and it
+            # can hold customer data meant for a customer-list upload.
             arguments: Annotated[
-                dict[str, Any] | str | None,
-                "Tool arguments as an object or object-valued JSON string",
+                Any,
+                WithJsonSchema(
+                    {
+                        "anyOf": [
+                            {"type": "object", "additionalProperties": True},
+                            {"type": "string"},
+                            {"type": "null"},
+                        ],
+                        "description": "Tool arguments as an object or object-valued JSON string",
+                    }
+                ),
             ] = None,
             tool_name: Annotated[
                 str | None,
@@ -158,6 +173,8 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
                 raise ValueError(
                     f"'{resolved_name}' is a synthetic search tool and cannot be called via the call_tool proxy"
                 )
+            if arguments is not None and not isinstance(arguments, (dict, str)):
+                raise ValidationError("arguments must be a JSON object or object-valued JSON string.")
             normalized_arguments = normalize_tool_arguments(arguments)
             return await ctx.fastmcp.call_tool(resolved_name, normalized_arguments)
 
@@ -331,7 +348,23 @@ mcp_server = FastMCP(
         "does not prove complete source history. Do not claim every real-world change "
         "when Meta retention or permissions are unknown. When a "
         "response returns an overflow export_id, retrieve it in bounded chunks "
-        "with read_overflow_artifact and delete it when finished."
+        "with read_overflow_artifact and delete it when finished. "
+        "For Meta product catalogs, products, product sets, feeds and catalog "
+        "event sources start with list_catalogs. For pixels, datasets, event "
+        "volume and event match quality start with list_datasets. For A/B tests "
+        "and lift studies use list_ad_studies and get_ad_study. For the account "
+        "opportunity score use get_opportunity_score, for unusual days use "
+        "detect_performance_anomalies, and for delivery-blocking errors use "
+        "get_delivery_errors. If you know a tool name from Meta's own Ads MCP "
+        "server (ads_...), call get_capabilities(official_tool='that name') to "
+        "find the tool here that serves it. To build a creative from plain inputs "
+        "use create_ad_creative_from_inputs with dry_run=true first. To copy a "
+        "campaign, ad set or ad use duplicate_campaign, duplicate_adset or "
+        "duplicate_ad; copies start paused. For many catalog products at once use "
+        "batch_update_catalog_products. For who can access a catalog use "
+        "list_catalog_assigned_users, and preview_catalog_access_change before "
+        "set_catalog_access. Tools that read a local file (customer lists, feed "
+        "files, videos) read only from the folder named by META_UPLOAD_DIR."
     ),
     transforms=[TOOL_SEARCH_TRANSFORM],
     mask_error_details=False,
@@ -345,3 +378,4 @@ mcp_server.add_middleware(RESPONSE_LIMITING_MIDDLEWARE)
 mcp_server.add_middleware(StructuredMetaErrorMiddleware())
 mcp_server.add_middleware(ReadOnlyAdvertisingMiddleware())
 mcp_server.add_middleware(ToolParameterHelpMiddleware())
+install_validation_log_privacy(mcp_server)

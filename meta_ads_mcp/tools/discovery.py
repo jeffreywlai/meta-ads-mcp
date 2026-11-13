@@ -7,7 +7,7 @@ from typing import Any
 
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, resolve_account_currency
 from meta_ads_mcp.normalize import (
@@ -315,16 +315,90 @@ def _campaign_suggested_next_tools(items: list[dict[str, Any]], account_id: str)
     }
 
 
+# Readiness fields added to the account list, from Meta's AdAccount reference: the owning Business Manager,
+# disable_reason, min_daily_budget and funding_source. Meta says funding_source needs the MANAGE task on the
+# account and is not available when the account is disabled, so it is asked for last and dropped first.
+LIST_ACCOUNT_READINESS_FIELDS = ["business{id,name}", "disable_reason", "min_daily_budget", "funding_source"]
+FUNDING_SOURCE_NOTE = (
+    "has_funding_source is true when Meta returned a payment method id; it is null when Meta returned none, which "
+    "can mean no payment method, a disabled account, or no MANAGE task on the account. The payment method id "
+    "itself is not returned."
+)
+
+
+async def _read_account_list(client: Any, params: dict[str, Any]) -> tuple[dict[str, Any], list[str], str | None]:
+    """Read the account list with readiness fields, dropping them step by step if Meta rejects them.
+
+    The last attempt is the request this tool sent before the readiness fields existed; its failure is raised.
+    """
+    attempts = [
+        LIST_ACCOUNT_READINESS_FIELDS,
+        [field for field in LIST_ACCOUNT_READINESS_FIELDS if field != "funding_source"],
+        [],
+    ]
+    first_error: str | None = None
+    for extra in attempts:
+        try:
+            payload = await client.list_objects(
+                "me", "adaccounts", fields=[*ACCOUNT_FIELDS, *extra], params=params,
+            )
+        except MetaApiError as exc:
+            if not extra or exc.code == 190:
+                raise
+            first_error = first_error or exc.message
+            continue
+        return payload, list(extra), first_error
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _add_readiness(item: dict[str, Any], read: set[str]) -> None:
+    """Add plain readiness values to one account without changing any field the list returned before."""
+    from meta_ads_mcp.tools.performance_signals import DISABLE_REASON_LABELS
+
+    if "business{id,name}" in read:
+        business = item.get("business")
+        item["business"] = (
+            {"id": str(business["id"]) if business.get("id") is not None else None, "name": business.get("name")}
+            if isinstance(business, dict) else None
+        )
+    if "disable_reason" in read:
+        code = item.get("disable_reason")
+        try:
+            item["disable_reason_label"] = DISABLE_REASON_LABELS.get(int(code), "UNKNOWN") if code is not None else None
+        except (TypeError, ValueError):
+            item["disable_reason_label"] = "UNKNOWN"
+    if "min_daily_budget" in read and "min_daily_budget" in item:
+        item["min_daily_budget"] = from_minor_units(
+            item.get("min_daily_budget"), item.get("currency"), field_name="min_daily_budget",
+        )
+    funding = item.pop("funding_source", None)
+    if "funding_source" in read:
+        item["has_funding_source"] = True if funding not in (None, "", "0", 0) else None
+
+
 @mcp_server.tool()
 async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[str, Any]:
-    """Use this first when the user needs to discover which ad accounts are available."""
+    """Use this first when the user needs to discover which ad accounts are available. Each account also carries its owning business, disable reason, minimum daily budget, and whether a payment method was returned."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit}
     if after:
         params["after"] = after
-    payload = await client.list_objects("me", "adaccounts", fields=ACCOUNT_FIELDS, params=params)
+    payload, read, error = await _read_account_list(client, params)
     normalized = normalize_collection(payload)
     normalized["items"] = _normalize_monetary_fields(normalized["items"])
+    read_set = set(read)
+    for item in normalized["items"]:
+        if isinstance(item, dict):
+            _add_readiness(item, read_set)
+    readiness: dict[str, Any] = {
+        "requested": list(LIST_ACCOUNT_READINESS_FIELDS),
+        "unavailable": [field for field in LIST_ACCOUNT_READINESS_FIELDS if field not in read_set],
+        "error": error,
+        "money_units": "min_daily_budget is in major units of each account's currency",
+    }
+    if "funding_source" in read_set:
+        readiness["has_funding_source_note"] = FUNDING_SOURCE_NOTE
+    normalized["summary"]["readiness_fields"] = readiness
     return normalized
 
 

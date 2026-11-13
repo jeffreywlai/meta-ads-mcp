@@ -1,0 +1,84 @@
+{
+  "_about": "Deliberate changes to the call contract of tools that are on master. Each entry needs a real benefit and what a caller must change. tests/test_backward_compat.py fails on any undeclared change, and on any entry here that no longer matches a detected change. Kinds: removed_tool, removed_parameter, new_required_parameter, default_changed (all detected automatically), and behaviour (a change the signature does not show, such as stricter validation or a changed response field; not detected, so declare it by hand). A behaviour entry may use tool \"*\" when the change applies to every tool on master.",
+  "changes": [
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "An id that contains a slash, a question mark, a hash, two dots in a row or a space is now refused before any request is sent. Before, such an id was placed in the request address as written, so get_creative('123/') read creative 123 and an id like '123/ads' read a different object than the tool was meant to read.",
+      "why_better": "A tool can only reach the object type it was built for. An id copied from text that strangers wrote (an ad comment, a Page review) can no longer steer a read or a delete to a different object or attach extra options to the request.",
+      "migration": "Pass the plain id with nothing before or after it, for example '123' or 'act_123'. Trim a trailing slash or any address fragment before calling."
+    },
+    {
+      "tool": "upload_creative_asset",
+      "kind": "behaviour",
+      "parameter": "file_path",
+      "what_changed": "file_path is now read only from the one folder named by the META_UPLOAD_DIR environment variable, the same rule every other upload tool follows. A path outside that folder, a link inside it that points outside, a file that is not .jpg, .jpeg or .png, an empty file and a file over 30 MB are refused before anything is sent to Meta, and every local path is refused while META_UPLOAD_DIR is unset. Before, any file anywhere on the machine was read and sent to Meta, whatever its type or size. The request sent for an accepted file is unchanged, and image_url calls are unchanged.",
+      "why_better": "The model that calls this tool also reads text written by strangers, such as ad comments and Page reviews. Before, a path slipped into that text could make the tool send any private file on your computer, such as a key or a document, to a Meta ad account. Now only images you have put in your chosen upload folder can ever leave the machine, and a wrong path gets a clear message that never repeats the path.",
+      "migration": "Set META_UPLOAD_DIR in the server's environment to one folder, put the images to upload there, and pass a path inside that folder or a file name relative to it. Use .jpg, .jpeg or .png files of at most 30 MB. Calls that pass image_url need no change."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "spend_cap inside params is now refused before any request is sent, with a message pointing to the named spend_cap parameter. Before, params={'spend_cap': 25000} was sent to Meta as written and read in minor units (250.00 USD), while the named spend_cap takes major units (spend_cap=250 is 250.00). daily_budget and lifetime_budget inside params were already refused; only their message changed.",
+      "why_better": "The same field no longer has two units, so an amount cannot silently be 100 times too small (or too large) because it was put in params instead of the named parameter.",
+      "migration": "Move the amount to the named spend_cap parameter in major units: divide the minor-unit amount you sent in params by the currency's minor-unit factor, 100 for most currencies and 1 for currencies without minor units such as JPY or KRW. params={'spend_cap': 25000} in USD becomes spend_cap=250."
+    },
+    {
+      "tool": "update_campaign",
+      "kind": "behaviour",
+      "what_changed": "spend_cap inside params is now refused before any request is sent, including the read of the campaign, with a message pointing to the named spend_cap parameter. Before, params={'spend_cap': 25000} was sent to Meta as written and read in minor units (250.00 USD), while the named spend_cap takes major units. daily_budget and lifetime_budget inside params were already refused; only their message changed.",
+      "why_better": "The same field no longer has two units, so an amount cannot silently be 100 times too small (or too large) because it was put in params instead of the named parameter.",
+      "migration": "Move the amount to the named spend_cap parameter in major units: divide the minor-unit amount you sent in params by the currency's minor-unit factor, 100 for most currencies and 1 for currencies without minor units such as JPY or KRW. params={'spend_cap': 25000} in USD becomes spend_cap=250."
+    },
+    {
+      "tool": "create_ad_set",
+      "kind": "behaviour",
+      "what_changed": "daily_spend_cap, lifetime_spend_cap, daily_min_spend_target and lifetime_min_spend_target inside params are now refused before any request is sent, with a message pointing to the named parameter of the same name. Before, they were sent to Meta as written and read in minor units, while the named parameters take major units. bid_amount, daily_budget and lifetime_budget inside params were already refused; only their message changed.",
+      "why_better": "The same field no longer has two units, so an amount cannot silently be 100 times too small (or too large) because it was put in params instead of the named parameter.",
+      "migration": "Move each amount to the named parameter of the same name in major units: divide the minor-unit amount you sent in params by the currency's minor-unit factor, 100 for most currencies and 1 for currencies without minor units such as JPY or KRW. params={'daily_spend_cap': 9000} in USD becomes daily_spend_cap=90."
+    },
+    {
+      "tool": "update_custom_audience",
+      "kind": "behaviour",
+      "what_changed": "When a call changes the audience rule, whether through the named rule parameter or through params={'rule': ...}, the tool now also asks Meta for the audience's current rule in the read it already makes before updating, and returns it as previous.rule. Before, a params-only rule change read and returned the other fields but not the old rule.",
+      "why_better": "The rule decides who is in the audience, and Meta does not keep the old one. Returning it before it is replaced is the only way to put it back if the new rule turns out to be wrong.",
+      "migration": "No change to how the tool is called. The response has one more field, previous.rule; the read before the update asks for one more field."
+    },
+    {
+      "tool": "create_ad_set",
+      "kind": "behaviour",
+      "parameter": "start_time",
+      "what_changed": "When start_time or end_time is given without a time zone (for example 2026-11-27T00:00:00), the ad set is still created with exactly the same request as before, but the tool then reads the new ad set once and the response gains two fields: warnings, saying the time had no time zone so Meta chose how to read it, and stored_schedule, the start and end time Meta stored. With validate_only the warning is given without the read. A time with an offset, Unix seconds or no time at all makes the same requests and returns the same fields as before.",
+      "why_better": "A time with no time zone can be read as a different hour than the caller meant, which starts or ends delivery hours early or late. Showing what Meta stored makes a shift visible at once, without refusing calls that worked before.",
+      "migration": "No change to how the tool is called. To avoid the warning and the extra read, pass times with a UTC offset, for example 2026-11-27T00:00:00-05:00. If the read after the create fails, the create is still reported as a success with its id."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "A campaign created without a campaign budget (no daily_budget and no lifetime_budget) and without is_adset_budget_sharing_enabled, named or inside params, is now sent with is_adset_budget_sharing_enabled false, one more field than before, and the response gains defaults_applied naming the field, the value sent and why. This applies to validate_only calls too. A campaign with a campaign budget is sent exactly as before, and a caller who gives the field gets exactly the value given.",
+      "why_better": "Meta now refuses every campaign without a campaign budget unless this choice is sent (seen live on 2026-11-13: code 100, subcode 4834011), so the old call always failed. It now succeeds, with each ad set keeping its own budget, which is how such campaigns behaved before Meta added budget sharing, and the response says what was chosen.",
+      "migration": "Nothing to change. To let ad sets share up to 20 percent of their budgets, pass is_adset_budget_sharing_enabled=true; to state the default yourself, pass false."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "When start_time or stop_time is sent, named or inside params, a real create (not validate_only) now reads the new campaign's start_time and stop_time once after the create, and the response gains stored_schedule (what Meta holds; a start Meta reports as 1969 or 1970, meaning unset, is shown as null) and, when a sent time was not stored, warnings saying so. The create request itself is unchanged. If the read fails, the create is still reported as a success, with a warning that the stored times could not be read.",
+      "why_better": "Meta accepts a campaign's start_time and stop_time and stores neither (seen live on 2026-11-13): a campaign's schedule comes from its ad sets. Before, the caller had no sign that the times were ignored and could believe the campaign was scheduled when it was not.",
+      "migration": "No change to how the tool is called. Set start and end times on the ad sets (create_ad_set or update_adset) instead of the campaign; a call without start_time or stop_time makes the same requests and returns the same fields as before."
+    },
+    {
+      "tool": "update_campaign",
+      "kind": "behaviour",
+      "what_changed": "When start_time or stop_time is sent, named or inside params, the tool now reads the campaign's start_time and stop_time once after the update and adds stored_schedule to the response. A sent time that Meta did not store is no longer listed under current; it moves to a new field, sent, and warnings says Meta did not store it. A sent time Meta did store stays in current, and every other field of current is unchanged. If the read fails, the update is still reported as a success, the times are listed under sent, and a warning says the stored times could not be read.",
+      "why_better": "Meta accepts a campaign's start_time and stop_time and stores neither (seen live on 2026-11-13), and the tool used to report the times it sent as the campaign's current values, which was false. The response now shows what the campaign really holds.",
+      "migration": "Read the times you sent from sent instead of current when Meta did not store them, and read what Meta holds from stored_schedule. Set schedules on the ad sets (update_adset) instead of the campaign. A call without start_time or stop_time makes the same requests and returns the same fields as before."
+    },
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "When Meta answers with a success status but the body cannot be read as a JSON object (it is not JSON, or it is a bare null, text or number), the tool now raises a Meta API error saying the answer could not be read. After a write the error says the outcome is not known. Before, a body that was not JSON was handed to the tool as an object, so a write was reported as done and a tool that reads before it writes went on to write; a bare null or number crashed the tool.",
+      "why_better": "An answer that cannot be read is no longer presented as a result. A caller is told plainly that a write may or may not have happened, and no tool acts on a read it could not read.",
+      "migration": "Nothing to change for a normal answer. Where a caller handled this case, treat the error like any other Meta error; when it says the outcome is not known, read the object before retrying."
+    }
+  ]
+}

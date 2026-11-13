@@ -16,14 +16,22 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.tools import (
     activity,
     ads,
+    assets,
     audiences,
     auth_tools,
+    business_access,
     campaigns,
+    catalogs,
+    catalog_feeds,
     creatives,
+    creative_formats,
+    datasets,
     diagnostics,
     discovery,
     execution,
+    experiments,
     insights,
+    performance_signals,
     recommendations,
     research,
     social_feedback,
@@ -142,7 +150,106 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_page_recommendations": {"page_id": "page_123"},
     "list_change_history": {"account_id": "123"},
     "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
+    "list_datasets": {"account_id": "123"},
+    "get_dataset": {"dataset_id": "px_123"},
+    "get_dataset_stats": {"dataset_id": "px_123", "since": "2026-03-01", "until": "2026-03-07"},
+    "get_dataset_quality": {"dataset_id": "px_123"},
+    "list_ad_studies": {"account_id": "123"},
+    "get_ad_study": {"study_id": "study_123", "include_results": True},
+    "check_ab_test_eligibility": {"entity_ids": ["cmp_123", "cmp_456"]},
+    "create_ab_test": {
+        "business_id": "biz_123",
+        "cells": [
+            {"name": "A", "treatment_percentage": 50, "adset_ids": ["adset_123"]},
+            {"name": "B", "treatment_percentage": 50, "adset_ids": ["adset_456"]},
+        ],
+        "start_time": "2099-01-01T00:00:00Z",
+        "end_time": "2099-01-15T00:00:00Z",
+    },
+    "create_lift_study": {
+        "business_id": "biz_123",
+        "cells": [{"name": "Test", "treatment_percentage": 90, "control_percentage": 10}],
+        "objectives": [{"name": "Purchases", "adspixels": [{"id": "px_123", "event_names": ["fb_pixel_purchase"]}]}],
+        "start_time": "2099-01-01T00:00:00Z",
+        "end_time": "2099-01-15T00:00:00Z",
+    },
+    "update_ad_study": {"study_id": "study_123", "name": "Updated Study"},
+    "cancel_ad_study": {"study_id": "study_123"},
+    "list_catalogs": {"business_id": "biz_123"},
+    "list_dpa_eligible_catalogs": {"business_id": "biz_123"},
+    "get_catalog_diagnostics": {"catalog_id": "cat_123"},
+    "get_catalog_dynamic_ads_health": {"catalog_id": "cat_123"},
+    "list_catalog_data_sources": {"catalog_id": "cat_123"},
+    "create_catalog": {"business_id": "biz_123"},
+    "update_catalog": {"catalog_id": "cat_123", "name": "Updated Catalog"},
+    "list_catalog_products": {"catalog_id": "cat_123"},
+    "create_catalog_product": {
+        "catalog_id": "cat_123", "retailer_id": "sku_123", "price": 12.5, "currency": "USD",
+        "url": "https://example.com/p", "image_url": "https://example.com/p.png",
+    },
+    "update_catalog_product": {"product_id": "prod_123", "price": 9.99},
+    "delete_catalog_product": {"product_id": "prod_123"},
+    "build_product_set_filter": {
+        "catalog_id": "cat_123", "conditions": [{"field": "brand", "operator": "eq", "value": "Acme"}],
+    },
+    "list_product_sets": {"catalog_id": "cat_123"},
+    "create_product_set": {"catalog_id": "cat_123", "filter": {"brand": {"eq": "Acme"}}},
+    "update_product_set": {"product_set_id": "ps_123", "name": "Updated Set"},
+    "delete_product_set": {"product_set_id": "ps_123"},
+    "batch_update_catalog_products": {
+        "catalog_id": "123", "items": [{"method": "update", "retailer_id": "sku_123", "name": "New"}],
+        "allow_upsert": True, "wait_seconds": 0,
+    },
+    "list_catalog_attribute_values": {"catalog_id": "123", "attribute": "brand"},
+    "list_product_feeds": {"catalog_id": "cat_123"},
+    "create_product_feed": {"catalog_id": "cat_123", "schedule": {"url": "https://example.com/feed.csv", "interval": "DAILY"}},
+    "update_product_feed": {"feed_id": "feed_123", "name": "Updated Feed"},
+    "delete_product_feed": {"feed_id": "feed_123"},
+    "create_product_feed_upload": {"feed_id": "feed_123", "url": "https://example.com/feed.csv"},
+    "list_product_feed_uploads": {"feed_id": "feed_123"},
+    "list_feed_rules": {"feed_id": "feed_123"},
+    "create_feed_rule": {"feed_id": "feed_123", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}},
+    "delete_feed_rule": {"rule_id": "rule_123"},
+    "update_feed_rule": {"rule_id": "123", "params": {"type": "to_lower"}},
+    "list_catalog_event_sources": {"catalog_id": "cat_123"},
+    "list_event_source_catalogs": {"event_source_id": "external_event_sources_123"},
+    "get_catalog_event_source_health": {"catalog_id": "cat_123"},
+    "get_catalog_event_source_recommendations": {"catalog_id": "cat_123"},
+    "connect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "px_123"},
+    "disconnect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "external_event_sources_123"},
+    "list_pages": {"source": "ad_account", "account_id": "123"},
+    "list_instagram_media": {"instagram_account_id": "ig_123"},
+    "list_creative_ads": {"account_id": "123"},
+    "get_field_reference": {"level": "ad", "field_names": ["name", "status"], "object_id": "ad_123"},
+    "update_adset": {"name": "Updated Ad Set"},
+    "update_ad": {"name": "Updated Ad"},
+    "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
+    "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
+    "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
+    "list_business_users": {"business_id": "123"},
+    "list_catalog_assigned_users": {"catalog_id": "456", "business_id": "123"},
+    "list_user_assigned_catalogs": {"user_id": "789"},
+    "preview_catalog_access_change": {"catalog_id": "456", "business_id": "123", "user_id": "789", "tasks": ["ADVERTISE"]},
+    "set_catalog_access": {"catalog_id": "456", "business_id": "123", "user_id": "789", "tasks": ["ADVERTISE"], "dry_run": True},
+    "list_catalog_partners": {"catalog_id": "456"},
+    "duplicate_campaign": {"campaign_id": "111", "deep_copy": True},
+    "duplicate_adset": {"adset_id": "411", "campaign_id": "999"},
+    "duplicate_ad": {"ad_id": "611", "new_name": "Copied ad"},
+    "get_performance_trend": {"object_id": "cmp_123"},
+    "detect_performance_anomalies": {"object_id": "cmp_123"},
+    "get_auction_ranking_report": {"object_id": "cmp_123"},
 }
+# search_terms became optional (search_page_ids is the other route), so the smoke run names it.
+TOOL_OVERRIDES["search_ads_archive"] = {**TOOL_OVERRIDES["search_ads_archive"], "search_terms": "shirts"}
+
+# Phase two, stream P1 (creatives, media and assets).
+TOOL_OVERRIDES["boost_instagram_post"] = {**TOOL_OVERRIDES["boost_instagram_post"], "adset_id": "adset_123"}
+TOOL_OVERRIDES.update({
+    "create_ad_creative_from_inputs": {"page_id": "111", "image_hash": "hash_123", "link_url": "https://example.com"},
+    "update_ad_creative_enhancements": {"features": {"image_touchups": "OPT_OUT"}},
+    "upload_ad_video": {"video_url": "https://example.com/video.mp4"},
+    "delete_ad_image": {"image_hash": "hash_123"},
+})
 
 
 class UniversalFakeClient:
@@ -302,6 +409,10 @@ class UniversalFakeClient:
             }
         if edge == "insights":
             return {"data": [SAMPLE_INSIGHTS_ROW]}
+        if edge in {"assigned_users", "agencies"}:
+            # Catalog access rows carry numeric ids as Meta returns them; the access tools treat a
+            # row whose id is not numeric as unidentified and refuse to change access around it.
+            return {"data": [{"id": "321", "name": f"{edge} item", "tasks": ["ADVERTISE"], "permitted_tasks": ["ADVERTISE"]}]}
         return {"data": [{"id": f"{edge}_123", "name": f"{edge} item"}]}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
@@ -364,6 +475,9 @@ class UniversalFakeClient:
 
     async def delete_object(self, object_id: str):
         return {"success": True, "id": object_id}
+
+    async def delete_edge_object(self, parent_id: str, edge: str, *, data):
+        return {"success": True, "parent_id": parent_id, "edge": edge}
 
     async def get_insights(self, object_id: str, *, fields, params):
         return {"data": [SAMPLE_INSIGHTS_ROW], "paging": {"cursors": {"after": "after_1"}}}
@@ -505,14 +619,22 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
     for module in [
         activity,
         ads,
+        assets,
         audiences,
         auth_tools,
+        business_access,
         campaigns,
+        catalogs,
+        catalog_feeds,
         creatives,
+        creative_formats,
+        datasets,
         diagnostics,
         discovery,
         execution,
+        experiments,
         insights,
+        performance_signals,
         recommendations,
         research,
         social_feedback,

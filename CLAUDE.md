@@ -10,7 +10,9 @@ uv run --extra dev pytest
 
 ## Project Notes
 
-- Prefer optimization and diagnostics tools over broad mutation coverage.
+- Prefer optimization and diagnostics tools over broad mutation coverage. The
+  one exception is parity with Meta's official Ads MCP server: see
+  `docs/superpowers/specs/2026-11-12-official-mcp-parity-design.md`.
 - Keep Graph API calls isolated in `meta_ads_mcp/graph_api.py`.
 - Return dicts and lists, not serialized JSON strings.
 - Keep IDs as strings.
