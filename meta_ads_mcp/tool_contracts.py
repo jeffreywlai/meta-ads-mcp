@@ -38,6 +38,9 @@ _WRITE_NAMES = frozenset(
         "add_audience_users",
         "remove_audience_users",
         "boost_instagram_post",
+        "duplicate_campaign",
+        "duplicate_adset",
+        "duplicate_ad",
     }
 )
 _READ_TAGS = frozenset({"read", "read-only", "readonly"})

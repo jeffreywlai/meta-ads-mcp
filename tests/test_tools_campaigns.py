@@ -869,6 +869,197 @@ def test_create_ad_set_rejects_too_many_decimals_for_spend_cap_before_sending(mo
     assert client.created_payload is None
 
 
+class CopyClient:
+    """Fake client for Meta's copies edge; records every call."""
+
+    def __init__(self, *, result: dict | None = None, rename_error: Exception | None = None) -> None:
+        self.result = result
+        self.rename_error = rename_error
+        self.calls: list[tuple] = []
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        if self.result is not None:
+            return self.result
+        return {
+            "copied_campaign_id": "222",
+            "ad_object_ids": [
+                {"ad_object_type": "campaign", "source_id": "111", "copied_id": "222"},
+                {"ad_object_type": "ad_set", "source_id": "311", "copied_id": "322"},
+            ],
+        }
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        if self.rename_error is not None:
+            raise self.rename_error
+        return {"success": True}
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        raise AssertionError("duplicate tools do not read")
+
+
+def test_duplicate_campaign_defaults_to_paused(monkeypatch) -> None:
+    client = CopyClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111"))
+    assert client.calls == [("create", "111", "copies", {"status_option": "PAUSED"})]
+    assert result["ok"] is True
+    assert result["action"] == "duplicate_campaign"
+    assert result["target"] == {"campaign_id": "111"}
+    assert result["new_id"] == "222"
+    assert result["new_ids"] == {"campaign_id": "222"}
+    assert result["copied_objects"] == [
+        {"type": "campaign", "source_id": "111", "copied_id": "222"},
+        {"type": "ad_set", "source_id": "311", "copied_id": "322"},
+    ]
+    assert result["status_option"] == "PAUSED"
+    assert result["dry_run"] is False
+
+
+def test_duplicate_adset_defaults_to_paused(monkeypatch) -> None:
+    client = CopyClient(result={"copied_adset_id": "422", "ad_object_ids": []})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_adset(adset_id="411"))
+    assert client.calls == [("create", "411", "copies", {"status_option": "PAUSED"})]
+    assert result["new_ids"] == {"adset_id": "422"}
+    assert result["target"] == {"adset_id": "411"}
+
+
+def test_duplicate_campaign_sends_every_option(monkeypatch) -> None:
+    client = CopyClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.duplicate_campaign(
+        campaign_id="111", deep_copy=True, status_option="INHERITED_FROM_SOURCE",
+        rename_strategy="DEEP_RENAME", rename_prefix="[Test] ", rename_suffix=" v2",
+        start_time="2026-12-01T00:00:00-05:00", end_time="2026-12-31T00:00:00-05:00",
+    ))
+    assert client.calls == [("create", "111", "copies", {
+        "deep_copy": True,
+        "status_option": "INHERITED_FROM_SOURCE",
+        "rename_options": {"rename_strategy": "DEEP_RENAME", "rename_prefix": "[Test] ", "rename_suffix": " v2"},
+        "start_time": "2026-12-01T00:00:00-05:00",
+        "end_time": "2026-12-31T00:00:00-05:00",
+    })]
+
+
+def test_duplicate_adset_into_another_campaign_with_schedule(monkeypatch) -> None:
+    client = CopyClient(result={"copied_adset_id": "422"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_adset(
+        adset_id="411", campaign_id="999", deep_copy=True, status_option="ACTIVE",
+        start_time="1795000000", end_time="0",
+    ))
+    assert client.calls == [("create", "411", "copies", {
+        "deep_copy": True, "status_option": "ACTIVE", "start_time": "1795000000", "end_time": "0",
+        "campaign_id": "999",
+    })]
+    assert result["copied_objects"] == []
+    assert result["status_option"] == "ACTIVE"
+
+
+def test_duplicate_campaign_new_name_renames_the_copy(monkeypatch) -> None:
+    client = CopyClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="Black Friday 2"))
+    assert client.calls == [
+        ("create", "111", "copies", {"status_option": "PAUSED"}),
+        ("update", "222", {"name": "Black Friday 2"}),
+    ]
+    assert result["rename"] == {"requested": "Black Friday 2", "applied": True}
+
+
+def test_duplicate_rename_failure_still_returns_the_new_id(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    client = CopyClient(rename_error=MetaApiError(message="Invalid parameter", status_code=400, code=100))
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="Black Friday 2"))
+    assert result["new_id"] == "222"
+    assert result["rename"]["applied"] is False
+    assert result["rename"]["error"]["code"] == 100
+    assert "update_campaign" in result["rename"]["next_step"]
+    assert "222" in result["rename"]["next_step"]
+
+
+def test_duplicate_without_a_new_id_in_the_response_says_so_and_does_not_rename(monkeypatch) -> None:
+    client = CopyClient(result={"success": True})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="X"))
+    assert [call[0] for call in client.calls] == ["create"]
+    assert result["new_id"] is None
+    assert "did not include" in result["warning"]
+    assert result["rename"]["applied"] is False
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "deep_copy": True, "new_name": "Copy",
+                                        "rename_suffix": " v2", "start_time": "1795000000"}),
+        (campaigns.duplicate_adset, {"adset_id": "411", "campaign_id": "999", "new_name": "Copy"}),
+    ],
+)
+def test_duplicate_dry_run_sends_nothing(monkeypatch, tool, arguments) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    result = asyncio.run(tool(**arguments, dry_run=True))
+    assert result["dry_run"] is True
+    assert result["sent"] is False
+    source_id = arguments.get("campaign_id") if tool is campaigns.duplicate_campaign else arguments["adset_id"]
+    assert result["requests"][0]["method"] == "POST"
+    assert result["requests"][0]["path"] == f"{source_id}/copies"
+    assert result["requests"][0]["data"]["status_option"] == "PAUSED"
+    assert result["requests"][1] == {
+        "method": "POST", "path": "<id of the new copy>", "data": {"name": "Copy"},
+    }
+
+
+def test_duplicate_campaign_dry_run_shows_exact_request(monkeypatch) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", deep_copy=True, dry_run=True))
+    assert result["requests"] == [
+        {"method": "POST", "path": "111/copies", "data": {"deep_copy": True, "status_option": "PAUSED"}},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "message"),
+    [
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "status_option": "DELETED"}, "status_option"),
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "status_option": "paused"}, "status_option"),
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "rename_strategy": "RENAME_ALL"}, "rename_strategy"),
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "start_time": "1795000000"}, "deep_copy"),
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "end_time": "1795000000"}, "deep_copy"),
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "deep_copy": True,
+                                        "start_time": "2026-12-31T00:00:00Z", "end_time": "2026-12-01T00:00:00Z"},
+         "end_time must be after start_time"),
+        (campaigns.duplicate_campaign, {"campaign_id": "111", "new_name": " "}, "new_name"),
+        (campaigns.duplicate_campaign, {"campaign_id": " "}, "campaign_id"),
+        (campaigns.duplicate_adset, {"adset_id": "411", "start_time": "2026-12-01"}, "UTC offset"),
+        (campaigns.duplicate_adset, {"adset_id": "411", "campaign_id": " "}, "campaign_id"),
+    ],
+)
+def test_duplicate_input_errors_make_no_call(monkeypatch, tool, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(tool(**arguments))
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("duplicate_campaign", {"campaign_id": "cmp_1"}),
+        ("duplicate_adset", {"adset_id": "411", "campaign_id": "act_1"}),
+    ],
+)
+def test_duplicate_ids_must_be_numeric_at_the_mcp_boundary(monkeypatch, tool_name, arguments) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(Exception):
+        asyncio.run(mcp_server.call_tool(tool_name, {**arguments, "dry_run": True}))
+
+
 class MoneyAdsetClient:
     """Fake client for update_adset money fields: an ad set on an account with a currency."""
 

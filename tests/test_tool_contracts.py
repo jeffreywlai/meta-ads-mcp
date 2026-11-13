@@ -218,6 +218,9 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
+    "duplicate_campaign": {"campaign_id": "111", "deep_copy": True},
+    "duplicate_adset": {"adset_id": "411", "campaign_id": "999"},
+    "duplicate_ad": {"ad_id": "611", "new_name": "Copied ad"},
 }
 
 

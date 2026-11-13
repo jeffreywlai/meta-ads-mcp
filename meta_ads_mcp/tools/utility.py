@@ -148,6 +148,9 @@ TOOL_GROUPS = {
         "add_audience_users",
         "remove_audience_users",
         "boost_instagram_post",
+        "duplicate_campaign",
+        "duplicate_adset",
+        "duplicate_ad",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -590,6 +593,18 @@ INTENT_GUIDE = {
             "For customer lists prefer file_path to a local CSV so personal data never passes through the model; inline rows are limited to 1,000.",
         ],
     },
+    "duplicate_campaigns_ad_sets_or_ads": {
+        "description": (
+            "Copy, clone or duplicate a campaign, ad set or ad, optionally with its children, into a new "
+            "parent, with a new name or schedule, after explicit user confirmation."
+        ),
+        "recommended_order": ["duplicate_campaign", "duplicate_adset", "duplicate_ad"],
+        "avoid_unless_needed": [],
+        "notes": [
+            "Copies are PAUSED unless status_option says otherwise; dry_run shows the exact request first.",
+            "Meta allows a deep copy of at most 3 ads in one call; copy larger structures level by level.",
+        ],
+    },
 }
 
 ROUTING_HINTS = {
@@ -955,6 +970,7 @@ async def list_mutation_tools() -> dict[str, object]:
             "general_edits": ["update_adset", "update_ad"],
             "customer_list_users": ["add_audience_users", "remove_audience_users"],
             "instagram_boost": ["boost_instagram_post"],
+            "duplication": ["duplicate_campaign", "duplicate_adset", "duplicate_ad"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",

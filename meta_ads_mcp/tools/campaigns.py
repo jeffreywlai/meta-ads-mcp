@@ -7,7 +7,7 @@ from typing import Any
 
 from meta_ads_mcp.api_compat import validate_targeting_placements
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.errors import MetaAdsError, ValidationError
 from meta_ads_mcp.field_reference import FIELD_REFERENCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, add_validate_only, merge_graph_payload
@@ -19,7 +19,7 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, StringList
+from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount, GraphId, StringList
 
 
 def _encode_budget_field(
@@ -602,3 +602,192 @@ async def update_adset(
     if spend:
         response["money_units"] = f"major units of the ad account currency ({currency})"
     return response
+
+
+# Meta's copies edge on campaigns, ad sets and ads (POST /{id}/copies).
+COPY_STATUS_OPTIONS = ("PAUSED", "ACTIVE", "INHERITED_FROM_SOURCE")
+COPY_RENAME_STRATEGIES = ("DEEP_RENAME", "ONLY_TOP_LEVEL_RENAME", "NO_RENAME")
+_NEW_COPY_PLACEHOLDER = "<id of the new copy>"
+
+
+def _required_id(value: str | None, field_name: str) -> str:
+    """Check a required object id that must not be blank."""
+    text = blank_to_none(value) if isinstance(value, str) else None
+    if text is None:
+        raise ValidationError(f"{field_name} is required.")
+    return text
+
+
+def build_copy_request(
+    *,
+    deep_copy: bool | None,
+    status_option: str,
+    rename_strategy: str | None,
+    rename_prefix: str | None,
+    rename_suffix: str | None,
+    new_name: str | None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    parent: tuple[str, str | None] | None = None,
+) -> dict[str, Any]:
+    """Validate copy options and build the body for POST /{id}/copies."""
+    if status_option not in COPY_STATUS_OPTIONS:
+        raise ValidationError(f"status_option must be one of {list(COPY_STATUS_OPTIONS)}.")
+    if rename_strategy is not None and rename_strategy not in COPY_RENAME_STRATEGIES:
+        raise ValidationError(f"rename_strategy must be one of {list(COPY_RENAME_STRATEGIES)}.")
+    if new_name is not None:
+        _nonblank_text(new_name, "new_name")
+    new_start = _validate_adset_time(start_time, "start_time")
+    new_end = _validate_adset_time(end_time, "end_time")
+    if new_start is not None and new_end is not None and new_end <= new_start:
+        raise ValidationError("end_time must be after start_time.")
+    data: dict[str, Any] = {}
+    if deep_copy:
+        data["deep_copy"] = True
+    data["status_option"] = status_option
+    rename_options = {
+        key: value
+        for key, value in (
+            ("rename_strategy", rename_strategy),
+            ("rename_prefix", rename_prefix),
+            ("rename_suffix", rename_suffix),
+        )
+        if value is not None
+    }
+    if rename_options:
+        data["rename_options"] = rename_options
+    if start_time is not None:
+        data["start_time"] = start_time
+    if end_time is not None:
+        data["end_time"] = end_time
+    if parent is not None and parent[1] is not None:
+        data[parent[0]] = _required_id(parent[1], parent[0])
+    return data
+
+
+async def run_copy(
+    client_factory: Any,
+    *,
+    action: str,
+    object_type: str,
+    source_id: str,
+    data: dict[str, Any],
+    new_name: str | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Send a copy request (or show it under dry_run), then apply new_name to the copy."""
+    id_key = f"{object_type}_id"
+    response: dict[str, Any] = {
+        "ok": True,
+        "action": action,
+        "target": {id_key: source_id},
+        "dry_run": dry_run,
+        "status_option": data["status_option"],
+    }
+    requests = [{"method": "POST", "path": f"{source_id}/copies", "data": data}]
+    if new_name is not None:
+        requests.append({"method": "POST", "path": _NEW_COPY_PLACEHOLDER, "data": {"name": new_name}})
+    if dry_run:
+        response.update({"sent": False, "requests": requests})
+        return response
+    client = client_factory()
+    result = await client.create_edge_object(source_id, "copies", data=data)
+    raw_new_id = result.get(f"copied_{object_type}_id") if isinstance(result, dict) else None
+    new_id = str(raw_new_id) if raw_new_id not in (None, "") else None
+    copied = result.get("ad_object_ids") if isinstance(result, dict) else None
+    response.update({
+        "sent": True,
+        "new_id": new_id,
+        "new_ids": {id_key: new_id},
+        "copied_objects": [
+            {
+                "type": item.get("ad_object_type"),
+                "source_id": None if item.get("source_id") is None else str(item.get("source_id")),
+                "copied_id": None if item.get("copied_id") is None else str(item.get("copied_id")),
+            }
+            for item in (copied if isinstance(copied, list) else [])
+            if isinstance(item, dict)
+        ],
+        "result": result,
+    })
+    if new_id is None:
+        response["warning"] = (
+            "Meta's response did not include the new copy's id; find the copy under its parent "
+            "before acting on it."
+        )
+    if new_name is None:
+        return response
+    rename: dict[str, Any] = {"requested": new_name, "applied": False}
+    if new_id is None:
+        rename["reason"] = "The copy's id is unknown, so it was not renamed."
+    else:
+        try:
+            await client.update_object(new_id, data={"name": new_name})
+        except MetaAdsError as exc:
+            public = getattr(exc, "to_public_dict", None)
+            rename["error"] = public() if callable(public) else {"type": type(exc).__name__}
+        except Exception as exc:  # The copy exists; keep its id in the answer whatever the rename did.
+            rename["error"] = {"type": type(exc).__name__}
+        else:
+            rename["applied"] = True
+        if not rename["applied"]:
+            rename["next_step"] = (
+                f"The copy {new_id} exists with Meta's default name; rename it with update_{object_type}."
+            )
+    response["rename"] = rename
+    return response
+
+
+@mcp_server.tool()
+async def duplicate_campaign(
+    campaign_id: GraphId,
+    deep_copy: bool = False,
+    status_option: str = "PAUSED",
+    new_name: str | None = None,
+    rename_strategy: str | None = None,
+    rename_prefix: str | None = None,
+    rename_suffix: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Copy a campaign with Meta's copy endpoint and return the new ids. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE. deep_copy also copies its ad sets and ads; Meta allows at most 3 ads in total for a deep copy made this way. start_time and end_time (deep copy only) set the copied ad sets' schedule. new_name renames the copy after it is made; rename_strategy (DEEP_RENAME, ONLY_TOP_LEVEL_RENAME, NO_RENAME), rename_prefix and rename_suffix control Meta's renaming, which by default appends " - Copy". dry_run returns the exact requests and sends nothing."""
+    source_id = _required_id(campaign_id, "campaign_id")
+    if not deep_copy and (start_time is not None or end_time is not None):
+        raise ValidationError("start_time and end_time apply to a campaign copy only with deep_copy=true.")
+    data = build_copy_request(
+        deep_copy=deep_copy, status_option=status_option, rename_strategy=rename_strategy,
+        rename_prefix=rename_prefix, rename_suffix=rename_suffix, new_name=new_name,
+        start_time=start_time, end_time=end_time,
+    )
+    return await run_copy(
+        get_graph_api_client, action="duplicate_campaign", object_type="campaign",
+        source_id=source_id, data=data, new_name=new_name, dry_run=dry_run,
+    )
+
+
+@mcp_server.tool()
+async def duplicate_adset(
+    adset_id: GraphId,
+    campaign_id: GraphId | None = None,
+    deep_copy: bool = False,
+    status_option: str = "PAUSED",
+    new_name: str | None = None,
+    rename_strategy: str | None = None,
+    rename_prefix: str | None = None,
+    rename_suffix: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Copy an ad set with Meta's copy endpoint and return the new ids. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE. campaign_id puts the copy under another campaign, whose settings such as budget it then follows; omitted, it stays in the original campaign. deep_copy also copies its ads; Meta allows at most 3 ads for a deep copy made this way. start_time and end_time (ISO 8601 with a UTC offset, or Unix seconds; end_time 0 means no end) override the copied schedule. new_name renames the copy after it is made; rename_strategy, rename_prefix and rename_suffix control Meta's renaming. dry_run returns the exact requests and sends nothing."""
+    source_id = _required_id(adset_id, "adset_id")
+    data = build_copy_request(
+        deep_copy=deep_copy, status_option=status_option, rename_strategy=rename_strategy,
+        rename_prefix=rename_prefix, rename_suffix=rename_suffix, new_name=new_name,
+        start_time=start_time, end_time=end_time, parent=("campaign_id", campaign_id),
+    )
+    return await run_copy(
+        get_graph_api_client, action="duplicate_adset", object_type="adset",
+        source_id=source_id, data=data, new_name=new_name, dry_run=dry_run,
+    )

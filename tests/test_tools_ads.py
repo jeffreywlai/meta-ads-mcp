@@ -496,6 +496,74 @@ def test_update_ad_names_a_changed_field_meta_did_not_return(monkeypatch) -> Non
     assert result["current"]["creative_id"] == "crt_new"
 
 
+class AdCopyClient:
+    """Fake client for an ad's copies edge."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return {"copied_ad_id": "622"}
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+
+def test_duplicate_ad_defaults_to_paused(monkeypatch) -> None:
+    client = AdCopyClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.duplicate_ad(ad_id="611"))
+    assert client.calls == [("create", "611", "copies", {"status_option": "PAUSED"})]
+    assert result["action"] == "duplicate_ad"
+    assert result["target"] == {"ad_id": "611"}
+    assert result["new_id"] == "622"
+    assert result["new_ids"] == {"ad_id": "622"}
+    assert result["copied_objects"] == []
+
+
+def test_duplicate_ad_into_another_ad_set_with_rename_rule_and_new_name(monkeypatch) -> None:
+    client = AdCopyClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.duplicate_ad(
+        ad_id="611", adset_id="700", status_option="ACTIVE",
+        rename_strategy="NO_RENAME", new_name="Hero ad B",
+    ))
+    assert client.calls == [
+        ("create", "611", "copies", {
+            "status_option": "ACTIVE", "rename_options": {"rename_strategy": "NO_RENAME"}, "adset_id": "700",
+        }),
+        ("update", "622", {"name": "Hero ad B"}),
+    ]
+    assert result["rename"] == {"requested": "Hero ad B", "applied": True}
+
+
+def test_duplicate_ad_dry_run_sends_nothing(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    result = asyncio.run(ads.duplicate_ad(ad_id="611", adset_id="700", dry_run=True))
+    assert result["dry_run"] is True
+    assert result["sent"] is False
+    assert result["requests"] == [
+        {"method": "POST", "path": "611/copies", "data": {"status_option": "PAUSED", "adset_id": "700"}},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"ad_id": "611", "status_option": "ARCHIVED"}, "status_option"),
+        ({"ad_id": "611", "rename_strategy": "x"}, "rename_strategy"),
+        ({"ad_id": "611", "adset_id": ""}, "adset_id"),
+        ({"ad_id": "611", "new_name": ""}, "new_name"),
+    ],
+)
+def test_duplicate_ad_input_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match=message):
+        asyncio.run(ads.duplicate_ad(**arguments))
+
+
 class RecordingAdsClient(FakeAdsClient):
     """Fake ad client that records every call in order."""
 

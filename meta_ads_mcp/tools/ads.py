@@ -17,8 +17,13 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
-from meta_ads_mcp.tools.campaigns import reject_named_and_params, validate_adlabels
-from meta_ads_mcp.tool_types import CurrencyAmount, StrictStringList, coerce_strict_csv_string_list
+from meta_ads_mcp.tools.campaigns import (
+    build_copy_request,
+    reject_named_and_params,
+    run_copy,
+    validate_adlabels,
+)
+from meta_ads_mcp.tool_types import CurrencyAmount, GraphId, StrictStringList, coerce_strict_csv_string_list
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -472,3 +477,29 @@ async def update_ad(
     if unavailable:
         response["previous_unavailable"] = unavailable
     return response
+
+
+@mcp_server.tool()
+async def duplicate_ad(
+    ad_id: GraphId,
+    adset_id: GraphId | None = None,
+    status_option: str = "PAUSED",
+    new_name: str | None = None,
+    rename_strategy: str | None = None,
+    rename_prefix: str | None = None,
+    rename_suffix: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Copy an ad with Meta's copy endpoint and return the new ad id. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE, and it keeps the same creative. adset_id puts the copy in another ad set; omitted, it stays in the original ad set. new_name renames the copy after it is made; rename_strategy, rename_prefix and rename_suffix control Meta's renaming, which by default appends " - Copy". dry_run returns the exact requests and sends nothing."""
+    source_id = blank_to_none(ad_id) if isinstance(ad_id, str) else None
+    if source_id is None:
+        raise ValidationError("ad_id is required.")
+    data = build_copy_request(
+        deep_copy=None, status_option=status_option, rename_strategy=rename_strategy,
+        rename_prefix=rename_prefix, rename_suffix=rename_suffix, new_name=new_name,
+        parent=("adset_id", adset_id),
+    )
+    return await run_copy(
+        get_graph_api_client, action="duplicate_ad", object_type="ad",
+        source_id=source_id, data=data, new_name=new_name, dry_run=dry_run,
+    )
