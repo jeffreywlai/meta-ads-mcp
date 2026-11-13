@@ -21,7 +21,7 @@ from meta_ads_mcp.money import (
     to_minor_units,
     validate_positive_amount,
 )
-from meta_ads_mcp.normalize import blank_to_none
+from meta_ads_mcp.normalize import blank_to_none, read_collection_page
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import (
     BidConstraints,
@@ -118,24 +118,37 @@ ADLABELS_PREVIOUS_INCOMPLETE = (
 ADLABELS_PREVIOUS_UNREADABLE = "Meta returned labels in a shape this server could not read; previous shows none."
 
 
+def _adlabels_rows_unreadable(count: int) -> str:
+    return (
+        f"{count} of the labels Meta returned {'is' if count == 1 else 'are'} not a label with an id or a name; "
+        "previous lists the others only. The update replaced the whole label set."
+    )
+
+
 def read_adlabels(value: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
-    """Shape labels read from Meta as a list of {id, name}, with a note when the list may not be complete."""
+    """Shape labels read from Meta as a list of {id, name}, with a note when the list may not be complete.
+
+    The labels are a list, or a page (data and paging). A page whose data is missing or not a
+    list shows no labels; a further page, or a row that is not a label with an id or a name, is
+    counted in the note rather than dropped silently.
+    """
     if value is None:
         return None, None
-    note = None
-    items = value
-    if isinstance(value, dict):
-        items = value.get("data")
-        if (value.get("paging") or {}).get("next"):
-            note = ADLABELS_PREVIOUS_INCOMPLETE
-    if not isinstance(items, list):
+    rows, unreadable, page_unreadable = read_collection_page({"data": value} if isinstance(value, list) else value)
+    if page_unreadable:
         return None, ADLABELS_PREVIOUS_UNREADABLE
     labels = [
         {key: str(item[key]) if key == "id" else item[key] for key in ("id", "name") if item.get(key) is not None}
-        for item in items
-        if isinstance(item, dict)
+        for item in rows
     ]
-    return labels, note
+    unreadable += sum(1 for label in labels if not label)
+    labels = [label for label in labels if label]
+    notes = []
+    if isinstance(value, dict) and isinstance(value.get("paging"), dict) and value["paging"].get("next"):
+        notes.append(ADLABELS_PREVIOUS_INCOMPLETE)
+    if unreadable:
+        notes.append(_adlabels_rows_unreadable(unreadable))
+    return labels, " ".join(notes) or None
 
 # Values from Meta's ad set reference (POST /act_{id}/adsets) and
 # AdAccount.create_ad_set in facebook-python-business-sdk 26.0.2, plus PHONE_CALL:
@@ -1519,6 +1532,18 @@ async def run_copy(
         ],
         "result": result,
     })
+    # copied_objects lists only what could be read; say so rather than let it pass as the full list.
+    if isinstance(copied, list):
+        unread_copies = sum(1 for item in copied if not isinstance(item, dict))
+        if unread_copies:
+            response["copied_objects_note"] = (
+                f"{unread_copies} of the {len(copied)} copied objects Meta listed could not be read; "
+                "copied_objects lists the others only."
+            )
+    elif copied is not None:
+        response["copied_objects_note"] = (
+            "Meta listed the copied objects in a shape this server could not read; copied_objects is empty."
+        )
     if new_id is None:
         response["warning"] = (
             "Meta's response did not include the new copy's id; find the copy under its parent "
