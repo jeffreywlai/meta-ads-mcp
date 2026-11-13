@@ -3,7 +3,8 @@
 Every format here follows a request shape shown in Meta's public Marketing API
 documentation (ad creative reference, carousel guide, asset feed spec and
 placement asset customization guides, lead ads guide, click-to-Messenger and
-click-to-WhatsApp guides, Instagram post and Partnership Ads guides). Formats
+click-to-WhatsApp guides, Instagram post and Partnership Ads guides, the
+multi-media ads guide and the catalog ads get-started guide). Formats
 Meta does not document are not built.
 """
 
@@ -12,13 +13,15 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from typing import Any
+from urllib.parse import urlsplit
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 # AdCreativeLinkDataCallToAction.type values from Meta's reference page, plus
 # INSTAGRAM_MESSAGE, which Meta's click-to-Instagram examples use.
@@ -81,7 +84,20 @@ def _text(value: Any) -> str | None:
     return blank_to_none(value) if isinstance(value, str) else None
 
 
+def _refuse_logins(value: Any, name: str) -> None:
+    """Refuse a URL with an embedded login anywhere in an input, before any request is built."""
+    if isinstance(value, str):
+        refuse_url_credentials(value, name)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_logins(item, f"{name}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value, start=1):
+            _refuse_logins(item, f"{name}[{index}]")
+
+
 def _require_url(value: str, name: str) -> str:
+    refuse_url_credentials(value, name)
     if not re.match(r"^https?://\S+$", value):
         raise ValidationError(f"{name} must be a full http:// or https:// URL.")
     return value
@@ -162,25 +178,33 @@ def _detect_format(inputs: _Inputs) -> str:
         "object_story_id": inputs.object_story_id,
         "source_instagram_media_id": inputs.source_instagram_media_id,
         "partnership_ad_code": inputs.partnership_ad_code,
+        "facebook_partnership_ad_code": inputs.facebook_partnership_ad_code,
         "cards": inputs.cards,
         "placement_customizations": inputs.placement_customizations,
+        "multi_media": inputs.multi_media,
+        "product_set_id": inputs.product_set_id,
     }
     chosen = [name for name, value in selectors.items() if value is not None]
     if len(chosen) > 1:
         raise ValidationError(f"Use only one of {', '.join(chosen)}; each selects a different creative format.")
     has_variants = any(value is not None for value in (inputs.primary_texts, inputs.headlines, inputs.descriptions))
     if chosen:
-        if has_variants:
+        if has_variants and chosen[0] != "multi_media":
             raise ValidationError(
-                "primary_texts, headlines and descriptions apply to a single image or single video only; "
+                "primary_texts, headlines and descriptions apply to a single image, a single video or multi_media only; "
                 f"they cannot be combined with {chosen[0]}."
             )
+        if chosen[0] == "object_story_id" and _has_partnership(inputs):
+            return "facebook_partnership_post"
         return {
             "object_story_id": "page_post",
             "source_instagram_media_id": "instagram_post",
             "partnership_ad_code": "partnership_ad_code",
+            "facebook_partnership_ad_code": "facebook_partnership_ad_code",
             "cards": "carousel",
             "placement_customizations": "placement_customization",
+            "multi_media": "multi_media",
+            "product_set_id": "catalog_carousel",
         }[chosen[0]]
     if has_variants:
         return "text_variants"
@@ -191,9 +215,14 @@ def _detect_format(inputs: _Inputs) -> str:
     raise ValidationError(
         "No creative format selected. Give image_hash or image_url (single image), video_id (single video), "
         "cards (carousel), primary_texts/headlines/descriptions with media (text variants), "
-        "placement_customizations, object_story_id (existing Page post), source_instagram_media_id "
-        "(existing Instagram post) or partnership_ad_code."
+        "placement_customizations, multi_media (asset pool), product_set_id (catalog carousel), object_story_id "
+        "(existing Page post), source_instagram_media_id (existing Instagram post), partnership_ad_code or "
+        "facebook_partnership_ad_code."
     )
+
+
+def _has_partnership(inputs: _Inputs) -> bool:
+    return bool(inputs.sponsor_page_id or inputs.sponsor_instagram_account_id or inputs.partnership_ad_format is not None)
 
 
 def _reject(inputs: _Inputs, names: list[str], format_label: str) -> None:
@@ -205,6 +234,7 @@ def _reject(inputs: _Inputs, names: list[str], format_label: str) -> None:
 _CONTENT_INPUTS = [
     "image_hash", "image_url", "video_id", "message", "headline", "description", "primary_texts",
     "headlines", "descriptions", "cards", "placement_customizations", "lead_gen_form_id", "page_welcome_message",
+    "multi_media", "product_set_id",
 ]
 
 
@@ -430,15 +460,13 @@ def _build_text_variants(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
             thumbnail["thumbnail_hash"] = inputs.image_hash
         feed["videos"] = [thumbnail]
         ad_format = "SINGLE_VIDEO"
-    elif inputs.image_hash:
-        if inputs.image_url:
-            raise ValidationError("text variants: give image_hash, not image_url, for the image.")
-        feed["images"] = [{"hash": inputs.image_hash}]
+    elif inputs.image_hash or inputs.image_url:
+        # Meta's AdAssetFeedSpecImage reference documents both hash and url.
+        media = _media_choice(inputs.image_hash, inputs.image_url, "text variants")
+        feed["images"] = [{"url": media["image_url"]} if "image_url" in media else {"hash": media["image_hash"]}]
         ad_format = "SINGLE_IMAGE"
     else:
-        raise ValidationError(
-            "Text variants need one image (image_hash; upload an image URL first with upload_creative_asset) or one video (video_id)."
-        )
+        raise ValidationError("Text variants need one image (image_hash or image_url) or one video (video_id).")
     feed.update(_asset_feed_texts(inputs))
     feed.update(_asset_feed_link(inputs, "text variants"))
     feed["ad_formats"] = [ad_format]
@@ -464,7 +492,7 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
     entries = inputs.placement_customizations
     if not isinstance(entries, list) or not MIN_PLACEMENT_ASSETS <= len(entries) <= MAX_PLACEMENT_ASSETS:
         raise ValidationError(f"placement_customizations must list {MIN_PLACEMENT_ASSETS} to {MAX_PLACEMENT_ASSETS} entries.")
-    allowed_keys = {"image_hash", "video_id", "publisher_platforms", *PLACEMENT_POSITION_FIELDS.values()}
+    allowed_keys = {"image_hash", "image_url", "video_id", "publisher_platforms", *PLACEMENT_POSITION_FIELDS.values()}
     media_kind: str | None = None
     assets: list[dict[str, Any]] = []
     rules: list[dict[str, Any]] = []
@@ -477,22 +505,28 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
             raise ValidationError(f"{where} must be an object.")
         unknown = sorted(set(entry) - allowed_keys)
         if unknown:
-            raise ValidationError(f"{where} has unknown keys: {', '.join(unknown)}. image_url is not accepted here; upload it first with upload_creative_asset.")
-        image_hash, video_id = _text(entry.get("image_hash")), _text(entry.get("video_id"))
-        if bool(image_hash) == bool(video_id):
-            raise ValidationError(f"{where} needs exactly one of image_hash or video_id.")
-        kind = "image" if image_hash else "video"
+            raise ValidationError(f"{where} has unknown keys: {', '.join(unknown)}. Allowed: {', '.join(sorted(allowed_keys))}.")
+        image_hash, image_url, video_id = (_text(entry.get(key)) for key in ("image_hash", "image_url", "video_id"))
+        if sum(1 for value in (image_hash, image_url, video_id) if value) != 1:
+            raise ValidationError(f"{where} needs exactly one of image_hash, image_url or video_id.")
+        if image_url:
+            _require_url(image_url, f"{where} image_url")
+        kind = "video" if video_id else "image"
         if media_kind is None:
             media_kind = kind
         elif media_kind != kind:
-            raise ValidationError("placement_customizations must be all images or all videos; Meta allows one ad format per asset feed.")
-        media = image_hash or video_id
+            raise ValidationError(
+                "placement_customizations must be all images or all videos: Meta's placement customization guide "
+                "documents one ad format per asset feed. For a pool that mixes images and videos, use multi_media."
+            )
+        media = image_hash or image_url or video_id
         if media in seen_media:
             raise ValidationError(f"{where} repeats media {media}; give each placement group a different asset.")
         seen_media.add(media)
         label = f"placement_{index}"
         if kind == "image":
-            assets.append({"hash": image_hash, "adlabels": [{"name": label}]})
+            image_ref = {"url": image_url} if image_url else {"hash": image_hash}
+            assets.append({**image_ref, "adlabels": [{"name": label}]})
         else:
             if not video_id.isdigit():
                 raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
@@ -604,6 +638,195 @@ def _build_partnership_ad_code(inputs: _Inputs) -> tuple[dict[str, Any], list[st
     return spec, ["The ad code is sent to Meta and is not echoed in this response."]
 
 
+def _facebook_sponsor(inputs: _Inputs, format_label: str) -> dict[str, Any]:
+    """Sponsor fields for a Facebook Partnership Ad, as Meta's boost-an-existing-Facebook-post guide shows."""
+    if not inputs.sponsor_page_id:
+        raise ValidationError(
+            f"{format_label} needs sponsor_page_id: Meta's Facebook Partnership Ads request names the partner Page in "
+            "facebook_branded_content.sponsor_page_id. sponsor_instagram_account_id may be added beside it."
+        )
+    return _partnership(inputs, required=True)
+
+
+def _identity_notes(inputs: _Inputs, format_label: str) -> list[str]:
+    """page_id and instagram_account_id are not part of Meta's Facebook Partnership Ads request; say so."""
+    unused = [name for name in ("page_id", "instagram_account_id") if getattr(inputs, name)]
+    if not unused:
+        return []
+    return [
+        f"{' and '.join(unused)} {'was' if len(unused) == 1 else 'were'} not sent: Meta's documented {format_label} "
+        "request has no such field. The post owner and sponsor_page_id are the two identities."
+    ]
+
+
+def _build_facebook_partnership_post(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
+    label = "Facebook Partnership Ad from an existing post"
+    _reject(inputs, [*_CONTENT_INPUTS, "link_url", "call_to_action_type"], f"A {label} (object_story_id with sponsor ids) uses the post as it is and")
+    story_id = inputs.object_story_id
+    if not _OBJECT_STORY_ID.match(story_id):
+        raise ValidationError("object_story_id must be {post_owner_page_id}_{post_id}, digits on both sides.")
+    spec: dict[str, Any] = {"object_story_id": story_id, **_facebook_sponsor(inputs, f"A {label}")}
+    if inputs.partnership_ad_format is not None:
+        spec["branded_content"] = {"ad_format": inputs.partnership_ad_format}
+    return spec, _identity_notes(inputs, label)
+
+
+def _build_facebook_partnership_ad_code(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
+    label = "Facebook Partnership Ad from an ad code"
+    _reject(inputs, _CONTENT_INPUTS, f"A {label} uses the creator's post as it is and")
+    if inputs.call_to_action_type in MESSAGING_DESTINATIONS:
+        raise ValidationError(f"Click-to-message buttons on a {label} are not built.")
+    branded: dict[str, Any] = {"facebook_boost_post_access_token": inputs.facebook_partnership_ad_code}
+    if inputs.partnership_ad_format is not None:
+        branded["ad_format"] = inputs.partnership_ad_format
+    spec: dict[str, Any] = {"branded_content": branded, **_facebook_sponsor(inputs, f"A {label}")}
+    if inputs.link_url:
+        spec["call_to_action"] = {"type": inputs.call_to_action_type or DEFAULT_CALL_TO_ACTION, "value": {"link": inputs.link_url}}
+    elif inputs.call_to_action_type:
+        raise ValidationError(f"call_to_action_type on a {label} needs link_url.")
+    return spec, ["The ad code is sent to Meta and is not echoed in this response.", *_identity_notes(inputs, label)]
+
+
+_FACEBOOK_HOSTS = ("facebook.com", "fb.com", "fb.me", "facebook.net")
+
+
+def _build_catalog_carousel(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
+    """A carousel template filled from a product set, as Meta's catalog ads get-started guide shows."""
+    page_id = _require_page(inputs, "a catalog carousel")
+    _reject(inputs, ["image_hash", "image_url", "video_id", "lead_gen_form_id"], "A catalog carousel takes its media from the catalog and")
+    if inputs.call_to_action_type in MESSAGING_DESTINATIONS or inputs.page_welcome_message:
+        raise ValidationError("Click-to-message catalog carousels are not built.")
+    if not inputs.link_url:
+        raise ValidationError("link_url is required for a catalog carousel: it is the default landing page and the end card link.")
+    host = (urlsplit(inputs.link_url).hostname or "").lower()
+    if any(host == name or host.endswith(f".{name}") for name in _FACEBOOK_HOSTS):
+        raise ValidationError("A catalog carousel link_url cannot be a Facebook URL; Meta's catalog ads guide says so.")
+    # Meta's guide: call_to_action carries the type only, and link and call_to_action take no template tags.
+    template: dict[str, Any] = {
+        "link": inputs.link_url,
+        "call_to_action": {"type": inputs.call_to_action_type or DEFAULT_CALL_TO_ACTION},
+    }
+    if inputs.message:
+        template["message"] = inputs.message
+    if inputs.headline:
+        template["name"] = inputs.headline
+    if inputs.description:
+        template["description"] = inputs.description
+    spec = _story_spec(inputs, page_id)
+    spec["template_data"] = template
+    notes = [
+        "Built as a template creative with product_set_id, as Meta's catalog ads guide shows. message, headline and "
+        "description may use catalog tags such as {{product.name}} and {{product.price}}. Meta's guide says the ad set "
+        "needs promoted_object.product_set_id for the same product set."
+    ]
+    return {"product_set_id": inputs.product_set_id, "object_story_spec": spec}, notes
+
+
+_MULTI_MEDIA_KEYS = {"image_hash", "image_url", "video_id", "thumbnail_url", "thumbnail_hash"}
+MIN_POOL_ASSETS = 2
+MAX_POOL_ASSETS = 10
+
+
+def _build_multi_media(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
+    """An asset pool Meta mixes at delivery, as Meta's multi-media ads guide shows (media_sourcing_spec)."""
+    page_id = _require_page(inputs, "multi_media")
+    _reject(inputs, ["image_hash", "image_url", "video_id"], "multi_media (put media in each entry)")
+    if inputs.call_to_action_type in MESSAGING_DESTINATIONS or inputs.page_welcome_message:
+        raise ValidationError("Click-to-message is not built for multi_media; use a single image or video.")
+    if not inputs.link_url:
+        raise ValidationError("link_url is required for multi_media.")
+    entries = inputs.multi_media
+    if not isinstance(entries, list) or not MIN_POOL_ASSETS <= len(entries) <= MAX_POOL_ASSETS:
+        raise ValidationError(
+            f"multi_media must list {MIN_POOL_ASSETS} to {MAX_POOL_ASSETS} images or videos; Meta's limit is "
+            f"{MAX_POOL_ASSETS} media per ad."
+        )
+    images: list[dict[str, Any]] = []
+    videos: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    primary: dict[str, Any] = {}
+    for index, entry in enumerate(entries, start=1):
+        where = f"multi_media[{index}]"
+        if not isinstance(entry, dict):
+            raise ValidationError(f"{where} must be an object.")
+        unknown = sorted(set(entry) - _MULTI_MEDIA_KEYS)
+        if unknown:
+            raise ValidationError(f"{where} has unknown keys: {', '.join(unknown)}. Allowed: {', '.join(sorted(_MULTI_MEDIA_KEYS))}.")
+        image_hash, image_url, video_id, thumb_url, thumb_hash = (
+            _text(entry.get(key)) for key in ("image_hash", "image_url", "video_id", "thumbnail_url", "thumbnail_hash")
+        )
+        if sum(1 for value in (image_hash, image_url, video_id) if value) != 1:
+            raise ValidationError(f"{where} needs exactly one of image_hash, image_url or video_id.")
+        media = image_hash or image_url or video_id
+        media_key = ("video" if video_id else "image", media)
+        if media_key in seen:
+            raise ValidationError(f"{where} repeats media {media}; Meta rejects duplicate images or videos in one pool.")
+        seen.add(media_key)
+        if video_id is None:
+            if thumb_url or thumb_hash:
+                raise ValidationError(f"{where}: thumbnail_url and thumbnail_hash apply to a video entry only.")
+            if image_url:
+                _require_url(image_url, f"{where} image_url")
+            images.append({**({"url": image_url} if image_url else {"hash": image_hash}), "source": "multi_media", "opt_in_status": "opt_in"})
+            if index == 1:
+                primary = {"image_url": image_url} if image_url else {"image_hash": image_hash}
+            continue
+        if not video_id.isdigit():
+            raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
+        if thumb_url and thumb_hash:
+            raise ValidationError(f"{where}: give thumbnail_url or thumbnail_hash, not both.")
+        if thumb_hash and index != 1:
+            raise ValidationError(
+                f"{where}: Meta's multi-media guide shows thumbnail_url for pool videos; thumbnail_hash is accepted only "
+                "on the first entry, which becomes the main video."
+            )
+        video: dict[str, Any] = {"video_id": video_id, "original_video_id": video_id, "source": "multi_media", "opt_in_status": "opt_in"}
+        if thumb_url:
+            video.update({"thumbnail_url": _require_url(thumb_url, f"{where} thumbnail_url"), "thumbnail_source": "custom"})
+        videos.append(video)
+        if index == 1:
+            if not (thumb_url or thumb_hash):
+                raise ValidationError(
+                    f"{where} is the main video, so it needs thumbnail_url or thumbnail_hash, as a single video does."
+                )
+            primary = {"video_id": video_id, **({"image_url": thumb_url} if thumb_url else {"image_hash": thumb_hash})}
+    call_to_action = {"type": inputs.call_to_action_type or DEFAULT_CALL_TO_ACTION, "value": {"link": inputs.link_url}}
+    main_message = (inputs.primary_texts or [inputs.message])[0]
+    main_headline = (inputs.headlines or [inputs.headline])[0]
+    main_description = (inputs.descriptions or [inputs.description])[0]
+    spec = _story_spec(inputs, page_id)
+    if "video_id" in primary:
+        video_data: dict[str, Any] = {**primary, "call_to_action": call_to_action}
+        for key, value in (("message", main_message), ("title", main_headline), ("link_description", main_description)):
+            if value:
+                video_data[key] = value
+        spec["video_data"] = video_data
+    else:
+        link_data: dict[str, Any] = {"link": inputs.link_url, "call_to_action": call_to_action, **_link_data_image(primary)}
+        for key, value in (("message", main_message), ("name", main_headline), ("description", main_description)):
+            if value:
+                link_data[key] = value
+        spec["link_data"] = link_data
+    sourcing: dict[str, Any] = {}
+    if images:
+        sourcing["images"] = images
+    if videos:
+        sourcing["videos"] = videos
+    for key, values in (("bodies", inputs.primary_texts), ("titles", inputs.headlines), ("descriptions", inputs.descriptions)):
+        if values:
+            sourcing[key] = [{"text": text} for text in values]
+    notes = [
+        "Built as media_sourcing_spec, as Meta's multi-media ads guide shows: the first entry is the main media in "
+        "object_story_spec and also appears in the pool, and Meta chooses among the media and texts at delivery.",
+    ]
+    if "image_url" in primary:
+        notes.append(
+            "The main image is given by URL (link_data.picture and the pool's url). Meta's guide shows a hash for the "
+            "main image; if Meta rejects the pairing, upload the image and use image_hash."
+        )
+    return {"object_story_spec": spec, "media_sourcing_spec": sourcing}, notes
+
+
 _BUILDERS = {
     "single_image": _build_single_image,
     "single_video": _build_single_video,
@@ -613,32 +836,61 @@ _BUILDERS = {
     "page_post": _build_page_post,
     "instagram_post": _build_instagram_post,
     "partnership_ad_code": _build_partnership_ad_code,
+    "facebook_partnership_post": _build_facebook_partnership_post,
+    "facebook_partnership_ad_code": _build_facebook_partnership_ad_code,
+    "catalog_carousel": _build_catalog_carousel,
+    "multi_media": _build_multi_media,
 }
+
+# Formats that carry their own Partnership Ad inputs, and new-media formats Meta's
+# "Instagram Partnership Ads with a New Ad Creative" guide shows (an object_story_spec
+# with sponsor ids beside it).
+_PARTNERSHIP_POST_FORMATS = {"instagram_post", "partnership_ad_code", "facebook_partnership_post", "facebook_partnership_ad_code"}
+_PARTNERSHIP_NEW_MEDIA_FORMATS = {"single_image", "single_video"}
 
 
 def build_creative_spec(inputs: _Inputs) -> tuple[str, dict[str, Any], list[str]]:
     """Return (format, Graph payload without name, notes) or raise ValidationError."""
     creative_format = _detect_format(inputs)
-    if creative_format not in {"instagram_post", "partnership_ad_code"}:
-        if inputs.sponsor_page_id or inputs.sponsor_instagram_account_id or inputs.partnership_ad_format is not None:
+    new_media_partnership = creative_format not in _PARTNERSHIP_POST_FORMATS and _has_partnership(inputs)
+    if new_media_partnership:
+        if creative_format not in _PARTNERSHIP_NEW_MEDIA_FORMATS:
             raise ValidationError(
-                "Partnership Ad inputs are built only with source_instagram_media_id or partnership_ad_code, as Meta's "
-                "Partnership Ads guide documents. Partnership Ads from new media are not built."
+                "Partnership Ads from new media are built for a single image or single video only, the shape Meta's "
+                "partnership guide shows; other formats with sponsor ids are not documented."
+            )
+        if inputs.partnership_ad_format is not None:
+            raise ValidationError(
+                "partnership_ad_format is documented for boosting an existing post or ad code, not for a Partnership "
+                "Ad from new media."
             )
     if inputs.lead_gen_form_id and creative_format not in {"single_image", "single_video"}:
         raise ValidationError("lead_gen_form_id is built for a single image or single video creative only.")
     payload, notes = _BUILDERS[creative_format](inputs)
+    if new_media_partnership:
+        payload.update(_partnership(inputs, required=True))
+        notes = [
+            *notes,
+            "Partnership Ad from new media: page_id is the primary identity and the sponsor ids are the partner, as "
+            "Meta's guide shows. That guide's example also sends a standard_enhancements opt-in, which Meta retired in "
+            "Marketing API v22.0, so it is not sent.",
+        ]
     if inputs.url_tags:
         payload["url_tags"] = inputs.url_tags
     return creative_format, payload, notes
+
+
+_AD_CODE_FIELDS = ("instagram_boost_post_access_token", "facebook_boost_post_access_token")
 
 
 def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
     """Hide the partnership ad code in anything returned to the caller."""
     shown = deepcopy(payload)
     branded = shown.get("branded_content")
-    if isinstance(branded, dict) and "instagram_boost_post_access_token" in branded:
-        branded["instagram_boost_post_access_token"] = "<partnership_ad_code>"
+    if isinstance(branded, dict):
+        for key in _AD_CODE_FIELDS:
+            if key in branded:
+                branded[key] = "<partnership_ad_code>"
     return shown
 
 
@@ -671,8 +923,16 @@ async def create_ad_creative_from_inputs(
     partnership_ad_code: str | None = None,
     partnership_ad_format: int | None = None,
     dry_run: bool = False,
+    multi_media: list[dict[str, Any]] | None = None,
+    product_set_id: GraphId | None = None,
+    facebook_partnership_ad_code: str | None = None,
 ) -> dict[str, Any]:
-    """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image_hash or video_id; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash or video_id with publisher_platforms and positions; at most one entry without platforms), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE), instant form (lead_gen_form_id) and Partnership Ads (sponsor ids on an Instagram post, or partnership_ad_code). dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
+    """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image or video; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash, image_url or video_id with publisher_platforms and positions; all images or all videos; at most one entry without platforms), multi_media asset pool (2 to 10 entries, images and videos may mix, each image_hash, image_url or video_id with optional thumbnail_url; the first is the main media; Meta mixes them with the text variants), catalog carousel (product_set_id with link_url; texts may use tags like {{product.name}}), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE), instant form (lead_gen_form_id) and Partnership Ads: sponsor ids on an Instagram post, on a Facebook post (object_story_id, sponsor_page_id required) or on a new single image or video; or an ad code (partnership_ad_code for Instagram, facebook_partnership_ad_code for Facebook). dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
+    for label, value in (
+        ("link_url", link_url), ("image_url", image_url), ("cards", cards),
+        ("placement_customizations", placement_customizations), ("multi_media", multi_media),
+    ):
+        _refuse_logins(value, label)
     account = blank_to_none(account_id)
     creative_name = blank_to_none(name)
     if account is None:
@@ -718,6 +978,9 @@ async def create_ad_creative_from_inputs(
         sponsor_instagram_account_id=_text(sponsor_instagram_account_id),
         partnership_ad_code=_text(partnership_ad_code),
         partnership_ad_format=partnership_ad_format,
+        multi_media=multi_media,
+        product_set_id=_text(product_set_id),
+        facebook_partnership_ad_code=_text(facebook_partnership_ad_code),
     )
     creative_format, spec, notes = build_creative_spec(inputs)
     payload = {"name": creative_name, **spec}
@@ -735,7 +998,17 @@ async def create_ad_creative_from_inputs(
             "notes": notes,
             "sent": False,
         }
-    created = await get_graph_api_client().create_edge_object(resolved_account, "adcreatives", data=payload)
+    try:
+        created = await get_graph_api_client().create_edge_object(resolved_account, "adcreatives", data=payload)
+    except Exception as exc:
+        _raise_step_failure(
+            exc,
+            definite="Meta refused the request, so no creative was created",
+            unknown=(
+                f"Meta may have created the creative named {creative_name!r} before the connection failed. Look for "
+                "it in the account's creatives before retrying, so a second copy is not made"
+            ),
+        )
     response = creation_response(action="create_ad_creative_from_inputs", target=target, result=created)
     response.update({
         "creative_id": str(created.get("id") or "") or None,
@@ -773,6 +1046,38 @@ COPYABLE_CREATIVE_FIELDS = [
     "product_set_id",
 ]
 ENHANCEMENT_READ_FIELDS = ["id", "name", "account_id", *COPYABLE_CREATIVE_FIELDS, "degrees_of_freedom_spec"]
+
+
+def _raise_step_failure(exc: Exception, *, definite: str, unknown: str) -> None:
+    """Raise the error for a failed write step, stating what is known about its outcome.
+
+    Must be called inside the ``except`` block that caught ``exc``.
+    """
+    error = _step_failure(exc, definite=definite, unknown=unknown)
+    if error is exc:
+        raise exc
+    raise error from exc
+
+
+def _step_failure(exc: Exception, *, definite: str, unknown: str) -> Exception:
+    """Return the error to raise when a write step fails, stating what is known about its outcome.
+
+    A Meta error response or a rate limit means the request was refused. A lost
+    response (mutation_outcome_unknown) or any error that is not one of this
+    server's own errors (a transport failure, for example) leaves the outcome
+    unknown. Meta error types keep their type; anything else becomes a
+    MetaApiError so the message reaches the caller.
+    """
+    outcome_unknown = bool(getattr(exc, "mutation_outcome_unknown", False)) or not isinstance(exc, MetaAdsError)
+    reason = getattr(exc, "message", None) if isinstance(exc, (MetaApiError, RateLimitError)) else None
+    reason = reason or str(exc) or type(exc).__name__
+    message = f"{unknown if outcome_unknown else definite}. Error: {reason}"
+    if isinstance(exc, (MetaApiError, RateLimitError)):
+        exc.message = message
+        if isinstance(exc, MetaApiError) and outcome_unknown:
+            exc.mutation_outcome_unknown = True
+        return exc
+    return MetaApiError(message=message, mutation_outcome_unknown=outcome_unknown)
 
 
 def _features_of(spec: Any) -> dict[str, str]:
@@ -876,18 +1181,40 @@ async def update_ad_creative_enhancements(
             "fields_not_copied": not_copied,
             "notes": [copy_note, review_note],
         }
-    created = await client.create_edge_object(resolved_account, "adcreatives", data=payload)
+    try:
+        created = await client.create_edge_object(resolved_account, "adcreatives", data=payload)
+    except Exception as exc:
+        _raise_step_failure(
+            exc,
+            definite=(
+                f"No replacement creative was created and ad {ad_id} still uses creative {old_creative_id}"
+            ),
+            unknown=(
+                f"Meta may have created a replacement creative named {payload['name']!r} before the connection "
+                f"failed. Nothing was attached, so ad {ad_id} still uses creative {old_creative_id}. Look for that "
+                "creative in the account before retrying, so a second copy is not made"
+            ),
+        )
     new_creative_id = str(created.get("id") or "")
     if not new_creative_id:
         raise ValidationError("Meta did not return a creative id, so the ad was not changed.")
     try:
         await client.update_object(ad_id, data={"creative": {"creative_id": new_creative_id}})
-    except MetaApiError as exc:
-        exc.message = (
-            f"Creative {new_creative_id} was created but ad {ad_id} still uses creative {old_creative_id}: {exc.message} "
-            "Delete the new creative with delete_creative or attach it with update_ad_creative."
+    except Exception as exc:
+        _raise_step_failure(
+            exc,
+            definite=(
+                f"Creative {new_creative_id} was created but ad {ad_id} still uses creative {old_creative_id}, "
+                "because Meta refused the attach. Delete the new creative with delete_creative or attach it with "
+                "update_ad_creative"
+            ),
+            unknown=(
+                f"Creative {new_creative_id} was created, but whether ad {ad_id} now uses it is unknown: the attach "
+                f"request got no clear answer. The ad's current creative is unknown (it was {old_creative_id}). Read "
+                "the ad with get_ad before retrying, and before deleting either creative, since the ad may be "
+                "using either one"
+            ),
         )
-        raise
     response = mutation_response(
         action="update_ad_creative_enhancements",
         target=target,
