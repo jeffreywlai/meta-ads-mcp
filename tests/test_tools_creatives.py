@@ -8,6 +8,9 @@ import pytest
 
 from meta_ads_mcp.tools import creatives
 
+# Written out, not imported, so a change to the production list fails these tests.
+CREATIVE_FIELDS_LITERAL = ["id", "name", "title", "body", "status", "object_story_spec", "asset_feed_spec", "degrees_of_freedom_spec", "url_tags", "image_hash", "thumbnail_url"]
+
 
 class FakeCreativeClient:
     """Fake creative client."""
@@ -54,7 +57,7 @@ def test_get_creative_reads_full_default_spec(monkeypatch) -> None:
 
     assert result["item"]["id"] == "crt_123"
     assert client.get_calls == [
-        {"object_id": "crt_123", "fields": creatives.CREATIVE_FIELDS, "params": None}
+        {"object_id": "crt_123", "fields": CREATIVE_FIELDS_LITERAL, "params": None}
     ]
     assert "url_tags" in creatives.CREATIVE_FIELDS
     assert "degrees_of_freedom_spec" in creatives.CREATIVE_FIELDS
@@ -413,7 +416,7 @@ def test_update_creative_without_labels_is_unchanged(monkeypatch) -> None:
     ))
 
     assert client.requests == [
-        ("get", "crt_1", creatives.CREATIVE_FIELDS, None),
+        ("get", "crt_1", CREATIVE_FIELDS_LITERAL, None),
         ("update", "crt_1", {"name": "New", "status": "ACTIVE", "adlabels": [{"name": "legacy"}]}),
     ]
     assert result == {
@@ -466,7 +469,7 @@ def test_update_creative_labels_set_replaces_all(monkeypatch) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
     result = asyncio.run(creatives.update_creative(creative_id="crt_1", adlabels=[{"name": "spring"}]))
     assert client.requests == [
-        ("get", "crt_1", [*creatives.CREATIVE_FIELDS, "adlabels{id,name}"], None),
+        ("get", "crt_1", [*CREATIVE_FIELDS_LITERAL, "adlabels.limit(100){id,name}"], None),
         ("update", "crt_1", {"adlabels": [{"name": "spring"}]}),
     ]
     assert result["previous"]["adlabels"] == [{"id": "1", "name": "old"}]
@@ -593,6 +596,7 @@ def test_upload_ad_video_status_read_failure_still_returns_the_id(monkeypatch) -
 
 def test_upload_ad_video_validation_makes_no_call(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    monkeypatch.setattr(creatives, "MAX_CHUNKED_VIDEO_BYTES", creatives.MAX_DIRECT_VIDEO_BYTES)
     big = tmp_path / "big.mp4"
     with big.open("wb") as handle:
         handle.truncate(creatives.MAX_DIRECT_VIDEO_BYTES + 1)
@@ -601,7 +605,7 @@ def test_upload_ad_video_validation_makes_no_call(monkeypatch, tmp_path) -> None
         ({"video_url": "https://x/v.mp4", "file_path": str(big)}, "exactly one"),
         ({"video_url": "ftp://x/v.mp4"}, "http"),
         ({"file_path": str(tmp_path / "missing.mp4")}, "does not point to a file"),
-        ({"file_path": str(big)}, "chunked upload"),
+        ({"file_path": str(big)}, "byte limit for video uploads"),
         ({"video_url": "https://x/v.mp4", "title": "t" * 255}, "255"),
     ]
     for arguments, message in cases:
@@ -786,7 +790,7 @@ def test_boost_partnership_inputs_reach_the_creative(monkeypatch) -> None:
     [
         ({"daily_budget": None}, "daily_budget"),
         ({"targeting": None}, "targeting is required"),
-        ({"objective": "OUTCOME_SALES"}, "objective must be one of"),
+        ({"objective": "OUTCOME_APP_PROMOTION"}, "objective must be one of"),
         ({"duration_days": 0}, "duration_days"),
         ({"duration_days": 366}, "duration_days"),
         ({"page_id": None}, "page_id is required"),
@@ -843,3 +847,638 @@ def test_upload_ad_video_file_reading_is_off_without_an_upload_folder(monkeypatc
     target.write_bytes(b"video")
     with pytest.raises(creatives.ValidationError, match="META_UPLOAD_DIR"):
         asyncio.run(creatives.upload_ad_video(account_id="123", file_path=str(target)))
+
+
+# Round-three review fixes (R2 findings G10, G17, G20).
+
+
+class LaterFailureClient:
+    """Creates succeed with id 900; the configured later step fails with the configured error."""
+
+    def __init__(self, *, fail_step: str, error: Exception, objects=None) -> None:
+        self.fail_step = fail_step
+        self.error = error
+        self.objects = objects or {}
+        self.calls: list[tuple] = []
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        if self.fail_step == "get":
+            raise self.error
+        return dict(self.objects.get(object_id, {"id": object_id}))
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        if self.fail_step == edge:
+            raise self.error
+        return {"id": "900"}
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        if self.fail_step == "update":
+            raise self.error
+        return {"success": True}
+
+
+def _later_error(kind: str) -> Exception:
+    from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError
+
+    return {
+        "rate_limit": lambda: RateLimitError("Synthetic limit", code=4),
+        "transport": lambda: MetaApiError(
+            message="Meta API request failed before a response was received.",
+            is_transient=True, mutation_outcome_unknown=True,
+        ),
+        "meta": lambda: MetaApiError(message="Invalid parameter", status_code=400, code=100),
+        "unexpected": lambda: NotFoundError("Meta object or edge not found"),
+    }[kind]()
+
+
+LATER_ERROR_KINDS = ["rate_limit", "transport", "meta", "unexpected"]
+
+
+@pytest.mark.parametrize("kind", LATER_ERROR_KINDS)
+def test_g10_boost_into_existing_adset_keeps_the_created_creative_id(monkeypatch, kind) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    client = LaterFailureClient(fail_step="ads", error=_later_error(kind))
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(Exception) as raised:
+        asyncio.run(creatives.boost_instagram_post("1", "40", "50", adset_id="60", page_id="30"))
+    message = str(raised.value)
+    assert "Creative 900 was created" in message
+    assert "delete_creative" in message
+    if kind == "transport":
+        assert "may have been created" in message
+    if kind == "rate_limit":
+        assert isinstance(raised.value, RateLimitError)
+
+
+@pytest.mark.parametrize("kind", LATER_ERROR_KINDS)
+def test_g10_video_status_read_failure_keeps_the_video_id(monkeypatch, kind) -> None:
+    client = LaterFailureClient(fail_step="get", error=_later_error(kind))
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video("1", video_url="https://example.invalid/video.mp4"))
+    assert result["video_id"] == "900"
+    assert result["processing_status"] is None
+    assert "could not be read" in result["status_note"]
+
+
+@pytest.mark.parametrize("tool", ["boost", "video"])
+def test_g10_later_rate_limit_preserves_created_object_id(monkeypatch, tool) -> None:
+    """Reviewer reproduction: a rate limit after the create must not hide id 900."""
+    import json
+
+    from meta_ads_mcp.errors import RateLimitError
+
+    client = LaterFailureClient(
+        fail_step="ads" if tool == "boost" else "get", error=RateLimitError("Synthetic limit", code=4),
+    )
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    if tool == "boost":
+        coro = creatives.boost_instagram_post("1", "40", "50", adset_id="60", page_id="30")
+    else:
+        coro = creatives.upload_ad_video("1", video_url="https://example.invalid/video.mp4")
+    try:
+        result = asyncio.run(coro)
+    except RateLimitError as error:
+        assert "900" in str(error), str(error)
+    else:
+        assert "900" in json.dumps(result), result
+
+
+@pytest.mark.parametrize("kind", LATER_ERROR_KINDS)
+def test_g10_label_add_failure_discloses_already_updated_fields(monkeypatch, kind) -> None:
+    client = LaterFailureClient(
+        fail_step="adlabels", error=_later_error(kind),
+        objects={"10": {"id": "10", "name": "Old", "adlabels": []}},
+    )
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(Exception) as raised:
+        asyncio.run(creatives.update_creative("10", name="New", adlabels=[{"id": "20"}], adlabels_operation="add"))
+    assert ("update", "10", {"name": "New"}) in client.calls
+    message = str(raised.value)
+    assert "already updated" in message
+    assert "name changed" in message
+    if kind == "transport":
+        assert "may or may not have been added" in message
+    else:
+        assert "labels were not added" in message
+
+
+def test_g10_label_add_rate_limit_discloses_already_updated_fields(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    client = LaterFailureClient(
+        fail_step="adlabels", error=RateLimitError("Synthetic limit", code=4),
+        objects={"10": {"id": "10", "name": "Old", "adlabels": []}},
+    )
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(RateLimitError) as info:
+        asyncio.run(creatives.update_creative("10", name="New", adlabels=[{"id": "20"}], adlabels_operation="add"))
+    assert ("update", "10", {"name": "New"}) in client.calls
+    assert "updated" in str(info.value).lower(), str(info.value)
+
+
+def test_g10_label_add_only_failure_does_not_claim_other_changes(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    client = LaterFailureClient(
+        fail_step="adlabels", error=RateLimitError("Synthetic limit", code=4),
+        objects={"10": {"id": "10", "adlabels": []}},
+    )
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(RateLimitError) as info:
+        asyncio.run(creatives.update_creative("10", adlabels=[{"id": "20"}], adlabels_operation="add"))
+    assert "already updated" not in str(info.value)
+    assert [call[0] for call in client.calls] == ["get", "create"]
+
+
+def test_preview_ad_formats_rate_limit_keeps_finished_previews(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    class Limited(RecordingCreativeClient):
+        async def preview_ad(self, **kwargs):
+            if kwargs.get("ad_format") == "INSTAGRAM_STORY":
+                raise RateLimitError("Synthetic limit", code=4)
+            return await super().preview_ad(**kwargs)
+
+    client = Limited()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.preview_ad(ad_id="ad_1", ad_formats="MOBILE_FEED_STANDARD,INSTAGRAM_STORY,INSTAGRAM_REELS"))
+    assert [item["ad_format"] for item in result["items"]] == ["MOBILE_FEED_STANDARD"]
+    assert [failure["ad_format"] for failure in result["failed"]] == ["INSTAGRAM_STORY", "INSTAGRAM_REELS"]
+    assert result["failed"][1]["error"].startswith("Not requested")
+    assert result["summary"]["complete"] is False
+    assert [request[1]["ad_format"] for request in client.requests] == ["MOBILE_FEED_STANDARD"]
+
+
+class PagedLabelClient:
+    def __init__(self, adlabels) -> None:
+        self.adlabels = adlabels
+        self.calls: list[tuple] = []
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or [])))
+        return {"id": object_id, "name": "Old", "adlabels": self.adlabels}
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return {"success": True}
+
+
+UNREAD_LABEL_PAGE = {
+    "data": [{"id": "20", "name": "remove-me"}],
+    "paging": {"next": "https://graph.facebook.com/next", "cursors": {"after": "page-two"}},
+}
+
+
+def test_g17_label_removal_does_not_overwrite_unread_labels(monkeypatch) -> None:
+    client = PagedLabelClient(UNREAD_LABEL_PAGE)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match="more labels than"):
+        asyncio.run(creatives.update_creative("10", adlabels=[{"id": "20"}], adlabels_operation="remove"))
+    assert not any(call[0] in {"update", "create"} for call in client.calls), client.calls
+
+
+def test_g17_label_removal_with_other_field_changes_writes_nothing(monkeypatch) -> None:
+    client = PagedLabelClient({"data": [{"id": "20"}], "paging": {"next": "https://graph.facebook.com/next"}})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError):
+        asyncio.run(creatives.update_creative("10", name="New", adlabels=[{"id": "20"}], adlabels_operation="remove"))
+    assert [call[0] for call in client.calls] == ["get"]
+
+
+def test_g17_label_read_asks_for_a_full_page_of_labels(monkeypatch) -> None:
+    client = PagedLabelClient({"data": [{"id": "1", "name": "keep"}, {"id": "2", "name": "drop"}], "paging": {"cursors": {"after": "x"}}})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.update_creative("10", adlabels=[{"id": "2"}], adlabels_operation="remove"))
+    assert client.calls[0] == ("get", "10", [*CREATIVE_FIELDS_LITERAL, "adlabels.limit(100){id,name}"])
+    assert client.calls[1] == ("update", "10", {"adlabels": [{"id": "1"}]})
+    assert result["previous"]["adlabels"] == [{"id": "1", "name": "keep"}, {"id": "2", "name": "drop"}]
+    assert result["adlabels_read_complete"] is True
+
+
+@pytest.mark.parametrize("operation", ["add", "set"])
+def test_g17_incomplete_label_read_is_reported_not_guessed(monkeypatch, operation) -> None:
+    client = PagedLabelClient(UNREAD_LABEL_PAGE)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.update_creative("10", adlabels=[{"id": "30"}], adlabels_operation=operation))
+    assert result["adlabels_read_complete"] is False
+    assert "first" in result["adlabels_note"]
+    if operation == "add":
+        # The add edge only adds; nothing was replaced, but the full label set is unknown.
+        assert client.calls[1] == ("create", "10", "adlabels", {"adlabels": [{"id": "30"}]})
+        assert result["current"]["adlabels"] is None
+    else:
+        assert client.calls[1] == ("update", "10", {"adlabels": [{"id": "30"}]})
+        assert result["current"]["adlabels"] == [{"id": "30"}]
+
+
+def test_g20_video_url_with_login_is_refused_before_any_request(monkeypatch) -> None:
+    secret = "synthetic-media-password"
+    url = f"https://user:{secret}@example.invalid/asset.mp4"
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    for dry_run in (True, False):
+        with pytest.raises(creatives.ValidationError) as raised:
+            asyncio.run(creatives.upload_ad_video("10", video_url=url, dry_run=dry_run))
+        assert secret not in str(raised.value)
+        assert "username or password" in str(raised.value)
+
+
+# boost_instagram_post: more objectives and Partnership Ad codes
+
+
+WEBSITE_CTA = {"type": "LEARN_MORE", "value": {"link": "https://shop.example.com/spring"}}
+PIXEL = {"pixel_id": "888", "custom_event_type": "PURCHASE"}
+
+
+def _created(client, edge):
+    return next(call[3] for call in client.calls if call[0] == "create" and call[2] == edge)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "objective", "destination", "goal", "promoted"),
+    [
+        ({"objective": "OUTCOME_TRAFFIC"}, "OUTCOME_TRAFFIC", "INSTAGRAM_PROFILE", "VISIT_INSTAGRAM_PROFILE", None),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "website", "call_to_action": WEBSITE_CTA},
+         "OUTCOME_TRAFFIC", "WEBSITE", "LINK_CLICKS", None),
+        ({"objective": "OUTCOME_ENGAGEMENT", "destination_type": "ON_VIDEO"}, "OUTCOME_ENGAGEMENT", "ON_VIDEO", "THRUPLAY", None),
+        ({"objective": "OUTCOME_SALES", "promoted_object": PIXEL, "call_to_action": WEBSITE_CTA},
+         "OUTCOME_SALES", "WEBSITE", "OFFSITE_CONVERSIONS", PIXEL),
+        ({"objective": "OUTCOME_LEADS", "promoted_object": {"pixel_id": "888", "custom_event_type": "LEAD"}, "call_to_action": WEBSITE_CTA},
+         "OUTCOME_LEADS", "WEBSITE", "OFFSITE_CONVERSIONS", {"pixel_id": "888", "custom_event_type": "LEAD"}),
+    ],
+)
+def test_boost_one_step_objectives_set_the_matching_destination_and_goal(
+    monkeypatch, arguments, objective, destination, goal, promoted,
+) -> None:
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+    campaign, adset = _created(client, "campaigns"), _created(client, "adsets")
+    assert campaign["objective"] == objective
+    assert adset["destination_type"] == destination
+    assert adset["optimization_goal"] == goal
+    assert adset.get("promoted_object") == promoted
+    assert adset["status"] == "PAUSED" and campaign["status"] == "PAUSED"
+    assert result["defaults_applied"]["optimization_goal"] == goal
+    if "destination_type" not in arguments:
+        assert result["defaults_applied"]["destination_type"] == destination
+
+
+def test_boost_one_step_default_objective_is_unchanged(monkeypatch) -> None:
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    asyncio.run(creatives.boost_instagram_post(**ONE_STEP))
+    adset = _created(client, "adsets")
+    assert (_created(client, "campaigns")["objective"], adset["destination_type"], adset["optimization_goal"]) == (
+        "OUTCOME_ENGAGEMENT", "ON_POST", "POST_ENGAGEMENT",
+    )
+    assert "promoted_object" not in adset
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "MESSENGER"}, "destination_type for OUTCOME_TRAFFIC must be one of"),
+        ({"objective": "OUTCOME_AWARENESS", "destination_type": "WEBSITE"}, "OUTCOME_AWARENESS takes no destination_type"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "WEBSITE"}, "website link"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "WEBSITE", "call_to_action": {"type": "LEARN_MORE"}}, "website link"),
+        ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA}, "pixel_id and custom_event_type"),
+        ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA, "promoted_object": {"pixel_id": "abc", "custom_event_type": "PURCHASE"}}, "pixel_id"),
+        ({"objective": "OUTCOME_ENGAGEMENT", "promoted_object": PIXEL}, "promoted_object applies to OUTCOME_SALES and OUTCOME_LEADS"),
+        ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA, "promoted_object": {**PIXEL, "object_store_url": "https://u:p@x.example/app"}}, "username or password"),
+    ],
+)
+def test_boost_one_step_objective_validation_makes_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+
+
+def test_boost_with_adset_rejects_destination_and_promoted_object(monkeypatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    base = {key: value for key, value in ONE_STEP.items() if key not in {"daily_budget", "targeting"}}
+    with pytest.raises(creatives.ValidationError, match="destination_type, promoted_object only apply in one-step mode"):
+        asyncio.run(creatives.boost_instagram_post(**base, adset_id="60", destination_type="ON_POST", promoted_object=PIXEL))
+
+
+def test_boost_with_a_partnership_ad_code_names_the_post_by_code(monkeypatch) -> None:
+    client = FakeBoostClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        account_id="123", instagram_account_id="ig_1", adset_id="adset_1", page_id="page_1",
+        partnership_ad_code="AC-998877", partnership_ad_format=2,
+    ))
+    creative = client.calls[0][3]
+    assert creative == {
+        "name": "Partnership ad creative",
+        "object_id": "page_1",
+        "branded_content": {"instagram_boost_post_access_token": "AC-998877", "ad_format": 2},
+        "facebook_branded_content": {"sponsor_page_id": "page_1"},
+        "instagram_branded_content": {"sponsor_id": "ig_1"},
+    }
+    assert "AC-998877" not in str(result)
+    assert result["target"]["partnership_ad_code"] == "<given, not shown>"
+    assert result["partnership_defaults_applied"] == {
+        "sponsor_page_id": "page_1 (page_id)", "sponsor_instagram_account_id": "ig_1 (instagram_account_id)",
+    }
+
+
+def test_boost_partnership_ad_code_uses_given_sponsors(monkeypatch) -> None:
+    client = FakeBoostClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    asyncio.run(creatives.boost_instagram_post(
+        account_id="123", instagram_account_id="ig_1", adset_id="adset_1", page_id="page_1",
+        partnership_ad_code="AC-1", sponsor_page_id="222", sponsor_instagram_account_id="333",
+    ))
+    creative = client.calls[0][3]
+    assert creative["facebook_branded_content"] == {"sponsor_page_id": "222"}
+    assert creative["instagram_branded_content"] == {"sponsor_id": "333"}
+    assert creative["branded_content"] == {"instagram_boost_post_access_token": "AC-1"}
+    assert "source_instagram_media_id" not in creative and "instagram_user_id" not in creative
+
+
+def test_boost_one_step_plan_with_a_partnership_ad_code_never_shows_the_code(monkeypatch) -> None:
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "instagram_media_id"}
+    plan = asyncio.run(creatives.boost_instagram_post(**arguments, partnership_ad_code="AC-SECRET-1", plan_only=True))
+    assert "AC-SECRET-1" not in str(plan)
+    creative = plan["plan"]["requests"][2]["data"]
+    assert creative["branded_content"] == {"instagram_boost_post_access_token": "<partnership_ad_code>"}
+    asyncio.run(creatives.boost_instagram_post(**arguments, partnership_ad_code="AC-SECRET-1"))
+    sent = _created(client, "adcreatives")
+    assert sent["branded_content"] == {"instagram_boost_post_access_token": "AC-SECRET-1"}
+    assert sent["name"] == "Partnership ad creative"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"instagram_media_id": "555", "partnership_ad_code": "AC-1"}, "exactly one of instagram_media_id or partnership_ad_code"),
+        ({}, "exactly one of instagram_media_id or partnership_ad_code"),
+        ({"partnership_ad_code": "has space"}, "partnership_ad_code"),
+        ({"partnership_ad_code": "AC-1", "instagram_account_id": None}, "instagram_account_id is required"),
+    ],
+)
+def test_boost_partnership_ad_code_validation_makes_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    base = {"account_id": "123", "instagram_account_id": "ig_1", "adset_id": "adset_1", "page_id": "page_1"}
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**base, **arguments}))
+
+
+def test_boost_one_step_never_defaults_a_budget(monkeypatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "daily_budget"}
+    for objective in ("OUTCOME_TRAFFIC", "OUTCOME_ENGAGEMENT"):
+        with pytest.raises(creatives.ValidationError, match="does not pick a budget"):
+            asyncio.run(creatives.boost_instagram_post(**arguments, objective=objective, plan_only=True))
+
+
+# upload_ad_video: chunked upload for local files above the direct-upload limit
+
+
+class ChunkedVideoClient:
+    """Plays Meta's side of a chunked advideos upload: start, transfers, finish."""
+
+    def __init__(self, *, chunk: int = 10, fail: dict | None = None, transfer_offsets=None, finish=None) -> None:
+        self.chunk = chunk
+        self.fail = fail or {}
+        self.transfer_offsets = list(transfer_offsets) if transfer_offsets is not None else None
+        self.finish = finish if finish is not None else {"success": True}
+        self.calls: list[tuple] = []
+        self.size = 0
+
+    async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+        phase = data["upload_phase"]
+        chunk = files["video_file_chunk"][1] if files else None
+        self.calls.append((phase, account_id, dict(data), chunk))
+        transfers = sum(1 for call in self.calls if call[0] == "transfer")
+        if (phase, transfers if phase == "transfer" else 0) in self.fail:
+            raise self.fail[(phase, transfers if phase == "transfer" else 0)]
+        if phase == "start":
+            self.size = int(data["file_size"])
+            return {"upload_session_id": "5001", "video_id": "7001", "start_offset": "0", "end_offset": str(min(self.chunk, self.size))}
+        if phase == "transfer":
+            if self.transfer_offsets is not None:
+                start, end = self.transfer_offsets.pop(0)
+                return {"start_offset": str(start), "end_offset": str(end)}
+            start = int(data["start_offset"]) + len(chunk)
+            return {"start_offset": str(start), "end_offset": str(min(start + self.chunk, self.size))}
+        return self.finish
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields, None))
+        return {"id": object_id, "status": {"video_status": "processing"}}
+
+
+def _large_video(monkeypatch, tmp_path, size: int = 25, name: str = "film.mp4"):
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 8)
+    path = tmp_path / name
+    path.write_bytes(bytes(range(65, 65 + size)))
+    return path
+
+
+def test_upload_ad_video_large_file_uses_the_chunked_upload(monkeypatch, tmp_path) -> None:
+    path = _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4", title="Spring", description="Launch"))
+
+    content = path.read_bytes()
+    assert client.calls == [
+        ("start", "act_123", {"upload_phase": "start", "file_size": 25}, None),
+        ("transfer", "act_123", {"upload_phase": "transfer", "upload_session_id": "5001", "start_offset": 0}, content[0:10]),
+        ("transfer", "act_123", {"upload_phase": "transfer", "upload_session_id": "5001", "start_offset": 10}, content[10:20]),
+        ("transfer", "act_123", {"upload_phase": "transfer", "upload_session_id": "5001", "start_offset": 20}, content[20:25]),
+        ("finish", "act_123", {"upload_phase": "finish", "upload_session_id": "5001", "title": "Spring", "description": "Launch"}, None),
+        ("get", "7001", ["id", "status"], None),
+    ]
+    assert result["video_id"] == "7001"
+    assert result["processing_status"] == "processing"
+    assert result["upload"] == {
+        "mode": "chunked", "upload_session_id": "5001", "file_name": "film.mp4", "bytes": 25,
+        "bytes_confirmed": 25, "transfer_requests": 3,
+    }
+    assert result["created"] == {"finish": {"success": True}}
+
+
+def test_upload_ad_video_small_file_still_uses_one_request(monkeypatch, tmp_path) -> None:
+    client = FakeVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    (tmp_path / "clip.mp4").write_bytes(b"12345678")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 8)
+    result = asyncio.run(creatives.upload_ad_video("123", file_path="clip.mp4"))
+    assert client.calls[0] == ("create", "act_123", "advideos", {}, {"source": ("clip.mp4", b"12345678")})
+    assert result["upload"]["mode"] == "direct"
+
+
+def test_upload_ad_video_chunked_dry_run_sends_nothing(monkeypatch, tmp_path) -> None:
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    result = asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4", name="Film", dry_run=True))
+    assert result["sent"] is False
+    would_send = result["would_send"]
+    assert would_send["upload"] == "chunked"
+    assert would_send["host"] == "graph-video.facebook.com"
+    assert would_send["source"] == {"file_name": "film.mp4", "bytes": 25}
+    assert [request["data"]["upload_phase"] for request in would_send["requests"]] == ["start", "transfer", "finish"]
+    assert would_send["requests"][0]["data"] == {"upload_phase": "start", "file_size": 25}
+    assert would_send["requests"][2]["data"] == {"upload_phase": "finish", "upload_session_id": "<from start>", "name": "Film"}
+
+
+def test_upload_ad_video_chunked_failure_reports_session_and_bytes(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(fail={("transfer", 2): RateLimitError("Synthetic limit", code=4)})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(RateLimitError) as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    message = str(raised.value)
+    for expected in ("upload session 5001", "video 7001", "10 of 25 bytes", "transfer step", "2 transfer requests", "Synthetic limit"):
+        assert expected in message, message
+    assert [call[0] for call in client.calls] == ["start", "transfer", "transfer"]
+
+
+def test_upload_ad_video_chunked_lost_finish_says_check_before_retrying(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    lost = MetaApiError(message="Meta API request failed before a response was received.", is_transient=True, mutation_outcome_unknown=True)
+    client = ChunkedVideoClient(fail={("finish", 0): lost})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    message = str(raised.value)
+    assert "25 of 25 bytes" in message
+    assert "may have been accepted" in message
+    assert "list_ad_videos(video_ids=['7001'])" in message
+
+
+def test_upload_ad_video_chunked_start_failure_says_nothing_was_sent(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(fail={("start", 0): MetaApiError(message="Invalid parameter", code=100)})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="nothing was transferred"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+
+
+@pytest.mark.parametrize(
+    ("offsets", "reason"),
+    [
+        ([(0, 10)], "did not move forward"),
+        ([(10, 40)], "outside the 25-byte file"),
+        ([(10, 5)], "outside the 25-byte file"),
+    ],
+)
+def test_upload_ad_video_chunked_stops_on_offsets_it_cannot_follow(monkeypatch, tmp_path, offsets, reason) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(transfer_offsets=offsets)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert reason in str(raised.value)
+    assert "upload session 5001" in str(raised.value)
+    assert [call[0] for call in client.calls] == ["start", "transfer"]
+
+
+def test_upload_ad_video_chunked_finish_without_success_is_not_reported_as_uploaded(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(finish={"success": False})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="did not confirm"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+
+
+def test_upload_ad_video_chunked_transfer_request_cap(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "MAX_CHUNKED_TRANSFER_REQUESTS", 2)
+    client = ChunkedVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="2-request limit"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert [call[0] for call in client.calls] == ["start", "transfer", "transfer"]
+
+
+def test_upload_ad_video_refuses_files_above_the_chunked_limit(monkeypatch, tmp_path) -> None:
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "MAX_CHUNKED_VIDEO_BYTES", 20)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    for dry_run in (False, True):
+        with pytest.raises(creatives.ValidationError, match="20-byte limit"):
+            asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4", dry_run=dry_run))
+
+
+def test_upload_ad_video_chunk_size_above_the_read_cap_is_refused(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "MAX_VIDEO_CHUNK_BYTES", 5)
+    client = ChunkedVideoClient(chunk=10)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="larger than this server reads at once"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert [call[0] for call in client.calls] == ["start"]
+
+
+def test_upload_ad_video_swapped_parent_folder_cannot_escape_the_upload_folder(monkeypatch, tmp_path) -> None:
+    """A folder inside the upload folder replaced by a link after the check must not be followed."""
+    from meta_ads_mcp.config import reload_settings
+
+    root = tmp_path / "uploads"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (nested / "clip.mp4").write_bytes(b"inside")
+    (outside / "clip.mp4").write_bytes(b"synthetic-outside-secret")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(root))
+    reload_settings()
+    original_open = creatives.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and str(path) in {"nested", str(nested)}:
+            swapped = True
+            nested.rename(root / "saved-nested")
+            nested.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(creatives.os, "open", swap_before_open)
+    client = FakeVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    try:
+        asyncio.run(creatives.upload_ad_video("123", file_path="nested/clip.mp4"))
+    except creatives.ValidationError as error:
+        assert "outside" not in str(error)
+    assert swapped
+    assert all(call[4] != {"source": ("clip.mp4", b"synthetic-outside-secret")} for call in client.calls if call[0] == "create")
+
+
+def test_g20_boost_call_to_action_link_with_login_is_refused(monkeypatch) -> None:
+    secret = "synthetic-link-password"
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    cta = {"type": "LEARN_MORE", "value": {"link": f"https://user:{secret}@example.invalid/page"}}
+    base = {"account_id": "1", "instagram_media_id": "40", "instagram_account_id": "50"}
+    for arguments in ({"adset_id": "60", "page_id": "30"}, {**ONE_STEP, "plan_only": True}):
+        with pytest.raises(creatives.ValidationError) as raised:
+            asyncio.run(creatives.boost_instagram_post(**{**base, **arguments, "call_to_action": cta}))
+        assert secret not in str(raised.value)

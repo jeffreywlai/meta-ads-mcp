@@ -914,6 +914,26 @@ class GraphAPIClient:
             params["after"] = cursor
         return await self.request("GET", "ads_archive", params=params)
 
+    async def post_ad_video_upload_phase(
+        self,
+        account_id: str,
+        *,
+        data: dict[str, Any],
+        files: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Send one phase (start, transfer or finish) of a chunked upload to an ad account's advideos edge.
+
+        Parameters are on Meta's ad account advideos reference. The video host is the one
+        the facebook-python-business SDK 26.0.2 uses for this upload (video_uploader.py).
+        """
+        return await self.request(
+            "POST",
+            f"{_segment(normalize_account_id(account_id))}/advideos",
+            data=data,
+            files=files,
+            base_url=f"https://graph-video.facebook.com/{self.settings.api_version}",
+        )
+
 
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:
     """Return a configured Graph API client."""

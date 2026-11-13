@@ -8,7 +8,7 @@ from typing import Annotated, Any, TypeAlias
 from pydantic import BeforeValidator
 
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaApiError, NotFoundError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, ValidationError
 from meta_ads_mcp.field_reference import FIELD_REFERENCE, SDK_SOURCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
@@ -113,6 +113,11 @@ def _require_id(value: str | None, name: str) -> str:
     return normalized
 
 
+def _requests_field(fields: list[str], name: str) -> bool:
+    """Whether a field list already asks for a field, with or without a sub-selection."""
+    return any(field.split("{", 1)[0].split(".", 1)[0].strip() == name for field in fields)
+
+
 def _validate_limit(limit: int, *, maximum: int | None = None) -> None:
     """Reject page sizes Meta would refuse or that would never terminate."""
     if limit < 1:
@@ -157,8 +162,18 @@ async def _scan_edge(
     complete = False
     next_after: str | None = None
     stop_reason = "page_cap"
+    read_error: str | None = None
     while pages_read < MAX_SCAN_PAGES:
-        payload = await client.list_objects(parent_id, edge, fields=fields, params=query)
+        try:
+            payload = await client.list_objects(parent_id, edge, fields=fields, params=query)
+        except (MetaApiError, RateLimitError) as exc:
+            if pages_read == 0:
+                raise
+            # Keep what was already read; the failed page can be asked for again.
+            stop_reason = "read_failed"
+            read_error = exc.message
+            next_after = query.get("after")
+            break
         pages_read += 1
         items.extend(payload.get("data", []))
         paging = extract_paging(payload)
@@ -174,7 +189,7 @@ async def _scan_edge(
         seen_cursors.add(cursor)
         next_after = cursor
         query["after"] = cursor
-    return {
+    scan = {
         "items": items,
         "pages_read": pages_read,
         "complete": complete,
@@ -182,6 +197,9 @@ async def _scan_edge(
         "stop_reason": stop_reason,
         "next_after": None if complete else next_after,
     }
+    if read_error is not None:
+        scan["read_error"] = read_error
+    return scan
 
 
 def _scan_note(scan: dict[str, Any], noun: str) -> str:
@@ -189,6 +207,11 @@ def _scan_note(scan: dict[str, Any], noun: str) -> str:
     examined = len(scan["items"])
     if scan["complete"]:
         return f"Scan complete: all {examined} {noun} on the edge were examined."
+    if scan["stop_reason"] == "read_failed":
+        return (
+            f"Scan incomplete: Meta refused page {scan['pages_read'] + 1} ({scan.get('read_error')}) after {examined} "
+            f"{noun} were examined. Call again with after=summary.next_after to retry that page."
+        )
     if scan["stop_reason"] == "page_cap":
         return (
             f"Scan incomplete: stopped after the {MAX_SCAN_PAGES}-page cap with {examined} {noun} examined. "
@@ -296,7 +319,7 @@ async def _lookup_videos(client: Any, video_ids: list[str], fields: list[str]) -
     """Read each requested video by id, keeping the ones Meta could not return."""
     items: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
-    for video_id in video_ids:
+    for position, video_id in enumerate(video_ids):
         try:
             video = await client.get_object(video_id, fields=fields)
         except NotFoundError:
@@ -305,6 +328,14 @@ async def _lookup_videos(client: Any, video_ids: list[str], fields: list[str]) -
         except MetaApiError as exc:
             missing.append({"id": video_id, "reason": exc.message, "code": exc.code})
             continue
+        except RateLimitError as exc:
+            # Keep the videos already read; stop asking while Meta is throttling.
+            missing.append({"id": video_id, "reason": exc.message, "code": exc.code, "rate_limited": True})
+            missing.extend(
+                {"id": remaining, "reason": "Not requested: Meta rate-limited an earlier lookup in this call."}
+                for remaining in video_ids[position + 1:]
+            )
+            break
         items.append(_with_processing_status(video))
     return {
         "items": items,
@@ -346,14 +377,23 @@ async def list_ad_videos(
         return await _lookup_videos(client(), ids, list(requested_fields))
     if title_filter:
         _validate_limit(limit, maximum=MAX_SCAN_PAGE_SIZE)
+        # The match runs here on each video's title, so the title must be read even when
+        # the caller's fields leave it out; it is dropped from the rows afterwards.
+        scan_fields = list(requested_fields)
+        title_added = not _requests_field(scan_fields, "title")
+        if title_added:
+            scan_fields.append("title")
         scan = await _scan_edge(
             client(), normalize_account_id(account_id), "advideos",
-            fields=list(requested_fields), params=_page_params(limit, after),
+            fields=scan_fields, params=_page_params(limit, after),
         )
         needle = title_filter.casefold()
         matched = [
-            _with_processing_status(video) for video in scan["items"]
-            if needle in str(video.get("title") or "").casefold()
+            _with_processing_status(
+                {key: value for key, value in video.items() if not (title_added and key == "title")}
+            )
+            for video in scan["items"]
+            if isinstance(video, dict) and needle in str(video.get("title") or "").casefold()
         ]
         return {
             "items": matched,
@@ -522,10 +562,10 @@ async def list_instagram_media(
         if edge == "stories" and "STORY" not in product_filter:
             raise ValidationError("source=stories returns stories only; include STORY or use source=media.")
     requested_fields = list(normalize_field_list(fields) or INSTAGRAM_MEDIA_FIELDS)
-    if not any(field.split("{", 1)[0].strip() == "boost_eligibility_info" for field in requested_fields):
+    if not _requests_field(requested_fields, "boost_eligibility_info"):
         requested_fields.append(BOOST_ELIGIBILITY_FIELD)
     for needed, active in (("timestamp", window), ("media_type", type_filter), ("media_product_type", product_filter)):
-        if active is not None and not any(field.split("{", 1)[0].strip() == needed for field in requested_fields):
+        if active is not None and not _requests_field(requested_fields, needed):
             requested_fields.append(needed)
     params = _page_params(limit, after)
     if window is not None and edge == "media":
@@ -686,20 +726,37 @@ async def list_audience_adsets(
 
     if mode in {"both", "targeting"}:
         resolved_account = blank_to_none(account_id)
-        if resolved_account is None:
-            audience = await client.get_object(audience_id, fields=["id", "account_id"])
-            resolved_account = blank_to_none(str(audience.get("account_id") or ""))
-        if resolved_account is None:
+        scan = None
+        targeting_error: str | None = None
+        try:
+            if resolved_account is None:
+                audience = await client.get_object(audience_id, fields=["id", "account_id"])
+                resolved_account = blank_to_none(str(audience.get("account_id") or ""))
+            if resolved_account is not None:
+                scan = await _scan_edge(
+                    client, normalize_account_id(resolved_account), "adsets",
+                    fields=AUDIENCE_TARGETING_ADSET_FIELDS, params=_page_params(limit, targeting_after),
+                )
+        except (MetaApiError, RateLimitError) as exc:
+            if mode == "targeting":
+                raise
+            # The ads scan already ran; keep its results and say the second scan failed.
+            targeting_error = exc.message
+        if targeting_error is not None:
+            targeting_scan = {
+                "ran": True,
+                "complete": False,
+                "error": targeting_error,
+                "scan_note": "The ad set targeting scan could not be read; call again with source=targeting to retry it.",
+            }
+            summary["targeting_next_after"] = blank_to_none(targeting_after)
+        elif resolved_account is None:
             targeting_scan = _skipped_scan(
                 "Meta did not return the audience's account_id; pass account_id to scan ad set targeting."
             )
             summary["targeting_next_after"] = None
         else:
             account_edge = normalize_account_id(resolved_account)
-            scan = await _scan_edge(
-                client, account_edge, "adsets",
-                fields=AUDIENCE_TARGETING_ADSET_FIELDS, params=_page_params(limit, targeting_after),
-            )
             matched = 0
             for adset in scan["items"]:
                 targeting = adset.get("targeting")
