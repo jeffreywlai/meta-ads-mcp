@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Annotated, Any, TypeAlias
 from pydantic import BeforeValidator
 
+from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
@@ -1370,6 +1371,24 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+# Without a start_time Meta starts the ad set when it creates it (the Click to Instagram
+# guide documents that default), which is after this server sends the request. A computed
+# end therefore gets this margin on top of duration_days, so the run is never shorter than
+# asked. An ad set create is never retried and is cut off after META_REQUEST_TIMEOUT, so the
+# margin is at least that timeout plus a minute.
+BOOST_END_MARGIN = timedelta(minutes=5)
+
+
+def _boost_end_margin() -> timedelta:
+    """The safety margin added to an end computed from duration_days when Meta picks the start."""
+    return max(BOOST_END_MARGIN, timedelta(seconds=get_settings().request_timeout) + timedelta(minutes=1))
+
+
+def _computed_boost_end(days: int) -> datetime:
+    """The end for a run of days that starts when Meta creates the ad set, fixed now: whole seconds, rounded up."""
+    return _ceil_second(_utc_now() + timedelta(days=days) + _boost_end_margin())
+
+
 def _ceil_second(moment: datetime) -> datetime:
     """moment rounded up to a whole second (unchanged when it already is one)."""
     whole = moment.replace(microsecond=0)
@@ -1698,13 +1717,16 @@ def _boost_settings(
         if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= BOOST_MAX_DURATION_DAYS:
             raise ValidationError(f"duration_days must be a whole number from 1 to {BOOST_MAX_DURATION_DAYS}.")
         # Sent in whole seconds, rounded up: a clock (or a start_time) with a fraction of a
-        # second must never make the run shorter than the days asked for.
-        end_at = _ceil_second(start_at + timedelta(days=days))
+        # second must never make the run shorter than the days asked for. Without a
+        # start_time this is only the value shown if the request were sent now: the end is
+        # computed again immediately before the ad set is created (_boost_one_step).
+        end_at = _ceil_second(start_at + timedelta(days=days)) if start_time is not None else _computed_boost_end(days)
         end_sent = end_at.isoformat()
     # Both checks compare the exact start (with its fraction of a second) and the exact end.
     if end_at - start_at < BOOST_MIN_RUN:
         raise ValidationError("end_time must be at least 24 hours after the start (start_time, or now when it is omitted).")
-    # A computed end is at most days (already checked) plus the rounding up above.
+    # A computed end is at most days (already checked) plus the rounding up and, without a
+    # start_time, the safety margin above.
     if end_time is not None and end_at - start_at > timedelta(days=BOOST_MAX_DURATION_DAYS):
         raise ValidationError(f"The ad set can run for at most {BOOST_MAX_DURATION_DAYS} days.")
     given = {
@@ -1846,6 +1868,34 @@ def _boost_created_message(created: list[tuple[str, str]], failed_step: str, rea
     )
 
 
+def _boost_schedule(settings: _BoostSettings, end_sent: Any, *, fixed_when_sent: bool, sent: bool) -> dict[str, Any]:
+    """The ad set's schedule as sent (or, in a plan, as it would be sent), and how a computed end is fixed."""
+    schedule: dict[str, Any] = {
+        "start_time": (
+            settings.start_sent if settings.start_sent is not None
+            else "when Meta creates the ad set (no start_time sent)"
+        ),
+        "end_time": end_sent,
+        "end_time_fixed_when_sent": fixed_when_sent,
+    }
+    if fixed_when_sent:
+        margin = int(_boost_end_margin().total_seconds())
+        days = f"{settings.days} day{'' if settings.days == 1 else 's'}"
+        basis = (
+            f"duration_days ({days}) plus a {margin}-second safety margin, counted from that moment, because Meta "
+            f"starts the ad set when it creates it, after the request leaves. The run is longer than {days} by at "
+            "most the margin."
+        )
+        schedule["safety_margin_seconds"] = margin
+        schedule["note"] = (
+            f"end_time was computed immediately before the ad set request was sent: {basis} end_time is the value sent."
+            if sent else
+            f"end_time is computed immediately before the ad set request is sent: {basis} The end_time shown is what "
+            "would be sent if it were sent now; a later call sends a later end_time."
+        )
+    return schedule
+
+
 async def _boost_one_step(
     client_factory: Any,
     *,
@@ -1902,9 +1952,13 @@ async def _boost_one_step(
     if bid_minor is not None:
         adset_data["bid_amount"] = bid_minor
     adset_data["targeting"] = settings.targeting
+    # A computed end with no start_time is fixed at the moment of sending (see _boost_end_margin);
+    # until then it is shown as it would be sent now, after the reads above.
+    end_fixed_when_sent = settings.start_sent is None and settings.end_computed and settings.days is not None
+    end_sent = _computed_boost_end(settings.days).isoformat() if end_fixed_when_sent else settings.end_sent
     if settings.start_sent is not None:
         adset_data["start_time"] = settings.start_sent
-    adset_data["end_time"] = settings.end_sent
+    adset_data["end_time"] = end_sent
     adset_data["status"] = "PAUSED"
     if settings.destination:
         adset_data["destination_type"] = settings.destination
@@ -1929,7 +1983,7 @@ async def _boost_one_step(
         "is_adset_budget_sharing_enabled": False if not campaign_level else None,
         "start_time": "when Meta creates the ad set (no start_time sent)" if settings.start_sent is None else None,
         "duration_days": settings.days if settings.end_computed and "duration_days" not in given else None,
-        "end_time": settings.end_sent if settings.end_computed else None,
+        "end_time": end_sent if settings.end_computed else None,
         "call_to_action": settings.call_to_action if settings.call_to_action_built else None,
         "page_id": f"{page_id} (the Page whose instagram_business_account is instagram_account_id)" if page_lookup else None,
         "status": "PAUSED for all four objects",
@@ -1954,7 +2008,10 @@ async def _boost_one_step(
             {"step": "ad", "method": "POST", "path": f"{account_id}/ads", "data": ad_data},
         ],
         "defaults_applied": defaults,
+        "schedule": _boost_schedule(settings, end_sent, fixed_when_sent=end_fixed_when_sent, sent=False),
     }
+    if end_fixed_when_sent:
+        plan["requests"][1]["end_time_note"] = plan["schedule"]["note"]
     if settings.budget_parameter == "daily_budget":
         plan["daily_budget"] = {"major_units": settings.budget, "sent_minor_units": budget_minor}
     if bid_minor is not None:
@@ -1999,6 +2056,13 @@ async def _boost_one_step(
         return object_id
 
     campaign_id = await create("campaign", "campaigns", campaign_data)
+    if end_fixed_when_sent:
+        # Fixed here, with no await before the ad set request, so the reads and the campaign
+        # create above cannot shorten the run Meta starts when it creates the ad set.
+        end_sent = _computed_boost_end(settings.days).isoformat()
+        adset_data["end_time"] = end_sent
+        if "end_time" in defaults:
+            defaults["end_time"] = end_sent
     adset_id = await create("ad set", "adsets", {**adset_data, "campaign_id": campaign_id})
     creative_id = await create("creative", "adcreatives", creative_data)
     ad_id = await create("ad", "ads", {**ad_data, "adset_id": adset_id, "creative": {"creative_id": creative_id}})
@@ -2014,6 +2078,7 @@ async def _boost_one_step(
         "budget": budget_shown,
         "currency": currency,
         "note": "All four objects are paused. Activate the campaign, ad set and ad with set_*_status when ready.",
+        "schedule": _boost_schedule(settings, end_sent, fixed_when_sent=end_fixed_when_sent, sent=True),
     })
     if settings.budget_parameter == "daily_budget":
         response["daily_budget"] = plan["daily_budget"]

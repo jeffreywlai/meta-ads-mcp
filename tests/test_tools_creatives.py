@@ -2065,7 +2065,7 @@ def test_boost_one_step_default_requests_are_exact(monkeypatch, fixed_clock) -> 
         ("adsets", {"name": "Instagram post 555 ad set", "campaign_id": "1", "daily_budget": 1250,
                     "billing_event": "IMPRESSIONS", "optimization_goal": "POST_ENGAGEMENT",
                     "bid_strategy": "LOWEST_COST_WITHOUT_CAP", "targeting": {"geo_locations": {"countries": ["AU"]}},
-                    "end_time": "2026-11-19T12:00:00+00:00", "status": "PAUSED", "destination_type": "ON_POST"}),
+                    "end_time": "2026-11-19T12:05:00+00:00", "status": "PAUSED", "destination_type": "ON_POST"}),
         ("adcreatives", {"name": "Instagram post 555 creative", "object_id": "777", "instagram_user_id": "666",
                          "source_instagram_media_id": "555"}),
         ("ads", {"name": "Instagram post 555", "adset_id": "2", "creative": {"creative_id": "3"}, "status": "PAUSED"}),
@@ -2205,7 +2205,7 @@ def test_boost_one_step_campaign_budget_moves_budget_and_bidding_to_the_campaign
     }
     assert "daily_budget" not in adset and "lifetime_budget" not in adset and "bid_strategy" not in adset
     assert adset["bid_amount"] == 200
-    assert adset["end_time"] == "2026-11-19T12:00:00+00:00"
+    assert adset["end_time"] == "2026-11-19T12:05:00+00:00"
     assert result["budget"]["level"] == "campaign"
     assert "is_adset_budget_sharing_enabled" not in result["defaults_applied"]
 
@@ -2435,15 +2435,18 @@ def test_boost_computed_end_is_never_shorter_than_the_days_asked(monkeypatch, mi
     client, result = _boost(monkeypatch, **{"daily_budget": None, budget: 10, "duration_days": days})
     sent = _created(client, "adsets")["end_time"]
     end = datetime.fromisoformat(sent)
-    assert sent == (now.replace(microsecond=0) + timedelta(days=days, seconds=1)).isoformat()
-    assert timedelta(days=days) <= end - now < timedelta(days=days, seconds=1)
+    # Without a start_time the end also carries the stated safety margin (round six, K6).
+    margin = timedelta(minutes=5)
+    assert creatives._boost_end_margin() == margin
+    assert sent == (now.replace(microsecond=0) + timedelta(days=days, seconds=1) + margin).isoformat()
+    assert timedelta(days=days) + margin <= end - now < timedelta(days=days, seconds=1) + margin
     assert "start_time" not in _created(client, "adsets")
     assert result["defaults_applied"]["end_time"] == sent
 
 
 def test_boost_computed_end_on_a_whole_second_clock_is_exact(monkeypatch, fixed_clock) -> None:
     client, _ = _boost(monkeypatch, duration_days=1)
-    assert _created(client, "adsets")["end_time"] == "2026-11-14T12:00:00+00:00"
+    assert _created(client, "adsets")["end_time"] == "2026-11-14T12:05:00+00:00"
 
 
 @pytest.mark.parametrize(
@@ -2719,7 +2722,7 @@ def test_boost_two_second_video_goal_may_bill_on_two_second_views(monkeypatch, f
         "name": "Instagram post 555 ad set", "campaign_id": "1", "daily_budget": 1250,
         "billing_event": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS", "optimization_goal": "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS",
         "bid_strategy": "LOWEST_COST_WITHOUT_CAP", "targeting": {"geo_locations": {"countries": ["AU"]}},
-        "end_time": "2026-11-19T12:00:00+00:00", "status": "PAUSED",
+        "end_time": "2026-11-19T12:05:00+00:00", "status": "PAUSED",
     }
     if destination:
         expected["destination_type"] = destination
