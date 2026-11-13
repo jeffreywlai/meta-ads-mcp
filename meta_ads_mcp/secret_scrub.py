@@ -5,25 +5,46 @@ Partnership Ad code, a local file's path) out of what it hands back uses this on
 
 How a text is searched
 ----------------------
-Meta can repeat a secret as written or encoded. A text is searched in up to three readings.
-Each reading is made in one left-to-right pass that keeps, for every character it produces,
-the span of the original text the character came from, so a match in a reading replaces
-exactly that span of the original text:
+Meta can repeat a secret as written or encoded. A text is searched in several readings.
+Each reading is made in one left-to-right pass over the text (or over another reading) that
+keeps, for every character it produces, the span of the original text the character came
+from, so a match in a reading replaces exactly that span of the original text. Write J for
+JSON string escapes (backslash followed by one of ``" \\ / b f n r t``, or ``u`` and four hex
+digits in either case; a high and a low surrogate escape in a row are one character), P for
+percent escapes through every layer (``%252F`` and ``%25252F`` are ``/``; bytes from escapes
+in a row are read as UTF-8) and P1 for one layer of percent escapes. The readings are:
 
-1. As written.
-2. Fully decoded. JSON string escapes are decoded first (backslash followed by one of
-   ``" \\ / b f n r t``, or ``u`` and four hex digits in either case; a high and a low
-   surrogate escape in a row are one character). Then percent escapes, in either hex case,
-   through every layer of encoding (``%252F`` and ``%25252F`` are ``/``). Bytes from escapes
-   in a row are read as UTF-8.
-3. Decoded once: JSON escapes, then a single layer of percent escapes. This reading is made
-   only when a secret itself holds a percent escape (a password typed as ``50%2Boff``), which
-   the full decoding would turn into something else when a text encodes it once.
+1. as written;
+2. J alone (made when the text holds a backslash);
+3. J, then P;
+4. J, then P1 applied once, twice, and so on up to MAX_SINGLE_PERCENT_LAYERS times, each a
+   reading of its own (made only when a secret itself holds a percent escape, such as a
+   password typed as ``50%2Boff``, which P would turn into something else);
+5. J again on top of a reading from 3 or 4 that percent decoding changed and that still holds
+   a backslash (JSON text that was then percent-encoded).
 
-In readings 2 and 3, ``+`` and a space count as the same character (form encoding writes a
-space as ``+``); a secret is compared the same way. Nothing else is folded: the secret's
-letters and digits must match exactly, in their own case. Only an escape's hex digits are
-read in either case.
+In every reading but the first, ``+`` and a space count as the same character (form encoding
+writes a space as ``+``); a secret is compared the same way. Nothing else is folded: the
+secret's letters and digits must match exactly, in their own case. Only an escape's hex
+digits are read in either case.
+
+What is found. Take a secret S and an echo of it: S percent-encoded k times (k = 0, 1 or
+more), with JSON escaping applied outside that encoding, inside it, or not at all. With S
+holding any mix of a backslash, a quote, a plus sign and a literal ``%HH``:
+
+========================  =====================  ==========================================
+S holds                   k = 0 (JSON or not)    k >= 1 (JSON outside, inside or not at all)
+========================  =====================  ==========================================
+no literal ``%HH``        found (reading 1 or 2) found, any k (reading 3; 5 for JSON inside)
+a literal ``%HH``         found (reading 1 or 2) found for k <= MAX_SINGLE_PERCENT_LAYERS
+                                                 (reading 4; 5 for JSON inside); not found
+                                                 for more layers
+========================  =====================  ==========================================
+
+Also not found: JSON escaping applied twice to a secret holding a backslash or a quote;
+percent encoding of an escape's own hex digits (no encoder writes it); the secret in another
+letter case or Unicode normalisation; and part of a secret. ``test_encoding_matrix`` in
+tests/test_secret_scrub.py walks every cell of this table, for each mix of characters.
 
 Where a run of text can be read more than one way, these fixed rules decide:
 
@@ -41,9 +62,9 @@ Where a run of text can be read more than one way, these fixed rules decide:
 
 A secret is found by plain substring search (``str.find``), never by a regular expression
 built from it, and every match in every reading is replaced; overlapping matches become one
-replacement. Each reading costs one pass over the text, and each secret one search per
-reading, so the work grows with the text's length times the number of secrets, whatever the
-text holds.
+replacement. Each reading costs one pass over the text, there are at most
+2 * MAX_SINGLE_PERCENT_LAYERS + 4 of them, and each secret is searched once per reading, so
+the work grows with the text's length times the number of secrets, whatever the text holds.
 
 How much is removed
 -------------------
@@ -73,6 +94,9 @@ from typing import Any
 MIN_SECRET_SUBSTRING_LENGTH = 8
 MIN_SECRET_TOKEN_LENGTH = 4
 REDACTED = "[redacted]"
+# How many single layers of percent escapes are read one at a time for a secret that itself
+# holds a percent escape (see "How a text is searched").
+MAX_SINGLE_PERCENT_LAYERS = 4
 
 RESULT = "result"
 ERROR = "error"
@@ -261,11 +285,39 @@ def _percent_reading(text: str, source: _Reading | None, *, layers: bool) -> tup
     return reading.text, reading
 
 
-def _decoded(text: str, *, layers: bool) -> tuple[str, _Reading | None]:
-    """Reading 2 (layers) or 3: JSON escapes, then percent escapes, with '+' read as a space."""
-    unescaped, reading = _json_reading(text, None)
-    decoded, reading = _percent_reading(unescaped, reading, layers=layers)
-    return decoded.replace("+", " "), reading
+def _decoded_readings(text: str, *, single_layer: bool) -> list[tuple[str, _Reading | None]]:
+    """Every decoded reading of a text (see the module docstring), with '+' read as a space.
+
+    JSON escapes only; then percent escapes through all layers, and through one layer when
+    single_layer; and JSON escapes again on top of a percent reading that changed the text
+    and left a backslash in it.
+    """
+    unescaped, json_reading = _json_reading(text, None)
+    readings: list[tuple[str, _Reading | None]] = []
+    if json_reading is not None:
+        readings.append((unescaped, json_reading))
+
+    def add_percent_reading(source: str, source_reading: _Reading | None, *, layers: bool) -> tuple[str, _Reading | None]:
+        decoded, reading = _percent_reading(source, source_reading, layers=layers)
+        if reading is not source_reading:
+            readings.append((decoded, reading))
+            if "\\" in decoded:
+                again, outer = _json_reading(decoded, reading)
+                if outer is not reading:
+                    readings.append((again, outer))
+        return decoded, reading
+
+    add_percent_reading(unescaped, json_reading, layers=True)
+    if single_layer:
+        current, current_reading = unescaped, json_reading
+        for _ in range(MAX_SINGLE_PERCENT_LAYERS):
+            current, reading = add_percent_reading(current, current_reading, layers=False)
+            if reading is current_reading:
+                break
+            current_reading = reading
+    if not readings:
+        readings.append((unescaped, json_reading))
+    return [(haystack.replace("+", " "), reading) for haystack, reading in readings]
 
 
 def _holds_percent_escape(text: str) -> bool:
@@ -335,10 +387,7 @@ class SecretScrubber:
         spans: list[tuple[int, int]] = []
         for needle in self._needles:
             _find_spans(text, needle.exact, needle.whole_token, None, spans)
-        readings = [_decoded(text, layers=True)]
-        if self._single_layer:
-            readings.append(_decoded(text, layers=False))
-        for haystack, reading in readings:
+        for haystack, reading in _decoded_readings(text, single_layer=self._single_layer):
             unchanged = reading is None and haystack == text
             for needle in self._needles:
                 if unchanged and needle.folded == needle.exact:
