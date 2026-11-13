@@ -707,3 +707,31 @@ def test_create_ad_old_style_creative_id_call_is_unchanged(monkeypatch) -> None:
         "ok": True, "action": "create_ad", "target": {"account_id": "act_123", "adset_id": "adset_123"},
         "validation_only": False, "created": {"id": "ad_created"},
     }
+
+
+# Round three: named ad schedule times and labels on updates.
+
+
+def test_create_ad_params_only_schedule_call_is_unchanged(monkeypatch) -> None:
+    """Ad schedule times inside params are sent exactly as before they had named parameters."""
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    params = {"ad_schedule_start_time": "2026-12-01T00:00:00", "ad_schedule_end_time": "1796000000"}
+    result = asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", params=dict(params)))
+    assert client.calls == [
+        ("create", "act_123", "ads", {
+            "name": "Ad", "adset_id": "adset_123", "creative": {"creative_id": "crt_123"},
+            "status": "PAUSED", **params,
+        }),
+    ]
+    assert result["created"] == {"id": "ad_created"}
+
+
+def test_update_ad_params_only_adlabels_call_is_unchanged(monkeypatch) -> None:
+    client = FakeUpdateAdClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(ads.update_ad(ad_id="ad_1", params={"adlabels": [{"name": "Q4"}]}))
+    assert client.calls == [
+        ("get", "ad_1", ["id", "adlabels"]),
+        ("update", "ad_1", {"adlabels": [{"name": "Q4"}]}),
+    ]

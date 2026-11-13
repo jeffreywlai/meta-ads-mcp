@@ -1293,3 +1293,95 @@ def test_g12_new_money_arguments_still_accept_numbers_at_the_mcp_boundary(monkey
     writes = [call for call in client.calls if call[0] in {"create", "update"}]
     assert len(writes) == 1
     assert writes[0][-1][field] == 15025
+
+
+# Round three: named parameters that were reachable only through params.
+
+BUDGET_SCHEDULE_PARAMS = [
+    {"time_start": 1795000000, "time_end": 1795086400, "budget_value": 2000, "budget_value_type": "ABSOLUTE"},
+]
+
+
+def test_create_ad_set_params_only_round_three_fields_call_is_unchanged(monkeypatch) -> None:
+    """destination_type, pacing_type, is_dynamic_creative, optimization_sub_event and budget_schedule_specs
+    inside params are sent exactly as before they had named parameters."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    params = {
+        "destination_type": "WHATSAPP",
+        "pacing_type": ["day_parting"],
+        "adset_schedule": [{"start_minute": 540, "end_minute": 1020, "days": [1, 2]}],
+        "is_dynamic_creative": False,
+        "optimization_sub_event": "VIDEO_SOUND_ON",
+        "budget_schedule_specs": BUDGET_SCHEDULE_PARAMS,
+    }
+    targeting = {"geo_locations": {"countries": ["DE"]}}
+    result = asyncio.run(campaigns.create_ad_set(
+        account_id="act_123", campaign_id="cmp_123", name="Old style set",
+        billing_event="IMPRESSIONS", optimization_goal="CONVERSATIONS", targeting=targeting,
+        daily_budget=20.0, params=dict(params),
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {
+            "campaign_id": "cmp_123",
+            "name": "Old style set",
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "CONVERSATIONS",
+            "targeting": targeting,
+            "status": "PAUSED",
+            "daily_budget": 2000,
+            **params,
+        }),
+    ]
+    assert list(client.calls[1][3]) == [
+        "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status",
+        "daily_budget", *params,
+    ]
+    assert result["created"] == {"id": "cmp_123"}
+
+
+def test_create_campaign_params_only_budget_schedule_call_is_unchanged(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    params = {"budget_schedule_specs": BUDGET_SCHEDULE_PARAMS, "is_skadnetwork_attribution": False}
+    result = asyncio.run(campaigns.create_campaign(
+        account_id="123", name="Old style", objective="OUTCOME_SALES", daily_budget=50.0, params=dict(params),
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "campaigns", {
+            "name": "Old style", "objective": "OUTCOME_SALES", "status": "PAUSED",
+            "special_ad_categories": [], "daily_budget": 5000, **params,
+        }),
+    ]
+    assert result["created"] == {"id": "cmp_123"}
+
+
+def test_update_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
+    """spend_cap, start_time, stop_time and adlabels inside params: same read, same write, same response."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    params = {
+        "spend_cap": 25000,
+        "start_time": "2026-12-01T00:00:00-0500",
+        "stop_time": "2026-12-31T00:00:00-0500",
+        "adlabels": [{"name": "Q4"}],
+    }
+    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", name="Renamed", params=dict(params)))
+    assert client.calls == [
+        ("get", "cmp_123", ["id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget"]),
+        ("get", "act_123", ["currency"]),
+        ("update", "cmp_123", {"name": "Renamed", **params}),
+    ]
+    assert list(client.calls[2][2]) == ["name", *params]
+    assert result == {
+        "ok": True,
+        "action": "update_campaign",
+        "target": {"campaign_id": "cmp_123"},
+        "previous": {
+            "name": "Old name", "status": "PAUSED", "objective": "OUTCOME_SALES",
+            "daily_budget": 50.0, "lifetime_budget": None,
+        },
+        "current": {"name": "Renamed", **params},
+    }
