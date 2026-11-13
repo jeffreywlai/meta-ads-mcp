@@ -15,6 +15,7 @@ from meta_ads_mcp.input_compat import canonical_tool_name, resolve_tool_name
 from meta_ads_mcp.official_parity import (
     DOCUMENTED_NOT_SERVED,
     LIVE_VERIFIED_TOOLS,
+    LIVE_VERIFIED_WRITE_TOOLS,
     OFFICIAL_TOOLS,
     SERVED_STATUSES,
     official_tool_guidance,
@@ -110,13 +111,26 @@ def test_verified_is_derived_from_live_runs_only() -> None:
         if entry.status not in SERVED_STATUSES:
             assert entry.verified is None, name
         else:
-            expected = "live" if all(tool in LIVE_VERIFIED_TOOLS for tool in entry.tools) else "mocked"
+            verified = LIVE_VERIFIED_TOOLS | LIVE_VERIFIED_WRITE_TOOLS
+            expected = "live" if all(tool in verified for tool in entry.tools) else "mocked"
             assert entry.verified == expected, name
 
 
-def test_no_write_tool_is_marked_live_verified() -> None:
-    """Live checks so far were read-only, so a write tool can never be listed as verified."""
+def test_read_and_write_live_lists_hold_only_their_own_kind() -> None:
+    """A write tool counts as run live only through the list kept for the live write test."""
+    from meta_ads_mcp.read_only import read_only_tool_names
+
+    read_only = read_only_tool_names()
     assert not LIVE_VERIFIED_TOOLS & set(utility.TOOL_GROUPS["writes"])
+    assert LIVE_VERIFIED_TOOLS <= read_only
+    # A write tool is any registered tool that read-only mode refuses.
+    assert LIVE_VERIFIED_WRITE_TOOLS <= _registered()
+    assert not LIVE_VERIFIED_WRITE_TOOLS & read_only
+
+
+def test_tools_meta_refused_live_are_not_marked_verified() -> None:
+    not_run = {"create_ad", "update_ad", "duplicate_ad", "update_ad_creative_enhancements", "boost_instagram_post", "delete_feed_rule"}
+    assert not LIVE_VERIFIED_WRITE_TOOLS & not_run
 
 
 def test_summary_counts_add_up() -> None:

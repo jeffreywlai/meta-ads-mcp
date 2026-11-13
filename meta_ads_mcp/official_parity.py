@@ -46,13 +46,16 @@ LIVE_VERIFIED_TOOLS: frozenset[str] = frozenset(
         "export_change_history",
         "get_ad_account",
         "get_ad_study",
+        "get_adset",
         "get_advertiser_context",
         "get_auction_ranking_report",
         "get_audience",
+        "get_campaign",
         "get_catalog_diagnostics",
         "get_catalog_dynamic_ads_health",
         "get_catalog_event_source_health",
         "get_catalog_event_source_recommendations",
+        "get_creative",
         "get_dataset",
         "get_dataset_quality",
         "get_dataset_stats",
@@ -98,6 +101,57 @@ LIVE_VERIFIED_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# Write tools run on 2026-11-13 against a throwaway ad account (no payment method,
+# everything created paused and then deleted) and a test catalog, with Meta
+# accepting the request and a read-back agreeing where one was possible. Not here:
+# anything that creates an ad (Meta refuses one on an account with no payment
+# method, so create_ad, update_ad, duplicate_ad, update_ad_creative_enhancements and
+# the last step of boost_instagram_post are untested live), delete_feed_rule (Meta
+# answers that the endpoint is retired), and the tools not exercised.
+LIVE_VERIFIED_WRITE_TOOLS: frozenset[str] = frozenset(
+    {
+        "add_audience_users",
+        "batch_update_catalog_products",
+        "cancel_ad_study",
+        "create_ab_test",
+        "create_ad_creative_from_inputs",
+        "create_ad_set",
+        "create_campaign",
+        "create_catalog",
+        "create_catalog_product",
+        "create_custom_audience",
+        "create_feed_rule",
+        "create_product_feed",
+        "create_product_feed_upload",
+        "create_product_set",
+        "delete_ad_image",
+        "delete_adset",
+        "delete_audience",
+        "delete_campaign",
+        "delete_catalog_product",
+        "delete_creative",
+        "delete_product_feed",
+        "delete_product_set",
+        "duplicate_adset",
+        "duplicate_campaign",
+        "remove_audience_users",
+        "set_campaign_status",
+        "update_ad_study",
+        "update_adset",
+        "update_adset_budget",
+        "update_campaign",
+        "update_campaign_budget",
+        "update_catalog",
+        "update_catalog_product",
+        "update_custom_audience",
+        "update_feed_rule",
+        "update_product_feed",
+        "update_product_set",
+        "upload_ad_video",
+        "upload_creative_asset",
+    }
+)
+
 # Documented by Meta but absent from its live server on 2026-11-12.
 DOCUMENTED_NOT_SERVED: frozenset[str] = frozenset({"ads_update_custom_audience_users"})
 
@@ -115,7 +169,8 @@ class OfficialToolEntry:
         """Whether every serving tool has run against a real account."""
         if self.status not in SERVED_STATUSES or not self.tools:
             return None
-        return "live" if all(tool in LIVE_VERIFIED_TOOLS for tool in self.tools) else "mocked"
+        verified = LIVE_VERIFIED_TOOLS | LIVE_VERIFIED_WRITE_TOOLS
+        return "live" if all(tool in verified for tool in self.tools) else "mocked"
 
     def to_dict(self, name: str) -> dict[str, object]:
         """Return a JSON-native view for tool responses."""
