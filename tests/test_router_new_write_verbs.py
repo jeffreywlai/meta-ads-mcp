@@ -6,17 +6,19 @@ connect and disconnect.
 
 Cost: building the routing contracts for the whole catalog takes most of a
 second, and tool search rebuilds them each time read-only mode is switched on
-or off. So routing decisions use contracts built once per catalog, read-only
-expectations are checked on the routing decision for the read-only catalog
-(tool search filters the catalog to read-only tools before it routes, see
-IntentAwareBM25SearchTransform._search), and a smaller set of end-to-end
-searches runs in each mode in one test per mode.
+or off. So routing decisions use contracts built once per catalog, and every
+query a read-only case checks runs through the real tool search in read-only
+mode in one batch, switching mode once (see read_only_searches); each case then
+checks its own query's search result, and the routing decision for the
+read-only catalog as well.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -48,6 +50,45 @@ def _search(query: str) -> list[str]:
     result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
     text = "\n".join(item.text for item in result.content if item.type == "text")
     return list(dict.fromkeys(re.findall(r"`([a-z][a-z0-9_]*)`", text)))
+
+
+@contextmanager
+def _read_only_mode() -> Iterator[None]:
+    """Run tool search with META_READ_ONLY=true, then restore the previous mode."""
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("META_READ_ONLY", "true")
+            reload_settings()
+            yield
+    finally:
+        reload_settings()
+
+
+# Real read-only search results by query, filled by the read_only_searches batch.
+_READ_ONLY_SEARCHES: dict[str, list[str]] = {}
+
+
+def _read_only_search(query: str) -> list[str]:
+    """What the real tool search returns for the query in read-only mode.
+
+    The read_only_searches batch has normally run the query already; a query
+    it did not cover is searched here, in read-only mode, on its own.
+    """
+    if query not in _READ_ONLY_SEARCHES:
+        with _read_only_mode():
+            _READ_ONLY_SEARCHES[query] = _search(query)
+    return _READ_ONLY_SEARCHES[query]
+
+
+@pytest.fixture(scope="module")
+def read_only_searches() -> dict[str, list[str]]:
+    """Run every query of READ_ONLY_QUERIES through the real search in read-only mode, switching mode once."""
+    pending = [query for query in dict.fromkeys(READ_ONLY_QUERIES) if query not in _READ_ONLY_SEARCHES]
+    if pending:
+        with _read_only_mode():
+            for query in pending:
+                _READ_ONLY_SEARCHES[query] = _search(query)
+    return _READ_ONLY_SEARCHES
 
 
 @pytest.mark.parametrize(
@@ -92,11 +133,13 @@ def test_negated_requests_do_not_offer_the_write_tool(query) -> None:
     assert not NEW_VERB_WRITE_TOOLS & set(_search(query))
 
 
-def test_read_only_mode_hides_the_new_write_tools(monkeypatch) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "true")
-    reload_settings()
-    for query in ("boost instagram post", "cancel ad study", "add users to a custom audience"):
-        assert not NEW_VERB_WRITE_TOOLS & set(_search(query))
+NEW_VERB_READ_ONLY_QUERIES = ("boost instagram post", "cancel ad study", "add users to a custom audience")
+
+
+@pytest.mark.usefixtures("read_only_searches")
+def test_read_only_mode_hides_the_new_write_tools() -> None:
+    for query in NEW_VERB_READ_ONLY_QUERIES:
+        assert not NEW_VERB_WRITE_TOOLS & set(_read_only_search(query))
 
 
 @pytest.mark.parametrize(
@@ -148,11 +191,13 @@ def test_other_requests_never_offer_the_duplicate_or_batch_tools(query) -> None:
     assert not PHASE_TWO_VERB_WRITE_TOOLS & set(_search(query))
 
 
-def test_read_only_mode_hides_the_duplicate_and_batch_tools(monkeypatch) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "true")
-    reload_settings()
-    for query in ("duplicate campaign", "batch update catalog products", "copy this campaign"):
-        assert not PHASE_TWO_VERB_WRITE_TOOLS & set(_search(query))
+PHASE_TWO_READ_ONLY_QUERIES = ("duplicate campaign", "batch update catalog products", "copy this campaign")
+
+
+@pytest.mark.usefixtures("read_only_searches")
+def test_read_only_mode_hides_the_duplicate_and_batch_tools() -> None:
+    for query in PHASE_TWO_READ_ONLY_QUERIES:
+        assert not PHASE_TWO_VERB_WRITE_TOOLS & set(_read_only_search(query))
 
 
 # Round-two review G16: "add", "remove" and "boost" also have arithmetic and
@@ -203,7 +248,7 @@ def _decision(query: str, *, locked: bool = False):
 
 
 def _read_only_offers(query: str) -> frozenset[str]:
-    """Every tool search can return for the query in read-only mode."""
+    """Every tool the routing decision for the read-only catalog allows search to return."""
     return _decision(query, locked=True).compatible_tools
 
 
@@ -216,63 +261,71 @@ def test_g16_analytical_requests_never_offer_mutations(query) -> None:
 ALL_SUBJECT_VERB_WRITE_TOOLS = NEW_VERB_WRITE_TOOLS | PHASE_TWO_VERB_WRITE_TOOLS
 
 
+# Names the search result's closing lines mention ("Next: use `call_tool` ...").
+SEARCH_TEXT_NAMES = {"call_tool", "get_capabilities"}
+
+
 def _assert_read_tools_only(query: str, locked: bool) -> None:
-    """Unlocked: a real search. Read-only: the routing decision for the read-only catalog."""
-    if locked:
-        offered = _read_only_offers(query)
-        assert offered, "a read request should still find read tools"
-        assert not ALL_SUBJECT_VERB_WRITE_TOOLS & offered, sorted(offered)
-        return
-    found = _search(query)
+    """A real search in the given mode returns read tools; read-only also checks the decision."""
+    found = _read_only_search(query) if locked else _search(query)
     assert found, "a read request should still find read tools"
     assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), found
+    if locked:
+        offered = _read_only_offers(query)
+        assert not ALL_SUBJECT_VERB_WRITE_TOOLS & offered, sorted(offered)
+        assert set(found) - SEARCH_TEXT_NAMES <= offered, (found, sorted(offered))
 
 
 def _assert_command_offered(query: str, expected: str, locked: bool, *, top: int = 3) -> None:
     if locked:
+        found = _read_only_search(query)
+        assert expected not in found, found
         assert expected not in _read_only_offers(query)
         return
     assert expected in _decision(query).compatible_tools, sorted(_decision(query).compatible_tools)
     assert expected in _search(query)[:top], _search(query)
 
 
+@pytest.mark.usefixtures("read_only_searches")
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
 @pytest.mark.parametrize("query", ANALYTICAL_QUERIES)
 def test_analytical_requests_return_read_tools_only(query, locked) -> None:
     _assert_read_tools_only(query, locked)
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "add up audience performance and show the campaign insights",
-        "show the campaign insights and add up audience performance",
-        "remove outliers from audience performance, then compare campaigns",
-        "compare campaigns, then remove outliers from audience performance",
-        "boost in instagram post engagement and list the ads",
-        "list the ads and boost in instagram post engagement",
-    ],
-)
+ANALYTICAL_CLAUSE_QUERIES = [
+    "add up audience performance and show the campaign insights",
+    "show the campaign insights and add up audience performance",
+    "remove outliers from audience performance, then compare campaigns",
+    "compare campaigns, then remove outliers from audience performance",
+    "boost in instagram post engagement and list the ads",
+    "list the ads and boost in instagram post engagement",
+]
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("query", ANALYTICAL_CLAUSE_QUERIES)
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
 def test_analytical_clauses_stay_read_safe_in_either_order(query, locked) -> None:
     assert _decision(query).suppress_mutations is True
     _assert_read_tools_only(query, locked)
 
 
-@pytest.mark.parametrize(
-    "query,expected",
-    [
-        ("add up audience performance and add users to the custom audience", "add_audience_users"),
-        ("add users to the custom audience and add up audience performance", "add_audience_users"),
-        ("remove outliers from audience performance, then remove customers from the audience", "remove_audience_users"),
-        ("remove customers from the audience, then remove outliers from audience performance", "remove_audience_users"),
-        ("boost in instagram post engagement and boost the instagram post", "boost_instagram_post"),
-        ("boost the instagram post and boost in instagram post engagement", "boost_instagram_post"),
-    ],
-)
+MIXED_CLAUSE_COMMANDS = [
+    ("add up audience performance and add users to the custom audience", "add_audience_users"),
+    ("add users to the custom audience and add up audience performance", "add_audience_users"),
+    ("remove outliers from audience performance, then remove customers from the audience", "remove_audience_users"),
+    ("remove customers from the audience, then remove outliers from audience performance", "remove_audience_users"),
+    ("boost in instagram post engagement and boost the instagram post", "boost_instagram_post"),
+    ("boost the instagram post and boost in instagram post engagement", "boost_instagram_post"),
+]
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("query,expected", MIXED_CLAUSE_COMMANDS)
 def test_a_real_write_clause_is_still_offered_next_to_an_analytical_one(query, expected) -> None:
     assert expected in _search(query)[:2]
-    assert expected not in _read_only_offers(query)
+    _assert_command_offered(query, expected, locked=True)
 
 
 @pytest.mark.parametrize(
@@ -331,6 +384,7 @@ def test_h12_reporting_objects_are_read_safe_after_prepositions(query) -> None:
     assert decision.suppress_mutations is True, sorted(decision.compatible_tools)
 
 
+@pytest.mark.usefixtures("read_only_searches")
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
 @pytest.mark.parametrize("query", H12_REVIEWER_QUERIES + H12_MORE_REPORTING_QUERIES)
 def test_h12_reporting_destinations_and_counts_offer_read_tools_only(query, locked) -> None:
@@ -355,6 +409,7 @@ H12_COMMANDS = [
 ]
 
 
+@pytest.mark.usefixtures("read_only_searches")
 @pytest.mark.parametrize(("query", "expected"), H12_COMMANDS)
 def test_h12_commands_near_reporting_wording_still_offer_the_write_tool(query, expected) -> None:
     _assert_command_offered(query, expected, locked=False)
@@ -403,6 +458,7 @@ def test_h13_reporting_words_in_entity_names_do_not_hide_commands(query, expecte
     assert expected in decision.compatible_tools, sorted(decision.compatible_tools)
 
 
+@pytest.mark.usefixtures("read_only_searches")
 @pytest.mark.parametrize(("query", "expected"), H13_REVIEWER_COMMANDS + H13_MORE_COMMANDS)
 def test_h13_named_entities_offer_the_write_tool_and_read_only_hides_it(query, expected) -> None:
     _assert_command_offered(query, expected, locked=False)
@@ -503,6 +559,7 @@ def test_report_container_nouns_do_not_offer_a_write(query) -> None:
     assert decision.suppress_mutations is True, decision
 
 
+@pytest.mark.usefixtures("read_only_searches")
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
 @pytest.mark.parametrize("query", J15_REVIEWER_QUERIES + J15_MORE_REPORTING_QUERIES)
 def test_j15_report_containers_ending_the_object_offer_read_tools_only(query, locked) -> None:
@@ -510,15 +567,96 @@ def test_j15_report_containers_ending_the_object_offer_read_tools_only(query, lo
     _assert_read_tools_only(query, locked)
 
 
+@pytest.mark.usefixtures("read_only_searches")
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
 @pytest.mark.parametrize(("query", "expected"), J15_COMMANDS)
 def test_j15_commands_near_report_containers_still_offer_the_write_tool(query, expected, locked) -> None:
     _assert_command_offered(query, expected, locked)
 
 
-# End-to-end: real tool searches in each mode, one switch of mode per test. The
-# cases above check read-only mode on the routing decision for the read-only
-# catalog; these confirm that search gives the same answer.
+# Round-five review K13: a part of a report named after an entity ("the report's
+# audience section", "the audience section of the dashboard") is a place in the
+# report, not the audience or campaign. The owning report is written as a
+# possessive or after "of"; when the phrase ends in an entity noun ("the
+# dashboard's audience"), the report only says which entity is meant.
+
+K13_REVIEWER_QUERIES = [
+    "add audience users to the report's audience section",
+    "remove audience users from the dashboard's audience section",
+    "copy the campaign into the report's campaign section",
+]
+
+K13_MORE_REPORTING_QUERIES = [
+    "add audience users to the audience section of the dashboard",
+    "remove customers from the audience part of the report",
+    "add customers to the spreadsheet's audience section",
+    "add users to the reports' audience section",
+    "disconnect the pixel from the report’s pixel section",
+    "connect the pixel to the dashboard's pixel area",
+    "copy the ad set into the dashboard's ad set panel",
+    "duplicate the campaign into the campaign block of the slide deck",
+    "clone the ad into the presentation's ad section",
+    "add customers to the weekly report's audience summary",
+    "remove customers from the custom audience part of the dashboard",
+    "add audience users into the workbook's customer area",
+    # The object is the part of the report.
+    "remove the report's audience section",
+    "remove the audience section of the report",
+    "cancel the ad study section of the report",
+    "duplicate the campaign section of the weekly report",
+    # After a layout preposition.
+    "add audience users for the report's audience section",
+    "add audience users as the audience section of the dashboard",
+]
+
+K13_COMMANDS = [
+    # A named audience or catalog.
+    ("add users to the audience 'Report Readers'", "add_audience_users"),
+    ('add customers to the audience named "Report Section"', "add_audience_users"),
+    ("connect the pixel to the catalog named 'Dashboard Section'", "connect_catalog_event_source"),
+    # A report, spreadsheet or export that is where the customers come from.
+    ("add customers from the report's export to the audience", "add_audience_users"),
+    ("add the spreadsheet's customers to the custom audience", "add_audience_users"),
+    ("remove the customers in the report's first tab from the audience", "remove_audience_users"),
+    ("remove the people in the sheet's first tab from the audience", "remove_audience_users"),
+    ("add the customers from the export's audience section to the custom audience", "add_audience_users"),
+    ("add the customer list rows from the report's audience section to the audience", "add_audience_users"),
+    # A report that says which entity is meant.
+    ("add users to the dashboard's audience", "add_audience_users"),
+    ("remove customers from the export's audience", "remove_audience_users"),
+    ("duplicate the dashboard's top campaign", "duplicate_campaign"),
+    ("copy the report's best ad set into another campaign", "duplicate_adset"),
+    ("connect the pixel of the report to the catalog", "connect_catalog_event_source"),
+    ("disconnect the pixel from the catalog of the report", "disconnect_catalog_event_source"),
+    ("add customers to the audience of the brand campaign", "add_audience_users"),
+    ("add the users of the dashboard to the audience", "add_audience_users"),
+    ("remove the users of the report from the audience", "remove_audience_users"),
+]
+
+
+@pytest.mark.parametrize("query", K13_REVIEWER_QUERIES)
+def test_reporting_sections_do_not_offer_mutations(query) -> None:
+    decision = _decision(query)
+    assert decision.suppress_mutations is True, sorted(decision.compatible_tools)
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize("query", K13_REVIEWER_QUERIES + K13_MORE_REPORTING_QUERIES)
+def test_k13_parts_of_a_report_offer_read_tools_only(query, locked) -> None:
+    assert _decision(query).suppress_mutations is True, sorted(_decision(query).compatible_tools)
+    _assert_read_tools_only(query, locked)
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize(("query", "expected"), K13_COMMANDS)
+def test_k13_commands_that_mention_a_report_still_offer_the_write_tool(query, expected, locked) -> None:
+    _assert_command_offered(query, expected, locked)
+
+
+# End-to-end: real tool searches in each mode, switching mode inside the test,
+# independently of the read_only_searches batch the cases above share.
 
 END_TO_END_READ_QUERIES = [
     *ANALYTICAL_QUERIES[:4],
@@ -538,10 +676,6 @@ END_TO_END_COMMANDS = [
 ]
 
 
-# Names the search result's closing lines mention ("Next: use `call_tool` ...").
-SEARCH_TEXT_NAMES = {"call_tool", "get_capabilities"}
-
-
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
 def test_end_to_end_search_in_each_mode(monkeypatch, locked) -> None:
     monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
@@ -559,3 +693,25 @@ def test_end_to_end_search_in_each_mode(monkeypatch, locked) -> None:
             assert set(found) - SEARCH_TEXT_NAMES <= _read_only_offers(query), (query, found)
         else:
             assert expected in found[:3], (query, found)
+
+
+# Every query a read-only case checks. read_only_searches runs them all through
+# the real search in read-only mode at once; a query missing here is still
+# searched for real, on its own, at the cost of switching mode for it.
+READ_ONLY_QUERIES = [
+    *NEW_VERB_READ_ONLY_QUERIES,
+    *PHASE_TWO_READ_ONLY_QUERIES,
+    *ANALYTICAL_QUERIES,
+    *ANALYTICAL_CLAUSE_QUERIES,
+    *(query for query, _expected in MIXED_CLAUSE_COMMANDS),
+    *H12_REVIEWER_QUERIES,
+    *H12_MORE_REPORTING_QUERIES,
+    *(query for query, _expected in H12_COMMANDS),
+    *(query for query, _expected in H13_REVIEWER_COMMANDS + H13_MORE_COMMANDS),
+    *J15_REVIEWER_QUERIES,
+    *J15_MORE_REPORTING_QUERIES,
+    *(query for query, _expected in J15_COMMANDS),
+    *K13_REVIEWER_QUERIES,
+    *K13_MORE_REPORTING_QUERIES,
+    *(query for query, _expected in K13_COMMANDS),
+]

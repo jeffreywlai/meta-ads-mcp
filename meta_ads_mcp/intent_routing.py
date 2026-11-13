@@ -900,10 +900,17 @@ _DESTINATION_PREPOSITIONS: dict[str, tuple[frozenset[str], ...]] = {
 
 @dataclass(frozen=True, slots=True)
 class _Word:
-    """One word of a clause, lowercased, and whether it was written as a Title-case name."""
+    """One word of a clause, lowercased, whether it was written as a Title-case name,
+    and whether it was written as a possessive ("report's", "reports'")."""
 
     text: str
     titled: bool
+    possessive: bool = False
+
+
+# An apostrophe (straight or curly) that makes the word before it possessive.
+_POSSESSIVE_AFTER = re.compile(r"['’]s(?![A-Za-z0-9])")
+_PLURAL_POSSESSIVE_AFTER = re.compile(r"['’](?![A-Za-z0-9])")
 
 
 def _phrase_words(clause: str) -> list[_Word]:
@@ -911,13 +918,23 @@ def _phrase_words(clause: str) -> list[_Word]:
 
     In a clause that also has ordinary lowercase words, a word written in Title
     case after the verb ("duplicate the campaign Reach") is marked as possibly
-    part of a name. All-capital words (CTR, ROAS) are not marked.
+    part of a name. All-capital words (CTR, ROAS) are not marked. The "s" of a
+    possessive stays a word of its own, as before.
     """
-    raw = re.findall(r"[A-Za-z0-9]+", re.sub(_QUOTED_VALUE, " ", clause))
+    text = re.sub(_QUOTED_VALUE, " ", clause)
+    matches = list(re.finditer(r"[A-Za-z0-9]+", text))
+    raw = [match[0] for match in matches]
     mixed = any(word[:1].islower() for word in raw[1:])
     return [
-        _Word(word.lower(), mixed and index > 0 and word[:1].isupper() and not word.isupper())
-        for index, word in enumerate(raw)
+        _Word(
+            word.lower(),
+            mixed and index > 0 and word[:1].isupper() and not word.isupper(),
+            bool(
+                _POSSESSIVE_AFTER.match(text, match.end())
+                or (word[-1:] in "sS" and _PLURAL_POSSESSIVE_AFTER.match(text, match.end()))
+            ),
+        )
+        for index, (word, match) in enumerate(zip(raw, matches))
     ]
 
 
@@ -945,6 +962,18 @@ def _phrase(words: list[_Word], start: int) -> tuple[list[_Word], int]:
     return phrase, index
 
 
+def _object_span(clause: str) -> tuple[list[_Word], list[_Word], int]:
+    """The clause's words, the object phrase (see _object_phrase), and where the phrase stopped."""
+    words = _phrase_words(clause)
+    phrase, stop = _phrase(words, 1)
+    last_entity = max((index for index, word in enumerate(phrase) if _is_entity(word.text)), default=-1)
+    named = [
+        word for index, word in enumerate(phrase)
+        if not (index > last_entity >= 0 and word.titled and not _is_entity(word.text))
+    ]
+    return words, named, stop
+
+
 def _object_phrase(clause: str) -> list[_Word]:
     """The words right after the verb, without a name written after the entity noun.
 
@@ -953,12 +982,7 @@ def _object_phrase(clause: str) -> list[_Word]:
     and Title-case words after the last entity noun ("the campaign Reach Test")
     are dropped as the entity's name.
     """
-    phrase = _phrase(_phrase_words(clause), 1)[0]
-    last_entity = max((index for index, word in enumerate(phrase) if _is_entity(word.text)), default=-1)
-    return [
-        word for index, word in enumerate(phrase)
-        if not (index > last_entity >= 0 and word.titled and not _is_entity(word.text))
-    ]
+    return _object_span(clause)[1]
 
 
 def _object_words(clause: str) -> list[str]:
@@ -988,19 +1012,44 @@ def _after_object(clause: str) -> tuple[list[_Word], int, int]:
     return words, start, end
 
 
-def _destination_words(clause: str) -> list[str]:
-    """Return the phrase after the verb's destination preposition, if any.
+def _destination_span(clause: str) -> tuple[list[_Word], list[_Word], int]:
+    """The clause's words, the phrase after the verb's destination preposition, and where it stopped.
 
-    "add audience users to the report" has the destination "the report".
+    "add audience users to the report" has the destination "the report"; with
+    no destination preposition the phrase is empty.
     """
     words, start, end = _after_object(clause)
     if not words:
-        return []
+        return [], [], 0
     for prepositions in _DESTINATION_PREPOSITIONS.get(words[0].text, ()):
         for index in range(start, end):
             if words[index].text in prepositions:
-                return [word.text for word in _phrase(words, index + 1)[0]]
-    return []
+                phrase, stop = _phrase(words, index + 1)
+                return words, phrase, stop
+    return words, [], len(words)
+
+
+def _is_report_container(word: str) -> bool:
+    return word in _REPORTING_DESTINATIONS or _singular(word) in _REPORTING_DESTINATIONS
+
+
+def _part_of_a_report(words: list[_Word], phrase: list[_Word], stop: int) -> bool:
+    """Whether a phrase names a part of a report rather than the thing a tool acts on.
+
+    The report is the phrase's owner, written as a possessive ("the report's
+    audience section") or after "of" ("the audience section of the
+    dashboard"), and the phrase's last word, which says what the phrase is, is
+    not an entity noun. When it is one ("the dashboard's audience", like "the
+    dashboard audience"), the report only says which audience is meant.
+    """
+    if not phrase or _is_entity(phrase[-1].text):
+        return False
+    if any(word.possessive and _is_report_container(word.text) for word in phrase[:-1]):
+        return True
+    if stop < len(words) and words[stop].text == "of":
+        owner = _phrase(words, stop + 1)[0]
+        return bool(owner) and _is_report_container(owner[-1].text)
+    return False
 
 
 # Prepositions that say how the object is laid out in a report, or what it is
@@ -1009,11 +1058,11 @@ def _destination_words(clause: str) -> list[str]:
 _LAYOUT_PREPOSITIONS = frozenset({"as", "at", "by", "for", "per"})
 
 
-def _layout_phrases(clause: str) -> list[list[str]]:
-    """Return each phrase after a layout preposition that follows the object."""
+def _layout_spans(clause: str) -> tuple[list[_Word], list[tuple[list[_Word], int]]]:
+    """The clause's words, and each phrase after a layout preposition with where it stopped."""
     words, start, end = _after_object(clause)
-    return [
-        [word.text for word in _phrase(words, index + 1)[0]]
+    return words, [
+        _phrase(words, index + 1)
         for index in range(start, end)
         if words[index].text in _LAYOUT_PREPOSITIONS
     ]
@@ -1046,15 +1095,31 @@ def _is_analytical(clause: str) -> bool:
     The exception is a destination that names what the tool acts on: in "add
     the customer spreadsheet to the audience" the spreadsheet is where the
     customers come from.
+
+    A part of a report is a reporting place even when it is named after an
+    entity: "the report's audience section" and "the audience section of the
+    dashboard" are in a report, as a destination or as the object (see
+    _part_of_a_report).
     """
-    object_words = _object_words(clause)
-    destination = _destination_words(clause)
+    words, object_phrase, object_stop = _object_span(clause)
+    object_words = [word.text for word in object_phrase]
+    _words, destination_phrase, destination_stop = _destination_span(clause)
+    destination = [word.text for word in destination_phrase]
     if _reporting_head(object_words, _ANALYTICAL_WORDS) or _reporting_head(
         destination, _ANALYTICAL_WORDS | _REPORTING_DESTINATIONS
     ):
         return True
-    container = _reporting_head(object_words, _REPORTING_DESTINATIONS) or any(
-        _reporting_head(phrase, _REPORTING_DESTINATIONS) for phrase in _layout_phrases(clause)
+    if _part_of_a_report(words, destination_phrase, destination_stop):
+        return True
+    layout_words, layouts = _layout_spans(clause)
+    container = (
+        _reporting_head(object_words, _REPORTING_DESTINATIONS)
+        or _part_of_a_report(words, object_phrase, object_stop)
+        or any(
+            _reporting_head([word.text for word in phrase], _REPORTING_DESTINATIONS)
+            or _part_of_a_report(layout_words, phrase, stop)
+            for phrase, stop in layouts
+        )
     )
     return container and not any(_is_entity(word) for word in destination)
 
