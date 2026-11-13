@@ -41,6 +41,7 @@ _WRITE_NAMES = frozenset(
         "duplicate_campaign",
         "duplicate_adset",
         "duplicate_ad",
+        "batch_update_catalog_products",
     }
 )
 _READ_TAGS = frozenset({"read", "read-only", "readonly"})

@@ -6,11 +6,13 @@ that feeds Advantage+ catalog ads), never this server's own list of tools.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, TypeAlias
+from urllib.parse import urlparse
 
 from pydantic import BeforeValidator, Field
 
@@ -18,6 +20,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import (
     MetaApiError,
     NotFoundError,
+    RateLimitError,
     UnsupportedFeatureError,
     ValidationError,
 )
@@ -25,7 +28,7 @@ from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
-from meta_ads_mcp.tool_types import FieldList, normalize_field_list
+from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 
 # Fields documented on the Product Catalog reference page.
 CATALOG_FIELDS = ["id", "name", "vertical", "product_count", "feed_count", "is_catalog_segment"]
@@ -313,13 +316,15 @@ async def _collect_edge(
     read stops the scan with a stated reason, and that page's rows are not added
     twice. max_pages caps requests regardless of how many rows came back, so a
     run of empty pages cannot loop. With stop_at_total, the first summary
-    total_count Meta returns ends the read.
+    total_count Meta returns ends the read. summary_total is the first
+    summary total_count Meta returned on any page, or None.
     """
     rows: list[Any] = []
     seen_cursors: set[str] = set()
     seen_pages: set[str] = set()
     cursor: str | None = None
     pages = 0
+    summary_total: int | None = None
     while True:
         page_params = dict(params)
         if cursor is not None:
@@ -332,16 +337,19 @@ async def _collect_edge(
             fingerprint = json.dumps(data, sort_keys=True, default=str)
             if fingerprint in seen_pages:
                 return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
-                        "stop_reason": "Meta returned a page that had already been read."}
+                        "stop_reason": "Meta returned a page that had already been read.", "summary_total": summary_total}
             seen_pages.add(fingerprint)
             rows.extend(data)
         total = (payload.get("summary") or {}).get("total_count")
+        if summary_total is None:
+            summary_total = to_int(total)
         if stop_at_total and to_int(total) is not None:
             return {"rows": rows, "complete": True, "total_count": to_int(total), "pages": pages,
-                    "stop_reason": None}
+                    "stop_reason": None, "summary_total": summary_total}
         paging = payload.get("paging") or {}
         if not paging.get("next"):
-            return {"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None}
+            return {"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None,
+                    "summary_total": summary_total}
         cursor = blank_to_none((paging.get("cursors") or {}).get("after"))
         if cursor is None:
             reason = "Meta reported another page but returned no cursor to read it."
@@ -353,7 +361,8 @@ async def _collect_edge(
             reason = f"Stopped after {pages} pages."
         else:
             continue
-        return {"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason}
+        return {"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason,
+                "summary_total": summary_total}
 
 
 async def _business_scope(client, business_id: str | None, account_id: str | None) -> dict[str, Any]:
@@ -420,8 +429,63 @@ async def list_catalogs(
     return result
 
 
-async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any]:
-    """Collect the documented per-catalog signals used to rank catalog-ad readiness."""
+_DPA_URL_SAMPLE_SIZE = 5
+
+
+def _host(url: Any) -> str | None:
+    """Return a URL's lowercased host without a leading www., or None."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    text = url.strip()
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        host = (urlparse(text).hostname or "").lower()
+    except ValueError:
+        return None
+    if not host or "." not in host or " " in host:
+        return None
+    return host[4:] if host.startswith("www.") else host
+
+
+def _same_site(host: str, domain: str) -> bool:
+    return host == domain or host.endswith("." + domain) or domain.endswith("." + host)
+
+
+async def _ad_domain_match(client, catalog_id: str, domain: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Compare a small sample of product URLs with the ad's domain (one request)."""
+    try:
+        payload = await client.list_objects(catalog_id, "products", fields=["url"],
+                                            params={"limit": _DPA_URL_SAMPLE_SIZE})
+    except _SIGNAL_ERRORS as error:
+        return {"domain": domain, "sampled_urls": 0, "matching_urls": 0, "match": "unknown"}, \
+            _error_entry("products (url sample)", error)
+    hosts = [host for row in payload.get("data") or [] if isinstance(row, dict)
+             if (host := _host(row.get("url"))) is not None]
+    matching = sum(_same_site(host, domain) for host in hosts)
+    if not hosts:
+        match = "unknown"
+    elif matching == len(hosts):
+        match = "yes"
+    elif matching:
+        match = "partial"
+    else:
+        match = "no"
+    return {"domain": domain, "sampled_urls": len(hosts), "matching_urls": matching, "match": match}, None
+
+
+async def _catalog_dpa_signals(
+    client,
+    catalog: dict[str, Any],
+    *,
+    ad_domain: str | None = None,
+    pixel_id: str | None = None,
+) -> dict[str, Any]:
+    """Collect the documented per-catalog signals used to rank catalog-ad readiness.
+
+    A catalog Meta reports with no products is blocked whatever else is true, so
+    its supporting edges are not read.
+    """
     catalog_id = str(catalog.get("id"))
     signals: dict[str, Any] = {
         "product_count": to_int(catalog.get("product_count")),
@@ -433,6 +497,14 @@ async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any
     }
     unavailable: list[dict[str, Any]] = []
     partial: list[dict[str, Any]] = []
+    context: dict[str, Any] = {}
+    if signals["product_count"] == 0:
+        if ad_domain is not None:
+            context["ad_domain"] = {"domain": ad_domain, "sampled_urls": 0, "matching_urls": 0, "match": "unknown"}
+        if pixel_id is not None:
+            context["pixel"] = {"pixel_id": pixel_id, "connected": None}
+        return {"signals": signals, "unavailable": unavailable, "partial": partial, "context": context,
+                "skipped": "The catalog has no products, so its product sets, event sources and diagnostics were not read."}
 
     def note_partial(signal: str, read: dict[str, Any], rows_read: int) -> None:
         partial.append({
@@ -463,8 +535,14 @@ async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any
         else:
             note_partial("external_event_sources", sources, len(sources["rows"]))
             signals["event_source_count"] = len(sources["rows"]) or None
+        if pixel_id is not None:
+            source_ids = {str(row.get("id")) for row in sources["rows"] if isinstance(row, dict)}
+            connected = True if pixel_id in source_ids else (False if sources["complete"] else None)
+            context["pixel"] = {"pixel_id": pixel_id, "connected": connected}
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("external_event_sources", error))
+        if pixel_id is not None:
+            context["pixel"] = {"pixel_id": pixel_id, "connected": None}
     try:
         diagnostics = await _collect_edge(
             client, catalog_id, "diagnostics", fields=DPA_DIAGNOSTIC_FIELDS,
@@ -480,7 +558,13 @@ async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any
             note_partial("diagnostics", diagnostics, len(groups))
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("diagnostics", error))
-    return {"signals": signals, "unavailable": unavailable, "partial": partial}
+    context_errors: list[dict[str, Any]] = []
+    if ad_domain is not None:
+        context["ad_domain"], error_entry = await _ad_domain_match(client, catalog_id, ad_domain)
+        if error_entry is not None:
+            context_errors.append(error_entry)
+    return {"signals": signals, "unavailable": unavailable, "partial": partial, "context": context,
+            "context_errors": context_errors}
 
 
 _DPA_REQUIRED_SIGNALS = (
@@ -553,13 +637,59 @@ def _assess_catalog(
 _ASSESSMENT_RANK = {"ready": 0, "needs_attention": 1, "unknown": 2, "blocked": 3}
 
 
+_ELIGIBLE_GROUP = {"ready": 0, "needs_attention": 0, "unknown": 1, "blocked": 2}
+
+
+def _context_reasons(context: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    domain = context.get("ad_domain")
+    if domain is not None:
+        if domain["match"] == "unknown":
+            reasons.append(f"Could not compare product URLs with {domain['domain']} (no product URL was read).")
+        else:
+            reasons.append(
+                f"{domain['matching_urls']} of {domain['sampled_urls']} sampled product URL(s) are on "
+                f"{domain['domain']}."
+            )
+    pixel = context.get("pixel")
+    if pixel is not None:
+        if pixel["connected"] is True:
+            reasons.append(f"Connected to pixel {pixel['pixel_id']}.")
+        elif pixel["connected"] is False:
+            reasons.append(f"Not connected to pixel {pixel['pixel_id']}.")
+        else:
+            reasons.append(f"Whether pixel {pixel['pixel_id']} is connected could not be established.")
+    return reasons
+
+
+def _context_score(context: dict[str, Any]) -> tuple[int, int]:
+    """Return (checks matched, checks supplied) for the optional ad context."""
+    matched = supplied = 0
+    if (domain := context.get("ad_domain")) is not None:
+        supplied += 1
+        matched += domain["match"] in {"yes", "partial"}
+    if (pixel := context.get("pixel")) is not None:
+        supplied += 1
+        matched += pixel["connected"] is True
+    return matched, supplied
+
+
 @mcp_server.tool()
 async def list_dpa_eligible_catalogs(
     business_id: str | None = None,
     account_id: str | None = None,
+    ad_url: str | None = None,
+    pixel_id: GraphId | None = None,
 ) -> dict[str, Any]:
-    """Rank a business's product catalogs (or an ad account's owning business's) by readiness for Advantage catalog (dynamic) ads, with the reasons and a recommended catalog when exactly one is ready. Derived locally from documented catalog data; Meta publishes no eligibility endpoint."""
+    """Rank a business's product catalogs (or an ad account's owning business's) by readiness for Advantage catalog (dynamic) ads, with the reasons and a recommended catalog when exactly one is ready. Optional ad_url and pixel_id put first the eligible catalogs whose sampled product URLs are on the ad's domain or that are connected to that pixel, and say why. Derived locally from documented catalog data; Meta publishes no eligibility endpoint."""
     scope_name, scope_value = _one_scope(business_id=business_id, account_id=account_id)
+    ad_domain = None
+    if ad_url is not None:
+        ad_domain = _host(ad_url)
+        if ad_domain is None:
+            raise ValidationError("ad_url must be a web address such as https://shop.example.com/product.")
+    pixel_id = blank_to_none(pixel_id) if isinstance(pixel_id, str) else None
+    has_context = ad_domain is not None or pixel_id is not None
     client = get_graph_api_client()
     scope = await _business_scope(
         client,
@@ -578,7 +708,7 @@ async def list_dpa_eligible_catalogs(
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
     for catalog in catalogs:
-        collected = await _catalog_dpa_signals(client, catalog)
+        collected = await _catalog_dpa_signals(client, catalog, ad_domain=ad_domain, pixel_id=pixel_id)
         assessment, reasons = _assess_catalog(
             collected["signals"], collected["unavailable"], collected["partial"],
         )
@@ -589,7 +719,9 @@ async def list_dpa_eligible_catalogs(
                 f"{catalog.get('id')}: {entry['signal']} was only partly read "
                 f"({entry['rows_read']} row(s) read). {entry['reason']}"
             )
-        findings.append({
+        for entry in collected.get("context_errors", []):
+            missing_signals.append(f"{catalog.get('id')}: {entry['signal']} could not be read ({entry['error']}).")
+        finding = {
             "catalog_id": str(catalog.get("id")),
             "name": catalog.get("name"),
             "vertical": catalog.get("vertical"),
@@ -598,8 +730,16 @@ async def list_dpa_eligible_catalogs(
             "signals": collected["signals"],
             "unavailable_signals": collected["unavailable"],
             "partial_signals": collected["partial"],
-        })
+        }
+        if collected.get("skipped"):
+            finding["signals_skipped"] = collected["skipped"]
+        if has_context:
+            finding["context_match"] = collected["context"]
+            reasons.extend(_context_reasons(collected["context"]))
+        findings.append(finding)
     findings.sort(key=lambda item: (
+        _ELIGIBLE_GROUP[item["assessment"]],
+        -_context_score(item.get("context_match") or {})[0],
         _ASSESSMENT_RANK[item["assessment"]],
         item["signals"]["da_must_fix_affected_items"] or 0,
         -(item["signals"]["product_count"] or 0),
@@ -607,7 +747,24 @@ async def list_dpa_eligible_catalogs(
     for rank, finding in enumerate(findings, start=1):
         finding["rank"] = rank
     ready = [finding for finding in findings if finding["assessment"] == "ready"]
-    if len(ready) == 1:
+    supplied = ", ".join(name for name, value in (("ad_url", ad_domain), ("pixel_id", pixel_id)) if value)
+    if has_context:
+        matched_ready = [
+            finding for finding in ready
+            if (score := _context_score(finding["context_match"]))[0] == score[1]
+        ]
+        if len(matched_ready) == 1:
+            recommended = matched_ready[0]["catalog_id"]
+            reason = f"It is the only catalog that passed every readiness rule and matched {supplied}."
+        elif matched_ready:
+            recommended = None
+            reason = (f"{len(matched_ready)} ready catalogs matched {supplied}; choose by which products the "
+                      "campaign should promote.")
+        else:
+            recommended = None
+            reason = (f"No ready catalog matched {supplied}; check that the ad's site and pixel belong to "
+                      "one of these catalogs.")
+    elif len(ready) == 1:
         recommended = ready[0]["catalog_id"]
         reason = "It is the only catalog that passed every readiness rule."
     elif ready:
@@ -618,10 +775,38 @@ async def list_dpa_eligible_catalogs(
         recommended = None
         reason = "No catalog passed every readiness rule; see each catalog's reasons."
     if not complete:
-        reason = listing["stop_reason"] or f"Stopped at the {_DPA_MAX_CATALOGS}-catalog cap."
+        stop = listing["stop_reason"] or f"Stopped at the {_DPA_MAX_CATALOGS}-catalog cap."
+        recommended = None
+        reason = (f"The catalog list is incomplete, so no catalog can be called the only choice. {stop}")
         missing_signals.append(
-            f"The catalog list is incomplete: only {len(catalogs)} catalog(s) were evaluated. {reason}"
+            f"The catalog list is incomplete: only {len(catalogs)} catalog(s) were evaluated. {stop}"
         )
+    signals_used = [
+        "product_catalog.product_count",
+        "product_catalog/product_sets",
+        "product_catalog/external_event_sources",
+        "product_catalog/diagnostics",
+    ]
+    rules = {
+        "blocked": "product_count is 0. Supporting edges are not read for such a catalog.",
+        "ready": ("Has products, at least one product set, at least one connected event source, "
+                  "and no must-fix dynamic-ads diagnostics."),
+        "needs_attention": "Has products but fails one of the ready rules.",
+        "unknown": ("A signal could not be read, was only partly read without a deciding result, "
+                    "or Meta omitted product_count."),
+        "eligible": "ready or needs_attention.",
+    }
+    ordering = "assessment, then fewest items affected by must-fix diagnostics, then most products."
+    if ad_domain is not None:
+        signals_used.append(f"product_catalog/products (url of up to {_DPA_URL_SAMPLE_SIZE} products)")
+        rules["ad_url"] = (f"Matches when at least one of up to {_DPA_URL_SAMPLE_SIZE} sampled product URLs is on "
+                           "the ad's domain or a subdomain of it; a small sample, not every product.")
+    if pixel_id is not None:
+        rules["pixel_id"] = "Matches when the pixel is among the catalog's connected event sources."
+    if has_context:
+        ordering = ("eligible catalogs first, then the most context checks matched (ad_url, pixel_id), then "
+                    "assessment, fewest items affected by must-fix diagnostics, and most products.")
+        rules["recommended"] = "The only ready catalog that matched every context check supplied."
     return analysis_response(
         scope={**scope, "ownership": "owned"},
         metrics={
@@ -638,22 +823,9 @@ async def list_dpa_eligible_catalogs(
             "basis": {
                 "note": ("This ranking is derived here from documented catalog data; Meta publishes no "
                          "catalog-ad eligibility endpoint."),
-                "signals_used": [
-                    "product_catalog.product_count",
-                    "product_catalog/product_sets",
-                    "product_catalog/external_event_sources",
-                    "product_catalog/diagnostics",
-                ],
-                "rules": {
-                    "blocked": "product_count is 0.",
-                    "ready": ("Has products, at least one product set, at least one connected event source, "
-                              "and no must-fix dynamic-ads diagnostics."),
-                    "needs_attention": "Has products but fails one of the ready rules.",
-                    "unknown": ("A signal could not be read, was only partly read without a deciding result, "
-                                "or Meta omitted product_count."),
-                    "eligible": "ready or needs_attention.",
-                },
-                "ordering": "assessment, then fewest items affected by must-fix diagnostics, then most products.",
+                "signals_used": signals_used,
+                "rules": rules,
+                "ordering": ordering,
             },
         },
     )
@@ -948,6 +1120,24 @@ async def update_catalog(
     return response
 
 
+PRODUCT_LIST_VIEWS = ("items", "product_groups")
+# ProductGroup fields from the SDK at 26.0.2 (the edge is documented on the catalog).
+PRODUCT_GROUP_FIELDS = ["id", "retailer_id", "variants"]
+PRODUCT_ERROR_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
+
+
+def _error_type(value: str | None) -> str | None:
+    """Normalize a catalog diagnostic error type; Meta's enum values are upper snake case."""
+    if value is None:
+        return None
+    normalized = value.strip().upper() if isinstance(value, str) else ""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", normalized):
+        raise ValidationError(
+            "error_type must be one of Meta's catalog diagnostic error types, for example IMAGE_RESOLUTION_LOW."
+        )
+    return normalized
+
+
 @mcp_server.tool()
 async def list_catalog_products(
     catalog_id: str | None = None,
@@ -957,28 +1147,69 @@ async def list_catalog_products(
     limit: int = 50,
     after: str | None = None,
     fields: FieldList | None = None,
+    error_type: str | None = None,
+    error_priority: str | None = None,
+    view: str = "items",
 ) -> dict[str, Any]:
-    """List products in a product catalog or product set, optionally narrowed by a Meta filter object, or read one product. Prices are returned as Meta formats them."""
+    """List products in a product catalog or product set, optionally narrowed by a Meta filter object, or read one product. error_type (a diagnostic type such as IMAGE_RESOLUTION_LOW) or error_priority (HIGH, MEDIUM, LOW) lists only products hit by catalog diagnostics; Meta rejects some types, which does not mean no products are affected. view=product_groups lists a catalog's product groups (one row per variant group) instead of items. Prices are returned as Meta formats them."""
     scope_name, scope_value = _one_scope(
         catalog_id=catalog_id, product_set_id=product_set_id, product_id=product_id,
     )
     _check_limit(limit)
     parsed_filter = _parse_filter(filter)
+    normalized_error_type = _error_type(error_type)
+    normalized_priority = None
+    if error_priority is not None:
+        normalized_priority = error_priority.strip().upper() if isinstance(error_priority, str) else ""
+        if normalized_priority not in PRODUCT_ERROR_PRIORITIES:
+            raise ValidationError(f"error_priority must be one of: {', '.join(PRODUCT_ERROR_PRIORITIES)}.")
+    if view not in PRODUCT_LIST_VIEWS:
+        raise ValidationError(f"view must be one of: {', '.join(PRODUCT_LIST_VIEWS)}.")
+    diagnostic = normalized_error_type is not None or normalized_priority is not None
     if scope_name == "product_id" and parsed_filter is not None:
         raise ValidationError("filter applies to catalog_id or product_set_id, not product_id.")
-    requested = normalize_field_list(fields) or PRODUCT_FIELDS
+    if scope_name == "product_id" and diagnostic:
+        raise ValidationError(
+            "error_type and error_priority apply to catalog_id or product_set_id; for one product, "
+            "request the errors field instead."
+        )
+    if view == "product_groups":
+        if scope_name != "catalog_id":
+            raise ValidationError("view=product_groups needs catalog_id; Meta documents product groups on catalogs only.")
+        if parsed_filter is not None or diagnostic:
+            raise ValidationError(
+                "view=product_groups takes no filter, error_type or error_priority; Meta documents no "
+                "parameters on the product_groups edge."
+            )
     client = get_graph_api_client()
     if scope_name == "product_id":
+        requested = normalize_field_list(fields) or PRODUCT_FIELDS
         result = _single(await client.get_object(scope_value, fields=requested))
         result["summary"]["scope"] = {"product_id": scope_value}
         return result
     params = _page_params(limit, after)
     params["summary"] = "total_count"
+    if view == "product_groups":
+        requested = normalize_field_list(fields) or PRODUCT_GROUP_FIELDS
+        payload = await client.list_objects(scope_value, "product_groups", fields=requested, params=params)
+        result = _paged(payload)
+        result["summary"]["scope"] = {scope_name: scope_value, "view": "product_groups"}
+        return result
+    requested = normalize_field_list(fields) or PRODUCT_FIELDS
     if parsed_filter is not None:
         params["filter"] = parsed_filter
+    if normalized_error_type is not None:
+        params["error_type"] = normalized_error_type
+    if normalized_priority is not None:
+        params["error_priority"] = normalized_priority
     payload = await client.list_objects(scope_value, "products", fields=requested, params=params)
     result = _paged(payload)
-    result["summary"]["scope"] = {scope_name: scope_value}
+    scope: dict[str, Any] = {scope_name: scope_value}
+    if normalized_error_type is not None:
+        scope["error_type"] = normalized_error_type
+    if normalized_priority is not None:
+        scope["error_priority"] = normalized_priority
+    result["summary"]["scope"] = scope
     return result
 
 
@@ -1102,6 +1333,521 @@ async def delete_catalog_product(product_id: str) -> dict[str, Any]:
     return response
 
 
+# ------------------------------------------------------------ items batch
+#
+# POST /{catalog_id}/items_batch, documented at
+# developers.facebook.com/docs/marketing-api/reference/product-catalog/items_batch
+# and the "send product updates" guide. Products are keyed by `id` (the
+# retailer id), prices are "<amount> <ISO currency>", and Meta processes the
+# batch in the background: completion is read from
+# GET /{catalog_id}/check_batch_request_status?handle=..., where the only
+# documented status value is "finished".
+
+BATCH_MAX_ITEMS = 50
+BATCH_METHODS = {"create": "CREATE", "update": "UPDATE", "delete": "DELETE"}
+_BATCH_POLL_INTERVAL = 2
+_BATCH_MAX_WAIT = 60
+_BATCH_READ_PAGE_SIZE = 100
+_BATCH_READ_MAX_PAGES = 2
+_BATCH_ITEM_KEYS = frozenset({
+    "method", "retailer_id", "name", "description", "url", "image_url", "brand", "availability",
+    "condition", "price", "sale_price", "currency", "fields",
+})
+# Named item key -> PRODUCT_ITEM field in the items_batch request.
+_BATCH_NAMED_FIELDS = {
+    "name": "title", "description": "description", "url": "link", "image_url": "image",
+    "brand": "brand", "availability": "availability", "condition": "condition",
+    "price": "price", "sale_price": "sale_price",
+}
+# The guide's CREATE requirement for PRODUCT_ITEM: availability, brand, condition,
+# description, id, image, link, price, title.
+_BATCH_CREATE_REQUIRED = ("name", "description", "url", "image_url", "brand", "availability",
+                          "condition", "price", "currency")
+# Further PRODUCT_ITEM fields listed in the "send product updates" guide, passed
+# through `fields` unchanged. Fields with a named key above are not repeated here.
+BATCH_EXTRA_FIELDS = frozenset({
+    "rich_text_description", "mobile_link", "additional_image_link", "video",
+    "quantity_to_sell_on_facebook", "sale_price_effective_date", "color", "size", "material",
+    "pattern", "gender", "age_group", "mpn", "gtin", "item_group_id", "additional_variant_attribute",
+    "ordering_index", "origin_country", "expiration_date", "fb_product_category",
+    "google_product_category", "product_type", "custom_label_0", "custom_label_1",
+    "custom_label_2", "custom_label_3", "custom_label_4", "custom_number_0", "custom_number_1",
+    "custom_number_2", "custom_number_3", "custom_number_4", "internal_label", "shipping",
+    "shipping_weight", "applink", "disabled_capabilities", "importer_address", "importer_name",
+})
+# Batch request field -> readable product item field, for showing previous values.
+_BATCH_READ_FIELD = {
+    "title": "name", "description": "description", "link": "url", "image": "image_url",
+    "brand": "brand", "availability": "availability", "condition": "condition", "price": "price",
+    "sale_price": "sale_price", "mobile_link": "mobile_link", "additional_image_link": "additional_image_urls",
+    "color": "color", "size": "size", "material": "material", "pattern": "pattern", "gender": "gender",
+    "age_group": "age_group", "gtin": "gtin", "mpn": "manufacturer_part_number",
+    "item_group_id": "retailer_product_group_id", "ordering_index": "ordering_index",
+    "origin_country": "origin_country", "expiration_date": "expiration_date",
+    "fb_product_category": "fb_product_category", "product_type": "product_type",
+    "custom_label_0": "custom_label_0", "custom_label_1": "custom_label_1",
+    "custom_label_2": "custom_label_2", "custom_label_3": "custom_label_3",
+    "custom_label_4": "custom_label_4", "importer_address": "importer_address",
+    "importer_name": "importer_name",
+}
+_BATCH_BASE_READ_FIELDS = [
+    "id", "retailer_id", "name", "description", "price", "currency", "sale_price", "availability",
+    "condition", "url", "image_url", "brand", "visibility", "review_status",
+]
+_FEED_FIELD = "product_feed"
+_BATCH_RETRY_WHY = (
+    "This tool reads the catalog before every write, so on a resend creates of SKUs that already exist "
+    "and deletes of SKUs that are already gone are skipped, and updates send the same values again. "
+    "Meta keys catalog products by retailer id (its batch documentation calls it a unique content ID), "
+    "so the catalog holds one product per retailer id and a resend cannot add a duplicate. A resend "
+    "does overwrite any change someone else or a feed made to the same fields in between."
+)
+
+
+async def _pause(seconds: float) -> None:
+    """Wait between batch status checks; replaced in tests."""
+    await asyncio.sleep(seconds)
+
+
+def _batch_price(value: Any, currency: str, label: str) -> str:
+    """Encode a major-unit price as items_batch documents it: '9.99 USD', '14 GBP'."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        raise ValidationError(f"{label} must be a finite number in major units.")
+    minor = _catalog_price(value, label)
+    whole, cents = divmod(minor, 100)
+    amount = str(whole) if cents == 0 else f"{whole}.{cents:02d}"
+    return f"{amount} {currency}"
+
+
+def _batch_entry(index: int, item: Any) -> dict[str, Any]:
+    """Validate one caller item and build its items_batch request and caller-facing view."""
+    label = f"items[{index}]"
+    if not isinstance(item, dict):
+        raise ValidationError(f"{label} must be an object with method and retailer_id.")
+    unknown = sorted(set(item) - _BATCH_ITEM_KEYS)
+    if unknown:
+        raise ValidationError(
+            f"{label} has unsupported keys: {', '.join(unknown)}. Named keys: "
+            f"{', '.join(sorted(_BATCH_ITEM_KEYS))}; other documented product fields go in fields."
+        )
+    method = str(item.get("method") or "").strip().lower()
+    if method not in BATCH_METHODS:
+        raise ValidationError(f"{label}.method must be create, update or delete.")
+    retailer_id = item.get("retailer_id")
+    if not isinstance(retailer_id, str) or not retailer_id.strip():
+        raise ValidationError(f"{label}.retailer_id must be a nonblank string (the product's SKU).")
+    retailer_id = retailer_id.strip()
+    values = {key: value for key, value in item.items() if key not in {"method", "retailer_id"} and value is not None}
+    extra = values.pop("fields", None) or {}
+    if not isinstance(extra, dict):
+        raise ValidationError(f"{label}.fields must be an object of documented product fields.")
+    if method == "delete":
+        if values or extra:
+            raise ValidationError(f"{label}: a delete takes only retailer_id.")
+        return {"method": method, "retailer_id": retailer_id,
+                "request": {"method": "DELETE", "data": {"id": retailer_id}}, "changes": {}}
+    for key in extra:
+        if key in _BATCH_NAMED_FIELDS.values() or key in {"id", "image_link", "currency"}:
+            raise ValidationError(f"{label}.fields.{key}: use the item's named key for this field instead.")
+        if key not in BATCH_EXTRA_FIELDS:
+            raise ValidationError(
+                f"{label}.fields.{key} is not a PRODUCT_ITEM field Meta's batch documentation lists."
+            )
+    if method == "create":
+        missing = [key for key in _BATCH_CREATE_REQUIRED if values.get(key) in (None, "")]
+        if missing:
+            raise ValidationError(
+                f"{label}: a create is missing {', '.join(missing)} (Meta requires these for a new product)."
+            )
+    if not values and not extra:
+        raise ValidationError(f"{label}: an update needs at least one field to change.")
+    data: dict[str, Any] = {"id": retailer_id}
+    changes: dict[str, Any] = {}
+    currency = _currency(values["currency"]) if "currency" in values else None
+    if currency is not None and not any(key in values for key in ("price", "sale_price")):
+        raise ValidationError(f"{label}.currency is sent only with price or sale_price.")
+    for key, batch_field in _BATCH_NAMED_FIELDS.items():
+        if key not in values:
+            continue
+        value = values[key]
+        if key in {"price", "sale_price"}:
+            if currency is None:
+                raise ValidationError(f"{label}.{key} needs currency in the same item.")
+            data[batch_field] = _batch_price(value, currency, f"{label}.{key}")
+        elif key == "image_url":
+            data[batch_field] = [{"url": _require(value, f"{label}.image_url")}]
+        else:
+            if key == "availability":
+                _choice(value, PRODUCT_AVAILABILITY, f"{label}.availability")
+            elif key == "condition":
+                _choice(value, PRODUCT_CONDITIONS, f"{label}.condition")
+            elif not isinstance(value, str) or not value.strip():
+                raise ValidationError(f"{label}.{key} must be a nonblank string.")
+            data[batch_field] = value
+        changes[key] = value
+    if currency is not None:
+        changes["currency"] = currency
+    for key, value in extra.items():
+        data[key] = value
+        changes[key] = value
+    return {"method": method, "retailer_id": retailer_id,
+            "request": {"method": BATCH_METHODS[method], "data": data}, "changes": changes}
+
+
+def _batch_read_fields(entries: list[dict[str, Any]], *, with_feed: bool) -> list[str]:
+    fields = list(_BATCH_BASE_READ_FIELDS)
+    for entry in entries:
+        for key in entry["request"]["data"]:
+            read = _BATCH_READ_FIELD.get(key)
+            if read and read not in fields:
+                fields.append(read)
+    if with_feed:
+        fields.append(_FEED_FIELD)
+    return fields
+
+
+async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Read the current products for every retailer id in one filtered request.
+
+    If Meta rejects the product_feed field, the read is repeated once without it
+    and the feed check is reported as unavailable.
+    """
+    ids = [entry["retailer_id"] for entry in entries]
+    params = {"filter": {"retailer_id": {"is_any": ids}}, "limit": _BATCH_READ_PAGE_SIZE}
+    feed_check = {"status": "read", "method": "product_feed field on each product"}
+    try:
+        read = await _collect_edge(client, catalog_id, "products",
+                                   fields=_batch_read_fields(entries, with_feed=True),
+                                   params=params, max_pages=_BATCH_READ_MAX_PAGES)
+    except MetaApiError as error:
+        if error.code != 100:
+            raise
+        read = await _collect_edge(client, catalog_id, "products",
+                                   fields=_batch_read_fields(entries, with_feed=False),
+                                   params=params, max_pages=_BATCH_READ_MAX_PAGES)
+        feed_check = {"status": "unavailable", "method": "product_feed field on each product",
+                      "error": str(error)}
+    wanted = set(ids)
+    found = {
+        str(row.get("retailer_id")): row for row in read["rows"]
+        if isinstance(row, dict) and str(row.get("retailer_id")) in wanted
+    }
+    return {"found": found, "complete": read["complete"], "stop_reason": read["stop_reason"],
+            "feed_check": feed_check}
+
+
+def _previous_for(entry: dict[str, Any], product: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Return (previous values keyed as the caller wrote them, keys that cannot be read back)."""
+    if entry["method"] == "delete":
+        return {key: value for key, value in product.items() if key != _FEED_FIELD}, []
+    previous: dict[str, Any] = {}
+    unavailable: list[str] = []
+    named = {batch: key for key, batch in _BATCH_NAMED_FIELDS.items()}
+    for batch_field in entry["request"]["data"]:
+        if batch_field == "id":
+            continue
+        key = named.get(batch_field, batch_field)
+        read = _BATCH_READ_FIELD.get(batch_field)
+        if read is None:
+            unavailable.append(key)
+            continue
+        previous[key] = product.get(read)
+        if batch_field in {"price", "sale_price"}:
+            previous["currency"] = product.get("currency")
+    return previous, unavailable
+
+
+def _feed_warning(entry: dict[str, Any], product: dict[str, Any]) -> str | None:
+    feed = product.get(_FEED_FIELD)
+    feed_id = feed.get("id") if isinstance(feed, dict) else feed
+    if not feed_id:
+        return None
+    if entry["method"] == "delete":
+        return (f"This product is linked to product feed {feed_id}. The feed's next fetch or upload may add it "
+                "back unless it is removed from the feed too.")
+    return (f"This product is linked to product feed {feed_id}. The feed's next fetch or upload may overwrite "
+            "this change unless the feed is changed too.")
+
+
+def _messages(entries: Any) -> list[str]:
+    return [str(entry.get("message")) for entry in entries or [] if isinstance(entry, dict) and entry.get("message")]
+
+
+def _by_id(entries: Any) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for entry in entries or []:
+        if isinstance(entry, dict) and entry.get("id") is not None and entry.get("message"):
+            grouped.setdefault(str(entry["id"]), []).append(str(entry["message"]))
+    return grouped
+
+
+def _batch_status_row(payload: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("data")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return rows[0]
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_finished(row: dict[str, Any] | None) -> bool:
+    return bool(row) and str(row.get("status") or "").strip().lower() == "finished"
+
+
+async def _check_batch(client, catalog_id: str, handle: str) -> dict[str, Any]:
+    payload = await client.list_objects(
+        catalog_id, "check_batch_request_status",
+        params={"handle": handle, "load_ids_of_invalid_requests": True},
+    )
+    return _batch_status_row(payload)
+
+
+def _settle(item: dict[str, Any], row: dict[str, Any]) -> None:
+    """Set a sent item's final outcome from a finished batch status."""
+    invalid = {str(value) for value in row.get("ids_of_invalid_requests") or []}
+    errors = _by_id(row.get("errors"))
+    warnings = _by_id(row.get("warnings"))
+    error_total = to_int(row.get("errors_total_count"))
+    listed_errors = len([entry for entry in row.get("errors") or [] if isinstance(entry, dict)])
+    attributed = error_total == 0 or bool(invalid) or (error_total is not None and listed_errors >= error_total)
+    retailer_id = item["retailer_id"]
+    item["warnings"] = [*item["warnings"], *warnings.get(retailer_id, [])]
+    if retailer_id in invalid or retailer_id in errors:
+        item["outcome"] = "failed"
+        item["errors"] = [*item["errors"], *errors.get(retailer_id, [])] or ["Meta listed this item as invalid."]
+    elif attributed:
+        item["outcome"] = "applied"
+    else:
+        item["outcome"] = "outcome_unknown"
+        item["reason"] = (f"Meta reported {error_total if error_total is not None else 'an unknown number of'} "
+                          "error(s) for the batch but did not name every affected item.")
+
+
+def _retry_statement(outcomes: set[str], handle: str | None) -> dict[str, Any]:
+    if "processing" in outcomes:
+        return {
+            "safe_now": False,
+            "how": (f"Do not resend yet: Meta accepted the batch and is still processing it. Call this tool "
+                    f"again with catalog_id and handle={handle!r} to read the outcome, then resend only "
+                    "the items reported failed."),
+            "why": _BATCH_RETRY_WHY,
+        }
+    if "outcome_unknown" in outcomes:
+        return {
+            "safe_now": True,
+            "how": ("Wait a few minutes, then resend the same items with this tool; if the timeout repeats, "
+                    "split them into batches of about half the size. A batch still being processed when "
+                    "you resend is not visible to the re-read, so a create in it may then be reported "
+                    "by Meta as an error for that item."),
+            "why": _BATCH_RETRY_WHY,
+        }
+    if outcomes & {"failed", "not_applied"}:
+        return {
+            "safe_now": True,
+            "how": "Fix the reported errors and resend only the items that failed or were not applied.",
+            "why": _BATCH_RETRY_WHY,
+        }
+    return {"safe_now": True, "how": "Nothing needs resending.", "why": _BATCH_RETRY_WHY}
+
+
+async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, Any]:
+    row = await _check_batch(client, catalog_id, handle)
+    finished = _is_finished(row)
+    errors = [entry for entry in row.get("errors") or [] if isinstance(entry, dict)]
+    warnings = [entry for entry in row.get("warnings") or [] if isinstance(entry, dict)]
+    failed = sorted({str(value) for value in row.get("ids_of_invalid_requests") or []}
+                    | set(_by_id(errors)))
+    return {
+        "ok": finished and not failed and not to_int(row.get("errors_total_count")),
+        "action": "batch_update_catalog_products",
+        "target": {"catalog_id": catalog_id},
+        "batch": {
+            "handle": handle,
+            "status": row.get("status"),
+            "complete": finished,
+            "status_checks": 1,
+            "errors_total_count": to_int(row.get("errors_total_count")),
+            "warnings_total_count": to_int(row.get("warnings_total_count")),
+        },
+        "failed_retailer_ids": failed[:100],
+        "errors": errors[:50],
+        "warnings": warnings[:50],
+        "note": ("Meta documents only the status value 'finished'; any other value means the batch is not "
+                 "known to be done."),
+    }
+
+
+@mcp_server.tool()
+async def batch_update_catalog_products(
+    catalog_id: GraphId,
+    items: list[dict[str, Any]] | None = None,
+    allow_upsert: bool = False,
+    dry_run: bool = False,
+    wait_seconds: int = 10,
+    handle: str | None = None,
+) -> dict[str, Any]:
+    """Create, update or delete up to 50 catalog products by retailer_id (SKU) in one call. Item: method (create, update, delete), retailer_id, then name, description, url, image_url, brand, availability, condition, price, sale_price, currency (major units) or fields. Reads products first and skips creates of existing SKUs and deletes of missing ones, so resending is safe. Meta applies batches in the background: each item is reported applied, failed, processing or unknown, with a feed warning where relevant. handle alone reads an earlier batch. dry_run writes nothing. Created products are not held in staging."""
+    if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 0 <= wait_seconds <= _BATCH_MAX_WAIT:
+        raise ValidationError(f"wait_seconds must be a whole number from 0 to {_BATCH_MAX_WAIT}.")
+    handle = blank_to_none(handle) if isinstance(handle, str) else None
+    if (items is None) == (handle is None):
+        raise ValidationError("Pass either items or handle: items to send a batch, handle to read an earlier one.")
+    if handle is not None:
+        return await _batch_status_only(get_graph_api_client(), catalog_id, handle)
+    if not isinstance(items, list) or not 1 <= len(items) <= BATCH_MAX_ITEMS:
+        raise ValidationError(f"items must hold 1 to {BATCH_MAX_ITEMS} products per call; split larger edits.")
+    entries = [_batch_entry(index, item) for index, item in enumerate(items)]
+    seen: set[str] = set()
+    for entry in entries:
+        if entry["retailer_id"] in seen:
+            raise ValidationError(f"retailer_id {entry['retailer_id']!r} appears more than once; send one item per SKU.")
+        seen.add(entry["retailer_id"])
+
+    client = get_graph_api_client()
+    current = await _read_batch_products(client, catalog_id, entries)
+    if not current["complete"]:
+        return {
+            "ok": False,
+            "action": "batch_update_catalog_products",
+            "target": {"catalog_id": catalog_id},
+            "sent": False,
+            "reason": ("The current products could not be read completely, so nothing was written. "
+                       f"{current['stop_reason']}"),
+        }
+
+    results: list[dict[str, Any]] = []
+    to_send: list[dict[str, Any]] = []
+    for entry in entries:
+        product = current["found"].get(entry["retailer_id"])
+        item: dict[str, Any] = {
+            "retailer_id": entry["retailer_id"],
+            "method": entry["method"],
+            "outcome": None,
+            "changes": entry["changes"],
+            "errors": [],
+            "warnings": [],
+        }
+        if product is not None:
+            item["product_id"] = str(product.get("id")) if product.get("id") is not None else None
+        if entry["method"] == "create" and product is not None:
+            item["outcome"] = "skipped_already_exists"
+            item["reason"] = "A product with this retailer_id is already in the catalog; use method update to change it."
+        elif entry["method"] == "delete" and product is None:
+            item["outcome"] = "skipped_not_found"
+            item["reason"] = "No product with this retailer_id is in the catalog, so there is nothing to delete."
+        elif entry["method"] == "update" and product is None and not allow_upsert:
+            item["outcome"] = "skipped_not_found"
+            item["reason"] = ("No product with this retailer_id is in the catalog; pass allow_upsert=true to "
+                              "create it from this update.")
+        else:
+            if product is not None:
+                previous, unavailable = _previous_for(entry, product)
+                item["previous"] = previous
+                if unavailable:
+                    item["previous_unavailable"] = unavailable
+                if warning := _feed_warning(entry, product):
+                    item["feed_warning"] = warning
+            to_send.append(item)
+            item["request"] = entry["request"]
+        results.append(item)
+
+    request_data = {
+        "item_type": "PRODUCT_ITEM",
+        "allow_upsert": allow_upsert,
+        "requests": [item["request"] for item in to_send],
+    }
+    response: dict[str, Any] = {
+        "action": "batch_update_catalog_products",
+        "target": {"catalog_id": catalog_id},
+        "dry_run": dry_run,
+        "items": results,
+        "feed_check": {
+            **current["feed_check"],
+            "note": ("A feed_warning appears when Meta reports a product_feed on the product. Meta documents "
+                     "that field without describing it, so its absence is not a guarantee that no feed, "
+                     "partner integration or other source will overwrite the change."),
+        },
+    }
+    notes: list[str] = []
+    if any(entry["method"] == "create" for entry in entries):
+        notes.append("Meta's batch documentation lists no visibility field for products, so products created "
+                     "here are not held in staging; use create_catalog_product for one that must start hidden.")
+    handle_value: str | None = None
+    row: dict[str, Any] | None = None
+    checks = 0
+    status_error: str | None = None
+
+    if dry_run:
+        for item in to_send:
+            item["outcome"] = "would_send"
+        response["request"] = {"endpoint": f"POST /{catalog_id}/items_batch", "data": request_data}
+    elif to_send:
+        try:
+            posted = await client.create_edge_object(catalog_id, "items_batch", data=request_data)
+        except (MetaApiError, RateLimitError) as error:
+            unknown = isinstance(error, MetaApiError) and error.mutation_outcome_unknown
+            for item in to_send:
+                item["outcome"] = "outcome_unknown" if unknown else "not_applied"
+                item["reason"] = ("The request failed without a response, so Meta may have applied it."
+                                  if unknown else "Meta refused the whole request, so nothing was ingested.")
+            response["error"] = error.to_public_dict()
+        else:
+            validation = {}
+            for entry in posted.get("validation_status") or []:
+                if isinstance(entry, dict) and entry.get("retailer_id") is not None:
+                    validation[str(entry["retailer_id"])] = entry
+            for item in to_send:
+                status = validation.get(item["retailer_id"]) or {}
+                item["errors"] = _messages(status.get("errors"))
+                item["warnings"] = _messages(status.get("warnings"))
+            handles = [str(value) for value in posted.get("handles") or [] if value]
+            if not handles:
+                for item in to_send:
+                    item["outcome"] = "not_applied"
+                    item["reason"] = "Meta returned no batch handle, which it documents as meaning nothing was ingested."
+            else:
+                handle_value = handles[0]
+                for round_number in range(wait_seconds // _BATCH_POLL_INTERVAL):
+                    await _pause(_BATCH_POLL_INTERVAL)
+                    try:
+                        row = await _check_batch(client, catalog_id, handle_value)
+                    except (MetaApiError, RateLimitError, UnsupportedFeatureError, NotFoundError) as error:
+                        status_error = str(error)
+                        break
+                    checks += 1
+                    if _is_finished(row):
+                        break
+                for item in to_send:
+                    if _is_finished(row):
+                        _settle(item, row)
+                    else:
+                        item["outcome"] = "processing"
+                        item["reason"] = ("Meta accepted the batch; it had not reported it finished when this "
+                                          "tool stopped checking.")
+    for item in to_send:
+        item.pop("request", None)
+    if handle_value is not None or row is not None:
+        response["batch"] = {
+            "handle": handle_value,
+            "status": (row or {}).get("status"),
+            "complete": _is_finished(row),
+            "status_checks": checks,
+            "errors_total_count": to_int((row or {}).get("errors_total_count")),
+            "warnings_total_count": to_int((row or {}).get("warnings_total_count")),
+        }
+        if status_error:
+            response["batch"]["status_error"] = status_error
+    outcomes = Counter(item["outcome"] for item in results)
+    response["summary"] = {
+        "submitted": len(results),
+        "items_in_request": 0 if dry_run else len(to_send),
+        "outcomes": dict(outcomes),
+    }
+    response["ok"] = dry_run or set(outcomes) <= {"applied", "skipped_already_exists", "skipped_not_found"}
+    response["retry"] = _retry_statement(set(outcomes), handle_value)
+    if notes:
+        response["notes"] = notes
+    return response
+
+
 def _filter_condition(index: int, condition: Any) -> dict[str, Any]:
     """Validate one structured condition and return its Meta rule."""
     label = f"conditions[{index}]"
@@ -1175,6 +1921,118 @@ async def build_product_set_filter(
         "missing_signals": missing,
         "next_step": "Pass filter to create_product_set or update_product_set to save it.",
     }
+
+
+# Readable product item fields (SDK 26.0.2 ProductItem) whose values a product set
+# filter is usually built on. Meta documents no endpoint that returns the values
+# present in a catalog with counts, so they are counted from a bounded scan.
+ATTRIBUTE_VALUE_FIELDS = (
+    "brand", "category", "product_type", "custom_label_0", "custom_label_1", "custom_label_2",
+    "custom_label_3", "custom_label_4", "availability", "condition", "color", "size", "material",
+    "pattern", "gender", "age_group", "fb_product_category", "currency", "visibility",
+    "review_status", "retailer_product_group_id",
+)
+_ATTRIBUTE_PAGE_SIZE = 100
+_ATTRIBUTE_MAX_PRODUCTS = 5000
+_ATTRIBUTE_MAX_TOP_N = 200
+_ATTRIBUTE_MAX_VERIFY = 10
+
+
+def _attribute_values(value: Any) -> list[str]:
+    """Return the countable values of one product's attribute; blanks count as no value."""
+    if isinstance(value, list):
+        return [text for entry in value for text in _attribute_values(entry)]
+    if value is None or isinstance(value, dict):
+        return [] if value is None else [json.dumps(value, sort_keys=True)]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+@mcp_server.tool()
+async def list_catalog_attribute_values(
+    catalog_id: GraphId,
+    attribute: str,
+    product_set_id: GraphId | None = None,
+    max_products: int = 1000,
+    top_n: int = 50,
+    verify_top: int = 0,
+) -> dict[str, Any]:
+    """Read-only: the values that actually occur for one product attribute (brand, category, product_type, custom_label_0 to custom_label_4, availability, color, size and similar) in a product catalog or one of its product sets, with counts, so product set filters can use exact existing values. Meta has no endpoint for this, so it scans up to max_products products (whole pages of 100) and reports how many it examined and whether that was all; counts from a partial scan are lower bounds. verify_top (up to 10) reads Meta's exact match count for that many top values, one request each."""
+    normalized = (attribute or "").strip().lower() if isinstance(attribute, str) else ""
+    if normalized not in ATTRIBUTE_VALUE_FIELDS:
+        raise ValidationError(f"attribute must be one of: {', '.join(ATTRIBUTE_VALUE_FIELDS)}.")
+    if not 1 <= max_products <= _ATTRIBUTE_MAX_PRODUCTS:
+        raise ValidationError(f"max_products must be from 1 to {_ATTRIBUTE_MAX_PRODUCTS}.")
+    if not 1 <= top_n <= _ATTRIBUTE_MAX_TOP_N:
+        raise ValidationError(f"top_n must be from 1 to {_ATTRIBUTE_MAX_TOP_N}.")
+    if not 0 <= verify_top <= _ATTRIBUTE_MAX_VERIFY:
+        raise ValidationError(f"verify_top must be from 0 to {_ATTRIBUTE_MAX_VERIFY}.")
+    parent = product_set_id or catalog_id
+    client = get_graph_api_client()
+    scan = await _collect_edge(
+        client, parent, "products", fields=[normalized],
+        params={"limit": min(_ATTRIBUTE_PAGE_SIZE, max_products), "summary": "total_count"},
+        max_pages=-(-max_products // _ATTRIBUTE_PAGE_SIZE), max_items=max_products,
+    )
+    rows = [row for row in scan["rows"] if isinstance(row, dict)]
+    counts: Counter[str] = Counter()
+    without_value = 0
+    for row in rows:
+        found = _attribute_values(row.get(normalized))
+        if not found:
+            without_value += 1
+        counts.update(set(found))
+    ranked = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    values: list[dict[str, Any]] = [{"value": value, "count": count} for value, count in ranked[:top_n]]
+    complete = scan["complete"]
+    in_scope = scan["summary_total"]
+    notes: list[str] = ["Values are counted exactly as Meta returns them; filters match on these values."]
+    if not complete:
+        of_total = f" of {in_scope}" if in_scope is not None else ""
+        notes.append(
+            f"Examined {len(rows)}{of_total} products, so counts are lower bounds and values that occur only "
+            "in unexamined products are missing. Raise max_products or use verify_top for exact counts."
+        )
+    verification_requests = 0
+    for entry in values[:verify_top]:
+        verification_requests += 1
+        try:
+            payload = await client.list_objects(
+                parent, "products", fields=["id"],
+                params={"filter": {normalized: {"eq": entry["value"]}}, "summary": "total_count", "limit": 1},
+            )
+        except _SIGNAL_ERRORS as error:
+            entry["verify_error"] = str(error)
+            continue
+        exact = to_int((payload.get("summary") or {}).get("total_count"))
+        if exact is None:
+            entry["verify_error"] = "Meta did not return summary.total_count."
+        else:
+            entry["verified_count"] = exact
+    scope: dict[str, Any] = {"catalog_id": catalog_id}
+    if product_set_id:
+        scope["product_set_id"] = product_set_id
+    scope["attribute"] = normalized
+    result: dict[str, Any] = {
+        "scope": scope,
+        "values": values,
+        "distinct_values": len(counts),
+        "values_shown": len(values),
+        "products_without_value": without_value,
+        "coverage": {
+            "products_examined": len(rows),
+            "products_in_scope": in_scope,
+            "complete": complete,
+            "stop_reason": scan["stop_reason"],
+            "requests": scan["pages"],
+            "counts_are": "exact" if complete else "lower_bounds",
+        },
+        "notes": notes,
+        "next_step": "Use these exact values in build_product_set_filter conditions.",
+    }
+    if verify_top:
+        result["verification_requests"] = verification_requests
+    return result
 
 
 @mcp_server.tool()

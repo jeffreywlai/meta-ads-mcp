@@ -195,6 +195,11 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "create_product_set": {"catalog_id": "cat_123", "filter": {"brand": {"eq": "Acme"}}},
     "update_product_set": {"product_set_id": "ps_123", "name": "Updated Set"},
     "delete_product_set": {"product_set_id": "ps_123"},
+    "batch_update_catalog_products": {
+        "catalog_id": "123", "items": [{"method": "update", "retailer_id": "sku_123", "name": "New"}],
+        "allow_upsert": True, "wait_seconds": 0,
+    },
+    "list_catalog_attribute_values": {"catalog_id": "123", "attribute": "brand"},
     "list_product_feeds": {"catalog_id": "cat_123"},
     "create_product_feed": {"catalog_id": "cat_123", "schedule": {"url": "https://example.com/feed.csv", "interval": "DAILY"}},
     "update_product_feed": {"feed_id": "feed_123", "name": "Updated Feed"},

@@ -153,6 +153,7 @@ TOOL_GROUPS = {
         "duplicate_campaign",
         "duplicate_adset",
         "duplicate_ad",
+        "batch_update_catalog_products",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -200,6 +201,7 @@ TOOL_GROUPS = {
         "list_event_source_catalogs",
         "get_catalog_event_source_health",
         "get_catalog_event_source_recommendations",
+        "list_catalog_attribute_values",
     ],
     "access": [
         "list_businesses",
@@ -512,8 +514,10 @@ INTENT_GUIDE = {
             "list_catalog_products",
             "list_product_sets",
             "build_product_set_filter",
+            "list_catalog_attribute_values",
         ],
         "avoid_unless_needed": [
+            "batch_update_catalog_products",
             "create_product_set",
             "update_product_set",
             "create_catalog_product",
@@ -528,6 +532,8 @@ INTENT_GUIDE = {
             "Turn a plain-English product selection into conditions and test it with build_product_set_filter before create_product_set.",
             "Product prices are major units (12.5 means 12.50); new products are created with visibility=staging.",
             "list_dpa_eligible_catalogs and get_catalog_dynamic_ads_health are derived from documented signals and state the rules they use.",
+            "Use list_catalog_attribute_values to see which brands, categories or custom labels actually occur before writing filter conditions.",
+            "batch_update_catalog_products edits up to 50 products by SKU in one call; check its per-item outcomes, feed warnings and retry statement.",
         ],
     },
     "manage_product_catalog_feeds_and_event_sources": {
@@ -1003,6 +1009,7 @@ async def list_mutation_tools() -> dict[str, object]:
             "instagram_boost": ["boost_instagram_post"],
             "product_catalog_access": ["set_catalog_access"],
             "duplication": ["duplicate_campaign", "duplicate_adset", "duplicate_ad"],
+            "catalog_product_batches": ["batch_update_catalog_products"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",
