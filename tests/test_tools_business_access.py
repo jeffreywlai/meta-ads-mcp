@@ -1423,3 +1423,134 @@ def test_partner_write_is_blocked_in_read_only(monkeypatch, read_only_mode) -> N
     arguments = {"catalog_id": CATALOG, "user_id": PARTNER, "tasks": [], "user_type": "AGENCY", "dry_run": True}
     with pytest.raises(ToolError, match="META_READ_ONLY"):
         run(mcp_server.call_tool("set_catalog_access", arguments))
+
+
+# Round four (H18): a caller identity row that cannot be read makes the caller unknown ----------
+
+
+@pytest.mark.parametrize("preview", [False, True])
+def test_h18_unknown_business_on_one_caller_row_blocks_partner_removal(monkeypatch, preview) -> None:
+    client = _partner_client(["MANAGE"])
+    client.edges[("me", "business_users")] = {"data": [{"id": "50", "business": {"id": "40"}}, {"id": "60"}]}
+    _use(monkeypatch, client)
+    if preview:
+        result = run(business_access.preview_catalog_access_change(CATALOG, PARTNER, [], user_type="AGENCY"))
+        assert result["would_be_refused"] is True, result
+        assert result["self_check"]["is_caller_business"] is None
+        assert "cannot confirm" in result["refusal_reason"]
+    else:
+        with pytest.raises(ValidationError, match="cannot confirm"):
+            run(business_access.set_catalog_access(CATALOG, PARTNER, [], user_type="AGENCY"))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("bad_row", [
+    {"id": "60", "business": {"id": ""}},
+    {"id": "60", "business": {"id": None}},
+    {"id": "60", "business": "40"},
+    {"id": "60", "business": {"id": {"nested": "40"}}},
+    {"id": "60", "business": {"id": True}},
+    {"id": "60", "business": {"id": "not-a-number"}},
+    "not-a-row",
+])
+def test_h18_any_unusable_caller_business_row_blocks_partner_removal(monkeypatch, bad_row) -> None:
+    client = _partner_client(["ADVERTISE"])
+    client.edges[("me", "business_users")] = {"data": [{"id": CALLER, "business": {"id": OTHER_BUSINESS}}, bad_row]}
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PARTNER, [], user_type="AGENCY"))
+    assert preview["would_be_refused"] is True
+    assert preview["self_check"]["is_caller_business"] is None
+    with pytest.raises(ValidationError, match="cannot confirm"):
+        run(business_access.set_catalog_access(CATALOG, PARTNER, [], user_type="AGENCY"))
+    assert client.writes() == []
+
+
+def test_h18_unknown_caller_business_still_allows_explicit_override(monkeypatch) -> None:
+    client = _partner_client(["ADVERTISE"])
+    client.edges[("me", "business_users")] = {"data": [{"id": CALLER, "business": {"id": OTHER_BUSINESS}}, {"id": "60"}]}
+    _use(monkeypatch, client)
+    result = run(business_access.set_catalog_access(
+        CATALOG, PARTNER, [], user_type="AGENCY", allow_self_removal=True,
+    ))
+    assert result["sent"] is True
+    assert [(w["method"], w["data"]) for w in client.writes()] == [("delete_edge_object", {"business": PARTNER})]
+
+
+def test_h18_fully_readable_caller_businesses_still_allow_removal(monkeypatch) -> None:
+    client = _partner_client(["ADVERTISE"])
+    client.edges[("me", "business_users")] = {"data": [
+        {"id": CALLER, "business": {"id": OTHER_BUSINESS}}, {"id": "60", "business": {"id": 40}},
+    ]}
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PARTNER, [], user_type="AGENCY"))
+    assert preview["would_be_refused"] is False and preview["self_check"]["is_caller_business"] is False
+
+
+@pytest.mark.parametrize("bad_row", [
+    {"business": {"id": BUSINESS}}, {"id": "", "business": {"id": BUSINESS}}, {"id": "abc", "business": {"id": BUSINESS}}, "x",
+])
+@pytest.mark.parametrize("tasks", [[], ["ADVERTISE"]])
+def test_h18_person_removal_refused_when_one_caller_id_row_is_unreadable(monkeypatch, bad_row, tasks) -> None:
+    client = _access_client(["MANAGE", "ADVERTISE"])
+    client.edges[("me", "business_users")] = {"data": [{"id": CALLER, "business": {"id": BUSINESS}}, bad_row]}
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, tasks, business_id=BUSINESS))
+    assert preview["would_be_refused"] is True
+    assert preview["self_check"]["is_caller"] is None
+    with pytest.raises(ValidationError, match="cannot confirm"):
+        run(business_access.set_catalog_access(CATALOG, PERSON, tasks, business_id=BUSINESS))
+    assert client.writes() == []
+
+
+def test_h18_person_removal_refused_when_own_user_id_is_unusable(monkeypatch) -> None:
+    client = _access_client(["ADVERTISE"])
+    client.objects["me"] = {"id": {"nested": "100"}}
+    _use(monkeypatch, client)
+    with pytest.raises(ValidationError, match="cannot confirm"):
+        run(business_access.set_catalog_access(CATALOG, PERSON, [], business_id=BUSINESS))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("bad_row", [{"name": "No id", "tasks": ["MANAGE"]}, {"id": None, "tasks": ["MANAGE"]}, "x"])
+def test_h18_unidentified_assignment_row_makes_an_absent_person_unknown(monkeypatch, bad_row) -> None:
+    client = _access_client(None)
+    client.edges[(CATALOG, "assigned_users")] = {"data": [{"id": "1", "tasks": ["ADVERTISE"]}, bad_row]}
+    _use(monkeypatch, client)
+    with pytest.raises(ValidationError, match="could not be read completely"):
+        run(business_access.set_catalog_access(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
+    assert client.writes() == []
+    check = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON))
+    assert check["access_status"] == "UNKNOWN" and check["summary"]["complete"] is False
+
+
+@pytest.mark.parametrize("bad_row", [{"name": "No id", "permitted_tasks": ["MANAGE"]}, "x"])
+def test_h18_unidentified_partner_row_makes_an_absent_partner_unknown(monkeypatch, bad_row) -> None:
+    client = _partner_client(None)
+    client.edges[(CATALOG, "agencies")] = {"data": [bad_row]}
+    _use(monkeypatch, client)
+    with pytest.raises(ValidationError, match="could not be read completely"):
+        run(business_access.set_catalog_access(CATALOG, PARTNER, ["ADVERTISE"], user_type="AGENCY"))
+    assert client.writes() == []
+
+
+def test_h18_partner_catalog_scan_with_unidentified_partner_row_is_incomplete(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={
+        (BUSINESS, "owned_product_catalogs"): _page([{"id": "1", "name": "A"}]),
+        ("1", "agencies"): _page([{"id": "88"}, {"name": "No id"}]),
+    }))
+    result = run(business_access.list_user_assigned_catalogs(user_id="77", user_type="AGENCY", business_id=BUSINESS))
+    assert result["items"] == []
+    assert result["summary"]["complete"] is False
+    assert "1" in result["summary"]["incomplete_reason"]
+
+
+def test_h18_owned_catalog_without_id_is_not_read_as_none_and_is_a_gap(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeClient(edges={
+        (BUSINESS, "owned_product_catalogs"): _page([{"id": "1", "name": "A"}, {"name": "No id"}]),
+        ("1", "agencies"): _page([{"id": "88"}]),
+    }))
+    result = run(business_access.list_user_assigned_catalogs(user_id="77", user_type="AGENCY", business_id=BUSINESS))
+    assert [call["parent_id"] for call in client.reads_of("agencies")] == ["1"]
+    assert result["summary"]["catalogs_checked"] == 1
+    assert result["summary"]["complete"] is False
+    assert "no readable id" in result["summary"]["incomplete_reason"]

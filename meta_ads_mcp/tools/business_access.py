@@ -185,6 +185,7 @@ async def _scan(
     seen: set[str] = set()
     cursor = blank_to_none(after)
     requests = 0
+    unreadable = 0
     reason: str | None = None
     next_after: str | None = None
     while True:
@@ -198,10 +199,15 @@ async def _scan(
         payload = await client.list_objects(parent_id, edge, fields=fields, params=query)
         requests += 1
         page = normalize_collection(payload)
-        page_rows = [row for row in page["items"] if isinstance(row, dict)]
+        items = page["items"] if isinstance(page["items"], list) else []
+        if page["items"] is not None and not isinstance(page["items"], list):
+            unreadable += 1
+        page_rows = [row for row in items if isinstance(row, dict)]
+        unreadable += len(items) - len(page_rows)
         rows.extend(page_rows)
         if not page["paging"].get("next"):
-            return {"rows": rows, "complete": True, "requests": requests, "reason": None, "next_after": None}
+            return {"rows": rows, "complete": True, "requests": requests, "reason": None, "next_after": None,
+                    "unreadable_rows": unreadable}
         new_cursor = page["paging"].get("after")
         if not new_cursor:
             reason = "Meta reported another page but gave no cursor to read it."
@@ -215,7 +221,34 @@ async def _scan(
             reason = "stopped once the requested row was found; later pages were not read."
             next_after = cursor
             break
-    return {"rows": rows, "complete": False, "requests": requests, "reason": reason, "next_after": next_after}
+    return {"rows": rows, "complete": False, "requests": requests, "reason": reason, "next_after": next_after,
+            "unreadable_rows": unreadable}
+
+
+def _readable_id(value: Any) -> str | None:
+    """An id Meta returned as a non-empty string or a whole number, as a string; otherwise None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _usable_id(value: Any) -> str | None:
+    """A Graph id as a string only when Meta returned a plain numeric id, otherwise None.
+
+    Used for the caller's own identities, where a value in any other shape cannot be
+    compared with the numeric recipient id and so cannot clear a removal.
+    """
+    readable = _readable_id(value)
+    return readable if readable is not None and readable.isdigit() else None
+
+
+def _unidentified_rows(scan: dict[str, Any]) -> int:
+    """Rows of a scan whose own id cannot be read: not an object, or no id at all."""
+    return scan.get("unreadable_rows", 0) + sum(1 for row in scan["rows"] if _readable_id(row.get("id")) is None)
 
 
 def _matches(row: dict[str, Any], search: str, text_fields: tuple[str, ...]) -> bool:
@@ -373,13 +406,21 @@ async def _find_assignment(
 def _found(row: dict[str, Any] | None, scan: dict[str, Any], fields: list[str], task_field: str) -> dict[str, Any]:
     """One recipient's row and whether their current access is fully known.
 
-    Known means the row was found with readable tasks, or every page was read
-    and the row was not there. A row whose tasks cannot be read is not known.
+    Known means the row was found with readable tasks, or every page was read,
+    every row read had a usable id, and the row was not there. A row whose tasks
+    cannot be read is not known, and neither is an absence when some row could
+    be the recipient's but carries no readable id.
     """
     tasks, problem = _tasks_state(row, task_field)
-    known = (row is not None or scan["complete"]) and problem is None
+    unidentified = 0 if row is not None else _unidentified_rows(scan)
+    known = (row is not None or (scan["complete"] and not unidentified)) and problem is None
     if problem is not None:
         reason = f"{problem}, so the current tasks are unknown"
+    elif row is None and scan["complete"] and unidentified:
+        reason = (
+            f"Meta returned {unidentified} row(s) without a readable id, so this server cannot tell whether "
+            "the recipient is among them"
+        )
     else:
         reason = None if known else scan["reason"]
     return {
@@ -516,8 +557,16 @@ async def list_user_assigned_catalogs(
     items: list[dict[str, Any]] = []
     unreadable: list[str] = []
     requests = owned["requests"]
+    unidentified_catalogs = _unidentified_rows(owned)
+    if unidentified_catalogs:
+        gaps.append(f"{unidentified_catalogs} owned catalog row(s) had no readable id and could not be checked.")
+    skipped = 0
     for catalog in catalogs:
-        catalog_id = str(catalog.get("id"))
+        usable = _readable_id(catalog.get("id"))
+        if usable is None:
+            skipped += 1
+            continue
+        catalog_id = usable
         try:
             partners = await _scan(client, catalog_id, "agencies", fields=PARTNER_FIELDS, max_pages=3)
         except MetaAdsError:
@@ -528,13 +577,18 @@ async def list_user_assigned_catalogs(
             items.append({**_project(catalog, OWNED_CATALOG_FIELDS), "access_type": "AGENCY"})
         elif not partners["complete"]:
             gaps.append(f"Catalog {catalog_id}: partner list not fully read ({partners['reason']}).")
+        elif unidentified := _unidentified_rows(partners):
+            gaps.append(
+                f"Catalog {catalog_id}: {unidentified} partner row(s) had no readable id, so whether it is shared "
+                "with this partner is unknown."
+            )
     if unreadable:
         gaps.append(f"Partner lists could not be read for catalogs: {', '.join(unreadable)}.")
     complete = not gaps
     summary: dict[str, Any] = {
         "count": len(items[:limit]),
         "matched": len(items),
-        "catalogs_checked": len(catalogs) - len(unreadable),
+        "catalogs_checked": len(catalogs) - len(unreadable) - skipped,
         "requests": requests,
         "complete": complete and len(items) <= limit,
         "next_after": owned["next_after"],
@@ -582,36 +636,47 @@ def _normalize_tasks(tasks: Any) -> list[str]:
 
 
 async def _caller_ids(client: Any) -> set[str] | None:
-    """Ids that belong to the token's own user, or None when they cannot be read."""
+    """Ids that belong to the token's own user, or None when they cannot all be read.
+
+    One row without a usable id makes the whole set unknown: that row could be
+    the recipient, so a partial set must not clear a removal.
+    """
     try:
         me = await client.get_object("me", fields=["id"])
-        ids = {str(me["id"])} if isinstance(me, dict) and me.get("id") else set()
+        own_id = _usable_id(me.get("id")) if isinstance(me, dict) else None
         scan = await _scan(client, "me", "business_users", fields=["id", "business"], max_pages=3)
     except MetaAdsError:
         return None
-    if not ids or not scan["complete"]:
+    if own_id is None or not scan["complete"] or scan.get("unreadable_rows"):
         return None
-    ids.update(str(row["id"]) for row in scan["rows"] if row.get("id"))
-    return ids
+    row_ids = [_usable_id(row.get("id")) for row in scan["rows"]]
+    if any(row_id is None for row_id in row_ids):
+        return None
+    return {own_id, *row_ids}  # type: ignore[arg-type]
+
+
+def _row_business_id(row: dict[str, Any]) -> str | None:
+    business = row.get("business")
+    return _usable_id(business.get("id")) if isinstance(business, dict) else None
 
 
 async def _caller_business_ids(client: Any) -> set[str] | None:
     """Businesses the token's own user belongs to, or None when that cannot be read.
 
     An empty answer is treated as unreadable: a system-user token can see no
-    business rows even though it belongs to one.
+    business rows even though it belongs to one. So is any row whose business
+    id cannot be read, since that business could be the recipient.
     """
     try:
         scan = await _scan(client, "me", "business_users", fields=["id", "business"], max_pages=3)
     except MetaAdsError:
         return None
-    if not scan["complete"]:
+    if not scan["complete"] or scan.get("unreadable_rows"):
         return None
-    ids = {
-        str(row["business"]["id"]) for row in scan["rows"]
-        if isinstance(row.get("business"), dict) and row["business"].get("id")
-    }
-    return ids or None
+    ids = [_row_business_id(row) for row in scan["rows"]]
+    if not ids or any(business_id is None for business_id in ids):
+        return None
+    return set(ids)  # type: ignore[arg-type]
 
 
 def _access_inputs(catalog_id: Any, user_id: Any, tasks: Any, business_id: Any, user_type: Any) -> dict[str, Any]:
@@ -712,7 +777,7 @@ async def _plan_access_change(
             )
         elif is_self is None and not allow_self_removal:
             refusal = (
-                "The token's own user ids could not be read, so this server cannot confirm that "
+                "The token's own user ids could not all be read, so this server cannot confirm that "
                 "this person is not the caller. Pass allow_self_removal=true to proceed after "
                 "confirming the recipient is not you."
             )
@@ -879,7 +944,7 @@ async def _plan_partner_change(
             )
         elif is_self is None and not allow_self_removal:
             refusal = (
-                "The businesses the token's own user belongs to could not be read, so this server cannot "
+                "The businesses the token's own user belongs to could not all be read, so this server cannot "
                 "confirm that the caller does not use the catalog through this partner. Pass "
                 "allow_self_removal=true to proceed after confirming that."
             )

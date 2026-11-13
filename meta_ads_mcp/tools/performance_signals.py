@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -214,6 +215,27 @@ def _history_summary(points: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+async def _history_pages(client: Any, account_id: str, params: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Read every page of the score history edge (bounded); return the rows and why the read stopped early."""
+    rows: list[Any] = []
+    page_params = dict(params)
+    seen: set[str] = set()
+    for _request in range(INSIGHTS_MAX_PAGES):
+        payload = await client.list_objects(account_id, "opportunity_score_history", params=page_params)
+        rows.extend(payload.get("data", []) or [])
+        paging = extract_paging(payload)
+        if not paging.get("next"):
+            return {"data": rows}, None
+        cursor = paging.get("after")
+        if not cursor:
+            return {"data": rows}, CURSOR_MISSING
+        if cursor in seen:
+            return {"data": rows}, CURSOR_REPEATED
+        seen.add(cursor)
+        page_params = {**params, "after": cursor}
+    return {"data": rows}, f"stopped after {INSIGHTS_MAX_PAGES} requests with more pages left"
+
+
 @mcp_server.tool()
 async def get_opportunity_score(
     account_id: str,
@@ -249,7 +271,7 @@ async def get_opportunity_score(
             params["get_reason"] = True
         window = {"from_date": params["from_date"], "to_date": params["to_date"]}
         try:
-            payload = await client.list_objects(resolved_account_id, "opportunity_score_history", params=params)
+            payload, history_stopped = await _history_pages(client, resolved_account_id, params)
         except (MetaApiError, UnsupportedFeatureError) as exc:
             history = {"available": False, "window": window, "points": None, "error": _public_error(exc)}
             missing_signals.append(
@@ -258,9 +280,15 @@ async def get_opportunity_score(
             )
         else:
             points = []
+            dates_seen: set[str] = set()
             for raw in payload.get("data", []) or []:
                 if not isinstance(raw, dict):
                     continue
+                if raw.get("date") is not None:
+                    # A page Meta repeats must not count its days twice.
+                    if str(raw["date"]) in dates_seen:
+                        continue
+                    dates_seen.add(str(raw["date"]))
                 point: dict[str, Any] = {
                     "date": raw.get("date"),
                     "opportunity_score": _number(raw.get("opportunity_score")),
@@ -273,9 +301,16 @@ async def get_opportunity_score(
                 "available": True,
                 "window": window,
                 "points": points,
+                "complete": history_stopped is None,
                 "summary": _history_summary(points),
                 "note": OPPORTUNITY_SCORE_HISTORY_NOTE,
             }
+            if history_stopped is not None:
+                history["incomplete_reason"] = history_stopped
+                missing_signals.append(
+                    f"opportunity_score_history could not be read to the last page ({history_stopped}), so the "
+                    "history and its summary cover only the days read."
+                )
             if include_history_reasons:
                 history["budget_units"] = (
                     f"major units of {currency}" if currency else "Meta minor units (account currency unknown)"
@@ -559,6 +594,51 @@ async def _read_insights_pages(
             raise ValidationError("Insights pagination could not finish: missing or repeated cursor.")
         seen.add(cursor)
         page_params = {**params, "after": cursor}
+
+
+ROW_BOUND_REACHED = "row_bound_reached"
+CURSOR_MISSING = "Meta reported another page but gave no cursor to read it"
+CURSOR_REPEATED = "Meta returned the same page cursor twice, so the read stopped"
+
+
+async def _read_bounded_pages(
+    object_id: str, fields: list[str], params: dict[str, Any], *,
+    max_pages: int = INSIGHTS_MAX_PAGES, max_rows: int | None = None,
+    enough: Callable[[list[dict[str, Any]]], bool] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Read one insights request page by page, keeping what was read when the read cannot finish.
+
+    Returns the raw rows and None when Meta reported no further page (or `enough` says the rows already hold
+    everything the caller needs), or the reason the read stopped first: ROW_BOUND_REACHED once max_rows rows
+    are read, a next page without a cursor, a repeated cursor, or the request cap. Callers label the result
+    partial instead of failing.
+    """
+    client = get_graph_api_client()
+    rows: list[dict[str, Any]] = []
+    page_params = dict(params)
+    seen: set[str] = set()
+    for _request in range(max_pages):
+        payload = await client.get_insights(object_id, fields=fields, params=page_params)
+        rows.extend(row for row in payload.get("data", []) or [] if isinstance(row, dict))
+        paging = extract_paging(payload)
+        if not paging.get("next") or (enough is not None and enough(rows)):
+            return rows, None
+        if max_rows is not None and len(rows) >= max_rows:
+            return rows, ROW_BOUND_REACHED
+        cursor = paging.get("after")
+        if not cursor:
+            return rows, CURSOR_MISSING
+        if cursor in seen:
+            return rows, CURSOR_REPEATED
+        seen.add(cursor)
+        page_params = {**params, "after": cursor}
+    return rows, f"stopped after {max_pages} requests with more pages left"
+
+
+def _covers(key: str, ids: list[str]) -> Callable[[list[dict[str, Any]]], bool]:
+    """True once the rows read hold a row for every one of ids (by the row's `key` field)."""
+    wanted = set(ids)
+    return lambda rows: wanted <= {str(row.get(key) or "") for row in rows}
 
 
 async def _read_with_results(
@@ -2134,34 +2214,45 @@ async def _ranking_scope_rows(
     attempts = (([*RANKING_SCOPE_FIELDS, *_result_fields(level)], True), (RANKING_SCOPE_LEAN_FIELDS, False))
     for fields, with_results in attempts:
         try:
-            payload = await get_graph_api_client().get_insights(object_id, fields=fields, params=params)
+            raw_rows, stopped = await _read_bounded_pages(object_id, fields, params)
         except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
             errors.append(str(_public_error(exc).get("message")))
             continue
-        return _normalize_with_results(payload), ("; ".join(errors) or None), with_results
+        if stopped is not None:
+            # A total summed from part of Meta's pages would understate the scope's spend.
+            errors.append(f"the scope's own rows could not be read to the last page ({stopped})")
+            return None, "; ".join(errors), False
+        return _normalize_with_results({"data": raw_rows}), ("; ".join(errors) or None), with_results
     return None, "; ".join(errors), False
 
 
 async def _ranking_cost_rows(
     object_id: str, ad_ids: list[str], window: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], str | None]:
-    """Read results for the selected ads in one request filtered to their ids. Never raises."""
+) -> tuple[dict[str, dict[str, Any]], str | None, str | None]:
+    """Read results for the selected ads in one request filtered to their ids, page by page. Never raises.
+
+    Returns the rows by ad id, the error that stopped the read, and why the read stopped before Meta's last
+    page while some selected ads still had no row.
+    """
     if not ad_ids:
-        return {}, None
+        return {}, None, None
     params = insights_tools._insights_params(
         level="ad", default_date_preset="last_30d", limit=len(ad_ids),
         filtering=[{"field": "ad.id", "operator": "IN", "value": list(ad_ids)}], **window,
     )
     try:
-        payload = await get_graph_api_client().get_insights(object_id, fields=RANKING_COST_FIELDS, params=params)
+        raw_rows, stopped = await _read_bounded_pages(
+            object_id, RANKING_COST_FIELDS, params, enough=_covers("ad_id", ad_ids),
+        )
     except Exception as exc:  # an enrichment failure must not fail the rankings report
-        return {}, str(_public_error(exc).get("message"))
+        return {}, str(_public_error(exc).get("message")), None
     wanted = set(ad_ids)
     rows: dict[str, dict[str, Any]] = {}
-    for row in payload.get("data", []) or []:
-        if isinstance(row, dict) and str(row.get("ad_id") or "") in wanted:
-            rows[str(row["ad_id"])] = row
-    return rows, None
+    for row in raw_rows:
+        key = str(row.get("ad_id") or "")
+        if key in wanted and key not in rows:
+            rows[key] = row
+    return rows, None, (stopped if len(rows) < len(wanted) else None)
 
 
 def _known_ranking(value: Any) -> bool:
@@ -2220,7 +2311,7 @@ async def _ranking_entity(
         if row.get("ad_id") and any(_known_ranking(row.get(field)) for field in RANKING_FIELDS)
     ))
     cost_ids_capped = cost_ids[:RANKING_COST_MAX_ADS]
-    cost_rows, cost_error = await _ranking_cost_rows(object_id, cost_ids_capped, window)
+    cost_rows, cost_error, cost_stopped = await _ranking_cost_rows(object_id, cost_ids_capped, window)
     rows = _normalize_with_results({"data": [
         {**cost_rows[str(row.get("ad_id"))], **row} if str(row.get("ad_id")) in cost_rows else row
         for row in lean_rows
@@ -2271,7 +2362,13 @@ async def _ranking_entity(
                 "No examined ad has a known ranking, so results and cost per result were not read and are null."
             )
     without_cost = len(rows) - len(cost_rows)
-    if cost_status == "read" and without_cost:
+    if cost_status == "read" and cost_stopped is not None:
+        missing_signals.append(
+            f"The results read stopped before Meta's last page ({cost_stopped}), so "
+            f"{len(cost_ids_capped) - len(cost_rows)} of the {len(cost_ids_capped)} ads selected for cost evidence "
+            "have no results or cost per result."
+        )
+    elif cost_status == "read" and without_cost:
         missing_signals.append(
             f"Results and cost per result were read for {len(cost_rows)} of {len(rows)} examined ads: those with at "
             f"least one known ranking (at most {RANKING_COST_MAX_ADS}, highest spend first). The others show them as null."
@@ -2280,13 +2377,15 @@ async def _ranking_entity(
         "status": cost_status,
         "method": (
             "one insights request at ad level for the same window, filtered to the selected ad ids "
-            "(filtering ad.id IN), unsorted, with Meta's results and cost_per_result fields"
+            "(filtering ad.id IN), unsorted, with Meta's results and cost_per_result fields, read page by page "
+            f"until Meta reports no more (at most {INSIGHTS_MAX_PAGES} requests)"
         ),
         "selection": f"examined ads with at least one known ranking, highest spend first, at most {RANKING_COST_MAX_ADS}",
         "ads_requested": len(cost_ids_capped),
         "ads_returned": len(cost_rows),
         "ads_eligible_not_requested": len(cost_ids) - len(cost_ids_capped),
         "error": cost_error,
+        "read_stopped": cost_stopped,
     }
 
     cost_known_rows = [row for row in rows if str(row.get("ad_id")) in cost_rows]
@@ -3056,34 +3155,37 @@ CONTEXT_SORTED_FIELDS = ["adset_id", "spend"]
 _CONTEXT_READ_ERRORS = (MetaApiError, NotFoundError, UnsupportedFeatureError, ValidationError, RateLimitError)
 
 
-async def _read_one_page_with_results(
-    object_id: str, fields: list[str], params: dict[str, Any], *, level: str,
-) -> tuple[list[dict[str, Any]], bool, str | None]:
-    """Read one page with Meta's result fields (once more without them if Meta rejects them).
+async def _read_pages_with_results(
+    object_id: str, fields: list[str], params: dict[str, Any], *, level: str, max_rows: int | None = None,
+    enough: Callable[[list[dict[str, Any]]], bool] | None = None,
+) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    """Read every page (bounded) with Meta's result fields, once more without them if Meta rejects them.
 
-    Returns the rows, whether Meta has more pages, and the error that made the result fields unavailable.
+    Returns the normalized rows, why the read stopped before Meta's last page (None when it reached it; see
+    _read_bounded_pages), and the error that made the result fields unavailable.
     """
-    client = get_graph_api_client()
     with_results = [*fields, *(field for field in _result_fields(level) if field not in fields)]
+    bounds: dict[str, Any] = {"max_rows": max_rows, "enough": enough}
     try:
-        payload = await client.get_insights(object_id, fields=with_results, params=params)
+        rows, stopped = await _read_bounded_pages(object_id, with_results, params, **bounds)
         result_error = None
     except (MetaApiError, UnsupportedFeatureError) as exc:
         if isinstance(exc, MetaApiError) and exc.code not in RESULT_RETRY_CODES:
             raise
         result_error = str(_public_error(exc).get("message"))
-        payload = await client.get_insights(object_id, fields=fields, params=params)
-    return _normalize_with_results(payload), bool(extract_paging(payload).get("next")), result_error
+        rows, stopped = await _read_bounded_pages(object_id, fields, params, **bounds)
+    return _normalize_with_results({"data": rows}), stopped, result_error
 
 
 async def _context_account_spend(account_id: str, start: date, end: date) -> tuple[float | None, str | None]:
     """The account's own spend in the window, for the share the examined ad sets cover. Never raises."""
     params = insights_tools._insights_params(level="account", since=start.isoformat(), until=end.isoformat(), limit=1)
     try:
-        payload = await get_graph_api_client().get_insights(account_id, fields=["spend"], params=params)
+        rows, stopped = await _read_bounded_pages(account_id, ["spend"], params)
     except _CONTEXT_READ_ERRORS as exc:
         return None, str(_public_error(exc).get("message"))
-    rows = [row for row in payload.get("data", []) or [] if isinstance(row, dict)]
+    if stopped is not None:
+        return None, f"Meta's account total could not be read to its last page ({stopped})"
     values = [to_float(row.get("spend")) for row in rows]
     if not rows:
         return 0.0, None
@@ -3103,19 +3205,21 @@ async def _context_adset_rows(
     rows: list[dict[str, Any]] = []
     result_error: str | None = None
     more = False
+    stop_reasons: list[str] = []
     if scope_ids is not None:
         coverage.update({
             "mode": "object_ids",
             "method": (
-                "two ad set insights requests filtered to the named ids (campaign.id IN, adset.id IN), "
-                f"one page of at most {CONTEXT_MAX_ADSETS} rows each"
+                "two ad set insights requests filtered to the named ids (campaign.id IN, adset.id IN), each read "
+                f"page by page until Meta reports no more, {CONTEXT_MAX_ADSETS} rows or {INSIGHTS_MAX_PAGES} "
+                "requests"
             ),
         })
         reads = await asyncio.gather(*(
-            _read_one_page_with_results(
+            _read_pages_with_results(
                 account_id, CONTEXT_INSIGHTS_FIELDS,
                 {**full_params, "filtering": [{"field": field, "operator": "IN", "value": list(scope_ids)}]},
-                level="adset",
+                level="adset", max_rows=CONTEXT_MAX_ADSETS,
             )
             for field in ("campaign.id", "adset.id")
         ), return_exceptions=True)
@@ -3127,8 +3231,10 @@ async def _context_adset_rows(
                     raise read
                 errors.append(str(_public_error(read).get("message")))
                 continue
-            read_rows, read_more, read_error = read
-            more = more or read_more
+            read_rows, stopped, read_error = read
+            more = more or stopped is not None
+            if stopped not in (None, ROW_BOUND_REACHED):
+                stop_reasons.append(stopped)
             result_error = result_error or read_error
             for row in read_rows:
                 key = str(row.get("adset_id") or "")
@@ -3145,7 +3251,8 @@ async def _context_adset_rows(
             "mode": "top_spenders",
             "method": (
                 f"one lean ad set request sorted by spend, highest first (limit {CONTEXT_MAX_ADSETS}), then one "
-                "request for those ad sets' full rows filtered by adset.id IN"
+                "request for those ad sets' full rows filtered by adset.id IN, read page by page until Meta reports "
+                f"no more (at most {INSIGHTS_MAX_PAGES} requests)"
             ),
         })
         sorted_params = {**insights_tools._insights_params(level="adset", limit=CONTEXT_MAX_ADSETS, **window),
@@ -3173,19 +3280,31 @@ async def _context_adset_rows(
             more = bool(extract_paging(picked).get("next")) or len(all_ids) > len(ids)
             if ids:
                 try:
-                    read_rows, _, result_error = await _read_one_page_with_results(
+                    read_rows, stopped, result_error = await _read_pages_with_results(
                         account_id, CONTEXT_INSIGHTS_FIELDS,
                         {**full_params, "limit": len(ids),
                          "filtering": [{"field": "adset.id", "operator": "IN", "value": ids}]},
-                        level="adset",
+                        level="adset", enough=_covers("adset_id", ids),
                     )
                 except _CONTEXT_READ_ERRORS as exc:
                     coverage.update({"status": "failed", "error": str(_public_error(exc).get("message"))})
                 else:
                     wanted = set(ids)
-                    rows = [row for row in read_rows if str(row.get("adset_id") or "") in wanted]
+                    kept: set[str] = set()
+                    for row in read_rows:
+                        key = str(row.get("adset_id") or "")
+                        if key in wanted and key not in kept:
+                            kept.add(key)
+                            rows.append(row)
                     if len(rows) < len(ids):
+                        # A selected ad set without its full row leaves its spend, funnel and goal events out.
+                        # Once every selected ad set has its row, a page Meta still offers holds nothing needed.
+                        coverage["adsets_selected"] = len(ids)
                         coverage["adsets_selected_without_rows"] = len(ids) - len(rows)
+                        more = True
+                        if stopped is not None:
+                            stop_reasons.append(stopped)
+    coverage["rows_read_stopped"] = "; ".join(dict.fromkeys(stop_reasons)) or None
     examined_spend = _known_total_spend(rows)
     share = _ratio(examined_spend, account_spend)
     coverage.update({
@@ -3214,17 +3333,23 @@ async def _context_ad_rows(
     coverage: dict[str, Any] = {
         "mode": "ad_ids",
         "row_level": "ad",
-        "method": "one ad-level insights request filtered to the named ad ids (ad.id IN), one page",
+        "method": (
+            "one ad-level insights request filtered to the named ad ids (ad.id IN), read page by page until Meta "
+            f"reports no more (at most {INSIGHTS_MAX_PAGES} requests)"
+        ),
         "status": "read",
         "error": None,
+        "rows_read_stopped": None,
     }
     rows: list[dict[str, Any]] = []
     result_error: str | None = None
     more = False
 
-    async def read() -> tuple[list[dict[str, Any]], bool, str | None] | BaseException:
+    async def read() -> tuple[list[dict[str, Any]], str | None, str | None] | BaseException:
         try:
-            return await _read_one_page_with_results(account_id, CONTEXT_AD_FIELDS, params, level="ad")
+            return await _read_pages_with_results(
+                account_id, CONTEXT_AD_FIELDS, params, level="ad", enough=_covers("ad_id", ad_ids),
+            )
         except _CONTEXT_READ_ERRORS as exc:
             return exc
 
@@ -3234,7 +3359,7 @@ async def _context_ad_rows(
     if isinstance(outcome, BaseException):
         coverage.update({"status": "failed", "error": str(_public_error(outcome).get("message"))})
     else:
-        read_rows, more, result_error = outcome
+        read_rows, stopped, result_error = outcome
         wanted = set(ad_ids)
         seen: set[str] = set()
         for row in read_rows:
@@ -3242,6 +3367,10 @@ async def _context_ad_rows(
             if key in wanted and key not in seen:
                 seen.add(key)
                 rows.append(row)
+        # Once every named ad has its row, a page Meta still offers holds nothing needed.
+        if stopped is not None and len(rows) < len(wanted):
+            more = True
+            coverage["rows_read_stopped"] = stopped
     examined_spend = _known_total_spend(rows)
     share = _ratio(examined_spend, account_spend)
     coverage.update({
@@ -3307,6 +3436,13 @@ def _coverage_signal(coverage: dict[str, Any]) -> list[str]:
             f"Partial briefing: examined the {examined} {which}{covered}; the remaining {unit}s were not examined, "
             "so spend, funnel and goal sections describe only the examined ones."
         )
+    if coverage.get("adsets_selected_without_rows"):
+        signals.append(
+            f"{coverage['adsets_selected_without_rows']} of the {coverage['adsets_selected']} selected "
+            "highest-spending ad sets had no full row read, so their spend, funnel and goal events are left out."
+        )
+    if coverage.get("rows_read_stopped"):
+        signals.append(f"Meta's {unit} rows could not be read to the last page ({coverage['rows_read_stopped']}).")
     if coverage.get("account_spend_error"):
         signals.append(
             f"The account's total spend could not be read ({coverage['account_spend_error']}), so the share of spend "
@@ -3399,8 +3535,11 @@ async def get_advertiser_context(
         }
         if unmatched and row_coverage["status"] != "failed":
             missing_signals.append(
-                "No ad set insights rows in the window matched " + ", ".join(unmatched)
-                + " (not a campaign or ad set of this account, or no delivery in the window)."
+                "No ad set insights rows in the window matched " + ", ".join(unmatched) + (
+                    " among the rows read; the read stopped before Meta's last page, so their rows may not have "
+                    "been read." if row_coverage["more_adsets_exist"]
+                    else " (not a campaign or ad set of this account, or no delivery in the window)."
+                )
             )
     if scope_ad_ids is not None:
         matched = {str(row.get("ad_id")) for row in rows if row.get("ad_id")}
@@ -3415,8 +3554,11 @@ async def get_advertiser_context(
         }
         if unmatched and row_coverage["status"] != "failed":
             missing_signals.append(
-                "No ad insights rows in the window matched " + ", ".join(unmatched)
-                + " (not an ad of this account, or no delivery in the window)."
+                "No ad insights rows in the window matched " + ", ".join(unmatched) + (
+                    " among the rows read; the read stopped before Meta's last page, so their rows may not have "
+                    "been read." if row_coverage["more_ads_exist"]
+                    else " (not an ad of this account, or no delivery in the window)."
+                )
             )
     currency = _supported_currency(account.get("currency"))
     money: dict[str, float | None] = {}

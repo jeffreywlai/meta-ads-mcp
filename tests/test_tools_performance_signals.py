@@ -2648,7 +2648,7 @@ def test_g19_ranking_does_not_borrow_another_ads_result_definition(monkeypatch) 
         return {
             "20": {"ad_id": "20", "clicks": "10"},
             "21": {"ad_id": "21", "clicks": "10", "results": [{"indicator": "actions:lead", "values": [{"value": "2"}]}]},
-        }, None
+        }, None, None
 
     _patch(monkeypatch, RecordingClient(insights_handler=handler))
     monkeypatch.setattr(performance_signals, "_ranking_cost_rows", costs)
@@ -3110,3 +3110,274 @@ def test_advertiser_context_ad_read_failure_is_reported_not_raised(monkeypatch) 
     assert result["ad_coverage"]["status"] == "failed"
     assert result["metrics"]["ad_rows"] == 0
     assert any(signal.startswith("Ad insights could not be read") for signal in result["missing_signals"])
+
+
+# ---------------------------------------------------------------------------
+# Round four (H7): a paged read is followed to its end or labelled partial, never assumed complete
+# ---------------------------------------------------------------------------
+
+
+def _paged(rows: list[dict[str, Any]], after: str | None = None, *, more: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {"data": rows}
+    if more:
+        payload["paging"] = {"next": "https://graph.example/next", "cursors": {"after": after} if after else {}}
+    return payload
+
+
+def _top_spender_handler(full_pages: Callable[[dict[str, Any]], dict[str, Any]]):
+    rows = {adset_id: _adset_row(adset_id, objective="OUTCOME_SALES", goal="OFFSITE_CONVERSIONS",
+                                 spend=float(spend), actions={"link_click": 10})
+            for adset_id, spend in (("20", 20), ("21", 10))}
+
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "30"}]}
+        if "sort" in params:
+            return {"data": [{"adset_id": "20", "spend": "20"}, {"adset_id": "21", "spend": "10"}]}
+        return full_pages(params, rows)
+
+    return handler
+
+
+def _context_rows_for(monkeypatch, handler) -> tuple[RecordingClient, list[dict[str, Any]], dict[str, Any]]:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    rows, _error, coverage = asyncio.run(performance_signals._context_adset_rows(
+        "act_10", date(2026, 11, 1), date(2026, 11, 7), None,
+    ))
+    return client, rows, coverage
+
+
+def test_h7_context_full_read_next_page_prevents_complete_claim(monkeypatch) -> None:
+    def full(params, rows):
+        return _paged([rows["20"]], "second", more=True)
+
+    client, rows, coverage = _context_rows_for(monkeypatch, _top_spender_handler(full))
+    assert coverage["complete"] is False, coverage
+    assert coverage["more_adsets_exist"] is True, coverage
+    assert coverage["adsets_selected_without_rows"] == 1
+    assert "same page cursor twice" in coverage["rows_read_stopped"]
+    assert [row["adset_id"] for row in rows] == ["20"]
+    full_calls = [call for call in _calls(client, "get_insights") if "filtering" in call["params"]]
+    assert len(full_calls) == 2 and full_calls[1]["params"]["after"] == "second"
+    signals = performance_signals._coverage_signal(coverage)
+    assert any("1 of the 2 selected" in signal for signal in signals), signals
+    assert any("Partial briefing" in signal for signal in signals), signals
+
+
+def test_h7_context_full_read_follows_every_page(monkeypatch) -> None:
+    def full(params, rows):
+        if params.get("after") == "p2":
+            return _paged([rows["21"]])
+        return _paged([rows["20"]], "p2", more=True)
+
+    client, rows, coverage = _context_rows_for(monkeypatch, _top_spender_handler(full))
+    assert coverage["complete"] is True and coverage["more_adsets_exist"] is False
+    assert sorted(row["adset_id"] for row in rows) == ["20", "21"]
+    assert coverage["examined_spend"] == pytest.approx(30.0)
+    assert "adsets_selected_without_rows" not in coverage and coverage.get("rows_read_stopped") is None
+    full_calls = [call for call in _calls(client, "get_insights") if "filtering" in call["params"]]
+    assert "after" not in full_calls[0]["params"] and full_calls[0]["params"]["limit"] == 2
+    assert performance_signals._coverage_signal(coverage) == []
+
+
+@pytest.mark.parametrize("shape", ["no_cursor", "page_cap"])
+def test_h7_context_full_read_that_cannot_finish_is_partial(monkeypatch, shape) -> None:
+    def full(params, rows):
+        if shape == "no_cursor":
+            return _paged([rows["20"]], None, more=True)
+        page = int(params.get("after") or 0)
+        return _paged([rows["20"]] if page == 0 else [], str(page + 1), more=True)
+
+    client, rows, coverage = _context_rows_for(monkeypatch, _top_spender_handler(full))
+    assert coverage["complete"] is False and coverage["more_adsets_exist"] is True
+    assert coverage["adsets_selected_without_rows"] == 1
+    full_calls = [call for call in _calls(client, "get_insights") if "filtering" in call["params"]]
+    assert len(full_calls) == (1 if shape == "no_cursor" else performance_signals.INSIGHTS_MAX_PAGES)
+
+
+def test_h7_briefing_names_unread_selected_adsets(monkeypatch) -> None:
+    def full(params, rows):
+        return _paged([rows["20"]], "second", more=True)
+
+    client = _context_client()
+    client.insights_handler = _top_spender_handler(full)
+    _patch(monkeypatch, client)
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=7))
+    coverage = result["adset_coverage"]
+    assert coverage["complete"] is False and coverage["adsets_selected_without_rows"] == 1
+    assert any("1 of the 2 selected" in signal for signal in result["missing_signals"])
+
+
+def test_h7_object_ids_reads_follow_pages(monkeypatch) -> None:
+    rows = [_adset_row(str(100 + index), objective="OUTCOME_SALES", goal="OFFSITE_CONVERSIONS",
+                       spend=10.0, actions={"link_click": 1}) for index in range(3)]
+    for row in rows:
+        row["campaign_id"] = "777"
+
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "30"}]}
+        (selector,) = params["filtering"]
+        if selector["field"] == "adset.id":
+            return {"data": []}
+        if params.get("after") == "p2":
+            return _paged(rows[2:])
+        return _paged(rows[:2], "p2", more=True)
+
+    client = _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    found, _error, coverage = asyncio.run(performance_signals._context_adset_rows(
+        "act_10", date(2026, 11, 1), date(2026, 11, 7), ["777"],
+    ))
+    assert len(found) == 3
+    assert coverage["complete"] is True and coverage["more_adsets_exist"] is False
+
+
+def test_h7_object_ids_read_stops_at_the_adset_bound(monkeypatch) -> None:
+    bound = performance_signals.CONTEXT_MAX_ADSETS
+
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "30"}]}
+        (selector,) = params["filtering"]
+        if selector["field"] == "adset.id":
+            return {"data": []}
+        page = int(params.get("after") or 0)
+        data = [_adset_row(str(1000 + page * bound + index), objective="OUTCOME_SALES", goal="OFFSITE_CONVERSIONS",
+                           spend=1.0, actions={}) for index in range(bound)]
+        for row in data:
+            row["campaign_id"] = "777"
+        return _paged(data, str(page + 1), more=True)
+
+    client = _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    found, _error, coverage = asyncio.run(performance_signals._context_adset_rows(
+        "act_10", date(2026, 11, 1), date(2026, 11, 7), ["777"],
+    ))
+    assert len(found) == bound
+    assert coverage["more_adsets_exist"] is True and coverage["complete"] is False
+    campaign_calls = [call for call in _calls(client, "get_insights")
+                      if call["params"].get("filtering", [{}])[0].get("field") == "campaign.id"]
+    assert len(campaign_calls) == 1
+
+
+def test_h7_ad_ids_read_follows_pages(monkeypatch) -> None:
+    rows = _ad_context_rows()
+
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "1000"}]}
+        if params.get("after") == "p2":
+            return _paged(rows[2:])
+        return _paged(rows[:2], "p2", more=True)
+
+    client = _context_client()
+    client.insights_handler = handler
+    _patch(monkeypatch, client)
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", ad_ids=["901", "902", "903"]))
+    assert result["metrics"]["ad_rows"] == 3
+    assert result["ad_coverage"]["complete"] is True
+    assert result["object_scope"]["unmatched_ad_ids"] == []
+
+
+def test_h7_ad_ids_read_that_stops_early_does_not_call_unread_ads_undelivered(monkeypatch) -> None:
+    rows = _ad_context_rows()
+
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "1000"}]}
+        return _paged(rows[:2], "again", more=True)
+
+    client = _context_client()
+    client.insights_handler = handler
+    _patch(monkeypatch, client)
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", ad_ids=["901", "902", "903"]))
+    assert result["ad_coverage"]["complete"] is False and result["ad_coverage"]["more_ads_exist"] is True
+    unmatched = [signal for signal in result["missing_signals"] if "903" in signal]
+    assert unmatched and all("may not have been read" in signal for signal in unmatched)
+
+
+def test_h7_account_spend_with_unreadable_next_page_is_unknown(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        return _paged([{"spend": "30"}], None, more=True)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    spend, error = asyncio.run(performance_signals._context_account_spend("act_10", date(2026, 11, 1), date(2026, 11, 7)))
+    assert spend is None and "cursor" in error
+
+
+def test_h7_ranking_cost_read_follows_pages(monkeypatch) -> None:
+    ads = _many_ads(4)
+    base = _meta_like_ranking_handler(ads, scope_spend=1e5, more=False)
+
+    def handler(object_id, fields, params):
+        if params["level"] == "ad" and "filtering" in params:
+            payload = base(object_id, fields, params)
+            if params.get("after") == "p2":
+                return {"data": payload["data"][2:]}
+            return _paged(payload["data"][:2], "p2", more=True)
+        return base(object_id, fields, params)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=4))
+    assert result["cost_evidence"]["ads_returned"] == 4
+    assert result["cost_evidence"].get("read_stopped") is None
+
+
+def test_h7_ranking_cost_read_that_stops_early_says_so(monkeypatch) -> None:
+    ads = _many_ads(4)
+    base = _meta_like_ranking_handler(ads, scope_spend=1e5, more=False)
+
+    def handler(object_id, fields, params):
+        if params["level"] == "ad" and "filtering" in params:
+            return _paged(base(object_id, fields, params)["data"][:2], "again", more=True)
+        return base(object_id, fields, params)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=4))
+    assert result["cost_evidence"]["ads_returned"] == 2
+    assert "same page cursor twice" in result["cost_evidence"]["read_stopped"]
+    assert any("stopped before" in signal for signal in result["missing_signals"])
+
+
+def test_h7_ranking_scope_total_with_more_pages_is_not_a_partial_sum(monkeypatch) -> None:
+    ads = _many_ads(4)
+    base = _meta_like_ranking_handler(ads, scope_spend=1e5, more=False)
+
+    def handler(object_id, fields, params):
+        if params["level"] != "ad":
+            return _paged(base(object_id, fields, params)["data"], None, more=True)
+        return base(object_id, fields, params)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=4))
+    assert any("total spend could not be read" in signal for signal in result["missing_signals"])
+
+
+def _history_pages(repeat: bool):
+    def pages(params):
+        if params.get("after") == "h2" and not repeat:
+            return {"data": [{"date": "2026-11-02", "opportunity_score": "78"}]}
+        return {"data": [{"date": "2026-11-01", "opportunity_score": "70"}],
+                "paging": {"next": "https://graph.example/next", "cursors": {"after": "h2"}}}
+    return pages
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_h7_opportunity_score_history_follows_pages_or_says_partial(monkeypatch, repeat) -> None:
+    client = _patch(monkeypatch, RecordingClient(
+        objects={"act_42": {"id": "act_42", "currency": "USD", "opportunity_score": 74}},
+        edges={("act_42", "opportunity_score_history"): _history_pages(repeat)},
+        recommendations_payload=REC_PAYLOAD,
+    ))
+    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+    result = asyncio.run(performance_signals.get_opportunity_score(account_id="42", history_days=45))
+    history_calls = _calls(client, "list_objects")
+    assert "after" not in history_calls[0]["params"]
+    history = result["history"]
+    if repeat:
+        assert history["complete"] is False
+        assert [point["opportunity_score"] for point in history["points"]] == [70]
+        assert any("history" in signal and "same page cursor twice" in signal for signal in result["missing_signals"])
+    else:
+        assert history["complete"] is True
+        assert [point["opportunity_score"] for point in history["points"]] == [70, 78]
+        assert len(history_calls) == 2 and history_calls[1]["params"]["after"] == "h2"
