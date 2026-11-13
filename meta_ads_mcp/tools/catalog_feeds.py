@@ -25,7 +25,7 @@ from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
-from meta_ads_mcp.tool_types import GraphId
+from meta_ads_mcp.tool_types import GraphId, StringList, coerce_csv_string_list
 
 UPLOAD_FIELDS = [
     "id",
@@ -129,6 +129,28 @@ SCHEDULE_KEYS = (
     "password",
 )
 SCHEDULE_URL_SCHEMES = ("http", "https", "ftp")
+# ProductFeed options, with the values Meta's reference documents for
+# POST /{product_catalog_id}/product_feeds and POST /{product_feed_id}. The value sent
+# is the SDK 26.0.2 enum value (facebook_business/adobjects/productfeed.py).
+FEED_TYPES = (
+    "ACTIVITY", "APP_AND_SOFTWARE", "ARTICLE_AND_PUBLICATION", "AUTOMOTIVE_MODEL", "COLLECTION",
+    "DESTINATION", "FLIGHT", "HOME_LISTING", "HOTEL", "HOTEL_ROOM", "LOCAL_INVENTORY", "MEDIA_TITLE",
+    "OFFER", "PRODUCT_RATINGS_AND_REVIEWS", "PRODUCTS", "SERVICE", "TRANSACTABLE_ITEMS",
+    "VEHICLE_OFFER", "VEHICLES",
+)
+FEED_DELIMITERS = ("AUTODETECT", "BAR", "COMMA", "TAB", "TILDE", "SEMICOLON")
+# The characters themselves, as Meta's own server takes them.
+_DELIMITER_CHARACTERS = {"|": "BAR", ",": "COMMA", "\t": "TAB", "~": "TILDE", ";": "SEMICOLON"}
+FEED_ENCODINGS = ("AUTODETECT", "LATIN1", "UTF8", "UTF16LE", "UTF16BE", "UTF32LE", "UTF32BE")
+# Common spellings: UTF-8 for UTF8 (hyphens are dropped) and ISO-8859-1 for LATIN1.
+_ENCODING_SPELLINGS = {"ISO88591": "LATIN1"}
+FEED_QUOTED_FIELDS_MODES = ("AUTODETECT", "ON", "OFF")
+FEED_OVERRIDE_TYPES = (
+    "LANGUAGE", "COUNTRY", "VERSION", "CATALOG_SEGMENT_CUSTOMIZE_DEFAULT", "LANGUAGE_AND_COUNTRY",
+    "BATCH_API_LANGUAGE_OR_COUNTRY", "SMART_PIXEL_LANGUAGE_OR_COUNTRY", "LOCAL",
+)
+# The SDK sends these in lower case; Meta's reference shows them in upper case.
+FEED_INGESTION_SOURCE_TYPES = ("primary_feed", "supplementary_feed")
 FEED_RULE_TYPES = (
     "mapping_rule",
     "value_mapping_rule",
@@ -515,6 +537,90 @@ def _normalize_schedule(value: Any, *, name: str) -> dict[str, Any]:
     return normalized
 
 
+def _feed_choice(
+    value: Any,
+    *,
+    name: str,
+    allowed: tuple[str, ...],
+    spellings: dict[str, str] | None = None,
+    strip_chars: str = "",
+) -> Any:
+    """Return the documented value for a feed option, OMIT when not given.
+
+    The input is never quoted back in the error.
+    """
+    if value is None:
+        return OMIT
+    if isinstance(value, str):
+        if spellings and value in spellings:
+            return spellings[value]
+        key = value.strip().upper()
+        for char in strip_chars:
+            key = key.replace(char, "")
+        key = (spellings or {}).get(key, key)
+        for choice in allowed:
+            if choice.upper() == key:
+                return choice
+    raise ValidationError(f"{name} must be one of {', '.join(allowed)}.")
+
+
+def _feed_options(
+    *,
+    delimiter: Any,
+    encoding: Any,
+    quoted_fields_mode: Any,
+    deletion_enabled: bool | None,
+) -> dict[str, Any]:
+    """The parsing options both feed writes accept, validated and in Meta's form."""
+    return {
+        "delimiter": _feed_choice(
+            delimiter, name="delimiter", allowed=FEED_DELIMITERS, spellings=_DELIMITER_CHARACTERS,
+        ),
+        "encoding": _feed_choice(
+            encoding, name="encoding", allowed=FEED_ENCODINGS, spellings=_ENCODING_SPELLINGS, strip_chars="-_",
+        ),
+        "quoted_fields_mode": _feed_choice(
+            quoted_fields_mode, name="quoted_fields_mode", allowed=FEED_QUOTED_FIELDS_MODES,
+        ),
+        "deletion_enabled": OMIT if deletion_enabled is None else deletion_enabled,
+    }
+
+
+def _supplementary_options(
+    *,
+    ingestion_source_type: Any,
+    primary_feed_ids: list[str] | None,
+    override_type: Any,
+    override_value: str | None,
+) -> dict[str, Any]:
+    """Validate the inputs of a supplementary feed, which overrides fields of primary feeds."""
+    source_type = _feed_choice(
+        ingestion_source_type, name="ingestion_source_type", allowed=FEED_INGESTION_SOURCE_TYPES,
+    )
+    override = _feed_choice(override_type, name="override_type", allowed=FEED_OVERRIDE_TYPES)
+    value = blank_to_none(override_value)
+    supplementary = source_type == "supplementary_feed"
+    if isinstance(primary_feed_ids, str):
+        primary_feed_ids = coerce_csv_string_list(primary_feed_ids)
+    if primary_feed_ids is not None:
+        if not supplementary:
+            raise ValidationError("primary_feed_ids applies only with ingestion_source_type=supplementary_feed.")
+        if not primary_feed_ids or not all(
+            isinstance(item, str) and item.strip().isdigit() for item in primary_feed_ids
+        ):
+            raise ValidationError("primary_feed_ids must be one or more numeric product feed ids.")
+    if override is not OMIT and not supplementary:
+        raise ValidationError("override_type applies only with ingestion_source_type=supplementary_feed.")
+    if value is not None and override is OMIT:
+        raise ValidationError("override_value needs override_type, the kind of value it is.")
+    return {
+        "ingestion_source_type": source_type,
+        "primary_feed_ids": OMIT if primary_feed_ids is None else [item.strip() for item in primary_feed_ids],
+        "override_type": override,
+        "override_value": OMIT if value is None else value,
+    }
+
+
 def _upload_status(upload: dict[str, Any]) -> str:
     """Meta has no upload status field; an end_time means the upload finished."""
     return "finished" if upload.get("end_time") else "in_progress"
@@ -818,8 +924,17 @@ async def create_product_feed(
     country: str | None = None,
     default_currency: str | None = None,
     params: dict[str, Any] | None = None,
+    feed_type: str | None = None,
+    delimiter: str | None = None,
+    encoding: str | None = None,
+    quoted_fields_mode: str | None = None,
+    deletion_enabled: bool | None = None,
+    ingestion_source_type: str | None = None,
+    primary_feed_ids: StringList | None = None,
+    override_type: str | None = None,
+    override_value: str | None = None,
 ) -> dict[str, Any]:
-    """Register a data feed on a product catalog. schedule {url, interval HOURLY|DAILY|WEEKLY|MONTHLY, hour, ...} fetches the file on a timer and replaces items; update_schedule only adds or updates items. Omit both to upload manually."""
+    """Register a data feed on a product catalog. schedule {url, interval HOURLY|DAILY|WEEKLY|MONTHLY, hour, ...} fetches the file on a timer and replaces items; update_schedule only adds or updates items. Omit both to upload manually. feed_type sets the item type (PRODUCTS by default; HOTEL, FLIGHT, DESTINATION, HOME_LISTING, VEHICLES, MEDIA_TITLE and others). Parsing: delimiter (COMMA, TAB, BAR, TILDE, SEMICOLON, AUTODETECT, or the character), encoding (UTF8, LATIN1, UTF16LE, ...), quoted_fields_mode (ON, OFF, AUTODETECT). deletion_enabled=true removes items missing from a later file and cannot be turned off afterwards. A supplementary feed (ingestion_source_type=supplementary_feed) names its primary_feed_ids and may set override_type (LANGUAGE, COUNTRY, ...) and override_value."""
     catalog_id = _require_id(catalog_id, "catalog_id")
     feed_name = blank_to_none(name)
     if feed_name is None:
@@ -834,6 +949,15 @@ async def create_product_feed(
         "file_name": blank_to_none(file_name) or OMIT,
         "country": (blank_to_none(country) or "").upper() or OMIT,
         "default_currency": (blank_to_none(default_currency) or "").upper() or OMIT,
+        "feed_type": _feed_choice(feed_type, name="feed_type", allowed=FEED_TYPES),
+        **_feed_options(
+            delimiter=delimiter, encoding=encoding, quoted_fields_mode=quoted_fields_mode,
+            deletion_enabled=deletion_enabled,
+        ),
+        **_supplementary_options(
+            ingestion_source_type=ingestion_source_type, primary_feed_ids=primary_feed_ids,
+            override_type=override_type, override_value=override_value,
+        ),
     }
     data = merge_graph_payload(payload, params)
     client = get_graph_api_client()
@@ -855,8 +979,12 @@ async def update_product_feed(
     update_schedule: _OptionalSchedule = None,
     default_currency: str | None = None,
     params: dict[str, Any] | None = None,
+    delimiter: str | None = None,
+    encoding: str | None = None,
+    quoted_fields_mode: str | None = None,
+    deletion_enabled: bool | None = None,
 ) -> dict[str, Any]:
-    """Edit a product catalog data feed's name, default currency, parsing options (via params: delimiter, encoding, quoted_fields_mode), or fetch schedules, returning before and after."""
+    """Edit a product catalog data feed's name, default currency, parsing options (delimiter, encoding, quoted_fields_mode, with the values create_product_feed takes), deletion_enabled, or fetch schedules, returning before and after. schedule replaces the timed full fetch, update_schedule the timed add-or-update fetch. A schedule cannot be removed or paused here: Meta's public API documents no way to clear one, so to stop timed fetches the only documented route is delete_product_feed, which also removes the feed. deletion_enabled cannot be turned off once on."""
     feed_id = _require_id(feed_id, "feed_id")
     payload: dict[str, Any] = {
         "name": OMIT,
@@ -866,6 +994,10 @@ async def update_product_feed(
             else _normalize_schedule(update_schedule, name="update_schedule")
         ),
         "default_currency": (blank_to_none(default_currency) or "").upper() or OMIT,
+        **_feed_options(
+            delimiter=delimiter, encoding=encoding, quoted_fields_mode=quoted_fields_mode,
+            deletion_enabled=deletion_enabled,
+        ),
     }
     if name is not None:
         if blank_to_none(name) is None:
@@ -877,6 +1009,11 @@ async def update_product_feed(
     extra_reads = [key for key in data if key in FEED_READABLE_FIELDS and key not in FEED_UPDATE_READ_FIELDS]
     client = get_graph_api_client()
     previous = await client.get_object(feed_id, fields=[*FEED_UPDATE_READ_FIELDS, *extra_reads])
+    if data.get("deletion_enabled") is False and previous.get("deletion_enabled") is True:
+        # Meta's reference: "Once enabled, we do not allow this field to be disabled."
+        raise ValidationError(
+            "deletion_enabled is on for this feed and cannot be turned off once enabled; nothing was changed."
+        )
     await client.update_object(feed_id, data=data)
     unavailable: dict[str, str] = {}
     for key in data:

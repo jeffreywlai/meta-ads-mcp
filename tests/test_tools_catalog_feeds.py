@@ -196,7 +196,7 @@ def test_create_product_feed_sends_name_schedule_and_options(monkeypatch) -> Non
         catalog_id="cat_1", name="Main feed", schedule=SCHEDULE,
         update_schedule={"url": "http://example.com/prices.csv", "interval": "HOURLY"},
         file_name="feed.csv", default_currency="usd", country="us",
-        params={"delimiter": "COMMA"},
+        delimiter="COMMA",
     ))
     call = client.calls[0]
     assert (call["method"], call["parent_id"], call["edge"]) == ("create_edge_object", "cat_1", "product_feeds")
@@ -2267,3 +2267,159 @@ def test_g15_list_page_that_hands_back_its_own_cursor_offers_no_next_cursor(monk
     fresh = run(getattr(catalog_feeds, tool)(**arguments, after="c0"))
     assert fresh["summary"]["next_after"] == "c1"
     assert "stop_reason" not in fresh["summary"]
+
+
+# round three: named feed type and parsing options -----------------------------------------------
+
+
+def test_create_product_feed_sends_named_feed_type_and_parsing_options(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(
+        catalog_id="cat_1", name="Hotels", feed_type="hotel", delimiter=",", encoding="utf-8",
+        quoted_fields_mode="on", deletion_enabled=False,
+    ))
+    assert client.calls[0]["data"] == {
+        "name": "Hotels",
+        "feed_type": "HOTEL",
+        "delimiter": "COMMA",
+        "encoding": "UTF8",
+        "quoted_fields_mode": "ON",
+        "deletion_enabled": False,
+    }
+
+
+@pytest.mark.parametrize(("given", "sent"), [
+    ("|", "BAR"), (",", "COMMA"), ("\t", "TAB"), ("~", "TILDE"), (";", "SEMICOLON"),
+    ("autodetect", "AUTODETECT"), ("semicolon", "SEMICOLON"), ("Tab", "TAB"),
+])
+def test_feed_delimiter_accepts_meta_names_and_characters(monkeypatch, given, sent) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", delimiter=given))
+    assert client.calls[0]["data"]["delimiter"] == sent
+
+
+@pytest.mark.parametrize(("given", "sent"), [
+    ("UTF-8", "UTF8"), ("utf8", "UTF8"), ("ISO-8859-1", "LATIN1"), ("latin1", "LATIN1"),
+    ("UTF-16LE", "UTF16LE"), ("UTF-16BE", "UTF16BE"), ("UTF-32LE", "UTF32LE"), ("UTF-32BE", "UTF32BE"),
+    ("AUTODETECT", "AUTODETECT"),
+])
+def test_feed_encoding_accepts_meta_names_and_common_spellings(monkeypatch, given, sent) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", encoding=given))
+    assert client.calls[0]["data"]["encoding"] == sent
+
+
+def test_create_product_feed_sends_a_supplementary_feed_with_its_override(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(
+        catalog_id="cat_1", name="French", ingestion_source_type="SUPPLEMENTARY_FEED",
+        primary_feed_ids="111, 222", override_type="language", override_value="fr_XX",
+    ))
+    assert client.calls[0]["data"] == {
+        "name": "French",
+        "ingestion_source_type": "supplementary_feed",
+        "primary_feed_ids": ["111", "222"],
+        "override_type": "LANGUAGE",
+        "override_value": "fr_XX",
+    }
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"feed_type": "BOATS"},
+    {"feed_type": ""},
+    {"delimiter": ":"},
+    {"encoding": "UTF-7"},
+    {"quoted_fields_mode": "maybe"},
+    {"ingestion_source_type": "secondary"},
+    {"ingestion_source_type": "supplementary_feed", "override_type": "REGION"},
+    {"primary_feed_ids": ["111"]},
+    {"override_type": "LANGUAGE"},
+    {"ingestion_source_type": "primary_feed", "override_type": "LANGUAGE"},
+    {"ingestion_source_type": "supplementary_feed", "override_value": "fr_XX"},
+    {"ingestion_source_type": "supplementary_feed", "primary_feed_ids": ["feed-one"]},
+    {"ingestion_source_type": "supplementary_feed", "primary_feed_ids": []},
+    {"delimiter": "COMMA", "params": {"delimiter": "TAB"}},
+    {"feed_type": "HOTEL", "params": {"feed_type": "HOTEL"}},
+])
+def test_create_product_feed_rejects_invalid_named_options_before_any_call(monkeypatch, kwargs) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", **kwargs))
+
+
+def test_create_product_feed_unsupported_option_error_lists_the_documented_values(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="HOTEL") as caught:
+        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", feed_type="boats-and-planes"))
+    assert "boats-and-planes" not in str(caught.value)
+
+
+def test_update_product_feed_sends_named_parsing_options_and_returns_previous(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"feed_1": {
+        "id": "feed_1", "name": "Main", "delimiter": "AUTODETECT", "encoding": "AUTODETECT",
+        "quoted_fields_mode": "AUTODETECT", "deletion_enabled": False,
+    }}))
+    result = run(catalog_feeds.update_product_feed(
+        feed_id="feed_1", delimiter="\t", encoding="ISO-8859-1", quoted_fields_mode="off", deletion_enabled=True,
+    ))
+    assert client.methods() == ["get_object", "update_object"]
+    assert client.calls[0]["fields"] == EXPECTED_FEED_UPDATE_READ_FIELDS
+    assert client.calls[1]["data"] == {
+        "delimiter": "TAB", "encoding": "LATIN1", "quoted_fields_mode": "OFF", "deletion_enabled": True,
+    }
+    assert result["previous"] == {
+        "delimiter": "AUTODETECT", "encoding": "AUTODETECT", "quoted_fields_mode": "AUTODETECT",
+        "deletion_enabled": False,
+    }
+
+
+def test_update_product_feed_refuses_to_turn_off_deletion_once_meta_has_it_on(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"feed_1": {"id": "feed_1", "deletion_enabled": True}}))
+    with pytest.raises(ValidationError, match="cannot be turned off"):
+        run(catalog_feeds.update_product_feed(feed_id="feed_1", deletion_enabled=False))
+    assert client.methods() == ["get_object"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"delimiter": "pipe"},
+    {"encoding": "ASCII"},
+    {"quoted_fields_mode": "yes"},
+    {"delimiter": "TAB", "params": {"delimiter": "TAB"}},
+    {"deletion_enabled": True, "params": {"deletion_enabled": True}},
+])
+def test_update_product_feed_rejects_invalid_named_options_before_any_call(monkeypatch, kwargs) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.update_product_feed(feed_id="feed_1", **kwargs))
+
+
+def test_update_product_feed_says_a_schedule_cannot_be_cleared_here() -> None:
+    doc = catalog_feeds.update_product_feed.__doc__ or ""
+    assert "cannot be removed" in doc
+    assert "delete_product_feed" in doc
+    assert "+" not in doc
+
+
+def test_feed_option_signatures_match_metas_feed_tools() -> None:
+    """Every input of Meta's create and update feed tools that its public API documents has a named parameter."""
+    create = set(inspect.signature(catalog_feeds.create_product_feed).parameters)
+    update = set(inspect.signature(catalog_feeds.update_product_feed).parameters)
+    assert {"catalog_id", "name", "feed_type", "country", "default_currency", "schedule"} <= create
+    assert {"delimiter", "encoding", "quoted_fields_mode", "deletion_enabled", "override_type"} <= create
+    assert {"name", "default_currency", "delimiter", "encoding", "quoted_fields_mode", "schedule", "update_schedule"} <= update
+
+
+def test_named_feed_options_work_through_the_mcp_boundary(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(mcp_server.call_tool("create_product_feed", {
+        "catalog_id": "1", "name": "French", "feed_type": "products", "delimiter": "\t",
+        "ingestion_source_type": "supplementary_feed", "primary_feed_ids": "111,222",
+        "override_type": "LANGUAGE", "override_value": "fr_XX",
+    }))
+    assert client.calls[0]["data"] == {
+        "name": "French", "feed_type": "PRODUCTS", "delimiter": "TAB",
+        "ingestion_source_type": "supplementary_feed", "primary_feed_ids": ["111", "222"],
+        "override_type": "LANGUAGE", "override_value": "fr_XX",
+    }
