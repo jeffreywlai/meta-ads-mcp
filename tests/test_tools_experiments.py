@@ -591,15 +591,15 @@ def test_study_count_with_next_page_but_no_cursor_is_not_complete() -> None:
 
 
 def test_study_count_repeated_cursor_stops_incomplete() -> None:
-    page = {"data": [_study("s1", "LIFT", *RUNNING)],
-            "paging": {"next": "https://graph.invalid/next", "cursors": {"after": "same"}}}
+    paging = {"next": "https://graph.invalid/next", "cursors": {"after": "same"}}
     client = PagedStudyClient({
-        ("act_10", "impacting_ad_studies", None): page,
-        ("act_10", "impacting_ad_studies", "same"): page,
+        ("act_10", "impacting_ad_studies", None): {"data": [_study("s1", "LIFT", *RUNNING)], "paging": paging},
+        ("act_10", "impacting_ad_studies", "same"): {"data": [_study("s2", "LIFT", *RUNNING)], "paging": paging},
     })
     result = run(experiments._count_account_active_studies(client, "act_10", NOW))
     assert result["count_complete"] is False
     assert result["pages_read"] == 2
+    assert result["active_studies"] == 2
     assert "already read" in result["stop_reason"]
 
 
@@ -1451,3 +1451,151 @@ def test_eligibility_account_count_performed_is_marked(monkeypatch) -> None:
     result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
     assert result["account"]["performed"] is True
     assert result["precheck_outcome"] == "passed"
+
+
+# --- round three (P4): true and false never become the number 1 (G12) -------------------
+
+
+def _mcp_call(name, arguments):
+    from meta_ads_mcp.coordinator import mcp_server
+
+    return run(mcp_server.call_tool(name, arguments))
+
+
+_CREATIVE_AB_ARGS = {
+    "account_id": "10", "business_id": "30", "name": "Creative test",
+    "cells": [{"name": "A", "treatment_percentage": 50, "ad_ids": ["40"]},
+              {"name": "B", "treatment_percentage": 50, "ad_ids": ["41"]}],
+    "start_time": "2099-01-01T00:00:00Z", "end_time": "2099-01-15T00:00:00Z",
+}
+_SPLIT_AB_ARGS = {
+    "account_id": "10", "business_id": "30", "name": "Split test",
+    "cells": [{"name": "A", "treatment_percentage": 50, "adset_ids": ["40"]},
+              {"name": "B", "treatment_percentage": 50, "adset_ids": ["41"]}],
+    "start_time": "2099-01-01T00:00:00Z", "end_time": "2099-01-15T00:00:00Z",
+}
+_LIFT_ARGS = {
+    "account_id": "10", "business_id": "30", "name": "Lift",
+    "cells": [{"name": "Test", "treatment_percentage": 90, "control_percentage": 10}],
+    "objectives": [{"name": "Purchases", "adspixels": [{"id": "1", "event_names": ["fb_pixel_purchase"]}]}],
+    "start_time": "2099-01-01T00:00:00Z", "end_time": "2099-01-15T00:00:00Z",
+}
+
+
+@pytest.mark.parametrize(("tool", "arguments"), [
+    # The reviewer's case: true was sent as a daily budget of 100 cents.
+    ("create_ab_test", {**_CREATIVE_AB_ARGS, "creative_test_daily_budget": True}),
+    ("create_ab_test", {**_CREATIVE_AB_ARGS, "creative_test_daily_budget": False}),
+    ("create_ab_test", {**_CREATIVE_AB_ARGS, "creative_test_lifetime_budget_percentage": True}),
+    ("create_ab_test", {**_SPLIT_AB_ARGS, "confidence_level": True}),
+    ("create_ab_test", {**_SPLIT_AB_ARGS, "start_time": True}),
+    ("create_ab_test", {**_SPLIT_AB_ARGS, "end_time": True}),
+    ("create_lift_study", {**_LIFT_ARGS, "start_time": True}),
+    ("create_lift_study", {**_LIFT_ARGS, "end_time": True}),
+    ("create_lift_study", {**_LIFT_ARGS, "observation_end_time": True}),
+    ("update_ad_study", {"study_id": "50", "start_time": True}),
+    ("update_ad_study", {"study_id": "50", "end_time": True}),
+    ("list_ad_studies", {"account_id": "10", "limit": True}),
+])
+def test_g12_true_or_false_is_refused_at_the_mcp_boundary_before_any_request(monkeypatch, tool, arguments) -> None:
+    """MCP reads true as 1 for number and time parameters; every one of them must refuse it with no request sent."""
+    from fastmcp.exceptions import ToolError
+    from fastmcp.exceptions import ValidationError as MCPValidationError
+
+    client = use(monkeypatch, FakeStudyClient(objects={
+        "act_10": {"id": "act_10", "currency": "USD", "business": {"id": "30"}},
+        "50": {"id": "50", "start_time": "2099-01-01T00:00:00+0000", "end_time": "2099-01-15T00:00:00+0000"},
+    }))
+    with pytest.raises((ToolError, MCPValidationError)):
+        _mcp_call(tool, arguments)
+    assert client.calls == []
+
+
+def test_g12_numbers_still_pass_the_mcp_boundary(monkeypatch) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"act_10": {"id": "act_10", "currency": "USD"}}))
+    _mcp_call("create_ab_test", {**_CREATIVE_AB_ARGS, "creative_test_daily_budget": 12.34})
+    assert client.calls[-1][3]["creative_test_config"] == {"daily_budget": 1234}
+    _mcp_call("create_ab_test", {**_SPLIT_AB_ARGS, "confidence_level": 80, "start_time": 4070908800,
+                                 "end_time": 4072118400})
+    payload = client.calls[-1][3]
+    assert (payload["confidence_level"], payload["start_time"], payload["end_time"]) == (80, 4070908800, 4072118400)
+    _mcp_call("list_ad_studies", {"account_id": "10", "limit": 5})
+    assert client.calls[-1][4] == {"limit": 5}
+
+
+# --- round three (P4): a page Meta repeats is never counted twice (G15) -----------------
+
+
+def test_g15_study_counter_does_not_count_a_repeated_page_twice() -> None:
+    """The reviewer's case: one page of 60 active studies served again for every cursor."""
+    studies = [{"id": str(100 + index), "start_time": "2026-11-01T00:00:00Z", "end_time": "2026-12-01T00:00:00Z"}
+               for index in range(60)]
+    client = FakeStudyClient(edges={("act_10", "impacting_ad_studies"): {
+        "data": studies, "paging": {"next": "next", "cursors": {"after": "repeat"}},
+    }})
+    result = run(experiments._count_account_active_studies(client, "act_10", datetime(2026, 11, 12, tzinfo=timezone.utc)))
+    assert result["active_studies"] == 60
+    assert result["count_complete"] is False
+    assert "already been read" in result["stop_reason"]
+    assert result["pages_read"] == 2
+
+
+def test_g15_repeated_study_page_does_not_falsely_cross_the_concurrency_limit(monkeypatch) -> None:
+    studies = [_study(str(100 + index), "SPLIT_TEST", *RUNNING) for index in range(60)]
+    use(monkeypatch, FakeStudyClient(
+        objects={"1": _campaign("1")},
+        edges={("act_123", "impacting_ad_studies"): {
+            "data": studies, "paging": {"next": "next", "cursors": {"after": "repeat"}},
+        }},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["1"]))
+    assert result["account"]["active_studies"] == 60
+    assert result["account"]["blockers"] == []
+    assert result["precheck_outcome"] == "inconclusive"
+
+
+def test_g15_a_study_id_on_two_different_pages_is_counted_once() -> None:
+    client = PagedStudyClient({
+        ("act_10", "impacting_ad_studies", None): {
+            "data": [_study("s1", "LIFT", *RUNNING), _study("s2", "LIFT", *RUNNING)],
+            "paging": {"next": "https://graph.invalid/n", "cursors": {"after": "p2"}},
+        },
+        ("act_10", "impacting_ad_studies", "p2"): {"data": [_study("s2", "LIFT", *RUNNING),
+                                                            _study("s3", "LIFT", *RUNNING)]},
+    })
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["active_studies"] == 3
+    assert result["count_complete"] is True
+
+
+def test_g15_entity_study_scan_stops_on_a_repeated_page(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"1": _campaign("1")},
+        edges={("1", "ad_studies"): {"data": [_study("s1", "SPLIT_TEST", *RUNNING)],
+                                     "paging": {"next": "next", "cursors": {"after": "again"}}}},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["1"]))
+    entity = result["entities"][0]
+    assert [study["id"] for study in entity["active_studies"]] == ["s1"]
+    assert entity["active_studies_complete"] is False
+    assert any("already been read" in message for message in entity["unresolved"])
+
+
+def test_g15_study_cells_and_objectives_on_a_repeated_page_are_read_once(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={
+            ("study_1", "cells"): {"data": [_cell("a", "as_1")],
+                                   "paging": {"next": "next", "cursors": {"after": "again"}}},
+            ("study_1", "objectives"): {"data": [{"id": "obj_1", "is_primary": True}],
+                                        "paging": {"next": "next", "cursors": {"after": "again"}}},
+        },
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1"))
+    assert [cell["id"] for cell in result["cells"]] == ["a"]
+    assert [objective["id"] for objective in result["objectives"]] == ["obj_1"]
+    summary = result["summary"]
+    assert summary["cell_nodes_complete"] is False
+    assert summary["objectives_complete"] is False
+    assert "already been read" in summary["cells_stop_reason"]
+    assert "already been read" in summary["objectives_stop_reason"]

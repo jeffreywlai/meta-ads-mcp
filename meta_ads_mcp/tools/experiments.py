@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import BeforeValidator
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import (
@@ -20,7 +22,21 @@ from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
-from meta_ads_mcp.tool_types import StringList, coerce_csv_string_list
+from meta_ads_mcp.tool_types import StrictCurrencyAmount, StringList, coerce_csv_string_list
+
+
+def _refuse_true_false(value: Any) -> Any:
+    """Refuse true or false where a number or time is expected; MCP would otherwise read true as 1."""
+    if isinstance(value, bool):
+        raise ValueError("expected a number or time, not true or false")
+    return value
+
+
+# Numeric and time parameters of these tools. MCP validation turns true into 1 (or 1.0) before a
+# tool's own checks run, so each one refuses true and false first.
+StrictNumber = Annotated[float, BeforeValidator(_refuse_true_false)]
+StrictCount = Annotated[int, BeforeValidator(_refuse_true_false)]
+StudyTime = Annotated[str | int, BeforeValidator(_refuse_true_false)]
 
 STUDY_LIST_FIELDS = [
     "id",
@@ -112,6 +128,26 @@ ENTITY_STUDY_SCAN_PAGES = 5
 STUDY_EDGE_PAGE_CAP = 10
 NO_CURSOR_REASON = "Meta reported another page but returned no cursor to fetch it."
 REPEATED_CURSOR_REASON = "Meta returned a cursor already read, so paging stopped to avoid counting a page twice."
+REPEATED_PAGE_REASON = (
+    "Meta returned a page that had already been read; it was not counted again and paging stopped."
+)
+
+
+def _page_fingerprint(items: list[Any]) -> str:
+    return json.dumps(items, sort_keys=True, default=str)
+
+
+def _new_rows(items: list[Any], seen_ids: set[str]) -> list[Any]:
+    """Rows whose id has not been seen on an earlier page; rows without an id are kept."""
+    fresh: list[Any] = []
+    for item in items:
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if item_id not in (None, ""):
+            if str(item_id) in seen_ids:
+                continue
+            seen_ids.add(str(item_id))
+        fresh.append(item)
+    return fresh
 # Creative tests (ad-level cells), from Meta's split testing guide: type SPLIT_TEST_V2, one ad per
 # cell, whole-number shares totalling 100, a creative_test_config budget, cooldown_start_time equal
 # to start_time and observation_end_time equal to end_time. The guide allows 2 to 7 cells; the Ad
@@ -571,16 +607,24 @@ async def _read_edge_pages(
     """Read every page of an edge, within max_pages requests.
 
     complete is true only when Meta's last page had no next link. A next link without a usable
-    cursor, a repeated cursor, or the page cap ends the read as incomplete with stop_reason saying why.
+    cursor, a repeated cursor, a page already read, or the page cap ends the read as incomplete
+    with stop_reason saying why. A repeated page is not added, and an id is kept only once.
     """
     items: list[Any] = []
     params: dict[str, Any] = {"limit": page_size}
     seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    seen_ids: set[str] = set()
     pages = 0
     while True:
         normalized = normalize_collection(await client.list_objects(parent, edge, fields=fields, params=params))
         pages += 1
-        items.extend(normalized["items"])
+        if normalized["items"]:
+            fingerprint = _page_fingerprint(normalized["items"])
+            if fingerprint in seen_pages:
+                return {"items": items, "pages_read": pages, "complete": False, "stop_reason": REPEATED_PAGE_REASON}
+            seen_pages.add(fingerprint)
+        items.extend(_new_rows(normalized["items"], seen_ids))
         if not normalized["paging"].get("next"):
             return {"items": items, "pages_read": pages, "complete": True, "stop_reason": None}
         cursor = normalized["paging"].get("after")
@@ -603,7 +647,7 @@ async def list_ad_studies(
     business_id: str | None = None,
     study_type: str | None = None,
     entity_id: str | None = None,
-    limit: int = 50,
+    limit: StrictCount = 50,
     after: str | None = None,
 ) -> dict[str, Any]:
     """List A/B tests (split tests) and lift studies with a derived state (scheduled, running, ended, canceled).
@@ -1043,21 +1087,29 @@ async def _scan_active_studies(
     """Page a study edge for scheduled or running studies.
 
     complete is true only when Meta's last page had no next link. A next link without a usable
-    cursor, a repeated cursor, the page cap, or reaching stop_at ends the scan as incomplete with
-    stop_reason saying why.
+    cursor, a repeated cursor, a page already read, the page cap, or reaching stop_at ends the scan
+    as incomplete with stop_reason saying why. A repeated page is not counted, and each study id
+    is counted once.
     """
     active: list[dict[str, Any]] = []
     pages = 0
     params: dict[str, Any] = {"limit": 100}
     seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    seen_ids: set[str] = set()
     while True:
         normalized = normalize_collection(
             await client.list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
         )
         pages += 1
+        if normalized["items"]:
+            fingerprint = _page_fingerprint(normalized["items"])
+            if fingerprint in seen_pages:
+                return {"active": active, "pages_read": pages, "complete": False, "stop_reason": REPEATED_PAGE_REASON}
+            seen_pages.add(fingerprint)
         active.extend(
             {"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state}
-            for study in normalized["items"]
+            for study in _new_rows(normalized["items"], seen_ids)
             if isinstance(study, dict) and (state := _study_state(study, now)) in ACTIVE_STATES
         )
         if not normalized["paging"].get("next"):
@@ -1290,14 +1342,14 @@ async def create_ab_test(
     account_id: str,
     name: str,
     cells: list[dict[str, Any]],
-    start_time: str | int,
-    end_time: str | int,
-    confidence_level: float | None = None,
+    start_time: StudyTime,
+    end_time: StudyTime,
+    confidence_level: StrictNumber | None = None,
     hypothesis: str | None = None,
     business_id: str | None = None,
     params: dict[str, Any] | None = None,
-    creative_test_daily_budget: float | None = None,
-    creative_test_lifetime_budget_percentage: float | None = None,
+    creative_test_daily_budget: StrictCurrencyAmount | None = None,
+    creative_test_lifetime_budget_percentage: StrictNumber | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Create an A/B test (Meta split test) comparing campaigns, ad sets, or single ads. Run check_ab_test_eligibility first.
@@ -1410,11 +1462,11 @@ async def create_lift_study(
     name: str,
     cells: list[dict[str, Any]],
     objectives: list[dict[str, Any]],
-    start_time: str | int,
-    end_time: str | int,
+    start_time: StudyTime,
+    end_time: StudyTime,
     business_id: str | None = None,
     description: str | None = None,
-    observation_end_time: str | int | None = None,
+    observation_end_time: StudyTime | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a conversion lift study (holdout test). Meta limits lift studies to approved advertisers.
@@ -1525,8 +1577,8 @@ async def update_ad_study(
     study_id: str,
     name: str | None = None,
     description: str | None = None,
-    start_time: str | int | None = None,
-    end_time: str | int | None = None,
+    start_time: StudyTime | None = None,
+    end_time: StudyTime | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Edit an A/B test or lift study and return previous and current values.
