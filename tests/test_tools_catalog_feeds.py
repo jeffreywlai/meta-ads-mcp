@@ -154,7 +154,7 @@ def test_list_product_feeds_lists_catalog_edge_with_paging(monkeypatch) -> None:
     assert call["method"] == "list_objects"
     assert (call["parent_id"], call["edge"]) == ("cat_1", "product_feeds")
     assert call["params"] == {"limit": 10, "after": "c1"}
-    assert call["fields"] == EXPECTED_FEED_LIST_FIELDS
+    assert call["fields"] == [*EXPECTED_FEED_LIST_FIELDS, "supplementary_feeds"]
     assert result["items"] == [{"id": "feed_1", "name": "Main"}]
     assert result["summary"] == {"count": 1, "complete": False, "truncated": True, "next_after": "c2"}
 
@@ -167,7 +167,7 @@ def test_list_product_feeds_one_feed_returns_settings_schedule_and_latest_upload
     call = client.calls[0]
     assert call["method"] == "get_object"
     assert call["object_id"] == "feed_1"
-    assert call["fields"] == EXPECTED_FEED_FIELDS
+    assert call["fields"] == [*EXPECTED_FEED_FIELDS, "supplementary_feeds"]
     assert "schedule" in call["fields"] and "update_schedule" in call["fields"]
     assert any(field.startswith("latest_upload{") for field in call["fields"])
     assert result["item"]["latest_upload"] == {"id": "up_1"}
@@ -2423,3 +2423,306 @@ def test_named_feed_options_work_through_the_mcp_boundary(monkeypatch) -> None:
         "ingestion_source_type": "supplementary_feed", "primary_feed_ids": ["111", "222"],
         "override_type": "LANGUAGE", "override_value": "fr_XX",
     }
+
+
+# list_product_feeds: supplementary_feeds, tolerated if Meta refuses it (round four, P46) ----------
+
+
+def _nonexisting_field_error(field: str) -> MetaApiError:
+    return MetaApiError(
+        message=f"(#100) Tried accessing nonexisting field ({field}) on node type (ProductFeed)",
+        status_code=400,
+        code=100,
+    )
+
+
+class RefusingFieldClient(FakeCatalogFeedClient):
+    """Refuses any read that asks for one of the given fields, as Meta does with error #100."""
+
+    def __init__(self, refused: set[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.refused = refused
+
+    def _refuse(self, fields) -> None:
+        asked = {str(field).split("{", 1)[0] for field in fields or []}
+        hit = sorted(asked & self.refused)
+        if hit:
+            raise _nonexisting_field_error(hit[0])
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        result = await super().get_object(object_id, fields=fields, params=params)
+        self._refuse(fields)
+        return result
+
+    async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+        result = await super().list_objects(parent_id, edge, fields=fields, params=params)
+        self._refuse(fields)
+        return result
+
+
+def test_list_product_feeds_reads_supplementary_feeds_by_default(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"feed_1": {"id": "feed_1", "supplementary_feeds": ["feed_9"]}},
+        edges={("cat_1", "product_feeds"): {"data": [{"id": "feed_1", "supplementary_feeds": ["feed_9"]}]}},
+    ))
+    one = run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
+    many = run(catalog_feeds.list_product_feeds(catalog_id="cat_1"))
+    assert client.calls[0]["fields"] == [*EXPECTED_FEED_FIELDS, "supplementary_feeds"]
+    assert client.calls[1]["fields"] == [*EXPECTED_FEED_LIST_FIELDS, "supplementary_feeds"]
+    assert one["item"]["supplementary_feeds"] == ["feed_9"]
+    assert many["items"][0]["supplementary_feeds"] == ["feed_9"]
+    assert "fields_unavailable" not in one["summary"]
+    assert "fields_unavailable" not in many["summary"]
+
+
+def test_list_product_feeds_retries_without_a_refused_field_and_names_it(monkeypatch) -> None:
+    client = _use(monkeypatch, RefusingFieldClient(
+        {"supplementary_feeds"},
+        objects={"feed_1": {"id": "feed_1", "name": "Main"}},
+        edges={("cat_1", "product_feeds"): {"data": [{"id": "feed_1"}],
+                                             "paging": {"cursors": {"after": "c2"}, "next": "https://next"}}},
+    ))
+    one = run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
+    many = run(catalog_feeds.list_product_feeds(catalog_id="cat_1", after="c1"))
+    assert [call["fields"] for call in client.calls] == [
+        [*EXPECTED_FEED_FIELDS, "supplementary_feeds"], EXPECTED_FEED_FIELDS,
+        [*EXPECTED_FEED_LIST_FIELDS, "supplementary_feeds"], EXPECTED_FEED_LIST_FIELDS,
+    ]
+    assert client.calls[3]["params"] == {"limit": 25, "after": "c1"}
+    assert one["item"] == {"id": "feed_1", "name": "Main"}
+    for result in (one, many):
+        assert list(result["summary"]["fields_unavailable"]) == ["supplementary_feeds"]
+        assert "refused" in result["summary"]["fields_unavailable"]["supplementary_feeds"]
+    assert many["summary"]["next_after"] == "c2"
+
+
+def test_list_product_feeds_other_errors_are_not_retried(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(errors={"feed_1": _permission_error()}))
+    with pytest.raises(MetaApiError, match="catalog_management"):
+        run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
+    assert len(client.calls) == 1
+
+
+def test_list_product_feeds_a_refusal_that_persists_without_the_field_is_raised(monkeypatch) -> None:
+    client = _use(monkeypatch, RefusingFieldClient({"supplementary_feeds", "schedule"}))
+    with pytest.raises(MetaApiError, match="schedule"):
+        run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
+    assert len(client.calls) == 2
+
+
+def test_delete_product_feed_pre_read_does_not_ask_for_supplementary_feeds(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.delete_product_feed(feed_id="feed_1"))
+    assert client.calls[0]["fields"] == EXPECTED_FEED_FIELDS
+
+
+# list_product_feed_uploads: error samples and error paging (round four, P46) ----------------------
+
+EXPECTED_SAMPLED_ERROR_FIELDS = [*EXPECTED_UPLOAD_ERROR_FIELDS, "samples.limit(1){id,row_number,retailer_id}"]
+
+
+def _error_pages(pages: dict[str | None, dict[str, Any]]):
+    """An errors edge whose page depends on the after cursor it is asked for."""
+    def page(params):
+        return pages[params.get("after")]
+    return page
+
+
+def _errors(start: int, count: int) -> list[dict[str, Any]]:
+    return [{"id": f"e{n}", "total_count": 1000 - n, "severity": "warning"} for n in range(start, start + count)]
+
+
+def test_list_product_feed_uploads_without_new_options_is_unchanged(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 2}},
+        edges={("up_1", "errors"): _upload_errors},
+    ))
+    run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1"))
+    assert client.calls[1]["fields"] == EXPECTED_UPLOAD_ERROR_FIELDS
+    assert client.calls[1]["params"] == {"limit": 100}
+    assert len(client.calls) == 2
+
+
+def test_list_product_feed_uploads_include_samples_returns_one_short_sample_per_error(monkeypatch) -> None:
+    long_id = "SKU-" + "x" * 300
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 2}},
+        edges={("up_1", "errors"): {"data": [
+            {"id": "e1", "total_count": 5, "samples": {"data": [{"id": "9", "row_number": 4, "retailer_id": "SKU-1"}]}},
+            {"id": "e2", "total_count": 3, "samples": {"data": [{"id": "8", "row_number": 7, "retailer_id": long_id}]}},
+            {"id": "e3", "total_count": 1},
+        ]}},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", include_samples=True))
+    assert client.calls[1]["fields"] == EXPECTED_SAMPLED_ERROR_FIELDS
+    errors = {error["id"]: error for error in result["item"]["errors"]}
+    assert errors["e1"]["sample"] == {"id": "9", "row_number": 4, "retailer_id": "SKU-1"}
+    assert "samples" not in errors["e1"]
+    long_sample = errors["e2"]["sample"]
+    assert len(long_sample["retailer_id"]) == catalog_feeds.MAX_SAMPLE_CHARS
+    assert long_id.startswith(long_sample["retailer_id"])
+    assert long_sample["retailer_id_truncated"] is True
+    assert errors["e3"]["sample"] is None
+    assert "row" in result["item"]["samples_note"]
+
+
+def test_list_product_feed_uploads_samples_refused_are_dropped_and_said(monkeypatch) -> None:
+    refusal = MetaApiError(message="(#100) Unknown path components: /samples", status_code=400, code=100)
+    calls: list[list[str]] = []
+
+    class SampleRefusingClient(FakeCatalogFeedClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            calls.append(list(fields or []))
+            if any(str(field).startswith("samples") for field in fields or []):
+                self.calls.append({"method": "list_objects", "edge": edge, "fields": fields, "params": params})
+                raise refusal
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    _use(monkeypatch, SampleRefusingClient(
+        objects={"up_1": {"id": "up_1", "error_count": 2}},
+        edges={("up_1", "errors"): _upload_errors},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", include_samples=True))
+    assert calls == [EXPECTED_SAMPLED_ERROR_FIELDS, EXPECTED_UPLOAD_ERROR_FIELDS]
+    item = result["item"]
+    assert len(item["errors"]) == 4
+    assert all("sample" not in error for error in item["errors"])
+    assert "could not be read" in item["samples_unavailable"]
+
+
+def test_list_product_feed_uploads_pages_errors_past_the_first_100(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 250}},
+        edges={("up_1", "errors"): _error_pages({
+            None: {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
+            "c1": {"data": _errors(100, 100), "paging": {"cursors": {"after": "c2"}, "next": "https://n2"}},
+            "c2": {"data": _errors(200, 50)},
+        })},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    error_calls = [call for call in client.calls if call.get("edge") == "errors"]
+    assert [call["params"] for call in error_calls] == [
+        {"limit": 100}, {"limit": 100, "after": "c1"}, {"limit": 100, "after": "c2"},
+    ]
+    item = result["item"]
+    assert len(item["errors"]) == 250
+    assert item["errors_complete"] is True
+    assert item["errors_next_after"] is None
+    assert "errors_stop_reason" not in item
+
+
+def test_list_product_feed_uploads_error_limit_stops_and_offers_a_cursor(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 250}},
+        edges={("up_1", "errors"): _error_pages({
+            None: {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
+            "c1": {"data": _errors(100, 50), "paging": {"cursors": {"after": "c2"}, "next": "https://n2"}},
+        })},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=150))
+    error_calls = [call for call in client.calls if call.get("edge") == "errors"]
+    # The second page asks only for the 50 errors still wanted.
+    assert [call["params"] for call in error_calls] == [{"limit": 100}, {"limit": 50, "after": "c1"}]
+    item = result["item"]
+    assert len(item["errors"]) == 150
+    assert item["errors_complete"] is False
+    assert item["errors_next_after"] == "c2"
+    assert "error_limit" in item["errors_stop_reason"]
+
+
+def test_list_product_feed_uploads_error_after_continues_from_a_cursor(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 250}},
+        edges={("up_1", "errors"): _error_pages({"c2": {"data": _errors(200, 50)}})},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_after="c2"))
+    assert client.calls[1]["params"] == {"limit": 100, "after": "c2"}
+    assert result["item"]["errors_complete"] is True
+    assert result["item"]["errors_from_start"] is False
+
+
+def test_list_product_feed_uploads_repeated_error_cursor_stops_the_read(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 500}},
+        edges={("up_1", "errors"): _error_pages({
+            None: {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
+            "c1": {"data": _errors(100, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
+        })},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    assert len([call for call in client.calls if call.get("edge") == "errors"]) == 2
+    item = result["item"]
+    assert len(item["errors"]) == 200
+    assert item["errors_complete"] is False
+    assert item["errors_next_after"] is None
+    assert "already read" in item["errors_stop_reason"]
+
+
+def test_list_product_feed_uploads_next_page_without_cursor_is_incomplete(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 500}},
+        edges={("up_1", "errors"): {"data": _errors(0, 100), "paging": {"next": "https://n1"}}},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    item = result["item"]
+    assert item["errors_complete"] is False
+    assert item["errors_next_after"] is None
+    assert "no cursor" in item["errors_stop_reason"]
+
+
+def test_list_product_feed_uploads_same_page_again_is_not_counted_twice(monkeypatch) -> None:
+    page = {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}}
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 500}},
+        edges={("up_1", "errors"): _error_pages({None: page, "c1": {**page, "paging": {
+            "cursors": {"after": "c2"}, "next": "https://n2"}}})},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    assert len([call for call in client.calls if call.get("edge") == "errors"]) == 2
+    assert len(result["item"]["errors"]) == 100
+    assert result["item"]["errors_complete"] is False
+
+
+def test_list_product_feed_uploads_error_requests_are_capped(monkeypatch) -> None:
+    def endless(params):
+        n = int(params.get("after") or 0)
+        return {"data": _errors(n * 100, 100), "paging": {"cursors": {"after": str(n + 1)}, "next": "https://n"}}
+
+    client = _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"up_1": {"id": "up_1", "error_count": 99999}},
+        edges={("up_1", "errors"): endless},
+    ))
+    result = run(catalog_feeds.list_product_feed_uploads(
+        feed_id="feed_1", upload_id="up_1", error_limit=catalog_feeds.MAX_UPLOAD_ERRORS,
+    ))
+    error_calls = [call for call in client.calls if call.get("edge") == "errors"]
+    assert len(error_calls) == catalog_feeds.MAX_UPLOAD_ERRORS // 100
+    assert len(result["item"]["errors"]) == catalog_feeds.MAX_UPLOAD_ERRORS
+    assert result["item"]["errors_complete"] is False
+    assert result["item"]["errors_next_after"] == str(len(error_calls))
+
+
+def test_list_product_feed_uploads_list_mode_offers_an_error_cursor(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("feed_1", "uploads"): {"data": [{"id": "up_1", "error_count": 300}]},
+        ("up_1", "errors"): {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
+    }))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1"))
+    item = result["items"][0]
+    assert item["errors_complete"] is False
+    assert item["errors_next_after"] == "c1"
+    assert "upload_id" in item["errors_stop_reason"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"error_after": "c1"},
+    {"error_limit": 200},
+    {"upload_id": "up_1", "error_limit": 0},
+    {"upload_id": "up_1", "error_limit": 1001},
+    {"upload_id": "up_1", "error_limit": True},
+    {"upload_id": "up_1", "include_samples": "yes"},
+])
+def test_list_product_feed_uploads_new_options_are_validated_before_any_call(monkeypatch, kwargs) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", **kwargs))
