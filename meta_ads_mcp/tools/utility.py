@@ -594,6 +594,30 @@ INTENT_GUIDE = {
             "For customer lists prefer file_path to a local CSV so personal data never passes through the model; inline rows are limited to 1,000.",
         ],
     },
+    "build_creatives_and_upload_media": {
+        "description": (
+            "Build a carousel, single image or video, text variants, placement-specific media, click-to-WhatsApp, "
+            "Messenger or Instagram Direct, instant form or Partnership Ad creative from named inputs; upload a "
+            "video; remove a library image; switch Advantage creative enhancements on a live ad; label creatives."
+        ),
+        "recommended_order": [
+            "upload_creative_asset",
+            "upload_ad_video",
+            "list_ad_videos",
+            "create_ad_creative_from_inputs",
+            "preview_ad",
+            "update_ad_creative_enhancements",
+            "update_creative",
+            "delete_ad_image",
+        ],
+        "avoid_unless_needed": ["create_ad_creative"],
+        "notes": [
+            "create_ad_creative_from_inputs dry_run returns the exact spec without creating anything.",
+            "Wait for list_ad_videos processing_status ready before using an uploaded video.",
+            "preview_ad ad_formats previews several placements in one call.",
+            "update_ad_creative_enhancements creates a copy of the creative and attaches it, so the ad goes back to review.",
+        ],
+    },
 }
 
 ROUTING_HINTS = {
@@ -959,6 +983,8 @@ async def list_mutation_tools() -> dict[str, object]:
             "general_edits": ["update_adset", "update_ad"],
             "customer_list_users": ["add_audience_users", "remove_audience_users"],
             "instagram_boost": ["boost_instagram_post"],
+            "creative_building": ["create_ad_creative_from_inputs", "update_ad_creative_enhancements"],
+            "media_library": ["upload_creative_asset", "upload_ad_video", "delete_ad_image"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",

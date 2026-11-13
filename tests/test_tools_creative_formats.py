@@ -487,3 +487,25 @@ def test_enhancements_validation_errors_make_no_call(monkeypatch, features, mess
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match=message):
         asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features=features))
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["build a carousel creative", "upload a video", "click to whatsapp creative", "turn off advantage creative enhancements"],
+)
+def test_creative_building_requests_route_to_the_new_intent(query) -> None:
+    from meta_ads_mcp.tools import utility
+
+    result = asyncio.run(utility.get_capabilities(intent=query))
+    assert result["closest_intents"][0]["intent"] == "build_creatives_and_upload_media"
+
+
+def test_creative_writes_appear_in_mutation_common_paths(monkeypatch) -> None:
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.tools import utility
+
+    monkeypatch.delenv("META_READ_ONLY", raising=False)
+    reload_settings()
+    result = asyncio.run(utility.list_mutation_tools())
+    assert result["common_paths"]["creative_building"] == ["create_ad_creative_from_inputs", "update_ad_creative_enhancements"]
+    assert result["common_paths"]["media_library"] == ["upload_creative_asset", "upload_ad_video", "delete_ad_image"]
