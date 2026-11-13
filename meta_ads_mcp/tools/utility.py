@@ -143,6 +143,7 @@ TOOL_GROUPS = {
         "delete_feed_rule",
         "connect_catalog_event_source",
         "disconnect_catalog_event_source",
+        "update_feed_rule",
         "update_adset",
         "update_ad",
         "add_audience_users",
@@ -548,6 +549,7 @@ INTENT_GUIDE = {
             "update_product_feed",
             "create_product_feed_upload",
             "create_feed_rule",
+            "update_feed_rule",
             "connect_catalog_event_source",
             "delete_feed_rule",
             "delete_product_feed",
@@ -557,6 +559,7 @@ INTENT_GUIDE = {
             "These tools work on Meta product catalogs and need the catalog_management permission.",
             "Deleting a feed removes the products it supplied unless another source also supplies them.",
             "Health and recommendations are derived here from event_stats, connected sources and Meta's Dynamic Ads checks.",
+            "Upload a local feed file with create_product_feed_upload(file_path=...) so its rows never pass through the conversation; compare a pixel's match rate across catalogs with list_event_source_catalogs(include_match_rates=true).",
         ],
     },
     "find_pages_media_and_asset_usage": {
@@ -992,6 +995,7 @@ async def list_mutation_tools() -> dict[str, object]:
             "product_catalog_feeds": [
                 "create_product_feed", "update_product_feed", "delete_product_feed",
                 "create_product_feed_upload", "create_feed_rule", "delete_feed_rule",
+                "update_feed_rule",
             ],
             "product_catalog_event_sources": ["connect_catalog_event_source", "disconnect_catalog_event_source"],
             "general_edits": ["update_adset", "update_ad"],

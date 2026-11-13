@@ -183,6 +183,7 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "create_product_feed_upload",
         "create_feed_rule",
         "delete_feed_rule",
+        "update_feed_rule",
         "connect_catalog_event_source",
         "disconnect_catalog_event_source",
         "update_adset",
