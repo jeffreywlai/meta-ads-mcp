@@ -19,6 +19,12 @@ from meta_ads_mcp.argument_privacy import (
 from meta_ads_mcp.errors import MetaApiError, RateLimitError
 
 
+# The search transform's proxy tool, and the envelope keys that name its target
+# (name, and the compatibility alias tool_name). See coordinator.py.
+PROXY_TOOL_NAMES: frozenset[str] = frozenset({"call_tool"})
+_PROXY_TARGET_KEYS = ("name", "tool_name")
+
+
 class ToolParameterHelpMiddleware(Middleware):
     """Reject unknown keywords with the live schema before a tool executes.
 
@@ -26,20 +32,59 @@ class ToolParameterHelpMiddleware(Middleware):
     than named, and the framework's argument-validation error is replaced by one
     that names parameters only: those arguments can hold personal data or
     secrets, and a misplaced value can arrive as a parameter name.
+
+    The call_tool proxy's own envelope (name, arguments, tool_name) gets the
+    same handling unless every target it names is a registered tool outside
+    that list: a customer value misplaced beside the nested arguments, or in
+    name itself, must not be quoted back either.
     """
+
+    @staticmethod
+    async def _tool_or_none(context: MiddlewareContext, name: str):
+        try:
+            return await context.fastmcp_context.fastmcp.get_tool(name)
+        except Exception:
+            return None
+
+    async def _envelope_is_private(self, context: MiddlewareContext) -> bool:
+        """Whether a proxy call targets a private tool, or a target that cannot be determined."""
+        arguments = context.message.arguments or {}
+        supplied = [arguments.get(key) for key in _PROXY_TARGET_KEYS if arguments.get(key) is not None]
+        if not supplied:
+            return True
+        for value in supplied:
+            if not isinstance(value, str) or not value.strip():
+                return True
+            # get_tool resolves the same aliases and official names the proxy does.
+            target = await self._tool_or_none(context, value.strip())
+            if (
+                target is None
+                or target.name in PRIVATE_ARGUMENT_TOOLS
+                or target.name in PROXY_TOOL_NAMES
+            ):
+                return True
+        return False
 
     async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext):
         tool = None
         if context.fastmcp_context is not None:
-            tool = await context.fastmcp_context.fastmcp.get_tool(context.message.name)
-        private = tool is not None and tool.name in PRIVATE_ARGUMENT_TOOLS
+            tool = await self._tool_or_none(context, context.message.name)
+        proxy = tool is not None and tool.name in PROXY_TOOL_NAMES
+        private = tool is not None and (
+            tool.name in PRIVATE_ARGUMENT_TOOLS
+            or (proxy and await self._envelope_is_private(context))
+        )
         if tool is not None and tool.parameters.get("additionalProperties") is False:
             accepted = list(tool.parameters.get("properties", {}))
             unexpected = sorted(set(context.message.arguments or {}) - set(accepted))
             if unexpected:
+                reason = (
+                    "the tool being called can receive personal data or secrets"
+                    if proxy
+                    else "this tool's arguments can hold personal data or secrets"
+                )
                 described = (
-                    f"{unknown_parameter_count(len(unexpected))} (names not repeated because "
-                    "this tool's arguments can hold personal data or secrets)"
+                    f"{unknown_parameter_count(len(unexpected))} (names not repeated because {reason})"
                     if private
                     else ", ".join(unexpected)
                 )
