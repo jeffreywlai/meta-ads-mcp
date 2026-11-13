@@ -1126,7 +1126,7 @@ ROUND_FOUR_INVALID = [
     ({"page_id": "111", "call_to_action_type": "MESSAGE_PAGE", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "Instagram Direct"),
     ({"page_id": "111", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "instagram_account_id"),
     ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "link_url": "https://x", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "link_url is not used"),
-    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a", "link": "https://x"}, {"image_hash": "b"}]}, "cards\\[1\\] link is not used"),
+    ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a", "link": "https://x"}, {"image_hash": "b"}]}, "cards\\[0\\] link is not used"),
     ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a"}, {"image_hash": "b", "call_to_action_type": "SHOP_NOW"}]}, "same messaging surface"),
     ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "cards": [{"image_hash": "a"}, {"video_id": "7"}]}, "needs image_hash"),
     ({"page_id": "111", "instagram_account_id": "2", "call_to_action_type": "INSTAGRAM_MESSAGE", "display_link": "example.com", "cards": [{"image_hash": "a"}, {"image_hash": "b"}]}, "display_link"),
@@ -1455,7 +1455,7 @@ def test_h2_private_body_validation_does_not_echo_customer_key(caplog, routed) -
         asyncio.run(mcp_server.call_tool(name, args))
     assert PRIVATE not in str(info.value)
     assert PRIVATE not in caplog.text
-    assert "cards[1] has 1 unknown key" in str(info.value)
+    assert "cards[0] has 1 unknown key" in str(info.value)
 
 
 PRIVATE_PLACEMENTS = [
@@ -2076,3 +2076,51 @@ def test_a_code_in_a_different_letter_case_is_a_different_code(monkeypatch) -> N
             account_id="10", name="C", page_id="40", sponsor_page_id="50", partnership_ad_code=secret,
         ))
     assert raised.value.message.endswith("Rejected " + secret.swapcase() + " and <partnership_ad_code>")
+
+
+# Every position in a caller's list is counted from 0 and written name[0], as in campaigns.py and
+# catalogs.py. The live check (2026-11-13) saw placement_customizations counted two ways.
+_PLACED = {"publisher_platforms": ["facebook"], "facebook_positions": ["feed"]}
+POSITION_CASES = [
+    ({"placement_customizations": [{"image_hash": "a", **_PLACED}, {"image_hash": "b", "colour": "red"}]},
+     "placement_customizations[1] has 1 unknown key"),
+    ({"placement_customizations": [{"image_hash": "a"}, {"image_hash": "a", **_PLACED}]},
+     "placement_customizations[1] repeats the media"),
+    ({"placement_customizations": [{"image_hash": "a"}, {"image_hash": "b"}]},
+     "placement_customizations[0] and placement_customizations[1] both"),
+    ({"placement_customizations": [
+        {"image_hash": "a", "publisher_platforms": ["facebook"], "facebook_positions": ["feed", "story"]},
+        {"image_hash": "b", "publisher_platforms": ["facebook"], "facebook_positions": ["story"]},
+    ]}, "claimed by placement_customizations[0] and placement_customizations[1]"),
+    ({"placement_customizations": [{"image_hash": "a", **_PLACED}, {"image_hash": "b", "publisher_platforms": ["x"]}]},
+     "placement_customizations[1] publisher_platforms has 1 unsupported value"),
+    ({"cards": [{"image_hash": "a"}, {"image_hash": "b", "colour": "red"}]}, "cards[1] has 1 unknown key"),
+    ({"cards": [{"image_hash": "a"}, {"video_id": "1"}]}, "cards[1] needs image_hash"),
+    ({"cards": [{"image_hash": "a"}, "card"]}, "cards[1] must be an object"),
+    ({"multi_media": [{"image_hash": "a"}, {"image_hash": "a"}]}, "multi_media[1] repeats the media"),
+    ({"multi_media": [{"image_hash": "a"}, {"video_id": "5", "thumbnail_hash": "t"}]},
+     "multi_media[1]: Meta's multi-media guide"),
+    ({"multi_media": [{"video_id": "5"}, {"image_hash": "a"}]}, "multi_media[0] is the main video"),
+    ({"cards": [{"image_hash": "a"}, {"image_hash": "b", "link": "https://user:pw@example.invalid/"}]},
+     "cards[1].link"),
+]
+
+
+@pytest.mark.parametrize(("arguments", "message"), POSITION_CASES)
+def test_list_positions_in_errors_count_from_zero(monkeypatch, arguments, message) -> None:
+    import re
+
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=re.escape(message)):
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            account_id="123", name="Creative", page_id="111", link_url="https://x", **arguments,
+        ))
+
+
+def test_placement_fallback_note_counts_from_zero(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="Creative", page_id="111", link_url="https://x", dry_run=True,
+        placement_customizations=[{"image_hash": "a", **_PLACED}, {"image_hash": "b"}],
+    ))
+    assert any(note.startswith("placement_customizations[1] has no publisher_platforms") for note in result["notes"])
