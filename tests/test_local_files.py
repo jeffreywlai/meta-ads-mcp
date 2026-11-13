@@ -353,3 +353,156 @@ def test_a_folder_on_the_path_needs_only_search_permission(tmp_path, monkeypatch
         assert read("feed.csv").content == b"x"
     finally:
         locked.chmod(0o755)
+
+
+# --- Round-three review H6: the upload folder itself is established once ----------
+
+
+def test_h6_upload_root_replacement_before_resolution_is_refused(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "uploads"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "feed.csv").write_bytes(b"approved")
+    (outside / "feed.csv").write_bytes(b"synthetic-outside-private-data")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(root))
+    reload_settings()
+    assert read("feed.csv").content == b"approved"
+    # Rename the folder and put a link to another folder in its place before the next read.
+    root.rename(tmp_path / "saved-uploads")
+    root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValidationError) as error:
+        read("feed.csv")
+    assert "replaced or moved" in str(error.value)
+    assert str(tmp_path) not in str(error.value) and error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_a_different_real_folder_put_in_the_upload_folders_place_is_refused(tmp_path, monkeypatch, absolute) -> None:
+    root = tmp_path / "uploads"
+    root.mkdir()
+    (root / "feed.csv").write_bytes(b"approved")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(root))
+    reload_settings()
+    assert read("feed.csv").content == b"approved"
+    root.rename(tmp_path / "saved-uploads")
+    root.mkdir()
+    (root / "feed.csv").write_bytes(b"synthetic-planted-data")
+    with pytest.raises(ValidationError, match="replaced or moved"):
+        read(str(root / "feed.csv") if absolute else "feed.csv")
+
+
+def test_the_upload_folder_swapped_for_another_real_folder_at_any_moment_is_refused(tmp_path, monkeypatch) -> None:
+    """The folder is swapped for a different real folder after the by-name check, before each open."""
+    _nested_layout(tmp_path / "probe", monkeypatch)
+    moments = _count_opens(monkeypatch, "nested/feed.csv")
+    refused: list[int] = []
+    for moment in range(moments):
+        base = tmp_path / f"moment-{moment}"
+        root, _, _ = _nested_layout(base, monkeypatch)
+        assert read("nested/feed.csv").content == b"inside-upload-folder"
+
+        def swap(root=root, base=base):
+            root.rename(base / "saved-uploads")
+            (root / "nested").mkdir(parents=True)
+            (root / "nested" / "feed.csv").write_bytes(b"synthetic-planted-data")
+
+        _swap_before_open(monkeypatch, moment, swap)
+        if _read_inside_or_refused("nested/feed.csv") is None:
+            refused.append(moment)
+    # Before the upload folder itself is opened, the swap is caught by its identity.
+    assert 0 in refused, refused
+
+
+def test_a_linked_upload_folder_setting_keeps_working(tmp_path, monkeypatch) -> None:
+    # A link in the configured path, like macOS's /tmp, is resolved when the
+    # setting is first read and stays allowed.
+    real = tmp_path / "real-uploads"
+    real.mkdir()
+    (real / "feed.csv").write_bytes(b"x")
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("META_UPLOAD_DIR", str(alias))
+    reload_settings()
+    assert read("feed.csv").content == b"x"
+    assert read(str(alias / "feed.csv")).content == b"x"
+    assert read(str(real / "feed.csv")).content == b"x"
+
+
+def test_reloading_settings_establishes_the_folder_again(tmp_path, monkeypatch) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for folder, content in ((first, b"one"), (second, b"two")):
+        folder.mkdir()
+        (folder / "feed.csv").write_bytes(content)
+    monkeypatch.setenv("META_UPLOAD_DIR", str(first))
+    reload_settings()
+    assert read("feed.csv").content == b"one"
+    monkeypatch.setenv("META_UPLOAD_DIR", str(second))
+    reload_settings()
+    assert read("feed.csv").content == b"two"
+    # A folder replaced while configured is accepted again once settings are reloaded.
+    second.rename(tmp_path / "old-second")
+    second.mkdir()
+    (second / "feed.csv").write_bytes(b"three")
+    with pytest.raises(ValidationError, match="replaced or moved"):
+        read("feed.csv")
+    reload_settings()
+    assert read("feed.csv").content == b"three"
+
+
+# --- Round-three review H15: a hard link is a second name for an outside file -----
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="needs hard links")
+def test_h15_upload_hardlink_to_outside_file_is_refused(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "uploads"
+    root.mkdir()
+    outside = tmp_path / "private.csv"
+    outside.write_bytes(b"synthetic-outside-private-data")
+    os.link(outside, root / "feed.csv")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(root))
+    reload_settings()
+    with pytest.raises(ValidationError) as error:
+        read("feed.csv")
+    message = str(error.value)
+    assert "independent copies" in message
+    assert str(tmp_path) not in message and "private" not in message
+    assert error.value.__cause__ is None
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="needs hard links")
+def test_a_hard_link_between_two_names_inside_the_folder_is_also_refused(upload_dir) -> None:
+    (upload_dir / "a.csv").write_bytes(b"x")
+    os.link(upload_dir / "a.csv", upload_dir / "b.csv")
+    for name in ("a.csv", "b.csv"):
+        with pytest.raises(ValidationError, match="independent copies"):
+            read(name)
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="needs hard links")
+def test_the_hard_link_refusal_closes_the_descriptor(upload_dir, tmp_path, monkeypatch) -> None:
+    outside = tmp_path / "private.csv"
+    outside.write_bytes(b"x")
+    os.link(outside, upload_dir / "feed.csv")
+    opened = _track_descriptors(monkeypatch)
+    with pytest.raises(ValidationError, match="independent copies"):
+        read("feed.csv")
+    _assert_all_closed(opened)
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="needs hard links")
+def test_the_hard_link_refusal_applies_to_open_upload_file(upload_dir, tmp_path) -> None:
+    from meta_ads_mcp.local_files import open_upload_file
+
+    outside = tmp_path / "private.csv"
+    outside.write_bytes(b"x")
+    os.link(outside, upload_dir / "feed.csv")
+    with pytest.raises(ValidationError, match="independent copies"):
+        open_upload_file("feed.csv", allowed_types=TYPES, max_bytes=1_000)
+
+
+def test_an_independent_copy_is_read(upload_dir) -> None:
+    (upload_dir / "feed.csv").write_bytes(b"copy")
+    assert os.stat(upload_dir / "feed.csv").st_nlink == 1
+    assert read("feed.csv").content == b"copy"
