@@ -11,10 +11,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, TypeAlias
-from urllib.parse import quote, quote_plus
-
 from pydantic import BeforeValidator
 
+from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
@@ -23,6 +22,7 @@ from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
+from meta_ads_mcp.tools.creative_formats import _code_forms
 from meta_ads_mcp.tool_types import (
     AccountId,
     FieldList,
@@ -101,12 +101,10 @@ def _error_attribute_names(exc: BaseException) -> list[str]:
     return [name for name in dict.fromkeys(names) if not name.startswith("__")]
 
 
-def _scrub_value(value: Any, secrets: list[str], shown: str) -> Any:
+def _scrub_value(value: Any, secrets: re.Pattern[str], shown: str) -> Any:
     """value with every secret replaced, inside strings, dict keys and values, lists and tuples."""
     if isinstance(value, str):
-        for secret in secrets:
-            value = value.replace(secret, shown)
-        return value
+        return secrets.sub(lambda _match: shown, value)
     if isinstance(value, dict):
         return {_scrub_value(key, secrets, shown): _scrub_value(item, secrets, shown) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -114,16 +112,22 @@ def _scrub_value(value: Any, secrets: list[str], shown: str) -> Any:
     return value
 
 
+def _secret_pattern(forms: list[str]) -> re.Pattern[str] | None:
+    """One pattern matching any of the given forms (regular-expression sources from _secret_forms), longest first."""
+    sources = sorted({form for form in forms if form}, key=len, reverse=True)
+    return re.compile("|".join(sources)) if sources else None
+
+
 def _scrub_error(exc: BaseException, secrets: list[str], shown: str) -> None:
     """Remove secret text from a raised error and every error behind it, in place.
 
-    A traceback log prints the whole __cause__ and __context__ chain, and the MCP error
-    shows the top error's public fields, so every error reachable that way (and inside an
-    exception group) is cleaned: its fields, args and notes. Each error is visited once,
-    so a cycle ends.
+    secrets are the forms _secret_forms gives. A traceback log prints the whole __cause__
+    and __context__ chain, and the MCP error shows the top error's public fields, so every
+    error reachable that way (and inside an exception group) is cleaned: its fields, args
+    and notes. Each error is visited once, so a cycle ends.
     """
-    secrets = sorted({secret for secret in secrets if secret}, key=len, reverse=True)
-    if not secrets:
+    pattern = _secret_pattern(secrets)
+    if pattern is None:
         return
     pending: list[BaseException | None] = [exc]
     seen: set[int] = set()
@@ -139,28 +143,53 @@ def _scrub_error(exc: BaseException, secrets: list[str], shown: str) -> None:
                 continue
             if value is None or isinstance(value, BaseException):
                 continue
-            cleaned = _scrub_value(value, secrets, shown)
+            cleaned = _scrub_value(value, pattern, shown)
             if cleaned != value:
                 try:
                     setattr(current, name, cleaned)
                 except (AttributeError, TypeError):
                     pass
         if current.args:
-            current.args = tuple(_scrub_value(arg, secrets, shown) for arg in current.args)
+            current.args = tuple(_scrub_value(arg, pattern, shown) for arg in current.args)
         notes = getattr(current, "__notes__", None)
         if isinstance(notes, list):
-            current.__notes__ = [_scrub_value(note, secrets, shown) for note in notes]
+            current.__notes__ = [_scrub_value(note, pattern, shown) for note in notes]
         pending.extend([current.__cause__, current.__context__])
         pending.extend(getattr(current, "exceptions", None) or ())
 
 
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _escape_insensitive_source(form: str) -> str:
+    """A pattern for an encoded form: its characters exactly, but each %XX escape's hex digits in either case."""
+    parts: list[str] = []
+    position = 0
+    for escape in _PERCENT_ESCAPE.finditer(form):
+        parts.append(re.escape(form[position:escape.start()]))
+        digits = escape.group()[1:]
+        parts.append("%" + "".join(f"[{digit.upper()}{digit.lower()}]" if digit.isalpha() else digit for digit in digits))
+        position = escape.end()
+    parts.append(re.escape(form[position:]))
+    return "".join(parts)
+
+
 def _secret_forms(secret: str | None) -> list[str]:
-    """A secret as given, trimmed, and URL-encoded, the ways an error could repeat it."""
+    """Every way an error could repeat a secret, as regular-expression sources for _secret_pattern.
+
+    The forms are creative_formats._code_forms (shared with the creative builder): as given,
+    trimmed, percent-encoded with and without the slash kept, and form-encoded. The secret's
+    own characters match exactly, case included; only the hex digits of a percent escape
+    match in either case (%2f as well as %2F). A '%' typed in the secret itself is a real
+    character, not an escape: encoding turns it into %25, so only encoded forms have escapes.
+    """
     if not isinstance(secret, str) or not secret.strip():
         return []
-    forms = {secret, secret.strip()}
-    forms |= {quote(form, safe="") for form in list(forms)} | {quote_plus(form) for form in list(forms)}
-    return [form for form in forms if form]
+    plain = {secret, secret.strip()}
+    return [
+        re.escape(form) if form in plain else _escape_insensitive_source(form)
+        for form in _code_forms(secret)
+    ]
 
 
 def _refuse_url_logins(value: Any, name: str) -> None:
@@ -422,6 +451,7 @@ def _legacy_image_file_name(file_path: str, resolved_name: str) -> str:
     folder (hero.jpg pointing to source.png) went up as hero.jpg, and Meta keys its answer
     by that name. Only a single, plain path component is used; anything else (empty, . or
     .., a separator, a control or invisible character) falls back to the real file's name.
+    Video uploads send the same name; the file type is still judged from the real file.
     """
     name = Path(file_path.strip()).expanduser().name if isinstance(file_path, str) else ""
     if (
@@ -435,8 +465,8 @@ def _legacy_image_file_name(file_path: str, resolved_name: str) -> str:
     return name
 
 
-def _image_file_forms(file_path: str, *names: str) -> list[str]:
-    """Every way an error could repeat a local image's path or name, for scrubbing."""
+def _local_file_forms(file_path: str, *names: str) -> list[str]:
+    """Every way an error could repeat a local file's path or names (image or video), for scrubbing."""
     forms: list[str] = []
     for text in (file_path, file_path.strip(), str(Path(file_path.strip()).expanduser()), *names):
         forms.extend(_secret_forms(text))
@@ -468,7 +498,7 @@ async def upload_creative_asset(
         except Exception as exc:
             # A file name can itself be private: no error or log line names the file or its
             # path, even when Meta's own error text repeats it.
-            _scrub_error(exc, _image_file_forms(file_path, image_file.name, file_name), FILE_SHOWN)
+            _scrub_error(exc, _local_file_forms(file_path, image_file.name, file_name), FILE_SHOWN)
             raise
     else:
         result = await client.upload_ad_image(
@@ -521,12 +551,18 @@ def _video_processing_status(video: dict[str, Any]) -> str | None:
 
 @dataclass(slots=True)
 class _OpenVideo:
-    """A local video opened for upload: the open descriptor is what gets read."""
+    """A local video opened for upload: the open descriptor is what gets read.
+
+    name is the real file's name (its type was judged from it); sent_name is the name sent
+    to Meta and shown in plans and results: the last part of the caller's path, as image
+    uploads send it, so an accepted in-folder link hero.mp4 to source.mp4 goes up as hero.mp4.
+    """
 
     descriptor: int
     name: str
     size: int
     modified_ns: int
+    sent_name: str
 
 
 FILE_SHOWN = "<file>"
@@ -572,7 +608,10 @@ def _open_upload_video(file_path: str, parameter: str = "file_path") -> _OpenVid
     if details.st_size != opened.size:
         os.close(opened.descriptor)
         raise ValidationError(f"{parameter} changed size while it was being opened; try again once it is complete.")
-    return _OpenVideo(descriptor=opened.descriptor, name=opened.name, size=opened.size, modified_ns=details.st_mtime_ns)
+    return _OpenVideo(
+        descriptor=opened.descriptor, name=opened.name, size=opened.size, modified_ns=details.st_mtime_ns,
+        sent_name=_legacy_image_file_name(file_path, opened.name),
+    )
 
 
 def _read_video_bytes(video: _OpenVideo, offset: int, length: int) -> bytes:
@@ -700,7 +739,7 @@ async def _chunked_video_upload(
             answer = await client.post_ad_video_upload_phase(
                 account,
                 data={"upload_phase": "transfer", "upload_session_id": session_id, "start_offset": start},
-                files={"video_file_chunk": (video.name, chunk)},
+                files={"video_file_chunk": (video.sent_name, chunk)},
             )
             sent_end = end
             started = answer if isinstance(answer, dict) else {}
@@ -736,7 +775,7 @@ async def _chunked_video_upload(
         "upload": {
             "mode": "chunked",
             "upload_session_id": session_id,
-            "file_name": video.name,
+            "file_name": video.sent_name,
             "bytes": video.size,
             "bytes_confirmed": progress["confirmed"],
             "transfer_requests": progress["requests"],
@@ -752,7 +791,7 @@ def _chunked_plan(account: str, video: _OpenVideo, meta_fields: dict[str, Any]) 
         "path": path,
         "host": VIDEO_UPLOAD_HOST,
         "upload": "chunked",
-        "source": {"file_name": video.name, "bytes": video.size},
+        "source": {"file_name": video.sent_name, "bytes": video.size},
         "requests": [
             {"method": "POST", "path": path, "data": {"upload_phase": "start", "file_size": video.size}},
             {
@@ -845,7 +884,7 @@ async def upload_ad_video(
     except Exception as exc:
         # A file name can itself be private: no error or log line names the file, even
         # when Meta's own error text repeats it.
-        _scrub_error(exc, [*_secret_forms(video.name), *_secret_forms(path_text)], FILE_SHOWN)
+        _scrub_error(exc, _local_file_forms(path_text, video.name, video.sent_name), FILE_SHOWN)
         raise
     finally:
         os.close(video.descriptor)
@@ -861,7 +900,7 @@ async def _upload_video_file(
 ) -> dict[str, Any]:
     """Upload an opened local video in one request or in chunks; the caller closes it."""
     if video.size <= MAX_DIRECT_VIDEO_BYTES:
-        source = {"file_name": video.name, "bytes": video.size}
+        source = {"file_name": video.sent_name, "bytes": video.size}
         content = b""
         if not dry_run:
             content = _read_video_bytes(video, 0, video.size)
@@ -871,7 +910,7 @@ async def _upload_video_file(
                     "was opened), so nothing was sent. Upload it again once it is complete."
                 )
         response = await _upload_video_request(
-            account, target, data=dict(meta_fields), files={"source": (video.name, content)},
+            account, target, data=dict(meta_fields), files={"source": (video.sent_name, content)},
             shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
         )
         if not dry_run:
@@ -891,7 +930,11 @@ async def _upload_video_file(
     response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
     response.update(await _read_video_status(client, outcome["video_id"]))
-    _note_change_after_send(response, outcome["changed_after_send"])
+    # The last await is the status read: check the open file again after it, so a change
+    # while it was in flight is reported (as the direct path does). A change already seen
+    # right after the finish still counts if this later check cannot be made.
+    changes = (outcome["changed_after_send"], _video_file_change(video))
+    _note_change_after_send(response, _FILE_CHANGED if _FILE_CHANGED in changes else next((c for c in changes if c), None))
     return response
 
 
@@ -1328,6 +1371,24 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+# Without a start_time Meta starts the ad set when it creates it (the Click to Instagram
+# guide documents that default), which is after this server sends the request. A computed
+# end therefore gets this margin on top of duration_days, so the run is never shorter than
+# asked. An ad set create is never retried and is cut off after META_REQUEST_TIMEOUT, so the
+# margin is at least that timeout plus a minute.
+BOOST_END_MARGIN = timedelta(minutes=5)
+
+
+def _boost_end_margin() -> timedelta:
+    """The safety margin added to an end computed from duration_days when Meta picks the start."""
+    return max(BOOST_END_MARGIN, timedelta(seconds=get_settings().request_timeout) + timedelta(minutes=1))
+
+
+def _computed_boost_end(days: int) -> datetime:
+    """The end for a run of days that starts when Meta creates the ad set, fixed now: whole seconds, rounded up."""
+    return _ceil_second(_utc_now() + timedelta(days=days) + _boost_end_margin())
+
+
 def _ceil_second(moment: datetime) -> datetime:
     """moment rounded up to a whole second (unchanged when it already is one)."""
     whole = moment.replace(microsecond=0)
@@ -1656,13 +1717,16 @@ def _boost_settings(
         if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= BOOST_MAX_DURATION_DAYS:
             raise ValidationError(f"duration_days must be a whole number from 1 to {BOOST_MAX_DURATION_DAYS}.")
         # Sent in whole seconds, rounded up: a clock (or a start_time) with a fraction of a
-        # second must never make the run shorter than the days asked for.
-        end_at = _ceil_second(start_at + timedelta(days=days))
+        # second must never make the run shorter than the days asked for. Without a
+        # start_time this is only the value shown if the request were sent now: the end is
+        # computed again immediately before the ad set is created (_boost_one_step).
+        end_at = _ceil_second(start_at + timedelta(days=days)) if start_time is not None else _computed_boost_end(days)
         end_sent = end_at.isoformat()
     # Both checks compare the exact start (with its fraction of a second) and the exact end.
     if end_at - start_at < BOOST_MIN_RUN:
         raise ValidationError("end_time must be at least 24 hours after the start (start_time, or now when it is omitted).")
-    # A computed end is at most days (already checked) plus the rounding up above.
+    # A computed end is at most days (already checked) plus the rounding up and, without a
+    # start_time, the safety margin above.
     if end_time is not None and end_at - start_at > timedelta(days=BOOST_MAX_DURATION_DAYS):
         raise ValidationError(f"The ad set can run for at most {BOOST_MAX_DURATION_DAYS} days.")
     given = {
@@ -1804,6 +1868,34 @@ def _boost_created_message(created: list[tuple[str, str]], failed_step: str, rea
     )
 
 
+def _boost_schedule(settings: _BoostSettings, end_sent: Any, *, fixed_when_sent: bool, sent: bool) -> dict[str, Any]:
+    """The ad set's schedule as sent (or, in a plan, as it would be sent), and how a computed end is fixed."""
+    schedule: dict[str, Any] = {
+        "start_time": (
+            settings.start_sent if settings.start_sent is not None
+            else "when Meta creates the ad set (no start_time sent)"
+        ),
+        "end_time": end_sent,
+        "end_time_fixed_when_sent": fixed_when_sent,
+    }
+    if fixed_when_sent:
+        margin = int(_boost_end_margin().total_seconds())
+        days = f"{settings.days} day{'' if settings.days == 1 else 's'}"
+        basis = (
+            f"duration_days ({days}) plus a {margin}-second safety margin, counted from that moment, because Meta "
+            f"starts the ad set when it creates it, after the request leaves. The run is longer than {days} by at "
+            "most the margin."
+        )
+        schedule["safety_margin_seconds"] = margin
+        schedule["note"] = (
+            f"end_time was computed immediately before the ad set request was sent: {basis} end_time is the value sent."
+            if sent else
+            f"end_time is computed immediately before the ad set request is sent: {basis} The end_time shown is what "
+            "would be sent if it were sent now; a later call sends a later end_time."
+        )
+    return schedule
+
+
 async def _boost_one_step(
     client_factory: Any,
     *,
@@ -1860,9 +1952,13 @@ async def _boost_one_step(
     if bid_minor is not None:
         adset_data["bid_amount"] = bid_minor
     adset_data["targeting"] = settings.targeting
+    # A computed end with no start_time is fixed at the moment of sending (see _boost_end_margin);
+    # until then it is shown as it would be sent now, after the reads above.
+    end_fixed_when_sent = settings.start_sent is None and settings.end_computed and settings.days is not None
+    end_sent = _computed_boost_end(settings.days).isoformat() if end_fixed_when_sent else settings.end_sent
     if settings.start_sent is not None:
         adset_data["start_time"] = settings.start_sent
-    adset_data["end_time"] = settings.end_sent
+    adset_data["end_time"] = end_sent
     adset_data["status"] = "PAUSED"
     if settings.destination:
         adset_data["destination_type"] = settings.destination
@@ -1887,7 +1983,7 @@ async def _boost_one_step(
         "is_adset_budget_sharing_enabled": False if not campaign_level else None,
         "start_time": "when Meta creates the ad set (no start_time sent)" if settings.start_sent is None else None,
         "duration_days": settings.days if settings.end_computed and "duration_days" not in given else None,
-        "end_time": settings.end_sent if settings.end_computed else None,
+        "end_time": end_sent if settings.end_computed else None,
         "call_to_action": settings.call_to_action if settings.call_to_action_built else None,
         "page_id": f"{page_id} (the Page whose instagram_business_account is instagram_account_id)" if page_lookup else None,
         "status": "PAUSED for all four objects",
@@ -1912,7 +2008,10 @@ async def _boost_one_step(
             {"step": "ad", "method": "POST", "path": f"{account_id}/ads", "data": ad_data},
         ],
         "defaults_applied": defaults,
+        "schedule": _boost_schedule(settings, end_sent, fixed_when_sent=end_fixed_when_sent, sent=False),
     }
+    if end_fixed_when_sent:
+        plan["requests"][1]["end_time_note"] = plan["schedule"]["note"]
     if settings.budget_parameter == "daily_budget":
         plan["daily_budget"] = {"major_units": settings.budget, "sent_minor_units": budget_minor}
     if bid_minor is not None:
@@ -1957,6 +2056,13 @@ async def _boost_one_step(
         return object_id
 
     campaign_id = await create("campaign", "campaigns", campaign_data)
+    if end_fixed_when_sent:
+        # Fixed here, with no await before the ad set request, so the reads and the campaign
+        # create above cannot shorten the run Meta starts when it creates the ad set.
+        end_sent = _computed_boost_end(settings.days).isoformat()
+        adset_data["end_time"] = end_sent
+        if "end_time" in defaults:
+            defaults["end_time"] = end_sent
     adset_id = await create("ad set", "adsets", {**adset_data, "campaign_id": campaign_id})
     creative_id = await create("creative", "adcreatives", creative_data)
     ad_id = await create("ad", "ads", {**ad_data, "adset_id": adset_id, "creative": {"creative_id": creative_id}})
@@ -1972,6 +2078,7 @@ async def _boost_one_step(
         "budget": budget_shown,
         "currency": currency,
         "note": "All four objects are paused. Activate the campaign, ad set and ad with set_*_status when ready.",
+        "schedule": _boost_schedule(settings, end_sent, fixed_when_sent=end_fixed_when_sent, sent=True),
     })
     if settings.budget_parameter == "daily_budget":
         response["daily_budget"] = plan["daily_budget"]
