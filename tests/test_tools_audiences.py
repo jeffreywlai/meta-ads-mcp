@@ -1042,12 +1042,17 @@ def test_update_custom_audience_without_rule_is_unchanged(monkeypatch) -> None:
     client = RecordingAudienceClient()
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", params={"rule": WEBSITE_RULE}))
+    # The write is exactly what it was. The read now also asks for the stored rule, so
+    # the prior rule comes back and the edit can be undone; the caller only gains a field.
     assert client.calls == [
-        ("get", "aud_1", OLD_AUDIENCE_READ_FIELDS, None),
+        ("get", "aud_1", [*OLD_AUDIENCE_READ_FIELDS, "rule"], None),
         ("update", "aud_1", {"rule": WEBSITE_RULE}),
     ]
-    assert result["previous"] == {"name": "Existing Audience", "description": "Old", "retention_days": 30,
-                                  "customer_file_source": "USER_PROVIDED_ONLY"}
+    previous = dict(result["previous"])
+    assert "rule" in previous
+    previous.pop("rule")
+    assert previous == {"name": "Existing Audience", "description": "Old", "retention_days": 30,
+                        "customer_file_source": "USER_PROVIDED_ONLY"}
     assert result["current"] == {"rule": WEBSITE_RULE}
 
 

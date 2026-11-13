@@ -277,7 +277,10 @@ async def update_custom_audience(
     if not payload:
         raise ValidationError("At least one field must be provided for update_custom_audience.")
     client = get_graph_api_client()
-    read_fields = AUDIENCE_FIELDS if rule is None else [*AUDIENCE_FIELDS, "rule"]
+    # Read the stored rule whenever the rule is being changed, by either route, so the
+    # prior rule is returned and the edit can be undone.
+    changes_rule = "rule" in payload
+    read_fields = [*AUDIENCE_FIELDS, "rule"] if changes_rule else AUDIENCE_FIELDS
     previous = await client.get_object(audience_id, fields=read_fields)
     await client.update_object(audience_id, data=payload)
     prior = {
@@ -286,7 +289,7 @@ async def update_custom_audience(
         "retention_days": previous.get("retention_days"),
         "customer_file_source": previous.get("customer_file_source"),
     }
-    if rule is not None:
+    if changes_rule:
         prior["rule"] = previous.get("rule")
     return mutation_response(
         action="update_custom_audience",
