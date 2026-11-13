@@ -682,3 +682,111 @@ def test_intent_guide_routes_pixel_questions_to_signal_tools() -> None:
     assert routed == SIGNAL_TOOLS
     closest = utility._closest_intents("check pixel event match quality")
     assert closest[0]["intent"] == "inspect_pixels_datasets_or_tracking"
+
+
+# ------------------------------------- R13: unreadable answers are never empty, complete reads
+
+UNREADABLE_PAGES = [
+    pytest.param({}, id="no-data"),
+    pytest.param({"data": None}, id="null-data"),
+    pytest.param({"data": "x"}, id="data-not-a-list"),
+    pytest.param({"data": {"id": "px1"}}, id="data-an-object"),
+]
+STATS_WINDOW = {"dataset_id": "px1", "since": "2026-11-01", "until": "2026-11-02"}
+
+
+def _fixed_now(monkeypatch) -> None:
+    monkeypatch.setattr(datasets, "_utc_now", lambda: datetime(2026, 11, 12, 12, tzinfo=timezone.utc))
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_listings_do_not_call_an_unreadable_page_complete(monkeypatch, payload) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"adspixels": [payload], "customconversions": [payload]}))
+    for result in (
+        asyncio.run(datasets.list_datasets(account_id="1")),
+        asyncio.run(datasets.list_custom_conversions(account_id="1")),
+    ):
+        assert result["items"] == []
+        assert result["summary"]["complete"] is False and result["summary"]["next_after"] is None
+        assert "readable data list" in result["summary"]["incomplete_reason"]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_dataset_stats_unreadable_first_page_is_not_zero_events(monkeypatch, payload) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [payload]}))
+    _fixed_now(monkeypatch)
+    summary = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))["summary"]
+    assert summary["complete"] is False
+    assert summary["total_count"] == 0
+    assert "readable data list" in summary["stop_reason"]
+    assert "incomplete" in summary["note"].lower()
+
+
+def test_dataset_stats_unreadable_later_page_keeps_earlier_totals_and_is_incomplete(monkeypatch) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [
+        _stats_page([{"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 4}]}],
+                    next_after="c2"),
+        {"data": None},
+    ]}))
+    _fixed_now(monkeypatch)
+    result = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))
+    assert result["items"] == [{"value": "PageView", "count": 4}]
+    assert result["summary"]["complete"] is False and result["summary"]["pages_fetched"] == 2
+
+
+@pytest.mark.parametrize("bad_hour", [
+    None, "x", {"start_time": "2026-11-01T01:00:00+0000"}, {"start_time": "2026-11-01T01:00:00+0000", "data": None},
+])
+def test_dataset_stats_unreadable_hour_is_disclosed_not_dropped(monkeypatch, bad_hour) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page([
+        {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 4}]}, bad_hour,
+    ])]}))
+    _fixed_now(monkeypatch)
+    summary = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))["summary"]
+    assert summary["total_count"] == 4
+    assert summary["complete"] is False and summary["unreadable_hours"] == 1
+    assert "not in the totals" in summary["stop_reason"]
+
+
+@pytest.mark.parametrize("bad_row", [None, {"value": "Lead"}, {"value": "Lead", "count": "many"}])
+def test_dataset_stats_row_without_a_count_is_disclosed_not_counted_as_zero(monkeypatch, bad_row) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page([
+        {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 4}, bad_row]},
+    ])]}))
+    _fixed_now(monkeypatch)
+    result = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))
+    assert result["items"] == [{"value": "PageView", "count": 4}]
+    assert result["summary"]["complete"] is False and result["summary"]["unreadable_counts"] == 1
+    assert "readable count" in result["summary"]["stop_reason"]
+
+
+def test_dataset_stats_zero_count_is_a_readable_count(monkeypatch) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page([
+        {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 0}]},
+    ])]}))
+    _fixed_now(monkeypatch)
+    summary = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))["summary"]
+    assert summary["complete"] is True and "unreadable_counts" not in summary
+
+
+@pytest.mark.parametrize("channel", ["web", "offline"])
+@pytest.mark.parametrize("value", [{"event_name": "Purchase"}, "x", 5])
+def test_dataset_quality_channel_in_an_unreadable_shape_is_not_no_data(monkeypatch, channel, value) -> None:
+    _use(monkeypatch, FakeDatasetClient(object_payloads={"dataset_quality": {channel: value}}))
+    result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel=channel))
+    assert result["findings"] == []
+    assert len(result["missing_signals"]) == 1
+    assert "cannot read" in result["missing_signals"][0]
+    assert "receive" not in result["missing_signals"][0]
+
+
+@pytest.mark.parametrize("channel", ["web", "offline"])
+def test_dataset_quality_entries_that_are_not_objects_are_disclosed(monkeypatch, channel) -> None:
+    row = (
+        {"event_name": "Purchase", "event_match_quality": {"composite_score": 8.2}} if channel == "web"
+        else {"event_name": "Purchase", "composite": {"score": 9.1}}
+    )
+    _use(monkeypatch, FakeDatasetClient(object_payloads={"dataset_quality": {channel: [row, None]}}))
+    result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel=channel))
+    assert result["metrics"]["events"] == 1
+    assert any("1 " + channel + " event entry" in signal for signal in result["missing_signals"])

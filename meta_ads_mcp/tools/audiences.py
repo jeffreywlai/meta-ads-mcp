@@ -21,7 +21,7 @@ from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list
 
@@ -109,6 +109,23 @@ async def list_audiences(
         fields=fields or AUDIENCE_SUMMARY_FIELDS,
         params=params,
     )
+    if read_collection_page(payload)[2]:
+        # A page without a readable data list is not an empty list: the audiences on it,
+        # and whether more pages follow, are unknown.
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {
+                "count": 0,
+                "complete": False,
+                "truncated": False,
+                "next_after": None,
+                "incomplete_reason": (
+                    "Meta returned a page without a readable data list, so the audiences on it, and whether "
+                    "more pages follow, are unknown."
+                ),
+            },
+        }
     normalized = normalize_collection(payload)
     has_more = bool(normalized["paging"].get("next"))
     normalized["summary"].update({

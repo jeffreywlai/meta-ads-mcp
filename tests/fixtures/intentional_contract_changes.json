@@ -86,6 +86,13 @@
       "what_changed": "When Meta's answer to the image read has no list of images, or holds an entry that cannot be read, the tool now raises the same error it already raised when more images existed than it read: it could not obtain a complete image result. Before, an answer with no list was returned as a complete result with the images marked unresolved, and an unreadable entry crashed the tool.",
       "why_better": "A result is no longer called complete when the read behind it could not be read.",
       "migration": "Nothing to change. This only happens when Meta's answer is malformed; treat the error like any other failed read."
+    },
+    {
+      "tool": "list_audiences",
+      "kind": "behaviour",
+      "what_changed": "When Meta answers a page of audiences without a readable data list (data missing, null or not a list), the tool now returns no items with summary.complete false, summary.next_after null and summary.incomplete_reason saying the page could not be read. Before, a missing data list was returned as an empty, complete list, a null data list crashed the tool, and a data value that was not a list was returned as the items. A normal page, including an empty data list, returns exactly what it did before.",
+      "why_better": "A page that could not be read is no longer presented as proof that the account has no more audiences, so a caller does not stop paging, or conclude an audience does not exist, on an answer that said nothing.",
+      "migration": "Nothing to change for a normal answer. A caller that pages until complete is true should also stop when next_after is null, and treat complete false with incomplete_reason as a list that was not fully read: retry the call or report it."
     }
   ]
 }

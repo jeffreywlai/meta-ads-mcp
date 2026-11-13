@@ -14,7 +14,8 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
+from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.tool_types import GraphId, StringList
 
 BUSINESS_FIELDS = ["id", "name", "verification_status", "permitted_roles"]
@@ -145,23 +146,55 @@ def _project(row: dict[str, Any], fields: list[str]) -> dict[str, Any]:
     return item
 
 
-def _page_response(payload: dict[str, Any], fields: list[str]) -> dict[str, Any]:
-    """Shape one Graph page the way list_audiences does, keeping only listed fields."""
-    normalized = normalize_collection(payload)
-    normalized["items"] = [_project(row, fields) for row in normalized["items"] if isinstance(row, dict)]
-    has_more = bool(normalized["paging"].get("next"))
-    after = normalized["paging"].get("after")
-    normalized["summary"] = {
-        "count": len(normalized["items"]),
-        "complete": not has_more,
+PAGE_UNREADABLE_REASON = (
+    "Meta returned a page without a readable data list, so the rows on it, and whether more pages "
+    "follow, are unknown."
+)
+
+
+def _non_object_rows_reason(count: int) -> str:
+    return (
+        f"Meta returned {count} row(s) that are not objects, so they could not be read and could be "
+        "any person, partner or business."
+    )
+
+
+def _page_response(payload: Any, fields: list[str]) -> dict[str, Any]:
+    """Shape one Graph page the way list_audiences does, keeping only listed fields.
+
+    A page without a readable data list is not an empty page: it is reported as not
+    complete, with the reason. Rows that are not objects cannot be shown, so they are
+    counted and the page is not complete either.
+    """
+    rows, bad_rows, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {
+                "count": 0, "complete": False, "truncated": False, "next_after": None,
+                "page_unreadable": True, "incomplete_reason": PAGE_UNREADABLE_REASON,
+            },
+        }
+    paging = extract_paging(payload)
+    items = [_project(row, fields) for row in rows]
+    has_more = bool(paging.get("next"))
+    after = paging.get("after")
+    summary: dict[str, Any] = {
+        "count": len(items),
+        "complete": not has_more and not bad_rows,
         "truncated": has_more,
         "next_after": after if has_more else None,
     }
+    reasons = []
     if has_more and not after:
-        normalized["summary"]["incomplete_reason"] = (
-            "Meta reported another page but gave no cursor to read it."
-        )
-    return normalized
+        reasons.append("Meta reported another page but gave no cursor to read it.")
+    if bad_rows:
+        summary["unreadable_rows"] = bad_rows
+        reasons.append(_non_object_rows_reason(bad_rows))
+    if reasons:
+        summary["incomplete_reason"] = " ".join(reasons)
+    return {"items": items, "paging": paging, "summary": summary}
 
 
 async def _scan(
@@ -178,8 +211,15 @@ async def _scan(
 ) -> dict[str, Any]:
     """Read an edge page by page, capped by pages, and say whether the end was reached.
 
-    The end is reached only when a page has no next link. A next link without a
-    cursor, a repeated cursor, or the page cap stops the read as incomplete.
+    The end is reached only when a readable page has no next link. A page without a
+    readable data list stops the read as incomplete: its rows, and whether more pages
+    follow, are unknown. So do a next link without a cursor, a repeated cursor, and the
+    page cap. Rows that are not objects are counted in unreadable_rows and also make the
+    read incomplete, because any one of them could be the row a caller is looking for.
+
+    A page whose next cursor repeats an earlier one is still a page Meta answered to a
+    cursor not read before, so its rows are kept; the read stops there as incomplete and
+    the repeated cursor is never followed.
     """
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -188,6 +228,7 @@ async def _scan(
     unreadable = 0
     reason: str | None = None
     next_after: str | None = None
+    page_unreadable = False
     while True:
         if requests >= max_pages:
             reason = f"stopped after {max_pages} requests; more pages exist."
@@ -198,17 +239,18 @@ async def _scan(
             query["after"] = cursor
         payload = await client.list_objects(parent_id, edge, fields=fields, params=query)
         requests += 1
-        page = normalize_collection(payload)
-        items = page["items"] if isinstance(page["items"], list) else []
-        if page["items"] is not None and not isinstance(page["items"], list):
-            unreadable += 1
-        page_rows = [row for row in items if isinstance(row, dict)]
-        unreadable += len(items) - len(page_rows)
+        page_rows, bad_rows, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            reason = PAGE_UNREADABLE_REASON
+            # The same page can be asked for again.
+            next_after = cursor
+            break
+        unreadable += bad_rows
         rows.extend(page_rows)
-        if not page["paging"].get("next"):
-            return {"rows": rows, "complete": True, "requests": requests, "reason": None, "next_after": None,
-                    "unreadable_rows": unreadable}
-        new_cursor = page["paging"].get("after")
+        paging = extract_paging(payload)
+        if not paging.get("next"):
+            break
+        new_cursor = paging.get("after")
         if not new_cursor:
             reason = "Meta reported another page but gave no cursor to read it."
             break
@@ -221,8 +263,16 @@ async def _scan(
             reason = "stopped once the requested row was found; later pages were not read."
             next_after = cursor
             break
-    return {"rows": rows, "complete": False, "requests": requests, "reason": reason, "next_after": next_after,
-            "unreadable_rows": unreadable}
+    reasons = [text for text in (reason, _non_object_rows_reason(unreadable) if unreadable else None) if text]
+    return {
+        "rows": rows,
+        "complete": not reasons,
+        "requests": requests,
+        "reason": " ".join(reasons) if reasons else None,
+        "next_after": next_after,
+        "unreadable_rows": unreadable,
+        "page_unreadable": page_unreadable,
+    }
 
 
 def _row_identity(value: Any) -> str | None:
@@ -271,11 +321,12 @@ def _search_response(
 ) -> dict[str, Any]:
     matches = [_project(row, fields) for row in scan["rows"] if _matches(row, search, text_fields)]
     items = matches[:limit]
-    # A row that could not be read could be the one searched for: a non-object row for
-    # any search, and a row without a readable id for an exact id search with no match.
-    unsearchable = scan.get("unreadable_rows", 0)
+    # A row that could not be read could be the one searched for. Rows that are not
+    # objects already make the scan incomplete; for an exact id search with no match, an
+    # object row without a readable id could be it too.
+    unsearchable = 0
     if search.isdigit() and not matches:
-        unsearchable = _unidentified_rows(scan)
+        unsearchable = _unidentified_rows(scan) - scan.get("unreadable_rows", 0)
     summary: dict[str, Any] = {
         "count": len(items),
         "matched": len(matches),
@@ -293,8 +344,7 @@ def _search_response(
         reasons.append(f"Not every row was read: {scan['reason']}")
     if unsearchable:
         reasons.append(
-            f"Meta returned {unsearchable} row(s) this server could not read (not an object, or without a "
-            "readable numeric id), so whether they match is unknown."
+            f"Meta returned {unsearchable} row(s) without a readable numeric id, so whether they match is unknown."
         )
     if len(matches) > limit:
         reasons.append(f"{len(matches)} rows matched; only the first {limit} are returned. Narrow the search.")
@@ -321,7 +371,10 @@ async def list_businesses(
         scan = await _scan(client, "me", "businesses", fields=BUSINESS_FIELDS, after=after)
         response = _search_response(scan, BUSINESS_FIELDS, search, ("name",), limit)
         returned = len(scan["rows"])
-    if returned == 0:
+        if scan["page_unreadable"] or scan["unreadable_rows"]:
+            returned = None
+    # Only a readable answer with no rows means Meta returned no businesses.
+    if returned == 0 and not response["summary"].get("page_unreadable") and not response["summary"].get("unreadable_rows"):
         response["notes"] = [EMPTY_BUSINESSES_NOTE]
     return response
 
@@ -571,7 +624,8 @@ async def list_user_assigned_catalogs(
     items: list[dict[str, Any]] = []
     unreadable: list[str] = []
     requests = owned["requests"]
-    unidentified_catalogs = _unidentified_rows(owned)
+    # Rows that are not objects are already in owned["reason"]; these are objects without a usable id.
+    unidentified_catalogs = _unidentified_rows(owned) - owned["unreadable_rows"]
     if unidentified_catalogs:
         gaps.append(f"{unidentified_catalogs} owned catalog row(s) had no readable id and could not be checked.")
     skipped = 0
@@ -765,12 +819,14 @@ async def _plan_access_change(
     change, lost, gained = _classify(found, proposed)
 
     target = {"catalog_id": catalog_id, "business_id": business_id, "user_id": user_id}
+    # Meta's ProductCatalog assigned_users reference and SDK 26.0.2 list only user and tasks for
+    # POST, and only user for DELETE; business is a parameter of the read alone, so it is not sent.
     if change == "remove":
-        request = {"method": "DELETE", "path": f"{catalog_id}/assigned_users", "data": {"user": user_id, "business": business_id}}
+        request = {"method": "DELETE", "path": f"{catalog_id}/assigned_users", "data": {"user": user_id}}
     elif change in {"grant", "increase", "reduce", "change"}:
         request = {
             "method": "POST", "path": f"{catalog_id}/assigned_users",
-            "data": {"user": user_id, "business": business_id, "tasks": proposed},
+            "data": {"user": user_id, "tasks": proposed},
         }
     else:
         request = None

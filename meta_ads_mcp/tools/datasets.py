@@ -18,7 +18,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_float, to_int
+from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page, to_float, to_int
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tool_types import FieldList, normalize_field_list
 
@@ -149,6 +149,31 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
     return params
 
 
+PAGE_UNREADABLE_REASON = (
+    "Meta returned a page without a readable data list, so the rows on it, and whether more pages "
+    "follow, are unknown."
+)
+
+
+def _listing_page(payload: Any) -> dict[str, Any]:
+    """One listing page as Meta returned it, with list_audiences-style completeness keys.
+
+    A page without a readable data list is not an empty, complete list: it is reported as
+    not complete with the reason.
+    """
+    _, _, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {
+                "count": 0, "complete": False, "truncated": False, "next_after": None,
+                "page_unreadable": True, "incomplete_reason": PAGE_UNREADABLE_REASON,
+            },
+        }
+    return _page_summary(normalize_collection(payload))
+
+
 def _page_summary(normalized: dict[str, Any]) -> dict[str, Any]:
     """Add the list_audiences-style completeness keys to a collection summary."""
     has_more = bool(normalized["paging"].get("next"))
@@ -239,7 +264,7 @@ async def list_datasets(
         fields=normalize_field_list(fields) or DATASET_SUMMARY_FIELDS,
         params=_page_params(limit, after),
     )
-    normalized = _page_summary(normalize_collection(payload))
+    normalized = _listing_page(payload)
     normalized["summary"]["scope"] = scope
     return normalized
 
@@ -305,6 +330,10 @@ async def get_dataset_stats(
     stop_reason: str | None = None
     seen_cursors: set[str] = set()
     seen_pages: set[str] = set()
+    # Hours, and counts within an hour, that could not be read: each could hold events that the
+    # totals would otherwise silently leave out.
+    unreadable_hours = 0
+    unreadable_counts = 0
     while True:
         if pages >= MAX_STATS_PAGES:
             stop_reason = f"Stopped after {pages} pages of hourly stats."
@@ -315,18 +344,30 @@ async def get_dataset_stats(
             seen_cursors.add(cursor)
         payload = await client.list_objects(dataset_id, "stats", params=params)
         pages += 1
-        buckets = payload.get("data") or []
-        if buckets:
-            fingerprint = _page_fingerprint(buckets)
+        buckets, bad_buckets, page_unreadable = read_collection_page(payload)
+        if page_unreadable:
+            stop_reason = "Meta returned a page of hourly stats without a readable data list."
+            break
+        unreadable_hours += bad_buckets
+        if buckets or bad_buckets:
+            fingerprint = _page_fingerprint(payload["data"])
             if fingerprint in seen_pages:
                 stop_reason = "Meta returned a page that had already been read; it was not counted again."
                 break
             seen_pages.add(fingerprint)
         for bucket in buckets:
+            bucket_rows, bad_rows, bucket_unreadable = read_collection_page(bucket)
+            if bucket_unreadable:
+                unreadable_hours += 1
+                continue
+            unreadable_counts += bad_rows
             rows = []
-            for row in bucket.get("data") or []:
+            for row in bucket_rows:
+                count = to_int(row.get("count"))
+                if count is None:
+                    unreadable_counts += 1
+                    continue
                 value = str(row.get("value"))
-                count = to_int(row.get("count")) or 0
                 totals[value] = totals.get(value, 0) + count
                 rows.append({"value": value, "count": count})
             if bucket.get("start_time") is not None:
@@ -339,6 +380,15 @@ async def get_dataset_stats(
             break
         if stop_reason is not None:
             break
+    if unreadable_hours or unreadable_counts:
+        complete = False
+        unread = []
+        if unreadable_hours:
+            unread.append(f"{unreadable_hours} hourly entr{'y' if unreadable_hours == 1 else 'ies'} without a readable data list")
+        if unreadable_counts:
+            unread.append(f"{unreadable_counts} row(s) without a readable count")
+        unread_reason = f"Meta returned {' and '.join(unread)}; the events in them are not in the totals."
+        stop_reason = f"{stop_reason} {unread_reason}" if stop_reason else unread_reason
 
     items = [
         {"value": value, "count": count}
@@ -353,11 +403,15 @@ async def get_dataset_stats(
         "pages_fetched": pages,
         "complete": complete,
     }
+    if unreadable_hours:
+        summary["unreadable_hours"] = unreadable_hours
+    if unreadable_counts:
+        summary["unreadable_counts"] = unreadable_counts
     if not complete:
         summary["stop_reason"] = stop_reason
         summary["note"] = (
-            f"Incomplete: {stop_reason} Totals cover only the {pages} pages read, each counted once. "
-            "Narrow the window to read the rest."
+            f"Incomplete: {stop_reason} Totals cover only the readable rows of the {pages} pages read, each "
+            "counted once, so the true totals may be higher. Narrow the window to read the rest."
         )
     response: dict[str, Any] = {
         "scope": {
@@ -441,12 +495,39 @@ def _offline_quality_event(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _quality_rows(payload: dict[str, Any], key: str) -> tuple[list[dict[str, Any]], str | None]:
+    """The event rows under one channel, and what could not be read of them.
+
+    Meta leaves the channel out when it has no data for it. A channel that is present but not
+    a list, or entries that are not objects, could hold weak events, so they are reported,
+    never read as no data.
+    """
+    if key not in payload or payload[key] is None:
+        return [], None
+    value = payload[key]
+    if not isinstance(value, list):
+        return [], (
+            f"Meta returned the {key} quality data in a shape this server cannot read, so whether any "
+            "event is below the thresholds is unknown."
+        )
+    rows = [row for row in value if isinstance(row, dict)]
+    bad = len(value) - len(rows)
+    if bad:
+        return rows, (
+            f"Meta returned {bad} {key} event entr{'y' if bad == 1 else 'ies'} that could not be read (not an "
+            "object), so they were not scored and could be below the thresholds."
+        )
+    return rows, None
+
+
 def _offline_quality_response(payload: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any]:
-    rows = payload.get("offline") or []
-    events = [_offline_quality_event(row) for row in rows if isinstance(row, dict)]
+    rows, unreadable = _quality_rows(payload, "offline")
+    events = [_offline_quality_event(row) for row in rows]
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
-    if not events:
+    if unreadable is not None:
+        missing.append(unreadable)
+    elif not events:
         missing.append(
             "Meta returned no offline data quality for this dataset; the offline channel only scores "
             "datasets that receive offline events."
@@ -511,11 +592,13 @@ async def get_dataset_quality(
         return _offline_quality_response(
             payload, {"dataset_id": dataset_id, "channel": "offline", "agent_name": agent_name},
         )
-    rows = payload.get("web") or []
-    events = [_quality_event(row) for row in rows if isinstance(row, dict)]
+    rows, unreadable = _quality_rows(payload, "web")
+    events = [_quality_event(row) for row in rows]
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
-    if not events:
+    if unreadable is not None:
+        missing.append(unreadable)
+    elif not events:
         missing.append(
             "Meta returned no web event quality data for this dataset; event match quality "
             "is only computed for web events that received server (Conversions API) events."
@@ -582,4 +665,4 @@ async def list_custom_conversions(
         fields=normalize_field_list(fields) or CUSTOM_CONVERSION_FIELDS,
         params=_page_params(limit, after),
     )
-    return _page_summary(normalize_collection(payload))
+    return _listing_page(payload)

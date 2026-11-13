@@ -405,7 +405,7 @@ def test_set_catalog_access_reads_current_access_first_and_returns_before_and_af
     assert methods.index("create_edge_object") > 0
     write = client.writes()[0]
     assert (write["parent_id"], write["edge"]) == (CATALOG, "assigned_users")
-    assert write["data"] == {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE", "MANAGE"]}
+    assert write["data"] == {"user": PERSON, "tasks": ["ADVERTISE", "MANAGE"]}
     assert result["previous"]["tasks"] == ["ADVERTISE"]
     assert result["current"]["tasks"] == ["ADVERTISE", "MANAGE"]
     assert result["change"] == "increase"
@@ -427,7 +427,7 @@ def test_set_catalog_access_removal_states_what_is_lost_and_deletes(monkeypatch)
     result = run(business_access.set_catalog_access(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON, tasks=[]))
     write = client.writes()[0]
     assert write["method"] == "delete_edge_object"
-    assert write["data"] == {"user": PERSON, "business": BUSINESS}
+    assert write["data"] == {"user": PERSON}
     assert result["change"] == "remove"
     assert set(result["can_no_longer"]) == {"MANAGE", "ADVERTISE"}
     assert "can no longer" in result["warnings"][0]
@@ -495,7 +495,7 @@ def test_set_catalog_access_dry_run_sends_nothing(monkeypatch) -> None:
     assert result["sent"] is False and result["dry_run"] is True
     assert result["would_send"] == {
         "method": "POST", "path": f"{CATALOG}/assigned_users",
-        "data": {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE"]},
+        "data": {"user": PERSON, "tasks": ["ADVERTISE"]},
     }
     assert result["previous"]["tasks"] == ["MANAGE"]
 
@@ -1009,11 +1009,11 @@ def test_person_call_without_user_type_sends_the_same_request_as_before(monkeypa
     ))
     assert [(w["method"], w["parent_id"], w["edge"], w["data"]) for w in client.writes()] == [
         ("create_edge_object", CATALOG, "assigned_users",
-         {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE", "MANAGE"]}),
+         {"user": PERSON, "tasks": ["ADVERTISE", "MANAGE"]}),
     ]
     assert result["request_sent"] == {
         "method": "POST", "path": f"{CATALOG}/assigned_users",
-        "data": {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE", "MANAGE"]},
+        "data": {"user": PERSON, "tasks": ["ADVERTISE", "MANAGE"]},
     }
     assert "verified_live" not in result and "meta_response" not in result
     assert not client.reads_of("agencies")
@@ -1637,3 +1637,276 @@ def test_name_search_with_a_non_object_row_is_not_complete(monkeypatch) -> None:
     result = run(business_access.list_businesses(name_contains="acme"))
     assert [item["id"] for item in result["items"]] == ["1"]
     assert result["summary"]["complete"] is False
+
+
+# R13 (review R1): a page without a readable data list is never an empty, complete read ---------
+
+UNREADABLE_PAGES = [
+    pytest.param({}, id="no-data"),
+    pytest.param({"data": None}, id="null-data"),
+    pytest.param({"data": "x"}, id="data-not-a-list"),
+    pytest.param({"data": {"id": PERSON}}, id="data-an-object"),
+]
+
+
+class R1AccessClient:
+    """Reviewer reproduction client: one edge answers without a data list."""
+
+    def __init__(self, missing_data_at):
+        self.missing_data_at = missing_data_at
+        self.writes = []
+
+    async def get_object(self, object_id, **kwargs):
+        return {"id": "99"}
+
+    async def list_objects(self, parent_id, edge, **kwargs):
+        if edge == "business_users":
+            if self.missing_data_at == "caller":
+                return {}
+            return {"data": [{"id": "30", "business": {"id": "40"}}]}
+        if self.missing_data_at == "recipient":
+            return {}
+        return {"data": [{"id": "30", "tasks": ["MANAGE"], "permitted_tasks": ["MANAGE"]}]}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.writes.append(("POST", parent_id, edge, data))
+        return {"success": True}
+
+    async def delete_edge_object(self, parent_id, edge, *, data):
+        self.writes.append(("DELETE", parent_id, edge, data))
+        return {"success": True}
+
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+@pytest.mark.parametrize("preview", [False, True])
+def test_r1_missing_assignment_data_is_unknown_and_prevents_a_write(monkeypatch, kind, preview) -> None:
+    fake = R1AccessClient("recipient")
+    monkeypatch.setattr(business_access, "get_graph_api_client", lambda: fake)
+    arguments = dict(catalog_id="10", user_id="30", tasks=["ADVERTISE"], user_type=kind)
+    if kind == "PERSON":
+        arguments["business_id"] = "20"
+    if preview:
+        result = run(business_access.preview_catalog_access_change(**arguments))
+        assert result["would_be_refused"] is True, result
+        assert result["current_access_read"]["complete"] is False
+    else:
+        with pytest.raises(ValidationError):
+            run(business_access.set_catalog_access(**arguments))
+        assert fake.writes == []
+
+
+def test_r1_missing_caller_business_users_does_not_clear_self_removal(monkeypatch) -> None:
+    fake = R1AccessClient("caller")
+    monkeypatch.setattr(business_access, "get_graph_api_client", lambda: fake)
+    with pytest.raises(ValidationError):
+        run(business_access.set_catalog_access("10", "30", [], business_id="20"))
+    assert fake.writes == []
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+@pytest.mark.parametrize("tasks", [["ADVERTISE"], ["MANAGE", "ADVERTISE"], []])
+def test_unreadable_access_page_makes_current_access_unknown_and_refuses(monkeypatch, payload, kind, tasks) -> None:
+    edge = "assigned_users" if kind == "PERSON" else "agencies"
+    recipient = PERSON if kind == "PERSON" else PARTNER
+    business = {"business_id": BUSINESS} if kind == "PERSON" else {}
+    client = _use(monkeypatch, FakeClient(
+        objects={"me": {"id": "100"}},
+        edges={
+            (CATALOG, edge): payload,
+            ("me", "business_users"): {"data": [{"id": CALLER, "business": {"id": OTHER_BUSINESS}}]},
+        },
+    ))
+    preview = run(business_access.preview_catalog_access_change(CATALOG, recipient, tasks, user_type=kind, **business))
+    assert preview["change"] == "unknown"
+    assert preview["would_be_refused"] is True and preview["would_send"] is None
+    assert preview["previous"]["tasks"] is None and preview["previous"]["has_direct_access"] is None
+    assert preview["current_access_read"]["complete"] is False
+    assert "readable data list" in preview["current_access_read"]["incomplete_reason"]
+    assert "could not be read completely" in preview["refusal_reason"]
+    with pytest.raises(ValidationError, match="could not be read completely"):
+        run(business_access.set_catalog_access(CATALOG, recipient, tasks, user_type=kind, **business))
+    with pytest.raises(ValidationError, match="could not be read completely"):
+        run(business_access.set_catalog_access(CATALOG, recipient, tasks, user_type=kind, dry_run=True, **business))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+def test_unreadable_second_access_page_makes_an_absent_recipient_unknown(monkeypatch, kind) -> None:
+    edge, key = ("assigned_users", "tasks") if kind == "PERSON" else ("agencies", "permitted_tasks")
+    recipient = PERSON if kind == "PERSON" else PARTNER
+    business = {"business_id": BUSINESS} if kind == "PERSON" else {}
+    pages = {None: _page([{"id": "1", key: ["ADVERTISE"]}], "p2", more=True), "p2": {"data": None}}
+    client = _use(monkeypatch, FakeClient(edges={(CATALOG, edge): lambda p: pages[p.get("after")]}))
+    preview = run(business_access.preview_catalog_access_change(CATALOG, recipient, ["ADVERTISE"], user_type=kind, **business))
+    assert preview["change"] == "unknown" and preview["would_be_refused"] is True
+    assert preview["current_access_read"]["requests"] == 2
+    with pytest.raises(ValidationError, match="could not be read completely"):
+        run(business_access.set_catalog_access(CATALOG, recipient, ["ADVERTISE"], user_type=kind, **business))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+def test_repeated_cursor_before_the_recipient_is_found_refuses(monkeypatch, kind) -> None:
+    """A repeated cursor ends the read as incomplete: an absent recipient is unknown, not new."""
+    edge, key = ("assigned_users", "tasks") if kind == "PERSON" else ("agencies", "permitted_tasks")
+    recipient = PERSON if kind == "PERSON" else PARTNER
+    business = {"business_id": BUSINESS} if kind == "PERSON" else {}
+    client = _use(monkeypatch, FakeClient(edges={
+        (CATALOG, edge): lambda p: _page([{"id": "1", key: ["ADVERTISE"]}], "same", more=True),
+    }))
+    preview = run(business_access.preview_catalog_access_change(CATALOG, recipient, ["ADVERTISE"], user_type=kind, **business))
+    assert preview["change"] == "unknown" and preview["would_be_refused"] is True
+    assert "same page cursor" in preview["current_access_read"]["incomplete_reason"]
+    assert preview["current_access_read"]["requests"] == 2
+    with pytest.raises(ValidationError, match="could not be read completely"):
+        run(business_access.set_catalog_access(CATALOG, recipient, ["ADVERTISE"], user_type=kind, **business))
+    assert client.writes() == []
+
+
+def test_recipient_found_on_a_page_whose_cursor_repeats_is_still_known(monkeypatch) -> None:
+    """The rows of a page Meta answered are kept; only the repeated cursor is not followed."""
+    pages = {
+        None: _page([{"id": "1", "tasks": ["ADVERTISE"]}], "p2", more=True),
+        "p2": _page([{"id": PERSON, "tasks": ["ADVERTISE"]}], "p2", more=True),
+    }
+    client = _access_client(["ADVERTISE"])
+    client.edges[(CATALOG, "assigned_users")] = lambda p: pages[p.get("after")]
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
+    assert preview["change"] == "no_change" and preview["current_access_read"]["complete"] is True
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_unreadable_caller_business_users_keeps_the_manage_guard(monkeypatch, payload) -> None:
+    client = _access_client(["MANAGE"])
+    client.edges[("me", "business_users")] = payload
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
+    assert preview["self_check"] == {"checked": True, "is_caller": None}
+    assert preview["would_be_refused"] is True and "cannot confirm" in preview["refusal_reason"]
+    with pytest.raises(ValidationError, match="cannot confirm"):
+        run(business_access.set_catalog_access(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
+    assert client.writes() == []
+
+
+def test_unreadable_second_caller_page_does_not_clear_self_removal(monkeypatch) -> None:
+    client = _access_client(["MANAGE"])
+    pages = {None: _page([{"id": CALLER, "business": {"id": BUSINESS}}], "p2", more=True), "p2": {}}
+    client.edges[("me", "business_users")] = lambda p: pages[p.get("after")]
+    _use(monkeypatch, client)
+    with pytest.raises(ValidationError, match="cannot confirm"):
+        run(business_access.set_catalog_access(CATALOG, PERSON, [], business_id=BUSINESS))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_unreadable_caller_businesses_refuse_partner_removal(monkeypatch, payload) -> None:
+    client = _partner_client(["ADVERTISE"])
+    client.edges[("me", "business_users")] = payload
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PARTNER, [], user_type="AGENCY"))
+    assert preview["self_check"] == {"checked": True, "is_caller_business": None}
+    assert preview["would_be_refused"] is True
+    with pytest.raises(ValidationError, match="cannot confirm"):
+        run(business_access.set_catalog_access(CATALOG, PARTNER, [], user_type="AGENCY"))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+def test_unreadable_read_back_is_not_verified(monkeypatch, kind) -> None:
+    if kind == "PERSON":
+        client = _access_client(["ADVERTISE"])
+        call = dict(catalog_id=CATALOG, user_id=PERSON, tasks=["ADVERTISE", "MANAGE"], business_id=BUSINESS)
+        edge = "assigned_users"
+    else:
+        client = _partner_client(["ADVERTISE"])
+        call = dict(catalog_id=CATALOG, user_id=PARTNER, tasks=["ADVERTISE", "MANAGE"], user_type="AGENCY")
+        edge = "agencies"
+    original = client.create_edge_object
+
+    async def create(parent_id, edge_name, *, data, files=None):
+        result = await original(parent_id, edge_name, data=data, files=files)
+        client.edges[(CATALOG, edge)] = {}
+        return result
+
+    client.create_edge_object = create
+    _use(monkeypatch, client)
+    result = run(business_access.set_catalog_access(**call))
+    assert result["sent"] is True and result["verified"] is False
+    assert "readable data list" in result["warnings"][-1]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_one_person_and_one_partner_checks_are_unknown_on_an_unreadable_page(monkeypatch, payload) -> None:
+    _use(monkeypatch, FakeClient(edges={(CATALOG, "assigned_users"): payload, (CATALOG, "agencies"): payload}))
+    person = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON))
+    assert person["access_status"] == "UNKNOWN" and person["summary"]["complete"] is False
+    assert "readable data list" in person["summary"]["incomplete_reason"]
+    partner = run(business_access.list_catalog_partners(catalog_id=CATALOG, partner_id=PARTNER))
+    assert partner["share_status"] == "UNKNOWN" and partner["item"]["permitted_tasks"] is None
+    assert partner["summary"]["complete"] is False
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_plain_listings_do_not_call_an_unreadable_page_complete(monkeypatch, payload) -> None:
+    _use(monkeypatch, FakeClient(edges={
+        ("me", "businesses"): payload,
+        (BUSINESS, "business_users"): payload,
+        (CATALOG, "assigned_users"): payload,
+        (CATALOG, "agencies"): payload,
+        (PERSON, "assigned_product_catalogs"): payload,
+    }))
+    results = [
+        run(business_access.list_businesses()),
+        run(business_access.list_business_users(business_id=BUSINESS)),
+        run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS)),
+        run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, user_type="AGENCY")),
+        run(business_access.list_catalog_partners(catalog_id=CATALOG)),
+        run(business_access.list_user_assigned_catalogs(user_id=PERSON)),
+    ]
+    for result in results:
+        assert result["items"] == []
+        assert result["summary"]["complete"] is False, result
+        assert "readable data list" in result["summary"]["incomplete_reason"]
+    assert "notes" not in results[0], "an unreadable page is not 'Meta returned no businesses'"
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_searches_do_not_call_an_unreadable_page_complete(monkeypatch, payload) -> None:
+    _use(monkeypatch, FakeClient(edges={
+        ("me", "businesses"): payload, (BUSINESS, "business_users"): payload, (CATALOG, "agencies"): payload,
+    }))
+    results = [
+        run(business_access.list_businesses(name_contains="acme")),
+        run(business_access.list_business_users(business_id=BUSINESS, search="jordan")),
+        run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, user_type="AGENCY", user_id=PARTNER)),
+        run(business_access.list_catalog_partners(catalog_id=CATALOG, search="agency")),
+    ]
+    for result in results:
+        assert result["items"] == []
+        assert result["summary"]["complete"] is False, result
+        assert "readable data list" in result["summary"]["incomplete_reason"]
+    assert "notes" not in results[0]
+
+
+def test_plain_listing_counts_rows_that_are_not_objects(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={(BUSINESS, "business_users"): _page([{"id": "1", "name": "A"}, None, "x"])}))
+    result = run(business_access.list_business_users(business_id=BUSINESS))
+    assert [item["id"] for item in result["items"]] == ["1"]
+    assert result["summary"]["unreadable_rows"] == 2 and result["summary"]["complete"] is False
+    assert "not objects" in result["summary"]["incomplete_reason"]
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_partner_catalog_scan_with_unreadable_pages_is_incomplete(monkeypatch, payload) -> None:
+    _use(monkeypatch, FakeClient(edges={(BUSINESS, "owned_product_catalogs"): payload}))
+    owned = run(business_access.list_user_assigned_catalogs(user_id="77", user_type="AGENCY", business_id=BUSINESS))
+    assert owned["items"] == [] and owned["summary"]["complete"] is False
+    assert "readable data list" in owned["summary"]["incomplete_reason"]
+    _use(monkeypatch, FakeClient(edges={
+        (BUSINESS, "owned_product_catalogs"): _page([{"id": "1", "name": "A"}]), ("1", "agencies"): payload,
+    }))
+    partner = run(business_access.list_user_assigned_catalogs(user_id="77", user_type="AGENCY", business_id=BUSINESS))
+    assert partner["items"] == [] and partner["summary"]["complete"] is False
+    assert "Catalog 1" in partner["summary"]["incomplete_reason"]
