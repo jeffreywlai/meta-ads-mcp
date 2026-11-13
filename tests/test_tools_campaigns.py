@@ -2707,6 +2707,26 @@ def test_create_ad_set_docstring_names_phone_call() -> None:
     assert "+" not in campaigns.create_ad_set.__doc__
 
 
+# Round six, K5 class: an unknown key inside a budget_schedule_specs period is counted, never
+# repeated, since a misplaced value (an email or a token) can arrive as a key.
+
+
+@pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])
+@pytest.mark.parametrize(("extra", "count"), [(1, "1 unknown key"), (2, "2 unknown keys")])
+def test_budget_schedule_unknown_keys_are_counted_not_repeated(monkeypatch, tool, extra, count) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    private = ["".join(("someone", f"{index}@example.invalid")) for index in range(extra)]
+    period = {**_GOOD_PERIOD, "budget_value_type": "MULTIPLIER", "budget_value": 140, **{key: "x" for key in private}}
+    base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
+    with pytest.raises(campaigns.ValidationError) as info:
+        asyncio.run(getattr(campaigns, tool)(**base, daily_budget=10, budget_schedule_specs=[period]))
+    message = str(info.value)
+    assert f"budget_schedule_specs[0] has {count}" in message
+    assert "one-time periods only" in message
+    assert "time_start, time_end, budget_value and budget_value_type" in message
+    assert not any(key in message for key in private)
+
+
 # Round six, K7. update_adset has always had start_time and end_time as named parameters, so
 # neither is accepted inside params: a mixed call (one bound named, the other inside params) is
 # refused before any request, pointing at the named parameter. It is never checked against a

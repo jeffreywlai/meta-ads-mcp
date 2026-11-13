@@ -154,7 +154,7 @@ def test_create_ad_rejects_conflicting_creative_inputs(monkeypatch) -> None:
 
 def test_create_ad_rejects_ignored_nested_creative_fields(monkeypatch) -> None:
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
-    with pytest.raises(ads.ValidationError, match="unexpected fields"):
+    with pytest.raises(ads.ValidationError, match="1 unknown key") as info:
         asyncio.run(
             ads.create_ad(
                 account_id="123",
@@ -163,6 +163,7 @@ def test_create_ad_rejects_ignored_nested_creative_fields(monkeypatch) -> None:
                 creative={"creative_id": "crt_1", "name": "would be ignored"},
             )
         )
+    assert "Accepted keys: creative_id, id" in str(info.value)
 
 
 @pytest.mark.parametrize(
@@ -952,3 +953,67 @@ def test_create_ad_docstring_names_the_round_four_fields() -> None:
     doc = ads.create_ad.__doc__
     assert "display_sequence" in doc and "engagement_audience" in doc
     assert "+" not in doc
+
+
+# Round six, K5: an unknown key in the creative alias is counted, never repeated, since a
+# misplaced value (an email or a token) can arrive as a key.
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_create_ad_private_body_error_counts_unknown_creative_keys(caplog, routed) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    secret = "".join(("private.person", "@creative.invalid"))
+    args = {"account_id": "10", "name": "A", "adset_id": "20", "creative": {secret: "x"}}
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as error:
+        asyncio.run(
+            mcp_server.call_tool("call_tool", {"name": "create_ad", "arguments": args}) if routed
+            else mcp_server.call_tool("create_ad", args)
+        )
+    assert secret not in str(error.value)
+    assert secret not in caplog.text
+    assert "1 unknown key" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("creative", "count"),
+    [
+        ({"creative_id": "1", "".join(("token", "-EAAB-synthetic")): "x"}, "1 unknown key"),
+        ({"".join(("a", "@b.invalid")): "x", "".join(("c", "@d.invalid")): "y"}, "2 unknown keys"),
+    ],
+)
+def test_create_ad_unknown_creative_keys_are_counted_before_any_call(monkeypatch, creative, count) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError) as info:
+        asyncio.run(ads.create_ad(**AD_BASE, creative=creative))
+    message = str(info.value)
+    assert count in message
+    assert "Accepted keys: creative_id, id" in message
+    assert not any(key in message for key in creative if key not in {"creative_id", "id"})
+
+
+def test_create_ad_creative_that_is_not_an_object_is_refused_without_repeating_it(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    text = "".join(("someone", "@example.invalid"))
+    with pytest.raises(ads.ValidationError) as info:
+        asyncio.run(ads.create_ad(**AD_BASE, creative=text))
+    assert "creative must be an object" in str(info.value)
+    assert "@" not in str(info.value)
+
+
+@pytest.mark.parametrize("creative", [{"creative_id": "crt_123"}, {"id": "crt_123"}, {"creative_id": "crt_123", "id": "crt_123"}])
+def test_create_ad_old_style_nested_creative_call_is_unchanged(monkeypatch, creative) -> None:
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    asyncio.run(ads.create_ad(**AD_BASE, creative=creative, validate_only=True))
+    assert client.calls == [
+        ("create", "act_123", "ads", {
+            "name": "Ad", "adset_id": "adset_123", "creative": {"creative_id": "crt_123"},
+            "status": "PAUSED", "execution_options": ["validate_only"],
+        }),
+    ]

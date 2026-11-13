@@ -54,6 +54,7 @@ VALID_AD_STATUSES = {"ACTIVE", "PAUSED"}
 UPDATABLE_AD_STATUSES = {"ACTIVE", "PAUSED", "ARCHIVED"}
 _OMITTED_PREVIOUS = "Meta returned no value for it; it may not have been set."
 _UNREAD_AD_PREVIOUS = "Not a field this server reads back from an ad."
+_CREATIVE_ALIAS_KEYS = ("creative_id", "id")
 
 
 def _append_image_candidate(
@@ -231,11 +232,15 @@ async def create_ad(
         )
     nested_creative_id: str | None = None
     if creative is not None:
-        unknown_keys = sorted(set(creative) - {"creative_id", "id"})
-        if unknown_keys:
+        if not isinstance(creative, dict):
+            raise ValidationError('creative must be an object such as {"creative_id": "123"}; or use creative_id.')
+        # Counted, never quoted: a misplaced value (an email or a token) can arrive as a key.
+        count = sum(1 for key in creative if key not in _CREATIVE_ALIAS_KEYS)
+        if count:
             raise ValidationError(
-                "creative accepts only creative_id or id when used as an alias; "
-                f"unexpected fields: {', '.join(unknown_keys)}."
+                "creative accepts only creative_id or id when used as an alias; it has "
+                f"{count} unknown {'key' if count == 1 else 'keys'} (not repeated here, since a misplaced "
+                f"value can arrive as a key). Accepted keys: {', '.join(_CREATIVE_ALIAS_KEYS)}."
             )
         nested_id = creative.get("id")
         nested_creative_value = creative.get("creative_id")
