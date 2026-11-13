@@ -342,8 +342,8 @@ Meta's reference documents, but Meta's live API answers that the endpoint is
 retired (tested 2026-11-13). The tool reports that plainly and says what to do
 instead.
 
-Of the 30 `partial` entries, 20 are open because no public API route is known
-for what Meta's own tool does, and 10 are built differently on purpose (for
+Of the 30 `partial` entries, 21 are open because no public API route is known
+for what Meta's own tool does, and 9 are built differently on purpose (for
 example, a stated rule in place of Meta's private detector, or rarely used ad
 set fields left to `params`). None is waiting to be built.
 

@@ -307,7 +307,7 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
     ),
     "ads_create_campaign": _partial(
         "create_campaign", "duplicate_campaign",
-        note="Meta's tool can also: Fixed-amount (ABSOLUTE) budget schedules, which ours switches off until Meta's unit is confirmed (BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED = False, campaigns.py:211-218; refused at :289-296). Staging into Ads Manager drafts [no public API route known, spec :39-40]. Every other field of Meta's tool is now named on ours: is_skadnetwork_attribution, campaign_optimization_type, is_using_l3_schedule, iterative_split_test_configs and topline_id were added (campaigns.py:458-462, checked at :335-350). Why this is open: Built differently: fixed-amount budget schedules switched off until Meta's unit is confirmed [drafts: no public API route known].",
+        note="Meta's tool can also: Staging into Ads Manager drafts [no public API route known, spec :39-40]. Fixed-amount (ABSOLUTE) budget schedules are offered: a live test on 2026-11-13 showed the value is in minor units, as the tool sends it. Every other field of Meta's tool is now named on ours: is_skadnetwork_attribution, campaign_optimization_type, is_using_l3_schedule, iterative_split_test_configs and topline_id were added (campaigns.py:458-462, checked at :335-350). Why this is open: No public API route known (Ads Manager drafts).",
     ),
     "ads_create_creative": _partial(
         "create_ad_creative_from_inputs", "create_ad_creative", "upload_creative_asset",
