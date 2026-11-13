@@ -32,9 +32,11 @@ from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 # The feed tools' masking: a URL password in a result or in a raised error's text
-# is replaced, keeping user, host and path. catalog_feeds imports nothing from here.
-from meta_ads_mcp.tools.catalog_feeds import _URL_LOGIN, _mask_error, _redact
-from meta_ads_mcp.url_secrets import refuse_url_credentials
+# is replaced, keeping user, host and path, and a password or token the caller supplied
+# is removed; the URL-login check on inputs is shared too. catalog_feeds imports nothing
+# from here.
+from meta_ads_mcp.tools.catalog_feeds import _count_keys, _guard_secrets, _redact
+from meta_ads_mcp.tools.catalog_feeds import _refuse_url_logins as _refuse_url_logins_shared
 
 # Fields documented on the Product Catalog reference page.
 CATALOG_FIELDS = ["id", "name", "vertical", "product_count", "feed_count", "is_catalog_segment"]
@@ -227,8 +229,9 @@ def _parse_filter(value: dict[str, Any] | str | None, *, name: str = "filter") -
     if isinstance(value, str):
         try:
             value = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ValidationError(f"{name} must be a JSON object, for example {{\"brand\": {{\"eq\": \"Acme\"}}}}.") from exc
+        except json.JSONDecodeError:
+            # The decoder's error holds the whole text; it is not chained to this one.
+            value = None
     if not isinstance(value, dict):
         raise ValidationError(f"{name} must be a JSON object, for example {{\"brand\": {{\"eq\": \"Acme\"}}}}.")
     return value
@@ -370,20 +373,12 @@ def _refuse_url_logins(value: Any, name: str) -> None:
     """Refuse a caller value holding a URL with a username or password, at any depth.
 
     Every string inside value is checked, whether it is the URL itself or text with
-    a URL in it (a description, a filter value), so a login cannot reach Meta,
-    where it would be stored and shown back. The message names the field, never
-    the URL.
+    a URL in it (a description, a filter value), and so is every mapping key, so a
+    login cannot reach Meta, where it would be stored and shown back. The message
+    names the location by parameter, index and key position (a key by name only when
+    it is a field name this module defines), never the URL or any other key.
     """
-    if isinstance(value, dict):
-        for key, item in value.items():
-            _refuse_url_logins(item, f"{name}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _refuse_url_logins(item, f"{name}[{index}]")
-    elif isinstance(value, str):
-        refuse_url_credentials(value, name)
-        if (match := _URL_LOGIN.search(value)) is not None:
-            refuse_url_credentials(value[match.start():].split()[0], name)
+    _refuse_url_logins_shared(value, name, _known_keys())
 
 
 def _refuse_url_logins_in(**values: Any) -> None:
@@ -397,23 +392,16 @@ def _shown(value: Any) -> Any:
 
 
 def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    """Run a tool so that neither its result nor an error it raises shows a password.
+    """Run a tool so that neither its result nor an error it raises shows a password or token.
 
     Every tool in this module goes through this, so a value read back from Meta
     (a stored product or checkout URL, a diagnostic, an error message) cannot
-    show a URL password, whichever field it arrives in.
+    show a URL password, whichever field or key it arrives in, and a password or
+    token the caller supplied (such as params.partner_integration.external_access_token)
+    is removed wherever Meta repeats it, in the result or in an error and every error
+    behind it.
     """
-
-    @functools.wraps(fn)
-    async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            result = await fn(*args, **kwargs)
-        except Exception as exc:
-            _mask_error(exc)
-            raise
-        return _shown(result)
-
-    return wrapper
+    return _guard_secrets(fn, _shown)
 
 
 def _row_identity(row: Any) -> str | None:
@@ -1657,6 +1645,11 @@ _BATCH_NAMED_FIELDS = {
     "brand": "brand", "availability": "availability", "condition": "condition",
     "price": "price", "sale_price": "sale_price",
 }
+# Request fields a caller must set through the item's named key, not through fields.
+_FIELDS_WITH_NAMED_KEY = {
+    **{batch: key for key, batch in _BATCH_NAMED_FIELDS.items()},
+    "id": "retailer_id", "image_link": "image_url", "currency": "currency",
+}
 # The guide's CREATE requirement for PRODUCT_ITEM: availability, brand, condition,
 # description, id, image, link, price, title.
 _BATCH_CREATE_REQUIRED = ("name", "description", "url", "image_url", "brand", "availability",
@@ -1698,6 +1691,23 @@ _BATCH_BASE_READ_FIELDS = [
     "condition", "url", "image_url", "brand", "visibility", "review_status",
 ]
 _FEED_FIELD = "product_feed"
+
+
+@functools.cache
+def _known_keys() -> frozenset[str]:
+    """Field names this module defines; only these may be named in a message about a nested key.
+
+    Any other key a caller sends is described by its position, since a misplaced value
+    (an email address, a URL with a login) can arrive as a key.
+    """
+    return frozenset({
+        *CATALOG_FIELDS, *CATALOG_UPDATE_READ_FIELDS, *CATALOG_EXTRA_READABLE, *_SECRET_SETTING_KEYS,
+        "partner_integration", *PRODUCT_DETAIL_FIELDS, *PRODUCT_READABLE_UPDATE_FIELDS,
+        *PRODUCT_SDK_READABLE_UPDATE_FIELDS, *PRODUCT_SET_FIELDS, *FILTER_OPERATORS, "and", "or",
+        "field", "operator", "value", *_BATCH_ITEM_KEYS, *_BATCH_NAMED_FIELDS.values(), *BATCH_EXTRA_FIELDS,
+    })
+
+
 _BATCH_RETRY_WHY = (
     "This tool reads the catalog before every write, so on a resend creates of SKUs that already exist "
     "and deletes of SKUs that are already gone are skipped, and updates send the same values again. "
@@ -1730,10 +1740,11 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
     # Every value, including image, video, additional image and app links nested
     # in fields, is checked before the catalog is read.
     _refuse_url_logins(item, label)
-    unknown = sorted(set(item) - _BATCH_ITEM_KEYS)
+    # Unknown keys are counted, never named: a misplaced value can arrive as a key.
+    unknown = [key for key in item if key not in _BATCH_ITEM_KEYS]
     if unknown:
         raise ValidationError(
-            f"{label} has unsupported keys: {', '.join(unknown)}. Named keys: "
+            f"{label} has {_count_keys(len(unknown), 'unsupported key')} (not repeated here). Named keys: "
             f"{', '.join(sorted(_BATCH_ITEM_KEYS))}; other documented product fields go in fields."
         )
     method = str(item.get("method") or "").strip().lower()
@@ -1752,13 +1763,19 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
             raise ValidationError(f"{label}: a delete takes only retailer_id.")
         return {"method": method, "retailer_id": retailer_id,
                 "request": {"method": "DELETE", "data": {"id": retailer_id}}, "changes": {}}
-    for key in extra:
-        if key in _BATCH_NAMED_FIELDS.values() or key in {"id", "image_link", "currency"}:
-            raise ValidationError(f"{label}.fields.{key}: use the item's named key for this field instead.")
-        if key not in BATCH_EXTRA_FIELDS:
-            raise ValidationError(
-                f"{label}.fields.{key} is not a PRODUCT_ITEM field Meta's batch documentation lists."
-            )
+    # A key is named only when it is one of this module's own field names; any other key
+    # is counted, since a misplaced value can arrive as a key.
+    named_here = [key for key in extra if key in _FIELDS_WITH_NAMED_KEY]
+    if named_here:
+        listed = ", ".join(f"{key} (use {_FIELDS_WITH_NAMED_KEY[key]})" for key in named_here)
+        raise ValidationError(f"{label}.fields: use the item's named key instead for {listed}.")
+    unknown_fields = [key for key in extra if key not in BATCH_EXTRA_FIELDS]
+    if unknown_fields:
+        raise ValidationError(
+            f"{label}.fields has {_count_keys(len(unknown_fields), 'key')} that Meta's batch documentation does "
+            f"not list as a PRODUCT_ITEM field (not repeated here). Accepted fields: "
+            f"{', '.join(sorted(BATCH_EXTRA_FIELDS))}."
+        )
     if method == "create":
         missing = [key for key in _BATCH_CREATE_REQUIRED if values.get(key) in (None, "")]
         if missing:
@@ -2060,6 +2077,14 @@ def _settle(
         )
 
 
+def _unreadable_handles_reason(unreadable: int, returned: int) -> str:
+    return (
+        f"Meta returned {returned} batch handle entr{'y' if returned == 1 else 'ies'} and {unreadable} of them "
+        "could not be read as a handle, so the part of the batch they stand for could not be checked and no "
+        "item can be called applied. Read the products before resending."
+    )
+
+
 def _retry_statement(outcomes: set[str], handles: list[str] | str | None) -> dict[str, Any]:
     if isinstance(handles, str):
         handles = [handles]
@@ -2240,11 +2265,15 @@ async def batch_update_catalog_products(
     if not isinstance(items, list) or not 1 <= len(items) <= BATCH_MAX_ITEMS:
         raise ValidationError(f"items must hold 1 to {BATCH_MAX_ITEMS} products per call; split larger edits.")
     entries = [_batch_entry(index, item) for index, item in enumerate(items)]
-    seen: set[str] = set()
-    for entry in entries:
+    seen: dict[str, int] = {}
+    for index, entry in enumerate(entries):
         if entry["retailer_id"] in seen:
-            raise ValidationError(f"retailer_id {entry['retailer_id']!r} appears more than once; send one item per SKU.")
-        seen.add(entry["retailer_id"])
+            # Positions, not the value: a retailer_id can be a misplaced personal value.
+            raise ValidationError(
+                f"items[{seen[entry['retailer_id']]}] and items[{index}] have the same retailer_id, so it "
+                "appears more than once; send one item per SKU."
+            )
+        seen[entry["retailer_id"]] = index
 
     client = get_graph_api_client()
     current = await _read_batch_products(client, catalog_id, entries)
@@ -2320,6 +2349,7 @@ async def batch_update_catalog_products(
                      "here are not held in staging; use create_catalog_product for one that must start hidden.")
     handles: list[str] = []
     tracks: dict[str, dict[str, Any]] = {}
+    unreadable_handles = 0
 
     if dry_run:
         for item in to_send:
@@ -2366,14 +2396,22 @@ async def batch_update_catalog_products(
                 }
             raw_handles = posted.get("handles")
             raw_handles = raw_handles if isinstance(raw_handles, list) else _entry_list(raw_handles)
+            # Meta documents handles as strings. Any other entry (an object, null, true, a
+            # list, a number, blank text) is a handle that cannot be checked; it is counted,
+            # and while one exists no item can be called applied.
             handles = list(dict.fromkeys(
-                text for value in raw_handles
-                if value is not None and not isinstance(value, (dict, list, bool)) and (text := str(value).strip())
+                value.strip() for value in raw_handles if isinstance(value, str) and value.strip()
             ))
-            if not handles:
+            unreadable_handles = sum(1 for value in raw_handles if not (isinstance(value, str) and value.strip()))
+            if not handles and not unreadable_handles:
                 for item in to_send:
                     item["outcome"] = "not_applied"
                     item["reason"] = "Meta returned no batch handle, which it documents as meaning nothing was ingested."
+            elif not handles:
+                for item in to_send:
+                    item["outcome"] = "outcome_unknown"
+                    item["reason"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))
+                response["batch"] = {"complete": False, "handles": [], "unreadable_handles": unreadable_handles}
             else:
                 tracks = await _poll_handles(client, catalog_id, handles, wait_seconds)
                 finished_rows = [track["row"] for track in tracks.values() if _is_finished(track["row"])]
@@ -2390,10 +2428,17 @@ async def batch_update_catalog_products(
                 for item in to_send:
                     _settle(item, finished_rows, unfinished_reason=unfinished_reason,
                             unattributed_submission_errors=len(unattributed))
+                    if unreadable_handles and item["outcome"] == "applied":
+                        item["outcome"] = "outcome_unknown"
+                        item["reason"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))
     for item in to_send:
         item.pop("request", None)
     if handles:
         response["batch"] = _batch_view(handles, tracks)
+        if unreadable_handles:
+            response["batch"]["unreadable_handles"] = unreadable_handles
+            response["batch"]["complete"] = False
+            response["batch"]["unreadable_note"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))
     outcomes = Counter(item["outcome"] for item in results)
     response["summary"] = {
         "submitted": len(results),
@@ -2419,8 +2464,9 @@ def _filter_condition(index: int, condition: Any) -> dict[str, Any]:
         raise ValidationError(f"{label}.field must be a nonblank product field name such as brand.")
     operator = str(condition.get("operator") or "").strip().lower()
     if operator not in FILTER_OPERATORS:
+        # The value given is not repeated: it can be a misplaced personal value.
         raise ValidationError(
-            f"{label}.operator {condition.get('operator')!r} is not accepted. "
+            f"{label}.operator is not one Meta's product set filter accepts. "
             f"Accepted operators: {', '.join(FILTER_OPERATORS)}."
         )
     if "value" not in condition:

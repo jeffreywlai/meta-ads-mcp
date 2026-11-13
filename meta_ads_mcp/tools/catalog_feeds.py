@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Annotated, Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 from pydantic import WithJsonSchema
 
@@ -26,6 +27,7 @@ from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 UPLOAD_FIELDS = [
     "id",
@@ -146,6 +148,8 @@ SCHEDULE_KEYS = (
     "password",
 )
 SCHEDULE_URL_SCHEMES = ("http", "https", "ftp")
+# Names a message about a nested params key may show; any other key is given by position.
+_FEED_KNOWN_KEYS = frozenset({*FEED_READABLE_FIELDS, *FEED_OPTIONAL_FIELDS, *SCHEDULE_KEYS})
 # ProductFeed options, with the values Meta's reference documents for
 # POST /{product_catalog_id}/product_feeds and POST /{product_feed_id}. The value sent
 # is the SDK 26.0.2 enum value (facebook_business/adobjects/productfeed.py).
@@ -206,7 +210,6 @@ FEED_FILE_TYPES = {
 }
 # This server's own limit on a local feed file read into memory; Meta publishes none.
 MAX_FEED_FILE_BYTES = 100 * 1024 * 1024
-_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
 # The login part of scheme://user:password@host anywhere in a string. It runs greedily to
 # the last @ before the path, query or fragment, which is where a URL parser ends the
 # login. A user name may itself contain @ (an email address), and a password may contain
@@ -243,6 +246,11 @@ def _require_id(value: str | None, name: str) -> str:
     if normalized is None:
         raise ValidationError(f"{name} is required.")
     return normalized
+
+
+def _count_keys(count: int, noun: str) -> str:
+    """'1 unsupported key', '3 unsupported keys': how a message counts keys it does not repeat."""
+    return f"{count} {noun}" + ("" if count == 1 else "s")
 
 
 def _validate_limit(limit: int) -> None:
@@ -408,17 +416,33 @@ def _mask_url_passwords(text: str) -> str:
     return _URL_LOGIN.sub(mask, text)
 
 
+def _distinct_key(shown: dict[Any, Any], key: Any) -> Any:
+    """key, or key with a number added when masking made it equal to a key already shown.
+
+    Two keys that differed only in a password become the same once it is masked; both
+    entries are kept, the later one as "<key> (2)", "<key> (3)" and so on.
+    """
+    if key not in shown or not isinstance(key, str):
+        return key
+    number = 2
+    while f"{key} ({number})" in shown:
+        number += 1
+    return f"{key} ({number})"
+
+
 def _redact(value: Any) -> Any:
     """Copy a response for display: any password key, and any password inside a URL, is masked.
 
     Every tool in this module returns through this function (see _secrets_masked), so a
-    new field that carries a URL, such as an upload's url, cannot be missed.
+    new field that carries a URL, such as an upload's url, cannot be missed. Keys are
+    masked as well as values, since Meta can return a map keyed by a URL.
     """
     if isinstance(value, dict):
-        return {
-            key: "[redacted]" if str(key).lower() == "password" and value[key] is not None else _redact(item)
-            for key, item in value.items()
-        }
+        shown: dict[Any, Any] = {}
+        for key, item in value.items():
+            masked = "[redacted]" if str(key).lower() == "password" and item is not None else _redact(item)
+            shown[_distinct_key(shown, _mask_text(key) if isinstance(key, str) else key)] = masked
+        return shown
     if isinstance(value, list):
         return [_redact(item) for item in value]
     if isinstance(value, tuple):
@@ -480,8 +504,145 @@ def _mask_error(exc: BaseException) -> None:
         pending.extend(getattr(current, "exceptions", None) or ())
 
 
-def _secrets_masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    """Run a tool so that neither its result nor an error it raises shows a password."""
+# Secrets a caller supplies (a feed or upload password, a catalog integration token) are
+# removed from any text a tool hands back. A secret this long or longer is removed wherever
+# it occurs; a shorter one only where it stands as a whole token (not inside a longer word),
+# so that a short password such as "abc" does not garble ordinary words around it.
+MIN_SECRET_SUBSTRING_LENGTH = 8
+_SECRET_SHOWN = "[redacted]"
+# An input key holding any of these (in any letter case) holds a secret; matches the
+# credential key parts errors.py strips from Meta's diagnostic data.
+_SECRET_KEY_PARTS = ("password", "secret", "token", "authorization", "credential", "api_key")
+
+
+def _secret_forms(secret: str) -> list[str]:
+    """A secret as given, trimmed, URL-encoded both ways and JSON-escaped: the ways an error can repeat it."""
+    forms = {secret, secret.strip()}
+    forms |= {quote(form, safe="") for form in list(forms)} | {quote_plus(form) for form in list(forms)}
+    forms |= {json.dumps(form)[1:-1] for form in list(forms)}
+    return [form for form in forms if form.strip()]
+
+
+def _caller_secrets(arguments: dict[str, Any]) -> list[str]:
+    """Every secret the caller supplied in this call, in each form an error could repeat it.
+
+    A secret is a string under a key (or parameter name) that names a password, token,
+    secret or authorization, at any depth, or the password of a URL login in any string.
+    """
+    found: set[str] = set()
+
+    def add_url_passwords(text: str) -> None:
+        if "@" in text and "://" in text:
+            for match in _URL_LOGIN.finditer(text):
+                _user, colon, password = match.group("login").partition(":")
+                if colon and password:
+                    found.add(password)
+
+    def visit(value: Any, key: Any = None) -> None:
+        if isinstance(key, str):
+            add_url_passwords(key)
+        if isinstance(value, str):
+            if isinstance(key, str) and any(part in key.lower() for part in _SECRET_KEY_PARTS) and value.strip():
+                found.add(value)
+            add_url_passwords(value)
+        elif isinstance(value, dict):
+            for inner_key, item in value.items():
+                visit(item, inner_key)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, key)
+
+    for name, value in arguments.items():
+        visit(value, name)
+    forms = {form for secret in found for form in _secret_forms(secret)}
+    return sorted(forms, key=len, reverse=True)
+
+
+def _scrub_text(text: str, secrets: list[str]) -> str:
+    for secret in secrets:
+        if secret not in text:
+            continue
+        if len(secret.strip()) >= MIN_SECRET_SUBSTRING_LENGTH:
+            text = text.replace(secret, _SECRET_SHOWN)
+        else:
+            text = re.sub(rf"(?<!\w){re.escape(secret)}(?!\w)", _SECRET_SHOWN, text)
+    return text
+
+
+def _scrub_value(value: Any, secrets: list[str]) -> Any:
+    """value with every known secret removed, from strings, mapping keys and values, lists and tuples."""
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        return _scrub_text(value, secrets)
+    if isinstance(value, dict):
+        shown: dict[Any, Any] = {}
+        for key, item in value.items():
+            shown[_distinct_key(shown, _scrub_value(key, secrets))] = _scrub_value(item, secrets)
+        return shown
+    if isinstance(value, list):
+        return [_scrub_value(item, secrets) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_value(item, secrets) for item in value)
+    return value
+
+
+def _scrub_known_secrets(exc: BaseException, secrets: list[str]) -> None:
+    """Remove known secrets from a raised error and every error behind it, in place.
+
+    Like _mask_error: every error reachable through __cause__, __context__ and exception
+    groups is cleaned (fields, args and notes), each once, so a cycle ends.
+    """
+    secrets = sorted({secret for secret in secrets if secret.strip()}, key=len, reverse=True)
+    if not secrets:
+        return
+    pending: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        for name in _error_attribute_names(current):
+            try:
+                value = getattr(current, name)
+            except AttributeError:
+                continue
+            if value is None or isinstance(value, BaseException):
+                continue
+            cleaned = _scrub_value(value, secrets)
+            if cleaned != value:
+                try:
+                    setattr(current, name, cleaned)
+                except (AttributeError, TypeError):
+                    pass
+        if current.args:
+            current.args = tuple(_scrub_value(arg, secrets) for arg in current.args)
+        notes = getattr(current, "__notes__", None)
+        if isinstance(notes, list):
+            current.__notes__ = [_scrub_value(note, secrets) for note in notes]
+        pending.extend([current.__cause__, current.__context__])
+        pending.extend(getattr(current, "exceptions", None) or ())
+
+
+def _call_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """The call's arguments by parameter name, however they were passed."""
+    try:
+        return dict(inspect.signature(fn).bind_partial(*args, **kwargs).arguments)
+    except TypeError:
+        return dict(kwargs)
+
+
+def _guard_secrets(
+    fn: Callable[..., Awaitable[Any]], show: Callable[[Any], Any],
+) -> Callable[..., Awaitable[Any]]:
+    """Run a tool so that neither its result nor an error it raises shows a password or token.
+
+    show masks the result (password keys and URL passwords); an error is masked the same
+    way. Then every secret the caller supplied in this call is removed from both, so a
+    secret Meta repeats as plain text in an error message cannot reach the response or a
+    traceback log.
+    """
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -489,10 +650,50 @@ def _secrets_masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitabl
             result = await fn(*args, **kwargs)
         except Exception as exc:
             _mask_error(exc)
+            _scrub_known_secrets(exc, _caller_secrets(_call_arguments(fn, args, kwargs)))
             raise
-        return _redact(result)
+        return _scrub_value(show(result), _caller_secrets(_call_arguments(fn, args, kwargs)))
 
     return wrapper
+
+
+def _secrets_masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Run a tool so that neither its result nor an error it raises shows a password."""
+    return _guard_secrets(fn, _redact)
+
+
+def _key_label(key: Any, position: int, known_keys: frozenset[str]) -> str:
+    """A key as a message may show it: its name when it is one this server defines, else its position."""
+    return f".{key}" if isinstance(key, str) and key in known_keys else f"[key #{position}]"
+
+
+def _refuse_url_logins(value: Any, name: str, known_keys: frozenset[str] = frozenset()) -> None:
+    """Refuse a caller value holding a URL with a username or password, at any depth.
+
+    Every string inside value is checked, whether it is the URL itself or text with
+    a URL in it (a description, a filter value), and so is every mapping key, so a
+    login cannot reach Meta, where it would be stored and shown back. The message
+    names the location by parameter, list index and key position, and names a key
+    only when it is one of known_keys (names this server defines); it never quotes
+    the URL or any other key.
+    """
+    if isinstance(value, dict):
+        for position, (key, item) in enumerate(value.items(), start=1):
+            label = f"{name}{_key_label(key, position, known_keys)}"
+            if isinstance(key, str):
+                _refuse_url_login_text(key, f"the name of key #{position} in {name}")
+            _refuse_url_logins(item, label, known_keys)
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _refuse_url_logins(item, f"{name}[{index}]", known_keys)
+    elif isinstance(value, str):
+        _refuse_url_login_text(value, name)
+
+
+def _refuse_url_login_text(text: str, name: str) -> None:
+    refuse_url_credentials(text, name)
+    if (match := _URL_LOGIN.search(text)) is not None:
+        refuse_url_credentials(text[match.start():].split()[0], name)
 
 
 def _bounded_int(value: Any, *, name: str, low: int, high: int | None) -> None:
@@ -514,13 +715,12 @@ def _normalize_schedule(value: Any, *, name: str) -> dict[str, Any]:
     """Validate a feed fetch schedule against Meta's ProductFeedSchedule fields."""
     if not isinstance(value, dict):
         raise ValidationError(f"{name} must be an object with url and interval.")
-    unknown = sorted(str(key) for key in set(value) - set(SCHEDULE_KEYS))
+    unknown = [key for key in value if key not in SCHEDULE_KEYS]
     if unknown:
-        # Name only key-like keys; anything else may be pasted data and is not quoted.
-        named = [key for key in unknown if _SAFE_KEY.match(key)]
-        listed = f": {', '.join(named)}" if len(named) == len(unknown) else ""
+        # Counted, never named: a misplaced key can be pasted data or a secret.
         raise ValidationError(
-            f"{name} has unsupported keys{listed}. Accepted keys: {', '.join(SCHEDULE_KEYS)}."
+            f"{name} has {_count_keys(len(unknown), 'unsupported key')} (not repeated here). "
+            f"Accepted keys: {', '.join(SCHEDULE_KEYS)}."
         )
     normalized = dict(value)
     normalized["url"] = _validate_http_url(
@@ -684,10 +884,14 @@ async def _read_upload_errors(
     Requests are capped by max_errors / UPLOAD_ERROR_PAGE_SIZE. The list is complete only when
     Meta's last page has no next link. A next page with no cursor, a cursor already read, or a
     page identical to one already read stops the read as incomplete, with the reason. When
-    samples were asked for and Meta refuses the first read, it is repeated without them.
+    samples were asked for and Meta refuses a page with them (error code 100), on any page,
+    that page and the rest are read without samples; the errors already read keep theirs,
+    and the response says after how many errors samples stopped.
     """
     fields = [*UPLOAD_ERROR_FIELDS, UPLOAD_ERROR_SAMPLE_FIELD] if include_samples else list(UPLOAD_ERROR_FIELDS)
     samples_unavailable: str | None = None
+    # How many errors had been read, with samples, when Meta first refused them.
+    sampled_before_refusal: int | None = None
     errors: list[dict[str, Any]] = []
     cursor = after
     cursors_read: set[str | None] = {cursor}
@@ -704,13 +908,21 @@ async def _read_upload_errors(
         try:
             payload = await client.list_objects(upload_id, "errors", fields=fields, params=params)
         except MetaApiError as error:
-            if not (include_samples and samples_unavailable is None and not errors and error.code == 100):
+            if not (include_samples and samples_unavailable is None and error.code == 100):
                 raise
             fields = list(UPLOAD_ERROR_FIELDS)
-            samples_unavailable = (
-                "Meta refused the samples part of the error read (error code 100), so the errors "
-                "were read again without samples and could not be read with one."
-            )
+            sampled_before_refusal = len(errors)
+            if errors:
+                samples_unavailable = (
+                    f"Meta refused the samples part of the error read (error code 100) after "
+                    f"{len(errors)} errors had been read with samples, so that page and the rest were "
+                    "read again without samples; errors read without one carry sample_unavailable."
+                )
+            else:
+                samples_unavailable = (
+                    "Meta refused the samples part of the error read (error code 100), so the errors "
+                    "were read again without samples and could not be read with one."
+                )
             payload = await client.list_objects(upload_id, "errors", fields=fields, params=params)
         page = normalize_collection(payload)
         if page["items"]:
@@ -722,7 +934,14 @@ async def _read_upload_errors(
                 )
                 break
             pages_read.add(fingerprint)
-        errors.extend(page["items"])
+        if include_samples and samples_unavailable is None:
+            errors.extend(_short_sample(row) if isinstance(row, dict) else row for row in page["items"])
+        elif sampled_before_refusal:
+            # Some errors in this response carry a sample, so say which ones cannot.
+            errors.extend({**row, "sample_unavailable": True} if isinstance(row, dict) else row
+                          for row in page["items"])
+        else:
+            errors.extend(page["items"])
         if not page["paging"].get("next"):
             complete = True
             break
@@ -748,8 +967,6 @@ async def _read_upload_errors(
             )
             break
         cursors_read.add(cursor)
-    if include_samples and samples_unavailable is None:
-        errors = [_short_sample(error) for error in errors]
     result: dict[str, Any] = {
         "errors": _sort_upload_errors(errors),
         "errors_complete": complete,
@@ -761,6 +978,7 @@ async def _read_upload_errors(
     if include_samples:
         if samples_unavailable:
             result["samples_unavailable"] = samples_unavailable
+            result["samples_unavailable_after_errors"] = sampled_before_refusal
         else:
             result["samples_note"] = (
                 "Each error carries one sample: the row number and the item's retailer id in the feed "
@@ -776,14 +994,31 @@ async def _upload_with_errors(
     max_errors: int = UPLOAD_ERROR_PAGE_SIZE,
     after: str | None = None,
     include_samples: bool = False,
+    requested_id: str | None = None,
 ) -> dict[str, Any]:
-    """Attach the upload's errors (by rows affected among those read) and a derived status."""
-    upload_id = _object_id(upload.get("id"))
+    """Attach the upload's errors (by rows affected among those read) and a derived status.
+
+    The errors are read by the id Meta returned, or by requested_id (the upload the caller
+    asked for) when Meta's row has none. Explicit zero error and warning counts mean there
+    are no errors to read. An upload with neither an id nor those zero counts gets
+    errors_complete=false with the reason, never an empty list called complete.
+    """
+    upload_id = _object_id(upload.get("id")) or requested_id
     item = {**upload, "status": _upload_status(upload)}
     error_count = to_int(upload.get("error_count"))
     warning_count = to_int(upload.get("warning_count"))
-    if upload_id is None or (error_count == 0 and warning_count == 0):
+    if error_count == 0 and warning_count == 0:
         item.update({"errors": [], "errors_complete": True})
+        return item
+    if upload_id is None:
+        item.update({
+            "errors": [],
+            "errors_complete": False,
+            "errors_stop_reason": (
+                "Meta returned this upload without an id, so its errors could not be read. Meta did not "
+                "report zero errors and zero warnings for it, so it may have errors."
+            ),
+        })
         return item
     item.update(await _read_upload_errors(
         client, upload_id, max_errors=max_errors, after=after, include_samples=include_samples,
@@ -815,7 +1050,16 @@ def _validate_rule_params(rule_type: str, params: Any) -> dict[str, str]:
         try:
             re.compile(regex)
         except re.error as exc:
-            raise ValidationError(f"regex_replace_rule params.regex is not a valid regular expression: {exc}.") from exc
+            # Python's own message can quote part of the pattern (a group name), so only the
+            # position is given, and the original error is not chained.
+            where = f" (the problem is at character {exc.pos})" if isinstance(exc.pos, int) else ""
+            failure = ValidationError(
+                f"regex_replace_rule params.regex is not a valid regular expression{where}."
+            )
+        else:
+            failure = None
+        if failure is not None:
+            raise failure
     elif rule_type == "fallback_rule":
         if not params.get("user_default_value", "").strip():
             raise ValidationError("fallback_rule params need user_default_value.")
@@ -1124,6 +1368,7 @@ async def create_product_feed(
             override_type=override_type, override_value=override_value,
         ),
     }
+    _refuse_url_logins(params, "params", _FEED_KNOWN_KEYS)
     data = merge_graph_payload(payload, params)
     client = get_graph_api_client()
     created = await client.create_edge_object(catalog_id, "product_feeds", data=data)
@@ -1168,6 +1413,7 @@ async def update_product_feed(
         if blank_to_none(name) is None:
             raise ValidationError("name cannot be blank.")
         payload["name"] = name.strip()
+    _refuse_url_logins(params, "params", _FEED_KNOWN_KEYS)
     data = merge_graph_payload(payload, params)
     if not data:
         raise ValidationError("At least one field must be provided for update_product_feed.")
@@ -1239,7 +1485,7 @@ async def create_product_feed_upload(
     password: _OptionalText = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Start a one-off upload for a product catalog data feed, from an http(s) url (with optional basic-auth username and password) or from a local file_path (CSV, TSV, XML, zip, gz, bz2) that this server reads and sends, so the file's rows never pass through the conversation. update_only=true only adds or updates items; otherwise items missing from the file may be deleted. The password is never returned. dry_run=true returns the request and sends nothing. Check progress with list_product_feed_uploads."""
+    """Start a one-off upload for a product catalog data feed, from a url (only http and https addresses are accepted for a one-off upload; Meta documents no FTP address for it, though a feed schedule may use one; optional basic-auth username and password) or from a local file_path (CSV, TSV, XML, zip, gz, bz2) that this server reads and sends, so the file's rows never pass through the conversation. update_only=true only adds or updates items; otherwise items missing from the file may be deleted. The password is never returned. dry_run=true returns the request and sends nothing. Check progress with list_product_feed_uploads."""
     feed_id = _require_id(feed_id, "feed_id")
     url_text = url if isinstance(url, str) and url.strip() else None
     file_given = file_path is not None
@@ -1342,7 +1588,7 @@ async def list_product_feed_uploads(
         return {
             "item": await _upload_with_errors(
                 client, upload, max_errors=error_limit or UPLOAD_ERROR_PAGE_SIZE, after=error_after,
-                include_samples=include_samples,
+                include_samples=include_samples, requested_id=upload_id,
             ),
             "feed_id": feed_id,
             "summary": {"count": 1},
@@ -2062,8 +2308,8 @@ async def connect_catalog_event_source(
         ), complete, gaps)
     if not complete:
         gaps.append(
-            f"Source {event_source_id} was not among the sources read, so it may already have been "
-            "connected; the connect request was sent either way."
+            "The source given as event_source_id was not among the sources read, so it may already have "
+            "been connected; the connect request was sent either way."
         )
     await client.create_edge_object(
         catalog_id, "external_event_sources", data={"external_event_sources": [event_source_id]},
@@ -2090,14 +2336,15 @@ async def disconnect_catalog_event_source(
     source = next((s for s in sources if _object_id(s.get("id")) == event_source_id), None)
     if source is None and complete:
         raise ValidationError(
-            f"Event source {event_source_id} is not connected to catalog {catalog_id}; nothing was changed."
+            # The ids are not repeated: event_source_id is not checked as an id before this point.
+            "The source given as event_source_id is not connected to this catalog; nothing was changed."
         )
     if source is None:
         # The list is capped, so absence proves nothing. Disconnecting a source that is not
         # connected removes nothing else, while refusing would block a request on large catalogs.
         gaps.append(
-            f"Source {event_source_id} was not among the sources read, so whether it was connected "
-            "before this request is not confirmed; the disconnect request was sent."
+            "The source given as event_source_id was not among the sources read, so whether it was "
+            "connected before this request is not confirmed; the disconnect request was sent."
         )
     await client.delete_edge_object(
         catalog_id, "external_event_sources", data={"external_event_sources": [event_source_id]},
