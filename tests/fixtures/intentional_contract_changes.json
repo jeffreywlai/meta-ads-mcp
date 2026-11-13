@@ -43,6 +43,14 @@
       "what_changed": "When a call changes the audience rule, whether through the named rule parameter or through params={'rule': ...}, the tool now also asks Meta for the audience's current rule in the read it already makes before updating, and returns it as previous.rule. Before, a params-only rule change read and returned the other fields but not the old rule.",
       "why_better": "The rule decides who is in the audience, and Meta does not keep the old one. Returning it before it is replaced is the only way to put it back if the new rule turns out to be wrong.",
       "migration": "No change to how the tool is called. The response has one more field, previous.rule; the read before the update asks for one more field."
+    },
+    {
+      "tool": "create_ad_set",
+      "kind": "behaviour",
+      "parameter": "start_time",
+      "what_changed": "When start_time or end_time is given without a time zone (for example 2026-11-27T00:00:00), the ad set is still created with exactly the same request as before, but the tool then reads the new ad set once and the response gains two fields: warnings, saying the time had no time zone so Meta chose how to read it, and stored_schedule, the start and end time Meta stored. With validate_only the warning is given without the read. A time with an offset, Unix seconds or no time at all makes the same requests and returns the same fields as before.",
+      "why_better": "A time with no time zone can be read as a different hour than the caller meant, which starts or ends delivery hours early or late. Showing what Meta stored makes a shift visible at once, without refusing calls that worked before.",
+      "migration": "No change to how the tool is called. To avoid the warning and the extra read, pass times with a UTC offset, for example 2026-11-27T00:00:00-05:00. If the read after the create fails, the create is still reported as a success with its id."
     }
   ]
 }
