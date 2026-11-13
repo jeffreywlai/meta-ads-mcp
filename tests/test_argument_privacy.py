@@ -750,6 +750,46 @@ def test_a_registered_proxy_target_behaves_as_before():
         _call_proxy({"name": "   ", "arguments": {}})
 
 
+def _protocol_call(name: str, arguments: dict):
+    """A tools/call as an MCP client sends it, through FastMCP's request handler."""
+    return asyncio.run(mcp_server._call_tool_mcp(name, arguments))
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        pytest.param(_MISPLACED_PERSON, {"rows": [[_MISPLACED_PERSON]]}, id="unknown_direct_name"),
+        pytest.param("call_tool", {"name": _MISPLACED_PERSON, "arguments": {}}, id="unknown_proxy_target"),
+        pytest.param("add_audience_users", {"audience_id": "1", "schema": ["EMAIL"], "rows": [[_MISPLACED_PERSON]]}, id="customer_rows"),
+    ],
+)
+def test_the_protocol_debug_log_never_repeats_values_or_a_name_that_is_no_tool(name, arguments, caplog):
+    from meta_ads_mcp.argument_privacy import FASTMCP_HANDLER_LOGGER
+
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger=FASTMCP_HANDLER_LOGGER)
+    with pytest.raises(Exception) as error:
+        _protocol_call(name, arguments)
+    assert _MISPLACED_PERSON not in _rendered_chain(error.value)
+    handler_records = [record for record in caplog.records if "Handler called: call_tool" in record.getMessage()]
+    assert handler_records, "FastMCP's DEBUG record of the call should still be logged"
+    if name != _MISPLACED_PERSON:
+        assert name in handler_records[0].getMessage()
+    _assert_not_logged(caplog, _MISPLACED_PERSON)
+
+
+def test_the_handler_filter_sits_on_the_logger_fastmcp_uses_for_the_call_record():
+    """If FastMCP moves or rewords the record, this fails instead of the filter silently missing it."""
+    import fastmcp.server.mixins.mcp_operations as operations
+
+    from meta_ads_mcp.argument_privacy import FASTMCP_HANDLER_LOGGER, HandlerLogPrivacyFilter
+
+    assert operations.logger.name == FASTMCP_HANDLER_LOGGER
+    assert any(isinstance(item, HandlerLogPrivacyFilter) for item in logging.getLogger(FASTMCP_HANDLER_LOGGER).filters)
+    source = Path(operations.__file__).read_text(encoding="utf-8")
+    assert 'Handler called: call_tool %s with %s", key, arguments' in source
+
+
 def test_a_registered_write_target_in_read_only_mode_keeps_the_read_only_refusal(monkeypatch):
     monkeypatch.setenv("META_READ_ONLY", "true")
     reload_settings()

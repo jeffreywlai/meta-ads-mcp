@@ -16,6 +16,9 @@ Two measures, both applied before any tool code runs:
   data or secrets. For those, ``ToolParameterHelpMiddleware`` returns validation
   errors that name parameters only and counts unknown parameters instead of
   quoting them (a misplaced customer value can arrive as an argument name).
+
+``HandlerLogPrivacyFilter`` does the same for FastMCP's DEBUG record of each
+MCP tool call, which otherwise carries the tool name and every argument value.
 """
 
 from __future__ import annotations
@@ -220,9 +223,64 @@ def _catalog_parameter_names(server: Any) -> set[str]:
 
 _INSTALLED: dict[int, ValidationLogPrivacyFilter] = {}
 
+# FastMCP's MCP request handler logs every tools/call at DEBUG with the tool name
+# and every argument value (fastmcp/server/mixins/mcp_operations.py).
+FASTMCP_HANDLER_LOGGER = "fastmcp.server.mixins.mcp_operations"
+_HANDLER_CALL_MARKER = "Handler called: call_tool"
+_UNKNOWN_TOOL = "<name that is no tool, withheld>"
+
+
+class HandlerLogPrivacyFilter(logging.Filter):
+    """Keep argument values, and a tool name that is no tool, out of FastMCP's DEBUG call log.
+
+    The tool name stays when it is a registered tool: a name that matches no tool
+    may be a customer value put in the wrong place. Arguments are counted.
+    """
+
+    def __init__(self, tool_names: Callable[[], Iterable[str]]) -> None:
+        super().__init__()
+        self._tool_names = tool_names
+
+    def _known(self, name: Any) -> bool:
+        try:
+            return isinstance(name, str) and name in set(self._tool_names())
+        except Exception:
+            return False
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = str(record.msg)
+        if _HANDLER_CALL_MARKER not in message:
+            return True
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 2:
+            name, arguments = args
+            count = len(arguments) if isinstance(arguments, Mapping) else 0
+            record.args = (
+                name if self._known(name) else _UNKNOWN_TOOL,
+                f"{count} argument{'s' if count != 1 else ''} ({_WITHHELD})",
+            )
+        else:
+            record.msg = f"{message.split(_HANDLER_CALL_MARKER, 1)[0]}{_HANDLER_CALL_MARKER} ({_WITHHELD})"
+            record.args = ()
+        return True
+
+
+def _catalog_tool_names(server: Any) -> set[str]:
+    return {
+        str(getattr(component, "name", ""))
+        for component in list(server.local_provider._components.values())
+    } | {"call_tool", "search_tools"}
+
+
+_HANDLER_INSTALLED: dict[int, HandlerLogPrivacyFilter] = {}
+
 
 def install_validation_log_privacy(server: Any) -> ValidationLogPrivacyFilter:
-    """Attach the log filter for this server's tools once, and return it."""
+    """Attach the log filters for this server's tools once, and return the validation one."""
+    if id(server) not in _HANDLER_INSTALLED:
+        handler_filter = HandlerLogPrivacyFilter(lambda: _catalog_tool_names(server))
+        logging.getLogger(FASTMCP_HANDLER_LOGGER).addFilter(handler_filter)
+        _HANDLER_INSTALLED[id(server)] = handler_filter
     existing = _INSTALLED.get(id(server))
     if existing is not None:
         return existing
