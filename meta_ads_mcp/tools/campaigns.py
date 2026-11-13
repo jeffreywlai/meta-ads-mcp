@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, TypeAlias
 
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from meta_ads_mcp.api_compat import validate_targeting_placements
 from meta_ads_mcp.coordinator import mcp_server
@@ -162,6 +162,11 @@ CAMPAIGN_OPTIMIZATION_TYPES = ("NONE", "ICO_ONLY")
 # A whole number for percentages and counts (not money). Strict, so the MCP
 # layer refuses true, false, decimals and text instead of reading true as 1.
 WholeNumber: TypeAlias = Annotated[int, Field(strict=True)]
+# Numeric ids as a JSON array or a comma-separated string, like every string-list input.
+AdIdList: TypeAlias = Annotated[
+    list[GraphId],
+    BeforeValidator(coerce_csv_string_list, json_schema_input_type=str | list[str]),
+]
 _GRAPH_ID_PATTERN = re.compile(r"[0-9]+")
 
 
@@ -776,7 +781,7 @@ async def create_ad_set(
     tune_for_category: str | None = None,
     value_rule_set_id: GraphId | None = None,
     placement_soft_opt_out: dict[str, Any] | None = None,
-    creative_sequence: list[GraphId] | None = None,
+    creative_sequence: AdIdList | None = None,
     time_based_ad_rotation_id_blocks: list[list[GraphId]] | None = None,
     time_based_ad_rotation_intervals: list[WholeNumber | str] | None = None,
     rf_prediction_id: GraphId | None = None,

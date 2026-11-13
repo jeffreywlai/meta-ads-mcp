@@ -2410,6 +2410,7 @@ def test_round_four_fields_are_accepted_at_the_mcp_boundary(monkeypatch) -> None
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     asyncio.run(mcp_server.call_tool("create_ad_set", {
         **_G12_ADSET_ARGS, "daily_imps": 1000, "min_budget_spend_percentage": 10, "rf_prediction_id": "8080",
+        "creative_sequence": "11, 12",
         "time_based_ad_rotation_id_blocks": [["11"], ["12"]],
         "time_based_ad_rotation_intervals": [1796101200, "2026-12-08T00:00:00-05:00"],
     }))
@@ -2419,6 +2420,7 @@ def test_round_four_fields_are_accepted_at_the_mcp_boundary(monkeypatch) -> None
     assert adset["daily_imps"] == 1000
     assert adset["min_budget_spend_percentage"] == 10
     assert adset["rf_prediction_id"] == "8080"
+    assert adset["creative_sequence"] == ["11", "12"]
     assert adset["time_based_ad_rotation_intervals"] == _ROTATION_TIMES
     assert campaign["topline_id"] == "777"
     assert campaign["is_skadnetwork_attribution"] is True
