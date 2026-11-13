@@ -1909,3 +1909,38 @@ def test_recommendations_flag_paged_da_checks_and_do_not_guess(monkeypatch) -> N
     assert recommendation["strength"] == "unknown"
     assert "more pages" in recommendation["reason"]
     assert "da_checks for pixel px_2 had more pages than were read." in result["missing_signals"]
+
+
+@pytest.mark.parametrize(
+    "url,secret",
+    [
+        # An email address as the user name puts an "@" before the password.
+        ("ftp://feeds@example.com:s3cr3t-pass@ftp.example.invalid/feed.csv", "s3cr3t-pass"),
+        ("sftp://ops.team@example.com:p%40ss:w0rd@host.example.invalid:22/dir/feed.tsv", "p%40ss:w0rd"),
+        # A password that itself contains "@" or ":".
+        ("https://user:pa@ss:word@host.example.invalid/feed.csv", "pa@ss:word"),
+        ("https://user:plainsecret@host.example.invalid/feed.csv?x=1#frag", "plainsecret"),
+        ("FTP://USER:UPPERsecret@HOST.EXAMPLE.INVALID/feed.csv", "UPPERsecret"),
+    ],
+)
+def test_url_password_masking_matches_how_a_url_is_parsed(url, secret) -> None:
+    """The mask must find the password wherever a URL parser would, not only in simple cases."""
+    masked = catalog_feeds._mask_url_passwords(f"fetch failed for {url} today")
+    assert secret not in masked
+    assert "[redacted]@" in masked
+    assert masked.startswith("fetch failed for ") and masked.endswith(" today")
+    # The host and path stay, so the source can still be identified.
+    assert "example.invalid" in masked.lower()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://host.example.invalid/feed.csv",
+        "https://user@host.example.invalid/feed.csv",
+        "contact feeds@example.com about https://host.example.invalid/a:b@c",
+        "ratio 3:1 @ noon",
+    ],
+)
+def test_url_password_masking_leaves_text_without_a_url_password_alone(text) -> None:
+    assert catalog_feeds._mask_url_passwords(text) == text

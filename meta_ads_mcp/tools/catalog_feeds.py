@@ -166,9 +166,11 @@ FEED_FILE_TYPES = {
 # This server's own limit on a local feed file read into memory; Meta publishes none.
 MAX_FEED_FILE_BYTES = 100 * 1024 * 1024
 _SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
-# scheme://user:password@ anywhere in a string. The password part runs greedily to the
-# last @ before the path, so a password containing @ is masked whole.
-_CREDENTIAL_URL = re.compile(r"(?P<head>[A-Za-z][A-Za-z0-9+.\-]*://[^\s/?#@:]*):[^\s/?#]*@")
+# The login part of scheme://user:password@host anywhere in a string. It runs greedily to
+# the last @ before the path, query or fragment, which is where a URL parser ends the
+# login. A user name may itself contain @ (an email address), and a password may contain
+# @ or :, so the split into user and password is made at the first colon afterwards.
+_URL_LOGIN = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<login>[^\s/?#]*)@")
 # Parameters that can carry a secret or pasted data. The framework accepts any value for
 # them and the tool validates it, because the framework's own type errors quote the input.
 _OptionalText = Annotated[Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})]
@@ -315,9 +317,21 @@ def _validate_http_url(
 
 def _mask_text(text: str) -> str:
     """Replace every password embedded in a URL inside the text, keeping user, host and path."""
+    return _mask_url_passwords(text)
+
+
+def _mask_url_passwords(text: str) -> str:
+    """Mask the password of every URL login in the text, splitting it as a URL parser would."""
     if "@" not in text or "://" not in text:
         return text
-    return _CREDENTIAL_URL.sub(lambda match: f"{match.group('head')}:[redacted]@", text)
+
+    def mask(match: re.Match[str]) -> str:
+        user, colon, _password = match.group("login").partition(":")
+        if not colon:
+            return match.group(0)
+        return f"{match.group('scheme')}{user}:[redacted]@"
+
+    return _URL_LOGIN.sub(mask, text)
 
 
 def _redact(value: Any) -> Any:
