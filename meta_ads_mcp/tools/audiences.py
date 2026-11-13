@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import math
 import re
 import secrets
@@ -218,6 +219,25 @@ async def create_lookalike_audience(
     }
 
 
+def _audience_rule(rule: Any) -> dict[str, Any]:
+    """Accept a website audience rule as an object or a JSON-encoded object string."""
+    value = rule
+    if isinstance(rule, str):
+        try:
+            value = json.loads(rule)
+        except ValueError:
+            raise ValidationError(
+                "rule must be a JSON object, or a string holding one, in Meta's website audience rule "
+                "format (the same format create_custom_audience takes)."
+            ) from None
+    if not isinstance(value, dict) or not value:
+        raise ValidationError(
+            "rule must be a nonempty JSON object in Meta's website audience rule format "
+            "(for example {\"inclusions\": {...}})."
+        )
+    return value
+
+
 @mcp_server.tool()
 async def update_custom_audience(
     audience_id: str,
@@ -226,8 +246,14 @@ async def update_custom_audience(
     retention_days: int | None = None,
     customer_file_source: str | None = None,
     params: dict[str, Any] | None = None,
+    rule: dict[str, Any] | str | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user already has an audience id and needs to change audience metadata."""
+    """Use this when the user already has an audience id and needs to change audience metadata.
+
+    rule replaces a website (or other rule-based) audience's rule: a JSON object or JSON string in the
+    format create_custom_audience takes; for website audiences, retention is retention_seconds inside it.
+    The prior rule is read first and returned in previous.
+    """
     payload: dict[str, Any] = {
         "name": OMIT,
         "description": OMIT,
@@ -242,21 +268,29 @@ async def update_custom_audience(
         payload["retention_days"] = retention_days
     if customer_file_source is not None:
         payload["customer_file_source"] = customer_file_source
+    if rule is not None:
+        # Added only when named, so a call that passes rule through params (as callers did
+        # before rule was named) is unchanged, while giving it both ways is rejected.
+        payload["rule"] = _audience_rule(rule)
     payload = merge_graph_payload(payload, params)
     if not payload:
         raise ValidationError("At least one field must be provided for update_custom_audience.")
     client = get_graph_api_client()
-    previous = await client.get_object(audience_id, fields=AUDIENCE_FIELDS)
+    read_fields = AUDIENCE_FIELDS if rule is None else [*AUDIENCE_FIELDS, "rule"]
+    previous = await client.get_object(audience_id, fields=read_fields)
     await client.update_object(audience_id, data=payload)
+    prior = {
+        "name": previous.get("name"),
+        "description": previous.get("description"),
+        "retention_days": previous.get("retention_days"),
+        "customer_file_source": previous.get("customer_file_source"),
+    }
+    if rule is not None:
+        prior["rule"] = previous.get("rule")
     return mutation_response(
         action="update_custom_audience",
         target={"audience_id": audience_id},
-        previous={
-            "name": previous.get("name"),
-            "description": previous.get("description"),
-            "retention_days": previous.get("retention_days"),
-            "customer_file_source": previous.get("customer_file_source"),
-        },
+        previous=prior,
         current=payload,
     )
 

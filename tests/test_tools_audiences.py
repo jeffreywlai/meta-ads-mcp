@@ -974,3 +974,134 @@ def test_audience_users_csv_keeps_bom_header_matching_and_blank_columns(monkeypa
     ]
     assert result["rows_read"] == 2
     assert result["invalid_values"] == 1
+
+
+# update_custom_audience: named rule (phase two, P4)
+
+
+class RecordingAudienceClient(FakeAudienceClient):
+    """Records every read and write in order, so a test can pin the exact requests."""
+
+    def __init__(self, previous: dict | None = None, read_error: Exception | None = None) -> None:
+        super().__init__()
+        self.calls: list[tuple] = []
+        self.previous = previous
+        self.read_error = read_error
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or []), params))
+        if self.read_error is not None:
+            raise self.read_error
+        if self.previous is not None:
+            return dict(self.previous)
+        return await super().get_object(object_id, fields=fields, params=params)
+
+    async def update_object(self, object_id: str, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+
+OLD_AUDIENCE_READ_FIELDS = [
+    "id", "name", "subtype", "approximate_count_lower_bound", "approximate_count_upper_bound",
+    "time_updated", "operation_status", "description", "customer_file_source", "retention_days",
+    "lookalike_spec",
+]
+WEBSITE_RULE = {
+    "inclusions": {
+        "operator": "or",
+        "rules": [{"event_sources": [{"id": "px_1", "type": "pixel"}], "retention_seconds": 2592000,
+                   "filter": {"operator": "and", "filters": [{"field": "url", "operator": "i_contains",
+                                                              "value": "checkout"}]}}],
+    }
+}
+
+
+def test_update_custom_audience_without_rule_is_unchanged(monkeypatch) -> None:
+    """An old-style call (named fields, or rule through params) sends exactly the requests it sent before rule was named."""
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(
+        audience_id="aud_1", name="Renamed", description="New", retention_days=45,
+        customer_file_source="USER_PROVIDED_ONLY",
+    ))
+    assert client.calls == [
+        ("get", "aud_1", OLD_AUDIENCE_READ_FIELDS, None),
+        ("update", "aud_1", {"name": "Renamed", "description": "New", "retention_days": 45,
+                             "customer_file_source": "USER_PROVIDED_ONLY"}),
+    ]
+    assert result == {
+        "ok": True,
+        "action": "update_custom_audience",
+        "target": {"audience_id": "aud_1"},
+        "previous": {"name": "Existing Audience", "description": "Old", "retention_days": 30,
+                     "customer_file_source": "USER_PROVIDED_ONLY"},
+        "current": {"name": "Renamed", "description": "New", "retention_days": 45,
+                    "customer_file_source": "USER_PROVIDED_ONLY"},
+    }
+
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", params={"rule": WEBSITE_RULE}))
+    assert client.calls == [
+        ("get", "aud_1", OLD_AUDIENCE_READ_FIELDS, None),
+        ("update", "aud_1", {"rule": WEBSITE_RULE}),
+    ]
+    assert result["previous"] == {"name": "Existing Audience", "description": "Old", "retention_days": 30,
+                                  "customer_file_source": "USER_PROVIDED_ONLY"}
+    assert result["current"] == {"rule": WEBSITE_RULE}
+
+
+@pytest.mark.parametrize("rule", [WEBSITE_RULE, json.dumps(WEBSITE_RULE), " " + json.dumps(WEBSITE_RULE) + " "])
+def test_update_custom_audience_named_rule_reads_rule_first_and_sends_it(monkeypatch, rule) -> None:
+    stored_rule = json.dumps({"inclusions": {"operator": "or", "rules": []}})
+    client = RecordingAudienceClient(previous={
+        "id": "aud_1", "name": "Site visitors", "subtype": "WEBSITE", "description": None, "rule": stored_rule,
+    })
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", name="Checkout visitors", rule=rule))
+    assert client.calls == [
+        ("get", "aud_1", [*OLD_AUDIENCE_READ_FIELDS, "rule"], None),
+        ("update", "aud_1", {"name": "Checkout visitors", "rule": WEBSITE_RULE}),
+    ]
+    assert result["previous"]["rule"] == stored_rule
+    assert result["previous"]["name"] == "Site visitors"
+    assert result["current"] == {"name": "Checkout visitors", "rule": WEBSITE_RULE}
+
+
+@pytest.mark.parametrize("rule", [WEBSITE_RULE, json.dumps(WEBSITE_RULE)])
+def test_update_custom_audience_rule_through_mcp_boundary(monkeypatch, rule) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(mcp_server.call_tool(
+        "update_custom_audience", {"audience_id": "aud_1", "rule": rule},
+    )).structured_content
+    assert client.calls[-1] == ("update", "aud_1", {"rule": WEBSITE_RULE})
+    assert result["current"] == {"rule": WEBSITE_RULE}
+
+
+def test_update_custom_audience_rule_named_and_in_params_raises_before_network(monkeypatch) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(audiences.ValidationError, match="rule") as excinfo:
+        asyncio.run(audiences.update_custom_audience(
+            audience_id="aud_1", rule=WEBSITE_RULE, params={"rule": WEBSITE_RULE},
+        ))
+    assert "params" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("rule", ["", "   ", "not json", "[1, 2]", "42", {}, "{}"])
+def test_update_custom_audience_rejects_a_rule_that_is_not_a_json_object(monkeypatch, rule) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(audiences.ValidationError, match="rule"):
+        asyncio.run(audiences.update_custom_audience(audience_id="aud_1", rule=rule))
+
+
+def test_update_custom_audience_rule_failed_pre_read_writes_nothing(monkeypatch) -> None:
+    from meta_ads_mcp.errors import NotFoundError
+
+    client = RecordingAudienceClient(read_error=NotFoundError("Meta object or edge not found: aud_1"))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    with pytest.raises(NotFoundError):
+        asyncio.run(audiences.update_custom_audience(audience_id="aud_1", rule=WEBSITE_RULE))
+    assert [call[0] for call in client.calls] == ["get"]

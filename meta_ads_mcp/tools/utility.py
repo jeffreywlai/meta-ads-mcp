@@ -485,6 +485,7 @@ INTENT_GUIDE = {
             "check_ab_test_eligibility is a local pre-check, not Meta's verdict; Meta decides when the test is created.",
             "Meta creates studies on a business; pass business_id when the ad account has no owning business.",
             "Lift studies are limited by Meta to approved advertisers.",
+            "For a creative test (ad against ad), give create_ab_test cells with one ad each in ad_ids and a creative test budget.",
         ],
     },
     "manage_product_catalogs_and_product_sets": {
