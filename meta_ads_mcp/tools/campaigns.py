@@ -276,11 +276,13 @@ def check_budget_schedule_specs(
     checked: list[dict[str, Any]] = []
     for index, spec in enumerate(specs):
         label = f"budget_schedule_specs[{index}]"
-        unknown = sorted(set(spec) - set(_BUDGET_SCHEDULE_KEYS))
-        if unknown:
+        # Counted, never quoted: a misplaced value (an email or a token) can arrive as a key.
+        count = sum(1 for key in spec if key not in _BUDGET_SCHEDULE_KEYS)
+        if count:
             raise ValidationError(
-                f"{label} takes only time_start, time_end, budget_value and budget_value_type "
-                f"(Meta supports one-time periods only); unexpected: {', '.join(unknown)}."
+                f"{label} has {count} unknown {'key' if count == 1 else 'keys'} (not repeated here, since a "
+                "misplaced value can arrive as a key). It takes only time_start, time_end, budget_value and "
+                "budget_value_type (Meta supports one-time periods only)."
             )
         missing = [key for key in _BUDGET_SCHEDULE_KEYS if key not in spec]
         if missing:

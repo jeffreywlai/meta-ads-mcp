@@ -429,8 +429,10 @@ def test_create_failure_states_whether_a_creative_may_exist(monkeypatch, failure
             account_id="123", name="Spring", page_id="111", image_hash="h", link_url="https://example.com",
         ))
     message = str(info.value)
+    # The caller's own name is free text, so it is pointed at, not repeated.
+    assert "Spring" not in message
     if unknown:
-        assert "may have created the creative named 'Spring'" in message
+        assert "may have created the creative (named with the name given in this call)" in message
         assert info.value.mutation_outcome_unknown is True
     else:
         assert "no creative was created" in message
@@ -480,9 +482,10 @@ def test_enhancements_copy_creative_change_features_and_attach(monkeypatch) -> N
         ad_id="10", features={"image_touchups": "opt_out", "enhance_cta": "OPT_IN"},
     ))
 
-    get_ad, get_creative, create, attach = client.calls
+    get_ad, get_creative, get_explicit, create, attach = client.calls
     assert get_ad[:2] == ("get", "10")
     assert get_creative == ("get", "20", cf.ENHANCEMENT_READ_FIELDS)
+    assert get_explicit == ("get", "20", cf.EXPLICIT_STORY_SPEC_READ)
     assert create[:3] == ("create", "act_123", "adcreatives")
     assert create[3] == {
         "name": "Spring (enhancements updated)",
@@ -506,7 +509,7 @@ def test_enhancements_dry_run_reads_but_writes_nothing(monkeypatch) -> None:
     client = FakeClient(objects={"10": AD, "20": CREATIVE})
     _patch(monkeypatch, client)
     result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}, dry_run=True))
-    assert [call[0] for call in client.calls] == ["get", "get"]
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
     assert result["sent"] is False
     assert result["would_send"][0]["path"] == "act_123/adcreatives"
     assert result["would_send"][1] == {"method": "POST", "path": "10", "data": {"creative": {"creative_id": "<new creative id>"}}}
@@ -581,10 +584,28 @@ def test_g10_uncertain_creative_create_says_a_copy_may_exist_and_ad_is_unchanged
     with pytest.raises(MetaApiError) as info:
         asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
     message = str(info.value)
+    # Built from the old creative's name as Meta returned it, so it is shown to help find the copy.
     assert "Spring (enhancements updated)" in message
     assert "may" in message
     assert "still uses creative 20" in message
-    assert [call[0] for call in client.calls] == ["get", "get", "create"]
+    assert [call[0] for call in client.calls] == ["get", "get", "get", "create"]
+
+
+def test_uncertain_enhancement_create_points_at_a_caller_name_without_repeating_it(monkeypatch) -> None:
+    class LostCreate(FakeClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            self.calls.append(("create", parent_id, edge, data))
+            raise MetaApiError("Meta API request failed before a response was received.", mutation_outcome_unknown=True)
+
+    private = "".join(("someone", "@example.invalid copy"))
+    client = LostCreate(objects={"10": AD, "20": CREATIVE})
+    _patch(monkeypatch, client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}, name=private))
+    message = str(info.value)
+    assert private not in message
+    assert "the name given in this call" in message
+    assert client.calls[-1][3]["name"] == private
 
 
 def test_enhancements_refuse_a_creative_that_cannot_be_copied(monkeypatch) -> None:
@@ -1292,7 +1313,7 @@ def test_enhancement_dry_run_never_shows_a_partnership_ad_code(monkeypatch) -> N
     result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}, dry_run=True))
     assert "AQSYNTHETICCODE1" not in json.dumps(result)
     assert result["would_send"][0]["data"]["branded_content"]["instagram_boost_post_access_token"] == "<partnership_ad_code>"
-    assert [call[0] for call in client.calls] == ["get", "get"]
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
 
 
 # H1: a Partnership Ad code never comes back inside an error.
@@ -1624,7 +1645,7 @@ def test_a_setting_the_copy_cannot_carry_is_named_in_dry_run_and_stops_a_real_ru
     assert field in result["fields_not_copied"]
     assert result["settings_that_cannot_be_copied"] == [field]
     assert any("refuse" in note for note in result["notes"])
-    assert [call[0] for call in client.calls] == ["get", "get"]
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
 
     client = ProjectingClient({
         "id": "20", "account_id": "123", "name": "C", field: value,
@@ -1635,7 +1656,7 @@ def test_a_setting_the_copy_cannot_carry_is_named_in_dry_run_and_stops_a_real_ru
         asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
     assert field in str(info.value)
     assert "nothing was created or attached" in str(info.value).lower()
-    assert [call[0] for call in client.calls] == ["get", "get"]
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
 
 
 def test_dry_run_without_lost_settings_reports_none(monkeypatch) -> None:
@@ -1819,3 +1840,175 @@ def test_round_five_invalid_combinations_raise_before_any_call(monkeypatch, argu
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match=message):
         asyncio.run(cf.create_ad_creative_from_inputs(account_id="123", name="Creative", **arguments))
+
+
+# Round six, K4: Meta returns object_story_spec{whats_app_business_phone_number} only when it is
+# asked for by name, and refuses a read naming object_story_spec both bare and with sub-fields.
+
+PHONE = "+1-202-555-0123"
+WHATSAPP_STORY = {"page_id": "40", "link_data": {
+    "image_hash": "h", "link": "https://api.whatsapp.com/send",
+    "call_to_action": {"type": "WHATSAPP_MESSAGE", "value": {"app_destination": "WHATSAPP"}},
+}}
+PHONE_READ = ["id", "object_story_spec{whats_app_business_phone_number}"]
+
+
+class PhoneClient(FakeClient):
+    """Serves a creative the way Meta's reference says: the phone setting only on an explicit read.
+
+    explicit is what the explicit read returns, or an error it raises; the wide read never carries
+    the phone setting, and a read naming object_story_spec twice is refused, as Meta does.
+    """
+
+    def __init__(self, explicit: Any, wide: dict[str, Any] | None = None) -> None:
+        super().__init__(objects={"10": AD})
+        self.explicit = explicit
+        self.wide = wide if wide is not None else {
+            "id": "20", "account_id": "123", "name": "Chat", "object_story_spec": deepcopy(WHATSAPP_STORY),
+        }
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        if object_id != "20":
+            return dict(self.objects.get(object_id, {"id": object_id}))
+        named = [field for field in fields or [] if field.split("{")[0] == "object_story_spec"]
+        if len(named) > 1:
+            raise MetaApiError("(#100) Field object_story_spec specified more than once", code=100)
+        if any("{" in field for field in named):
+            if isinstance(self.explicit, Exception):
+                raise self.explicit
+            return deepcopy(self.explicit)
+        return {key: deepcopy(value) for key, value in self.wide.items() if key in (fields or [])}
+
+
+def _phone_run(monkeypatch, client: PhoneClient, *, dry_run: bool, name: str | None = None):
+    _patch(monkeypatch, client)
+    return asyncio.run(cf.update_ad_creative_enhancements(
+        ad_id="10", features={"image_touchups": "OPT_OUT"}, dry_run=dry_run, name=name,
+    ))
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_enhancement_copy_explicitly_reads_the_whatsapp_phone_setting(monkeypatch, dry_run) -> None:
+    client = PhoneClient({"id": "20", "object_story_spec": {"whats_app_business_phone_number": PHONE}})
+    result = _phone_run(monkeypatch, client, dry_run=dry_run)
+    payload = result["would_send"][0]["data"] if dry_run else next(call[3] for call in client.calls if call[0] == "create")
+    assert payload["object_story_spec"] == {**WHATSAPP_STORY, "whats_app_business_phone_number": PHONE}
+    reads = [call[2] for call in client.calls if call[:2] == ("get", "20")]
+    assert reads == [cf.ENHANCEMENT_READ_FIELDS, PHONE_READ]
+    assert "object_story_spec" in cf.ENHANCEMENT_READ_FIELDS
+    if dry_run:
+        assert result["settings_not_read"] == []
+        assert [call[0] for call in client.calls] == ["get", "get", "get"]
+    else:
+        assert [call[0] for call in client.calls] == ["get", "get", "get", "create", "update"]
+    notes = result["notes"]
+    assert any("whats_app_business_phone_number, read separately" in note for note in notes)
+
+
+@pytest.mark.parametrize("explicit", [
+    {"id": "20"},  # Meta's live answer for a creative with no number: no object_story_spec at all.
+    {"id": "20", "object_story_spec": {"whats_app_business_phone_number": None}},  # The reference's null.
+    {"id": "20", "object_story_spec": {}},
+])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_enhancement_copy_without_a_phone_setting_sends_the_spec_unchanged(monkeypatch, explicit, dry_run) -> None:
+    client = PhoneClient(explicit)
+    result = _phone_run(monkeypatch, client, dry_run=dry_run)
+    payload = result["would_send"][0]["data"] if dry_run else next(call[3] for call in client.calls if call[0] == "create")
+    assert payload["object_story_spec"] == WHATSAPP_STORY
+    if dry_run:
+        assert result["settings_not_read"] == []
+        assert not any("could not be read" in note for note in result["notes"])
+    else:
+        assert client.calls[-1] == ("update", "10", {"creative": {"creative_id": "999"}})
+
+
+UNREADABLE_PHONE_READS = [
+    (MetaApiError("(#100) Tried accessing nonexisting field (whats_app_business_phone_number)", code=100), MetaApiError),
+    (RateLimitError("Synthetic limit", code=4), RateLimitError),
+    (httpx.ReadTimeout("synthetic"), MetaApiError),
+    (RuntimeError("synthetic transport"), MetaApiError),
+    (["not", "an", "object"], ValidationError),
+    ({"id": "20", "object_story_spec": "phone"}, ValidationError),
+    ({"id": "20", "object_story_spec": {"whats_app_business_phone_number": 12025550123}}, ValidationError),
+    ({"id": "20", "object_story_spec": {"whats_app_business_phone_number": {"number": PHONE}}}, ValidationError),
+    ({"id": "20", "object_story_spec": {"whats_app_business_phone_number": "  "}}, ValidationError),
+]
+
+
+@pytest.mark.parametrize(("explicit", "error_type"), UNREADABLE_PHONE_READS)
+def test_an_unreadable_phone_setting_stops_a_real_run_before_any_write(monkeypatch, explicit, error_type) -> None:
+    client = PhoneClient(explicit)
+    with pytest.raises(error_type) as info:
+        _phone_run(monkeypatch, client, dry_run=False)
+    message = str(info.value)
+    assert "object_story_spec.whats_app_business_phone_number of creative 20 could not be read" in message
+    assert "Nothing was created or attached; ad 10 still uses creative 20" in message
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
+    if isinstance(explicit, Exception):
+        assert info.value.__cause__ is explicit or info.value is explicit
+
+
+@pytest.mark.parametrize(("explicit", "error_type"), UNREADABLE_PHONE_READS)
+def test_an_unreadable_phone_setting_is_named_in_a_dry_run(monkeypatch, explicit, error_type) -> None:
+    client = PhoneClient(explicit)
+    result = _phone_run(monkeypatch, client, dry_run=True)
+    assert result["settings_not_read"] == ["object_story_spec.whats_app_business_phone_number"]
+    note = next(note for note in result["notes"] if "could not be read" in note)
+    assert "A real run would refuse and change nothing" in note
+    assert "whats_app_business_phone_number" not in result["would_send"][0]["data"]["object_story_spec"]
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_phone_setting_without_an_object_story_spec_to_carry_it_is_not_invented(monkeypatch, dry_run) -> None:
+    """Meta reports a number, but the wide read has no object_story_spec: refuse, never build one."""
+    client = PhoneClient(
+        {"id": "20", "object_story_spec": {"whats_app_business_phone_number": PHONE}},
+        wide={"id": "20", "account_id": "123", "name": "Post", "object_story_id": "40_41"},
+    )
+    if dry_run:
+        result = _phone_run(monkeypatch, client, dry_run=True)
+        assert "object_story_spec" not in result["would_send"][0]["data"]
+        assert result["settings_not_read"] == ["object_story_spec.whats_app_business_phone_number"]
+        assert any("returned no object_story_spec" in note for note in result["notes"])
+        return
+    with pytest.raises(ValidationError, match="returned no object_story_spec to carry it"):
+        _phone_run(monkeypatch, client, dry_run=False)
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
+
+
+def test_two_different_phone_values_stop_a_real_run(monkeypatch) -> None:
+    wide = {"id": "20", "account_id": "123", "name": "Chat",
+            "object_story_spec": {**deepcopy(WHATSAPP_STORY), "whats_app_business_phone_number": "+1-202-555-0199"}}
+    client = PhoneClient({"id": "20", "object_story_spec": {"whats_app_business_phone_number": PHONE}}, wide=wide)
+    with pytest.raises(ValidationError, match="two different values"):
+        _phone_run(monkeypatch, client, dry_run=False)
+    assert all(call[0] == "get" for call in client.calls)
+
+
+def test_the_same_phone_value_in_both_reads_is_sent_once(monkeypatch) -> None:
+    wide = {"id": "20", "account_id": "123", "name": "Chat",
+            "object_story_spec": {**deepcopy(WHATSAPP_STORY), "whats_app_business_phone_number": PHONE}}
+    client = PhoneClient({"id": "20", "object_story_spec": {"whats_app_business_phone_number": PHONE}}, wide=wide)
+    _phone_run(monkeypatch, client, dry_run=False)
+    sent = next(call[3] for call in client.calls if call[0] == "create")
+    assert sent["object_story_spec"]["whats_app_business_phone_number"] == PHONE
+
+
+def test_the_explicit_read_does_not_change_the_creative_it_read(monkeypatch) -> None:
+    """The phone setting goes into a copy of the read spec; the full read is never one that names object_story_spec twice."""
+    client = PhoneClient({"id": "20", "object_story_spec": {"whats_app_business_phone_number": PHONE}})
+    _phone_run(monkeypatch, client, dry_run=False)
+    assert "whats_app_business_phone_number" not in client.wide["object_story_spec"]
+    for call in client.calls:
+        if call[:2] == ("get", "20"):
+            assert sum(1 for field in call[2] if field.split("{")[0] == "object_story_spec") == 1
+
+
+def test_every_explicit_story_setting_is_a_sub_field_of_object_story_spec_in_the_sdk() -> None:
+    # SDK 26.0.2 AdCreativeObjectStorySpec fields: instagram_user_id, link_data, page_id, photo_data,
+    # product_data, template_data, text_data, video_data, whats_app_business_phone_number.
+    assert cf.EXPLICIT_STORY_SPEC_FIELDS == ("whats_app_business_phone_number",)
+    assert cf.EXPLICIT_STORY_SPEC_READ == PHONE_READ

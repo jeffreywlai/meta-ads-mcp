@@ -1355,8 +1355,9 @@ async def _create_from_inputs(
             exc,
             definite="Meta refused the request, so no creative was created",
             unknown=(
-                f"Meta may have created the creative named {creative_name!r} before the connection failed. Look for "
-                "it in the account's creatives before retrying, so a second copy is not made"
+                # The name is the caller's free text, so it is pointed at rather than repeated.
+                "Meta may have created the creative (named with the name given in this call) before the connection "
+                "failed. Look for it in the account's creatives before retrying, so a second copy is not made"
             ),
         )
     response = creation_response(action="create_ad_creative_from_inputs", target=target, result=created)
@@ -1484,6 +1485,15 @@ ENHANCEMENT_READ_FIELDS = [
     "id", "name", "account_id", *COPYABLE_CREATIVE_FIELDS, *READ_ONLY_CREATIVE_SETTINGS, "degrees_of_freedom_spec",
 ]
 
+# object_story_spec settings Meta returns only when asked for by name. Meta's Ad Creative
+# reference: whats_app_business_phone_number "is not returned by default. Request it explicitly
+# with fields=object_story_spec{whats_app_business_phone_number}"; it is a string in SDK 26.0.2's
+# AdCreativeObjectStorySpec, the type of create_ad_creative's object_story_spec. Meta refuses a
+# read that names object_story_spec both bare and with sub-fields, and the sub-field read returns
+# only the sub-fields named, so they are read separately and merged into the wide read's spec.
+EXPLICIT_STORY_SPEC_FIELDS = ("whats_app_business_phone_number",)
+EXPLICIT_STORY_SPEC_READ = ["id", "object_story_spec{" + ",".join(EXPLICIT_STORY_SPEC_FIELDS) + "}"]
+
 
 def _holds_value(value: Any) -> bool:
     """Whether a read field carries a setting. False is every copied switch's default, so it is not one."""
@@ -1535,6 +1545,74 @@ def _step_failure(exc: Exception, *, definite: str, unknown: str) -> Exception:
     return MetaApiError(message=message, mutation_outcome_unknown=outcome_unknown)
 
 
+_EXPLICIT_UNREADABLE = "Meta returned it in a shape this server could not read"
+
+
+async def _read_explicit_story_settings(
+    client: Any, creative_id: str
+) -> tuple[dict[str, str], str | None, Exception | None]:
+    """Read the object_story_spec settings Meta returns only when asked for by name.
+
+    Returns the settings that hold a value, the reason they could not be read (None when they
+    were read), and the error the read raised, if any. A creative without them comes back with
+    no object_story_spec at all, or (as Meta's reference says) with a null value.
+    """
+    try:
+        read = await client.get_object(creative_id, fields=EXPLICIT_STORY_SPEC_READ)
+    except Exception as exc:
+        return {}, f"Meta's read of it failed ({type(exc).__name__})", exc
+    if not isinstance(read, dict):
+        return {}, _EXPLICIT_UNREADABLE, None
+    spec = read.get("object_story_spec")
+    if spec is None:
+        return {}, None, None
+    if not isinstance(spec, dict):
+        return {}, _EXPLICIT_UNREADABLE, None
+    values: dict[str, str] = {}
+    for field in EXPLICIT_STORY_SPEC_FIELDS:
+        value = spec.get(field)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not value.strip():
+            return {}, _EXPLICIT_UNREADABLE, None
+        values[field] = value
+    return values, None, None
+
+
+def _merge_explicit_story_settings(copied: dict[str, Any], values: dict[str, str]) -> str | None:
+    """Put explicitly read settings into the copied object_story_spec; the reason when they cannot go in."""
+    if not values:
+        return None
+    spec = copied.get("object_story_spec")
+    if not isinstance(spec, dict):
+        # Never build an object_story_spec around it: the copy would not match the creative.
+        return "Meta reported it, but the creative's read returned no object_story_spec to carry it"
+    merged = deepcopy(spec)
+    for field, value in values.items():
+        if merged.get(field) not in (None, "", value):
+            return "Meta returned two different values for it in two reads"
+        merged[field] = value
+    copied["object_story_spec"] = merged
+    return None
+
+
+def _refuse_unread_settings(
+    error: Exception | None, not_read: list[str], reason: str | None, *, ad_id: str, creative_id: str
+) -> None:
+    """Stop a real run, before any write, when a setting Meta returns only on request was not read."""
+    message = (
+        f"{', '.join(not_read)} of creative {creative_id} could not be read: {reason}. Meta returns it only when "
+        f"asked for by name, so a copy made without it could lose it. Nothing was created or attached; ad {ad_id} "
+        f"still uses creative {creative_id}."
+    )
+    if isinstance(error, (MetaApiError, RateLimitError)):
+        error.message = f"{message} Meta's error: {error.message}"
+        raise error
+    if error is not None:
+        raise MetaApiError(message=message) from error
+    raise ValidationError(message)
+
+
 def _features_of(spec: Any) -> dict[str, str]:
     """Read enroll_status per feature from a degrees_of_freedom_spec."""
     features: dict[str, str] = {}
@@ -1552,7 +1630,7 @@ async def update_ad_creative_enhancements(
     name: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Turn Advantage creative enhancements on or off for a live ad. Meta does not edit a published creative, so this reads the ad's creative, creates a copy with features changed (for example {"image_touchups": "OPT_OUT", "text_optimizations": "OPT_IN"}), and attaches the copy. The copy carries every creative setting Meta accepts when a creative is created; if the creative has a setting Meta does not accept on create, nothing is changed. The ad is expected to go back to review because its creative changed. dry_run reads the ad and creative and returns the new creative, the ad update and fields_not_copied without sending anything."""
+    """Turn Advantage creative enhancements on or off for a live ad. Meta does not edit a published creative, so this reads the ad's creative, creates a copy with features changed (for example {"image_touchups": "OPT_OUT", "text_optimizations": "OPT_IN"}), and attaches the copy. The copy carries every creative setting Meta accepts when a creative is created; if the creative has a setting Meta does not accept on create, nothing is changed. The ad is expected to go back to review because its creative changed. dry_run reads the ad and creative and returns the new creative, the ad update, fields_not_copied and settings_not_read without sending anything."""
     codes: list[str] = []
     try:
         return await _update_enhancements(ad_id, features, name, dry_run, codes)
@@ -1625,6 +1703,9 @@ async def _update_enhancements(
             "This creative has no object_story_spec, object_story_id, source_instagram_media_id, asset_feed_spec "
             "or Partnership Ad code that can be copied, so a replacement cannot be built. Nothing was changed."
         )
+    explicit, explicit_problem, explicit_error = await _read_explicit_story_settings(client, old_creative_id)
+    explicit_problem = explicit_problem or _merge_explicit_story_settings(copied, explicit)
+    not_read = [f"object_story_spec.{field}" for field in EXPLICIT_STORY_SPEC_FIELDS] if explicit_problem else []
     old_spec = creative.get("degrees_of_freedom_spec") if isinstance(creative.get("degrees_of_freedom_spec"), dict) else {}
     new_spec = deepcopy(old_spec)
     feature_spec = new_spec.get("creative_features_spec")
@@ -1661,6 +1742,15 @@ async def _update_enhancements(
         f"Copied from the old creative: {', '.join(sorted(copied))}. Meta returns some read-only values inside these "
         "specs; if Meta rejects the copy, nothing is attached."
     )
+    if explicit and not explicit_problem:
+        copy_note += (
+            f" object_story_spec includes {', '.join(sorted(explicit))}, read separately because Meta returns it "
+            "only when asked for by name."
+        )
+    not_read_note = (
+        f"{', '.join(not_read)} could not be read: {explicit_problem}. Meta returns it only when asked for by name, "
+        "so a copy made without it could lose it. A real run would refuse and change nothing."
+    ) if not_read else None
     if dry_run:
         return {
             "ok": True,
@@ -1676,7 +1766,8 @@ async def _update_enhancements(
             "proposed_features": _features_of(new_spec),
             "fields_not_copied": not_copied,
             "settings_that_cannot_be_copied": lost_settings,
-            "notes": [copy_note, review_note, *([lost_note] if lost_note else [])],
+            "settings_not_read": not_read,
+            "notes": [copy_note, review_note, *(note for note in (lost_note, not_read_note) if note)],
         }
     if lost_settings:
         raise ValidationError(
@@ -1684,6 +1775,10 @@ async def _update_enhancements(
             f"is created, so the copy this change needs would lose it. Nothing was created or attached; ad {ad_id} "
             f"still uses creative {old_creative_id}. Make this change in Ads Manager instead."
         )
+    if not_read:
+        _refuse_unread_settings(explicit_error, not_read, explicit_problem, ad_id=ad_id, creative_id=old_creative_id)
+    # A name the caller typed is free text, so the error points at it rather than repeating it.
+    shown_name = "with the name given in this call" if new_name else f"named {payload['name']!r}"
     try:
         created = await client.create_edge_object(resolved_account, "adcreatives", data=payload)
     except Exception as exc:
@@ -1693,7 +1788,7 @@ async def _update_enhancements(
                 f"No replacement creative was created and ad {ad_id} still uses creative {old_creative_id}"
             ),
             unknown=(
-                f"Meta may have created a replacement creative named {payload['name']!r} before the connection "
+                f"Meta may have created a replacement creative {shown_name} before the connection "
                 f"failed. Nothing was attached, so ad {ad_id} still uses creative {old_creative_id}. Look for that "
                 "creative in the account before retrying, so a second copy is not made"
             ),
