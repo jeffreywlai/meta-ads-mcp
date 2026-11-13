@@ -137,13 +137,20 @@ def read_adlabels(value: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
     return labels, note
 
 # Values from Meta's ad set reference (POST /act_{id}/adsets) and
-# AdAccount.create_ad_set in facebook-python-business-sdk 26.0.2.
+# AdAccount.create_ad_set in facebook-python-business-sdk 26.0.2, plus PHONE_CALL:
+# the reference and the SDK omit it, but Meta's call ads guide
+# (marketing-api/call-ads, step 2) sets destination_type PHONE_CALL on the ad set
+# and the campaign reference's objective mapping table pairs it with QUALITY_CALL.
+# LEAD_FORM_MESSENGER is not added: no Meta page spells it that way, and the
+# LEAD_FROM_MESSENGER of the mapping table contradicts the Messenger lead ads
+# guide. Both stay reachable inside params.
 ADSET_DESTINATION_TYPES = (
     "WEBSITE", "APP", "MESSENGER", "APPLINKS_AUTOMATIC", "WHATSAPP", "INSTAGRAM_DIRECT", "FACEBOOK",
     "MESSAGING_MESSENGER_WHATSAPP", "MESSAGING_INSTAGRAM_DIRECT_MESSENGER",
     "MESSAGING_INSTAGRAM_DIRECT_MESSENGER_WHATSAPP", "MESSAGING_INSTAGRAM_DIRECT_WHATSAPP",
     "SHOP_AUTOMATIC", "ON_AD", "ON_POST", "ON_EVENT", "ON_VIDEO", "ON_PAGE", "INSTAGRAM_PROFILE",
     "FACEBOOK_PAGE", "INSTAGRAM_PROFILE_AND_FACEBOOK_PAGE", "INSTAGRAM_LIVE", "FACEBOOK_LIVE", "IMAGINE",
+    "PHONE_CALL",
 )
 ADSET_OPTIMIZATION_SUB_EVENTS = (
     "NONE", "VIDEO_SOUND_ON", "TRIP_CONSIDERATION", "TRAVEL_INTENT", "TRAVEL_INTENT_NO_DESTINATION_INTENT",
@@ -354,43 +361,62 @@ _ROTATION_PAIR = ("time_based_ad_rotation_id_blocks", "time_based_ad_rotation_in
 
 
 def _check_ad_rotation(blocks: Any, intervals: Any, params: dict[str, Any] | None) -> list[int] | None:
-    """Check time-based ad rotation: one block of ad ids for each date range; returns start times as Unix seconds."""
+    """Check time-based ad rotation: one block of ad ids for each date range.
+
+    When one half is named and the other is inside params, the pair is checked
+    as it will be sent, with the params half read from params by the same rules.
+    The params half is sent as given, so its start times must already be Unix
+    seconds. A call with both halves inside params is not checked here. Returns
+    the named start times as Unix seconds, or None when they were not named.
+    """
     if blocks is None and intervals is None:
         return None
-    given = {"time_based_ad_rotation_id_blocks": blocks, "time_based_ad_rotation_intervals": intervals}
-    if any(value is None and key not in (params or {}) for key, value in given.items()):
+    blocks_key, intervals_key = _ROTATION_PAIR
+    params = params or {}
+    given = {blocks_key: blocks, intervals_key: intervals}
+    if any(value is None and key not in params for key, value in given.items()):
         raise ValidationError(
             "time_based_ad_rotation_id_blocks and time_based_ad_rotation_intervals go together: "
             "one block of ad ids for each date range, each range starting at the matching time."
         )
-    if blocks is not None and (
-        not isinstance(blocks, list)
-        or not blocks
-        or any(not isinstance(block, list) or not block or not all(map(_is_graph_id, block)) for block in blocks)
+    blocks_label = blocks_key if blocks is not None else f"{blocks_key} inside params"
+    intervals_label = intervals_key if intervals is not None else f"{intervals_key} inside params"
+    sent_blocks = blocks if blocks is not None else params[blocks_key]
+    sent_intervals = intervals if intervals is not None else params[intervals_key]
+    if (
+        not isinstance(sent_blocks, list)
+        or not sent_blocks
+        or any(not isinstance(block, list) or not block or not all(map(_is_graph_id, block)) for block in sent_blocks)
     ):
         raise ValidationError(
-            'time_based_ad_rotation_id_blocks must be a non-empty list of non-empty lists of Meta ad ids, '
+            f'{blocks_label} must be a non-empty list of non-empty lists of Meta ad ids, '
             'for example [["11"], ["12", "13"]].'
         )
-    seconds = None
-    if intervals is not None:
-        if not isinstance(intervals, list) or len(intervals) < 2:
-            raise ValidationError(
-                "time_based_ad_rotation_intervals needs at least two start times; Meta says the first "
-                "should match the campaign start time."
-            )
-        seconds = [
-            _schedule_seconds(value, f"time_based_ad_rotation_intervals[{index}]")
-            for index, value in enumerate(intervals)
-        ]
-        if any(later <= earlier for earlier, later in zip(seconds, seconds[1:])):
-            raise ValidationError("time_based_ad_rotation_intervals must be in increasing order.")
-    if blocks is not None and seconds is not None and len(blocks) != len(seconds):
+    if not isinstance(sent_intervals, list) or len(sent_intervals) < 2:
+        raise ValidationError(
+            f"{intervals_label} needs at least two start times; Meta says the first "
+            "should match the campaign start time."
+        )
+    if intervals is None and any(
+        isinstance(value, bool) or not (isinstance(value, int) or (isinstance(value, str) and value.isdigit()))
+        for value in sent_intervals
+    ):
+        raise ValidationError(
+            f"{intervals_label} is sent as given, so its start times must be Unix seconds. "
+            "Give time_based_ad_rotation_intervals as the named parameter to use ISO 8601 times."
+        )
+    seconds = [
+        _schedule_seconds(value, f"{intervals_key}[{index}]{'' if intervals is not None else ' inside params'}")
+        for index, value in enumerate(sent_intervals)
+    ]
+    if any(later <= earlier for earlier, later in zip(seconds, seconds[1:])):
+        raise ValidationError(f"{intervals_label} must be in increasing order.")
+    if len(sent_blocks) != len(seconds):
         raise ValidationError(
             "time_based_ad_rotation_id_blocks needs one block of ad ids for each date range: "
-            f"{len(blocks)} blocks for {len(seconds)} start times."
+            f"{len(sent_blocks)} blocks for {len(seconds)} start times."
         )
-    return seconds
+    return seconds if intervals is not None else None
 
 
 def check_adset_round_four_fields(named: dict[str, Any], params: dict[str, Any] | None) -> dict[str, Any]:
@@ -403,6 +429,12 @@ def check_adset_round_four_fields(named: dict[str, Any], params: dict[str, Any] 
         if named[key] is not None:
             check_whole_number(named[key], key, minimum=0, maximum=100)
     low, high = named["min_budget_spend_percentage"], named["max_budget_spend_percentage"]
+    # One bound named and the other inside params: compare the pair as it will be sent.
+    for bound, key in ((low, "min_budget_spend_percentage"), (high, "max_budget_spend_percentage")):
+        other = "max_budget_spend_percentage" if key == "min_budget_spend_percentage" else "min_budget_spend_percentage"
+        if bound is not None and named[other] is None and params and other in params:
+            value = check_whole_number(params[other], f"{other} inside params", minimum=0, maximum=100)
+            low, high = (bound, value) if key == "min_budget_spend_percentage" else (value, bound)
     if low is not None and high is not None and low > high:
         raise ValidationError("min_budget_spend_percentage must not be more than max_budget_spend_percentage.")
     for key in ("daily_imps", "lifetime_imps"):
@@ -496,6 +528,9 @@ async def create_campaign(
             validate_positive_amount(value, field_name=field_name)
     new_start = _validate_adset_time(start_time, "start_time")
     new_stop = _validate_adset_time(stop_time, "stop_time")
+    # One bound named and the other inside params: compare the pair as it will be sent.
+    new_start = new_start or params_half_of_time_pair(stop_time, params, "start_time")
+    new_stop = new_stop or params_half_of_time_pair(start_time, params, "stop_time")
     if new_start is not None and new_stop is not None and new_stop <= new_start:
         raise ValidationError("stop_time must be after start_time.")
     if promoted_object is not None and not promoted_object:
@@ -598,6 +633,12 @@ async def update_campaign(
             validate_positive_amount(value, field_name=field_name)
     new_start = _validate_adset_time(start_time, "start_time")
     new_stop = _validate_adset_time(stop_time, "stop_time")
+    # One bound named and the other inside params: compare the pair as it will be
+    # sent, not against the stored bound the params value replaces.
+    params_start = params_half_of_time_pair(stop_time, params, "start_time")
+    params_stop = params_half_of_time_pair(start_time, params, "stop_time")
+    new_start = new_start or params_start
+    new_stop = new_stop or params_stop
     if new_start is not None and new_stop is not None and new_stop <= new_start:
         raise ValidationError("stop_time must be after start_time.")
     if adlabels is not None:
@@ -621,9 +662,9 @@ async def update_campaign(
         payload[key] = named[key]
     merge_graph_payload(payload, params)
     other_bound = None
-    if new_start is not None and stop_time is None:
+    if start_time is not None and stop_time is None and params_stop is None:
         other_bound = "stop_time"
-    elif new_stop is not None and start_time is None:
+    elif stop_time is not None and start_time is None and params_start is None:
         other_bound = "start_time"
     extra_reads = [*named_given, *([other_bound] if other_bound else [])]
     client = get_graph_api_client()
@@ -791,7 +832,7 @@ async def create_ad_set(
     max_budget_spend_percentage: WholeNumber | None = None,
     brand_safety_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. existing_customer_budget_percentage, min_budget_spend_percentage and max_budget_spend_percentage are whole percentages from 0 to 100; daily_imps and lifetime_imps are impression counts for FIXED_CPM campaigns; multi_optimization_goal_weight is UNDEFINED, BALANCED, PREFER_INSTALL or PREFER_EVENT; tune_for_category is a special ad category such as HOUSING; is_incremental_attribution_enabled turns on incremental attribution; campaign_attribution is the app attribution type, for example SKAN or AEM; value_rule_set_id attaches a value rule set and sends value_rules_applied true with it; rf_prediction_id is a reach and frequency prediction id; creative_sequence lists ad ids in the order to show them; time_based_ad_rotation_id_blocks (lists of ad ids) and time_based_ad_rotation_intervals (at least two range start times, ISO 8601 with a UTC offset or Unix seconds; sent as Unix seconds) go together, one block per range; placement_soft_opt_out and brand_safety_config are Meta's objects. start_time and end_time are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE, or PHONE_CALL for call ads); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. existing_customer_budget_percentage, min_budget_spend_percentage and max_budget_spend_percentage are whole percentages from 0 to 100; daily_imps and lifetime_imps are impression counts for FIXED_CPM campaigns; multi_optimization_goal_weight is UNDEFINED, BALANCED, PREFER_INSTALL or PREFER_EVENT; tune_for_category is a special ad category such as HOUSING; is_incremental_attribution_enabled turns on incremental attribution; campaign_attribution is the app attribution type, for example SKAN or AEM; value_rule_set_id attaches a value rule set and sends value_rules_applied true with it; rf_prediction_id is a reach and frequency prediction id; creative_sequence lists ad ids in the order to show them; time_based_ad_rotation_id_blocks (lists of ad ids) and time_based_ad_rotation_intervals (at least two range start times, ISO 8601 with a UTC offset or Unix seconds; sent as Unix seconds) go together, one block per range, and are checked as a pair even when one of them is inside params (where start times must already be Unix seconds); placement_soft_opt_out and brand_safety_config are Meta's objects. start_time and end_time are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named_spend = {
         "daily_spend_cap": daily_spend_cap,
         "lifetime_spend_cap": lifetime_spend_cap,
@@ -1058,6 +1099,23 @@ def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
 def validate_schedule_time(value: str | None, field_name: str) -> datetime | None:
     """Check a schedule time for another tool module: ISO 8601 with a UTC offset, or Unix seconds."""
     return _validate_adset_time(value, field_name)
+
+
+def params_half_of_time_pair(named_half: Any, params: dict[str, Any] | None, key: str) -> datetime | None:
+    """Read the other half of a start and end pair from params when the caller named only one half.
+
+    The params value is checked by the same rule as the named one, so the pair can be
+    compared as it will be sent. None when no half is named or params does not hold
+    this one: a call with both halves inside params is not checked.
+    """
+    if named_half is None or not params or key not in params:
+        return None
+    value = params[key]
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str):
+        raise ValidationError(f"{key} inside params must be {_ADSET_TIME_FORMAT}.")
+    return _validate_adset_time(value, f"{key} inside params")
 
 
 def _stored_adset_time(value: Any) -> datetime | None:

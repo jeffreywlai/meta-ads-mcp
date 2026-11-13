@@ -1596,7 +1596,10 @@ def test_create_ad_set_enum_lists_match_meta_sdk_26(field) -> None:
     }[field]
     values = {"destination_type": campaigns.ADSET_DESTINATION_TYPES,
               "optimization_sub_event": campaigns.ADSET_OPTIMIZATION_SUB_EVENTS}[field]
-    assert set(values) == sdk and len(values) == len(sdk)
+    # PHONE_CALL is missing from the SDK and the reference enum; Meta's call ads guide
+    # (marketing-api/call-ads, step 2) and the objective mapping table document it.
+    documented_elsewhere = {"PHONE_CALL"} if field == "destination_type" else set()
+    assert set(values) == sdk | documented_elsewhere and len(values) == len(sdk) + len(documented_elsewhere)
 
 
 @pytest.mark.parametrize(
@@ -2435,3 +2438,270 @@ def test_round_four_docstrings_name_every_new_field_without_a_plus() -> None:
         assert "+" not in doc
         for key in keys:
             assert key in doc, key
+
+
+# Round five: a pair of fields with one half named and the other inside params is
+# checked as the pair that will be sent. A call with both halves inside params is
+# an old-style call and is sent unchanged.
+
+
+@pytest.mark.parametrize("which", ["blocks_named", "intervals_named"])
+def test_mixed_named_params_rotation_pair_is_validated_as_a_pair(monkeypatch, which) -> None:
+    """Reviewer reproduction (J13): two named blocks with one params interval, or two named
+    intervals with one params block, must be refused before any call."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    args = (
+        {"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+         "params": {"time_based_ad_rotation_intervals": [1796101200]}}
+        if which == "blocks_named"
+        else {"time_based_ad_rotation_intervals": [1796101200, 1796706000],
+              "params": {"time_based_ad_rotation_id_blocks": [["11"]]}}
+    )
+    with pytest.raises(campaigns.ValidationError):
+        asyncio.run(campaigns.create_ad_set("10", "20", "S", "IMPRESSIONS", "REACH", {}, **args))
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        # Named blocks, intervals inside params.
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"], ["13"]],
+          "params": {"time_based_ad_rotation_intervals": _ROTATION_TIMES}},
+         "3 blocks for 2 start times"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "params": {"time_based_ad_rotation_intervals": [1796706000, 1796101200]}},
+         "time_based_ad_rotation_intervals inside params must be in increasing order"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "params": {"time_based_ad_rotation_intervals": [1796101200, 1796101200]}},
+         "increasing order"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "params": {"time_based_ad_rotation_intervals": [1796101200, "2026-12-08T00:00:00-05:00"]}},
+         "inside params is sent as given, so its start times must be Unix seconds"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "params": {"time_based_ad_rotation_intervals": [1796101200, True]}},
+         "must be Unix seconds"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "params": {"time_based_ad_rotation_intervals": [1796101200, "0"]}},
+         "positive"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "params": {"time_based_ad_rotation_intervals": "1796101200,1796706000"}},
+         "time_based_ad_rotation_intervals inside params needs at least two start times"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "params": {"time_based_ad_rotation_intervals": None}},
+         "time_based_ad_rotation_intervals inside params needs at least two start times"),
+        # Named intervals, blocks inside params.
+        ({"time_based_ad_rotation_intervals": _ROTATION_TIMES,
+          "params": {"time_based_ad_rotation_id_blocks": [["11"], ["x"]]}},
+         "time_based_ad_rotation_id_blocks inside params must be a non-empty list"),
+        ({"time_based_ad_rotation_intervals": _ROTATION_TIMES,
+          "params": {"time_based_ad_rotation_id_blocks": [[11], [12]]}},
+         "time_based_ad_rotation_id_blocks inside params must be"),
+        ({"time_based_ad_rotation_intervals": _ROTATION_TIMES,
+          "params": {"time_based_ad_rotation_id_blocks": [["11"], []]}},
+         "time_based_ad_rotation_id_blocks inside params must be"),
+        ({"time_based_ad_rotation_intervals": _ROTATION_TIMES,
+          "params": {"time_based_ad_rotation_id_blocks": []}},
+         "time_based_ad_rotation_id_blocks inside params must be"),
+        ({"time_based_ad_rotation_intervals": [1796101200, 1796706000, 1797310800],
+          "params": {"time_based_ad_rotation_id_blocks": [["11"], ["12"]]}},
+         "2 blocks for 3 start times"),
+    ],
+)
+def test_create_ad_set_mixed_rotation_pair_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **arguments))
+    assert client.calls == []
+
+
+def test_create_ad_set_mixed_rotation_pair_sends_named_half_converted_and_params_half_as_given(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE, time_based_ad_rotation_intervals=["2026-12-01T00:00:00-05:00", "1796706000"],
+        params={"time_based_ad_rotation_id_blocks": [["11"], ["12", "13"]]},
+    ))
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE, time_based_ad_rotation_id_blocks=[["11"], ["12"]],
+        params={"time_based_ad_rotation_intervals": ["1796101200", 1796706000]},
+    ))
+    first, second = (call[3] for call in client.calls)
+    assert first["time_based_ad_rotation_intervals"] == [1796101200, 1796706000]
+    assert first["time_based_ad_rotation_id_blocks"] == [["11"], ["12", "13"]]
+    assert second["time_based_ad_rotation_id_blocks"] == [["11"], ["12"]]
+    assert second["time_based_ad_rotation_intervals"] == ["1796101200", 1796706000]
+
+
+def test_create_ad_set_params_only_rotation_pair_is_sent_unchecked_and_unchanged(monkeypatch) -> None:
+    """Both halves inside params: an old-style call, sent exactly as given even when the counts differ."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    params = {
+        "time_based_ad_rotation_id_blocks": [["11"], ["12"], [13]],
+        "time_based_ad_rotation_intervals": ["2026-12-01T00:00:00", 1796101200],
+    }
+    asyncio.run(campaigns.create_ad_set(**ADSET_BASE, params=dict(params)))
+    assert client.calls == [
+        ("create", "act_123", "adsets", {
+            "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
+            "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED", **params,
+        }),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"min_budget_spend_percentage": 70, "params": {"max_budget_spend_percentage": 60}},
+         "min_budget_spend_percentage must not be more than max_budget_spend_percentage"),
+        ({"max_budget_spend_percentage": 60, "params": {"min_budget_spend_percentage": 70}},
+         "min_budget_spend_percentage must not be more than max_budget_spend_percentage"),
+        ({"min_budget_spend_percentage": 10, "params": {"max_budget_spend_percentage": 150}},
+         "max_budget_spend_percentage inside params must be a whole number from 0 to 100"),
+        ({"max_budget_spend_percentage": 60, "params": {"min_budget_spend_percentage": "10"}},
+         "min_budget_spend_percentage inside params must be a whole number"),
+        ({"max_budget_spend_percentage": 60, "params": {"min_budget_spend_percentage": True}},
+         "min_budget_spend_percentage inside params must be a whole number"),
+    ],
+)
+def test_create_ad_set_mixed_spend_percentage_pair_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **arguments))
+    assert client.calls == []
+
+
+def test_create_ad_set_spend_percentage_pair_mixed_valid_and_params_only_are_sent(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE, min_budget_spend_percentage=10, params={"max_budget_spend_percentage": 60},
+    ))
+    # Both inside params: old-style, sent unchecked.
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE, params={"min_budget_spend_percentage": 70, "max_budget_spend_percentage": 60},
+    ))
+    first, second = (call[3] for call in client.calls)
+    assert (first["min_budget_spend_percentage"], first["max_budget_spend_percentage"]) == (10, 60)
+    assert (second["min_budget_spend_percentage"], second["max_budget_spend_percentage"]) == (70, 60)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"start_time": "2026-12-10T00:00:00Z", "params": {"stop_time": "2026-12-05T00:00:00Z"}},
+         "stop_time must be after start_time"),
+        ({"stop_time": "2026-12-05T00:00:00Z", "params": {"start_time": "1796428800"}},
+         "stop_time must be after start_time"),
+        ({"stop_time": "2026-12-05T00:00:00Z", "params": {"start_time": 1796428800}},
+         "stop_time must be after start_time"),
+        ({"start_time": "2026-12-01T00:00:00Z", "params": {"stop_time": "2026-12-31T00:00:00"}},
+         "stop_time inside params needs a UTC offset"),
+        ({"start_time": "2026-12-01T00:00:00Z", "params": {"stop_time": "soon"}},
+         "stop_time inside params must be"),
+        ({"start_time": "2026-12-01T00:00:00Z", "params": {"stop_time": ["2026-12-31T00:00:00Z"]}},
+         "stop_time inside params must be"),
+    ],
+)
+def test_create_campaign_mixed_schedule_pair_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_campaign(**CAMPAIGN_BASE, **arguments))
+    assert client.calls == []
+
+
+def test_create_campaign_mixed_schedule_pair_in_order_is_sent_as_given(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_campaign(
+        **CAMPAIGN_BASE, start_time="2026-12-01T00:00:00-05:00", params={"stop_time": "2026-12-31T00:00:00-0500"},
+    ))
+    sent = client.calls[-1][3]
+    assert (sent["start_time"], sent["stop_time"]) == ("2026-12-01T00:00:00-05:00", "2026-12-31T00:00:00-0500")
+
+
+def test_update_campaign_mixed_schedule_pair_is_compared_with_the_params_bound_not_the_stored_one(monkeypatch) -> None:
+    """The stored stop_time (2026-12-31) is replaced by the params one, so it is not read or compared."""
+    client = StoredCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.update_campaign(
+        campaign_id="cmp_123", start_time="2027-01-05T00:00:00Z", params={"stop_time": "2027-02-01T00:00:00Z"},
+    ))
+    assert client.calls == [
+        ("get", "cmp_123", [
+            "id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget", "start_time",
+        ]),
+        ("get", "act_123", ["currency"]),
+        ("update", "cmp_123", {"start_time": "2027-01-05T00:00:00Z", "stop_time": "2027-02-01T00:00:00Z"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        # Before the stored stop_time, but after the params stop_time that replaces it.
+        ({"start_time": "2026-12-10T00:00:00Z", "params": {"stop_time": "2026-12-05T00:00:00Z"}},
+         "stop_time must be after start_time"),
+        ({"stop_time": "2026-12-20T00:00:00Z", "params": {"start_time": "2026-12-25T00:00:00Z"}},
+         "stop_time must be after start_time"),
+        ({"stop_time": "2026-12-20T00:00:00Z", "params": {"start_time": "2026-12-25T00:00:00"}},
+         "start_time inside params needs a UTC offset"),
+    ],
+)
+def test_update_campaign_mixed_schedule_pair_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    client = StoredCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", **arguments))
+    assert client.calls == []
+
+
+# Round five: destination_type PHONE_CALL, from Meta's call ads guide.
+
+_CALL_ADSET = {**ADSET_BASE, "optimization_goal": "QUALITY_CALL"}
+_CALL_ADSET_SENT = {
+    "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "QUALITY_CALL",
+    "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED", "daily_budget": 2000,
+    "destination_type": "PHONE_CALL",
+}
+
+
+def test_create_ad_set_named_phone_call_destination_is_sent(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(**_CALL_ADSET, daily_budget=20.0, destination_type=" phone_call "))
+    assert client.calls == [("get", "act_123", ["currency"]), ("create", "act_123", "adsets", _CALL_ADSET_SENT)]
+
+
+def test_create_ad_set_params_only_phone_call_destination_call_is_unchanged(monkeypatch) -> None:
+    """PHONE_CALL inside params, as callers sent it before it was a named value: the same request."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        **_CALL_ADSET, daily_budget=20.0, params={"destination_type": "PHONE_CALL"},
+    ))
+    assert client.calls == [("get", "act_123", ["currency"]), ("create", "act_123", "adsets", _CALL_ADSET_SENT)]
+    assert list(client.calls[1][3]) == list(_CALL_ADSET_SENT)
+    assert result["created"] == {"id": "cmp_123"}
+
+
+@pytest.mark.parametrize("value", ["LEAD_FORM_MESSENGER", "LEAD_FROM_MESSENGER"])
+def test_create_ad_set_messenger_lead_destinations_stay_params_only(monkeypatch, value) -> None:
+    """Meta's pages do not agree on these, so they are not named values; params still sends them."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="inside params"):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, destination_type=value))
+    assert client.calls == []
+    asyncio.run(campaigns.create_ad_set(**ADSET_BASE, params={"destination_type": value}))
+    assert client.calls[-1][3]["destination_type"] == value
+
+
+def test_create_ad_set_docstring_names_phone_call() -> None:
+    assert "PHONE_CALL" in campaigns.create_ad_set.__doc__
+    assert "+" not in campaigns.create_ad_set.__doc__
