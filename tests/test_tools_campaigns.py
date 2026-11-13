@@ -9,15 +9,6 @@ import pytest
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.tools import campaigns
 
-# The fixed-amount (ABSOLUTE) scheduled increase ships switched off. The tests of
-# its conversion and limits below run with it switched on.
-_ABSOLUTE_CONFIRMED_AS_SHIPPED = campaigns.BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED
-
-
-@pytest.fixture(autouse=True)
-def _absolute_budget_increases_on(monkeypatch):
-    monkeypatch.setattr(campaigns, "BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED", True)
-
 
 class FakeCampaignClient:
     """Fake campaign client."""
@@ -1447,7 +1438,7 @@ def test_create_ad_set_round_three_named_parameters_are_sent(monkeypatch) -> Non
         budget_schedule_specs=[
             {"time_start": "2026-12-24T00:00:00-05:00", "time_end": "2026-12-24T06:00:00-05:00",
              "budget_value": 12.5, "budget_value_type": "ABSOLUTE"},
-            {"time_start": 1798000000, "time_end": "1798010800", "budget_value": 140, "budget_value_type": "multiplier"},
+            {"time_start": 1798002000, "time_end": "1798012800", "budget_value": 140, "budget_value_type": "multiplier"},
         ],
     ))
     assert client.calls == [
@@ -1467,7 +1458,7 @@ def test_create_ad_set_round_three_named_parameters_are_sent(monkeypatch) -> Non
             "optimization_sub_event": "VIDEO_SOUND_ON",
             "budget_schedule_specs": [
                 {"time_start": 1798088400, "time_end": 1798110000, "budget_value": 1250, "budget_value_type": "ABSOLUTE"},
-                {"time_start": 1798000000, "time_end": 1798010800, "budget_value": 140, "budget_value_type": "MULTIPLIER"},
+                {"time_start": 1798002000, "time_end": 1798012800, "budget_value": 140, "budget_value_type": "MULTIPLIER"},
             ],
         }),
     ]
@@ -1478,7 +1469,7 @@ def test_create_ad_set_multiplier_schedule_alone_does_not_read_currency(monkeypa
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     asyncio.run(campaigns.create_ad_set(
         **ADSET_BASE, is_dynamic_creative=True,
-        budget_schedule_specs=[{"time_start": 1798000000, "time_end": 1798010800, "budget_value": 2,
+        budget_schedule_specs=[{"time_start": 1798002000, "time_end": 1798012800, "budget_value": 2,
                                 "budget_value_type": "MULTIPLIER"}],
     ))
     assert [call[0] for call in client.calls] == ["create"]
@@ -1505,13 +1496,13 @@ def test_create_campaign_budget_schedule_zero_decimal_currency(monkeypatch) -> N
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     asyncio.run(campaigns.create_campaign(
         **CAMPAIGN_BASE,
-        budget_schedule_specs=[{"time_start": 1798000000, "time_end": 1798010800, "budget_value": 3000,
+        budget_schedule_specs=[{"time_start": 1798002000, "time_end": 1798012800, "budget_value": 3000,
                                 "budget_value_type": "ABSOLUTE"}],
     ))
     assert client.created_payload["data"]["budget_schedule_specs"][0]["budget_value"] == 3000
 
 
-_GOOD_PERIOD = {"time_start": 1798000000, "time_end": 1798010800, "budget_value": 20, "budget_value_type": "ABSOLUTE"}
+_GOOD_PERIOD = {"time_start": 1798002000, "time_end": 1798012800, "budget_value": 20, "budget_value_type": "ABSOLUTE"}
 
 
 @pytest.mark.parametrize(
@@ -1522,12 +1513,12 @@ _GOOD_PERIOD = {"time_start": 1798000000, "time_end": 1798010800, "budget_value"
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "recurrence_type": "WEEKLY"}]}, "one-time periods only"),
         ({"budget_schedule_specs": [{k: v for k, v in _GOOD_PERIOD.items() if k != "time_end"}]}, "missing time_end"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value_type": "PERCENT"}]}, "budget_value_type must be one of"),
-        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 1798010799}]}, "at least 3 hours"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 1798011900}]}, "at least 3 hours"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": "2026-12-01T00:00:00"}]}, "UTC offset"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": True}]}, "time_start"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": None}]}, "time_start must be"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 0}]}, "time_end must be"),
-        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 1798010800.5}]}, "time_end must be"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 1798012800.5}]}, "time_end must be"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": True}]}, "must be a number"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": "20"}]}, "must be a number"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": 0}]}, "greater than 0"),
@@ -1833,18 +1824,95 @@ def test_update_adset_adlabels_errors_make_no_call(monkeypatch, arguments, messa
         asyncio.run(campaigns.update_adset(adset_id="adset_1", **arguments))
 
 
-def test_absolute_budget_increase_is_refused_until_metas_unit_is_confirmed(monkeypatch) -> None:
-    monkeypatch.setattr(campaigns, "BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED", False)
-    period = {"time_start": 1798000000, "time_end": 1798010800, "budget_value": 20, "budget_value_type": "ABSOLUTE"}
-    with pytest.raises(campaigns.ValidationError, match="ABSOLUTE is not offered yet"):
-        campaigns.check_budget_schedule_specs([period], daily_budget=50, lifetime_budget=None)
-    multiplier = {**period, "budget_value": 140, "budget_value_type": "MULTIPLIER"}
-    checked = campaigns.check_budget_schedule_specs([multiplier], daily_budget=50, lifetime_budget=None)
-    assert checked[0]["budget_value"] == 140
+# Scheduled budget increases, as Meta answered live on 2026-11-13: an ABSOLUTE budget_value is in
+# minor units (the tool converts from major units), times fall on a quarter hour, and on a 10.00
+# daily budget an increase of 80.00 is accepted and more is refused.
 
 
-def test_absolute_budget_increase_is_off_by_default() -> None:
-    assert _ABSOLUTE_CONFIRMED_AS_SHIPPED is False
+@pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])
+def test_absolute_budget_increase_is_offered_and_sent_in_minor_units(monkeypatch, tool) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
+    asyncio.run(getattr(campaigns, tool)(**base, daily_budget=10, budget_schedule_specs=[
+        {"time_start": "2026-12-24T09:00:00-05:00", "time_end": "2026-12-24T12:00:00-05:00",
+         "budget_value": 5, "budget_value_type": "ABSOLUTE"},
+    ]))
+    assert client.calls[-1][3]["budget_schedule_specs"][0]["budget_value"] == 500
+
+
+@pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])
+@pytest.mark.parametrize("increase", [80, 79.99])
+def test_absolute_increase_up_to_eight_times_the_daily_budget_is_sent(monkeypatch, tool, increase) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
+    asyncio.run(getattr(campaigns, tool)(**base, daily_budget=10, budget_schedule_specs=[
+        {**_GOOD_PERIOD, "budget_value": increase},
+    ]))
+    assert client.calls[-1][3]["budget_schedule_specs"][0]["budget_value"] == round(increase * 100)
+
+
+@pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])
+def test_absolute_increase_past_eight_times_the_daily_budget_is_refused_before_any_call(monkeypatch, tool) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
+    with pytest.raises(campaigns.ValidationError, match=r"budget_schedule_specs\[0\]\.budget_value 80\.01 .*at most 80"):
+        asyncio.run(getattr(campaigns, tool)(**base, daily_budget=10, budget_schedule_specs=[
+            {**_GOOD_PERIOD, "budget_value": 80.01},
+        ]))
+
+
+@pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])
+def test_absolute_increase_that_is_not_a_whole_number_of_cents_is_refused_before_the_create(monkeypatch, tool) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
+    with pytest.raises(
+        campaigns.ValidationError,
+        match=r"budget_schedule_specs\[0\]\.budget_value has too many decimal places for USD \(maximum 2\)",
+    ):
+        asyncio.run(getattr(campaigns, tool)(**base, daily_budget=10, budget_schedule_specs=[
+            {**_GOOD_PERIOD, "budget_value": 5.005},
+        ]))
+    assert [call[0] for call in client.calls] == ["get"]
+
+
+@pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])
+@pytest.mark.parametrize("value_type", ["ABSOLUTE", "MULTIPLIER"])
+@pytest.mark.parametrize(
+    ("bound", "value"),
+    [
+        ("time_start", "2026-12-24T09:10:00-05:00"),
+        ("time_start", "2026-12-24T09:15:30-05:00"),
+        ("time_start", 1798002000 + 60),
+        ("time_end", "2026-12-24T12:05:00-05:00"),
+        ("time_end", str(1798012800 + 1)),
+    ],
+)
+def test_budget_increase_times_off_a_quarter_hour_are_refused_before_any_call(
+    monkeypatch, tool, value_type, bound, value,
+) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
+    period = {"time_start": "2026-12-24T09:00:00-05:00", "time_end": "2026-12-24T13:00:00-05:00",
+              "budget_value": 140 if value_type == "MULTIPLIER" else 20, "budget_value_type": value_type}
+    specs = [dict(period), {**period, bound: value}]
+    with pytest.raises(
+        campaigns.ValidationError,
+        match=rf"budget_schedule_specs\[1\]\.{bound} must fall on a quarter hour \(minute 0, 15, 30 or 45, zero seconds\)",
+    ):
+        asyncio.run(getattr(campaigns, tool)(**base, daily_budget=20, budget_schedule_specs=specs))
+
+
+@pytest.mark.parametrize("offset", ["-05:00", "+05:30", "+05:45", "Z"])
+def test_budget_increase_times_on_a_quarter_hour_in_any_offset_are_accepted(offset) -> None:
+    checked = campaigns.check_budget_schedule_specs(
+        [{"time_start": f"2026-12-24T09:45:00{offset}", "time_end": f"2026-12-24T12:45:00{offset}",
+          "budget_value": 140, "budget_value_type": "MULTIPLIER"}],
+        daily_budget=None, lifetime_budget=None,
+    )
+    assert checked[0]["time_end"] - checked[0]["time_start"] == 3 * 60 * 60
 
 
 # A money field inside params is refused: the named parameter takes major units,
