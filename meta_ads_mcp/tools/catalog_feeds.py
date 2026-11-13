@@ -6,11 +6,15 @@ server's own tool catalog.
 
 from __future__ import annotations
 
+import functools
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from typing import Annotated, Any
+from urllib.parse import urlsplit
+
+from pydantic import WithJsonSchema
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import build_finding
@@ -162,6 +166,13 @@ FEED_FILE_TYPES = {
 # This server's own limit on a local feed file read into memory; Meta publishes none.
 MAX_FEED_FILE_BYTES = 100 * 1024 * 1024
 _SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
+# scheme://user:password@ anywhere in a string. The password part runs greedily to the
+# last @ before the path, so a password containing @ is masked whole.
+_CREDENTIAL_URL = re.compile(r"(?P<head>[A-Za-z][A-Za-z0-9+.\-]*://[^\s/?#@:]*):[^\s/?#]*@")
+# Parameters that can carry a secret or pasted data. The framework accepts any value for
+# them and the tool validates it, because the framework's own type errors quote the input.
+_OptionalText = Annotated[Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})]
+_OptionalSchedule = Annotated[Any, WithJsonSchema({"anyOf": [{"type": "object"}, {"type": "null"}]})]
 _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 _DERIVED_METHOD = (
@@ -302,19 +313,55 @@ def _validate_http_url(
     return url
 
 
-def _mask_url_password(value: Any) -> Any:
-    """Replace a password embedded in a URL's user info with a marker."""
-    if not isinstance(value, str) or "@" not in value:
-        return value
-    try:
-        parts = urlsplit(value)
-        if parts.password is None:
-            return value
-    except ValueError:
-        return value
-    userinfo, hostport = parts.netloc.rsplit("@", 1)
-    user = userinfo.split(":", 1)[0]
-    return urlunsplit(parts._replace(netloc=f"{user}:[redacted]@{hostport}"))
+def _mask_text(text: str) -> str:
+    """Replace every password embedded in a URL inside the text, keeping user, host and path."""
+    if "@" not in text or "://" not in text:
+        return text
+    return _CREDENTIAL_URL.sub(lambda match: f"{match.group('head')}:[redacted]@", text)
+
+
+def _redact(value: Any) -> Any:
+    """Copy a response for display: any password key, and any password inside a URL, is masked.
+
+    Every tool in this module returns through this function (see _secrets_masked), so a
+    new field that carries a URL, such as an upload's url, cannot be missed.
+    """
+    if isinstance(value, dict):
+        return {
+            key: "[redacted]" if str(key).lower() == "password" and value[key] is not None else _redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact(item) for item in value)
+    if isinstance(value, str):
+        return _mask_text(value)
+    return value
+
+
+def _mask_error(exc: BaseException) -> None:
+    """Mask URL passwords in a raised error's text and data, in place."""
+    for name in ("message", "user_title", "user_message", "details", "error_data"):
+        if hasattr(exc, name) and getattr(exc, name, None) is not None:
+            setattr(exc, name, _redact(getattr(exc, name)))
+    if exc.args:
+        exc.args = tuple(_redact(arg) for arg in exc.args)
+
+
+def _secrets_masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Run a tool so that neither its result nor an error it raises shows a password."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = await fn(*args, **kwargs)
+        except Exception as exc:
+            _mask_error(exc)
+            raise
+        return _redact(result)
+
+    return wrapper
 
 
 def _bounded_int(value: Any, *, name: str, low: int, high: int | None) -> None:
@@ -374,22 +421,6 @@ def _normalize_schedule(value: Any, *, name: str) -> dict[str, Any]:
         if key in value and not isinstance(value[key], str):
             raise ValidationError(f"{name}.{key} must be a string.")
     return normalized
-
-
-def _redact_schedules(payload: dict[str, Any]) -> dict[str, Any]:
-    """Copy a payload for display with schedule passwords removed, including one in a URL."""
-    shown = dict(payload)
-    for key in ("schedule", "update_schedule"):
-        schedule = shown.get(key)
-        if not isinstance(schedule, dict):
-            continue
-        redacted = dict(schedule)
-        if "password" in redacted:
-            redacted["password"] = "[redacted]"
-        if "url" in redacted:
-            redacted["url"] = _mask_url_password(redacted["url"])
-        shown[key] = redacted
-    return shown
 
 
 def _upload_status(upload: dict[str, Any]) -> str:
@@ -529,10 +560,16 @@ def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[s
         matched = to_int(row.get("total_matched_content_ids"))
         unmatched = to_int(row.get("total_unmatched_content_ids"))
         bucket = per_source.setdefault(
-            source_id, {"days": {}, "events": {}, "window": [0, 0, 0, 0], "rows_missing_counters": 0},
+            source_id,
+            {"days": {}, "events": {}, "window": [0, 0, 0, 0], "rows_missing_counters": 0, "other": [0, 0]},
         )
         if matched is None or unmatched is None:
             bucket["rows_missing_counters"] += 1
+        other = to_int(row.get("total_content_ids_matched_other_catalogs"))
+        if other is None:
+            bucket["other"][1] += 1
+        else:
+            bucket["other"][0] += other
         day = str(row.get("date_start") or row.get("date_stop") or "unknown")
         _add_counts(bucket["days"].setdefault(day, [0, 0, 0, 0]), matched, unmatched)
         event = str(row.get("event") or "unknown")
@@ -546,6 +583,7 @@ def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[s
             "unmatched_content_ids": window["unmatched_content_ids"],
             "window_match_rate": window["match_rate"],
             "rows_missing_counters": bucket["rows_missing_counters"],
+            "content_ids_matched_other_catalogs": None if bucket["other"][1] else bucket["other"][0],
             "match_rate_history": [
                 {"date": day, **_counts_view(totals)}
                 for day, totals in sorted(bucket["days"].items())
@@ -556,6 +594,44 @@ def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[s
             },
         }
     return summaries, unattributed
+
+
+def _across_catalogs(stats: dict[str, Any] | None, stats_complete: bool) -> dict[str, Any]:
+    """This catalog's rate for a source beside the share that matched its other catalogs.
+
+    Computed only from a finished event_stats read with both counters known.
+    """
+    view: dict[str, Any] = {
+        "this_catalog_match_rate": None,
+        "content_ids_matched_other_catalogs": None,
+        "other_catalogs_match_share": None,
+        "all_catalogs_match_rate_range": None,
+        "note": None,
+    }
+    if stats is None:
+        view["note"] = "No event_stats rows for this source were read, so no rates are available."
+        return view
+    if not stats_complete:
+        view["note"] = "event_stats was only partly read, so the rates were not computed."
+        return view
+    matched, unmatched = stats["matched_content_ids"], stats["unmatched_content_ids"]
+    other = stats["content_ids_matched_other_catalogs"]
+    this_rate = _match_rate(matched, unmatched)
+    view["this_catalog_match_rate"] = this_rate
+    view["content_ids_matched_other_catalogs"] = other
+    if this_rate is None:
+        view["note"] = "Meta omitted a matched or unmatched counter, or reported no content ids, so no rate."
+        return view
+    if other is None:
+        view["note"] = "Meta omitted the other-catalogs counter on some rows, so the all-catalog range is unknown."
+        return view
+    other_share = round(other / (matched + unmatched), 4)
+    view["other_catalogs_match_share"] = other_share
+    view["all_catalogs_match_rate_range"] = {
+        "low": max(this_rate, other_share),
+        "high": round(min(1.0, this_rate + other_share), 4),
+    }
+    return view
 
 
 def _validate_threshold(match_rate_threshold: float) -> None:
@@ -616,6 +692,7 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def list_product_feeds(
     catalog_id: str | None = None,
     feed_id: str | None = None,
@@ -631,23 +708,20 @@ async def list_product_feeds(
     client = get_graph_api_client()
     if feed_id is not None:
         feed = await client.get_object(feed_id, fields=FEED_FIELDS)
-        return {"item": _redact_schedules(feed) if isinstance(feed, dict) else feed, "summary": {"count": 1}}
+        return {"item": feed, "summary": {"count": 1}}
     payload = await client.list_objects(
         catalog_id, "product_feeds", fields=FEED_LIST_FIELDS, params=_page_params(limit, after),
     )
-    collection = _paged_collection(payload)
-    collection["items"] = [
-        _redact_schedules(item) if isinstance(item, dict) else item for item in collection["items"]
-    ]
-    return collection
+    return _paged_collection(payload)
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def create_product_feed(
     catalog_id: str,
     name: str,
-    schedule: dict[str, Any] | None = None,
-    update_schedule: dict[str, Any] | None = None,
+    schedule: _OptionalSchedule = None,
+    update_schedule: _OptionalSchedule = None,
     file_name: str | None = None,
     country: str | None = None,
     default_currency: str | None = None,
@@ -675,17 +749,18 @@ async def create_product_feed(
     return creation_response(
         action="create_product_feed",
         target={"catalog_id": catalog_id},
-        # Meta may return the schedule it was sent; never hand a password back.
-        result=_redact_schedules(created) if isinstance(created, dict) else created,
+        # Meta may return the schedule it was sent; _secrets_masked masks any password.
+        result=created,
     )
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def update_product_feed(
     feed_id: str,
     name: str | None = None,
-    schedule: dict[str, Any] | None = None,
-    update_schedule: dict[str, Any] | None = None,
+    schedule: _OptionalSchedule = None,
+    update_schedule: _OptionalSchedule = None,
     default_currency: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -723,16 +798,15 @@ async def update_product_feed(
     response = mutation_response(
         action="update_product_feed",
         target={"feed_id": feed_id},
-        previous=_redact_schedules({
-            key: previous[key] for key in data if key in FEED_READABLE_FIELDS and key in previous
-        }),
-        current=_redact_schedules(data),
+        previous={key: previous[key] for key in data if key in FEED_READABLE_FIELDS and key in previous},
+        current=data,
     )
     response["previous_unavailable"] = unavailable
     return response
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def delete_product_feed(feed_id: str) -> dict[str, Any]:
     """Use only on an explicit request to delete a product catalog data feed and its schedule. Products the feed supplied are removed from the catalog afterwards unless another source also supplies them, and ads using them stop. Returns the feed's prior settings."""
     feed_id = _require_id(feed_id, "feed_id")
@@ -742,7 +816,7 @@ async def delete_product_feed(feed_id: str) -> dict[str, Any]:
     return mutation_response(
         action="delete_product_feed",
         target={"feed_id": feed_id},
-        previous=_redact_schedules(previous),
+        previous=previous,
         current={"deleted": True, "result": result},
     )
 
@@ -776,13 +850,14 @@ def _read_feed_file(file_path: Any) -> tuple[str, bytes, str]:
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def create_product_feed_upload(
     feed_id: str,
-    url: str | None = None,
+    url: _OptionalText = None,
     update_only: bool | None = None,
-    file_path: str | None = None,
-    username: str | None = None,
-    password: str | None = None,
+    file_path: _OptionalText = None,
+    username: _OptionalText = None,
+    password: _OptionalText = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Start a one-off upload for a product catalog data feed, from an http(s) url (with optional basic-auth username and password) or from a local file_path (CSV, TSV, XML, zip, gz, bz2) that this server reads and sends, so the file's rows never pass through the conversation. update_only=true only adds or updates items; otherwise items missing from the file may be deleted. The password is never returned. dry_run=true returns the request and sends nothing. Check progress with list_product_feed_uploads."""
@@ -858,6 +933,7 @@ async def create_product_feed_upload(
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def list_product_feed_uploads(
     feed_id: str,
     upload_id: str | None = None,
@@ -887,6 +963,7 @@ async def list_product_feed_uploads(
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def list_feed_rules(
     feed_id: str,
     limit: int = 100,
@@ -903,6 +980,7 @@ async def list_feed_rules(
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def create_feed_rule(
     feed_id: str,
     attribute: str,
@@ -930,6 +1008,7 @@ async def create_feed_rule(
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def update_feed_rule(
     rule_id: GraphId,
     params: dict[str, Any],
@@ -979,6 +1058,7 @@ async def update_feed_rule(
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def delete_feed_rule(rule_id: str) -> dict[str, Any]:
     """Use only on an explicit request to delete one product catalog feed rule. The feed and its products are unaffected; later uploads are no longer transformed by the rule. Returns the rule as it was."""
     rule_id = _require_id(rule_id, "rule_id")
@@ -994,6 +1074,7 @@ async def delete_feed_rule(rule_id: str) -> dict[str, Any]:
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def list_catalog_event_sources(
     catalog_id: str,
     limit: int = 100,
@@ -1010,14 +1091,81 @@ async def list_catalog_event_sources(
     return _paged_collection(payload)
 
 
+def _canonical_event_name(event_name: str | None, include_match_rates: bool) -> str | None:
+    text = blank_to_none(event_name)
+    if text is None:
+        return None
+    if not include_match_rates:
+        raise ValidationError("event_name only applies with include_match_rates=true.")
+    for name in CATALOG_EVENT_NAMES:
+        if name.lower() == text.lower():
+            return name
+    raise ValidationError(f"event_name must be one of {', '.join(CATALOG_EVENT_NAMES)}.")
+
+
+async def _source_rate_in_catalog(
+    client: Any, catalog_id: str, source_id: str, event_name: str | None,
+) -> dict[str, Any]:
+    """One source's 28-day match rate in one catalog, from that catalog's event_stats.
+
+    A rate is given only when the read finished and both counters are known.
+    """
+    reasons: list[str] = []
+    rows, complete = await _collect_edge(
+        client, catalog_id, "event_stats", fields=EVENT_STAT_FIELDS, page_size=500,
+        max_pages=MATCH_RATE_STATS_PAGES, stop_reasons=reasons,
+    )
+    own = [row for row in rows if _object_id(row.get("event_source")) == source_id]
+    if event_name is not None:
+        own = [row for row in own if row.get("event") == event_name]
+    stats = _summarize_event_stats(own)[0].get(source_id)
+    matched = stats["matched_content_ids"] if stats else None
+    unmatched = stats["unmatched_content_ids"] if stats else None
+    base = {
+        "event_stat_rows": len(own),
+        "events": sorted({str(row.get("event") or "unknown") for row in own}),
+        "stats_complete": complete,
+    }
+    empty = {"match_rate": None, "matched_content_ids": None, "unmatched_content_ids": None}
+    if not complete:
+        return {
+            "status": "partial_read", **empty, **base,
+            "partial_counts_from_pages_read": {"matched_content_ids": matched, "unmatched_content_ids": unmatched},
+            "note": f"event_stats was only partly read, so no rate is given: {' '.join(reasons)}",
+        }
+    if stats is None:
+        return {
+            "status": "no_events_in_window", **empty, **base,
+            "note": "Meta reported no rows for this source"
+            f"{' and event' if event_name else ''} in this catalog's 28-day event_stats window.",
+        }
+    rate = stats["window_match_rate"]
+    if rate is None:
+        status = "counters_missing" if matched is None or unmatched is None else "no_content_ids"
+        return {
+            "status": status, "match_rate": None, "matched_content_ids": matched,
+            "unmatched_content_ids": unmatched, **base,
+            "note": "Meta omitted a matched or unmatched counter on some rows, so the rate is unknown."
+            if status == "counters_missing" else "The rows read counted no content ids, so there is no rate.",
+        }
+    return {
+        "status": "computed", "match_rate": rate, "matched_content_ids": matched,
+        "unmatched_content_ids": unmatched, **base,
+    }
+
+
 @mcp_server.tool()
+@_secrets_masked
 async def list_event_source_catalogs(
     event_source_id: str,
     business_id: str | None = None,
+    include_match_rates: bool = False,
+    event_name: str | None = None,
 ) -> dict[str, Any]:
-    """Find the product catalogs one pixel or app is connected to by checking a business's owned catalogs. business_id defaults to the pixel's owner business; the summary says how many catalogs were checked and whether the scan was complete."""
+    """Find the product catalogs one pixel or app is connected to by checking a business's owned catalogs. business_id defaults to the pixel's owner business; the summary says how many catalogs were checked and whether the scan was complete. include_match_rates=true also computes the source's 28-day match rate in each connected catalog (one more read per catalog, first 10 only), optionally for one event_name such as Purchase."""
     event_source_id = _require_id(event_source_id, "event_source_id")
     business_id = blank_to_none(business_id)
+    event_name = _canonical_event_name(event_name, include_match_rates)
     client = get_graph_api_client()
     if business_id is None:
         source = await client.get_object(event_source_id, fields=["id", "owner_business"])
@@ -1050,37 +1198,88 @@ async def list_event_source_catalogs(
         else f"The scan is incomplete after checking {len(catalogs)} catalogs: "
         f"{' '.join(stop_reasons)} Catalogs or sources not read may also be connected."
     )
-    return {
-        "items": matches,
-        "summary": {
-            "count": len(matches),
-            "event_source_id": event_source_id,
-            "business_id": business_id,
-            "catalogs_scanned": len(catalogs),
-            "complete": complete,
-            "stop_reasons": stop_reasons,
-            "method": "derived: each catalog owned by the business is checked for this source "
-            "on its external_event_sources edge; catalogs shared with the business by others "
-            "are not checked.",
-            "note": note,
-        },
+    summary: dict[str, Any] = {
+        "count": len(matches),
+        "event_source_id": event_source_id,
+        "business_id": business_id,
+        "catalogs_scanned": len(catalogs),
+        "complete": complete,
+        "stop_reasons": stop_reasons,
+        "method": "derived: each catalog owned by the business is checked for this source "
+        "on its external_event_sources edge; catalogs shared with the business by others "
+        "are not checked.",
+        "note": note,
     }
+    if not include_match_rates:
+        return {"items": matches, "summary": summary}
+    items: list[dict[str, Any]] = []
+    not_checked: list[str] = []
+    for index, catalog in enumerate(matches):
+        catalog_id = _object_id(catalog.get("id"))
+        if index < MAX_MATCH_RATE_CATALOGS and catalog_id is not None:
+            rate = await _source_rate_in_catalog(client, catalog_id, event_source_id, event_name)
+        else:
+            not_checked.append(catalog_id or "")
+            rate = {
+                "status": "not_checked",
+                "match_rate": None,
+                "note": f"Only the first {MAX_MATCH_RATE_CATALOGS} connected catalogs get a match-rate read.",
+            }
+        items.append({**catalog, "match_rate": rate})
+    computed = [item for item in items if item["match_rate"]["status"] == "computed"]
+    ranked = sorted(computed, key=lambda item: -item["match_rate"]["match_rate"])
+    summary["match_rates"] = {
+        "event_name": event_name,
+        "catalogs_checked": len(items) - len(not_checked),
+        "catalogs_with_rate": len(computed),
+        "catalogs_not_checked": not_checked,
+        "max_catalogs_checked": MAX_MATCH_RATE_CATALOGS,
+        "max_event_stats_pages_per_catalog": MATCH_RATE_STATS_PAGES,
+        "ranked_by_match_rate": [item["id"] for item in ranked],
+        "ranking_covers_every_connected_catalog": complete and len(computed) == len(items),
+        "method": "derived: for each connected catalog, this source's rows in the catalog's event_stats "
+        "(last 28 days) are summed. A rate is given only when that read finished and Meta reported both "
+        "counters; a counter Meta omitted is unknown, not zero.",
+        "definition": _MATCH_RATE_NOTE,
+        "caution": "Each catalog's rate counts content ids (not de-duplicated) against that catalog alone. "
+        "A higher rate does not by itself mean a catalog is the right one for this source; "
+        + ("all events are counted, so catalogs can differ in which events they received; pass event_name "
+           "to compare one event." if event_name is None else f"only {event_name} events are counted."),
+    }
+    return {"items": items, "summary": summary}
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def get_catalog_event_source_health(
     catalog_id: str,
     match_rate_threshold: float = DEFAULT_MATCH_RATE_THRESHOLD,
+    event_source_id: GraphId | None = None,
 ) -> dict[str, Any]:
-    """Health of each pixel or app connected to a product catalog: daily match-rate history over Meta's 28-day event_stats window, per-event match rates, and failed Dynamic Ads checks, ranked as findings."""
+    """Health of each pixel or app connected to a product catalog: daily match-rate history over Meta's 28-day event_stats window, per-event match rates, failed Dynamic Ads checks ranked as findings, and each source's share of content ids that matched its other catalogs beside this catalog's rate. event_source_id limits the report to one connected source."""
     catalog_id = _require_id(catalog_id, "catalog_id")
     _validate_threshold(match_rate_threshold)
+    scope_id = blank_to_none(event_source_id)
     client = get_graph_api_client()
     inputs = await _catalog_signal_inputs(client, catalog_id)
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
     reports: list[dict[str, Any]] = []
-    for source in inputs["sources"]:
+    sources = inputs["sources"]
+    if scope_id is not None:
+        sources = [source for source in sources if _object_id(source.get("id")) == scope_id]
+        if not sources and inputs["sources_complete"]:
+            raise ValidationError(
+                f"Event source {scope_id} is not connected to catalog {catalog_id}; "
+                "list_catalog_event_sources shows the connected ones."
+            )
+        if not sources:
+            sources = [{"id": scope_id}]
+            missing.append(
+                f"Source {scope_id} was not among the connected sources read (that list is partial), "
+                "so its name and type are unknown."
+            )
+    for source in sources:
         source_id = _object_id(source.get("id"))
         if source_id is None:
             continue
@@ -1096,6 +1295,7 @@ async def get_catalog_event_source_health(
             "matched_content_ids": stats["matched_content_ids"] if stats else None,
             "unmatched_content_ids": stats["unmatched_content_ids"] if stats else None,
             "by_event": stats["by_event"] if stats else {},
+            "across_catalogs": _across_catalogs(stats, inputs["stats_complete"]),
             "checks": [],
             "failed_checks": [],
             "unevaluated_checks": [],
@@ -1198,24 +1398,33 @@ async def get_catalog_event_source_health(
         missing.append("Low-match-rate findings were not made because event_stats was only partly read.")
     if inputs["unattributed_rows"]:
         missing.append(f"{inputs['unattributed_rows']} event_stats rows had no event_source and were not attributed.")
+    metrics: dict[str, Any] = {
+        "connected_sources": len(reports),
+        "sources_complete": inputs["sources_complete"],
+        "event_stat_rows": inputs["stat_rows"],
+        "stats_complete": inputs["stats_complete"],
+        "match_rate_threshold": match_rate_threshold,
+    }
+    scope: dict[str, Any] = {"catalog_id": catalog_id}
+    if scope_id is not None:
+        scope["event_source_id"] = scope_id
+        across = reports[0]["across_catalogs"]
+        metrics["this_catalog_match_rate"] = across["this_catalog_match_rate"]
+        metrics["all_catalogs_match_rate_range"] = across["all_catalogs_match_rate_range"]
     return analysis_response(
-        scope={"catalog_id": catalog_id},
-        metrics={
-            "connected_sources": len(reports),
-            "sources_complete": inputs["sources_complete"],
-            "event_stat_rows": inputs["stat_rows"],
-            "stats_complete": inputs["stats_complete"],
-            "match_rate_threshold": match_rate_threshold,
-        },
+        scope=scope,
+        metrics=metrics,
         findings=_sorted_findings(findings),
         missing_signals=missing,
         extra={
             "sources": reports,
             "method": _DERIVED_METHOD,
             "match_rate_definition": _MATCH_RATE_NOTE,
+            "across_catalogs_definition": _ACROSS_CATALOGS_NOTE,
             "signals_used": [
                 "GET {catalog_id}/external_event_sources (connected sources)",
-                "GET {catalog_id}/event_stats (daily matched and unmatched content ids per event and source, last 28 days)",
+                "GET {catalog_id}/event_stats (daily matched and unmatched content ids per event and source, "
+                "and ids matched in the source's other catalogs, last 28 days)",
                 "GET {event_source_id}/da_checks for pixel and app sources (Meta's Dynamic Ads checks: passed, failed, unavailable)",
             ],
         },
@@ -1223,6 +1432,7 @@ async def get_catalog_event_source_health(
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def get_catalog_event_source_recommendations(
     catalog_id: str,
     business_id: str | None = None,
@@ -1340,7 +1550,11 @@ async def get_catalog_event_source_recommendations(
         )
         if index < MAX_PIXEL_CANDIDATES_CHECKED:
             checks_payload = await client.list_objects(pixel_id, "da_checks", fields=DA_CHECK_FIELDS)
-            checks = normalize_collection(checks_payload)["items"]
+            checks_page = normalize_collection(checks_payload)
+            checks = checks_page["items"]
+            checks_paged = bool(checks_page["paging"].get("next"))
+            if checks_paged:
+                missing.append(f"da_checks for pixel {pixel_id} had more pages than were read.")
             dpa_check = next((c for c in checks if c.get("key") == "pixel_missing_dpa_event"), None)
             result = str((dpa_check or {}).get("result") or "").lower()
             if dpa_check is not None:
@@ -1351,6 +1565,12 @@ async def get_catalog_event_source_recommendations(
             elif result == "failed":
                 strength = "weak"
                 reason = "Meta's check pixel_missing_dpa_event failed: the pixel does not send all catalog events yet."
+            elif dpa_check is None and checks_paged:
+                strength = "unknown"
+                reason = (
+                    "Meta's check pixel_missing_dpa_event was not on the first page of checks read, "
+                    "and more pages exist, so the result is unknown."
+                )
             else:
                 strength = "unknown"
                 reason = "Meta returned no usable pixel_missing_dpa_event result for this pixel."
@@ -1423,6 +1643,7 @@ def _with_completeness(response: dict[str, Any], complete: bool, gaps: list[str]
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def connect_catalog_event_source(
     catalog_id: str,
     event_source_id: str,
@@ -1457,6 +1678,7 @@ async def connect_catalog_event_source(
 
 
 @mcp_server.tool()
+@_secrets_masked
 async def disconnect_catalog_event_source(
     catalog_id: str,
     event_source_id: str,

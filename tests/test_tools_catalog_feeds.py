@@ -1770,6 +1770,127 @@ def test_list_event_source_catalogs_incomplete_scan_ranking_is_not_complete(monk
     assert result["summary"]["match_rates"]["ranking_covers_every_connected_catalog"] is False
 
 
+# phase two: credentials embedded in URLs are masked on every path --------------------------------
+
+URL_SECRET = "pw-in-url-5521"
+CRED_URL = f"ftp://feeduser:{URL_SECRET}@feeds.example.com/path/feed.csv"
+MASKED_URL = "ftp://feeduser:[redacted]@feeds.example.com/path/feed.csv"
+
+
+class CredentialUrlClient(FakeCatalogFeedClient):
+    """Meta-shaped responses that carry a URL with an embedded password in every place a URL can appear."""
+
+    def __init__(self) -> None:
+        upload = {"id": "up_1", "url": CRED_URL, "end_time": "2026-11-01T00:00:00+0000", "error_count": 1}
+        feed = {
+            "id": "feed_1", "name": "Main",
+            "schedule": {"url": CRED_URL, "interval": "DAILY"},
+            "update_schedule": {"url": CRED_URL, "interval": "HOURLY"},
+            "latest_upload": dict(upload),
+        }
+        super().__init__(
+            objects={"feed_1": feed, "up_1": upload},
+            edges={
+                ("cat_1", "product_feeds"): {"data": [feed]},
+                ("feed_1", "uploads"): {"data": [upload]},
+                ("up_1", "errors"): {"data": [{"id": "e1", "description": f"Could not fetch {CRED_URL} today"}]},
+            },
+        )
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        await super().create_edge_object(parent_id, edge, data=data, files=files)
+        return {"id": "created_1", "schedule": {"url": CRED_URL}, "url": CRED_URL, "message": f"fetching {CRED_URL}"}
+
+
+def test_a_password_embedded_in_any_returned_url_is_masked(monkeypatch, tmp_path) -> None:
+    _use(monkeypatch, CredentialUrlClient())
+    feed_file = tmp_path / "feed.csv"
+    feed_file.write_bytes(b"id\n1\n")
+    results = {
+        "feed": run(catalog_feeds.list_product_feeds(feed_id="feed_1")),
+        "feeds": run(catalog_feeds.list_product_feeds(catalog_id="cat_1")),
+        "upload": run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1")),
+        "uploads": run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1")),
+        "create": run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="F", schedule=SCHEDULE)),
+        "update": run(catalog_feeds.update_product_feed(feed_id="feed_1", schedule=SCHEDULE, update_schedule=SCHEDULE)),
+        "delete": run(catalog_feeds.delete_product_feed(feed_id="feed_1")),
+        "upload_url": run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", url="https://e.com/f.csv")),
+        "upload_file": run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", file_path=str(feed_file))),
+    }
+    for name, result in results.items():
+        assert URL_SECRET not in repr(result), name
+    assert results["feed"]["item"]["latest_upload"]["url"] == MASKED_URL
+    assert results["feed"]["item"]["schedule"]["url"] == MASKED_URL
+    assert results["feeds"]["items"][0]["latest_upload"]["url"] == MASKED_URL
+    assert results["upload"]["item"]["url"] == MASKED_URL
+    assert results["upload"]["item"]["errors"][0]["description"] == f"Could not fetch {MASKED_URL} today"
+    assert results["uploads"]["items"][0]["url"] == MASKED_URL
+    assert results["update"]["previous"]["schedule"]["url"] == MASKED_URL
+    assert results["delete"]["previous"]["update_schedule"]["url"] == MASKED_URL
+    assert results["create"]["created"]["schedule"]["url"] == MASKED_URL
+
+
+def test_dry_run_masks_the_password_but_says_a_credential_is_sent(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    secret = "dry-run-secret-3390"
+    result = run(catalog_feeds.create_product_feed_upload(
+        feed_id="feed_1", url="https://e.com/f.csv", username="feeduser", password=secret, dry_run=True,
+    ))
+    assert secret not in repr(result)
+    assert result["would_send"]["data"]["password"] == "[redacted]"
+    assert result["would_send"]["data"]["username"] == "feeduser"
+    assert result["upload_source"]["credentials_sent"] is True
+
+
+def test_meta_error_text_quoting_a_credential_url_is_masked(monkeypatch, caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    error = MetaApiError(
+        message=f"Could not fetch {CRED_URL}",
+        status_code=400,
+        code=100,
+        user_message=f"Check {CRED_URL}",
+        error_data={"url": CRED_URL},
+        details={"error": {"message": f"Could not fetch {CRED_URL}"}},
+    )
+    _use(monkeypatch, FakeCatalogFeedClient(errors={"feed_1": error, ("feed_1", "uploads"): error}))
+    for call in (
+        lambda: catalog_feeds.list_product_feeds(feed_id="feed_1"),
+        lambda: catalog_feeds.list_product_feed_uploads(feed_id="feed_1"),
+        lambda: catalog_feeds.update_product_feed(feed_id="feed_1", name="New"),
+    ):
+        with pytest.raises(MetaApiError) as caught:
+            run(call())
+        assert URL_SECRET not in str(caught.value)
+        assert URL_SECRET not in repr(caught.value.to_public_dict())
+        assert URL_SECRET not in repr(caught.value)
+        assert "feeds.example.com/path/feed.csv" in str(caught.value)
+    assert URL_SECRET not in caplog.text
+
+
+@pytest.mark.parametrize(("tool", "arguments", "secret"), [
+    ("create_product_feed_upload", {"feed_id": "1", "url": "https://e.com/f.csv", "username": "u", "password": 987654321}, "987654321"),
+    ("create_product_feed_upload", {"feed_id": "1", "url": ["listed-secret-6612"]}, "listed-secret-6612"),
+    ("create_product_feed_upload", {"feed_id": "1", "file_path": ["listed-secret-6612"]}, "listed-secret-6612"),
+    ("create_product_feed_upload", {"feed_id": "1", "url": "https://e.com/f.csv", "username": ["listed-secret-6612"], "password": "p"}, "listed-secret-6612"),
+    ("create_product_feed", {"catalog_id": "1", "name": "F", "schedule": "url=ftp://u:str-secret-7713@h/f.csv"}, "str-secret-7713"),
+    ("update_product_feed", {"feed_id": "1", "update_schedule": ["str-secret-7713"]}, "str-secret-7713"),
+])
+def test_wrongly_typed_secret_arguments_are_not_quoted_by_the_framework(monkeypatch, caplog, tool, arguments, secret) -> None:
+    import logging
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    _no_client(monkeypatch)
+    with pytest.raises(Exception) as caught:
+        run(mcp_server.call_tool(tool, arguments))
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+    assert secret not in caplog.text
+
+
 # phase two: recommendations flag paged da_checks --------------------------------------------------
 
 
