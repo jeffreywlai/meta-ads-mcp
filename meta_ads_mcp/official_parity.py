@@ -269,9 +269,9 @@ OFFICIAL_TOOLS: dict[str, OfficialToolEntry] = {
         "delete_product_feed",
         note="Deletes a feed; its products are removed unless another source supplies them.",
     ),
-    "ads_catalog_product_feed_delete_rule": _covered(
+    "ads_catalog_product_feed_delete_rule": _unavailable(
         "delete_feed_rule",
-        note="Deletes a feed rule; the feed and products are unaffected.",
+        note="Meta's reference documents DELETE on a feed rule, but the live API (v26.0, tested 2026-11-13) answers that the endpoint is deprecated (code 100, subcode 33). delete_feed_rule sends the documented request and, on that answer, says the rule was not deleted and points to update_feed_rule, delete_product_feed and Commerce Manager.",
     ),
     "ads_catalog_product_set_delete": _covered(
         "delete_product_set",

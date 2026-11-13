@@ -20,7 +20,7 @@ from pydantic import WithJsonSchema
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import build_finding
-from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
@@ -1711,14 +1711,32 @@ async def update_feed_rule(
     return response
 
 
+# Meta's reference documents DELETE /{rule_id}, but the live API (v26.0, seen 2026-11-13)
+# answers code 100, subcode 33, "Accesssing Deprecated Platform API Endpoint".
+RULE_DELETE_RETIRED = (
+    "Meta has retired deleting a feed rule through its API, so the rule was not deleted. "
+    "Remove the rule in Commerce Manager, change what it does with update_feed_rule, or delete "
+    "the whole feed with delete_product_feed, which removes its rules and the items it loaded."
+)
+
+
+def _is_retired_endpoint(error: MetaApiError) -> bool:
+    return error.code == 100 and "deprecated platform api endpoint" in (error.message or "").lower()
+
+
 @mcp_server.tool()
 @_secrets_masked
 async def delete_feed_rule(rule_id: str) -> dict[str, Any]:
-    """Use only on an explicit request to delete one product catalog feed rule. The feed and its products are unaffected; later uploads are no longer transformed by the rule. Returns the rule as it was."""
+    """Use only on an explicit request to delete one product catalog feed rule. The feed and its products are unaffected; later uploads are no longer transformed by the rule. Returns the rule as it was. Meta's live API has answered that this delete is retired; when it does, the rule is not deleted and the error says what to do."""
     rule_id = _require_id(rule_id, "rule_id")
     client = get_graph_api_client()
     previous = await client.get_object(rule_id, fields=RULE_FIELDS)
-    result = await client.delete_object(rule_id)
+    try:
+        result = await client.delete_object(rule_id)
+    except MetaApiError as error:
+        if _is_retired_endpoint(error):
+            raise UnsupportedFeatureError(RULE_DELETE_RETIRED) from error
+        raise
     return mutation_response(
         action="delete_feed_rule",
         target={"rule_id": rule_id},

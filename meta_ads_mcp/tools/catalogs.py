@@ -213,10 +213,23 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
     return params
 
 
-def _paged(payload: dict[str, Any]) -> dict[str, Any]:
-    """Shape one Graph page with the completeness fields list_audiences uses."""
+def _paged(payload: dict[str, Any], *, limit: int | None = None, after: str | None = None) -> dict[str, Any]:
+    """Shape one Graph page with the completeness fields list_audiences uses.
+
+    Meta's products edge returns a next link even when every row has already been
+    returned (seen live: 5 of 5 rows, limit 50, and the page after it is empty). So
+    a next link is not believed when this is the first page, it is shorter than the
+    limit, and it already holds as many rows as Meta's own total_count.
+    """
     normalized = normalize_collection(payload)
     has_more = bool(normalized["paging"].get("next"))
+    stated_total = to_int((payload.get("summary") or {}).get("total_count"))
+    rows = len(normalized["items"])
+    if (
+        has_more and limit is not None and blank_to_none(after) is None
+        and stated_total is not None and rows < limit and rows >= stated_total
+    ):
+        has_more = False
     normalized["summary"].update({
         "complete": not has_more,
         "truncated": has_more,
@@ -1488,7 +1501,7 @@ async def list_catalog_products(
     if view == "product_groups":
         requested = normalize_field_list(fields) or PRODUCT_GROUP_FIELDS
         payload = await client.list_objects(scope_value, "product_groups", fields=requested, params=params)
-        result = _paged(payload)
+        result = _paged(payload, limit=limit, after=after)
         result["summary"]["scope"] = {scope_name: scope_value, "view": "product_groups"}
         return result
     requested = normalize_field_list(fields) or PRODUCT_FIELDS
@@ -1499,7 +1512,7 @@ async def list_catalog_products(
     if normalized_priority is not None:
         params["error_priority"] = normalized_priority
     payload = await client.list_objects(scope_value, "products", fields=requested, params=params)
-    result = _paged(payload)
+    result = _paged(payload, limit=limit, after=after)
     scope: dict[str, Any] = {scope_name: scope_value}
     if normalized_error_type is not None:
         scope["error_type"] = normalized_error_type
@@ -2866,7 +2879,7 @@ async def list_product_sets(
     if scope_name == "catalog_id":
         params["summary"] = "total_count"
     payload = await client.list_objects(scope_value, "product_sets", fields=requested, params=params)
-    result = _paged(payload)
+    result = _paged(payload, limit=limit, after=after)
     result["summary"]["scope"] = {scope_name: scope_value}
     return result
 

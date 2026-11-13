@@ -14,7 +14,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 
 from meta_ads_mcp.config import reload_settings
-from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.secret_scrub import ERROR, scrub_exception
 from meta_ads_mcp.tools import catalog_feeds
 
@@ -3382,3 +3382,40 @@ def test_schedule_returned_as_json_text_has_its_password_masked(monkeypatch, pas
     shown = json.loads(result["item"]["schedule"])
     assert shown["password"] == "[redacted]" and shown["username"] == "u"
     assert result["item"]["update_schedule"] == "no json"
+
+
+def _retired_endpoint_error() -> MetaApiError:
+    # Meta's live answer to DELETE /{rule_id}, seen on 2026-11-13 at v26.0.
+    return MetaApiError(
+        message="Accesssing Deprecated Platform API Endpoint - GraphProductFeedRuleDelete",
+        status_code=400, code=100, subcode=33,
+    )
+
+
+def test_delete_feed_rule_says_plainly_when_meta_has_retired_the_delete(monkeypatch) -> None:
+    rule = {"id": "rule_1", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}}
+
+    class RetiredDelete(FakeCatalogFeedClient):
+        async def delete_object(self, object_id: str):
+            self.calls.append({"method": "delete_object", "object_id": object_id})
+            raise _retired_endpoint_error()
+
+    client = _use(monkeypatch, RetiredDelete(objects={"rule_1": rule}))
+    with pytest.raises(UnsupportedFeatureError) as error:
+        run(catalog_feeds.delete_feed_rule(rule_id="rule_1"))
+    text = str(error.value)
+    assert "retired" in text and "not deleted" in text
+    assert "delete_product_feed" in text and "Commerce Manager" in text
+    assert client.methods() == ["get_object", "delete_object"]
+
+
+def test_delete_feed_rule_keeps_any_other_meta_error(monkeypatch) -> None:
+    rule = {"id": "rule_1", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}}
+
+    class RefusedDelete(FakeCatalogFeedClient):
+        async def delete_object(self, object_id: str):
+            raise _permission_error()
+
+    _use(monkeypatch, RefusedDelete(objects={"rule_1": rule}))
+    with pytest.raises(MetaApiError):
+        run(catalog_feeds.delete_feed_rule(rule_id="rule_1"))

@@ -3159,3 +3159,38 @@ def test_serialized_integration_token_is_collected_as_a_secret() -> None:
 
     arguments = {"params": {"partner_integration": _integration_text(), "custom_data": json.dumps({"token": "Gold"})}}
     assert _caller_secrets(arguments, catalogs._CATALOG_CREDENTIAL_PATHS) == [_INTEGRATION_SECRET]
+
+
+def _live_page(rows: int, total: int | None) -> dict:
+    # The shape Meta's products edge returned in a live read: a next link and cursors
+    # even though every row had already been returned (the page after it is empty).
+    payload = {
+        "data": [{"id": str(n)} for n in range(rows)],
+        "paging": {"cursors": {"before": "B", "after": "A"}, "next": "https://graph.facebook.com/next", "previous": "p"},
+    }
+    if total is not None:
+        payload["summary"] = {"total_count": total}
+    return payload
+
+
+def test_first_short_page_holding_meta_total_is_complete_despite_a_next_link() -> None:
+    summary = catalogs._paged(_live_page(5, 5), limit=50, after=None)["summary"]
+    assert summary["complete"] is True and summary["truncated"] is False
+    assert summary["next_after"] is None and summary["total_count"] == 5 and summary["count"] == 5
+
+
+@pytest.mark.parametrize(("rows", "total", "limit", "after"), [
+    (2, 5, 2, None),      # fewer rows than Meta's total: more pages exist
+    (5, 5, 5, None),      # a full page: Meta's next link is believed
+    (5, 5, 50, "CURSOR"),  # a later page: rows before it are not counted here
+    (5, None, 50, None),  # no total from Meta: nothing to confirm against
+    (5, 9, 50, None),     # Meta's total is larger
+])
+def test_a_next_link_is_still_believed_when_the_total_does_not_confirm_the_end(rows, total, limit, after) -> None:
+    summary = catalogs._paged(_live_page(rows, total), limit=limit, after=after)["summary"]
+    assert summary["complete"] is False and summary["truncated"] is True and summary["next_after"] == "A"
+
+
+def test_paged_without_limit_keeps_meta_next_link() -> None:
+    summary = catalogs._paged(_live_page(5, 5))["summary"]
+    assert summary["complete"] is False and summary["next_after"] == "A"

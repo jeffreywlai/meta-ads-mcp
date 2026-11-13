@@ -328,14 +328,19 @@ registered.
 
 | Status | Meaning | Tools |
 |--------|---------|-------|
-| `covered` | A tool here does everything Meta's tool does, or more | 59 |
+| `covered` | A tool here does everything Meta's tool does, or more | 58 |
 | `partial` | A tool here does part of it; the entry says what Meta's tool can do that ours cannot, and why that is still open | 30 |
 | `missing` | Nothing here yet, although Meta's public API appears to allow it | 0 |
-| `unavailable` | No public API route is known, so no tool is registered | 12 |
+| `unavailable` | No working public API route is known | 13 |
 | `app_internal` | Plumbing for Meta's own app (upload dialogs, telemetry); nothing to match | 6 |
 
 The `covered` count includes `ads_update_custom_audience_users`, which Meta
 documents but does not serve.
+
+One `unavailable` entry does have a tool: `delete_feed_rule` sends the request
+Meta's reference documents, but Meta's live API answers that the endpoint is
+retired (tested 2026-11-13). The tool reports that plainly and says what to do
+instead.
 
 Of the 30 `partial` entries, 20 are open because no public API route is known
 for what Meta's own tool does, and 10 are built differently on purpose (for
