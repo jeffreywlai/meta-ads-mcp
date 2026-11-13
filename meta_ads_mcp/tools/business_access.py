@@ -819,12 +819,14 @@ async def _plan_access_change(
     change, lost, gained = _classify(found, proposed)
 
     target = {"catalog_id": catalog_id, "business_id": business_id, "user_id": user_id}
+    # Meta's ProductCatalog assigned_users reference and SDK 26.0.2 list only user and tasks for
+    # POST, and only user for DELETE; business is a parameter of the read alone, so it is not sent.
     if change == "remove":
-        request = {"method": "DELETE", "path": f"{catalog_id}/assigned_users", "data": {"user": user_id, "business": business_id}}
+        request = {"method": "DELETE", "path": f"{catalog_id}/assigned_users", "data": {"user": user_id}}
     elif change in {"grant", "increase", "reduce", "change"}:
         request = {
             "method": "POST", "path": f"{catalog_id}/assigned_users",
-            "data": {"user": user_id, "business": business_id, "tasks": proposed},
+            "data": {"user": user_id, "tasks": proposed},
         }
     else:
         request = None

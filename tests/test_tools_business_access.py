@@ -405,7 +405,7 @@ def test_set_catalog_access_reads_current_access_first_and_returns_before_and_af
     assert methods.index("create_edge_object") > 0
     write = client.writes()[0]
     assert (write["parent_id"], write["edge"]) == (CATALOG, "assigned_users")
-    assert write["data"] == {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE", "MANAGE"]}
+    assert write["data"] == {"user": PERSON, "tasks": ["ADVERTISE", "MANAGE"]}
     assert result["previous"]["tasks"] == ["ADVERTISE"]
     assert result["current"]["tasks"] == ["ADVERTISE", "MANAGE"]
     assert result["change"] == "increase"
@@ -427,7 +427,7 @@ def test_set_catalog_access_removal_states_what_is_lost_and_deletes(monkeypatch)
     result = run(business_access.set_catalog_access(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON, tasks=[]))
     write = client.writes()[0]
     assert write["method"] == "delete_edge_object"
-    assert write["data"] == {"user": PERSON, "business": BUSINESS}
+    assert write["data"] == {"user": PERSON}
     assert result["change"] == "remove"
     assert set(result["can_no_longer"]) == {"MANAGE", "ADVERTISE"}
     assert "can no longer" in result["warnings"][0]
@@ -495,7 +495,7 @@ def test_set_catalog_access_dry_run_sends_nothing(monkeypatch) -> None:
     assert result["sent"] is False and result["dry_run"] is True
     assert result["would_send"] == {
         "method": "POST", "path": f"{CATALOG}/assigned_users",
-        "data": {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE"]},
+        "data": {"user": PERSON, "tasks": ["ADVERTISE"]},
     }
     assert result["previous"]["tasks"] == ["MANAGE"]
 
@@ -1009,11 +1009,11 @@ def test_person_call_without_user_type_sends_the_same_request_as_before(monkeypa
     ))
     assert [(w["method"], w["parent_id"], w["edge"], w["data"]) for w in client.writes()] == [
         ("create_edge_object", CATALOG, "assigned_users",
-         {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE", "MANAGE"]}),
+         {"user": PERSON, "tasks": ["ADVERTISE", "MANAGE"]}),
     ]
     assert result["request_sent"] == {
         "method": "POST", "path": f"{CATALOG}/assigned_users",
-        "data": {"user": PERSON, "business": BUSINESS, "tasks": ["ADVERTISE", "MANAGE"]},
+        "data": {"user": PERSON, "tasks": ["ADVERTISE", "MANAGE"]},
     }
     assert "verified_live" not in result and "meta_response" not in result
     assert not client.reads_of("agencies")
