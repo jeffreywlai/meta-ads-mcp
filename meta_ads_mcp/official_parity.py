@@ -104,10 +104,9 @@ LIVE_VERIFIED_TOOLS: frozenset[str] = frozenset(
 # Write tools run on 2026-11-13 against a throwaway ad account (everything created
 # paused and then deleted; nothing spent) and a test catalog, with Meta accepting
 # the request and a read-back agreeing where one was possible. Not here:
-# update_ad_creative_enhancements (Meta accepted its copy of an existing-post
-# creative and refused its copy of image, video and asset-pool creatives),
-# delete_feed_rule (Meta answers that the endpoint is retired), and the tools not
-# exercised.
+# delete_feed_rule (Meta answers that the endpoint is retired) and the tools not
+# exercised. update_ad_creative_enhancements ran for real on an existing-post,
+# image, video and asset-pool creative after its copy was corrected.
 LIVE_VERIFIED_WRITE_TOOLS: frozenset[str] = frozenset(
     {
         "add_audience_users",
@@ -144,6 +143,7 @@ LIVE_VERIFIED_WRITE_TOOLS: frozenset[str] = frozenset(
         "set_campaign_status",
         "update_ad",
         "update_ad_creative",
+        "update_ad_creative_enhancements",
         "update_ad_study",
         "update_adset",
         "update_adset_bid_amount",
