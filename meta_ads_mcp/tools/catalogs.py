@@ -2165,6 +2165,14 @@ def _filter_condition(index: int, condition: Any) -> dict[str, Any]:
         if not isinstance(value, list) or not value:
             raise ValidationError(f"{label}.value must be a nonempty list for {operator}.")
     elif operator in _NUMERIC_OPERATORS:
+        if field_name.strip() == "price":
+            # Meta's product set filter reference: price "must be specified with currency";
+            # price_amount is "the price multiplied by 100, for all currencies".
+            raise ValidationError(
+                f"{label}: compare prices with field price_amount, the price x 100 in the product's currency "
+                "(under 100 dollars is price_amount lt 10000), and add a currency condition when the catalog "
+                "holds more than one currency. Meta requires price itself to be given with its currency."
+            )
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValidationError(f"{label}.value must be a number for {operator}.")
     elif operator in _STRING_OPERATORS:
@@ -2183,7 +2191,7 @@ async def build_product_set_filter(
     conditions: list[dict[str, Any]],
     match: str = "all",
 ) -> dict[str, Any]:
-    """Read-only: turn conditions [{field, operator, value}] into a Meta product set filter, then count matching products in the catalog and return up to five samples. Creates nothing. price_amount is price x 100."""
+    """Read-only: turn conditions [{field, operator, value}] into a Meta product set filter, then count matching products in the catalog and return up to five samples. Creates nothing. Compare prices with price_amount, the price x 100 in the product's currency, plus a currency condition when the catalog holds several currencies."""
     catalog_id = _require(catalog_id, "catalog_id")
     if not isinstance(conditions, list) or not conditions:
         raise ValidationError("conditions must be a nonempty list of {field, operator, value} objects.")

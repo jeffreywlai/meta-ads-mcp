@@ -1165,6 +1165,49 @@ def test_filter_builder_validates_conditions(monkeypatch, conditions, match) -> 
         _run(catalogs.build_product_set_filter(catalog_id="cat_1", conditions=conditions))
 
 
+def test_filter_builder_points_price_comparisons_to_price_amount(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="price_amount"):
+        _run(catalogs.build_product_set_filter(
+            catalog_id="cat_1", conditions=[{"field": "price", "operator": "lt", "value": 100}],
+        ))
+
+
+def test_plain_language_request_maps_onto_attribute_values_and_filter_builder(monkeypatch) -> None:
+    """'blue shirts under 100 dollars': read real values, then build one filter from them."""
+    pages = {
+        "product_type": [{"id": "1", "product_type": "Shirts"}, {"id": "2", "product_type": "Shoes"}],
+        "color": [{"id": "1", "color": "Navy Blue"}, {"id": "2", "color": "Black"}],
+        "currency": [{"id": "1", "currency": "USD"}, {"id": "2", "currency": "USD"}],
+    }
+
+    class Client(FakeCatalogClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            self.calls.append(("list", {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}))
+            if "filter" in (params or {}):
+                return {"data": [{"id": "1", "name": "Oxford shirt"}], "summary": {"total_count": 1}}
+            return {"data": pages[fields[1]]}
+
+    _use(monkeypatch, Client())
+    found = {
+        attribute: [entry["value"] for entry in
+                    _run(catalogs.list_catalog_attribute_values("123", attribute))["values"]]
+        for attribute in ("product_type", "color", "currency")
+    }
+    assert "Shirts" in found["product_type"] and "Navy Blue" in found["color"] and found["currency"] == ["USD"]
+    result = _run(catalogs.build_product_set_filter(catalog_id="123", conditions=[
+        {"field": "product_type", "operator": "i_contains", "value": "shirt"},
+        {"field": "color", "operator": "i_contains", "value": "blue"},
+        {"field": "price_amount", "operator": "lt", "value": 10000},
+        {"field": "currency", "operator": "eq", "value": "USD"},
+    ]))
+    assert result["filter"] == {"and": [
+        {"product_type": {"i_contains": "shirt"}}, {"color": {"i_contains": "blue"}},
+        {"price_amount": {"lt": 10000}}, {"currency": {"eq": "USD"}},
+    ]}
+    assert result["match_count"] == 1
+
+
 def test_filter_builder_rejects_unknown_match(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="all or any"):
