@@ -19,6 +19,7 @@ from meta_ads_mcp.tools import (
     assets,
     audiences,
     auth_tools,
+    business_access,
     campaigns,
     catalogs,
     catalog_feeds,
@@ -218,6 +219,11 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
+    "list_business_users": {"business_id": "123"},
+    "list_catalog_assigned_users": {"catalog_id": "456", "business_id": "123"},
+    "list_user_assigned_catalogs": {"user_id": "789"},
+    "preview_catalog_access_change": {"catalog_id": "456", "business_id": "123", "user_id": "789", "tasks": ["ADVERTISE"]},
+    "set_catalog_access": {"catalog_id": "456", "business_id": "123", "user_id": "789", "tasks": ["ADVERTISE"], "dry_run": True},
 }
 
 
@@ -587,6 +593,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         assets,
         audiences,
         auth_tools,
+        business_access,
         campaigns,
         catalogs,
         catalog_feeds,

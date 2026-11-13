@@ -148,6 +148,7 @@ TOOL_GROUPS = {
         "add_audience_users",
         "remove_audience_users",
         "boost_instagram_post",
+        "set_catalog_access",
     ],
     "creative_ops": [
         "get_ad_image",
@@ -197,6 +198,11 @@ TOOL_GROUPS = {
         "get_catalog_event_source_recommendations",
     ],
     "access": [
+        "list_businesses",
+        "list_business_users",
+        "list_catalog_assigned_users",
+        "list_user_assigned_catalogs",
+        "preview_catalog_access_change",
     ],
     "auth": [
         "generate_auth_url",
@@ -590,6 +596,26 @@ INTENT_GUIDE = {
             "For customer lists prefer file_path to a local CSV so personal data never passes through the model; inline rows are limited to 1,000.",
         ],
     },
+    "manage_business_people_and_catalog_access": {
+        "description": (
+            "List the businesses you can access, a business's people, system users or partner agencies, "
+            "who can use a product catalog and with which permissions, or which catalogs one person or partner "
+            "can use; preview or grant, change or remove a person's catalog access."
+        ),
+        "recommended_order": [
+            "list_businesses",
+            "list_business_users",
+            "list_catalog_assigned_users",
+            "list_user_assigned_catalogs",
+            "preview_catalog_access_change",
+        ],
+        "avoid_unless_needed": ["set_catalog_access"],
+        "notes": [
+            "Catalog access tools take a person's business-scoped id from list_business_users, not a personal Facebook id.",
+            "Run preview_catalog_access_change first and show the user what the person would lose before set_catalog_access.",
+            "set_catalog_access refuses to remove the token's own access unless allow_self_removal=true; partner business shares cannot be changed here.",
+        ],
+    },
 }
 
 ROUTING_HINTS = {
@@ -955,6 +981,7 @@ async def list_mutation_tools() -> dict[str, object]:
             "general_edits": ["update_adset", "update_ad"],
             "customer_list_users": ["add_audience_users", "remove_audience_users"],
             "instagram_boost": ["boost_instagram_post"],
+            "product_catalog_access": ["set_catalog_access"],
         },
         "safety_notes": [
             "Ask for explicit confirmation before spend-affecting changes.",
