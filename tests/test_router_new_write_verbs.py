@@ -3,6 +3,14 @@
 The router only offers a write tool when a request starts with a write verb.
 Six tools start with verbs it did not know: add, remove, boost, cancel,
 connect and disconnect.
+
+Cost: building the routing contracts for the whole catalog takes most of a
+second, and tool search rebuilds them each time read-only mode is switched on
+or off. So routing decisions use contracts built once per catalog, read-only
+expectations are checked on the routing decision for the read-only catalog
+(tool search filters the catalog to read-only tools before it routes, see
+IntentAwareBM25SearchTransform._search), and a smaller set of end-to-end
+searches runs in each mode in one test per mode.
 """
 
 from __future__ import annotations
@@ -15,6 +23,9 @@ import pytest
 from meta_ads_mcp import stdio  # noqa: F401 - import registers all tools
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.intent_routing import StructuredIntentRouter
+from meta_ads_mcp.read_only import read_only_tool_names
+from meta_ads_mcp.tool_contracts import build_tool_contracts
 
 NEW_VERB_WRITE_TOOLS = {
     "add_audience_users",
@@ -24,6 +35,13 @@ NEW_VERB_WRITE_TOOLS = {
     "connect_catalog_event_source",
     "disconnect_catalog_event_source",
 }
+
+
+@pytest.fixture(autouse=True)
+def unlocked_by_default(monkeypatch):
+    """Searches run with writes allowed unless a test switches read-only mode on."""
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
 
 
 def _search(query: str) -> list[str]:
@@ -159,12 +177,34 @@ ANALYTICAL_QUERIES = [
 ]
 
 
-def _decision(query: str):
-    from meta_ads_mcp.intent_routing import StructuredIntentRouter
-    from meta_ads_mcp.tool_contracts import build_tool_contracts
+_CONTRACTS: dict[tuple, dict] = {}
 
-    contracts = build_tool_contracts(list(mcp_server.local_provider._components.values()))
-    return StructuredIntentRouter().decide(query, tool_contracts=contracts)
+
+def _contracts(*, locked: bool = False) -> dict:
+    """Routing contracts for the registered catalog, built once per catalog.
+
+    locked gives the read-only catalog: the tools search keeps in read-only
+    mode before it routes.
+    """
+    tools = list(mcp_server.local_provider._components.values())
+    key = tuple((str(getattr(tool, "name", "")), id(tool)) for tool in tools)
+    if key not in _CONTRACTS:
+        _CONTRACTS.clear()
+        _CONTRACTS[key] = build_tool_contracts(tools)
+    contracts = _CONTRACTS[key]
+    if locked:
+        allowed = read_only_tool_names()
+        contracts = {name: contract for name, contract in contracts.items() if name in allowed}
+    return contracts
+
+
+def _decision(query: str, *, locked: bool = False):
+    return StructuredIntentRouter().decide(query, tool_contracts=_contracts(locked=locked))
+
+
+def _read_only_offers(query: str) -> frozenset[str]:
+    """Every tool search can return for the query in read-only mode."""
+    return _decision(query, locked=True).compatible_tools
 
 
 @pytest.mark.parametrize("query", ANALYTICAL_QUERIES)
@@ -176,14 +216,30 @@ def test_g16_analytical_requests_never_offer_mutations(query) -> None:
 ALL_SUBJECT_VERB_WRITE_TOOLS = NEW_VERB_WRITE_TOOLS | PHASE_TWO_VERB_WRITE_TOOLS
 
 
-@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
-@pytest.mark.parametrize("query", ANALYTICAL_QUERIES)
-def test_analytical_requests_return_read_tools_only(monkeypatch, query, locked) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
-    reload_settings()
+def _assert_read_tools_only(query: str, locked: bool) -> None:
+    """Unlocked: a real search. Read-only: the routing decision for the read-only catalog."""
+    if locked:
+        offered = _read_only_offers(query)
+        assert offered, "a read request should still find read tools"
+        assert not ALL_SUBJECT_VERB_WRITE_TOOLS & offered, sorted(offered)
+        return
     found = _search(query)
     assert found, "a read request should still find read tools"
     assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), found
+
+
+def _assert_command_offered(query: str, expected: str, locked: bool, *, top: int = 3) -> None:
+    if locked:
+        assert expected not in _read_only_offers(query)
+        return
+    assert expected in _decision(query).compatible_tools, sorted(_decision(query).compatible_tools)
+    assert expected in _search(query)[:top], _search(query)
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize("query", ANALYTICAL_QUERIES)
+def test_analytical_requests_return_read_tools_only(query, locked) -> None:
+    _assert_read_tools_only(query, locked)
 
 
 @pytest.mark.parametrize(
@@ -198,13 +254,9 @@ def test_analytical_requests_return_read_tools_only(monkeypatch, query, locked) 
     ],
 )
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
-def test_analytical_clauses_stay_read_safe_in_either_order(monkeypatch, query, locked) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
-    reload_settings()
+def test_analytical_clauses_stay_read_safe_in_either_order(query, locked) -> None:
     assert _decision(query).suppress_mutations is True
-    found = _search(query)
-    assert found
-    assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), found
+    _assert_read_tools_only(query, locked)
 
 
 @pytest.mark.parametrize(
@@ -218,13 +270,9 @@ def test_analytical_clauses_stay_read_safe_in_either_order(monkeypatch, query, l
         ("boost the instagram post and boost in instagram post engagement", "boost_instagram_post"),
     ],
 )
-def test_a_real_write_clause_is_still_offered_next_to_an_analytical_one(monkeypatch, query, expected) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "false")
-    reload_settings()
+def test_a_real_write_clause_is_still_offered_next_to_an_analytical_one(query, expected) -> None:
     assert expected in _search(query)[:2]
-    monkeypatch.setenv("META_READ_ONLY", "true")
-    reload_settings()
-    assert expected not in _search(query)
+    assert expected not in _read_only_offers(query)
 
 
 @pytest.mark.parametrize(
@@ -285,13 +333,9 @@ def test_h12_reporting_objects_are_read_safe_after_prepositions(query) -> None:
 
 @pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
 @pytest.mark.parametrize("query", H12_REVIEWER_QUERIES + H12_MORE_REPORTING_QUERIES)
-def test_h12_reporting_destinations_and_counts_offer_read_tools_only(monkeypatch, query, locked) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
-    reload_settings()
+def test_h12_reporting_destinations_and_counts_offer_read_tools_only(query, locked) -> None:
     assert _decision(query).suppress_mutations is True
-    found = _search(query)
-    assert found, "a reporting request should still find read tools"
-    assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), found
+    _assert_read_tools_only(query, locked)
 
 
 # Commands whose wording is close to the reporting requests above.
@@ -312,14 +356,9 @@ H12_COMMANDS = [
 
 
 @pytest.mark.parametrize(("query", "expected"), H12_COMMANDS)
-def test_h12_commands_near_reporting_wording_still_offer_the_write_tool(monkeypatch, query, expected) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "false")
-    reload_settings()
-    assert expected in _decision(query).compatible_tools
-    assert expected in _search(query)[:3], _search(query)
-    monkeypatch.setenv("META_READ_ONLY", "true")
-    reload_settings()
-    assert expected not in _search(query)
+def test_h12_commands_near_reporting_wording_still_offer_the_write_tool(query, expected) -> None:
+    _assert_command_offered(query, expected, locked=False)
+    _assert_command_offered(query, expected, locked=True)
 
 
 # Round-three review H13: a reporting word inside an entity's name is the name,
@@ -365,11 +404,158 @@ def test_h13_reporting_words_in_entity_names_do_not_hide_commands(query, expecte
 
 
 @pytest.mark.parametrize(("query", "expected"), H13_REVIEWER_COMMANDS + H13_MORE_COMMANDS)
-def test_h13_named_entities_offer_the_write_tool_and_read_only_hides_it(monkeypatch, query, expected) -> None:
-    monkeypatch.setenv("META_READ_ONLY", "false")
+def test_h13_named_entities_offer_the_write_tool_and_read_only_hides_it(query, expected) -> None:
+    _assert_command_offered(query, expected, locked=False)
+    _assert_command_offered(query, expected, locked=True)
+
+
+# Round-four review J15: a reporting container noun ending the object phrase
+# ("remove audience users column") is what the verb acts on, as it is after a
+# preposition ("to the column"), and so is one after a layout preposition ("as
+# a column", "per row"). Commands whose destination is the audience keep working.
+
+J15_REVIEWER_QUERIES = [
+    "remove audience users column",
+    "remove audience users row",
+    "add audience users worksheet",
+]
+
+J15_MORE_REPORTING_QUERIES = [
+    "add audience users column",
+    "remove the audience users columns",
+    "add a custom audience users row",
+    "add audience users tab",
+    "remove audience users sheet",
+    "add the audience users cell",
+    "remove audience members graph",
+    "add audience users dashboard",
+    "add the audience users workbook",
+    "remove audience users doc",
+    "add audience users plot",
+    "add audience user rows",
+    "remove customer rows",
+    "Add Audience Users Column",
+    "remove the audience users scorecard",
+    "add audience users readout",
+    "remove audience users recap",
+    "add audience users deck",
+    "add audience users presentation",
+    "remove audience users visualization",
+    "add audience users document",
+    "remove the custom audience users tabs",
+    "add customer list users column",
+    "boost instagram post slide",
+    "duplicate the campaign row",
+    "duplicate the campaign slide",
+    "duplicate the ad set rows",
+    "copy the ad set tab",
+    "copy the ad set worksheet",
+    "clone the ad cell",
+    "connect the pixel column",
+    "disconnect the event source worksheet",
+    "cancel ad study visualization",
+    # After a layout preposition.
+    "add audience users as a column",
+    "add audience users per row",
+    "add audience users by column",
+    "add audience users for each row",
+    "add audience users for the report",
+    "remove audience users at row 3",
+    "add audience users as a new sheet",
+    "copy the campaign as a row",
+]
+
+J15_COMMANDS = [
+    ("remove customers from the audience", "remove_audience_users"),
+    ("add users to the customer list", "add_audience_users"),
+    # A container that is where the customers come from, not what is changed.
+    ("add the customer spreadsheet to the audience", "add_audience_users"),
+    ("add the users row to the custom audience", "add_audience_users"),
+    ("add the customer rows to the audience", "add_audience_users"),
+    ("add the customer list rows to the audience", "add_audience_users"),
+    ("remove the customer worksheet from the audience", "remove_audience_users"),
+    ("remove the customers in the sheet from the custom audience", "remove_audience_users"),
+    ("remove users in the column from the audience", "remove_audience_users"),
+    ("remove the people in the spreadsheet tab from the audience", "remove_audience_users"),
+    ("add customers in the spreadsheet to the custom audience", "add_audience_users"),
+    ("add the contacts from the sheet to the customer list", "add_audience_users"),
+    ("add audience users from the worksheet", "add_audience_users"),
+    ("remove customers at row 3 from the audience", "remove_audience_users"),
+    ("add customers by email to the audience", "add_audience_users"),
+    ("add customers as members of the audience", "add_audience_users"),
+    # A container that describes which object is meant, or is part of its name.
+    ("remove audience users listed in the column", "remove_audience_users"),
+    ("duplicate the campaign shown in the row", "duplicate_campaign"),
+    ("copy the ad set listed in the worksheet", "duplicate_adset"),
+    ("clone the ad listed in the deck", "duplicate_ad"),
+    ("boost the instagram post shown in the slide", "boost_instagram_post"),
+    ("cancel the ad study shown in the slide", "cancel_ad_study"),
+    ("connect the pixel shown in the dashboard to the catalog", "connect_catalog_event_source"),
+    ('duplicate the campaign named "Row"', "duplicate_campaign"),
+    ("duplicate the Column campaign", "duplicate_campaign"),
+    ("batch update catalog products by SKU", "batch_update_catalog_products"),
+]
+
+
+@pytest.mark.parametrize("query", J15_REVIEWER_QUERIES)
+def test_report_container_nouns_do_not_offer_a_write(query) -> None:
+    decision = _decision(query)
+    assert decision.suppress_mutations is True, decision
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize("query", J15_REVIEWER_QUERIES + J15_MORE_REPORTING_QUERIES)
+def test_j15_report_containers_ending_the_object_offer_read_tools_only(query, locked) -> None:
+    assert _decision(query).suppress_mutations is True, sorted(_decision(query).compatible_tools)
+    _assert_read_tools_only(query, locked)
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize(("query", "expected"), J15_COMMANDS)
+def test_j15_commands_near_report_containers_still_offer_the_write_tool(query, expected, locked) -> None:
+    _assert_command_offered(query, expected, locked)
+
+
+# End-to-end: real tool searches in each mode, one switch of mode per test. The
+# cases above check read-only mode on the routing decision for the read-only
+# catalog; these confirm that search gives the same answer.
+
+END_TO_END_READ_QUERIES = [
+    *ANALYTICAL_QUERIES[:4],
+    "show the campaign insights and add up audience performance",
+    *H12_REVIEWER_QUERIES,
+    *H12_MORE_REPORTING_QUERIES[:4],
+    *J15_REVIEWER_QUERIES,
+    *J15_MORE_REPORTING_QUERIES[::6],
+]
+
+END_TO_END_COMMANDS = [
+    ("add up audience performance and add users to the custom audience", "add_audience_users"),
+    *H12_COMMANDS[:4],
+    *H13_REVIEWER_COMMANDS,
+    *H13_MORE_COMMANDS[:4],
+    *J15_COMMANDS[::4],
+]
+
+
+# Names the search result's closing lines mention ("Next: use `call_tool` ...").
+SEARCH_TEXT_NAMES = {"call_tool", "get_capabilities"}
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+def test_end_to_end_search_in_each_mode(monkeypatch, locked) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
     reload_settings()
-    assert expected in _decision(query).compatible_tools, sorted(_decision(query).compatible_tools)
-    assert expected in _search(query)[:3], _search(query)
-    monkeypatch.setenv("META_READ_ONLY", "true")
-    reload_settings()
-    assert expected not in _search(query)
+    for query in END_TO_END_READ_QUERIES:
+        found = _search(query)
+        assert found, query
+        assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), (query, found)
+        if locked:
+            assert set(found) - SEARCH_TEXT_NAMES <= _read_only_offers(query), (query, found)
+    for query, expected in END_TO_END_COMMANDS:
+        found = _search(query)
+        if locked:
+            assert expected not in found, (query, found)
+            assert set(found) - SEARCH_TEXT_NAMES <= _read_only_offers(query), (query, found)
+        else:
+            assert expected in found[:3], (query, found)
