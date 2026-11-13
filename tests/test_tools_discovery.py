@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from meta_ads_mcp.errors import UnsupportedFeatureError
+from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError
 from meta_ads_mcp.tools import discovery
 
 
@@ -836,3 +836,99 @@ def test_list_instagram_accounts_handles_empty_result_and_paging(monkeypatch) ->
     result = asyncio.run(discovery.list_instagram_accounts(account_id="123"))
     assert result["summary"]["count"] == 0
     assert result["paging"]["after"] == "after_ig"
+
+
+# ---------------------------------------------------------------------------
+# list_ad_accounts readiness fields (phase two, item 27)
+# ---------------------------------------------------------------------------
+
+OLD_ACCOUNT_FIELDS = [
+    "id", "name", "account_id", "account_status", "currency", "timezone_name", "amount_spent", "balance",
+    "business_name",
+]
+OLD_ACCOUNT_ROW = {
+    "id": "act_1", "name": "Shop", "account_id": "1", "account_status": 1, "currency": "USD",
+    "timezone_name": "America/New_York", "amount_spent": "123456", "balance": "500", "business_name": "Shop Inc",
+}
+
+
+class AccountsClient:
+    def __init__(self, extra: dict | None = None, failing_fields: set[str] | None = None) -> None:
+        self.extra = extra or {}
+        self.failing_fields = failing_fields or set()
+        self.calls: list[dict] = []
+
+    async def list_objects(self, parent_id, edge, *, fields, params):
+        self.calls.append({"parent_id": parent_id, "edge": edge, "fields": list(fields), "params": dict(params)})
+        if self.failing_fields & set(fields):
+            raise MetaApiError(message="(#200) Requires MANAGE task", status_code=403, code=200)
+        row = dict(OLD_ACCOUNT_ROW)
+        row.update({key: value for key, value in self.extra.items() if any(field.startswith(key) for field in fields)})
+        return {"data": [row], "paging": {"cursors": {"after": "A"}}}
+
+
+def test_list_ad_accounts_keeps_every_field_it_returned_before(monkeypatch) -> None:
+    client = AccountsClient(extra={
+        "business": {"id": "77", "name": "Shop Inc"}, "disable_reason": 0, "min_daily_budget": 100,
+        "funding_source": "6000123",
+    })
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.list_ad_accounts(limit=10, after="X"))
+
+    call = client.calls[0]
+    assert (call["parent_id"], call["edge"]) == ("me", "adaccounts")
+    assert call["params"] == {"limit": 10, "after": "X"}
+    assert call["fields"][: len(OLD_ACCOUNT_FIELDS)] == OLD_ACCOUNT_FIELDS
+    item = result["items"][0]
+    assert {key: item[key] for key in OLD_ACCOUNT_FIELDS} == {
+        **OLD_ACCOUNT_ROW, "amount_spent": 1234.56, "balance": 5.0,
+    }
+    assert result["paging"]["after"] == "A"
+    assert item["business"] == {"id": "77", "name": "Shop Inc"}
+    assert item["disable_reason"] == 0 and item["disable_reason_label"] == "NONE"
+    assert item["min_daily_budget"] == 1.0
+    assert item["has_funding_source"] is True
+    assert "funding_source" not in item
+    assert result["summary"]["readiness_fields"]["unavailable"] == []
+
+
+def test_list_ad_accounts_absent_funding_source_is_unknown_not_false(monkeypatch) -> None:
+    client = AccountsClient(extra={"disable_reason": 3})
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+    result = asyncio.run(discovery.list_ad_accounts())
+    item = result["items"][0]
+    assert item["has_funding_source"] is None
+    assert item["disable_reason_label"] == "RISK_PAYMENT"
+    assert "MANAGE" in result["summary"]["readiness_fields"]["has_funding_source_note"]
+
+
+def test_list_ad_accounts_funding_permission_error_drops_only_that_field(monkeypatch) -> None:
+    client = AccountsClient(extra={"disable_reason": 0, "min_daily_budget": 250}, failing_fields={"funding_source"})
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.list_ad_accounts())
+
+    assert len(client.calls) == 2
+    assert "funding_source" not in client.calls[1]["fields"]
+    item = result["items"][0]
+    assert item["min_daily_budget"] == 2.5
+    assert "has_funding_source" not in item
+    readiness = result["summary"]["readiness_fields"]
+    assert readiness["unavailable"] == ["funding_source"]
+    assert "MANAGE" in readiness["error"]
+
+
+def test_list_ad_accounts_falls_back_to_the_old_request_when_readiness_fields_fail(monkeypatch) -> None:
+    client = AccountsClient(failing_fields={"disable_reason"})
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.list_ad_accounts())
+
+    assert [len(call["fields"]) for call in client.calls][-1] == len(OLD_ACCOUNT_FIELDS)
+    assert client.calls[-1]["fields"] == OLD_ACCOUNT_FIELDS
+    item = result["items"][0]
+    assert {key: item[key] for key in OLD_ACCOUNT_FIELDS}["amount_spent"] == 1234.56
+    assert result["summary"]["readiness_fields"]["unavailable"] == [
+        "business{id,name}", "disable_reason", "min_daily_budget", "funding_source",
+    ]

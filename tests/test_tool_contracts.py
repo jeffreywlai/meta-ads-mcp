@@ -233,7 +233,12 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "duplicate_campaign": {"campaign_id": "111", "deep_copy": True},
     "duplicate_adset": {"adset_id": "411", "campaign_id": "999"},
     "duplicate_ad": {"ad_id": "611", "new_name": "Copied ad"},
+    "get_performance_trend": {"object_id": "cmp_123"},
+    "detect_performance_anomalies": {"object_id": "cmp_123"},
+    "get_auction_ranking_report": {"object_id": "cmp_123"},
 }
+# search_terms became optional (search_page_ids is the other route), so the smoke run names it.
+TOOL_OVERRIDES["search_ads_archive"] = {**TOOL_OVERRIDES["search_ads_archive"], "search_terms": "shirts"}
 
 
 class UniversalFakeClient:

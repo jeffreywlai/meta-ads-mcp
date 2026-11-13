@@ -872,6 +872,40 @@ class GraphAPIClient:
         """Send a DELETE to a collection edge with form-encoded parameters in the body."""
         return await self.request("DELETE", f"{_segment(parent_id)}/{_segment(edge)}", data=data)
 
+    async def search_ads_library(
+        self,
+        *,
+        ad_reached_countries: list[str],
+        ad_type: str = "ALL",
+        limit: int = 25,
+        fields: FieldList | None = None,
+        after: str | None = None,
+        search_terms: str | None = None,
+        search_page_ids: list[str] | None = None,
+        ad_active_status: str | None = None,
+    ) -> dict[str, Any]:
+        """Search the Ads Library (/ads_archive) by Page ids and active status as well as keywords.
+
+        Meta documents search_page_ids as up to ten Page ids "separated by commas", and ad_active_status as
+        ACTIVE, ALL or INACTIVE. Optional parameters are sent only when given.
+        """
+        params: dict[str, Any] = {
+            "ad_reached_countries": ad_reached_countries,
+            "ad_type": ad_type,
+            "limit": limit,
+        }
+        if serialized_fields := _serialize_fields(fields):
+            params["fields"] = serialized_fields
+        if search_terms is not None:
+            params["search_terms"] = search_terms
+        if search_page_ids:
+            params["search_page_ids"] = ",".join(search_page_ids)
+        if ad_active_status is not None:
+            params["ad_active_status"] = ad_active_status
+        if cursor := _normalize_cursor(after):
+            params["after"] = cursor
+        return await self.request("GET", "ads_archive", params=params)
+
 
 def get_graph_api_client(access_token_override: str | None = None) -> GraphAPIClient:
     """Return a configured Graph API client."""

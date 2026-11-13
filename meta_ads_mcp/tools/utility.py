@@ -641,7 +641,71 @@ INTENT_GUIDE = {
             "Meta allows a deep copy of at most 3 ads in one call; copy larger structures level by level.",
         ],
     },
+    "rank_entities_by_a_metric": {
+        "description": "List the top or bottom campaigns, ad sets or ads by a metric such as spend, impressions or link clicks, ranked by Meta.",
+        "recommended_order": ["get_entity_insights", "compare_performance"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass sort, such as spend_descending, with level and a limit; Meta accepts one sort key per request.",
+            "Keep fields lean on account-wide sorted requests; heavy sorted requests with action arrays fail on large accounts.",
+        ],
+    },
+    "trend_or_anomalies_for_several_entities": {
+        "description": "Trend or screen for unusual days across several campaigns, ad sets or ads in one call.",
+        "recommended_order": ["get_performance_trend", "detect_performance_anomalies", "get_auction_ranking_report"],
+        "avoid_unless_needed": ["export_insights"],
+        "notes": [
+            "Pass object_ids (up to 10 numeric ids) or child_level with one object_id to cover its highest-spending children.",
+            "Results follow Meta's own result for each entity; the response names any entity that could not be read.",
+        ],
+    },
+    "research_an_advertisers_ads_in_the_ad_library": {
+        "description": "See the ads a specific Page or competitor is running in the public Meta Ad Library, active or inactive.",
+        "recommended_order": ["search_ads_archive"],
+        "avoid_unless_needed": [],
+        "notes": ["Pass search_page_ids (up to 10 Page ids) with or without search_terms, and ad_active_status ACTIVE, ALL or INACTIVE."],
+    },
 }
+
+# The full manifest is sent as both text and structured data, so it has to stay well
+# under half the response limit. Intents in this original set keep their full entry and
+# their routing hint there. Intents added since appear with their description and tool
+# order only; their notes come from get_capabilities(intent=...).
+FULL_DETAIL_MANIFEST_INTENTS = frozenset(
+    {
+        "check_connectivity_or_auth",
+        "discover_accounts_or_ids",
+        "inspect_single_entity_performance",
+        "compare_multiple_entities",
+        "compare_current_vs_previous_window",
+        "read_change_history",
+        "export_reporting_data",
+        "retrieve_oversized_response",
+        "find_optimization_opportunities",
+        "read_ad_comments_or_quality_signals",
+        "plan_targeting_or_audiences",
+        "creative_workflows",
+        "research_competitor_ads",
+        "writes_after_confirmation",
+    }
+)
+
+
+def _manifest_intent_guide() -> dict[str, dict[str, object]]:
+    """Return the intent guide sized for the full manifest."""
+    return {
+        intent: (
+            route
+            if intent in FULL_DETAIL_MANIFEST_INTENTS
+            else {
+                "description": route["description"],
+                "recommended_order": route["recommended_order"],
+                "avoid_unless_needed": route["avoid_unless_needed"],
+            }
+        )
+        for intent, route in INTENT_GUIDE.items()
+    }
+
 
 ROUTING_HINTS = {
     intent: list(route["recommended_order"]) + list(route["avoid_unless_needed"])
@@ -956,11 +1020,17 @@ async def get_capabilities(
             "server": _server_metadata(),
             "auth": auth,
             "tool_groups": tool_groups,
-            "routing_hints": ROUTING_HINTS,
-            "intent_guide": INTENT_GUIDE,
+            "routing_hints": {
+                intent: hint for intent, hint in ROUTING_HINTS.items() if intent in FULL_DETAIL_MANIFEST_INTENTS
+            },
+            "intent_guide": _manifest_intent_guide(),
             "resources": RESOURCE_URIS,
             "official_parity": parity_summary(),
-            "notes": notes,
+            "notes": [
+                *notes,
+                "Newer intents are listed here with their description and tool order only; call "
+                "get_capabilities(intent='<intent key>') for an intent's notes.",
+            ],
         }
 
     return {

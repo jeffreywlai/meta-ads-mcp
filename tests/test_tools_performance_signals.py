@@ -266,8 +266,16 @@ def test_opportunity_score_validation_errors_make_no_calls(monkeypatch, kwargs) 
 # ---------------------------------------------------------------------------
 
 
+def _meta_result(indicator: str, value: float | None) -> list[dict[str, Any]]:
+    """Meta's results / cost_per_result shape: [{indicator, values: [{value, attribution_windows}]}]."""
+    values = [] if value is None else [{"value": str(value), "attribution_windows": ["default"]}]
+    return [{"indicator": indicator, "values": values}]
+
+
 def _day_row(day: str, *, spend: float, impressions: int, clicks: int, purchases: float | None = None,
-             purchase_value: float | None = None) -> dict[str, Any]:
+             purchase_value: float | None = None, result: tuple[str, float] | None = None,
+             meta_results: bool = True) -> dict[str, Any]:
+    """A daily row. Purchases are also Meta's result (actions:purchase) unless result names another one."""
     row: dict[str, Any] = {
         "date_start": day,
         "date_stop": day,
@@ -279,6 +287,10 @@ def _day_row(day: str, *, spend: float, impressions: int, clicks: int, purchases
         row["actions"] = [{"action_type": "purchase", "value": str(purchases)}]
     if purchase_value is not None:
         row["action_values"] = [{"action_type": "purchase", "value": str(purchase_value)}]
+    if result is not None:
+        row["results"] = _meta_result(*result)
+    elif purchases is not None and meta_results:
+        row["results"] = _meta_result("actions:purchase", purchases)
     return row
 
 
@@ -1844,3 +1856,502 @@ def test_delivery_errors_validation_errors_make_no_calls(monkeypatch, kwargs) ->
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.get_delivery_errors(**kwargs))
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Meta's own result (phase two, item 3)
+# ---------------------------------------------------------------------------
+
+
+def test_trend_cost_per_result_follows_metas_result_definition(monkeypatch) -> None:
+    """A traffic campaign has no purchases or leads; its result is Meta's link_click result."""
+    rows = [
+        _day_row("2026-11-01", spend=100, impressions=10000, clicks=200, result=("actions:link_click", 50)),
+        _day_row("2026-11-02", spend=120, impressions=10000, clicks=240, result=("actions:link_click", 40)),
+    ]
+    for row in rows:
+        row["actions"] = [{"action_type": "link_click", "value": "0"}, {"action_type": "purchase", "value": "3"}]
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="cmp_1", since="2026-11-01", until="2026-11-02",
+    ))
+
+    call = _calls(client, "get_insights")[0]
+    assert {"results", "cost_per_result"} <= set(call["fields"])
+    first = result["periods"][0]["metrics"]
+    assert first["cost_per_result"] == pytest.approx(2.0)  # 100 / 50 link clicks, not 100 / 3 purchases
+    assert first["conversion_rate"] == pytest.approx(0.25)
+    assert first["roas"] is None
+    assert result["periods"][1]["inputs"]["results"] == 40.0
+    assert result["result"] == {
+        "source": "meta_results_field", "status": "single", "indicator": "actions:link_click",
+        "action_type": "link_click", "additive": True, "conversion_value_source": None,
+    }
+    assert "Meta's own result" in result["results_definition"]
+    assert any("no value for the result's action (link_click)" in signal for signal in result["missing_signals"])
+
+
+def test_trend_without_a_meta_result_does_not_fall_back_to_purchases(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-01", spend=100, impressions=1000, clicks=10, purchases=5, purchase_value=500,
+                 meta_results=False),
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="adset", object_id="as_1", since="2026-11-01", until="2026-11-01",
+    ))
+    metrics = result["periods"][0]["metrics"]
+    assert metrics["cost_per_result"] is None and metrics["roas"] is None and metrics["conversion_rate"] is None
+    assert result["result"]["status"] == "not_reported"
+    assert any("reported no result" in signal and "No other action is substituted" in signal
+               for signal in result["missing_signals"])
+
+
+def test_trend_day_without_result_counts_zero_once_meta_reports_one(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-02", spend=10, impressions=100, clicks=5, result=("actions:lead", 2)),
+        _day_row("2026-11-03", spend=10, impressions=100, clicks=5),
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="adset", object_id="as_1", since="2026-11-02", until="2026-11-03", granularity="week",
+    ))
+    period = result["periods"][0]
+    assert period["inputs"]["results"] == 2.0
+    assert period["metrics"]["cost_per_result"] == pytest.approx(10.0)
+
+
+def test_trend_mixed_results_are_not_added_together(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-01", spend=10, impressions=100, clicks=5, result=("actions:lead", 2)),
+        _day_row("2026-11-02", spend=10, impressions=100, clicks=5, result=("actions:purchase", 1)),
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="cmp_1", since="2026-11-01", until="2026-11-02",
+    ))
+    assert all(period["metrics"]["cost_per_result"] is None for period in result["periods"])
+    assert result["result"]["status"] == "mixed"
+    assert result["result"]["indicators"] == ["actions:lead", "actions:purchase"]
+    assert any("more than one result type" in signal for signal in result["missing_signals"])
+
+
+def test_trend_reach_result_is_daily_only_with_metas_cost(monkeypatch) -> None:
+    rows = [
+        _day_row("2026-11-03", spend=30, impressions=5000, clicks=5, result=("reach", 4000)),
+        _day_row("2026-11-04", spend=30, impressions=5000, clicks=5, result=("reach", 3900)),
+    ]
+    for row in rows:
+        row["cost_per_result"] = _meta_result("reach", 7.5)
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+
+    daily = asyncio.run(performance_signals.get_performance_trend(
+        level="adset", object_id="as_1", since="2026-11-03", until="2026-11-04",
+    ))
+    assert daily["periods"][0]["metrics"]["cost_per_result"] == 7.5
+    assert daily["periods"][0]["inputs"]["results"] == 4000
+    assert daily["periods"][0]["metrics"]["conversion_rate"] is None
+    weekly = asyncio.run(performance_signals.get_performance_trend(
+        level="adset", object_id="as_1", since="2026-11-03", until="2026-11-04", granularity="week",
+    ))
+    assert weekly["periods"][0]["inputs"]["results"] is None
+    assert weekly["periods"][0]["metrics"]["cost_per_result"] is None
+    assert any("not an action count" in signal for signal in weekly["missing_signals"])
+
+
+def test_account_level_trend_does_not_request_cost_per_result(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler([])))
+    asyncio.run(performance_signals.get_performance_trend(
+        level="account", object_id="42", since="2026-11-01", until="2026-11-02",
+    ))
+    fields = _calls(client, "get_insights")[0]["fields"]
+    assert "results" in fields and "cost_per_result" not in fields
+
+
+def test_trend_result_fields_rejected_reads_again_without_them(monkeypatch) -> None:
+    rows = [_day_row("2026-11-01", spend=10, impressions=100, clicks=5, purchases=1)]
+
+    def handler(object_id, fields, params):
+        if "results" in fields:
+            raise MetaApiError(message="(#100) results is not valid", status_code=400, code=100)
+        return {"data": rows}
+
+    client = _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="cmp_1", since="2026-11-01", until="2026-11-01",
+    ))
+    assert len(_calls(client, "get_insights")) == 2
+    assert result["periods"][0]["metrics"]["cpc"] == pytest.approx(2.0)
+    assert result["periods"][0]["metrics"]["cost_per_result"] is None
+    assert result["result"]["status"] == "request_failed"
+    assert any("rejected the request for its result fields" in signal for signal in result["missing_signals"])
+
+
+def test_anomalies_cost_per_result_follows_metas_result(monkeypatch) -> None:
+    days = _days(date(2026, 11, 15), 15)
+    rows = [
+        _day_row(day, spend=100, impressions=10000, clicks=100, result=("actions:link_click", 50 + index % 3))
+        for index, day in enumerate(days[:-1])
+    ]
+    rows.append(_day_row(days[-1], spend=100, impressions=10000, clicks=100, result=("actions:link_click", 5)))
+    _patch(monkeypatch, RecordingClient(insights_handler=_daily_handler(rows)))
+    result = asyncio.run(performance_signals.detect_performance_anomalies(
+        level="adset", object_id="as_1", metrics=["cost_per_result"], lookback_days=1, baseline_days=14,
+        end_date="2026-11-15",
+    ))
+    assert [anomaly["metric"] for anomaly in result["anomalies"]] == ["cost_per_result"]
+    assert result["anomalies"][0]["value"] == pytest.approx(20.0)
+    assert result["result"]["indicator"] == "actions:link_click"
+
+
+# ---------------------------------------------------------------------------
+# Several entities per call (phase two, item 14)
+# ---------------------------------------------------------------------------
+
+
+def _per_object_handler(rows_by_object: dict[str, list[dict[str, Any]]], failing: dict[str, Exception] | None = None):
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if failing and object_id in failing:
+            raise failing[object_id]
+        window = json.loads(params["time_range"])
+        rows = rows_by_object.get(object_id, [])
+        return {"data": [row for row in rows if window["since"] <= row["date_start"] <= window["until"]]}
+
+    return handler
+
+
+def test_multi_entity_report_names_an_unreadable_entity_and_returns_the_rest(monkeypatch) -> None:
+    rows = {
+        "111": [_day_row("2026-11-01", spend=10, impressions=100, clicks=5, purchases=1)],
+        "333": [_day_row("2026-11-01", spend=30, impressions=300, clicks=15, purchases=3)],
+    }
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_per_object_handler(
+        rows, failing={"222": _permission_error()},
+    )))
+
+    trend = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_ids=["111", "222", "333"], since="2026-11-01", until="2026-11-01",
+    ))
+
+    assert sorted(call["object_id"] for call in _calls(client, "get_insights")) == ["111", "222", "333"]
+    entities = {entity["object_id"]: entity for entity in trend["entities"]}
+    assert entities["111"]["status"] == "read" and entities["333"]["status"] == "read"
+    assert entities["111"]["totals"]["metrics"]["cost_per_result"] == pytest.approx(10.0)
+    assert entities["333"]["changes"]["cpc"]["first"] == pytest.approx(2.0)
+    assert entities["222"]["status"] == "unreadable" and "Permissions" in entities["222"]["error"]
+    assert trend["coverage"]["entities_unreadable"][0]["object_id"] == "222"
+    assert trend["coverage"]["complete"] is False
+    assert any(signal.startswith("222 could not be read") for signal in trend["missing_signals"])
+    assert trend["scope"] == {"level": "campaign", "object_ids": ["111", "222", "333"]}
+
+    anomalies = asyncio.run(performance_signals.detect_performance_anomalies(
+        level="campaign", object_ids="111,222", lookback_days=1, baseline_days=7, end_date="2026-11-08",
+    ))
+    by_id = {entity["object_id"]: entity for entity in anomalies["entities"]}
+    assert by_id["222"]["status"] == "unreadable"
+    assert by_id["111"]["status"] == "read" and by_id["111"]["judged"] is False
+
+
+def test_trend_child_level_selects_top_spenders_then_reads_them_in_one_filtered_request(monkeypatch) -> None:
+    daily = {
+        "501": [_day_row("2026-11-01", spend=50, impressions=500, clicks=10, result=("actions:lead", 5))],
+        "502": [_day_row("2026-11-01", spend=20, impressions=200, clicks=4, result=("actions:link_click", 4))],
+    }
+
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        assert object_id == "act_42"
+        if "sort" in params:
+            assert params["sort"] == ["spend_descending"] and params["limit"] == 2
+            assert set(fields) == {"campaign_id", "campaign_name", "spend"}
+            return {
+                "data": [{"campaign_id": "501", "campaign_name": "A", "spend": "50"},
+                         {"campaign_id": "502", "campaign_name": "B", "spend": "20"}],
+                "paging": {"cursors": {"after": "c"}, "next": "https://graph.example/next"},
+            }
+        (selector,) = params["filtering"]
+        assert selector == {"field": "campaign.id", "operator": "IN", "value": ["501", "502"]}
+        assert params["level"] == "campaign" and params["time_increment"] == 1
+        return {"data": [{**row, "campaign_id": key} for key, rows in daily.items() for row in rows]}
+
+    client = _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="account", object_id="42", child_level="campaign", max_entities=2,
+        since="2026-11-01", until="2026-11-01",
+    ))
+
+    assert len(_calls(client, "get_insights")) == 2
+    entities = {entity["object_id"]: entity for entity in result["entities"]}
+    assert entities["501"]["name"] == "A"
+    assert entities["501"]["result"]["indicator"] == "actions:lead"
+    assert entities["501"]["totals"]["metrics"]["cost_per_result"] == pytest.approx(10.0)
+    assert entities["502"]["result"]["indicator"] == "actions:link_click"
+    assert result["coverage"]["data_read"] == "one_filtered_request"
+    assert result["coverage"]["selection"]["more_children_exist"] is True
+    assert result["coverage"]["complete"] is False
+    assert any("highest-spending campaign" in signal for signal in result["missing_signals"])
+    assert "periods" not in result
+
+
+def test_child_level_falls_back_to_one_request_per_child_when_the_filtered_read_fails(monkeypatch) -> None:
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if "sort" in params:
+            return {"data": [{"adset_id": "601", "spend": "9"}, {"adset_id": "602", "spend": "8"}]}
+        if "filtering" in params:
+            raise _unknown_error()
+        if object_id == "602":
+            raise _permission_error()
+        return {"data": [_day_row("2026-11-01", spend=9, impressions=90, clicks=3, purchases=1)]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="cmp_1", child_level="adset", since="2026-11-01", until="2026-11-01",
+    ))
+    assert result["coverage"]["data_read"] == "one_request_per_entity"
+    assert "unknown error" in result["coverage"]["filtered_read_error"]
+    statuses = {entity["object_id"]: entity["status"] for entity in result["entities"]}
+    assert statuses == {"601": "read", "602": "unreadable"}
+    assert any("602 could not be read" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"level": "campaign", "object_id": "1", "object_ids": ["2"]},
+        {"level": "campaign", "object_ids": ["cmp_1"]},
+        {"level": "account", "object_ids": ["1"]},
+        {"level": "campaign", "object_ids": [str(index) for index in range(11)]},
+        {"level": "campaign", "object_ids": ["1"], "child_level": "ad"},
+        {"level": "ad", "object_id": "1", "child_level": "campaign"},
+        {"level": "campaign", "object_id": "1", "child_level": "adset", "max_entities": 11},
+        {"level": "campaign"},
+    ],
+)
+def test_multi_entity_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
+    for tool in (performance_signals.get_performance_trend, performance_signals.detect_performance_anomalies):
+        client = _patch(monkeypatch, RecordingClient())
+        with pytest.raises(ValidationError):
+            asyncio.run(tool(**kwargs))
+        assert client.calls == []
+
+
+def test_multi_entity_trend_response_stays_small(monkeypatch) -> None:
+    rows = {
+        str(index): [
+            _day_row(day, spend=10 + index, impressions=1000, clicks=10, purchases=1)
+            for day in _days(date(2026, 11, 30), 30)
+        ]
+        for index in range(1, 11)
+    }
+    _patch(monkeypatch, RecordingClient(insights_handler=_per_object_handler(rows)))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="ad", object_ids=list(rows), since="2026-11-01", until="2026-11-30",
+    ))
+    assert result["coverage"]["entities_read"] == 10
+    assert len(json.dumps(result).encode()) < 20_000
+
+
+def test_anomalies_multi_entity_response_stays_small(monkeypatch) -> None:
+    days = _days(date(2026, 11, 30), 35)
+    rows = {
+        str(index): [
+            _day_row(day, spend=100 + (offset % 3) + (900 if offset == 34 else 0), impressions=1000, clicks=10,
+                     purchases=1 + offset % 2)
+            for offset, day in enumerate(days)
+        ]
+        for index in range(1, 11)
+    }
+    _patch(monkeypatch, RecordingClient(insights_handler=_per_object_handler(rows)))
+    result = asyncio.run(performance_signals.detect_performance_anomalies(
+        level="ad", object_ids=list(rows), end_date="2026-11-30",
+    ))
+    assert result["coverage"]["entities_read"] == 10
+    assert result["metrics"]["anomaly_count"] >= 10
+    assert len(result["findings"]) <= performance_signals.MULTI_ENTITY_MAX_FINDINGS
+    assert {finding["affected_entities"][0]["object_id"] for finding in result["findings"]} <= set(rows)
+    assert len(json.dumps(result).encode()) < 20_000
+
+
+# ---------------------------------------------------------------------------
+# Ranking report: Meta's result and several scopes
+# ---------------------------------------------------------------------------
+
+
+def test_ranking_compares_cost_only_within_the_same_meta_result(monkeypatch) -> None:
+    rows = [
+        _ad_row("leads", spend=400, purchases=0, quality="AVERAGE", engagement="AVERAGE", conversion="AVERAGE"),
+        _ad_row("leads_cheap", spend=100, purchases=0, quality="AVERAGE", engagement="AVERAGE", conversion="AVERAGE"),
+        _ad_row("clicks", spend=500, purchases=0, quality="AVERAGE", engagement="AVERAGE", conversion="AVERAGE"),
+    ]
+    rows[0]["results"] = _meta_result("actions:lead", 4)  # 100 per lead
+    rows[1]["results"] = _meta_result("actions:lead", 5)  # 20 per lead
+    rows[2]["results"] = _meta_result("actions:link_click", 1000)  # 0.5 per click
+    _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(
+        rows, scope_spend=1000.0, more=False,
+    )))
+
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
+
+    ads = {ad["ad_id"]: ad for ad in result["ranked_ads"]}
+    assert ads["leads"]["result_indicator"] == "actions:lead"
+    assert ads["leads"]["cost_per_result_baseline"] == {"value": pytest.approx(500 / 9),
+                                                        "basis": "examined_ads_with_same_result"}
+    assert ads["clicks"]["cost_per_result_baseline"]["value"] == pytest.approx(0.5)
+    assert ads["leads"]["diagnosis"] == "bid_and_budget"
+    assert ads["clicks"]["diagnosis"] is None
+    assert result["rules"]["cost_baseline"]
+    assert any("different Meta results" in signal for signal in result["missing_signals"])
+
+
+def test_ranking_cost_read_requests_metas_result_fields(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(
+        _many_ads(3), scope_spend=20000.0, more=False,
+    )))
+    asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
+    cost = next(call for call in _ad_level_calls(client) if "filtering" in call["params"])
+    assert {"results", "cost_per_result"} <= set(cost["fields"])
+    scope = next(call for call in _calls(client, "get_insights") if call["params"]["level"] == "campaign")
+    assert "results" in scope["fields"]
+
+
+def test_ranking_object_ids_pool_scopes_and_name_an_unreadable_one(monkeypatch) -> None:
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if object_id == "902":
+            raise _permission_error()
+        inner = _meta_like_ranking_handler(
+            [_ad_row(f"ad_{object_id}", spend=100, purchases=2, quality="BELOW_AVERAGE_10", engagement="AVERAGE",
+                     conversion="AVERAGE")],
+            scope_spend=100.0, more=False,
+        )
+        return inner(object_id, fields, params)
+
+    client = _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(
+        level="campaign", object_ids=["901", "902", "903"], max_ads=90,
+    ))
+
+    sorted_calls = [call for call in _ad_level_calls(client) if "sort" in call["params"]]
+    assert {call["params"]["limit"] for call in sorted_calls} == {30}
+    assert {ad["ad_id"] for ad in result["weak_ads"]} == {"ad_901", "ad_903"}
+    assert {ad["scope_object_id"] for ad in result["ranked_ads"]} == {"901", "903"}
+    statuses = {entity["object_id"]: entity["status"] for entity in result["entities"]}
+    assert statuses == {"901": "read", "902": "unreadable", "903": "read"}
+    assert result["coverage"]["entities_unreadable"] == ["902"]
+    assert any(signal.startswith("902 could not be read") for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"level": "campaign", "object_id": "1", "object_ids": ["2"]},
+        {"level": "account", "object_ids": ["1"]},
+        {"level": "campaign", "object_ids": ["1", "2", "3", "4", "5", "6"]},
+        {"level": "adset", "object_ids": ["as_1"]},
+    ],
+)
+def test_ranking_object_ids_validation_errors_make_no_calls(monkeypatch, kwargs) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.get_auction_ranking_report(**kwargs))
+    assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Advertiser context: Meta's result per ad set, missing spend, and object_ids
+# ---------------------------------------------------------------------------
+
+
+def test_advertiser_context_judges_offsite_conversion_goals_on_metas_result(monkeypatch) -> None:
+    rows = [dict(row) for row in CONTEXT_ROWS]
+    rows[0]["results"] = _meta_result("actions:offsite_conversion.fb_pixel_purchase", 300)
+    rows[1]["results"] = _meta_result("actions:offsite_conversion.fb_pixel_purchase", 30)
+    rows[2]["results"] = _meta_result("actions:link_click", 1000)
+    client = _context_client()
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
+
+    assert "results" in _calls(client, "get_insights")[0]["fields"]
+    volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
+    conversions = volume["OFFSITE_CONVERSIONS"]
+    assert conversions["verdict"] == "some_adsets_meet_threshold"
+    assert conversions["adsets_meeting_threshold"] == 1 and conversions["adsets_below_threshold"] == 1
+    assert conversions["result_indicators"] == ["actions:offsite_conversion.fb_pixel_purchase"]
+    assert "Meta's own result" in conversions["event_basis"]
+    assert not any("OFFSITE_CONVERSIONS" in signal for signal in result["missing_signals"])
+    by_goal = {row["optimization_goal"]: row for row in result["spend_by_optimization_goal"]}
+    assert by_goal["OFFSITE_CONVERSIONS"]["results"] == 330.0
+    assert by_goal["OFFSITE_CONVERSIONS"]["cost_per_result"] == pytest.approx(800 / 330)
+    by_objective = {row["objective"]: row for row in result["spend_by_objective"]}
+    assert by_objective["OUTCOME_TRAFFIC"]["result_indicator"] == "actions:link_click"
+
+
+def test_advertiser_context_reach_result_is_not_judged_as_events() -> None:
+    row = _goal_row("as_r", "REACH", {})
+    row["meta_result"] = {"status": "read", "indicator": "reach", "value": 90000.0}
+    entry = performance_signals._goal_volume([row], 7)[0]
+    assert entry["verdict"] == "not_assessed"
+    assert "not an event count" in entry["reason"]
+
+
+def test_advertiser_context_missing_spend_is_unknown_not_zero(monkeypatch) -> None:
+    rows = [dict(row) for row in CONTEXT_ROWS]
+    del rows[1]["spend"]
+    client = _context_client()
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
+
+    assert result["metrics"]["spend"] is None
+    by_objective = {row["objective"]: row for row in result["spend_by_objective"]}
+    assert by_objective["OUTCOME_SALES"]["spend"] is None
+    assert by_objective["OUTCOME_SALES"]["spend_share"] is None
+    assert by_objective["OUTCOME_TRAFFIC"]["spend"] == 200.0
+    assert by_objective["OUTCOME_TRAFFIC"]["spend_share"] is None
+    volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
+    assert volume["OFFSITE_CONVERSIONS"]["adset_count"] == 2
+    assert volume["OFFSITE_CONVERSIONS"]["spend"] is None
+    assert volume["OFFSITE_CONVERSIONS"]["adsets_with_unknown_spend"] == 1
+    assert any("had no spend" in signal for signal in result["missing_signals"])
+
+
+def test_advertiser_context_object_ids_keep_only_named_campaigns_and_adsets(monkeypatch) -> None:
+    rows = [dict(row) for row in CONTEXT_ROWS]
+    for index, row in enumerate(rows):
+        row["campaign_id"], row["adset_id"] = f"10{index}", f"20{index}"
+    client = _context_client()
+    client.insights_handler = lambda object_id, fields, params: {"data": rows}
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(
+        account_id="act_42", object_ids=["100", "202", "999"],
+    ))
+
+    assert len(_calls(client, "get_insights")) == 1
+    assert result["scope"]["object_ids"] == ["100", "202", "999"]
+    assert result["metrics"]["adset_rows"] == 2
+    assert result["metrics"]["spend"] == 800.0
+    assert result["object_scope"]["unmatched_object_ids"] == ["999"]
+    assert any("999" in signal for signal in result["missing_signals"])
+    assert result["datasets"]["items"][0]["id"] == "px_1"
+
+
+@pytest.mark.parametrize("object_ids", [["cmp_1"], [str(index) for index in range(51)]])
+def test_advertiser_context_object_ids_validation_makes_no_calls(monkeypatch, object_ids) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.get_advertiser_context(account_id="act_1", object_ids=object_ids))
+    assert client.calls == []
+
+
+def test_child_level_with_no_delivering_children_says_so(monkeypatch) -> None:
+    client = _patch(monkeypatch, RecordingClient(insights_handler=lambda object_id, fields, params: {"data": []}))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        level="campaign", object_id="cmp_1", child_level="ad", since="2026-11-01", until="2026-11-02",
+    ))
+    assert len(_calls(client, "get_insights")) == 1
+    assert result["entities"] == []
+    assert result["coverage"]["complete"] is True
+    assert any("no ad with insights" in signal for signal in result["missing_signals"])

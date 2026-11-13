@@ -296,3 +296,37 @@ def test_list_mutation_tools_returns_write_catalog() -> None:
     assert result["count"] == len(utility.TOOL_GROUPS["writes"])
     assert "set_campaign_status" in result["common_paths"]["pause_or_enable"]
     assert result["safety_notes"]
+
+
+def test_full_manifest_fits_in_one_response_without_overflow() -> None:
+    """The server sends a result as both text and structured data, so it must be under half the limit."""
+    import json
+
+    from meta_ads_mcp.coordinator import MAX_TOOL_RESPONSE_BYTES, mcp_server
+
+    raw = asyncio.run(utility.get_capabilities(include_full_manifest=True))
+    assert len(json.dumps(raw)) < MAX_TOOL_RESPONSE_BYTES * 0.45
+    served = asyncio.run(mcp_server.call_tool("get_capabilities", {"include_full_manifest": True})).structured_content
+    assert "overflow" not in served
+    assert set(served) >= {"server", "auth", "tool_groups", "routing_hints", "intent_guide", "resources", "notes"}
+
+
+def test_full_manifest_keeps_original_intents_whole_and_newer_ones_compact() -> None:
+    raw = asyncio.run(utility.get_capabilities(include_full_manifest=True))
+    guide = raw["intent_guide"]
+    assert set(guide) == set(utility.INTENT_GUIDE)
+    for intent in utility.FULL_DETAIL_MANIFEST_INTENTS:
+        assert guide[intent] == utility.INTENT_GUIDE[intent]
+        assert raw["routing_hints"][intent] == utility.ROUTING_HINTS[intent]
+    newer = set(utility.INTENT_GUIDE) - utility.FULL_DETAIL_MANIFEST_INTENTS
+    assert newer, "expected intents added after the original set"
+    for intent in newer:
+        assert set(guide[intent]) == {"description", "recommended_order", "avoid_unless_needed"}
+        assert guide[intent]["recommended_order"] == utility.INTENT_GUIDE[intent]["recommended_order"]
+        assert intent not in raw["routing_hints"]
+    assert any("get_capabilities(intent=" in note for note in raw["notes"])
+
+
+def test_single_intent_lookup_still_returns_the_notes_of_a_newer_intent() -> None:
+    result = asyncio.run(utility.get_capabilities(intent="manage_product_catalogs_and_product_sets"))
+    assert result["selected_intent"]["notes"] == utility.INTENT_GUIDE["manage_product_catalogs_and_product_sets"]["notes"]
