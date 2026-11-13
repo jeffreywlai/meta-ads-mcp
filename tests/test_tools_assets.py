@@ -669,7 +669,7 @@ def test_list_instagram_media_without_filters_is_unchanged(monkeypatch) -> None:
     [
         ({"since": "11/01/2026"}, "YYYY-MM-DD"),
         ({"since": "2026-11-05", "until": "2026-11-01"}, "on or after"),
-        ({"media_types": ["GIF"]}, "unknown values"),
+        ({"media_types": ["GIF"]}, "1 unknown value"),
         ({"media_product_types": ["story"]}, "source=stories"),
         ({"media_product_types": ["FEED"], "source": "stories"}, "stories only"),
     ],
@@ -678,6 +678,18 @@ def test_list_instagram_media_filter_validation_makes_no_call(monkeypatch, argum
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match=message):
         asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", **arguments))
+
+
+def test_validation_messages_name_the_parameter_not_the_pasted_value(monkeypatch) -> None:
+    """A value pasted into the wrong field may be private; messages name the parameter only."""
+    _no_client(monkeypatch)
+    pasted = "someone.private@example.invalid"
+    with pytest.raises(ValidationError) as media_error:
+        asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", media_types=[pasted]))
+    with pytest.raises(ValidationError) as field_error:
+        asyncio.run(assets.get_field_reference(level="ad", field_names=[pasted], object_id="ad_1"))
+    for error in (media_error, field_error):
+        assert pasted not in str(error.value).lower()
 
 
 # Phase two: list_audience_adsets targeting scan

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any, TypeAlias
+from urllib.parse import quote, quote_plus
+
+from pydantic import BeforeValidator
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
@@ -15,8 +21,28 @@ from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import AccountId, CurrencyAmount, FieldList, GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.tool_types import (
+    AccountId,
+    FieldList,
+    GraphId,
+    StrictCurrencyAmount,
+    StringList,
+    coerce_csv_string_list,
+)
 from meta_ads_mcp.url_secrets import refuse_url_credentials
+
+
+def _refuse_true_false(value: Any) -> Any:
+    """MCP clients may send true or false where a number belongs; never read them as 1 or 0."""
+    if isinstance(value, bool):
+        raise ValueError("must be a whole number, not true or false")
+    return value
+
+
+# A whole number that refuses true and false (which the lax int type reads as 1 and 0).
+_WholeNumber: TypeAlias = Annotated[int, BeforeValidator(_refuse_true_false)]
+# A time as ISO 8601 text with a UTC offset, or Unix seconds as a number or digits.
+_TimeInput: TypeAlias = Annotated[str | int, BeforeValidator(_refuse_true_false)]
 
 CREATIVE_FIELDS = [
     "id",
@@ -55,14 +81,97 @@ def _with_context(exc: Exception, prefix: str) -> Exception:
     return MetaApiError(message=f"{prefix} {_failure_reason(exc)}")
 
 
+_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _key_label(key: Any) -> str:
+    """A nested key as it may appear in a message: a field-like name, or a placeholder for anything else."""
+    return key if isinstance(key, str) and _SAFE_KEY.match(key) else "<key>"
+
+
+def _error_attribute_names(exc: BaseException) -> list[str]:
+    """The data attributes an error carries: dataclass fields, slots and instance attributes."""
+    names: list[str] = [field.name for field in dataclasses.fields(exc)] if dataclasses.is_dataclass(exc) else []
+    for cls in type(exc).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        names.extend([slots] if isinstance(slots, str) else list(slots))
+    names.extend(getattr(exc, "__dict__", {}))
+    return [name for name in dict.fromkeys(names) if not name.startswith("__")]
+
+
+def _scrub_value(value: Any, secrets: list[str], shown: str) -> Any:
+    """value with every secret replaced, inside strings, dict keys and values, lists and tuples."""
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, shown)
+        return value
+    if isinstance(value, dict):
+        return {_scrub_value(key, secrets, shown): _scrub_value(item, secrets, shown) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_scrub_value(item, secrets, shown) for item in value)
+    return value
+
+
+def _scrub_error(exc: BaseException, secrets: list[str], shown: str) -> None:
+    """Remove secret text from a raised error and every error behind it, in place.
+
+    A traceback log prints the whole __cause__ and __context__ chain, and the MCP error
+    shows the top error's public fields, so every error reachable that way (and inside an
+    exception group) is cleaned: its fields, args and notes. Each error is visited once,
+    so a cycle ends.
+    """
+    secrets = sorted({secret for secret in secrets if secret}, key=len, reverse=True)
+    if not secrets:
+        return
+    pending: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        for name in _error_attribute_names(current):
+            try:
+                value = getattr(current, name)
+            except AttributeError:
+                continue
+            if value is None or isinstance(value, BaseException):
+                continue
+            cleaned = _scrub_value(value, secrets, shown)
+            if cleaned != value:
+                try:
+                    setattr(current, name, cleaned)
+                except (AttributeError, TypeError):
+                    pass
+        if current.args:
+            current.args = tuple(_scrub_value(arg, secrets, shown) for arg in current.args)
+        notes = getattr(current, "__notes__", None)
+        if isinstance(notes, list):
+            current.__notes__ = [_scrub_value(note, secrets, shown) for note in notes]
+        pending.extend([current.__cause__, current.__context__])
+        pending.extend(getattr(current, "exceptions", None) or ())
+
+
+def _secret_forms(secret: str | None) -> list[str]:
+    """A secret as given, trimmed, and URL-encoded, the ways an error could repeat it."""
+    if not isinstance(secret, str) or not secret.strip():
+        return []
+    forms = {secret, secret.strip()}
+    forms |= {quote(form, safe="") for form in list(forms)} | {quote_plus(form) for form in list(forms)}
+    return [form for form in forms if form]
+
+
 def _refuse_url_logins(value: Any, name: str) -> None:
-    """Refuse a login embedded in any URL inside a nested input, before any request is built."""
+    """Refuse a login embedded in any URL inside a nested input, before any request is built.
+
+    The message names the location by field-like keys only, never by a key that may be pasted data.
+    """
     if isinstance(value, str):
         if "://" in value or "@" in value:
             refuse_url_credentials(value, name)
     elif isinstance(value, dict):
         for key, item in value.items():
-            _refuse_url_logins(item, f"{name}.{key}")
+            _refuse_url_logins(item, f"{name}.{_key_label(key)}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _refuse_url_logins(item, f"{name}[{index}]")
@@ -379,6 +488,25 @@ class _OpenVideo:
     descriptor: int
     name: str
     size: int
+    modified_ns: int
+
+
+FILE_SHOWN = "<file>"
+_FILE_CHANGED = (
+    "The local file changed while it was being uploaded (its size or modification time is not what it was "
+    "when it was opened), so the bytes sent may not be the whole file."
+)
+
+
+def _video_file_change(video: _OpenVideo) -> str | None:
+    """Why the opened file no longer matches what was opened, or None when it is unchanged."""
+    try:
+        details = os.fstat(video.descriptor)
+    except OSError:
+        return "The local file could not be checked for changes while it was being uploaded."
+    if details.st_size != video.size or details.st_mtime_ns != video.modified_ns:
+        return _FILE_CHANGED
+    return None
 
 
 def _open_upload_video(file_path: str, parameter: str = "file_path") -> _OpenVideo:
@@ -398,7 +526,15 @@ def _open_upload_video(file_path: str, parameter: str = "file_path") -> _OpenVid
             "video uploads (Meta's limit for ad videos is 4 GB)."
         ),
     )
-    return _OpenVideo(descriptor=opened.descriptor, name=opened.name, size=opened.size)
+    try:
+        details = os.fstat(opened.descriptor)
+    except OSError:
+        os.close(opened.descriptor)
+        raise ValidationError(f"{parameter} could not be read.") from None
+    if details.st_size != opened.size:
+        os.close(opened.descriptor)
+        raise ValidationError(f"{parameter} changed size while it was being opened; try again once it is complete.")
+    return _OpenVideo(descriptor=opened.descriptor, name=opened.name, size=opened.size, modified_ns=details.st_mtime_ns)
 
 
 def _read_video_bytes(video: _OpenVideo, offset: int, length: int) -> bytes:
@@ -437,16 +573,22 @@ async def _chunked_video_upload(
     video: _OpenVideo,
     meta_fields: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run start, transfer and finish on the advideos edge; on failure name the session and what was sent."""
+    """Run start, transfer and finish on the advideos edge; on failure name the session and what was sent.
+
+    The upload is complete only when Meta's offsets reach the file size. Each answer must
+    continue exactly where the chunk just sent ended: no gap (bytes never sent) and no
+    step backwards. The opened file is checked for changes before each transfer and before
+    the finish. Messages never name the local file.
+    """
     try:
         started = await client.post_ad_video_upload_phase(
             account, data={"upload_phase": "start", "file_size": video.size},
         )
     except Exception as exc:
-        prefix = f"Starting the chunked upload of {video.name} failed, so nothing was transferred."
+        prefix = "Starting the chunked upload failed, so nothing was transferred."
         if _outcome_unknown(exc):
             prefix = (
-                f"Starting the chunked upload of {video.name} may or may not have opened an upload session; "
+                "Starting the chunked upload may or may not have opened an upload session; "
                 "no video bytes were sent."
             )
         wrapped = _with_context(exc, f"{prefix} Reason:")
@@ -456,12 +598,12 @@ async def _chunked_video_upload(
     session_id = str(started.get("upload_session_id") or "") if isinstance(started, dict) else ""
     video_id = str(started.get("video_id") or "") if isinstance(started, dict) else ""
     if not session_id:
-        raise MetaApiError(message=f"Meta did not return an upload session for {video.name}; nothing was transferred.")
+        raise MetaApiError(message="Meta did not return an upload session for the chunked upload; nothing was transferred.")
     progress = {"phase": "transfer", "confirmed": 0, "requests": 0}
 
     def stopped_message(reason: str) -> str:
         message = (
-            f"The chunked upload of {video.name} stopped during the {progress['phase']} step: upload session {session_id}, "
+            f"The chunked upload stopped during the {progress['phase']} step: upload session {session_id}, "
             f"video {video_id or 'not returned'}. Meta confirmed {progress['confirmed']} of {video.size} bytes "
             f"({progress['requests']} transfer requests sent)."
         )
@@ -479,14 +621,30 @@ async def _chunked_video_upload(
     try:
         start = _offset(started.get("start_offset"))
         end = _offset(started.get("end_offset"))
+        sent_end: int | None = None
         while True:
             if start is None or end is None or not 0 <= start <= end <= video.size:
                 raise _ChunkedUploadStopped(
                     f"Meta asked for bytes {started.get('start_offset') if start is None else start} to "
                     f"{started.get('end_offset') if end is None else end}, outside the {video.size}-byte file."
                 )
+            expected = 0 if sent_end is None else sent_end
+            if start < expected:
+                raise _ChunkedUploadStopped(
+                    f"Meta's next chunk (from byte {start}) did not move forward to byte {expected}, "
+                    "where the bytes already sent end."
+                )
+            if start > expected:
+                raise _ChunkedUploadStopped(
+                    f"Meta's next chunk starts at byte {start}, but only bytes 0 to {expected} were sent in this "
+                    f"session, so bytes {expected} to {start} would never be sent."
+                )
             progress["confirmed"] = start
             if start == end:
+                if end != video.size:
+                    raise _ChunkedUploadStopped(
+                        f"Meta ended the transfer at byte {end} of the {video.size}-byte file, so the rest was never sent."
+                    )
                 break
             if end - start > MAX_VIDEO_CHUNK_BYTES:
                 raise _ChunkedUploadStopped(
@@ -496,6 +654,9 @@ async def _chunked_video_upload(
                 raise _ChunkedUploadStopped(
                     f"The upload reached this server's {MAX_CHUNKED_TRANSFER_REQUESTS}-request limit for one video."
                 )
+            changed = _video_file_change(video)
+            if changed:
+                raise _ChunkedUploadStopped(changed)
             chunk = _read_video_bytes(video, start, end - start)
             progress["requests"] += 1
             answer = await client.post_ad_video_upload_phase(
@@ -503,15 +664,14 @@ async def _chunked_video_upload(
                 data={"upload_phase": "transfer", "upload_session_id": session_id, "start_offset": start},
                 files={"video_file_chunk": (video.name, chunk)},
             )
-            next_start = _offset(answer.get("start_offset")) if isinstance(answer, dict) else None
-            next_end = _offset(answer.get("end_offset")) if isinstance(answer, dict) else None
-            if next_start is not None and next_end is not None and next_start != next_end and next_start <= start:
-                raise _ChunkedUploadStopped(
-                    f"Meta's next chunk (from byte {next_start}) did not move forward from byte {start}."
-                )
+            sent_end = end
             started = answer if isinstance(answer, dict) else {}
-            start, end = next_start, next_end
+            start = _offset(started.get("start_offset"))
+            end = _offset(started.get("end_offset"))
         progress["phase"] = "finish"
+        changed = _video_file_change(video)
+        if changed:
+            raise _ChunkedUploadStopped(changed)
         finished = await client.post_ad_video_upload_phase(
             account, data={"upload_phase": "finish", "upload_session_id": session_id, **meta_fields},
         )
@@ -558,7 +718,10 @@ def _chunked_plan(account: str, video: _OpenVideo, meta_fields: dict[str, Any]) 
                 "path": path,
                 "data": {"upload_phase": "transfer", "upload_session_id": "<from start>", "start_offset": "<from Meta>"},
                 "files": {"video_file_chunk": "<the bytes from start_offset to end_offset that Meta names>"},
-                "repeats": "until Meta answers with start_offset equal to end_offset",
+                "repeats": (
+                    "while each answer continues exactly where the chunk sent ended, until start_offset and "
+                    "end_offset both equal the file size"
+                ),
             },
             {"method": "POST", "path": path, "data": {"upload_phase": "finish", "upload_session_id": "<from start>", **meta_fields}},
         ],
@@ -636,26 +799,50 @@ async def upload_ad_video(
     # to send some other file on this machine to Meta.
     video = _open_upload_video(path_text)
     try:
-        if video.size <= MAX_DIRECT_VIDEO_BYTES:
-            source = {"file_name": video.name, "bytes": video.size}
-            content = b"" if dry_run else _read_video_bytes(video, 0, video.size)
-            return await _upload_video_request(
-                resolved_account, target, data=dict(meta_fields), files={"source": (video.name, content)},
-                shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
-            )
-        if dry_run:
-            return {
-                "ok": True,
-                "action": "upload_ad_video",
-                "dry_run": True,
-                "sent": False,
-                "target": target,
-                "would_send": _chunked_plan(resolved_account, video, meta_fields),
-            }
-        client = get_graph_api_client()
-        outcome = await _chunked_video_upload(client, resolved_account, video, meta_fields)
+        return await _upload_video_file(resolved_account, target, video, meta_fields, dry_run=dry_run)
+    except Exception as exc:
+        # A file name can itself be private: no error or log line names the file, even
+        # when Meta's own error text repeats it.
+        _scrub_error(exc, [*_secret_forms(video.name), *_secret_forms(path_text)], FILE_SHOWN)
+        raise
     finally:
         os.close(video.descriptor)
+
+
+async def _upload_video_file(
+    account: str,
+    target: dict[str, Any],
+    video: _OpenVideo,
+    meta_fields: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Upload an opened local video in one request or in chunks; the caller closes it."""
+    if video.size <= MAX_DIRECT_VIDEO_BYTES:
+        source = {"file_name": video.name, "bytes": video.size}
+        content = b""
+        if not dry_run:
+            content = _read_video_bytes(video, 0, video.size)
+            if _video_file_change(video):
+                raise ValidationError(
+                    "file_path changed while it was being read (its size or modification time differs from when it "
+                    "was opened), so nothing was sent. Upload it again once it is complete."
+                )
+        return await _upload_video_request(
+            account, target, data=dict(meta_fields), files={"source": (video.name, content)},
+            shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
+        )
+    if dry_run:
+        return {
+            "ok": True,
+            "action": "upload_ad_video",
+            "dry_run": True,
+            "sent": False,
+            "target": target,
+            "would_send": _chunked_plan(account, video, meta_fields),
+        }
+    client = get_graph_api_client()
+    outcome = await _chunked_video_upload(client, account, video, meta_fields)
     response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
     response.update(await _read_video_status(client, outcome["video_id"]))
@@ -707,7 +894,7 @@ async def delete_ad_image(
     listing = await client.get_ad_images_by_hashes(resolved_account, hashes=[image_hash], fields=AD_IMAGE_READ_FIELDS)
     matches = [item for item in listing.get("data", []) if isinstance(item, dict) and item.get("hash") == image_hash]
     if not matches:
-        raise ValidationError(f"No image with hash {image_hash} was found in {resolved_account}; nothing was deleted.")
+        raise ValidationError(f"No image with the given image_hash was found in {resolved_account}; nothing was deleted.")
     previous = matches[0]
     target = {"account_id": resolved_account, "image_hash": image_hash}
     if dry_run:
@@ -838,7 +1025,10 @@ async def _update_creative_labels(
             )
         missing = [label for label in labels if not any(_label_matches(existing, label) for existing in previous_labels)]
         if missing:
-            raise ValidationError(f"These labels are not on creative {creative_id}, so nothing was changed: {missing}.")
+            raise ValidationError(
+                f"{len(missing)} of the adlabels to remove {'is' if len(missing) == 1 else 'are'} not on creative "
+                f"{creative_id}, so nothing was changed. Read the creative's labels with get_creative first."
+            )
         remaining = [label for label in previous_labels if not any(_label_matches(label, wanted) for wanted in labels)]
         expected = [{"id": str(label["id"])} if label.get("id") else {"name": str(label.get("name"))} for label in remaining]
         payload["adlabels"] = expected
@@ -969,61 +1159,135 @@ async def delete_creative(creative_id: str) -> dict[str, Any]:
     }
 
 
-# One-step boost: objective and destination -> ad set optimization goal and what the ad
-# set promotes. Engagement (post and video), awareness, and sales and leads with a pixel
-# come from the objective mapping table on Meta's campaign reference page. Profile visits
-# (INSTAGRAM_PROFILE with VISIT_INSTAGRAM_PROFILE) and website traffic (WEBSITE with
-# LINK_CLICKS) use values listed on Meta's ad set create reference; the table does not
-# pair them, so they rest on that reference plus Meta's own boost tool. The first
-# destination listed for each objective is its default.
+# One-step boost. Each objective lists the destinations it takes in one step; for each
+# destination, the optimization goals Meta documents for it (the first is the default),
+# what the ad set promotes, and what the post's call to action must be. Sources:
+# - Campaign reference, Objective Mapping table (ad-campaign-group#odax-mapping):
+#   awareness; engagement on a post or video; Messenger and WhatsApp; PHONE_CALL; instant
+#   forms (ON_AD); sales and leads with a pixel; app promotion with application_id and
+#   object_store_url.
+# - Click to Instagram and click to WhatsApp guides (ad-creative/messaging-ads):
+#   INSTAGRAM_DIRECT and WHATSAPP with CONVERSATIONS, billing IMPRESSIONS, promoted_object
+#   page_id, and the call to action each shows for an existing Instagram post.
+# - Use Posts as Instagram Ads guide: MESSAGE_PAGE with app_destination MESSENGER on a post.
+# - Call ads guide: PHONE_CALL with QUALITY_CALL, billing IMPRESSIONS, CALL_NOW with a tel: link.
+# - Ad set reference: INSTAGRAM_PROFILE with VISIT_INSTAGRAM_PROFILE, and WEBSITE.
+# Combinations those pages do not show (for example OUTCOME_SALES with a messaging
+# destination, where the guides and the mapping table disagree on the pixel) are not offered.
+def _route(goals: tuple[str, ...], *, promoted: str | None = None, cta: str | None = None) -> dict[str, Any]:
+    return {"goals": goals, "promoted": promoted, "cta": cta}
+
+
+_ENGAGEMENT_MESSAGING_GOALS = ("CONVERSATIONS", "LINK_CLICKS")
+_TRAFFIC_MESSAGING_GOALS = ("CONVERSATIONS", "LINK_CLICKS", "REACH", "IMPRESSIONS")
 BOOST_OBJECTIVES: dict[str, dict[str | None, dict[str, Any]]] = {
     "OUTCOME_ENGAGEMENT": {
-        "ON_POST": {"optimization_goal": "POST_ENGAGEMENT"},
-        "ON_VIDEO": {"optimization_goal": "THRUPLAY"},
+        "ON_POST": _route(("POST_ENGAGEMENT", "REACH")),
+        "ON_VIDEO": _route(("THRUPLAY", "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS")),
+        "INSTAGRAM_DIRECT": _route(_ENGAGEMENT_MESSAGING_GOALS, promoted="page", cta="message"),
+        "WHATSAPP": _route(_ENGAGEMENT_MESSAGING_GOALS, promoted="page", cta="message"),
+        "MESSENGER": _route(_ENGAGEMENT_MESSAGING_GOALS, promoted="page", cta="message"),
     },
     "OUTCOME_AWARENESS": {
-        None: {"optimization_goal": "REACH", "promoted_page": True},
+        None: _route(("REACH", "IMPRESSIONS", "AD_RECALL_LIFT", "THRUPLAY", "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"), promoted="page"),
     },
     "OUTCOME_TRAFFIC": {
-        "INSTAGRAM_PROFILE": {"optimization_goal": "VISIT_INSTAGRAM_PROFILE"},
-        "WEBSITE": {"optimization_goal": "LINK_CLICKS", "needs_link": True},
+        "INSTAGRAM_PROFILE": _route(("VISIT_INSTAGRAM_PROFILE",)),
+        "WEBSITE": _route(("LINK_CLICKS", "LANDING_PAGE_VIEWS", "IMPRESSIONS"), cta="website"),
+        "INSTAGRAM_DIRECT": _route(_TRAFFIC_MESSAGING_GOALS, promoted="page", cta="message"),
+        "WHATSAPP": _route(_TRAFFIC_MESSAGING_GOALS, promoted="page", cta="message"),
+        "MESSENGER": _route(_TRAFFIC_MESSAGING_GOALS, promoted="page", cta="message"),
+        "PHONE_CALL": _route(("QUALITY_CALL", "LINK_CLICKS"), cta="call"),
     },
     "OUTCOME_SALES": {
-        "WEBSITE": {"optimization_goal": "OFFSITE_CONVERSIONS", "needs_link": True, "needs_pixel": True},
+        "WEBSITE": _route(("OFFSITE_CONVERSIONS",), promoted="pixel", cta="website"),
+        "PHONE_CALL": _route(("QUALITY_CALL",), promoted="page", cta="call"),
     },
     "OUTCOME_LEADS": {
-        "WEBSITE": {"optimization_goal": "OFFSITE_CONVERSIONS", "needs_link": True, "needs_pixel": True},
+        "WEBSITE": _route(("OFFSITE_CONVERSIONS",), promoted="pixel", cta="website"),
+        "ON_AD": _route(("LEAD_GENERATION", "QUALITY_LEAD"), promoted="page", cta="lead_form"),
+        "WHATSAPP": _route(("CONVERSATIONS",), promoted="page", cta="message"),
+        "PHONE_CALL": _route(("QUALITY_CALL",), promoted="page", cta="call"),
+    },
+    "OUTCOME_APP_PROMOTION": {
+        None: _route(("APP_INSTALLS", "LINK_CLICKS", "OFFSITE_CONVERSIONS"), promoted="app", cta="app"),
     },
 }
+# The call to action each messaging guide shows for an existing Instagram post.
+BOOST_MESSAGE_CALLS_TO_ACTION: dict[str, dict[str, Any]] = {
+    "INSTAGRAM_DIRECT": {"type": "INSTAGRAM_MESSAGE", "value": {"link": "https://www.instagram.com"}},
+    "WHATSAPP": {"type": "WHATSAPP_MESSAGE", "value": {"link": "https://api.whatsapp.com/send", "app_destination": "WHATSAPP"}},
+    "MESSENGER": {"type": "MESSAGE_PAGE", "value": {"app_destination": "MESSENGER"}},
+}
+# Call-to-action types tied to one destination; elsewhere they are refused.
+_DESTINATION_CALL_TO_ACTIONS = {"INSTAGRAM_MESSAGE": "INSTAGRAM_DIRECT", "WHATSAPP_MESSAGE": "WHATSAPP", "MESSAGE_PAGE": "MESSENGER", "CALL_NOW": "PHONE_CALL"}
+# Lead ads guide: the call-to-action types an instant form accepts.
+BOOST_LEAD_FORM_CALL_TO_ACTIONS = ("APPLY_NOW", "DOWNLOAD", "GET_QUOTE", "LEARN_MORE", "SIGN_UP", "SUBSCRIBE")
+_TEL_LINK = re.compile(r"^tel:\+[0-9]{6,15}$")
 BOOST_DEFAULT_OBJECTIVE = "OUTCOME_ENGAGEMENT"
 PARTNERSHIP_CODE_SHOWN = "<partnership_ad_code>"
 BOOST_DEFAULT_DURATION_DAYS = 6
 BOOST_MAX_DURATION_DAYS = 365
+BOOST_MIN_RUN = timedelta(hours=24)
 BOOST_BILLING_EVENT = "IMPRESSIONS"
 BOOST_BID_STRATEGY = "LOWEST_COST_WITHOUT_CAP"
+# Campaign and ad set references: bid_amount is required with these two and means nothing without them.
+BOOST_BID_STRATEGIES = ("LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP")
+_CAPPED_BID_STRATEGIES = {"LOWEST_COST_WITH_BID_CAP", "COST_CAP"}
+# Campaign reference special_ad_categories values.
+BOOST_SPECIAL_AD_CATEGORIES = (
+    "NONE", "EMPLOYMENT", "HOUSING", "CREDIT", "ISSUES_ELECTIONS_POLITICS", "ONLINE_GAMBLING_AND_GAMING",
+    "FINANCIAL_PRODUCTS_SERVICES",
+)
 BOOST_PARTNERSHIP_AD_FORMATS = (1, 2, 3)
+BOOST_PAGE_LOOKUP_MAX_REQUESTS = 10
+BOOST_PAGE_LOOKUP_PAGE_SIZE = 100
+_MESSAGING_DESTINATIONS = frozenset(BOOST_MESSAGE_CALLS_TO_ACTION)
 _DELETE_TOOL = {"campaign": "delete_campaign", "ad set": "delete_adset", "creative": "delete_creative", "ad": "delete_ad"}
+_BUDGET_PARAMETERS = ("daily_budget", "lifetime_budget", "campaign_daily_budget", "campaign_lifetime_budget")
 
 
-def _boost_goal(
-    objective: str | None,
-    destination_type: str | None,
-    promoted_object: dict[str, Any] | None,
-    call_to_action: dict[str, Any] | None,
-) -> tuple[str, str | None, dict[str, Any]]:
-    """Resolve objective and destination to Meta's ad set settings, or refuse before any request."""
-    resolved_objective = (blank_to_none(objective) or BOOST_DEFAULT_OBJECTIVE).upper()
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _upper(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be text.")
+    return blank_to_none(value.strip().upper())
+
+
+def _boost_billing_events(goal: str, destination: str | None) -> tuple[str, ...]:
+    """Billing events for a goal, from Meta's optimization goal and billing event table.
+
+    The messaging and call ads guides require IMPRESSIONS for their destinations.
+    """
+    allowed = [BOOST_BILLING_EVENT]
+    if destination in _MESSAGING_DESTINATIONS or destination == "PHONE_CALL":
+        return tuple(allowed)
+    if goal == "LINK_CLICKS":
+        allowed.append("LINK_CLICKS")
+    if goal == "THRUPLAY":
+        allowed.append("THRUPLAY")
+    return tuple(allowed)
+
+
+def _boost_route(objective: str | None, destination_type: str | None) -> tuple[str, str | None, dict[str, Any]]:
+    """Resolve objective and destination, or refuse before any request."""
+    resolved_objective = _upper(objective, "objective") or BOOST_DEFAULT_OBJECTIVE
     if resolved_objective not in BOOST_OBJECTIVES:
         raise ValidationError(
-            f"objective must be one of {', '.join(BOOST_OBJECTIVES)} in one-step mode; other objectives need their own "
-            "destination and goal, so create the campaign and ad set first and pass adset_id."
+            f"objective must be one of {', '.join(BOOST_OBJECTIVES)} in one-step mode; for anything else create the "
+            "campaign and ad set first and pass adset_id."
         )
     destinations = BOOST_OBJECTIVES[resolved_objective]
-    requested = blank_to_none(destination_type)
+    requested = _upper(destination_type, "destination_type")
     if requested is None:
         destination = next(iter(destinations))
     else:
-        destination = requested.upper()
+        destination = requested
         if None in destinations:
             raise ValidationError(f"{resolved_objective} takes no destination_type in one-step mode; leave it out.")
         if destination not in destinations:
@@ -1031,27 +1295,356 @@ def _boost_goal(
                 f"destination_type for {resolved_objective} must be one of {', '.join(str(key) for key in destinations)} "
                 "in one-step mode."
             )
-    mapping = destinations[destination]
-    if mapping.get("needs_pixel"):
+    return resolved_objective, destination, destinations[destination]
+
+
+def _cta_type(call_to_action: dict[str, Any] | None) -> str | None:
+    return str(call_to_action.get("type")).strip().upper() if isinstance(call_to_action, dict) else None
+
+
+def _cta_value(call_to_action: dict[str, Any] | None) -> dict[str, Any]:
+    value = call_to_action.get("value") if isinstance(call_to_action, dict) else None
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValidationError("call_to_action.value must be an object.")
+    return value
+
+
+def _boost_call_to_action(
+    kind: str | None,
+    objective: str,
+    destination: str | None,
+    call_to_action: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """The call to action sent with the post, and whether this tool built it."""
+    cta_type = _cta_type(call_to_action)
+    value = _cta_value(call_to_action)
+    tied = _DESTINATION_CALL_TO_ACTIONS.get(cta_type or "")
+    if tied is not None and tied != destination:
+        raise ValidationError(f"call_to_action type {cta_type} needs destination_type {tied}.")
+    if kind == "message":
+        expected = BOOST_MESSAGE_CALLS_TO_ACTION[destination]
+        if call_to_action is None:
+            return deepcopy(expected), True
+        if value and value != expected["value"]:
+            raise ValidationError(
+                f"For {destination} this tool sends the call to action Meta's guide shows for an Instagram post; "
+                "leave call_to_action.value out."
+            )
+        return deepcopy(expected), False
+    if kind == "website":
+        link = value.get("link")
+        if not isinstance(link, str) or not link.strip().startswith(("http://", "https://")):
+            raise ValidationError(
+                f"{objective} with destination {destination} sends people to a website, so call_to_action "
+                "needs a website link, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}."
+            )
+        return call_to_action, False
+    if kind == "lead_form":
+        form_id = value.get("lead_gen_form_id")
+        if cta_type not in BOOST_LEAD_FORM_CALL_TO_ACTIONS or not isinstance(form_id, (str, int)) or isinstance(form_id, bool) or not str(form_id).strip().isdigit():
+            raise ValidationError(
+                "destination_type ON_AD (instant form) needs call_to_action with a type from "
+                f"{', '.join(BOOST_LEAD_FORM_CALL_TO_ACTIONS)} and value.lead_gen_form_id, the numeric form id, "
+                "for example {\"type\": \"SIGN_UP\", \"value\": {\"lead_gen_form_id\": \"123\"}}."
+            )
+        if set(value) - {"lead_gen_form_id"}:
+            raise ValidationError("For an instant form, call_to_action.value takes only lead_gen_form_id.")
+        return {"type": cta_type, "value": {"lead_gen_form_id": str(form_id).strip()}}, False
+    if kind == "call":
+        link = value.get("link")
+        if cta_type != "CALL_NOW" or not isinstance(link, str) or not _TEL_LINK.match(link.strip()) or set(value) - {"link"}:
+            raise ValidationError(
+                "destination_type PHONE_CALL needs call_to_action {\"type\": \"CALL_NOW\", \"value\": {\"link\": "
+                "\"tel:\" followed by the phone number with its country code, for example tel:+15551234567}}."
+            )
+        return {"type": "CALL_NOW", "value": {"link": link.strip()}}, False
+    if kind == "app":
+        link = value.get("link")
+        if call_to_action is None or not isinstance(link, str) or not link.strip().startswith(("http://", "https://")):
+            raise ValidationError(
+                "OUTCOME_APP_PROMOTION needs call_to_action with the app's store link, for example "
+                "{\"type\": \"INSTALL_MOBILE_APP\", \"value\": {\"link\": \"https://play.google.com/store/apps/details?id=...\"}}."
+            )
+        return call_to_action, False
+    return call_to_action, False
+
+
+def _boost_promoted_object(
+    kind: str | None,
+    objective: str,
+    destination: str | None,
+    goal: str,
+    promoted_object: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Check promoted_object for the route; page-based routes get page_id added once the Page is known."""
+    if kind == "pixel":
         if not isinstance(promoted_object, dict) or not promoted_object.get("pixel_id") or not blank_to_none(str(promoted_object.get("custom_event_type") or "")):
             raise ValidationError(
-                f"{resolved_objective} needs promoted_object with pixel_id and custom_event_type, for example "
+                f"{objective} needs promoted_object with pixel_id and custom_event_type, for example "
                 "{\"pixel_id\": \"123\", \"custom_event_type\": \"PURCHASE\"}."
             )
         if not str(promoted_object["pixel_id"]).strip().isdigit():
             raise ValidationError("promoted_object.pixel_id must be a numeric pixel id.")
         _refuse_url_logins(promoted_object, "promoted_object")
-    elif promoted_object is not None:
-        raise ValidationError("promoted_object applies to OUTCOME_SALES and OUTCOME_LEADS in one-step mode.")
-    if mapping.get("needs_link"):
-        value = call_to_action.get("value") if isinstance(call_to_action, dict) else None
-        link = value.get("link") if isinstance(value, dict) else None
-        if not isinstance(link, str) or not link.strip().startswith(("http://", "https://")):
+        return promoted_object
+    if kind == "app":
+        application_id = promoted_object.get("application_id") if isinstance(promoted_object, dict) else None
+        store_url = promoted_object.get("object_store_url") if isinstance(promoted_object, dict) else None
+        if application_id is None or not str(application_id).strip().isdigit() or isinstance(application_id, bool):
             raise ValidationError(
-                f"{resolved_objective} with destination {destination} sends people to a website, so call_to_action "
-                "needs a website link, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}."
+                "OUTCOME_APP_PROMOTION needs promoted_object with application_id (numeric) and object_store_url, for "
+                "example {\"application_id\": \"123\", \"object_store_url\": \"https://play.google.com/store/apps/details?id=...\"}."
             )
-    return resolved_objective, destination, mapping
+        if not isinstance(store_url, str) or not store_url.strip().startswith(("http://", "https://")):
+            raise ValidationError("promoted_object.object_store_url must be the app's http(s) store address.")
+        if goal == "OFFSITE_CONVERSIONS" and not blank_to_none(str(promoted_object.get("custom_event_type") or "")):
+            raise ValidationError(
+                "optimization_goal OFFSITE_CONVERSIONS for an app needs promoted_object.custom_event_type, the app event "
+                "to optimize for (Meta's ad set reference)."
+            )
+        _refuse_url_logins(promoted_object, "promoted_object")
+        return promoted_object
+    if kind == "page":
+        if promoted_object is None:
+            return {}
+        if destination == "WHATSAPP" and isinstance(promoted_object, dict) and set(promoted_object) <= {"whatsapp_phone_number"}:
+            number = promoted_object.get("whatsapp_phone_number")
+            if number is not None and not (isinstance(number, str) and re.fullmatch(r"\+?[0-9]{6,15}", number.strip())):
+                raise ValidationError("promoted_object.whatsapp_phone_number must be a phone number with its country code.")
+            return {key: value.strip() for key, value in promoted_object.items() if isinstance(value, str)}
+        allowed = " (only whatsapp_phone_number may be added)" if destination == "WHATSAPP" else ""
+        raise ValidationError(
+            f"promoted_object for {destination or objective} is the Page, set from page_id{allowed}; leave it out."
+        )
+    if promoted_object is not None:
+        raise ValidationError(
+            f"promoted_object does not apply to {objective}"
+            + (f" with destination {destination}" if destination else "")
+            + " in one-step mode."
+        )
+    return None
+
+
+def _boost_time(value: Any, field_name: str) -> tuple[Any, datetime]:
+    """A one-step time (ISO 8601 with a UTC offset, or Unix seconds): what is sent, and when it is."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValidationError(f"{field_name} must be an ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00) or Unix seconds.")
+    if isinstance(value, int) or value.strip().isdigit():
+        seconds = int(value if isinstance(value, int) else value.strip())
+        if seconds <= 0:
+            raise ValidationError(f"{field_name} must be a positive Unix time.")
+        return seconds, datetime.fromtimestamp(seconds, UTC)
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError(
+            f"{field_name} must be an ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00) or Unix seconds."
+        ) from None
+    if parsed.tzinfo is None:
+        raise ValidationError(
+            f"{field_name} needs a UTC offset or Z (for example 2026-12-01T00:00:00-05:00) so the ad set does not "
+            "run at the wrong hour."
+        )
+    return text, parsed
+
+
+@dataclass(slots=True)
+class _BoostSettings:
+    """Everything a one-step boost sends, checked before any request."""
+
+    objective: str
+    destination: str | None
+    route: dict[str, Any]
+    goal: str
+    billing_event: str
+    bid_strategy: str
+    bid_amount: float | None
+    budget_parameter: str
+    budget: float
+    promoted_object: dict[str, Any] | None
+    call_to_action: dict[str, Any] | None
+    call_to_action_built: bool
+    special_ad_categories: list[str]
+    buying_type: str | None
+    start_sent: Any
+    end_sent: Any
+    end_computed: bool
+    days: int | None
+    targeting: dict[str, Any]
+    given: set[str]
+
+
+def _boost_settings(
+    *,
+    objective: str | None,
+    destination_type: str | None,
+    optimization_goal: str | None,
+    billing_event: str | None,
+    bid_strategy: str | None,
+    bid_amount: float | None,
+    budgets: dict[str, float | None],
+    promoted_object: dict[str, Any] | None,
+    call_to_action: dict[str, Any] | None,
+    special_ad_categories: Any,
+    buying_type: str | None,
+    start_time: Any,
+    end_time: Any,
+    duration_days: int | None,
+    targeting: dict[str, Any] | None,
+) -> _BoostSettings:
+    """Check every one-step input against Meta's documented combinations; nothing is sent."""
+    given_budgets = {name: value for name, value in budgets.items() if value is not None}
+    if not given_budgets:
+        raise ValidationError(
+            "daily_budget (account currency, major units) is required when adset_id is omitted, or instead one of "
+            "lifetime_budget, campaign_daily_budget or campaign_lifetime_budget; this tool does not pick a budget for you."
+        )
+    if len(given_budgets) > 1:
+        raise ValidationError(
+            f"Give one budget, not {', '.join(given_budgets)}: an ad set daily or lifetime budget, or a campaign daily "
+            "or lifetime budget."
+        )
+    budget_parameter, budget = next(iter(given_budgets.items()))
+    validate_positive_amount(budget, field_name=budget_parameter)
+    if not isinstance(targeting, dict) or not targeting:
+        raise ValidationError("targeting is required when adset_id is omitted, for example {\"geo_locations\": {\"countries\": [\"US\"]}}.")
+    resolved_objective, destination, route = _boost_route(objective, destination_type)
+    goal = _upper(optimization_goal, "optimization_goal") or route["goals"][0]
+    if goal not in route["goals"]:
+        place = f"{resolved_objective} with destination {destination}" if destination else resolved_objective
+        raise ValidationError(f"optimization_goal for {place} must be one of {', '.join(route['goals'])} in one-step mode.")
+    billing = _upper(billing_event, "billing_event") or BOOST_BILLING_EVENT
+    allowed_billing = _boost_billing_events(goal, destination)
+    if billing not in allowed_billing:
+        raise ValidationError(f"billing_event for optimization_goal {goal} must be {' or '.join(allowed_billing)}.")
+    strategy = _upper(bid_strategy, "bid_strategy") or BOOST_BID_STRATEGY
+    if strategy not in BOOST_BID_STRATEGIES:
+        raise ValidationError(
+            f"bid_strategy must be one of {', '.join(BOOST_BID_STRATEGIES)} in one-step mode; a minimum return on ad "
+            "spend needs bid constraints, so use create_ad_set for it."
+        )
+    if strategy in _CAPPED_BID_STRATEGIES and bid_amount is None:
+        raise ValidationError(f"bid_strategy {strategy} needs bid_amount (account currency, major units).")
+    if strategy not in _CAPPED_BID_STRATEGIES and bid_amount is not None:
+        raise ValidationError("bid_amount needs bid_strategy LOWEST_COST_WITH_BID_CAP or COST_CAP.")
+    if bid_amount is not None:
+        validate_positive_amount(bid_amount, field_name="bid_amount")
+    if promoted_object is not None and not isinstance(promoted_object, dict):
+        raise ValidationError("promoted_object must be an object, for example {\"pixel_id\": \"123\", \"custom_event_type\": \"PURCHASE\"}.")
+    promoted = _boost_promoted_object(route["promoted"], resolved_objective, destination, goal, promoted_object)
+    cta, built = _boost_call_to_action(route["cta"], resolved_objective, destination, call_to_action)
+    categories: list[str] = []
+    if special_ad_categories is not None:
+        values = coerce_csv_string_list(special_ad_categories)
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ValidationError(f"special_ad_categories must list values from {', '.join(BOOST_SPECIAL_AD_CATEGORIES)}.")
+        categories = list(dict.fromkeys(value.strip().upper() for value in values if value.strip()))
+        unknown = [value for value in categories if value not in BOOST_SPECIAL_AD_CATEGORIES]
+        if unknown:
+            raise ValidationError(
+                f"special_ad_categories has {len(unknown)} unknown value(s); use {', '.join(BOOST_SPECIAL_AD_CATEGORIES)}."
+            )
+        if "NONE" in categories and len(categories) > 1:
+            raise ValidationError("special_ad_categories NONE cannot be combined with another category.")
+    resolved_buying_type = _upper(buying_type, "buying_type")
+    if resolved_buying_type == "RESERVED":
+        raise ValidationError(
+            "buying_type RESERVED (reach and frequency) needs a reserved prediction whose budget and schedule the ad set "
+            "must match, which one-step mode cannot plan; create the campaign and ad set first and pass adset_id."
+        )
+    if resolved_buying_type not in (None, "AUCTION"):
+        raise ValidationError("buying_type must be AUCTION in one-step mode.")
+    now = _utc_now()
+    start_sent, start_at = (None, now) if start_time is None else _boost_time(start_time, "start_time")
+    if start_time is not None and start_at < now - timedelta(minutes=1):
+        raise ValidationError("start_time is in the past; omit it to start when Meta creates the ad set.")
+    if end_time is not None and duration_days is not None:
+        raise ValidationError("Give end_time or duration_days, not both.")
+    days: int | None = None
+    if end_time is not None:
+        end_sent, end_at = _boost_time(end_time, "end_time")
+    else:
+        days = BOOST_DEFAULT_DURATION_DAYS if duration_days is None else duration_days
+        if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= BOOST_MAX_DURATION_DAYS:
+            raise ValidationError(f"duration_days must be a whole number from 1 to {BOOST_MAX_DURATION_DAYS}.")
+        end_at = (start_at + timedelta(days=days)).replace(microsecond=0)
+        end_sent = end_at.isoformat()
+    if end_at - start_at < BOOST_MIN_RUN:
+        raise ValidationError("end_time must be at least 24 hours after the start (start_time, or now when it is omitted).")
+    if end_at - start_at > timedelta(days=BOOST_MAX_DURATION_DAYS):
+        raise ValidationError(f"The ad set can run for at most {BOOST_MAX_DURATION_DAYS} days.")
+    given = {
+        name for name, value in (
+            ("objective", objective), ("destination_type", blank_to_none(destination_type) if isinstance(destination_type, str) else destination_type),
+            ("optimization_goal", optimization_goal), ("billing_event", billing_event), ("bid_strategy", bid_strategy),
+            ("special_ad_categories", special_ad_categories), ("buying_type", buying_type), ("start_time", start_time),
+            ("duration_days", duration_days),
+        ) if value is not None
+    }
+    return _BoostSettings(
+        objective=resolved_objective, destination=destination, route=route, goal=goal, billing_event=billing,
+        bid_strategy=strategy, bid_amount=bid_amount, budget_parameter=budget_parameter, budget=budget,
+        promoted_object=promoted, call_to_action=cta, call_to_action_built=built, special_ad_categories=categories,
+        buying_type=resolved_buying_type, start_sent=start_sent, end_sent=end_sent, end_computed=end_time is None,
+        days=days, targeting=targeting, given=given,
+    )
+
+
+async def _page_for_instagram_account(client: Any, instagram_account_id: str) -> tuple[str, dict[str, Any]]:
+    """Find the one Page whose instagram_business_account is this Instagram account.
+
+    Reads the token user's Pages (me/accounts, the Page field instagram_business_account),
+    page by page with a request cap. Only a complete read with exactly one match is used.
+    """
+    matches: list[str] = []
+    cursors: set[str] = set()
+    params: dict[str, Any] = {"limit": BOOST_PAGE_LOOKUP_PAGE_SIZE}
+    pages_read = 0
+    requests = 0
+    complete = False
+    stop_reason = f"the read stopped at this server's {BOOST_PAGE_LOOKUP_MAX_REQUESTS}-request limit"
+    while requests < BOOST_PAGE_LOOKUP_MAX_REQUESTS:
+        payload = await client.list_objects("me", "accounts", fields=["id", "instagram_business_account"], params=dict(params))
+        requests += 1
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        for page in rows if isinstance(rows, list) else []:
+            if not isinstance(page, dict):
+                continue
+            pages_read += 1
+            linked = page.get("instagram_business_account")
+            linked_id = linked.get("id") if isinstance(linked, dict) else None
+            if linked_id is not None and str(linked_id) == instagram_account_id and page.get("id"):
+                matches.append(str(page["id"]))
+        paging = payload.get("paging") if isinstance(payload, dict) else None
+        if not isinstance(paging, dict) or not paging.get("next"):
+            complete = True
+            break
+        cursor = (paging.get("cursors") or {}).get("after") if isinstance(paging.get("cursors"), dict) else None
+        if not cursor:
+            stop_reason = "Meta said more Pages exist but gave no cursor to read them"
+            break
+        if cursor in cursors:
+            stop_reason = "Meta repeated a page cursor"
+            break
+        cursors.add(cursor)
+        params["after"] = cursor
+    matches = list(dict.fromkeys(matches))
+    lookup = {"source": "me/accounts instagram_business_account", "pages_read": pages_read, "requests": requests, "complete": complete}
+    if complete and len(matches) == 1:
+        return matches[0], lookup
+    if len(matches) > 1:
+        reason = f"{len(matches)} Pages list this Instagram account"
+    elif not complete:
+        reason = f"the list of your Pages could not be read completely ({stop_reason})"
+    else:
+        reason = f"none of the {pages_read} Pages this token manages lists this Instagram account as its instagram_business_account"
+    raise ValidationError(
+        f"page_id is required: it could not be found from instagram_account_id because {reason}. Nothing was created; "
+        "pass page_id, the Facebook Page linked to the Instagram account."
+    )
 
 
 def _boost_creative_spec(
@@ -1126,83 +1719,103 @@ async def _boost_one_step(
     client_factory: Any,
     *,
     account_id: str,
-    media_id: str,
+    media_id: str | None,
     instagram_account_id: str,
     page_id: str | None,
     ad_name: str,
-    creative_spec: dict[str, Any],
-    daily_budget: float | None,
-    duration_days: int | None,
-    targeting: dict[str, Any] | None,
-    objective: str | None,
-    destination_type: str | None,
-    promoted_object: dict[str, Any] | None,
-    call_to_action: dict[str, Any] | None,
-    partnership_defaults: dict[str, str],
+    creative_for: Any,
+    settings: _BoostSettings,
     plan_only: bool,
 ) -> dict[str, Any]:
     """Create campaign, ad set, creative and ad, all paused, or return the plan."""
-    if daily_budget is None:
-        raise ValidationError("daily_budget (account currency, major units) is required when adset_id is omitted; this tool does not pick a budget for you.")
-    validate_positive_amount(daily_budget, field_name="daily_budget")
-    if not isinstance(targeting, dict) or not targeting:
-        raise ValidationError("targeting is required when adset_id is omitted, for example {\"geo_locations\": {\"countries\": [\"US\"]}}.")
-    resolved_objective, destination, mapping = _boost_goal(objective, destination_type, promoted_object, call_to_action)
-    days = BOOST_DEFAULT_DURATION_DAYS if duration_days is None else duration_days
-    if not isinstance(days, int) or not 1 <= days <= BOOST_MAX_DURATION_DAYS:
-        raise ValidationError(f"duration_days must be a whole number from 1 to {BOOST_MAX_DURATION_DAYS}.")
-    if page_id is None:
-        raise ValidationError("page_id is required when adset_id is omitted: the creative needs the Facebook Page linked to the Instagram account.")
     client = client_factory()
     currency = await resolve_account_currency(client, account_id)
-    budget_minor = to_minor_units(daily_budget, currency, field_name="daily_budget")
-    end_time = (datetime.now(UTC) + timedelta(days=days)).replace(microsecond=0).isoformat()
+    budget_minor = to_minor_units(settings.budget, currency, field_name=settings.budget_parameter)
+    bid_minor = (
+        to_minor_units(settings.bid_amount, currency, field_name="bid_amount") if settings.bid_amount is not None else None
+    )
+    page_lookup: dict[str, Any] | None = None
+    if page_id is None:
+        try:
+            page_id, page_lookup = await _page_for_instagram_account(client, instagram_account_id)
+        except (MetaApiError, RateLimitError) as exc:
+            exc.message = (
+                f"Finding page_id from instagram_account_id failed, so nothing was created; pass page_id. Reason: {exc.message}"
+            )
+            raise
+    creative_spec, partnership_defaults = creative_for(page_id, settings.call_to_action)
+    campaign_level = settings.budget_parameter.startswith("campaign_")
+    budget_field = "daily_budget" if settings.budget_parameter.endswith("daily_budget") else "lifetime_budget"
     campaign_data: dict[str, Any] = {
         "name": f"{ad_name} campaign",
-        "objective": resolved_objective,
+        "objective": settings.objective,
         "status": "PAUSED",
-        "special_ad_categories": [],
-        "is_adset_budget_sharing_enabled": False,
+        "special_ad_categories": settings.special_ad_categories,
     }
-    adset_data: dict[str, Any] = {
-        "name": f"{ad_name} ad set",
-        "campaign_id": "<campaign id>",
-        "daily_budget": budget_minor,
-        "billing_event": BOOST_BILLING_EVENT,
-        "optimization_goal": mapping["optimization_goal"],
-        "bid_strategy": BOOST_BID_STRATEGY,
-        "targeting": targeting,
-        "end_time": end_time,
-        "status": "PAUSED",
-    }
-    if destination:
-        adset_data["destination_type"] = destination
-    if mapping.get("promoted_page"):
-        adset_data["promoted_object"] = {"page_id": page_id}
-    elif mapping.get("needs_pixel"):
-        adset_data["promoted_object"] = promoted_object
+    if settings.buying_type is not None:
+        campaign_data["buying_type"] = settings.buying_type
+    if campaign_level:
+        campaign_data[budget_field] = budget_minor
+        campaign_data["bid_strategy"] = settings.bid_strategy
+    else:
+        campaign_data["is_adset_budget_sharing_enabled"] = False
+    adset_data: dict[str, Any] = {"name": f"{ad_name} ad set", "campaign_id": "<campaign id>"}
+    if not campaign_level:
+        adset_data[budget_field] = budget_minor
+    adset_data.update({
+        "billing_event": settings.billing_event,
+        "optimization_goal": settings.goal,
+    })
+    if not campaign_level:
+        adset_data["bid_strategy"] = settings.bid_strategy
+    if bid_minor is not None:
+        adset_data["bid_amount"] = bid_minor
+    adset_data["targeting"] = settings.targeting
+    if settings.start_sent is not None:
+        adset_data["start_time"] = settings.start_sent
+    adset_data["end_time"] = settings.end_sent
+    adset_data["status"] = "PAUSED"
+    if settings.destination:
+        adset_data["destination_type"] = settings.destination
+    if settings.route["promoted"] == "page":
+        adset_data["promoted_object"] = {"page_id": page_id, **(settings.promoted_object or {})}
+    elif settings.promoted_object is not None:
+        adset_data["promoted_object"] = settings.promoted_object
     creative_data = {"name": f"{ad_name} creative", **creative_spec}
     ad_data = {"name": ad_name, "adset_id": "<ad set id>", "creative": {"creative_id": "<creative id>"}, "status": "PAUSED"}
-    defaults = {
-        "objective": resolved_objective if objective is None else None,
-        "duration_days": days if duration_days is None else None,
-        "optimization_goal": mapping["optimization_goal"],
-        "billing_event": BOOST_BILLING_EVENT,
-        "bid_strategy": BOOST_BID_STRATEGY,
-        "special_ad_categories": [],
-        "is_adset_budget_sharing_enabled": False,
-        "start_time": "when Meta creates the ad set (no start_time sent)",
-        "end_time": end_time,
+    given = settings.given
+    defaults: dict[str, Any] = {
+        "objective": settings.objective if "objective" not in given else None,
+        "destination_type": settings.destination if "destination_type" not in given and settings.destination else None,
+        "optimization_goal": settings.goal if "optimization_goal" not in given else None,
+        "billing_event": settings.billing_event if "billing_event" not in given else None,
+        "bid_strategy": (
+            (f"{settings.bid_strategy} (on the campaign)" if campaign_level else settings.bid_strategy)
+            if "bid_strategy" not in given else None
+        ),
+        "special_ad_categories": [] if "special_ad_categories" not in given else None,
+        "buying_type": "AUCTION (Meta's default; not sent)" if "buying_type" not in given else None,
+        "is_adset_budget_sharing_enabled": False if not campaign_level else None,
+        "start_time": "when Meta creates the ad set (no start_time sent)" if settings.start_sent is None else None,
+        "duration_days": settings.days if settings.end_computed and "duration_days" not in given else None,
+        "end_time": settings.end_sent if settings.end_computed else None,
+        "call_to_action": settings.call_to_action if settings.call_to_action_built else None,
+        "page_id": f"{page_id} (the Page whose instagram_business_account is instagram_account_id)" if page_lookup else None,
         "status": "PAUSED for all four objects",
         "names": f"derived from '{ad_name}'",
         **partnership_defaults,
     }
     defaults = {key: value for key, value in defaults.items() if value is not None}
-    if blank_to_none(destination_type) is None:
-        defaults["destination_type"] = destination
-    plan = {
+    budget_shown = {
+        "level": "campaign" if campaign_level else "ad set",
+        "type": "daily" if budget_field == "daily_budget" else "lifetime",
+        "parameter": settings.budget_parameter,
+        "major_units": settings.budget,
+        "sent_minor_units": budget_minor,
+    }
+    plan: dict[str, Any] = {
         "currency": currency,
-        "daily_budget": {"major_units": daily_budget, "sent_minor_units": budget_minor},
+        "budget": budget_shown,
         "requests": [
             {"step": "campaign", "method": "POST", "path": f"{account_id}/campaigns", "data": campaign_data},
             {"step": "ad set", "method": "POST", "path": f"{account_id}/adsets", "data": adset_data},
@@ -1211,6 +1824,12 @@ async def _boost_one_step(
         ],
         "defaults_applied": defaults,
     }
+    if settings.budget_parameter == "daily_budget":
+        plan["daily_budget"] = {"major_units": settings.budget, "sent_minor_units": budget_minor}
+    if bid_minor is not None:
+        plan["bid_amount"] = {"major_units": settings.bid_amount, "sent_minor_units": bid_minor}
+    if page_lookup is not None:
+        plan["page_lookup"] = page_lookup
     target = {"account_id": account_id, "instagram_media_id": media_id, "instagram_account_id": instagram_account_id, "page_id": page_id}
     if media_id is None:
         target["partnership_ad_code"] = "<given, not shown>"
@@ -1261,11 +1880,24 @@ async def _boost_one_step(
         "ad_id": ad_id,
         "status": "PAUSED",
         "defaults_applied": defaults,
-        "daily_budget": plan["daily_budget"],
+        "budget": budget_shown,
         "currency": currency,
         "note": "All four objects are paused. Activate the campaign, ad set and ad with set_*_status when ready.",
     })
+    if settings.budget_parameter == "daily_budget":
+        response["daily_budget"] = plan["daily_budget"]
+    if bid_minor is not None:
+        response["bid_amount"] = plan["bid_amount"]
+    if page_lookup is not None:
+        response["page_lookup"] = page_lookup
     return response
+
+
+_ONE_STEP_ONLY = (
+    "daily_budget", "lifetime_budget", "campaign_daily_budget", "campaign_lifetime_budget", "duration_days",
+    "targeting", "objective", "destination_type", "promoted_object", "optimization_goal", "billing_event",
+    "bid_strategy", "bid_amount", "start_time", "end_time", "special_ad_categories", "buying_type",
+)
 
 
 @mcp_server.tool()
@@ -1278,20 +1910,105 @@ async def boost_instagram_post(
     call_to_action: dict[str, Any] | None = None,
     validate_only: bool = False,
     page_id: str | None = None,
-    daily_budget: CurrencyAmount | None = None,
-    duration_days: int | None = None,
+    daily_budget: StrictCurrencyAmount | None = None,
+    duration_days: _WholeNumber | None = None,
     targeting: dict[str, Any] | None = None,
     objective: str | None = None,
     plan_only: bool = False,
     url_tags: str | None = None,
     sponsor_page_id: GraphId | None = None,
     sponsor_instagram_account_id: GraphId | None = None,
-    partnership_ad_format: int | None = None,
+    partnership_ad_format: _WholeNumber | None = None,
     destination_type: str | None = None,
     promoted_object: dict[str, Any] | None = None,
     partnership_ad_code: str | None = None,
+    optimization_goal: str | None = None,
+    billing_event: str | None = None,
+    bid_strategy: str | None = None,
+    bid_amount: StrictCurrencyAmount | None = None,
+    lifetime_budget: StrictCurrencyAmount | None = None,
+    campaign_daily_budget: StrictCurrencyAmount | None = None,
+    campaign_lifetime_budget: StrictCurrencyAmount | None = None,
+    start_time: _TimeInput | None = None,
+    end_time: _TimeInput | None = None,
+    special_ad_categories: StringList | None = None,
+    buying_type: str | None = None,
 ) -> dict[str, Any]:
-    """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, from daily_budget (major units, never defaulted), targeting, duration_days (default 6) and objective: OUTCOME_ENGAGEMENT (default; destination_type ON_POST or ON_VIDEO), OUTCOME_AWARENESS, OUTCOME_TRAFFIC (INSTAGRAM_PROFILE profile visits by default, or WEBSITE), OUTCOME_SALES or OUTCOME_LEADS (WEBSITE, with promoted_object pixel_id and custom_event_type). Website destinations need call_to_action with value.link. Every default is stated; plan_only returns the plan and creates nothing. If a later step fails the error names every object already created. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3; for a creator's post, partnership_ad_code (the code the creator issued) instead of instagram_media_id. Check list_instagram_media boost_eligible first."""
+    """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, with every default stated; plan_only returns the exact requests and creates nothing; if a later step fails the error names every object already created. One-step needs targeting and exactly one budget, never defaulted, in major units: daily_budget or lifetime_budget on the ad set, or campaign_daily_budget or campaign_lifetime_budget (bid_strategy then goes on the campaign). The run is duration_days (default 6) or end_time, from start_time or creation; times are ISO 8601 with a UTC offset or Unix seconds. objective and destination_type: OUTCOME_ENGAGEMENT (default; ON_POST, ON_VIDEO, INSTAGRAM_DIRECT, WHATSAPP, MESSENGER), OUTCOME_AWARENESS, OUTCOME_TRAFFIC (INSTAGRAM_PROFILE default, WEBSITE, the three messaging destinations, PHONE_CALL), OUTCOME_SALES (WEBSITE with promoted_object pixel_id and custom_event_type, or PHONE_CALL), OUTCOME_LEADS (WEBSITE with a pixel, ON_AD instant form, WHATSAPP, PHONE_CALL), OUTCOME_APP_PROMOTION (promoted_object application_id and object_store_url). Messaging destinations get their message button automatically; WEBSITE and app promotion need call_to_action value.link; ON_AD needs call_to_action value.lead_gen_form_id; PHONE_CALL needs CALL_NOW with a tel: link. optimization_goal, billing_event, bid_strategy (LOWEST_COST_WITHOUT_CAP default, LOWEST_COST_WITH_BID_CAP or COST_CAP with bid_amount), special_ad_categories and buying_type (AUCTION) are checked against Meta's documented combinations. Without page_id, the Page is found from the Instagram account when exactly one of your Pages lists it. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3; for a creator's post, partnership_ad_code instead of instagram_media_id. Check list_instagram_media boost_eligible first."""
+    try:
+        return await _boost_instagram_post(
+            account_id=account_id,
+            instagram_media_id=instagram_media_id,
+            instagram_account_id=instagram_account_id,
+            adset_id=adset_id,
+            name=name,
+            call_to_action=call_to_action,
+            validate_only=validate_only,
+            page_id=page_id,
+            duration_days=duration_days,
+            targeting=targeting,
+            objective=objective,
+            plan_only=plan_only,
+            url_tags=url_tags,
+            sponsor_page_id=sponsor_page_id,
+            sponsor_instagram_account_id=sponsor_instagram_account_id,
+            partnership_ad_format=partnership_ad_format,
+            destination_type=destination_type,
+            promoted_object=promoted_object,
+            partnership_ad_code=partnership_ad_code,
+            optimization_goal=optimization_goal,
+            billing_event=billing_event,
+            bid_strategy=bid_strategy,
+            bid_amount=bid_amount,
+            budgets={
+                "daily_budget": daily_budget,
+                "lifetime_budget": lifetime_budget,
+                "campaign_daily_budget": campaign_daily_budget,
+                "campaign_lifetime_budget": campaign_lifetime_budget,
+            },
+            start_time=start_time,
+            end_time=end_time,
+            special_ad_categories=special_ad_categories,
+            buying_type=buying_type,
+        )
+    except Exception as exc:
+        # Meta's error text may repeat the creator's code; it never reaches the caller or a log.
+        _scrub_error(exc, _secret_forms(partnership_ad_code), PARTNERSHIP_CODE_SHOWN)
+        raise
+
+
+async def _boost_instagram_post(
+    *,
+    account_id: str,
+    instagram_media_id: str | None,
+    instagram_account_id: str | None,
+    adset_id: str | None,
+    name: str | None,
+    call_to_action: dict[str, Any] | None,
+    validate_only: bool,
+    page_id: str | None,
+    duration_days: int | None,
+    targeting: dict[str, Any] | None,
+    objective: str | None,
+    plan_only: bool,
+    url_tags: str | None,
+    sponsor_page_id: str | None,
+    sponsor_instagram_account_id: str | None,
+    partnership_ad_format: int | None,
+    destination_type: str | None,
+    promoted_object: dict[str, Any] | None,
+    partnership_ad_code: str | None,
+    optimization_goal: str | None,
+    billing_event: str | None,
+    bid_strategy: str | None,
+    bid_amount: float | None,
+    budgets: dict[str, float | None],
+    start_time: Any,
+    end_time: Any,
+    special_ad_categories: Any,
+    buying_type: str | None,
+) -> dict[str, Any]:
+    """The boost itself; boost_instagram_post wraps it so no error shows the Partnership Ad code."""
     ids = {
         "account_id": blank_to_none(account_id),
         "instagram_account_id": blank_to_none(instagram_account_id),
@@ -1313,13 +2030,14 @@ async def boost_instagram_post(
     if one_step and validate_only:
         raise ValidationError("validate_only needs an existing adset_id; in one-step mode use plan_only to see what would be created.")
     if not one_step:
-        extra = [
-            label for label, value in (
-                ("daily_budget", daily_budget), ("duration_days", duration_days), ("targeting", targeting),
-                ("objective", objective), ("destination_type", blank_to_none(destination_type)),
-                ("promoted_object", promoted_object),
-            ) if value is not None
-        ]
+        values = {
+            "duration_days": duration_days, "targeting": targeting, "objective": objective,
+            "destination_type": blank_to_none(destination_type) if isinstance(destination_type, str) else destination_type,
+            "promoted_object": promoted_object, "optimization_goal": optimization_goal, "billing_event": billing_event,
+            "bid_strategy": bid_strategy, "bid_amount": bid_amount, "start_time": start_time, "end_time": end_time,
+            "special_ad_categories": special_ad_categories, "buying_type": buying_type, **budgets,
+        }
+        extra = [label for label in _ONE_STEP_ONLY if values.get(label) is not None]
         if plan_only:
             extra.append("plan_only")
         if extra:
@@ -1342,13 +2060,13 @@ async def boost_instagram_post(
     ad_name = blank_to_none(name) or (f"Instagram post {media_id}" if media_id else "Partnership ad")
     resolved_page_id = blank_to_none(page_id)
 
-    def creative_for(page: str | None) -> tuple[dict[str, Any], dict[str, str]]:
+    def creative_for(page: str | None, cta: dict[str, Any] | None = call_to_action) -> tuple[dict[str, Any], dict[str, str]]:
         return _boost_creative_spec(
             page_id=page,
             instagram_account_id=ids["instagram_account_id"],
             media_id=media_id,
             ad_code=ad_code,
-            call_to_action=call_to_action,
+            call_to_action=cta,
             url_tags=url_tags,
             sponsor_page_id=sponsor_page_id,
             sponsor_instagram_account_id=sponsor_instagram_account_id,
@@ -1356,7 +2074,23 @@ async def boost_instagram_post(
         )
 
     if one_step:
-        creative_spec, partnership_defaults = creative_for(resolved_page_id)
+        settings = _boost_settings(
+            objective=objective,
+            destination_type=destination_type,
+            optimization_goal=optimization_goal,
+            billing_event=billing_event,
+            bid_strategy=bid_strategy,
+            bid_amount=bid_amount,
+            budgets=budgets,
+            promoted_object=promoted_object,
+            call_to_action=call_to_action,
+            special_ad_categories=special_ad_categories,
+            buying_type=buying_type,
+            start_time=start_time,
+            end_time=end_time,
+            duration_days=duration_days,
+            targeting=targeting,
+        )
         return await _boost_one_step(
             get_graph_api_client,
             account_id=resolved_account_id,
@@ -1364,15 +2098,8 @@ async def boost_instagram_post(
             instagram_account_id=ids["instagram_account_id"],
             page_id=resolved_page_id,
             ad_name=ad_name,
-            creative_spec=creative_spec,
-            daily_budget=daily_budget,
-            duration_days=duration_days,
-            targeting=targeting,
-            objective=objective,
-            destination_type=destination_type,
-            promoted_object=promoted_object,
-            call_to_action=call_to_action,
-            partnership_defaults=partnership_defaults,
+            creative_for=creative_for,
+            settings=settings,
             plan_only=plan_only,
         )
     client = get_graph_api_client()
