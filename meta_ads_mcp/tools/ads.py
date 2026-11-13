@@ -18,7 +18,10 @@ from meta_ads_mcp.money import (
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
 from meta_ads_mcp.tools.campaigns import (
+    WholeNumber,
     build_copy_request,
+    check_true_or_false,
+    check_whole_number,
     read_adlabels,
     reject_money_in_params,
     reject_named_and_params,
@@ -181,15 +184,23 @@ async def create_ad(
     creative_spec: dict[str, Any] | None = None,
     ad_schedule_start_time: str | None = None,
     ad_schedule_end_time: str | None = None,
+    display_sequence: WholeNumber | None = None,
+    engagement_audience: bool | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or Unix seconds); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. A named parameter and the same key inside params cannot both be given. bid_amount is refused inside params, where Meta would read it in minor units; use the named bid_amount."""
+    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or Unix seconds); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. display_sequence is the ad's position in its campaign's sequence (a whole number from 0); engagement_audience true makes an audience of people who engage with this ad. A named parameter and the same key inside params cannot both be given. bid_amount is refused inside params, where Meta would read it in minor units; use the named bid_amount."""
     schedule_times = {"ad_schedule_start_time": ad_schedule_start_time, "ad_schedule_end_time": ad_schedule_end_time}
+    named_later = {"display_sequence": display_sequence, "engagement_audience": engagement_audience}
     reject_named_and_params(
-        {"conversion_domain": conversion_domain, "adlabels": adlabels, **schedule_times}, params
+        {"conversion_domain": conversion_domain, "adlabels": adlabels, **schedule_times, **named_later}, params
     )
     reject_money_in_params(params, ("bid_amount",))
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
+    if display_sequence is not None:
+        check_whole_number(display_sequence, "display_sequence", minimum=0)
+    if engagement_audience is not None:
+        check_true_or_false(engagement_audience, "engagement_audience")
+    later_fields = {**schedule_times, **named_later}
     schedule_start = validate_schedule_time(ad_schedule_start_time, "ad_schedule_start_time")
     schedule_end = validate_schedule_time(ad_schedule_end_time, "ad_schedule_end_time")
     if schedule_start is not None and schedule_end is not None and schedule_end <= schedule_start:
@@ -212,7 +223,7 @@ async def create_ad(
             raise ValidationError("creative_spec is for a new creative; to use an existing one, use creative_id.")
         return await _create_ad(
             account_id, name, adset_id, creative_spec, status, bid_amount, tracking_specs,
-            conversion_domain, adlabels, validate_only, params, schedule_times,
+            conversion_domain, adlabels, validate_only, params, later_fields,
         )
     nested_creative_id: str | None = None
     if creative is not None:
@@ -244,7 +255,7 @@ async def create_ad(
     )
     return await _create_ad(
         account_id, name, adset_id, {"creative_id": resolved_creative_id}, status, bid_amount,
-        tracking_specs, conversion_domain, adlabels, validate_only, params, schedule_times,
+        tracking_specs, conversion_domain, adlabels, validate_only, params, later_fields,
     )
 
 
@@ -260,9 +271,9 @@ async def _create_ad(
     adlabels: list[dict[str, Any]] | None,
     validate_only: bool,
     params: dict[str, Any] | None,
-    schedule_times: dict[str, str | None],
+    later_fields: dict[str, Any],
 ) -> dict[str, Any]:
-    """Send one validated ad creation."""
+    """Send one validated ad creation; later_fields are named fields sent only when given."""
     payload: dict[str, Any] = {
         "name": name,
         "adset_id": adset_id,
@@ -273,7 +284,7 @@ async def _create_ad(
     }
     # New named fields join the payload only when given, so a call that puts
     # them in params (as callers did before they existed) is sent unchanged.
-    for key, value in (("conversion_domain", conversion_domain), ("adlabels", adlabels), *schedule_times.items()):
+    for key, value in (("conversion_domain", conversion_domain), ("adlabels", adlabels), *later_fields.items()):
         if value is not None:
             payload[key] = value
     add_validate_only(payload, validate_only=validate_only)

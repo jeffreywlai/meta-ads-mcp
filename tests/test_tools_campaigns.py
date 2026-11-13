@@ -2092,3 +2092,344 @@ def test_create_ad_set_docstring_explains_zoneless_times_and_money_in_params() -
     assert "stored_schedule" in doc
     assert "refused inside params" in doc
     assert "+" not in doc
+
+
+# Round four: the last named fields from Meta's create_campaign and create_ad_set.
+
+ROUND_FOUR_CAMPAIGN_PARAMS = {
+    "is_skadnetwork_attribution": True,
+    "campaign_optimization_type": "ICO_ONLY",
+    "is_using_l3_schedule": False,
+    "iterative_split_test_configs": [{"name": "Test 1"}],
+    "topline_id": "777",
+}
+ROUND_FOUR_ADSET_PARAMS = {
+    "existing_customer_budget_percentage": 20,
+    "multi_optimization_goal_weight": "BALANCED",
+    "is_incremental_attribution_enabled": True,
+    "campaign_attribution": "SKAN",
+    "tune_for_category": "HOUSING",
+    "value_rule_set_id": "5550",
+    "placement_soft_opt_out": {"facebook_positions": ["right_hand_column"]},
+    "creative_sequence": ["11", "12"],
+    "time_based_ad_rotation_id_blocks": [["11"], ["12", "13"]],
+    "time_based_ad_rotation_intervals": [1796101200, 1796706000],
+    "rf_prediction_id": "8080",
+    "daily_imps": 1000,
+    "lifetime_imps": 20000,
+    "min_budget_spend_percentage": 10,
+    "max_budget_spend_percentage": 60,
+    "brand_safety_config": {"comment_moderation_filter": "STRICT"},
+    # Fields Meta's own tool lists that are left to params: still sent unchanged.
+    "cost_bidding_mode": "BALANCED",
+    "marketing_goal": "SALES",
+}
+_R4_PARAMS_ONLY = {"cost_bidding_mode", "marketing_goal"}
+
+
+def test_create_campaign_params_only_round_four_fields_call_is_unchanged(monkeypatch) -> None:
+    """The five campaign fields inside params are sent exactly as before they had named parameters."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_campaign(
+        **CAMPAIGN_BASE, daily_budget=50.0, params=dict(ROUND_FOUR_CAMPAIGN_PARAMS),
+    ))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "campaigns", {
+            "name": "C", "objective": "OUTCOME_SALES", "status": "PAUSED",
+            "special_ad_categories": [], "daily_budget": 5000, **ROUND_FOUR_CAMPAIGN_PARAMS,
+        }),
+    ]
+    assert list(client.calls[1][3]) == [
+        "name", "objective", "status", "special_ad_categories", "daily_budget", *ROUND_FOUR_CAMPAIGN_PARAMS,
+    ]
+    assert result == {
+        "ok": True, "action": "create_campaign", "target": {"account_id": "act_123"},
+        "validation_only": False, "created": {"id": "cmp_123"},
+    }
+
+
+def test_create_ad_set_params_only_round_four_fields_call_is_unchanged(monkeypatch) -> None:
+    """The round-four ad set fields inside params are sent exactly as before; value_rule_set_id in
+    params gets no value_rules_applied added."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(**ADSET_BASE, daily_budget=20.0, params=dict(ROUND_FOUR_ADSET_PARAMS)))
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {
+            "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
+            "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED", "daily_budget": 2000,
+            **ROUND_FOUR_ADSET_PARAMS,
+        }),
+    ]
+    assert list(client.calls[1][3]) == [
+        "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status", "daily_budget",
+        *ROUND_FOUR_ADSET_PARAMS,
+    ]
+    assert result["created"] == {"id": "cmp_123"}
+
+
+@pytest.mark.parametrize("key", list(ROUND_FOUR_CAMPAIGN_PARAMS))
+def test_create_campaign_round_four_named_parameter_and_same_params_key_together_raise(monkeypatch, key) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    value = ROUND_FOUR_CAMPAIGN_PARAMS[key]
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(campaigns.create_campaign(**CAMPAIGN_BASE, **{key: value}, params={key: value}))
+
+
+@pytest.mark.parametrize("key", [key for key in ROUND_FOUR_ADSET_PARAMS if key not in _R4_PARAMS_ONLY])
+def test_create_ad_set_round_four_named_parameter_and_same_params_key_together_raise(monkeypatch, key) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    value = ROUND_FOUR_ADSET_PARAMS[key]
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **{key: value}, params={key: value}))
+
+
+def test_create_campaign_round_four_named_parameters_are_sent(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    configs = [{"name": "Test 1", "splits": [{"adset_id": "1"}]}]
+    asyncio.run(campaigns.create_campaign(
+        **CAMPAIGN_BASE,
+        is_skadnetwork_attribution=True,
+        campaign_optimization_type=" ico_only ",
+        is_using_l3_schedule=False,
+        iterative_split_test_configs=configs,
+        topline_id="777",
+    ))
+    assert client.calls == [
+        ("create", "act_123", "campaigns", {
+            "name": "C", "objective": "OUTCOME_SALES", "status": "PAUSED", "special_ad_categories": [],
+            "is_skadnetwork_attribution": True,
+            "campaign_optimization_type": "ICO_ONLY",
+            "is_using_l3_schedule": False,
+            "iterative_split_test_configs": configs,
+            "topline_id": "777",
+        }),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"is_skadnetwork_attribution": "yes"}, "is_skadnetwork_attribution must be true or false"),
+        ({"is_using_l3_schedule": 1}, "is_using_l3_schedule must be true or false"),
+        ({"campaign_optimization_type": "ALL"}, "campaign_optimization_type must be one of"),
+        ({"campaign_optimization_type": "ALL"}, "inside params"),
+        ({"iterative_split_test_configs": []}, "iterative_split_test_configs must not be empty"),
+        ({"iterative_split_test_configs": [{}]}, "iterative_split_test_configs must be a list of non-empty objects"),
+        ({"topline_id": "abc"}, "topline_id must be a Meta id"),
+        ({"topline_id": " "}, "topline_id must be a Meta id"),
+    ],
+)
+def test_create_campaign_round_four_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_campaign(**CAMPAIGN_BASE, **arguments))
+
+
+def test_create_ad_set_round_four_named_parameters_are_sent(monkeypatch) -> None:
+    """None of these is money, so no currency read is made; times in the rotation become Unix seconds."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE,
+        existing_customer_budget_percentage=20,
+        multi_optimization_goal_weight="prefer_event",
+        is_incremental_attribution_enabled=True,
+        campaign_attribution=" SKAN ",
+        tune_for_category="housing",
+        value_rule_set_id="5550",
+        placement_soft_opt_out={"facebook_positions": ["right_hand_column"]},
+        creative_sequence=["11", "12"],
+        time_based_ad_rotation_id_blocks=[["11"], ["12", "13"]],
+        time_based_ad_rotation_intervals=["2026-12-01T00:00:00-05:00", 1796706000],
+        rf_prediction_id="8080",
+        daily_imps=1000,
+        lifetime_imps=20000,
+        min_budget_spend_percentage=0,
+        max_budget_spend_percentage=100,
+        brand_safety_config={"comment_moderation_filter": "STRICT"},
+    ))
+    assert client.calls == [
+        ("create", "act_123", "adsets", {
+            "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
+            "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED",
+            "existing_customer_budget_percentage": 20,
+            "multi_optimization_goal_weight": "PREFER_EVENT",
+            "is_incremental_attribution_enabled": True,
+            "campaign_attribution": "SKAN",
+            "tune_for_category": "HOUSING",
+            "value_rule_set_id": "5550",
+            "value_rules_applied": True,
+            "placement_soft_opt_out": {"facebook_positions": ["right_hand_column"]},
+            "creative_sequence": ["11", "12"],
+            "time_based_ad_rotation_id_blocks": [["11"], ["12", "13"]],
+            "time_based_ad_rotation_intervals": [1796101200, 1796706000],
+            "rf_prediction_id": "8080",
+            "daily_imps": 1000,
+            "lifetime_imps": 20000,
+            "min_budget_spend_percentage": 0,
+            "max_budget_spend_percentage": 100,
+            "brand_safety_config": {"comment_moderation_filter": "STRICT"},
+        }),
+    ]
+
+
+def test_create_ad_set_value_rule_set_keeps_a_value_rules_applied_given_in_params(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(**ADSET_BASE, value_rule_set_id="5550", params={"value_rules_applied": False}))
+    sent = client.calls[-1][3]
+    assert sent["value_rule_set_id"] == "5550"
+    assert sent["value_rules_applied"] is False
+
+
+def test_create_ad_set_rotation_pair_may_be_split_between_named_and_params(monkeypatch) -> None:
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **ADSET_BASE, time_based_ad_rotation_id_blocks=[["11"], ["12"]],
+        params={"time_based_ad_rotation_intervals": [1796101200, 1796706000]},
+    ))
+    sent = client.calls[-1][3]
+    assert sent["time_based_ad_rotation_id_blocks"] == [["11"], ["12"]]
+    assert sent["time_based_ad_rotation_intervals"] == [1796101200, 1796706000]
+
+
+_ROTATION_TIMES = [1796101200, 1796706000]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"existing_customer_budget_percentage": 101},
+         "existing_customer_budget_percentage must be a whole number from 0 to 100"),
+        ({"existing_customer_budget_percentage": True}, "existing_customer_budget_percentage must be a whole number"),
+        ({"existing_customer_budget_percentage": 12.5}, "existing_customer_budget_percentage must be a whole number"),
+        ({"min_budget_spend_percentage": -1}, "min_budget_spend_percentage must be a whole number from 0 to 100"),
+        ({"max_budget_spend_percentage": "50"}, "max_budget_spend_percentage must be a whole number"),
+        ({"min_budget_spend_percentage": 70, "max_budget_spend_percentage": 60},
+         "min_budget_spend_percentage must not be more than max_budget_spend_percentage"),
+        ({"daily_imps": 0}, "daily_imps must be a whole number greater than 0"),
+        ({"lifetime_imps": False}, "lifetime_imps must be a whole number greater than 0"),
+        ({"multi_optimization_goal_weight": "HEAVY"}, "multi_optimization_goal_weight must be one of"),
+        ({"tune_for_category": "AUTOS"}, "tune_for_category must be one of"),
+        ({"tune_for_category": "AUTOS"}, "inside params"),
+        ({"is_incremental_attribution_enabled": "true"}, "is_incremental_attribution_enabled must be true or false"),
+        ({"campaign_attribution": " "}, "campaign_attribution must not be blank"),
+        ({"campaign_attribution": ["SKAN"]}, "campaign_attribution must not be blank"),
+        ({"value_rule_set_id": "rules"}, "value_rule_set_id must be a Meta id"),
+        ({"rf_prediction_id": "12a"}, "rf_prediction_id must be a Meta id"),
+        ({"placement_soft_opt_out": {}}, "placement_soft_opt_out must be a non-empty object"),
+        ({"brand_safety_config": []}, "brand_safety_config must be a non-empty object"),
+        ({"creative_sequence": []}, "creative_sequence must be a non-empty list of Meta ad ids"),
+        ({"creative_sequence": ["11", "ad_12"]}, "creative_sequence must be a non-empty list of Meta ad ids"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], []], "time_based_ad_rotation_intervals": _ROTATION_TIMES},
+         "time_based_ad_rotation_id_blocks must be a non-empty list of non-empty lists of Meta ad ids"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["x"]], "time_based_ad_rotation_intervals": _ROTATION_TIMES},
+         "time_based_ad_rotation_id_blocks must be"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]], "time_based_ad_rotation_intervals": [1796101200]},
+         "time_based_ad_rotation_intervals needs at least two"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "time_based_ad_rotation_intervals": [1796706000, 1796101200]},
+         "time_based_ad_rotation_intervals must be in increasing order"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]], "time_based_ad_rotation_intervals": [1796101200, True]},
+         r"time_based_ad_rotation_intervals\[1\] must be"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+          "time_based_ad_rotation_intervals": [1796101200, "2026-12-08T00:00:00"]}, "UTC offset"),
+        ({"time_based_ad_rotation_id_blocks": [["11"]], "time_based_ad_rotation_intervals": _ROTATION_TIMES},
+         "one block of ad ids for each date range"),
+        ({"time_based_ad_rotation_id_blocks": [["11"], ["12"]]},
+         "time_based_ad_rotation_id_blocks and time_based_ad_rotation_intervals go together"),
+        ({"time_based_ad_rotation_intervals": _ROTATION_TIMES},
+         "time_based_ad_rotation_id_blocks and time_based_ad_rotation_intervals go together"),
+    ],
+)
+def test_create_ad_set_round_four_errors_make_no_call(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, **arguments))
+
+
+@pytest.mark.parametrize(
+    ("sdk_values", "ours"),
+    [
+        ({"BALANCED", "PREFER_EVENT", "PREFER_INSTALL", "UNDEFINED"}, "ADSET_MULTI_OPTIMIZATION_GOAL_WEIGHTS"),
+        ({"CREDIT", "EMPLOYMENT", "FINANCIAL_PRODUCTS_SERVICES", "HOUSING", "ISSUES_ELECTIONS_POLITICS", "NONE",
+          "ONLINE_GAMBLING_AND_GAMING"}, "ADSET_TUNE_FOR_CATEGORIES"),
+    ],
+)
+def test_create_ad_set_round_four_enum_lists_match_meta_sdk_26(sdk_values, ours) -> None:
+    """The documented values, as listed by AdAccount.create_ad_set in the Meta SDK at tag 26.0.2."""
+    values = getattr(campaigns, ours)
+    assert set(values) == sdk_values and len(values) == len(sdk_values)
+
+
+def test_create_campaign_optimization_types_match_metas_reference() -> None:
+    """Meta's reference for POST /act_{id}/campaigns lists enum {NONE, ICO_ONLY}; the SDK at 26.0.2 does not list it."""
+    assert campaigns.CAMPAIGN_OPTIMIZATION_TYPES == ("NONE", "ICO_ONLY")
+
+
+_R4_CAMPAIGN_ARGS = {"account_id": "10", "name": "C", "objective": "OUTCOME_SALES"}
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "bad"),
+    [
+        ("create_campaign", _R4_CAMPAIGN_ARGS, {"topline_id": "12x"}),
+        ("create_campaign", _R4_CAMPAIGN_ARGS, {"topline_id": 777}),
+        ("create_ad_set", _G12_ADSET_ARGS, {"daily_imps": True}),
+        ("create_ad_set", _G12_ADSET_ARGS, {"min_budget_spend_percentage": False}),
+        ("create_ad_set", _G12_ADSET_ARGS, {"existing_customer_budget_percentage": "20"}),
+        ("create_ad_set", _G12_ADSET_ARGS, {"rf_prediction_id": "pred"}),
+        ("create_ad_set", _G12_ADSET_ARGS, {"creative_sequence": ["11", "ad"]}),
+        ("create_ad_set", _G12_ADSET_ARGS, {"time_based_ad_rotation_id_blocks": [["11"], ["x"]],
+                                            "time_based_ad_rotation_intervals": _ROTATION_TIMES}),
+        ("create_ad_set", _G12_ADSET_ARGS, {"time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+                                            "time_based_ad_rotation_intervals": [1796101200, True]}),
+    ],
+)
+def test_round_four_numbers_and_ids_are_checked_at_the_mcp_boundary(monkeypatch, tool, args, bad) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises((ToolError, MCPValidationError, campaigns.ValidationError)):
+        asyncio.run(mcp_server.call_tool(tool, {**args, **bad}))
+    assert client.calls == []
+
+
+def test_round_four_fields_are_accepted_at_the_mcp_boundary(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(mcp_server.call_tool("create_ad_set", {
+        **_G12_ADSET_ARGS, "daily_imps": 1000, "min_budget_spend_percentage": 10, "rf_prediction_id": "8080",
+        "time_based_ad_rotation_id_blocks": [["11"], ["12"]],
+        "time_based_ad_rotation_intervals": [1796101200, "2026-12-08T00:00:00-05:00"],
+    }))
+    asyncio.run(mcp_server.call_tool("create_campaign", {**_R4_CAMPAIGN_ARGS, "topline_id": "777",
+                                                         "is_skadnetwork_attribution": True}))
+    adset, campaign = (call[3] for call in client.calls if call[0] == "create")
+    assert adset["daily_imps"] == 1000
+    assert adset["min_budget_spend_percentage"] == 10
+    assert adset["rf_prediction_id"] == "8080"
+    assert adset["time_based_ad_rotation_intervals"] == _ROTATION_TIMES
+    assert campaign["topline_id"] == "777"
+    assert campaign["is_skadnetwork_attribution"] is True
+
+
+def test_round_four_docstrings_name_every_new_field_without_a_plus() -> None:
+    for tool, keys in (
+        (campaigns.create_campaign, list(ROUND_FOUR_CAMPAIGN_PARAMS)),
+        (campaigns.create_ad_set, [key for key in ROUND_FOUR_ADSET_PARAMS if key not in _R4_PARAMS_ONLY]),
+    ):
+        doc = tool.__doc__
+        assert "+" not in doc
+        for key in keys:
+            assert key in doc, key
