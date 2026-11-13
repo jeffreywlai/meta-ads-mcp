@@ -143,6 +143,7 @@ TOOL_GROUPS = {
         "delete_feed_rule",
         "connect_catalog_event_source",
         "disconnect_catalog_event_source",
+        "update_feed_rule",
         "update_adset",
         "update_ad",
         "add_audience_users",
@@ -538,6 +539,7 @@ INTENT_GUIDE = {
             "update_product_feed",
             "create_product_feed_upload",
             "create_feed_rule",
+            "update_feed_rule",
             "connect_catalog_event_source",
             "delete_feed_rule",
             "delete_product_feed",
@@ -950,6 +952,7 @@ async def list_mutation_tools() -> dict[str, object]:
             "product_catalog_feeds": [
                 "create_product_feed", "update_product_feed", "delete_product_feed",
                 "create_product_feed_upload", "create_feed_rule", "delete_feed_rule",
+                "update_feed_rule",
             ],
             "product_catalog_event_sources": ["connect_catalog_event_source", "disconnect_catalog_event_source"],
             "general_edits": ["update_adset", "update_ad"],

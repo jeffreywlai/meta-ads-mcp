@@ -203,6 +203,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "list_feed_rules": {"feed_id": "feed_123"},
     "create_feed_rule": {"feed_id": "feed_123", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}},
     "delete_feed_rule": {"rule_id": "rule_123"},
+    "update_feed_rule": {"rule_id": "123", "params": {"type": "to_lower"}},
     "list_catalog_event_sources": {"catalog_id": "cat_123"},
     "list_event_source_catalogs": {"event_source_id": "external_event_sources_123"},
     "get_catalog_event_source_health": {"catalog_id": "cat_123"},

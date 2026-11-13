@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.diagnostics import build_finding
@@ -18,6 +19,7 @@ from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
+from meta_ads_mcp.tool_types import GraphId
 
 UPLOAD_FIELDS = [
     "id",
@@ -139,6 +141,27 @@ CATALOG_SCAN_PAGE_SIZE = 25
 MAX_EDGE_PAGES = 10
 MAX_PIXEL_CANDIDATES_CHECKED = 10
 DEFAULT_MATCH_RATE_THRESHOLD = 0.8
+# list_event_source_catalogs(include_match_rates=true): at most this many connected
+# catalogs get one more read (their event_stats), each capped at this many pages.
+MAX_MATCH_RATE_CATALOGS = 10
+MATCH_RATE_STATS_PAGES = 5
+# ProductEventStat.event values Meta documents.
+CATALOG_EVENT_NAMES = (
+    "ViewContent", "AddToCart", "Purchase", "InitiateCheckout", "Search", "Lead", "AddToWishlist", "Subscribe",
+)
+# Feed file formats Meta documents for direct uploads (CSV, TSV, XML, and zip, gzip
+# or bz2 compressed files), by file extension, with the multipart content type sent.
+FEED_FILE_TYPES = {
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".xml": "application/xml",
+    ".zip": "application/zip",
+    ".gz": "application/gzip",
+    ".bz2": "application/x-bzip2",
+}
+# This server's own limit on a local feed file read into memory; Meta publishes none.
+MAX_FEED_FILE_BYTES = 100 * 1024 * 1024
+_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
 _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 _DERIVED_METHOD = (
@@ -149,6 +172,14 @@ _MATCH_RATE_NOTE = (
     "match_rate = total_matched_content_ids / (total_matched_content_ids + "
     "total_unmatched_content_ids) from the catalog's event_stats edge. This ratio and "
     "the threshold are computed here; Meta does not publish a match-rate threshold."
+)
+_ACROSS_CATALOGS_NOTE = (
+    "For the content ids a source sent, Meta's event_stats counts how many matched this catalog "
+    "(total_matched_content_ids) and how many matched another catalog connected to the source "
+    "(total_content_ids_matched_other_catalogs). Meta does not say whether an id that matched both is "
+    "counted in both, so the share matching any connected catalog is given as a range: at least the "
+    "larger of the two shares, at most their sum (capped at 1). Computed here; Meta publishes no "
+    "all-catalog rate. Counts are not de-duplicated."
 )
 
 
@@ -242,17 +273,48 @@ def _object_id(value: Any) -> str | None:
     return None
 
 
-def _validate_http_url(value: Any, *, name: str, schemes: tuple[str, ...]) -> str:
-    """Accept only absolute URLs with an allowed scheme and a host."""
+def _validate_http_url(
+    value: Any,
+    *,
+    name: str,
+    schemes: tuple[str, ...],
+    credentials_hint: str = "pass them in the username and password fields",
+) -> str:
+    """Accept only absolute URLs with an allowed scheme and a host and no credentials.
+
+    The value is never quoted back: a mistaken value can be a feed record or a secret.
+    """
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be an absolute {'/'.join(schemes)} URL.")
     url = value.strip()
-    parts = urlsplit(url)
-    if parts.scheme.lower() not in schemes or not parts.netloc:
+    try:
+        parts = urlsplit(url)
+        has_credentials = parts.username is not None or parts.password is not None
+    except ValueError:
+        raise ValidationError(f"{name} must be an absolute URL using {', '.join(schemes)}.") from None
+    if parts.scheme.lower() not in schemes or not parts.netloc or any(c.isspace() for c in url):
+        raise ValidationError(f"{name} must be an absolute URL using {', '.join(schemes)}.")
+    if has_credentials:
         raise ValidationError(
-            f"{name} must be an absolute URL using {', '.join(schemes)}; got {url!r}."
+            f"{name} must not contain a username or password, because the URL is stored and shown "
+            f"in responses; {credentials_hint}."
         )
     return url
+
+
+def _mask_url_password(value: Any) -> Any:
+    """Replace a password embedded in a URL's user info with a marker."""
+    if not isinstance(value, str) or "@" not in value:
+        return value
+    try:
+        parts = urlsplit(value)
+        if parts.password is None:
+            return value
+    except ValueError:
+        return value
+    userinfo, hostport = parts.netloc.rsplit("@", 1)
+    user = userinfo.split(":", 1)[0]
+    return urlunsplit(parts._replace(netloc=f"{user}:[redacted]@{hostport}"))
 
 
 def _bounded_int(value: Any, *, name: str, low: int, high: int | None) -> None:
@@ -274,15 +336,18 @@ def _normalize_schedule(value: Any, *, name: str) -> dict[str, Any]:
     """Validate a feed fetch schedule against Meta's ProductFeedSchedule fields."""
     if not isinstance(value, dict):
         raise ValidationError(f"{name} must be an object with url and interval.")
-    unknown = sorted(set(value) - set(SCHEDULE_KEYS))
+    unknown = sorted(str(key) for key in set(value) - set(SCHEDULE_KEYS))
     if unknown:
+        # Name only key-like keys; anything else may be pasted data and is not quoted.
+        named = [key for key in unknown if _SAFE_KEY.match(key)]
+        listed = f": {', '.join(named)}" if len(named) == len(unknown) else ""
         raise ValidationError(
-            f"{name} has unsupported keys: {', '.join(unknown)}. "
-            f"Accepted keys: {', '.join(SCHEDULE_KEYS)}."
+            f"{name} has unsupported keys{listed}. Accepted keys: {', '.join(SCHEDULE_KEYS)}."
         )
     normalized = dict(value)
     normalized["url"] = _validate_http_url(
-        value.get("url"), name=f"{name}.url", schemes=SCHEDULE_URL_SCHEMES
+        value.get("url"), name=f"{name}.url", schemes=SCHEDULE_URL_SCHEMES,
+        credentials_hint=f"put them in {name}.username and {name}.password",
     )
     interval = value.get("interval")
     interval_value = interval.strip().upper() if isinstance(interval, str) else None
@@ -312,12 +377,18 @@ def _normalize_schedule(value: Any, *, name: str) -> dict[str, Any]:
 
 
 def _redact_schedules(payload: dict[str, Any]) -> dict[str, Any]:
-    """Copy a payload for display with schedule passwords removed."""
+    """Copy a payload for display with schedule passwords removed, including one in a URL."""
     shown = dict(payload)
     for key in ("schedule", "update_schedule"):
         schedule = shown.get(key)
-        if isinstance(schedule, dict) and "password" in schedule:
-            shown[key] = {**schedule, "password": "[redacted]"}
+        if not isinstance(schedule, dict):
+            continue
+        redacted = dict(schedule)
+        if "password" in redacted:
+            redacted["password"] = "[redacted]"
+        if "url" in redacted:
+            redacted["url"] = _mask_url_password(redacted["url"])
+        shown[key] = redacted
     return shown
 
 
@@ -356,12 +427,17 @@ async def _upload_with_errors(client: Any, upload: dict[str, Any]) -> dict[str, 
     return item
 
 
-def _validate_rule_params(rule_type: str, params: Any) -> dict[str, str]:
-    """Check rule inputs against the shapes Meta documents for each rule type."""
+def _check_rule_params_shape(params: Any) -> None:
+    """The checks every rule type shares: a non-empty object of string keys and values."""
     if not isinstance(params, dict) or not params:
         raise ValidationError("params must be a non-empty object of string keys and string values.")
     if not all(isinstance(key, str) and isinstance(value, str) for key, value in params.items()):
         raise ValidationError("params keys and values must all be strings.")
+
+
+def _validate_rule_params(rule_type: str, params: Any) -> dict[str, str]:
+    """Check rule inputs against the shapes Meta documents for each rule type."""
+    _check_rule_params_shape(params)
     if rule_type == "mapping_rule":
         if not params.get("map_from", "").strip():
             raise ValidationError("mapping_rule params need map_from, the column name in your feed file.")
@@ -555,11 +631,15 @@ async def list_product_feeds(
     client = get_graph_api_client()
     if feed_id is not None:
         feed = await client.get_object(feed_id, fields=FEED_FIELDS)
-        return {"item": feed, "summary": {"count": 1}}
+        return {"item": _redact_schedules(feed) if isinstance(feed, dict) else feed, "summary": {"count": 1}}
     payload = await client.list_objects(
         catalog_id, "product_feeds", fields=FEED_LIST_FIELDS, params=_page_params(limit, after),
     )
-    return _paged_collection(payload)
+    collection = _paged_collection(payload)
+    collection["items"] = [
+        _redact_schedules(item) if isinstance(item, dict) else item for item in collection["items"]
+    ]
+    return collection
 
 
 @mcp_server.tool()
@@ -667,24 +747,114 @@ async def delete_product_feed(feed_id: str) -> dict[str, Any]:
     )
 
 
+def _read_feed_file(file_path: Any) -> tuple[str, bytes, str]:
+    """Read a local feed file in the server; errors never quote the path or the contents."""
+    text = blank_to_none(file_path) if isinstance(file_path, str) else None
+    if text is None:
+        raise ValidationError("file_path must be a non-blank local file path.")
+    path = Path(text).expanduser()
+    content_type = FEED_FILE_TYPES.get(path.suffix.lower())
+    if content_type is None:
+        raise ValidationError(
+            "file_path must name a feed file ending in one of "
+            f"{', '.join(FEED_FILE_TYPES)} (the formats Meta documents for feed uploads)."
+        )
+    try:
+        if not path.is_file():
+            raise ValidationError("file_path does not point to a readable file.")
+        size = path.stat().st_size
+        if size == 0:
+            raise ValidationError("file_path points to an empty file.")
+        if size > MAX_FEED_FILE_BYTES:
+            raise ValidationError(
+                f"file_path is larger than this server's {MAX_FEED_FILE_BYTES}-byte limit for feed files."
+            )
+        content = path.read_bytes()
+    except OSError:
+        raise ValidationError("file_path could not be read.") from None
+    return path.name, content, content_type
+
+
 @mcp_server.tool()
 async def create_product_feed_upload(
     feed_id: str,
-    url: str,
+    url: str | None = None,
     update_only: bool | None = None,
+    file_path: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Start a one-off upload for a product catalog data feed from an http(s) URL. update_only=true only adds or updates items; otherwise items missing from the file may be deleted. Check progress with list_product_feed_uploads."""
+    """Start a one-off upload for a product catalog data feed, from an http(s) url (with optional basic-auth username and password) or from a local file_path (CSV, TSV, XML, zip, gz, bz2) that this server reads and sends, so the file's rows never pass through the conversation. update_only=true only adds or updates items; otherwise items missing from the file may be deleted. The password is never returned. dry_run=true returns the request and sends nothing. Check progress with list_product_feed_uploads."""
     feed_id = _require_id(feed_id, "feed_id")
-    data: dict[str, Any] = {"url": _validate_http_url(url, name="url", schemes=("http", "https"))}
+    url_text = url if isinstance(url, str) and url.strip() else None
+    file_given = file_path is not None
+    if (url_text is not None) == file_given:
+        raise ValidationError(
+            "Provide exactly one of url (an http or https address) or file_path (a local feed file)."
+        )
+    if (username is None) != (password is None):
+        raise ValidationError("username and password must be given together.")
+    credentials = username is not None
+    if credentials and file_given:
+        raise ValidationError("username and password apply only to a url upload, not to file_path.")
+    if credentials and not (
+        isinstance(username, str) and username.strip() and isinstance(password, str) and password
+    ):
+        raise ValidationError("username and password must be non-blank strings.")
+    data: dict[str, Any] = {}
+    files: dict[str, Any] | None = None
+    source: dict[str, Any]
+    if url_text is not None:
+        data["url"] = _validate_http_url(
+            url_text, name="url", schemes=("http", "https"),
+            credentials_hint="pass them as the username and password parameters",
+        )
+        source = {"type": "url", "url": data["url"], "credentials_sent": credentials}
+    else:
+        file_name, content, content_type = _read_feed_file(file_path)
+        files = {"file": (file_name, content, content_type)}
+        source = {"type": "file", "file_name": file_name, "size_bytes": len(content), "content_type": content_type}
     if update_only is not None:
         data["update_only"] = update_only
+    if credentials:
+        data["username"] = username.strip()
+        data["password"] = password
+    target = {"feed_id": feed_id}
+    if dry_run:
+        would_send: dict[str, Any] = {
+            "method": "POST",
+            "path": f"{feed_id}/uploads",
+            "data": {**data, "password": "[redacted]"} if credentials else dict(data),
+        }
+        if files is not None:
+            would_send["files"] = {
+                "file": {key: source[key] for key in ("file_name", "size_bytes", "content_type")},
+            }
+        return {
+            "ok": True,
+            "action": "create_product_feed_upload",
+            "target": target,
+            "dry_run": True,
+            "sent": False,
+            "would_send": would_send,
+            "upload_source": source,
+        }
     client = get_graph_api_client()
-    created = await client.create_edge_object(feed_id, "uploads", data=data)
-    return creation_response(
+    if files is None:
+        created = await client.create_edge_object(feed_id, "uploads", data=data)
+    else:
+        created = await client.create_edge_object(feed_id, "uploads", data=data, files=files)
+    response = creation_response(
         action="create_product_feed_upload",
-        target={"feed_id": feed_id},
-        result=created,
+        target=target,
+        # Never hand a password back, even if Meta echoes the request.
+        result={key: value for key, value in created.items() if key != "password"}
+        if isinstance(created, dict) else created,
     )
+    response["dry_run"] = False
+    response["upload_source"] = source
+    return response
 
 
 @mcp_server.tool()
@@ -757,6 +927,55 @@ async def create_feed_rule(
         target={"feed_id": feed_id},
         result=created,
     )
+
+
+@mcp_server.tool()
+async def update_feed_rule(
+    rule_id: GraphId,
+    params: dict[str, Any],
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Change the params of one product catalog feed rule, returning before and after. params replaces the rule's params in full, in the shape its rule_type takes (see create_feed_rule). A rule's attribute and rule_type cannot be changed: delete the rule and create a new one. dry_run=true reads the rule and returns the request without sending it."""
+    rule_id = _require_id(rule_id, "rule_id")
+    _check_rule_params_shape(params)
+    client = get_graph_api_client()
+    rule = await client.get_object(rule_id, fields=RULE_FIELDS)
+    rule_type = str(rule.get("rule_type") or "").strip().lower()
+    notes: list[str] = []
+    if rule_type in FEED_RULE_TYPES:
+        new_params = _validate_rule_params(rule_type, params)
+    else:
+        new_params = dict(params)
+        notes.append(
+            "Meta returned no recognised rule_type for this rule, so only the general params checks "
+            "(string keys and values) ran; the checks for a specific rule type did not."
+        )
+    previous = {key: rule[key] for key in ("attribute", "rule_type", "params") if key in rule}
+    current: dict[str, Any] = {
+        **{key: previous[key] for key in ("attribute", "rule_type") if key in previous},
+        "params": new_params,
+    }
+    request = {"method": "POST", "path": rule_id, "data": {"params": new_params}}
+    unchanged = rule.get("params") == new_params
+    if unchanged:
+        current["unchanged"] = True
+    response = mutation_response(
+        action="update_feed_rule",
+        target={"rule_id": rule_id},
+        previous=previous,
+        current=current,
+    )
+    response.update({"dry_run": dry_run, "missing_signals": notes})
+    if unchanged:
+        notes.append("The rule already has these params; nothing was sent.")
+        response.update({"sent": False, "would_send": None})
+        return response
+    if dry_run:
+        response.update({"sent": False, "would_send": request})
+        return response
+    response["result"] = await client.update_object(rule_id, data=request["data"])
+    response["sent"] = True
+    return response
 
 
 @mcp_server.tool()

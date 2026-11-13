@@ -58,7 +58,9 @@ class FakeCatalogFeedClient:
         return value
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
-        self.calls.append({"method": "create_edge_object", "parent_id": parent_id, "edge": edge, "data": data})
+        self.calls.append({
+            "method": "create_edge_object", "parent_id": parent_id, "edge": edge, "data": data, "files": files,
+        })
         return {"id": "created_1"}
 
     async def update_object(self, object_id: str, *, data):
@@ -819,7 +821,7 @@ def test_feed_tools_are_grouped_reads_in_catalog_and_writes_in_writes() -> None:
     writes = {
         "create_product_feed", "update_product_feed", "delete_product_feed",
         "create_product_feed_upload", "create_feed_rule", "delete_feed_rule",
-        "connect_catalog_event_source", "disconnect_catalog_event_source",
+        "connect_catalog_event_source", "disconnect_catalog_event_source", "update_feed_rule",
     }
     assert reads <= set(TOOL_GROUPS["catalog"])
     assert writes <= set(TOOL_GROUPS["writes"])
@@ -1191,3 +1193,598 @@ def test_create_product_feed_redacts_a_password_meta_echoes_back(monkeypatch) ->
     assert result["created"]["id"] == "feed_new"
     assert result["created"]["schedule"]["password"] == "[redacted]"
     assert result["created"]["update_schedule"]["password"] == "[redacted]"
+
+
+# phase two: update_feed_rule ---------------------------------------------------------------
+
+LETTER_CASE_RULE = {
+    "id": "rule_1", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"},
+}
+
+
+def test_update_feed_rule_reads_then_updates_and_returns_previous(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"rule_1": LETTER_CASE_RULE}))
+    result = run(catalog_feeds.update_feed_rule(rule_id="rule_1", params={"type": "to_lower"}))
+    assert client.methods() == ["get_object", "update_object"]
+    assert client.calls[0]["object_id"] == "rule_1"
+    assert client.calls[0]["fields"] == EXPECTED_RULE_FIELDS
+    assert client.calls[1]["object_id"] == "rule_1"
+    assert client.calls[1]["data"] == {"params": {"type": "to_lower"}}
+    assert result["ok"] is True
+    assert result["action"] == "update_feed_rule"
+    assert result["target"] == {"rule_id": "rule_1"}
+    assert result["previous"] == {"attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}}
+    assert result["current"] == {"attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_lower"}}
+    assert result["dry_run"] is False
+
+
+@pytest.mark.parametrize(("rule", "params"), [
+    (LETTER_CASE_RULE, {"type": "shout"}),
+    ({**LETTER_CASE_RULE, "rule_type": "regex_replace_rule", "params": {"regex": "a"}}, {"regex": "("}),
+    ({**LETTER_CASE_RULE, "rule_type": "mapping_rule", "params": {"map_from": "x"}}, {"other": "y"}),
+    ({**LETTER_CASE_RULE, "rule_type": "fallback_rule", "params": {"user_default_value": "x"}}, {"user_default_value": " "}),
+    ({**LETTER_CASE_RULE, "rule_type": "value_mapping_rule", "params": {"a": "b"}}, {str(i): "v" for i in range(11)}),
+])
+def test_update_feed_rule_checks_params_against_the_rules_own_type(monkeypatch, rule, params) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"rule_1": rule}))
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.update_feed_rule(rule_id="rule_1", params=params))
+    assert client.methods() == ["get_object"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"rule_id": " ", "params": {"type": "to_lower"}},
+    {"rule_id": "rule_1", "params": {}},
+    {"rule_id": "rule_1", "params": {"type": 5}},
+    {"rule_id": "rule_1", "params": "type=to_lower"},
+])
+def test_update_feed_rule_rejects_bad_input_before_any_call(monkeypatch, kwargs) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.update_feed_rule(**kwargs))
+
+
+def test_update_feed_rule_dry_run_reads_but_sends_no_write(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"rule_1": LETTER_CASE_RULE}))
+    result = run(catalog_feeds.update_feed_rule(rule_id="rule_1", params={"type": "to_lower"}, dry_run=True))
+    assert client.methods() == ["get_object"]
+    assert result["dry_run"] is True
+    assert result["sent"] is False
+    assert result["would_send"] == {"method": "POST", "path": "rule_1", "data": {"params": {"type": "to_lower"}}}
+    assert result["previous"]["params"] == {"type": "to_upper"}
+    assert result["current"]["params"] == {"type": "to_lower"}
+
+
+def test_update_feed_rule_read_failure_sends_no_update(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(errors={"rule_1": _permission_error()}))
+    with pytest.raises(MetaApiError):
+        run(catalog_feeds.update_feed_rule(rule_id="rule_1", params={"type": "to_lower"}))
+    assert client.methods() == ["get_object"]
+
+
+def test_update_feed_rule_with_identical_params_sends_nothing(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"rule_1": LETTER_CASE_RULE}))
+    result = run(catalog_feeds.update_feed_rule(rule_id="rule_1", params={"type": "to_upper"}))
+    assert client.methods() == ["get_object"]
+    assert result["current"]["unchanged"] is True
+
+
+def test_update_feed_rule_unknown_rule_type_runs_generic_checks_and_says_so(monkeypatch) -> None:
+    rule = {"id": "rule_1", "attribute": "title", "params": {"x": "y"}}
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"rule_1": rule}))
+    result = run(catalog_feeds.update_feed_rule(rule_id="rule_1", params={"x": "z"}))
+    assert client.methods() == ["get_object", "update_object"]
+    assert any("rule_type" in note for note in result["missing_signals"])
+
+
+def test_update_feed_rule_docstring_says_params_replace_and_type_is_fixed() -> None:
+    doc = inspect.getdoc(catalog_feeds.update_feed_rule).lower()
+    assert "replace" in doc
+    assert "attribute" in doc and "rule_type" in doc and "delete" in doc
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_update_feed_rule_is_a_write_blocked_in_read_only(monkeypatch, routed) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+    from meta_ads_mcp.read_only import read_only_tool_names
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+    from meta_ads_mcp.tools.utility import TOOL_GROUPS
+
+    assert "update_feed_rule" in TOOL_GROUPS["writes"]
+    assert all("update_feed_rule" not in names for group, names in TOOL_GROUPS.items() if group != "writes")
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    _no_client(monkeypatch)
+    try:
+        assert "update_feed_rule" not in read_only_tool_names()
+        components = mcp_server.local_provider._components.values()
+        contracts = build_tool_contracts([c for c in components if getattr(c, "name", None)])
+        assert contracts["update_feed_rule"].effect == "write"
+        arguments = {"rule_id": "123", "params": {"type": "to_lower"}}
+        tool, payload = ("call_tool", {"name": "update_feed_rule", "arguments": arguments}) if routed else ("update_feed_rule", arguments)
+        with pytest.raises(ToolError, match="META_READ_ONLY"):
+            run(mcp_server.call_tool(tool, payload))
+    finally:
+        monkeypatch.delenv("META_READ_ONLY")
+        reload_settings()
+
+
+# phase two: feed credentials and local file uploads -------------------------------------------
+
+
+def test_feed_credentials_are_never_returned_or_logged(monkeypatch, caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    secret = "synthetic-feed-password-7781"
+
+    class EchoingClient(FakeCatalogFeedClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            await super().create_edge_object(parent_id, edge, data=data, files=files)
+            return {"id": "created_1", **data}
+
+    client = _use(monkeypatch, EchoingClient(objects={"feed_1": {"id": "feed_1", "name": "Main"}}))
+    schedule = {**SCHEDULE, "username": "feeduser", "password": secret}
+    results = [
+        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", schedule=schedule, update_schedule=schedule)),
+        run(catalog_feeds.update_product_feed(feed_id="feed_1", schedule=schedule)),
+        run(catalog_feeds.create_product_feed_upload(
+            feed_id="feed_1", url="https://example.com/feed.csv", username="feeduser", password=secret,
+        )),
+        run(catalog_feeds.create_product_feed_upload(
+            feed_id="feed_1", url="https://example.com/feed.csv", username="feeduser", password=secret, dry_run=True,
+        )),
+    ]
+    upload_posts = [call for call in client.calls if call.get("edge") == "uploads"]
+    assert upload_posts[0]["data"] == {
+        "url": "https://example.com/feed.csv", "username": "feeduser", "password": secret,
+    }
+    assert len(upload_posts) == 1
+    for result in results:
+        assert secret not in repr(result)
+    assert results[3]["would_send"]["data"]["password"] == "[redacted]"
+    assert secret not in caplog.text
+
+
+def test_feed_reads_mask_a_password_embedded_in_a_schedule_url(monkeypatch) -> None:
+    secret = "synthetic-url-password-4410"
+    feed = {"id": "feed_1", "schedule": {"url": f"ftp://user:{secret}@example.com/feed.csv", "interval": "DAILY"}}
+    _use(monkeypatch, FakeCatalogFeedClient(
+        objects={"feed_1": feed},
+        edges={("cat_1", "product_feeds"): {"data": [feed]}},
+    ))
+    one = run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
+    many = run(catalog_feeds.list_product_feeds(catalog_id="cat_1"))
+    assert secret not in repr(one) and secret not in repr(many)
+    assert one["item"]["schedule"]["url"] == "ftp://user:[redacted]@example.com/feed.csv"
+
+
+@pytest.mark.parametrize("url", [
+    "https://user:pw-in-url@example.com/feed.csv",
+    "ftp://user:pw-in-url@example.com/feed.csv",
+])
+def test_urls_with_embedded_credentials_are_rejected_without_echo(monkeypatch, url) -> None:
+    _no_client(monkeypatch)
+    calls = [
+        lambda: catalog_feeds.create_product_feed(catalog_id="cat_1", name="F", schedule={"url": url, "interval": "DAILY"}),
+        lambda: catalog_feeds.update_product_feed(feed_id="feed_1", update_schedule={"url": url, "interval": "DAILY"}),
+    ]
+    if url.startswith("https"):
+        calls.append(lambda: catalog_feeds.create_product_feed_upload(feed_id="feed_1", url=url))
+    for call in calls:
+        with pytest.raises(ValidationError) as caught:
+            run(call())
+        message = str(caught.value)
+        assert "pw-in-url" not in message
+        assert "username" in message and "password" in message
+
+
+CSV_RECORD = "id,title,price\n4471,Synthetic Shirt,10 USD"
+
+
+def test_a_csv_like_value_is_never_echoed_in_an_error(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    calls = [
+        lambda: catalog_feeds.create_product_feed_upload(feed_id="feed_1", url=CSV_RECORD),
+        lambda: catalog_feeds.create_product_feed(catalog_id="cat_1", name="F", schedule={"url": CSV_RECORD, "interval": "DAILY"}),
+        lambda: catalog_feeds.update_product_feed(feed_id="feed_1", schedule={"url": "https://e.com/f.csv", "interval": CSV_RECORD}),
+        lambda: catalog_feeds.update_product_feed(
+            feed_id="feed_1", schedule={"url": "https://e.com/f.csv", "interval": "WEEKLY", "day_of_week": CSV_RECORD},
+        ),
+        lambda: catalog_feeds.update_product_feed(
+            feed_id="feed_1", schedule={"url": "https://e.com/f.csv", "interval": "DAILY", "hour": CSV_RECORD},
+        ),
+        lambda: catalog_feeds.update_product_feed(
+            feed_id="feed_1", schedule={"url": "https://e.com/f.csv", "interval": "DAILY", CSV_RECORD: "x"},
+        ),
+    ]
+    for call in calls:
+        with pytest.raises(ValidationError) as caught:
+            run(call())
+        assert "Synthetic Shirt" not in str(caught.value)
+        assert "4471" not in str(caught.value)
+
+
+def test_create_product_feed_upload_sends_a_local_file_read_by_the_server(monkeypatch, tmp_path) -> None:
+    content = b"id,title,price\n1,Synthetic Mug,5 USD\n"
+    path = tmp_path / "products.csv"
+    path.write_bytes(content)
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    result = run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", file_path=str(path), update_only=True))
+    [call] = client.calls
+    assert (call["method"], call["parent_id"], call["edge"]) == ("create_edge_object", "feed_1", "uploads")
+    assert call["data"] == {"update_only": True}
+    assert call["files"] == {"file": ("products.csv", content, "text/csv")}
+    assert result["created"] == {"id": "created_1"}
+    assert result["upload_source"] == {
+        "type": "file", "file_name": "products.csv", "size_bytes": len(content), "content_type": "text/csv",
+    }
+    assert "Synthetic Mug" not in repr(result)
+
+
+@pytest.mark.parametrize(("name", "content_type"), [
+    ("feed.tsv", "text/tab-separated-values"),
+    ("feed.xml", "application/xml"),
+    ("feed.csv.gz", "application/gzip"),
+    ("feed.zip", "application/zip"),
+    ("feed.bz2", "application/x-bzip2"),
+])
+def test_create_product_feed_upload_sets_the_documented_file_type(monkeypatch, tmp_path, name, content_type) -> None:
+    path = tmp_path / name
+    path.write_bytes(b"x")
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", file_path=str(path)))
+    assert client.calls[0]["files"]["file"][2] == content_type
+    assert client.calls[0]["data"] == {}
+
+
+def test_create_product_feed_upload_file_dry_run_sends_nothing(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "products.csv"
+    content = b"id,title\n1,Synthetic Lamp\n"
+    path.write_bytes(content)
+    _no_client(monkeypatch)
+    result = run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", file_path=str(path), dry_run=True))
+    assert result["dry_run"] is True and result["sent"] is False
+    assert result["would_send"] == {
+        "method": "POST",
+        "path": "feed_1/uploads",
+        "data": {},
+        "files": {"file": {"file_name": "products.csv", "size_bytes": len(content), "content_type": "text/csv"}},
+    }
+    assert "Synthetic Lamp" not in repr(result)
+
+
+def test_create_product_feed_upload_url_call_is_unchanged(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    result = run(catalog_feeds.create_product_feed_upload("feed_1", "https://example.com/feed.csv", True))
+    [call] = client.calls
+    assert call["data"] == {"url": "https://example.com/feed.csv", "update_only": True}
+    assert call["files"] is None
+    assert result["created"] == {"id": "created_1"}
+
+
+def _bad_file_cases(tmp_path):
+    empty = tmp_path / "empty.csv"
+    empty.write_bytes(b"")
+    secret_named = tmp_path / "id_rsa"
+    secret_named.write_bytes(b"synthetic-key-material")
+    good = tmp_path / "ok.csv"
+    good.write_bytes(b"id\n1\n")
+    return [
+        {"file_path": str(tmp_path / "missing.csv")},
+        {"file_path": str(tmp_path)},
+        {"file_path": str(empty)},
+        {"file_path": str(secret_named)},
+        {"file_path": " "},
+        {"file_path": str(good), "url": "https://example.com/feed.csv"},
+        {"file_path": str(good), "username": "u", "password": "p"},
+        {},
+        {"url": "https://example.com/feed.csv", "username": "u"},
+        {"url": "https://example.com/feed.csv", "password": "p"},
+    ]
+
+
+def test_create_product_feed_upload_rejects_bad_sources_before_any_call(monkeypatch, tmp_path) -> None:
+    _no_client(monkeypatch)
+    for kwargs in _bad_file_cases(tmp_path):
+        with pytest.raises(ValidationError) as caught:
+            run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", **kwargs))
+        message = str(caught.value)
+        assert str(tmp_path) not in message
+        assert "synthetic-key-material" not in message
+
+
+def test_create_product_feed_upload_rejects_a_file_over_the_size_cap(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "big.csv"
+    path.write_bytes(b"0123456789")
+    monkeypatch.setattr(catalog_feeds, "MAX_FEED_FILE_BYTES", 5)
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="larger"):
+        run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", file_path=str(path)))
+
+
+# phase two: health scoped to one source, and its rate across catalogs ---------------------------
+
+
+def _stat_other(day: str, source: str, event: str, matched: int, unmatched: int, other: int | None) -> dict[str, Any]:
+    row = _stat(day, source, event, matched, unmatched)
+    if other is not None:
+        row["total_content_ids_matched_other_catalogs"] = other
+    return row
+
+
+def test_event_source_health_can_be_scoped_to_one_source(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): SOURCES,
+        ("cat_1", "event_stats"): {"data": [
+            _stat_other("2026-11-01", "px_1", "ViewContent", 60, 40, 30),
+            _stat_other("2026-11-01", "app_1", "ViewContent", 5, 5, 0),
+        ]},
+        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_1"))
+    assert [source["id"] for source in result["sources"]] == ["px_1"]
+    assert [call["parent_id"] for call in client.calls if call.get("edge") == "da_checks"] == ["px_1"]
+    assert result["scope"] == {"catalog_id": "cat_1", "event_source_id": "px_1"}
+    assert result["metrics"]["connected_sources"] == 1
+    assert not any("app_1" in signal for signal in result["missing_signals"])
+
+
+def test_event_source_health_reports_the_sources_rate_across_its_catalogs(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): {"data": [
+            _stat_other("2026-11-01", "px_1", "ViewContent", 50, 30, 20),
+            _stat_other("2026-11-02", "px_1", "Purchase", 10, 10, 10),
+        ]},
+        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_1"))
+    across = result["sources"][0]["across_catalogs"]
+    assert across["this_catalog_match_rate"] == 0.6
+    assert across["content_ids_matched_other_catalogs"] == 30
+    assert across["other_catalogs_match_share"] == 0.3
+    assert across["all_catalogs_match_rate_range"] == {"low": 0.6, "high": 0.9}
+    assert result["metrics"]["this_catalog_match_rate"] == 0.6
+    assert result["metrics"]["all_catalogs_match_rate_range"] == {"low": 0.6, "high": 0.9}
+    assert "range" in result["across_catalogs_definition"]
+
+
+def test_event_source_health_across_catalog_rate_is_unknown_when_meta_omits_the_counter(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): {"data": [
+            _stat_other("2026-11-01", "px_1", "ViewContent", 50, 30, 20),
+            _stat_other("2026-11-02", "px_1", "ViewContent", 10, 10, None),
+        ]},
+        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    across = result["sources"][0]["across_catalogs"]
+    assert across["this_catalog_match_rate"] == 0.6
+    assert across["content_ids_matched_other_catalogs"] is None
+    assert across["other_catalogs_match_share"] is None
+    assert across["all_catalogs_match_rate_range"] is None
+
+
+def test_event_source_health_across_catalog_rate_needs_a_finished_read(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): _endless([_stat_other("2026-11-01", "px_1", "ViewContent", 5, 5, 5)]),
+        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_1"))
+    across = result["sources"][0]["across_catalogs"]
+    assert across["this_catalog_match_rate"] is None
+    assert across["all_catalogs_match_rate_range"] is None
+    assert "partly read" in across["note"]
+
+
+def test_event_source_health_scope_to_unconnected_source_is_refused_after_a_full_read(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): SOURCES,
+        ("cat_1", "event_stats"): {"data": []},
+    }))
+    with pytest.raises(ValidationError, match="not connected"):
+        run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_404"))
+    assert not any(call.get("edge") == "da_checks" for call in client.calls)
+
+
+def test_event_source_health_scope_beyond_a_partial_source_list_is_reported_not_refused(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}], "paging": {"next": "https://graph.invalid/next"}},
+        ("cat_1", "event_stats"): {"data": [_stat_other("2026-11-01", "px_9", "ViewContent", 9, 1, 0)]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_9"))
+    [source] = result["sources"]
+    assert source["id"] == "px_9"
+    assert source["window_match_rate"] == 0.9
+    assert any("px_9" in signal and "not among" in signal for signal in result["missing_signals"])
+
+
+def test_event_source_health_unscoped_call_is_unchanged_apart_from_new_fields(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): SOURCES,
+        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 90, 10)]},
+        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("app_1", "da_checks"): {"data": [{"key": "x", "result": "passed"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert [(c["parent_id"], c["edge"]) for c in client.calls] == [
+        ("cat_1", "external_event_sources"), ("cat_1", "event_stats"), ("px_1", "da_checks"), ("app_1", "da_checks"),
+    ]
+    assert result["scope"] == {"catalog_id": "cat_1"}
+    assert [source["id"] for source in result["sources"]] == ["px_1", "app_1"]
+
+
+# phase two: list_event_source_catalogs match rates ---------------------------------------------
+
+
+def _scan_edges() -> dict[tuple[str, str], Any]:
+    return {
+        ("biz_1", "owned_product_catalogs"): {"data": [
+            {"id": "cat_1", "name": "A"}, {"id": "cat_2", "name": "B"}, {"id": "cat_3", "name": "C"},
+        ]},
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}]},
+        ("cat_2", "external_event_sources"): {"data": [{"id": "px_1"}, {"id": "px_2"}]},
+        ("cat_3", "external_event_sources"): {"data": [{"id": "px_2"}]},
+        ("cat_1", "event_stats"): {"data": [
+            _stat("2026-11-01", "px_1", "ViewContent", 40, 60),
+            _stat("2026-11-01", "px_1", "Purchase", 10, 0),
+            _stat("2026-11-01", "px_9", "ViewContent", 1000, 0),
+        ]},
+        ("cat_2", "event_stats"): {"data": [
+            _stat("2026-11-01", "px_1", "ViewContent", 90, 10),
+            _stat("2026-11-01", "px_1", "Purchase", 0, 10),
+        ]},
+    }
+
+
+def test_list_event_source_catalogs_without_match_rates_is_unchanged(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges()))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    assert [(c["parent_id"], c["edge"]) for c in client.calls] == [
+        ("biz_1", "owned_product_catalogs"),
+        ("cat_1", "external_event_sources"),
+        ("cat_2", "external_event_sources"),
+        ("cat_3", "external_event_sources"),
+    ]
+    assert result["items"] == [{"id": "cat_1", "name": "A"}, {"id": "cat_2", "name": "B"}]
+    assert set(result["summary"]) == {
+        "count", "event_source_id", "business_id", "catalogs_scanned", "complete", "stop_reasons", "method", "note",
+    }
+
+
+def test_list_event_source_catalogs_match_rates_per_connected_catalog(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges()))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    stats_calls = [c for c in client.calls if c["edge"] == "event_stats"]
+    assert [c["parent_id"] for c in stats_calls] == ["cat_1", "cat_2"]
+    assert all(c["fields"] == EXPECTED_EVENT_STAT_FIELDS for c in stats_calls)
+    items = {item["id"]: item for item in result["items"]}
+    assert items["cat_1"]["match_rate"] == {
+        "status": "computed", "match_rate": 0.4545, "matched_content_ids": 50, "unmatched_content_ids": 60,
+        "event_stat_rows": 2, "events": ["Purchase", "ViewContent"], "stats_complete": True,
+    }
+    assert items["cat_2"]["match_rate"]["match_rate"] == round(90 / 110, 4)
+    rates = result["summary"]["match_rates"]
+    assert rates["ranked_by_match_rate"] == ["cat_2", "cat_1"]
+    assert rates["ranking_covers_every_connected_catalog"] is True
+    assert rates["catalogs_checked"] == 2 and rates["catalogs_with_rate"] == 2
+    assert rates["catalogs_not_checked"] == []
+    assert "derived" in rates["method"].lower()
+    assert "Meta does not publish" in rates["definition"]
+
+
+def test_list_event_source_catalogs_match_rates_for_one_event(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges()))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True, event_name="purchase",
+    ))
+    items = {item["id"]: item for item in result["items"]}
+    assert items["cat_1"]["match_rate"]["match_rate"] == 1.0
+    assert items["cat_2"]["match_rate"]["match_rate"] == 0.0
+    assert result["summary"]["match_rates"]["event_name"] == "Purchase"
+    assert result["summary"]["match_rates"]["ranked_by_match_rate"] == ["cat_1", "cat_2"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"event_name": "Purchase"},
+    {"include_match_rates": True, "event_name": "Checkout"},
+])
+def test_list_event_source_catalogs_rejects_bad_match_rate_input_before_any_call(monkeypatch, kwargs) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1", **kwargs))
+
+
+def test_list_event_source_catalogs_match_rate_unknown_when_a_counter_is_omitted(monkeypatch) -> None:
+    row = _stat("2026-11-01", "px_1", "ViewContent", 40, 60)
+    del row["total_unmatched_content_ids"]
+    _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges() | {("cat_1", "event_stats"): {"data": [row]}}))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    first = result["items"][0]["match_rate"]
+    assert first["status"] == "counters_missing"
+    assert first["match_rate"] is None
+    assert first["unmatched_content_ids"] is None
+    rates = result["summary"]["match_rates"]
+    assert rates["ranked_by_match_rate"] == ["cat_2"]
+    assert rates["ranking_covers_every_connected_catalog"] is False
+
+
+def test_list_event_source_catalogs_match_rate_needs_a_finished_stats_read(monkeypatch) -> None:
+    edges = _scan_edges() | {("cat_1", "event_stats"): _endless([_stat("2026-11-01", "px_1", "ViewContent", 1, 1)])}
+    _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    first = result["items"][0]["match_rate"]
+    assert first["status"] == "partial_read"
+    assert first["match_rate"] is None
+    assert first["stats_complete"] is False
+    assert first["partial_counts_from_pages_read"]["matched_content_ids"] > 0
+    assert "cat_1" not in result["summary"]["match_rates"]["ranked_by_match_rate"]
+
+
+def test_list_event_source_catalogs_match_rate_no_events_is_not_zero(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges() | {("cat_1", "event_stats"): {"data": []}}))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    first = result["items"][0]["match_rate"]
+    assert first["status"] == "no_events_in_window"
+    assert first["match_rate"] is None
+
+
+def test_list_event_source_catalogs_match_rates_are_capped_and_say_which_were_skipped(monkeypatch) -> None:
+    catalogs = [{"id": f"cat_{i}"} for i in range(12)]
+    edges: dict[tuple[str, str], Any] = {("biz_1", "owned_product_catalogs"): {"data": catalogs}}
+    for catalog in catalogs:
+        edges[(catalog["id"], "external_event_sources")] = {"data": [{"id": "px_1"}]}
+        edges[(catalog["id"], "event_stats")] = {"data": [_stat("2026-11-01", "px_1", "ViewContent", 1, 1)]}
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    assert len([c for c in client.calls if c["edge"] == "event_stats"]) == 10
+    rates = result["summary"]["match_rates"]
+    assert rates["catalogs_checked"] == 10
+    assert rates["catalogs_not_checked"] == ["cat_10", "cat_11"]
+    assert rates["ranking_covers_every_connected_catalog"] is False
+    assert result["items"][11]["match_rate"]["status"] == "not_checked"
+
+
+def test_list_event_source_catalogs_incomplete_scan_ranking_is_not_complete(monkeypatch) -> None:
+    edges = _scan_edges() | {
+        ("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1"}], "paging": {"next": "https://graph.invalid/next"}},
+    }
+    _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["match_rates"]["ranking_covers_every_connected_catalog"] is False
+
+
+# phase two: recommendations flag paged da_checks --------------------------------------------------
+
+
+def test_recommendations_flag_paged_da_checks_and_do_not_guess(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": []},
+        ("cat_1", "event_stats"): {"data": []},
+        ("biz_1", "adspixels"): {"data": [{"id": "px_2", "name": "Paged"}]},
+        ("px_2", "da_checks"): {
+            "data": [{"key": "pixel_other_check", "result": "passed"}],
+            "paging": {"next": "https://next", "cursors": {"after": "c2"}},
+        },
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    [recommendation] = result["recommendations"]
+    assert recommendation["strength"] == "unknown"
+    assert "more pages" in recommendation["reason"]
+    assert "da_checks for pixel px_2 had more pages than were read." in result["missing_signals"]
