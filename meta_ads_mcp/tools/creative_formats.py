@@ -1589,13 +1589,18 @@ def _has_inline_story(copied: dict[str, Any]) -> bool:
     return isinstance(spec, dict) and any(_holds_value(spec.get(key)) for key in INLINE_STORY_KEYS)
 
 
-def _carried_calls_to_action(copied: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    """Every call to action the copied specs carry, with where it sits.
+def _carried_calls_to_action(copied: dict[str, Any]) -> list[tuple[str, dict[str, Any], frozenset[str]]]:
+    """Every call to action the copied specs carry: where it sits, and the links around it.
 
     The story's own (link, video, photo or template data), each carousel card's, and an asset
-    feed's call_to_action_types (a type only) and call_to_actions.
+    feed's call_to_action_types (a type only) and call_to_actions. The third value holds the
+    destination links of the thing the call to action sits on (the story's or card's own link,
+    or the feed's link_urls), which is where a button with no link of its own leads.
     """
-    found: list[tuple[str, dict[str, Any]]] = []
+    def links(*values: Any) -> frozenset[str]:
+        return frozenset(value for value in values if isinstance(value, str) and value)
+
+    found: list[tuple[str, dict[str, Any], frozenset[str]]] = []
     spec = copied.get("object_story_spec")
     if isinstance(spec, dict):
         for key in ("link_data", "video_data", "photo_data", "template_data"):
@@ -1603,29 +1608,39 @@ def _carried_calls_to_action(copied: dict[str, Any]) -> list[tuple[str, dict[str
             if not isinstance(data, dict):
                 continue
             if isinstance(data.get("call_to_action"), dict):
-                found.append((f"object_story_spec.{key}.call_to_action", data["call_to_action"]))
+                found.append((f"object_story_spec.{key}.call_to_action", data["call_to_action"], links(data.get("link"))))
             cards = data.get("child_attachments")
             for index, card in enumerate(cards if isinstance(cards, list) else []):
                 if isinstance(card, dict) and isinstance(card.get("call_to_action"), dict):
-                    found.append((f"object_story_spec.{key}.child_attachments[{index}].call_to_action", card["call_to_action"]))
+                    found.append((
+                        f"object_story_spec.{key}.child_attachments[{index}].call_to_action",
+                        card["call_to_action"], links(card.get("link")),
+                    ))
     feed = copied.get("asset_feed_spec")
     if isinstance(feed, dict):
+        urls = feed.get("link_urls")
+        feed_links = links(*(entry.get("website_url") for entry in (urls if isinstance(urls, list) else [])
+                             if isinstance(entry, dict)))
         types = feed.get("call_to_action_types")
         for index, value in enumerate(types if isinstance(types, list) else []):
             if isinstance(value, str):
-                found.append((f"asset_feed_spec.call_to_action_types[{index}]", {"type": value}))
+                found.append((f"asset_feed_spec.call_to_action_types[{index}]", {"type": value}, feed_links))
         entries = feed.get("call_to_actions")
         for index, entry in enumerate(entries if isinstance(entries, list) else []):
             if isinstance(entry, dict):
-                found.append((f"asset_feed_spec.call_to_actions[{index}]", entry))
+                found.append((f"asset_feed_spec.call_to_actions[{index}]", entry, feed_links))
     return found
 
 
-def _same_call_to_action(top: Any, inner: dict[str, Any]) -> bool:
-    """Whether a top-level call to action is the same as one the copy carries.
+def _same_call_to_action(top: Any, inner: dict[str, Any], destinations: frozenset[str] = frozenset()) -> bool:
+    """Whether everything a top-level call to action says is carried by one inside the copy.
 
-    The type must match. Of the value, only what both sides hold is compared: Meta's derived
-    top-level view was seen holding only link while the story's held more.
+    The type must match, and every value the top-level one reports must be accounted for: the
+    inner one holds the same value under the same key, or, for link only, the inner one has no
+    link of its own and the thing it sits on leads to that same link (destinations). A value the
+    inner one holds differently, or does not hold at all, means the copy would lose it. The inner
+    one may hold more than the top-level view; that is not a difference. Seen live: Meta's
+    top-level view is {type, value: {link}} and equals the story's own.
     """
     if not isinstance(top, dict):
         return False
@@ -1634,9 +1649,19 @@ def _same_call_to_action(top: Any, inner: dict[str, Any]) -> bool:
         return False
     if str(inner.get("type") or "").strip().upper() != top_type.strip().upper():
         return False
-    top_value, inner_value = top.get("value"), inner.get("value")
-    if isinstance(top_value, dict) and isinstance(inner_value, dict):
-        return all(top_value[key] == inner_value[key] for key in top_value.keys() & inner_value.keys())
+    top_value = top.get("value")
+    if top_value in (None, {}):
+        return True
+    if not isinstance(top_value, dict):
+        return False
+    inner_value = inner.get("value")
+    inner_value = inner_value if isinstance(inner_value, dict) else {}
+    for key, value in top_value.items():
+        if key in inner_value:
+            if inner_value[key] != value:
+                return False
+        elif not (key == "link" and isinstance(value, str) and value in destinations):
+            return False
     return True
 
 
@@ -1652,7 +1677,11 @@ def _leave_out_derived_call_to_action(copied: dict[str, Any]) -> tuple[dict[str,
     if "call_to_action" not in copied or not _has_inline_story(copied):
         return None, False
     top = copied.pop("call_to_action")
-    match = next((where for where, inner in _carried_calls_to_action(copied) if _same_call_to_action(top, inner)), None)
+    match = next(
+        (where for where, inner, destinations in _carried_calls_to_action(copied)
+         if _same_call_to_action(top, inner, destinations)),
+        None,
+    )
     if match is None:
         return None, True
     return {

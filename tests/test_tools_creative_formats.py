@@ -2494,3 +2494,85 @@ def test_x3_shapes_meta_accepted_send_the_same_body(monkeypatch, shape) -> None:
     assert client.calls[-1] == ("update", "10", {"creative": {"creative_id": "999"}})
     assert result["fields_not_copied"] == []
     assert result.get("derived_fields_left_out", []) == []
+
+
+# --- R9 P1: the top-level call to action is left out only when its destination is carried too ---
+
+_P1_LINK = "https://www.example.com/zz-test"
+
+
+def _p1_top(link: str = _P1_LINK, kind: str = "LEARN_MORE") -> dict[str, Any]:
+    return {"type": kind, "value": {"link": link}}
+
+
+# The shapes Meta returned live on 2026-11-13 for creatives this server built: the top-level
+# view is {type, value: {link}} and equals the story's own call to action.
+_P1_LIVE_SHAPES = {
+    "single_image": {"call_to_action": _p1_top(), "object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": _P1_LINK, "call_to_action": _p1_top()}}},
+    "single_image_with_query": {"call_to_action": _p1_top(_P1_LINK + "?a=1", "SHOP_NOW"), "object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": _P1_LINK + "?a=1", "call_to_action": _p1_top(_P1_LINK + "?a=1", "SHOP_NOW")}}},
+    "single_video": {"call_to_action": _p1_top(), "object_story_spec": {"page_id": "2", "video_data": {
+        "video_id": "v", "image_hash": "h", "call_to_action": _p1_top()}}},
+    "asset_pool": {"call_to_action": _p1_top(), "object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": _P1_LINK, "call_to_action": _p1_top()}},
+        "asset_feed_spec": {"optimization_type": "DEGREES_OF_FREEDOM", "bodies": [{"text": "a"}], "titles": [{"text": "b"}]}},
+}
+
+
+@pytest.mark.parametrize("shape", list(_P1_LIVE_SHAPES))
+def test_p1_live_shapes_still_leave_out_the_derived_call_to_action(shape) -> None:
+    copied = deepcopy(_P1_LIVE_SHAPES[shape])
+    entry, lost = cf._leave_out_derived_call_to_action(copied)
+    assert lost is False and entry is not None and entry["field"] == "call_to_action"
+    assert "call_to_action" not in copied
+
+
+_P1_CONFLICTS = {
+    # the story's own button names another link
+    "story_link_differs": {"object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": "https://example.com/story", "call_to_action": _p1_top("https://example.com/story")}}},
+    # the story's button has a type only, and the story leads somewhere else
+    "type_only_story_leads_elsewhere": {"object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": "https://example.com/story", "call_to_action": {"type": "LEARN_MORE"}}}},
+    # the story's button holds other values and no link, and the story leads somewhere else
+    "no_shared_values": {"object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": "https://example.com/story",
+        "call_to_action": {"type": "LEARN_MORE", "value": {"link_caption": "example.com"}}}}},
+    # a feed's type-only entry must not stand in when the feed leads somewhere else
+    "feed_type_leads_elsewhere": {"object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": "https://example.com/story", "call_to_action": _p1_top("https://example.com/story")}},
+        "asset_feed_spec": {"call_to_action_types": ["LEARN_MORE"], "link_urls": [{"website_url": "https://example.com/story"}]}},
+    # a value the copy does not hold anywhere
+    "extra_value_not_carried": {"object_story_spec": {"page_id": "2", "link_data": {
+        "image_hash": "h", "link": _P1_LINK, "call_to_action": _p1_top()}}},
+    # a card's button for another link
+    "card_link_differs": {"object_story_spec": {"page_id": "2", "link_data": {"link": "https://example.com/story", "child_attachments": [
+        {"image_hash": "h", "link": "https://example.com/a", "call_to_action": _p1_top("https://example.com/a")}]}}},
+}
+
+
+@pytest.mark.parametrize("case", list(_P1_CONFLICTS))
+def test_p1_a_destination_the_copy_does_not_carry_counts_as_lost(case) -> None:
+    top = _p1_top("https://example.com/button")
+    if case == "extra_value_not_carried":
+        top = {"type": "LEARN_MORE", "value": {"link": _P1_LINK, "lead_gen_form_id": "77"}}
+    copied = {"call_to_action": top, **deepcopy(_P1_CONFLICTS[case])}
+    entry, lost = cf._leave_out_derived_call_to_action(copied)
+    assert lost is True and entry is None
+
+
+@pytest.mark.parametrize(("inner", "destinations", "expected"), [
+    ({"type": "LEARN_MORE"}, frozenset({_P1_LINK}), True),           # type only; the story leads to the same link
+    ({"type": "LEARN_MORE"}, frozenset(), False),                    # type only; nothing says where it leads
+    ({"type": "LEARN_MORE", "value": {"link": _P1_LINK, "link_format": "x"}}, frozenset(), True),  # holds more
+    ({"type": "LEARN_MORE", "value": {"link": "https://other.example"}}, frozenset({_P1_LINK}), False),  # own link wins
+    ({"type": "SHOP_NOW", "value": {"link": _P1_LINK}}, frozenset({_P1_LINK}), False),              # another type
+])
+def test_p1_same_call_to_action_accounts_for_every_reported_value(inner, destinations, expected) -> None:
+    assert cf._same_call_to_action(_p1_top(), inner, destinations) is expected
+
+
+def test_p1_a_top_level_view_with_no_value_needs_only_the_type() -> None:
+    assert cf._same_call_to_action({"type": "LEARN_MORE"}, {"type": "learn_more", "value": {"link": _P1_LINK}}) is True
+    assert cf._same_call_to_action({"type": "LEARN_MORE", "value": "x"}, {"type": "LEARN_MORE"}) is False
