@@ -127,6 +127,13 @@ ADSET_OPTIMIZATION_SUB_EVENTS = (
 # Scheduled budget increases (Meta's high demand periods): the budget_schedules
 # reference and the budget_schedule_specs parameter on campaign and ad set creation.
 BUDGET_SCHEDULE_VALUE_TYPES = ("ABSOLUTE", "MULTIPLIER")
+# Meta does not say whether an ABSOLUTE budget_value is in whole currency units
+# or in cents: its budgets overview says amounts are in the smallest unit, its
+# budget schedule reference says "140 could be $140 or 140%". A wrong guess is a
+# 100-fold error in a spend increase, so ABSOLUTE stays off until one live check
+# settles the unit. Set this to True, and keep or drop the conversion in
+# encode_budget_schedule_specs, once that check has been made.
+BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED = False
 _BUDGET_SCHEDULE_KEYS = ("time_start", "time_end", "budget_value", "budget_value_type")
 MAX_BUDGET_SCHEDULE_SPECS = 50
 _MIN_HIGH_DEMAND_SECONDS = 3 * 60 * 60
@@ -198,6 +205,13 @@ def check_budget_schedule_specs(
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValidationError(f"{label}.budget_value must be a number, not {type(value).__name__}.")
         if value_type == "ABSOLUTE":
+            if not BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED:
+                raise ValidationError(
+                    f"{label}: ABSOLUTE is not offered yet. Meta does not document whether its "
+                    "budget_value is in whole currency units or in cents, and a wrong guess would be "
+                    "a 100-fold error in the increase. Use MULTIPLIER instead (Meta's example: 140 "
+                    "means 140 percent)."
+                )
             validate_positive_amount(value, field_name=f"{label}.budget_value")
             if daily_budget is not None and daily_budget + value > _MAX_SCHEDULED_BUDGET_MULTIPLE * daily_budget:
                 raise ValidationError(
@@ -257,7 +271,7 @@ async def create_campaign(
     adlabels: list[dict[str, Any]] | None = None,
     budget_schedule_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours, account permission required): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type ABSOLUTE or MULTIPLIER, and budget_value, which for ABSOLUTE is the increase in major units of the account currency (20 means 20.00; converted to minor units) and for MULTIPLIER is a whole number sent unchanged (Meta's example: 140 means 140 percent). A named parameter and the same key inside params cannot both be given."""
+    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours, account permission required): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. A named parameter and the same key inside params cannot both be given."""
     reject_named_and_params(
         {
             "spend_cap": spend_cap,
@@ -559,7 +573,7 @@ async def create_ad_set(
     optimization_sub_event: str | None = None,
     budget_schedule_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type ABSOLUTE or MULTIPLIER, and budget_value, which for ABSOLUTE is the increase in major units of the account currency (converted to minor units) and for MULTIPLIER a whole number sent unchanged (Meta's example: 140 means 140 percent). dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
     named_spend = {
         "daily_spend_cap": daily_spend_cap,
         "lifetime_spend_cap": lifetime_spend_cap,

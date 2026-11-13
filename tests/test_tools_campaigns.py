@@ -9,6 +9,15 @@ import pytest
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.tools import campaigns
 
+# The fixed-amount (ABSOLUTE) scheduled increase ships switched off. The tests of
+# its conversion and limits below run with it switched on.
+_ABSOLUTE_CONFIRMED_AS_SHIPPED = campaigns.BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED
+
+
+@pytest.fixture(autouse=True)
+def _absolute_budget_increases_on(monkeypatch):
+    monkeypatch.setattr(campaigns, "BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED", True)
+
 
 class FakeCampaignClient:
     """Fake campaign client."""
@@ -1813,3 +1822,17 @@ def test_update_adset_adlabels_errors_make_no_call(monkeypatch, arguments, messa
     monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
     with pytest.raises(campaigns.ValidationError, match=message):
         asyncio.run(campaigns.update_adset(adset_id="adset_1", **arguments))
+
+
+def test_absolute_budget_increase_is_refused_until_metas_unit_is_confirmed(monkeypatch) -> None:
+    monkeypatch.setattr(campaigns, "BUDGET_SCHEDULE_ABSOLUTE_UNIT_CONFIRMED", False)
+    period = {"time_start": 1798000000, "time_end": 1798010800, "budget_value": 20, "budget_value_type": "ABSOLUTE"}
+    with pytest.raises(campaigns.ValidationError, match="ABSOLUTE is not offered yet"):
+        campaigns.check_budget_schedule_specs([period], daily_budget=50, lifetime_budget=None)
+    multiplier = {**period, "budget_value": 140, "budget_value_type": "MULTIPLIER"}
+    checked = campaigns.check_budget_schedule_specs([multiplier], daily_budget=50, lifetime_budget=None)
+    assert checked[0]["budget_value"] == 140
+
+
+def test_absolute_budget_increase_is_off_by_default() -> None:
+    assert _ABSOLUTE_CONFIRMED_AS_SHIPPED is False

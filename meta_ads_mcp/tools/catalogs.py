@@ -1893,6 +1893,15 @@ def _settle(item: dict[str, Any], row: dict[str, Any]) -> None:
     if retailer_id in attribution["failed_ids"]:
         item["outcome"] = "failed"
         item["errors"] = [*item["errors"], *errors.get(retailer_id, [])] or ["Meta listed this item as invalid."]
+    elif item["errors"]:
+        # Meta's answer to the submission already listed errors for this item
+        # (validation_status), yet the finished batch does not name it as failed.
+        # The two disagree, so the item is not called applied.
+        item["outcome"] = "outcome_unknown"
+        item["reason"] = (
+            "Meta listed errors for this item when the batch was submitted, but the finished batch "
+            "did not name it as failed. Read the product before resending."
+        )
     elif attribution["complete"]:
         item["outcome"] = "applied"
     else:

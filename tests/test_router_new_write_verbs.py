@@ -225,3 +225,15 @@ def test_a_real_write_clause_is_still_offered_next_to_an_analytical_one(monkeypa
     monkeypatch.setenv("META_READ_ONLY", "true")
     reload_settings()
     assert expected not in _search(query)
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("boost the instagram post with the best engagement", "boost_instagram_post"),
+        ("duplicate the campaign with the highest spend", "duplicate_campaign"),
+        ("remove customers from the audience with the lowest reach", "remove_audience_users"),
+    ],
+)
+def test_a_command_whose_target_is_described_by_a_number_is_still_a_command(query, expected) -> None:
+    assert expected in _decision(query).compatible_tools

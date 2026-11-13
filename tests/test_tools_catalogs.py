@@ -2263,3 +2263,16 @@ def test_catalog_writes_are_blocked_in_read_only(monkeypatch, name, routed) -> N
     finally:
         monkeypatch.delenv("META_READ_ONLY")
         reload_settings()
+
+
+def test_batch_item_with_submission_errors_is_not_called_applied() -> None:
+    """Meta's answer to the submission listed errors for the item; a clean finished batch cannot overrule that."""
+    clean = {"status": "finished", "errors_total_count": 0, "errors": []}
+    flagged = {"retailer_id": "target", "warnings": [], "errors": ["price is missing"]}
+    catalogs._settle(flagged, clean)
+    assert flagged["outcome"] == "outcome_unknown"
+    assert "when the batch was submitted" in flagged["reason"]
+    assert flagged["errors"] == ["price is missing"]
+    untouched = {"retailer_id": "other", "warnings": [], "errors": []}
+    catalogs._settle(untouched, clean)
+    assert untouched["outcome"] == "applied"

@@ -844,11 +844,26 @@ _ANALYTICAL_WORDS = frozenset(
 )
 
 
+def _object_words(clause: str) -> list[str]:
+    """Return the words right after a clause's verb, up to the first preposition or conjunction."""
+    object_words: list[str] = []
+    for word in re.findall(r"[a-z0-9]+", clause)[1:]:
+        if word in _OBJECT_PHRASE_ENDINGS:
+            break
+        object_words.append(word)
+    return object_words
+
+
 def _is_analytical(clause: str) -> bool:
-    """Return whether a clause talks about reporting numbers."""
+    """Return whether the thing a clause's verb acts on is a reporting number.
+
+    Only the words right after the verb count. "boost instagram post engagement
+    totals" asks for numbers; "boost the post with the best engagement" is a
+    command whose target is described by a number.
+    """
     return any(
         word in _ANALYTICAL_WORDS or _singular(word) in _ANALYTICAL_WORDS
-        for word in re.findall(r"[a-z0-9]+", clause)
+        for word in _object_words(clause)
     )
 
 
@@ -859,17 +874,12 @@ def _acts_on_tool_subject(clause: str, name: str, *, required: int = 1) -> bool:
     must name what the tool acts on: "add customers to the audience" adds
     audience users, while in "remove outliers from audience performance" the
     thing removed is outliers. A clause that uses the verb with a particle
-    ("add up", "boost in") or talks about reporting numbers is never a command.
+    ("add up", "boost in") or whose object is a reporting number is never a command.
     The required count still applies to the whole clause.
     """
     if _is_analytical(clause):
         return False
-    words = re.findall(r"[a-z0-9]+", clause)
-    object_words: list[str] = []
-    for word in words[1:]:
-        if word in _OBJECT_PHRASE_ENDINGS:
-            break
-        object_words.append(word)
+    object_words = _object_words(clause)
     if not object_words or not _names_tool_subject(" ".join(object_words), name):
         return False
     return _names_tool_subject(clause, name, required=required)
