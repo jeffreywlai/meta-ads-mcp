@@ -1546,6 +1546,141 @@ def _refuse_unread_settings(
     raise ValidationError(message)
 
 
+# object_story_spec parts that hold the creative's own story (SDK 26.0.2 AdCreativeObjectStorySpec).
+# A creative with one of them is not promoting an existing post.
+INLINE_STORY_KEYS = ("link_data", "video_data", "photo_data", "template_data", "text_data")
+
+# Image pairs Meta returns on read but accepts only one of on create; the first (the library
+# image's hash) is kept and the second left out. video_data: Meta's live answer (2026-11-13,
+# subcode 1443051, "Only one of image_url and image_hash should be specified"). link_data and
+# photo_data: Meta's reference pages say "Specify this field or image_hash but not both".
+# template_data is typed AdCreativeLinkData in SDK 26.0.2, so the link_data rule applies to it.
+# Not changed, because Meta's reference does not say "not both" and the live carousel copy was
+# accepted as read: child_attachments (image_hash, picture) and asset_feed_spec images (hash, url).
+REDUNDANT_STORY_IMAGES = (
+    ("video_data", "image_hash", "image_url"),
+    ("link_data", "image_hash", "picture"),
+    ("photo_data", "image_hash", "url"),
+    ("template_data", "image_hash", "picture"),
+)
+_REDUNDANT_IMAGE_REASONS = {
+    "video_data": (
+        "Meta returns both the thumbnail's image_hash and image_url but refuses both together (only one of them may "
+        "be given); image_hash is kept as the stable reference to the library image, since the URL Meta returns is "
+        "a signed address that expires."
+    ),
+    "link_data": (
+        "Meta's link data reference says to give image_hash or picture but not both; image_hash, the library "
+        "image, is kept."
+    ),
+    "photo_data": (
+        "Meta's photo data reference says to give image_hash or url but not both; image_hash, the library image, "
+        "is kept."
+    ),
+    "template_data": (
+        "template_data takes link data (SDK 26.0.2), whose reference says to give image_hash or picture but not "
+        "both; image_hash, the library image, is kept."
+    ),
+}
+
+
+def _has_inline_story(copied: dict[str, Any]) -> bool:
+    spec = copied.get("object_story_spec")
+    return isinstance(spec, dict) and any(_holds_value(spec.get(key)) for key in INLINE_STORY_KEYS)
+
+
+def _carried_calls_to_action(copied: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Every call to action the copied specs carry, with where it sits.
+
+    The story's own (link, video, photo or template data), each carousel card's, and an asset
+    feed's call_to_action_types (a type only) and call_to_actions.
+    """
+    found: list[tuple[str, dict[str, Any]]] = []
+    spec = copied.get("object_story_spec")
+    if isinstance(spec, dict):
+        for key in ("link_data", "video_data", "photo_data", "template_data"):
+            data = spec.get(key)
+            if not isinstance(data, dict):
+                continue
+            if isinstance(data.get("call_to_action"), dict):
+                found.append((f"object_story_spec.{key}.call_to_action", data["call_to_action"]))
+            cards = data.get("child_attachments")
+            for index, card in enumerate(cards if isinstance(cards, list) else []):
+                if isinstance(card, dict) and isinstance(card.get("call_to_action"), dict):
+                    found.append((f"object_story_spec.{key}.child_attachments[{index}].call_to_action", card["call_to_action"]))
+    feed = copied.get("asset_feed_spec")
+    if isinstance(feed, dict):
+        types = feed.get("call_to_action_types")
+        for index, value in enumerate(types if isinstance(types, list) else []):
+            if isinstance(value, str):
+                found.append((f"asset_feed_spec.call_to_action_types[{index}]", {"type": value}))
+        entries = feed.get("call_to_actions")
+        for index, entry in enumerate(entries if isinstance(entries, list) else []):
+            if isinstance(entry, dict):
+                found.append((f"asset_feed_spec.call_to_actions[{index}]", entry))
+    return found
+
+
+def _same_call_to_action(top: Any, inner: dict[str, Any]) -> bool:
+    """Whether a top-level call to action is the same as one the copy carries.
+
+    The type must match. Of the value, only what both sides hold is compared: Meta's derived
+    top-level view was seen holding only link while the story's held more.
+    """
+    if not isinstance(top, dict):
+        return False
+    top_type = top.get("type")
+    if not isinstance(top_type, str) or not top_type.strip():
+        return False
+    if str(inner.get("type") or "").strip().upper() != top_type.strip().upper():
+        return False
+    top_value, inner_value = top.get("value"), inner.get("value")
+    if isinstance(top_value, dict) and isinstance(inner_value, dict):
+        return all(top_value[key] == inner_value[key] for key in top_value.keys() & inner_value.keys())
+    return True
+
+
+def _leave_out_derived_call_to_action(copied: dict[str, Any]) -> tuple[dict[str, str] | None, bool]:
+    """Take the top-level call_to_action out of a copy whose creative carries its own story.
+
+    Meta derives that field on read from the call to action inside the story and refuses it beside
+    the story on create ("Call to Action field must be used with existing post promotion"). On an
+    existing post (no story of its own) it is where the button belongs, so it stays. Returns the
+    entry for derived_fields_left_out when the copied specs carry the same call to action, and
+    True as the second value when they do not (a setting the copy would lose).
+    """
+    if "call_to_action" not in copied or not _has_inline_story(copied):
+        return None, False
+    top = copied.pop("call_to_action")
+    match = next((where for where, inner in _carried_calls_to_action(copied) if _same_call_to_action(top, inner)), None)
+    if match is None:
+        return None, True
+    return {
+        "field": "call_to_action",
+        "reason": (
+            f"Meta derives the top-level call_to_action from the one in {match}, which the copy carries, and refuses "
+            "it beside the creative's own story; it belongs at the top level only on an existing post."
+        ),
+    }, False
+
+
+def _leave_out_redundant_images(copied: dict[str, Any]) -> list[dict[str, str]]:
+    """Send one reference per image in the copied object_story_spec, where Meta accepts only one."""
+    spec = copied.get("object_story_spec")
+    if not isinstance(spec, dict):
+        return []
+    left_out: list[dict[str, str]] = []
+    adjusted = deepcopy(spec)
+    for key, kept, dropped in REDUNDANT_STORY_IMAGES:
+        data = adjusted.get(key)
+        if isinstance(data, dict) and _holds_value(data.get(kept)) and _holds_value(data.get(dropped)):
+            del data[dropped]
+            left_out.append({"field": f"object_story_spec.{key}.{dropped}", "reason": _REDUNDANT_IMAGE_REASONS[key]})
+    if left_out:
+        copied["object_story_spec"] = adjusted
+    return left_out
+
+
 def _features_of(spec: Any) -> dict[str, str]:
     """Read enroll_status per feature from a degrees_of_freedom_spec."""
     features: dict[str, str] = {}
@@ -1639,6 +1774,9 @@ async def _update_enhancements(
     explicit, explicit_problem, explicit_error = await _read_explicit_story_settings(client, old_creative_id)
     explicit_problem = explicit_problem or _merge_explicit_story_settings(copied, explicit)
     not_read = [f"object_story_spec.{field}" for field in EXPLICIT_STORY_SPEC_FIELDS] if explicit_problem else []
+    derived_call_to_action, call_to_action_lost = _leave_out_derived_call_to_action(copied)
+    derived = [derived_call_to_action] if derived_call_to_action else []
+    derived.extend(_leave_out_redundant_images(copied))
     old_spec = creative.get("degrees_of_freedom_spec") if isinstance(creative.get("degrees_of_freedom_spec"), dict) else {}
     new_spec = deepcopy(old_spec)
     feature_spec = new_spec.get("creative_features_spec")
@@ -1658,15 +1796,29 @@ async def _update_enhancements(
     resolved_account = normalize_account_id(account_id)
     target = {"ad_id": ad_id, "account_id": resolved_account}
     previous = {"creative_id": old_creative_id, "creative_features": _features_of(old_spec)}
+    # A derived field left out because the copy already carries its content is not a lost setting.
+    derived_top_level = {entry["field"] for entry in derived if "." not in entry["field"]}
     not_copied = sorted(
         key for key, value in creative.items()
-        if key not in {"id", "name", "account_id", "degrees_of_freedom_spec", *copied} and _holds_value(value)
+        if key not in {"id", "name", "account_id", "degrees_of_freedom_spec", *copied, *derived_top_level}
+        and _holds_value(value)
     )
     lost_settings = [field for field in READ_ONLY_CREATIVE_SETTINGS if _holds_value(creative.get(field))]
     lost_note = (
         f"The old creative has {', '.join(lost_settings)}, which Meta does not accept when a creative is created, so "
         "a copy would lose it. A real run would refuse and change nothing; make this change in Ads Manager instead."
     ) if lost_settings else None
+    call_to_action_problem = (
+        "has a top-level call_to_action that the copied "
+        f"{'object_story_spec and asset_feed_spec do' if 'asset_feed_spec' in copied else 'object_story_spec does'} "
+        "not carry with the same type and value. "
+        "Meta refuses a top-level call_to_action beside a creative's own story (it belongs there only on an existing "
+        "post), so the copy would lose it"
+    ) if call_to_action_lost else None
+    call_to_action_note = (
+        f"The old creative {call_to_action_problem}. A real run would refuse and change nothing; make this change in "
+        "Ads Manager instead."
+    ) if call_to_action_problem else None
     review_note = (
         "The ad now uses a new creative, so expect it to go back to review before it delivers with the change. "
         "The old creative is left in the library."
@@ -1698,15 +1850,23 @@ async def _update_enhancements(
             ],
             "proposed_features": _features_of(new_spec),
             "fields_not_copied": not_copied,
-            "settings_that_cannot_be_copied": lost_settings,
+            "derived_fields_left_out": derived,
+            "settings_that_cannot_be_copied": [*lost_settings, *(["call_to_action"] if call_to_action_lost else [])],
             "settings_not_read": not_read,
-            "notes": [copy_note, review_note, *(note for note in (lost_note, not_read_note) if note)],
+            "notes": [
+                copy_note, review_note, *(note for note in (lost_note, call_to_action_note, not_read_note) if note),
+            ],
         }
     if lost_settings:
         raise ValidationError(
             f"Creative {old_creative_id} has {', '.join(lost_settings)}, which Meta does not accept when a creative "
             f"is created, so the copy this change needs would lose it. Nothing was created or attached; ad {ad_id} "
             f"still uses creative {old_creative_id}. Make this change in Ads Manager instead."
+        )
+    if call_to_action_problem:
+        raise ValidationError(
+            f"Creative {old_creative_id} {call_to_action_problem}. Nothing was created or attached; ad {ad_id} still "
+            f"uses creative {old_creative_id}. Make this change in Ads Manager instead."
         )
     if not_read:
         _refuse_unread_settings(explicit_error, not_read, explicit_problem, ad_id=ad_id, creative_id=old_creative_id)
@@ -1752,5 +1912,5 @@ async def _update_enhancements(
         previous=previous,
         current={"creative_id": new_creative_id, "creative_features": _features_of(new_spec)},
     )
-    response.update({"fields_not_copied": not_copied, "notes": [copy_note, review_note]})
+    response.update({"fields_not_copied": not_copied, "derived_fields_left_out": derived, "notes": [copy_note, review_note]})
     return response
