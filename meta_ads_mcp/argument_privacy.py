@@ -62,6 +62,13 @@ PRIVATE_ARGUMENT_TOOLS: frozenset[str] = frozenset(
         "build_product_set_filter",
         # Reads a creative that can hold a Partnership Ad code and previews its copy.
         "update_ad_creative_enhancements",
+        # Take Meta's raw creative fields (creative_spec, creative, params,
+        # object_story_spec, asset_feed_spec), where a creator's Partnership Ad
+        # code sits in branded_content.instagram_boost_post_access_token.
+        "create_ad",
+        "create_ad_creative",
+        "preview_ad",
+        "update_creative",
         # Catalog settings in params can carry an integration access token
         # (partner_integration.external_access_token).
         "create_catalog",
