@@ -215,6 +215,19 @@ def _retry_timing(response: Any, attempt: int) -> RetryTiming:
     )
 
 
+# Meta's per-object edit limit (code 613) states its window only in the message,
+# for example "... the concurrent request rate limit of 1 calls per 30 seconds."
+_STATED_RATE_LIMIT_WINDOW = re.compile(r"rate limit of [1-9][0-9]{0,5} calls? per ([1-9][0-9]{0,5}) seconds?\b")
+
+
+def _with_stated_window(timing: RetryTiming, error: MetaApiError) -> RetryTiming:
+    """Wait at least the window a code 613 message states; unchanged when the message states none."""
+    match = _STATED_RATE_LIMIT_WINDOW.search(error.message) if error.code == 613 else None
+    if match is None or float(match.group(1)) <= timing.delay_seconds:
+        return timing
+    return RetryTiming(delay_seconds=float(match.group(1)), server_retry_after_seconds=timing.server_retry_after_seconds)
+
+
 def _usage_headers(response: Any) -> dict[str, Any] | None:
     """Return parsed Meta usage headers without exposing unrelated headers."""
     usage: dict[str, Any] = {}
@@ -419,6 +432,9 @@ class GraphAPIClient:
                     and bool(error.is_transient)
                 )
                 if response.status_code == 429 or _is_rate_limit_error(error):
+                    # The automatic wait for a safe read keeps its cap: can_automatically_wait.
+                    retry_timing = _with_stated_window(retry_timing, error)
+                    delay = retry_timing.delay_seconds
                     if (
                         safe_to_retry
                         and attempt + 1 < retries

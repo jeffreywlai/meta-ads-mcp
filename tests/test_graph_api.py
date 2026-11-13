@@ -504,6 +504,120 @@ def test_request_raises_rate_limit_error_for_exhausted_payload_throttle(monkeypa
     assert exc_info.value.operation == "GET /retry-edge"
 
 
+# Meta's answer to a second edit of the same ad set within 30 seconds (live, 2026-11-13).
+_PER_OBJECT_EDIT_LIMIT = {
+    "error": {
+        "message": "(#613) Calls to this API have exceeded the concurrent request rate limit of 1 calls per 30 seconds.",
+        "type": "OAuthException",
+        "code": 613,
+        "error_subcode": 4841018,
+    }
+}
+
+
+def test_per_object_edit_limit_reports_the_window_from_metas_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, _PER_OBJECT_EDIT_LIMIT, headers={
+            "x-business-use-case-usage": '{"1":[{"estimated_time_to_regain_access":0}]}',
+        }),
+        FakeResponse(200, {"id": "must_not_be_sent"}),
+    ])
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client(max_retries=2).request("POST", "123", data={"name": "x"}))
+    public = exc_info.value.to_public_dict()
+    assert public["retry_after_seconds"] == 30.0
+    assert public["code"] == 613 and public["subcode"] == 4841018
+    assert public["retryable"] is True
+    # A write is never slept on or retried by the client.
+    assert sleeps == []
+    assert len(FakeAsyncClient.responses) == 1
+
+
+def test_per_object_edit_limit_keeps_a_longer_retry_after_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(400, _PER_OBJECT_EDIT_LIMIT, headers={"Retry-After": "45"})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert exc_info.value.retry_after_seconds == 45.0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "(#613) Calls to this API have exceeded the rate limit.",
+        "(#613) rate limit of 1 calls per thirty seconds",
+        "(#613) rate limit of 1 calls per 30 minutes",
+        "(#613) rate limit of 1 calls per 0 seconds",
+    ],
+)
+def test_per_object_edit_limit_without_a_readable_window_keeps_todays_wait(
+    monkeypatch: pytest.MonkeyPatch, message: str,
+) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, {"error": {"message": message, "code": 613, "error_subcode": 4841018}}),
+    ])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert exc_info.value.retry_after_seconds == 1.0
+
+
+def test_window_in_the_message_of_another_code_is_not_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, {"error": {"message": "rate limit of 1 calls per 30 seconds", "code": 17}}),
+    ])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert exc_info.value.retry_after_seconds == 1.0
+
+
+def test_read_that_meets_the_edit_limit_waits_the_window_within_the_automatic_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, _PER_OBJECT_EDIT_LIMIT),
+        FakeResponse(200, {"id": "123"}),
+    ])
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    assert asyncio.run(_client(max_retries=1).request("GET", "123")) == {"id": "123"}
+    assert sleeps == [30.0]
+
+
+def test_read_that_meets_a_window_past_the_automatic_cap_is_not_slept_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    long_window = {"error": {**_PER_OBJECT_EDIT_LIMIT["error"],
+                             "message": "(#613) Calls to this API have exceeded the rate limit of 10 calls per 300 seconds."}}
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, long_window),
+        FakeResponse(200, {"id": "must_not_be_returned"}),
+    ])
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client(max_retries=2).request("GET", "123"))
+    assert exc_info.value.retry_after_seconds == 300.0
+    assert sleeps == []
+    assert len(FakeAsyncClient.responses) == 1
+
+
 def test_read_rate_limit_respects_retry_after_and_returns_usage_when_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
