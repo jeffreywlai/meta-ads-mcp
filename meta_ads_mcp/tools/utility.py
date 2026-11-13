@@ -196,6 +196,7 @@ TOOL_GROUPS = {
         "list_event_source_catalogs",
         "get_catalog_event_source_health",
         "get_catalog_event_source_recommendations",
+        "list_catalog_attribute_values",
     ],
     "access": [
     ],

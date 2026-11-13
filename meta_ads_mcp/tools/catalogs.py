@@ -316,13 +316,15 @@ async def _collect_edge(
     read stops the scan with a stated reason, and that page's rows are not added
     twice. max_pages caps requests regardless of how many rows came back, so a
     run of empty pages cannot loop. With stop_at_total, the first summary
-    total_count Meta returns ends the read.
+    total_count Meta returns ends the read. summary_total is the first
+    summary total_count Meta returned on any page, or None.
     """
     rows: list[Any] = []
     seen_cursors: set[str] = set()
     seen_pages: set[str] = set()
     cursor: str | None = None
     pages = 0
+    summary_total: int | None = None
     while True:
         page_params = dict(params)
         if cursor is not None:
@@ -335,16 +337,19 @@ async def _collect_edge(
             fingerprint = json.dumps(data, sort_keys=True, default=str)
             if fingerprint in seen_pages:
                 return {"rows": rows, "complete": False, "total_count": None, "pages": pages,
-                        "stop_reason": "Meta returned a page that had already been read."}
+                        "stop_reason": "Meta returned a page that had already been read.", "summary_total": summary_total}
             seen_pages.add(fingerprint)
             rows.extend(data)
         total = (payload.get("summary") or {}).get("total_count")
+        if summary_total is None:
+            summary_total = to_int(total)
         if stop_at_total and to_int(total) is not None:
             return {"rows": rows, "complete": True, "total_count": to_int(total), "pages": pages,
-                    "stop_reason": None}
+                    "stop_reason": None, "summary_total": summary_total}
         paging = payload.get("paging") or {}
         if not paging.get("next"):
-            return {"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None}
+            return {"rows": rows, "complete": True, "total_count": None, "pages": pages, "stop_reason": None,
+                    "summary_total": summary_total}
         cursor = blank_to_none((paging.get("cursors") or {}).get("after"))
         if cursor is None:
             reason = "Meta reported another page but returned no cursor to read it."
@@ -356,7 +361,8 @@ async def _collect_edge(
             reason = f"Stopped after {pages} pages."
         else:
             continue
-        return {"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason}
+        return {"rows": rows, "complete": False, "total_count": None, "pages": pages, "stop_reason": reason,
+                "summary_total": summary_total}
 
 
 async def _business_scope(client, business_id: str | None, account_id: str | None) -> dict[str, Any]:
@@ -1752,6 +1758,118 @@ async def build_product_set_filter(
         "missing_signals": missing,
         "next_step": "Pass filter to create_product_set or update_product_set to save it.",
     }
+
+
+# Readable product item fields (SDK 26.0.2 ProductItem) whose values a product set
+# filter is usually built on. Meta documents no endpoint that returns the values
+# present in a catalog with counts, so they are counted from a bounded scan.
+ATTRIBUTE_VALUE_FIELDS = (
+    "brand", "category", "product_type", "custom_label_0", "custom_label_1", "custom_label_2",
+    "custom_label_3", "custom_label_4", "availability", "condition", "color", "size", "material",
+    "pattern", "gender", "age_group", "fb_product_category", "currency", "visibility",
+    "review_status", "retailer_product_group_id",
+)
+_ATTRIBUTE_PAGE_SIZE = 100
+_ATTRIBUTE_MAX_PRODUCTS = 5000
+_ATTRIBUTE_MAX_TOP_N = 200
+_ATTRIBUTE_MAX_VERIFY = 10
+
+
+def _attribute_values(value: Any) -> list[str]:
+    """Return the countable values of one product's attribute; blanks count as no value."""
+    if isinstance(value, list):
+        return [text for entry in value for text in _attribute_values(entry)]
+    if value is None or isinstance(value, dict):
+        return [] if value is None else [json.dumps(value, sort_keys=True)]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+@mcp_server.tool()
+async def list_catalog_attribute_values(
+    catalog_id: GraphId,
+    attribute: str,
+    product_set_id: GraphId | None = None,
+    max_products: int = 1000,
+    top_n: int = 50,
+    verify_top: int = 0,
+) -> dict[str, Any]:
+    """Read-only: the values that actually occur for one product attribute (brand, category, product_type, custom_label_0 to custom_label_4, availability, color, size and similar) in a product catalog or one of its product sets, with counts, so product set filters can use exact existing values. Meta has no endpoint for this, so it scans up to max_products products (whole pages of 100) and reports how many it examined and whether that was all; counts from a partial scan are lower bounds. verify_top (up to 10) reads Meta's exact match count for that many top values, one request each."""
+    normalized = (attribute or "").strip().lower() if isinstance(attribute, str) else ""
+    if normalized not in ATTRIBUTE_VALUE_FIELDS:
+        raise ValidationError(f"attribute must be one of: {', '.join(ATTRIBUTE_VALUE_FIELDS)}.")
+    if not 1 <= max_products <= _ATTRIBUTE_MAX_PRODUCTS:
+        raise ValidationError(f"max_products must be from 1 to {_ATTRIBUTE_MAX_PRODUCTS}.")
+    if not 1 <= top_n <= _ATTRIBUTE_MAX_TOP_N:
+        raise ValidationError(f"top_n must be from 1 to {_ATTRIBUTE_MAX_TOP_N}.")
+    if not 0 <= verify_top <= _ATTRIBUTE_MAX_VERIFY:
+        raise ValidationError(f"verify_top must be from 0 to {_ATTRIBUTE_MAX_VERIFY}.")
+    parent = product_set_id or catalog_id
+    client = get_graph_api_client()
+    scan = await _collect_edge(
+        client, parent, "products", fields=[normalized],
+        params={"limit": min(_ATTRIBUTE_PAGE_SIZE, max_products), "summary": "total_count"},
+        max_pages=-(-max_products // _ATTRIBUTE_PAGE_SIZE), max_items=max_products,
+    )
+    rows = [row for row in scan["rows"] if isinstance(row, dict)]
+    counts: Counter[str] = Counter()
+    without_value = 0
+    for row in rows:
+        found = _attribute_values(row.get(normalized))
+        if not found:
+            without_value += 1
+        counts.update(set(found))
+    ranked = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    values: list[dict[str, Any]] = [{"value": value, "count": count} for value, count in ranked[:top_n]]
+    complete = scan["complete"]
+    in_scope = scan["summary_total"]
+    notes: list[str] = ["Values are counted exactly as Meta returns them; filters match on these values."]
+    if not complete:
+        of_total = f" of {in_scope}" if in_scope is not None else ""
+        notes.append(
+            f"Examined {len(rows)}{of_total} products, so counts are lower bounds and values that occur only "
+            "in unexamined products are missing. Raise max_products or use verify_top for exact counts."
+        )
+    verification_requests = 0
+    for entry in values[:verify_top]:
+        verification_requests += 1
+        try:
+            payload = await client.list_objects(
+                parent, "products", fields=["id"],
+                params={"filter": {normalized: {"eq": entry["value"]}}, "summary": "total_count", "limit": 1},
+            )
+        except _SIGNAL_ERRORS as error:
+            entry["verify_error"] = str(error)
+            continue
+        exact = to_int((payload.get("summary") or {}).get("total_count"))
+        if exact is None:
+            entry["verify_error"] = "Meta did not return summary.total_count."
+        else:
+            entry["verified_count"] = exact
+    scope: dict[str, Any] = {"catalog_id": catalog_id}
+    if product_set_id:
+        scope["product_set_id"] = product_set_id
+    scope["attribute"] = normalized
+    result: dict[str, Any] = {
+        "scope": scope,
+        "values": values,
+        "distinct_values": len(counts),
+        "values_shown": len(values),
+        "products_without_value": without_value,
+        "coverage": {
+            "products_examined": len(rows),
+            "products_in_scope": in_scope,
+            "complete": complete,
+            "stop_reason": scan["stop_reason"],
+            "requests": scan["pages"],
+            "counts_are": "exact" if complete else "lower_bounds",
+        },
+        "notes": notes,
+        "next_step": "Use these exact values in build_product_set_filter conditions.",
+    }
+    if verify_top:
+        result["verification_requests"] = verification_requests
+    return result
 
 
 @mcp_server.tool()

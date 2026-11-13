@@ -1700,7 +1700,7 @@ def test_attribute_values_verify_counts_reads_exact_totals(monkeypatch) -> None:
 
     client = _use(monkeypatch, Client(edges={("123", "products"): pages}))
     result = _run(catalogs.list_catalog_attribute_values(
-        catalog_id="123", attribute="brand", max_products=100, verify_top=2,
+        catalog_id="123", attribute="brand", max_products=200, verify_top=2,
     ))
     verify_calls = [call for kind, call in client.calls if "filter" in (call.get("params") or {})]
     assert verify_calls[0]["params"] == {"filter": {"brand": {"eq": "Acme"}}, "summary": "total_count", "limit": 1}
