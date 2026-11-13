@@ -252,7 +252,7 @@ async def list_business_users(
         response = _search_response(await _scan(client, business_id, edge, fields=fields, after=after), fields, query, text_fields, limit)
     response["scope"] = {"business_id": business_id, "user_type": user_type}
     response["notes"] = [
-        "Meta may show a person who is not a business admin only themselves and the admins, so a short list can mean limited visibility.",
+        "The list holds only the people Meta lets this token see, so a short list can mean limited visibility rather than a small business.",
         "This lists who is on the business, not who can use one catalog; use list_catalog_assigned_users for that.",
     ]
     return response
