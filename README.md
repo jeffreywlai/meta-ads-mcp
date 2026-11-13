@@ -337,6 +337,11 @@ registered.
 The `covered` count includes `ads_update_custom_audience_users`, which Meta
 documents but does not serve.
 
+Of the 30 `partial` entries, 20 are open because no public API route is known
+for what Meta's own tool does, and 10 are built differently on purpose (for
+example, a stated rule in place of Meta's private detector, or rarely used ad
+set fields left to `params`). None is waiting to be built.
+
 Each `covered` or `partial` entry also carries `verified`: `live` when every
 serving tool has been run against a real ad account and Meta accepted the
 request, otherwise `mocked`. Mocked tests use a fake client that accepts any
