@@ -901,11 +901,13 @@ _DESTINATION_PREPOSITIONS: dict[str, tuple[frozenset[str], ...]] = {
 @dataclass(frozen=True, slots=True)
 class _Word:
     """One word of a clause, lowercased, whether it was written as a Title-case name,
-    and whether it was written as a possessive ("report's", "reports'")."""
+    whether it was written as a possessive ("report's", "reports'"), and whether it
+    is a number written as an id ("#123", "act_123")."""
 
     text: str
     titled: bool
     possessive: bool = False
+    marked_id: bool = False
 
 
 # An apostrophe (straight or curly) that makes the word before it possessive.
@@ -933,9 +935,48 @@ def _phrase_words(clause: str) -> list[_Word]:
                 _POSSESSIVE_AFTER.match(text, match.end())
                 or (word[-1:] in "sS" and _PLURAL_POSSESSIVE_AFTER.match(text, match.end()))
             ),
+            word.isdigit() and _id_mark_before(text, match.start()),
         )
         for index, (word, match) in enumerate(zip(raw, matches))
     ]
+
+
+def _id_mark_before(text: str, start: int) -> bool:
+    """Whether what is written right before position start marks a number as an id: "#123", "act_123"."""
+    if text[start - 1:start] == "#":
+        return True
+    return text[max(0, start - 4):start].lower() == "act_" and not text[start - 5:start - 4].isalnum()
+# Words that say the numbers after them are ids: "id 123", "ID: 123", "ids 123, 456".
+_ID_WORDS = frozenset({"id", "ids"})
+# A bare number this long is an id; a shorter one is a position ("page 2", "section 3").
+# Meta ids are much longer than any page, row or section number.
+_MIN_BARE_ID_DIGITS = 5
+
+
+def _without_trailing_id(phrase: list[_Word]) -> list[_Word]:
+    """The phrase without the id that can follow its entity noun to say which one is meant.
+
+    That is a number written after "id" or "ids", after "#" or as act_<digits>, or a bare
+    number of at least _MIN_BARE_ID_DIGITS digits ("the dashboard's audience 1234567890").
+    A short bare number is kept: "section 2" is a place in a report. A quoted name and
+    punctuation are already gone (see _phrase_words).
+    """
+    end = len(phrase)
+    while end:
+        start = end
+        while start and phrase[start - 1].text.isdigit():
+            start -= 1
+        numbers = phrase[start:end]
+        if not numbers:
+            break
+        qualified = bool(start) and phrase[start - 1].text in _ID_WORDS
+        marked = any(word.marked_id for word in numbers)
+        if not (qualified or marked or all(len(word.text) >= _MIN_BARE_ID_DIGITS for word in numbers)):
+            break
+        if qualified or (marked and start and phrase[start - 1].text == "act"):
+            start -= 1
+        end = start
+    return phrase[:end]
 
 
 def _is_entity(word: str) -> bool:
@@ -1040,11 +1081,14 @@ def _part_of_a_report(words: list[_Word], phrase: list[_Word], stop: int) -> boo
     audience section") or after "of" ("the audience section of the
     dashboard"), and the phrase's last word, which says what the phrase is, is
     not an entity noun. When it is one ("the dashboard's audience", like "the
-    dashboard audience"), the report only says which audience is meant.
+    dashboard audience"), the report only says which audience is meant. The last
+    word is judged without an id written after it ("the dashboard's audience
+    1234567890", "the report's catalog id 42", see _without_trailing_id).
     """
-    if not phrase or _is_entity(phrase[-1].text):
+    head = _without_trailing_id(phrase) or phrase
+    if not head or _is_entity(head[-1].text):
         return False
-    if any(word.possessive and _is_report_container(word.text) for word in phrase[:-1]):
+    if any(word.possessive and _is_report_container(word.text) for word in head[:-1]):
         return True
     if stop < len(words) and words[stop].text == "of":
         owner = _phrase(words, stop + 1)[0]

@@ -22,7 +22,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from meta_ads_mcp import stdio  # noqa: F401 - import registers all tools
+from meta_ads_mcp import intent_routing, stdio  # noqa: F401 - import registers all tools
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.intent_routing import StructuredIntentRouter
@@ -655,6 +655,93 @@ def test_k13_commands_that_mention_a_report_still_offer_the_write_tool(query, ex
     _assert_command_offered(query, expected, locked)
 
 
+# Round-six review L10: the last word of a report-owned phrase is judged after
+# setting aside an id written after it. "the dashboard's audience 1234567890"
+# names an audience by id; "the report's audience section 2" is still a place
+# in the report. A short bare number is a position (page 2, section 3); a
+# number after "id" or "#", an act_ id, or a long number is an id.
+
+L10_REVIEWER_COMMANDS = [
+    ("duplicate the dashboard's top campaign 1234567890", "duplicate_campaign"),
+    ("add users to the dashboard's audience 1234567890", "add_audience_users"),
+    ("disconnect the pixel from the report's catalog 1234567890", "disconnect_catalog_event_source"),
+]
+
+L10_MORE_COMMANDS = [
+    ("add users to the report's audience id 1234567890", "add_audience_users"),
+    ("add customers to the dashboard's audience with id 1234567890", "add_audience_users"),
+    ("remove customers from the report's audience #1234567890", "remove_audience_users"),
+    ("add customers to the report's audience ID: 42", "add_audience_users"),
+    ("remove users from the dashboard's audience #77", "remove_audience_users"),
+    ("connect the pixel to the dashboard's catalog 1234567890.", "connect_catalog_event_source"),
+    ("add users to the dashboard's audience 1234567890!", "add_audience_users"),
+    ("copy the report's best ad set 1234567890 into another campaign", "duplicate_adset"),
+    ("clone the dashboard's ad 1234567890", "duplicate_ad"),
+    ("duplicate the report's campaigns ids 1234567890, 9876543210", "duplicate_campaign"),
+    ("remove users from the spreadsheet's audience 'Spring Buyers'", "remove_audience_users"),
+    ("disconnect the pixel 1234567890 from the report's catalog 9876543210", "disconnect_catalog_event_source"),
+    ("connect the dashboard's pixel 1234567890 to the catalog 9876543210", "connect_catalog_event_source"),
+    ("add users to the audience 1234567890 of the dashboard", "add_audience_users"),
+]
+
+L10_MORE_REPORTING_QUERIES = [
+    "move the audience section to page 2 of the report",
+    "add audience users to the report's audience section 2",
+    "remove customers from the dashboard's audience section 3",
+    "copy the campaign into the report's campaign section 4",
+    "add audience users to the report's audience section #2",
+    "remove the report's audience section 2",
+    "remove the dashboard's audience section 12.",
+    "add audience users to the audience section 2 of the dashboard",
+    "add customers to the audience part 2 of the report",
+    "add users to page 2 of the report",
+    "add audience users to row 12 of the dashboard",
+    "copy the campaign into slide 4 of the deck",
+    "duplicate the campaign section 2 of the weekly report",
+    "add customers to the report's audience section id 2",
+]
+
+
+@pytest.mark.parametrize(("query", "expected"), L10_REVIEWER_COMMANDS)
+def test_l10_an_explicit_entity_id_does_not_turn_a_write_into_report_editing(query, expected) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+    text = "\n".join(item.text for item in result.content if item.type == "text")
+    assert f"`{expected}`" in text
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize(("query", "expected"), L10_REVIEWER_COMMANDS + L10_MORE_COMMANDS)
+def test_l10_an_entity_named_by_id_after_a_report_still_offers_the_write_tool(query, expected, locked) -> None:
+    _assert_command_offered(query, expected, locked)
+
+
+@pytest.mark.parametrize(
+    ("phrase", "kept"),
+    [
+        ("the dashboard's audience 1234567890", "audience"),
+        ("the dashboard's account act_1234", "account"),
+        ("the report's audience ID: 42", "audience"),
+        ("the report's audience #7", "audience"),
+        ("the report's campaigns ids 1234567890, 9876543210", "campaigns"),
+        ("the report's audience section 2", "2"),
+        ("page 12", "12"),
+        ("the transact_123 audience", "audience"),
+    ],
+)
+def test_l10_the_id_after_an_entity_is_set_aside_but_a_position_is_not(phrase, kept) -> None:
+    words = intent_routing._phrase_words(f"add {phrase}")[1:]
+    assert intent_routing._without_trailing_id(words)[-1].text == kept
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize("query", L10_MORE_REPORTING_QUERIES)
+def test_l10_report_edits_that_mention_a_number_offer_read_tools_only(query, locked) -> None:
+    assert _decision(query).suppress_mutations is True, sorted(_decision(query).compatible_tools)
+    _assert_read_tools_only(query, locked)
+
+
 # End-to-end: real tool searches in each mode, switching mode inside the test,
 # independently of the read_only_searches batch the cases above share.
 
@@ -714,4 +801,6 @@ READ_ONLY_QUERIES = [
     *K13_REVIEWER_QUERIES,
     *K13_MORE_REPORTING_QUERIES,
     *(query for query, _expected in K13_COMMANDS),
+    *(query for query, _expected in L10_REVIEWER_COMMANDS + L10_MORE_COMMANDS),
+    *L10_MORE_REPORTING_QUERIES,
 ]
