@@ -196,7 +196,7 @@ def test_create_product_feed_sends_name_schedule_and_options(monkeypatch) -> Non
         catalog_id="cat_1", name="Main feed", schedule=SCHEDULE,
         update_schedule={"url": "http://example.com/prices.csv", "interval": "HOURLY"},
         file_name="feed.csv", default_currency="usd", country="us",
-        params={"delimiter": "COMMA"},
+        delimiter="COMMA",
     ))
     call = client.calls[0]
     assert (call["method"], call["parent_id"], call["edge"]) == ("create_edge_object", "cat_1", "product_feeds")
@@ -1046,9 +1046,24 @@ def test_recommendations_rank_unconnected_pixels_with_evidence(monkeypatch) -> N
 
 
 def _endless(rows):
-    """An edge that always reports another page, so a capped scan cannot finish."""
+    """An edge that always reports another page, so a capped scan cannot finish.
+
+    Each page has a new cursor and its own copy of the rows (marked with the page
+    number), so the read stops at the page cap rather than at a repeated page.
+    """
     def page(params):
-        return {"data": rows, "paging": {"next": "https://next", "cursors": {"after": "again"}}}
+        number = int(params.get("after") or 0)
+        return {
+            "data": [{**row, "page": number} for row in rows],
+            "paging": {"next": "https://next", "cursors": {"after": str(number + 1)}},
+        }
+    return page
+
+
+def _stalled(rows, cursor: str = "repeat"):
+    """An edge that returns the same page and the same cursor on every read."""
+    def page(params):
+        return {"data": [dict(row) for row in rows], "paging": {"next": "https://next", "cursors": {"after": cursor}}}
     return page
 
 
@@ -1986,3 +2001,425 @@ def test_feed_file_upload_from_the_upload_folder_is_sent(monkeypatch, tmp_path) 
     assert sent["files"]["file"][0] == "feed.csv"
     assert sent["files"]["file"][1] == b"id\n1\n"
     assert result["ok"] is True
+
+
+# round three: G6, a masked error must not keep the password further down its chain ---------------
+
+
+G6_SECRET = "synthetic-url-password-6061"
+G6_URL = f"https://user:{G6_SECRET}@example.invalid/feed.csv"
+
+
+def _error_chain(error: BaseException) -> list[BaseException]:
+    """Every error reachable through __cause__ and __context__, each once."""
+    pending: list[BaseException | None] = [error]
+    seen: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is known for known in seen):
+            continue
+        seen.append(current)
+        pending.extend([current.__cause__, current.__context__])
+    return seen
+
+
+def _assert_chain_clean(error: BaseException, secret: str) -> None:
+    import traceback
+
+    chain = _error_chain(error)
+    for link in chain:
+        assert secret not in str(link), repr(link)
+        assert secret not in repr(link), repr(link)
+        assert secret not in repr(link.args), repr(link)
+        if hasattr(link, "to_public_dict"):
+            assert secret not in repr(link.to_public_dict()), link.to_public_dict()
+    assert secret not in "".join(traceback.format_exception(error))
+
+
+class _ChainedErrorClient(FakeCatalogFeedClient):
+    """Raises the way GraphAPIClient does: a rate-limit or unsupported error from a Meta error."""
+
+    def __init__(self, kind: str = "rate_limit", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.kind = kind
+
+    def _fail(self) -> None:
+        from meta_ads_mcp.errors import RateLimitError, UnsupportedFeatureError
+
+        try:
+            raise MetaApiError(
+                message=f"Fetch {G6_URL} failed",
+                code=4,
+                user_message=f"Check {G6_URL}",
+                error_data={"url": G6_URL},
+                details={"error": {"message": f"Fetch {G6_URL} failed"}},
+            )
+        except MetaApiError as original:
+            if self.kind == "rate_limit":
+                raise RateLimitError(f"Rate limit fetching {G6_URL}", code=4, operation="GET feed") from original
+            if self.kind == "unsupported":
+                raise UnsupportedFeatureError(original.message) from original
+            # An error raised while handling another, with no explicit cause.
+            raise RuntimeError(f"wrapper around {G6_URL}")
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append({"method": "get_object", "object_id": object_id})
+        self._fail()
+
+
+def test_g6_feed_error_chain_never_contains_url_password(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    _use(monkeypatch, _ChainedErrorClient())
+    with pytest.raises(RateLimitError) as info:
+        run(catalog_feeds.list_product_feeds(feed_id="10"))
+    assert len(_error_chain(info.value)) == 2
+    _assert_chain_clean(info.value, G6_SECRET)
+    # The host and path stay readable, so the failing source can still be found.
+    assert "example.invalid/feed.csv" in str(info.value.__cause__)
+
+
+@pytest.mark.parametrize("kind", ["unsupported", "context"])
+def test_g6_every_kind_of_chained_error_is_masked(monkeypatch, kind) -> None:
+    _use(monkeypatch, _ChainedErrorClient(kind))
+    with pytest.raises(Exception) as info:
+        run(catalog_feeds.update_product_feed(feed_id="10", name="New"))
+    assert len(_error_chain(info.value)) == 2
+    _assert_chain_clean(info.value, G6_SECRET)
+
+
+def test_g6_error_chain_with_a_cycle_is_masked_and_ends(monkeypatch) -> None:
+    class CyclingClient(FakeCatalogFeedClient):
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            first = MetaApiError(message=f"first {G6_URL}")
+            second = RuntimeError(f"second {G6_URL}")
+            first.__context__ = second
+            second.__context__ = first
+            raise first
+
+    _use(monkeypatch, CyclingClient())
+    with pytest.raises(MetaApiError) as info:
+        run(catalog_feeds.list_product_feeds(feed_id="10"))
+    _assert_chain_clean(info.value, G6_SECRET)
+
+
+def test_g6_chained_error_password_reaches_no_mcp_error_or_log(monkeypatch, caplog) -> None:
+    import logging
+
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    _use(monkeypatch, _ChainedErrorClient())
+    with pytest.raises(ToolError) as info:
+        run(mcp_server.call_tool("list_product_feeds", {"feed_id": "10"}))
+    _assert_chain_clean(info.value, G6_SECRET)
+    assert G6_SECRET not in caplog.text
+    for record in caplog.records:
+        if record.exc_info:
+            _assert_chain_clean(record.exc_info[1], G6_SECRET)
+
+
+# round three: G15, a page Meta keeps returning is read once and the read says it stalled -----------
+
+
+def _stats_reads(client: FakeCatalogFeedClient) -> list[dict[str, Any]]:
+    return [call for call in client.calls if call["method"] == "list_objects" and call["edge"] == "event_stats"]
+
+
+def test_g15_feed_stats_repeated_page_is_not_counted_twice(monkeypatch) -> None:
+    row = {
+        "event_source": "20", "date_start": "2026-11-01",
+        "total_matched_content_ids": 7, "total_unmatched_content_ids": 3,
+    }
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"id": "20", "source_type": "PIXEL"}]},
+        ("10", "event_stats"): _stalled([row]),
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health("10"))
+    source = result["sources"][0]
+    assert source["matched_content_ids"] == 7, source
+    assert source["unmatched_content_ids"] == 3, source
+    assert len(_stats_reads(client)) <= 2
+    # The counts come from a stalled read: they are flagged, and no rate or finding rests on them.
+    assert result["metrics"]["stats_complete"] is False
+    assert result["metrics"]["event_stat_rows"] == 1
+    assert source["counts_complete"] is False
+    assert source["window_match_rate"] is None
+    assert "low_match_rate" not in [finding["type"] for finding in result["findings"]]
+    assert any("same page" in signal for signal in result["missing_signals"]), result["missing_signals"]
+
+
+def test_g15_repeated_cursor_stops_the_read_after_counting_each_new_page_once(monkeypatch) -> None:
+    def pages(params):
+        after = params.get("after")
+        day = {None: "2026-11-01", "a": "2026-11-02"}.get(after, "2026-11-09")
+        # The second page hands back the cursor that led to it.
+        return {
+            "data": [_stat(day, "px_1", "ViewContent", 4, 1)],
+            "paging": {"next": "https://next", "cursors": {"after": "a"}},
+        }
+
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "OFFLINE"}]},
+        ("cat_1", "event_stats"): pages,
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert len(_stats_reads(client)) == 2
+    source = result["sources"][0]
+    assert source["matched_content_ids"] == 8
+    assert [day["date"] for day in source["match_rate_history"]] == ["2026-11-01", "2026-11-02"]
+    assert source["counts_complete"] is False
+    assert any("cursor" in signal and "already" in signal for signal in result["missing_signals"])
+
+
+def test_g15_complete_stats_read_is_marked_complete(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "OFFLINE"}]},
+        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 9, 1)]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    source = result["sources"][0]
+    assert source["counts_complete"] is True
+    assert source["window_match_rate"] == 0.9
+
+
+def test_g15_recommendations_never_total_a_stalled_stats_read(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
+        ("cat_1", "event_stats"): _stalled([_stat("2026-11-01", "px_1", "ViewContent", 7, 3)]),
+        ("biz_1", "adspixels"): {"data": []},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    metrics = result["metrics"]
+    assert len(_stats_reads(client)) <= 2
+    assert metrics["matched_content_ids_28d"] is None
+    assert metrics["match_rate_28d"] is None
+    assert metrics["partial_counts_from_pages_read"] == {
+        "event_stat_rows": 1, "matched_content_ids": 7, "unmatched_content_ids": 3,
+    }
+    assert result["findings"] == []
+
+
+def test_g15_match_rate_per_catalog_from_a_stalled_read_is_partial(monkeypatch) -> None:
+    edges = _scan_edges() | {("cat_1", "event_stats"): _stalled([_stat("2026-11-01", "px_1", "ViewContent", 7, 3)])}
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+    ))
+    first = result["items"][0]["match_rate"]
+    assert first["status"] == "partial_read"
+    assert first["partial_counts_from_pages_read"] == {"matched_content_ids": 7, "unmatched_content_ids": 3}
+    assert "same page" in first["note"]
+    assert len([call for call in _stats_reads(client) if call["parent_id"] == "cat_1"]) <= 2
+
+
+def test_g15_repeated_catalog_page_is_scanned_once(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("biz_1", "owned_product_catalogs"): _stalled([{"id": "cat_1", "name": "A"}]),
+        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}]},
+    }))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    assert result["summary"]["catalogs_scanned"] == 1
+    assert result["summary"]["count"] == 1
+    assert [item["id"] for item in result["items"]] == ["cat_1"]
+    assert result["summary"]["complete"] is False
+    assert any("same page" in reason for reason in result["summary"]["stop_reasons"])
+    assert len([call for call in client.calls if call.get("edge") == "external_event_sources"]) == 1
+
+
+def test_g15_repeated_source_page_does_not_duplicate_connected_sources(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): _stalled([{"id": "px_1"}]),
+    }))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_2"))
+    assert result["previous"]["connected_event_source_ids"] == ["px_1"]
+    assert result["current"]["connected_event_source_ids"] == ["px_1", "px_2"]
+    assert result["previous_complete"] is False
+    assert any("same page" in gap for gap in result["missing_signals"])
+    assert len([call for call in client.calls if call.get("edge") == "external_event_sources" and call["method"] == "list_objects"]) <= 2
+
+
+def test_g15_repeated_empty_pages_stop_on_the_repeated_cursor(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("cat_1", "external_event_sources"): _stalled([]),
+        ("cat_1", "event_stats"): {"data": []},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    assert result["metrics"]["sources_complete"] is False
+    assert result["findings"] == []
+    assert len([call for call in client.calls if call.get("edge") == "external_event_sources"]) == 2
+    assert any("already" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize(("tool", "arguments", "parent", "edge"), [
+    ("list_product_feeds", {"catalog_id": "cat_1"}, "cat_1", "product_feeds"),
+    ("list_product_feed_uploads", {"feed_id": "feed_1"}, "feed_1", "uploads"),
+    ("list_feed_rules", {"feed_id": "feed_1"}, "feed_1", "rules"),
+    ("list_catalog_event_sources", {"catalog_id": "cat_1"}, "cat_1", "external_event_sources"),
+])
+def test_g15_list_page_that_hands_back_its_own_cursor_offers_no_next_cursor(monkeypatch, tool, arguments, parent, edge) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={(parent, edge): _stalled([{"id": "1"}], cursor="c1")}))
+    result = run(getattr(catalog_feeds, tool)(**arguments, after="c1"))
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["next_after"] is None
+    assert "repeat this page" in result["summary"]["stop_reason"]
+    # A page with a new cursor still offers it.
+    fresh = run(getattr(catalog_feeds, tool)(**arguments, after="c0"))
+    assert fresh["summary"]["next_after"] == "c1"
+    assert "stop_reason" not in fresh["summary"]
+
+
+# round three: named feed type and parsing options -----------------------------------------------
+
+
+def test_create_product_feed_sends_named_feed_type_and_parsing_options(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(
+        catalog_id="cat_1", name="Hotels", feed_type="hotel", delimiter=",", encoding="utf-8",
+        quoted_fields_mode="on", deletion_enabled=False,
+    ))
+    assert client.calls[0]["data"] == {
+        "name": "Hotels",
+        "feed_type": "HOTEL",
+        "delimiter": "COMMA",
+        "encoding": "UTF8",
+        "quoted_fields_mode": "ON",
+        "deletion_enabled": False,
+    }
+
+
+@pytest.mark.parametrize(("given", "sent"), [
+    ("|", "BAR"), (",", "COMMA"), ("\t", "TAB"), ("~", "TILDE"), (";", "SEMICOLON"),
+    ("autodetect", "AUTODETECT"), ("semicolon", "SEMICOLON"), ("Tab", "TAB"),
+])
+def test_feed_delimiter_accepts_meta_names_and_characters(monkeypatch, given, sent) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", delimiter=given))
+    assert client.calls[0]["data"]["delimiter"] == sent
+
+
+@pytest.mark.parametrize(("given", "sent"), [
+    ("UTF-8", "UTF8"), ("utf8", "UTF8"), ("ISO-8859-1", "LATIN1"), ("latin1", "LATIN1"),
+    ("UTF-16LE", "UTF16LE"), ("UTF-16BE", "UTF16BE"), ("UTF-32LE", "UTF32LE"), ("UTF-32BE", "UTF32BE"),
+    ("AUTODETECT", "AUTODETECT"),
+])
+def test_feed_encoding_accepts_meta_names_and_common_spellings(monkeypatch, given, sent) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", encoding=given))
+    assert client.calls[0]["data"]["encoding"] == sent
+
+
+def test_create_product_feed_sends_a_supplementary_feed_with_its_override(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(catalog_feeds.create_product_feed(
+        catalog_id="cat_1", name="French", ingestion_source_type="SUPPLEMENTARY_FEED",
+        primary_feed_ids="111, 222", override_type="language", override_value="fr_XX",
+    ))
+    assert client.calls[0]["data"] == {
+        "name": "French",
+        "ingestion_source_type": "supplementary_feed",
+        "primary_feed_ids": ["111", "222"],
+        "override_type": "LANGUAGE",
+        "override_value": "fr_XX",
+    }
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"feed_type": "BOATS"},
+    {"feed_type": ""},
+    {"delimiter": ":"},
+    {"encoding": "UTF-7"},
+    {"quoted_fields_mode": "maybe"},
+    {"ingestion_source_type": "secondary"},
+    {"ingestion_source_type": "supplementary_feed", "override_type": "REGION"},
+    {"primary_feed_ids": ["111"]},
+    {"override_type": "LANGUAGE"},
+    {"ingestion_source_type": "primary_feed", "override_type": "LANGUAGE"},
+    {"ingestion_source_type": "supplementary_feed", "override_value": "fr_XX"},
+    {"ingestion_source_type": "supplementary_feed", "primary_feed_ids": ["feed-one"]},
+    {"ingestion_source_type": "supplementary_feed", "primary_feed_ids": []},
+    {"delimiter": "COMMA", "params": {"delimiter": "TAB"}},
+    {"feed_type": "HOTEL", "params": {"feed_type": "HOTEL"}},
+])
+def test_create_product_feed_rejects_invalid_named_options_before_any_call(monkeypatch, kwargs) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", **kwargs))
+
+
+def test_create_product_feed_unsupported_option_error_lists_the_documented_values(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="HOTEL") as caught:
+        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", feed_type="boats-and-planes"))
+    assert "boats-and-planes" not in str(caught.value)
+
+
+def test_update_product_feed_sends_named_parsing_options_and_returns_previous(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"feed_1": {
+        "id": "feed_1", "name": "Main", "delimiter": "AUTODETECT", "encoding": "AUTODETECT",
+        "quoted_fields_mode": "AUTODETECT", "deletion_enabled": False,
+    }}))
+    result = run(catalog_feeds.update_product_feed(
+        feed_id="feed_1", delimiter="\t", encoding="ISO-8859-1", quoted_fields_mode="off", deletion_enabled=True,
+    ))
+    assert client.methods() == ["get_object", "update_object"]
+    assert client.calls[0]["fields"] == EXPECTED_FEED_UPDATE_READ_FIELDS
+    assert client.calls[1]["data"] == {
+        "delimiter": "TAB", "encoding": "LATIN1", "quoted_fields_mode": "OFF", "deletion_enabled": True,
+    }
+    assert result["previous"] == {
+        "delimiter": "AUTODETECT", "encoding": "AUTODETECT", "quoted_fields_mode": "AUTODETECT",
+        "deletion_enabled": False,
+    }
+
+
+def test_update_product_feed_refuses_to_turn_off_deletion_once_meta_has_it_on(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(objects={"feed_1": {"id": "feed_1", "deletion_enabled": True}}))
+    with pytest.raises(ValidationError, match="cannot be turned off"):
+        run(catalog_feeds.update_product_feed(feed_id="feed_1", deletion_enabled=False))
+    assert client.methods() == ["get_object"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"delimiter": "pipe"},
+    {"encoding": "ASCII"},
+    {"quoted_fields_mode": "yes"},
+    {"delimiter": "TAB", "params": {"delimiter": "TAB"}},
+    {"deletion_enabled": True, "params": {"deletion_enabled": True}},
+])
+def test_update_product_feed_rejects_invalid_named_options_before_any_call(monkeypatch, kwargs) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError):
+        run(catalog_feeds.update_product_feed(feed_id="feed_1", **kwargs))
+
+
+def test_update_product_feed_says_a_schedule_cannot_be_cleared_here() -> None:
+    doc = catalog_feeds.update_product_feed.__doc__ or ""
+    assert "cannot be removed" in doc
+    assert "delete_product_feed" in doc
+    assert "+" not in doc
+
+
+def test_feed_option_signatures_match_metas_feed_tools() -> None:
+    """Every input of Meta's create and update feed tools that its public API documents has a named parameter."""
+    create = set(inspect.signature(catalog_feeds.create_product_feed).parameters)
+    update = set(inspect.signature(catalog_feeds.update_product_feed).parameters)
+    assert {"catalog_id", "name", "feed_type", "country", "default_currency", "schedule"} <= create
+    assert {"delimiter", "encoding", "quoted_fields_mode", "deletion_enabled", "override_type"} <= create
+    assert {"name", "default_currency", "delimiter", "encoding", "quoted_fields_mode", "schedule", "update_schedule"} <= update
+
+
+def test_named_feed_options_work_through_the_mcp_boundary(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = _use(monkeypatch, FakeCatalogFeedClient())
+    run(mcp_server.call_tool("create_product_feed", {
+        "catalog_id": "1", "name": "French", "feed_type": "products", "delimiter": "\t",
+        "ingestion_source_type": "supplementary_feed", "primary_feed_ids": "111,222",
+        "override_type": "LANGUAGE", "override_value": "fr_XX",
+    }))
+    assert client.calls[0]["data"] == {
+        "name": "French", "feed_type": "PRODUCTS", "delimiter": "TAB",
+        "ingestion_source_type": "supplementary_feed", "primary_feed_ids": ["111", "222"],
+        "override_type": "LANGUAGE", "override_value": "fr_XX",
+    }
