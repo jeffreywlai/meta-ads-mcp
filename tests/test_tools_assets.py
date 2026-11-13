@@ -814,3 +814,89 @@ def test_get_field_reference_metrics_reject_object_id(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="object_id"):
         asyncio.run(assets.get_field_reference(level="metrics", field_names=["spend"], object_id="1"))
+
+
+# Round three: a later read failure keeps what was already read and says what is missing.
+
+
+class FailingPageClient(FakeAssetsClient):
+    """Serves queued pages, then fails on the configured edge's next request."""
+
+    def __init__(self, *, fail_edge: str, fail_after: int, error: Exception, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.fail_edge = fail_edge
+        self.fail_after = fail_after
+        self.error = error
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        if edge == self.fail_edge and sum(1 for call in self.list_calls if call["edge"] == edge) >= self.fail_after:
+            self.list_calls.append({"parent_id": parent_id, "edge": edge, "fields": fields, "params": dict(params or {})})
+            raise self.error
+        return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+
+@pytest.mark.parametrize("error", [
+    lambda: __import__("meta_ads_mcp.errors", fromlist=["RateLimitError"]).RateLimitError("Synthetic limit", code=4),
+    lambda: MetaApiError(message="Meta API request failed before a response was received.", is_transient=True),
+])
+def test_scan_read_failure_after_the_first_page_keeps_rows_and_is_incomplete(monkeypatch, error) -> None:
+    client = FailingPageClient(
+        fail_edge="ads", fail_after=1, error=error(),
+        pages={("act_123", "ads"): [_paged([_ad("a1", "crt_1")], after="c1")]},
+    )
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_creative_ads(creative_id="crt_1", account_id="123"))
+    assert [item["id"] for item in result["items"]] == ["a1"]
+    summary = result["summary"]
+    assert summary["complete"] is False
+    assert summary["next_after"] == "c1"
+    assert summary["scan_capped"] is False
+    assert "refused page 2" in summary["scan_note"]
+
+
+def test_scan_read_failure_on_the_first_page_is_raised(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    client = FailingPageClient(fail_edge="ads", fail_after=0, error=RateLimitError("Synthetic limit", code=4))
+    _patch(monkeypatch, client)
+    with pytest.raises(RateLimitError):
+        asyncio.run(assets.list_creative_ads(creative_id="crt_1", account_id="123"))
+
+
+def test_video_lookup_rate_limit_keeps_videos_already_read(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    class Limited(FakeAssetsClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            self.get_calls.append({"object_id": object_id})
+            if object_id == "2":
+                raise RateLimitError("Synthetic limit", code=4)
+            return {"id": object_id, "status": {"video_status": "ready"}}
+
+    client = Limited()
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_ad_videos(account_id="123", video_ids="1,2,3"))
+    assert [item["id"] for item in result["items"]] == ["1"]
+    assert [entry["id"] for entry in result["missing"]] == ["2", "3"]
+    assert result["missing"][1]["reason"].startswith("Not requested")
+    assert result["summary"]["complete"] is False
+    assert [call["object_id"] for call in client.get_calls] == ["1", "2"]
+
+
+def test_audience_adsets_targeting_failure_keeps_the_ads_scan(monkeypatch) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    client = FailingPageClient(
+        fail_edge="adsets", fail_after=0, error=RateLimitError("Synthetic limit", code=4),
+        objects={"aud_1": {"id": "aud_1", "account_id": "123"}},
+        pages={("aud_1", "ads"): [_paged([{"id": "a1", "adset_id": "s1", "campaign_id": "c1"}])]},
+    )
+    _patch(monkeypatch, client)
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1"))
+    assert [item["id"] for item in result["items"]] == ["s1"]
+    summary = result["summary"]
+    assert summary["complete"] is False
+    assert summary["targeting_scan"]["complete"] is False
+    assert summary["targeting_scan"]["error"] == "Synthetic limit"
+    with pytest.raises(RateLimitError):
+        asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting"))
