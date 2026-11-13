@@ -16,9 +16,12 @@ import re
 import socket
 from pathlib import Path
 
+import anyio
+import mcp.types as mcp_types
 import pytest
 from fastmcp.exceptions import ToolError
 from fastmcp.exceptions import ValidationError as MCPValidationError
+from mcp.shared.message import SessionMessage
 
 import meta_ads_mcp.server  # noqa: F401  (registers every tool)
 from meta_ads_mcp import argument_privacy
@@ -795,3 +798,296 @@ def test_a_registered_write_target_in_read_only_mode_keeps_the_read_only_refusal
     reload_settings()
     with pytest.raises(ToolError, match="META_READ_ONLY is enabled; 'create_ad' is not permitted"):
         _call_proxy({"name": "create_ad", "arguments": {}})
+
+
+# --- Round-five review K3: the MCP transport logs a malformed message first --------
+#
+# The mcp library checks each JSON-RPC message against the MCP request and
+# notification types before FastMCP's middleware runs, and logs the ones that
+# fail with the whole message. These tests drive the real low-level server over
+# in-memory streams, as a transport does.
+
+_TRANSPORT_PERSON = "".join(("private.person", "@transport.invalid"))
+
+
+def _jsonrpc_request(params: dict, method: str = "tools/call", request_id: int = 1):
+    return SessionMessage(mcp_types.JSONRPCMessage(
+        root=mcp_types.JSONRPCRequest(jsonrpc="2.0", id=request_id, method=method, params=params)
+    ))
+
+
+def _jsonrpc_notification(method: str, params: dict):
+    return SessionMessage(mcp_types.JSONRPCMessage(
+        root=mcp_types.JSONRPCNotification(jsonrpc="2.0", method=method, params=params)
+    ))
+
+
+def _serve(messages: list, replies: int = 1) -> list:
+    """Send messages to the real low-level MCP server and return its first replies."""
+    lowlevel = mcp_server._mcp_server
+
+    async def exercise():
+        to_server, server_in = anyio.create_memory_object_stream(10)
+        server_out, from_server = anyio.create_memory_object_stream(10)
+        received = []
+
+        async def serve():
+            await lowlevel.run(server_in, server_out, lowlevel.create_initialization_options(), stateless=True)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(serve)
+            for message in messages:
+                await to_server.send(message)
+            with anyio.fail_after(5):
+                for _ in range(replies):
+                    received.append(await from_server.receive())
+            tasks.cancel_scope.cancel()
+        return received
+
+    return anyio.run(exercise)
+
+
+def _ping(request_id: int = 99):
+    """A well-formed request: its reply shows the messages sent before it were handled."""
+    return _jsonrpc_request({}, method="ping", request_id=request_id)
+
+
+def _transport_records(caplog, prefix: str) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.getMessage().startswith(prefix)]
+
+
+def _capture_transport_logs(caplog) -> None:
+    from meta_ads_mcp.argument_privacy import MCP_LOWLEVEL_LOGGER
+
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger=MCP_LOWLEVEL_LOGGER)
+
+
+@pytest.mark.parametrize("unknown_name", [False, True])
+def test_malformed_mcp_arguments_are_private_before_tool_dispatch(caplog, unknown_name):
+    secret = _TRANSPORT_PERSON
+    name = secret if unknown_name else "add_audience_users"
+    _capture_transport_logs(caplog)
+    (reply,) = _serve([_jsonrpc_request({"name": name, "arguments": [secret]})])
+    assert reply.message.root.error.message == "Invalid request parameters"
+    assert secret not in caplog.text
+    _assert_not_logged(caplog, secret)
+    # An operator still sees that a malformed call arrived, its method, where and why.
+    (warning,) = _transport_records(caplog, "Failed to validate request: ")
+    assert warning.levelno == logging.WARNING
+    assert warning.getMessage().startswith("Failed to validate request: method 'tools/call'; params.arguments: dict_type")
+    (debug,) = _transport_records(caplog, "Message that failed validation: ")
+    assert debug.levelno == logging.DEBUG
+    assert "method 'tools/call'; params.arguments: dict_type" in debug.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        pytest.param(
+            _jsonrpc_request({"name": 5, "arguments": {"rows": [[_TRANSPORT_PERSON]]}}),
+            "Failed to validate request: method 'tools/call'; params.name: string_type",
+            id="wrong_type_name_beside_customer_rows",
+        ),
+        pytest.param(
+            _jsonrpc_request({"name": "add_audience_users", _TRANSPORT_PERSON: "x", "arguments": [1]}),
+            "Failed to validate request: method 'tools/call'; params.arguments: dict_type",
+            id="customer_value_as_an_envelope_key",
+        ),
+        pytest.param(
+            _jsonrpc_request({"uri": _TRANSPORT_PERSON, "arguments": [_TRANSPORT_PERSON]}, method=_TRANSPORT_PERSON),
+            "Failed to validate request: the method is no MCP request method and is not repeated",
+            id="customer_value_as_the_method",
+        ),
+        pytest.param(
+            _jsonrpc_request({"uri": [_TRANSPORT_PERSON]}, method="resources/read"),
+            "Failed to validate request: method 'resources/read'; params.uri: url_type",
+            id="another_request_type",
+        ),
+        pytest.param(
+            _jsonrpc_notification("notifications/cancelled", {"requestId": [_TRANSPORT_PERSON]}),
+            "Failed to validate notification: method 'notifications/cancelled'; params.requestId.int: int_type",
+            id="wrong_type_notification",
+        ),
+        pytest.param(
+            _jsonrpc_notification(_TRANSPORT_PERSON, {"requestId": [_TRANSPORT_PERSON]}),
+            "Failed to validate notification: the method is no MCP notification method and is not repeated",
+            id="customer_value_as_a_notification_method",
+        ),
+    ],
+)
+def test_every_malformed_mcp_message_keeps_method_location_and_type_only(message, expected, caplog):
+    _capture_transport_logs(caplog)
+    _serve([message, _ping()])
+    _assert_not_logged(caplog, _TRANSPORT_PERSON)
+    records = _transport_records(caplog, expected)
+    assert records, [record.getMessage() for record in caplog.records]
+    assert records[0].levelno == logging.WARNING
+
+
+def _stdio_parse_error(line: str) -> Exception:
+    """The exception the stdio transport hands the server for a line it cannot read."""
+    try:
+        mcp_types.JSONRPCMessage.model_validate_json(line)
+    except Exception as error:  # noqa: BLE001 - whatever the transport would forward
+        return error
+    raise AssertionError("the line was expected to be unreadable")
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        pytest.param(
+            '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["' + _TRANSPORT_PERSON + '"]}',
+            "JSONRPCRequest.params: dict_type",
+            id="params_as_a_list",
+        ),
+        pytest.param("tools/call " + _TRANSPORT_PERSON, "(whole message): json_invalid", id="not_json"),
+    ],
+)
+def test_an_unreadable_transport_line_is_logged_without_its_contents(line, expected, caplog):
+    _capture_transport_logs(caplog)
+    _serve([_stdio_parse_error(line)])
+    _assert_not_logged(caplog, _TRANSPORT_PERSON)
+    (record,) = _transport_records(caplog, "Received exception from stream: ")
+    assert record.levelno == logging.ERROR
+    assert expected in record.getMessage(), record.getMessage()
+
+
+def test_the_low_level_server_does_not_log_a_tool_name_that_is_no_tool(caplog):
+    _capture_transport_logs(caplog)
+    _serve([
+        _jsonrpc_request({"name": _TRANSPORT_PERSON, "arguments": {"rows": [[_TRANSPORT_PERSON]]}}, request_id=1),
+        _jsonrpc_request({"name": "list_adsets", "arguments": {}}, request_id=2),
+    ], replies=2)
+    _assert_not_logged(caplog, _TRANSPORT_PERSON)
+    misses = [record.getMessage() for record in _transport_records(caplog, "Tool cache miss for ")]
+    assert "Tool cache miss for <name that is no tool, withheld>, refreshing cache" in misses, misses
+    assert "Tool cache miss for list_adsets, refreshing cache" in misses, misses
+
+
+def _session_record(message: str, args: tuple = (), exc_info=None, level: int = logging.WARNING) -> logging.LogRecord:
+    import mcp.shared.session as session
+
+    return logging.LogRecord("root", level, session.__file__, 1, message, args, exc_info)
+
+
+def _raised_with(secret: str):
+    try:
+        try:
+            raise KeyError(secret)
+        except KeyError as inner:
+            raise RuntimeError(f"while reading {secret}") from inner
+    except RuntimeError:
+        import sys
+
+        return sys.exc_info()
+
+
+def _formatted(record: logging.LogRecord) -> str:
+    return logging.Formatter("%(levelname)s %(name)s %(message)s").format(record)
+
+
+def test_an_exception_on_the_transport_keeps_its_type_and_frames_but_not_its_message():
+    from meta_ads_mcp.argument_privacy import SessionLogPrivacyFilter
+
+    secret = _TRANSPORT_PERSON
+    record = _session_record(f"Unhandled exception in receive loop: {secret}", exc_info=_raised_with(secret), level=logging.ERROR)
+    assert SessionLogPrivacyFilter().filter(record) is True
+    rendered = _formatted(record)
+    assert secret not in rendered
+    assert record.levelno == logging.ERROR
+    assert rendered.startswith("ERROR root Unhandled exception in receive loop: RuntimeError")
+    assert "builtins.KeyError: (message withheld" in rendered
+    assert "builtins.RuntimeError: (message withheld" in rendered
+    assert "_raised_with" in rendered, "the frames should still show where it failed"
+
+
+@pytest.mark.parametrize(
+    ("message", "args", "expected"),
+    [
+        ("Progress callback raised an exception: %s", (ValueError(_TRANSPORT_PERSON),), "Progress callback raised an exception: ValueError"),
+        (f"Response ID {_TRANSPORT_PERSON!r} cannot be normalized to match pending requests", (), "Response ID cannot be normalized"),
+        (f"A message a newer mcp release logs: {_TRANSPORT_PERSON}", (), "MCP session record not recognised"),
+        (f"Failed to validate request: {_TRANSPORT_PERSON}", (), "Failed to validate request: details withheld"),
+    ],
+)
+def test_every_session_record_shape_is_withheld(message, args, expected):
+    from meta_ads_mcp.argument_privacy import SessionLogPrivacyFilter
+
+    record = _session_record(message, args)
+    assert SessionLogPrivacyFilter().filter(record) is True
+    assert _TRANSPORT_PERSON not in _formatted(record)
+    assert record.getMessage().startswith(expected), record.getMessage()
+
+
+def test_the_session_filter_leaves_other_records_on_the_root_logger_alone():
+    from meta_ads_mcp.argument_privacy import SessionLogPrivacyFilter
+
+    unchanged = _session_record("Read stream closed by client", level=logging.DEBUG)
+    other = logging.LogRecord("root", logging.WARNING, "/elsewhere/library/module.py", 1, "value %s", ("kept",), None)
+    for record, text in ((unchanged, "Read stream closed by client"), (other, "value kept")):
+        assert SessionLogPrivacyFilter().filter(record) is True
+        assert record.getMessage() == text
+
+
+@pytest.mark.parametrize(
+    ("message", "args", "expected"),
+    [
+        ("Warning: %s: %s", ("UserWarning", f"serialized {_TRANSPORT_PERSON}"), "Warning: UserWarning: (message withheld"),
+        ("Received message: %s", (_jsonrpc_request({"name": _TRANSPORT_PERSON}).message,), "Received message: JSONRPCRequest (contents withheld)"),
+        ("Tool '%s' not listed, no validation will be performed", (_TRANSPORT_PERSON,), "Tool '<name that is no tool, withheld>' not listed"),
+        ("Processing request of type %s", ("CallToolRequest",), "Processing request of type CallToolRequest"),
+    ],
+)
+def test_every_low_level_server_record_shape_is_withheld(message, args, expected):
+    from meta_ads_mcp.argument_privacy import MCP_LOWLEVEL_LOGGER, LowLevelServerLogPrivacyFilter
+
+    record = logging.LogRecord(MCP_LOWLEVEL_LOGGER, logging.INFO, __file__, 1, message, args, _raised_with(_TRANSPORT_PERSON))
+    assert LowLevelServerLogPrivacyFilter(lambda: {"list_adsets"}).filter(record) is True
+    assert _TRANSPORT_PERSON not in _formatted(record)
+    assert record.getMessage().startswith(expected), record.getMessage()
+
+
+def test_the_transport_filters_sit_where_the_mcp_library_logs():
+    """If the mcp library moves or rewords a record, this fails instead of the filter missing it."""
+    import mcp.server.lowlevel.server as lowlevel_server
+    import mcp.shared.session as session
+
+    from meta_ads_mcp.argument_privacy import (
+        MCP_LOWLEVEL_LOGGER,
+        LowLevelServerLogPrivacyFilter,
+        SessionLogPrivacyFilter,
+    )
+
+    assert any(isinstance(item, SessionLogPrivacyFilter) for item in logging.getLogger().filters)
+    assert lowlevel_server.logger.name == MCP_LOWLEVEL_LOGGER
+    assert any(isinstance(item, LowLevelServerLogPrivacyFilter) for item in logging.getLogger(MCP_LOWLEVEL_LOGGER).filters)
+
+    # The session module logs only through the root logger, and only these records.
+    source = Path(session.__file__).read_text(encoding="utf-8")
+    assert not re.search(r"\blogger\s*=|getLogger\(", source)
+    messages = re.findall(r"logging\.(?:debug|info|warning|error|exception|critical)\(\s*f?\"([^\"]*)\"", source)
+    known = (
+        "Failed to validate request: ", "Message that failed validation: ", "Failed to validate notification: ",
+        "Read stream closed by client", "Unhandled exception in receive loop: ", "Response ID ",
+        "Progress callback raised an exception: ",
+    )
+    assert messages and all(message.startswith(known) for message in messages), messages
+
+    # The low-level server's records that carry a value are the ones the filter rewrites.
+    source = Path(lowlevel_server.__file__).read_text(encoding="utf-8")
+    formatted = re.findall(r"logger\.\w+\(\s*f\"([^\"]*)\"", source)
+    assert formatted == ["Received exception from stream: {message}"], formatted
+    templates = set(re.findall(r"logger\.\w+\(\s*\"([^\"]*%[sr][^\"]*)\"", source))
+    rewritten = {
+        "Tool cache miss for %s, refreshing cache", "Tool '%s' not listed, no validation will be performed",
+        "Received message: %s", "Warning: %s: %s",
+    }
+    # These carry the server's own name, a request type's name or a request id.
+    harmless = {
+        "Initializing server %r", "Processing request of type %s", "Dispatching request of type %s",
+        "Request %s cancelled - duplicate response suppressed", "Response for %s dropped - transport closed",
+        "Dispatching notification of type %s",
+    }
+    assert templates == rewritten | harmless, templates ^ (rewritten | harmless)
