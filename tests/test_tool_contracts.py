@@ -23,6 +23,7 @@ from meta_ads_mcp.tools import (
     catalogs,
     catalog_feeds,
     creatives,
+    creative_formats,
     datasets,
     diagnostics,
     discovery,
@@ -219,6 +220,15 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
 }
+
+# Phase two, stream P1 (creatives, media and assets).
+TOOL_OVERRIDES["boost_instagram_post"] = {**TOOL_OVERRIDES["boost_instagram_post"], "adset_id": "adset_123"}
+TOOL_OVERRIDES.update({
+    "create_ad_creative_from_inputs": {"page_id": "111", "image_hash": "hash_123", "link_url": "https://example.com"},
+    "update_ad_creative_enhancements": {"features": {"image_touchups": "OPT_OUT"}},
+    "upload_ad_video": {"video_url": "https://example.com/video.mp4"},
+    "delete_ad_image": {"image_hash": "hash_123"},
+})
 
 
 class UniversalFakeClient:
@@ -591,6 +601,7 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         catalogs,
         catalog_feeds,
         creatives,
+        creative_formats,
         datasets,
         diagnostics,
         discovery,

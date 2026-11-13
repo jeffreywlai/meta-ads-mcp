@@ -190,4 +190,8 @@ def test_live_catalog_classifies_every_current_mutation() -> None:
         "add_audience_users",
         "remove_audience_users",
         "boost_instagram_post",
+        "create_ad_creative_from_inputs",
+        "update_ad_creative_enhancements",
+        "upload_ad_video",
+        "delete_ad_image",
     }
