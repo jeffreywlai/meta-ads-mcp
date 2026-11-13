@@ -3011,10 +3011,14 @@ def test_l9_batch_malformed_status_preserves_postwrite_outcome(monkeypatch, stat
     client = _use(monkeypatch, Batch(create_responses={("10", "items_batch"): {"handles": ["h1"]}}))
     _no_pause(monkeypatch)
 
+    status_requests: list[str] = []
+
+    def answer(request):
+        status_requests.append(request.url.path)
+        return httpx.Response(200, content=json.dumps(status_reply), headers={"content-type": "application/json"})
+
     async def scenario():
-        transport = httpx.MockTransport(lambda request: httpx.Response(
-            200, content=json.dumps(status_reply), headers={"content-type": "application/json"},
-        ))
+        transport = httpx.MockTransport(answer)
         async with httpx.AsyncClient(transport=transport) as http:
             monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda self, *, base_url=None: http)
             return await catalogs.batch_update_catalog_products(
@@ -3027,11 +3031,14 @@ def test_l9_batch_malformed_status_preserves_postwrite_outcome(monkeypatch, stat
     assert result["items"][0]["outcome"] == "processing"
     assert result["batch"]["handle"] == "h1"
     assert result["batch"]["status_error"]
-    assert result["batch"]["status_checks"] == 1  # an unreadable status is not asked for again
+    assert "could not be read" in result["items"][0]["reason"]
+    # An unreadable status is asked for once, not again. (Since the client change in
+    # 67433b7 it arrives as a MetaApiError; status_checks counts answers that were read.)
+    assert len(status_requests) == 1 and status_requests[0].endswith("/check_batch_request_status")
     assert result["retry"]["safe_now"] is False and "h1" in result["retry"]["how"]
 
 
-@pytest.mark.parametrize("status", [{"data": []}, {"data": [None]}, {"json_response": None},
+@pytest.mark.parametrize("status", [{"data": []}, {"data": [None]}, {"data": "x"},
                                     {"text_response": "<html>", "content_type": "text/html", "status_code": 200}])
 def test_batch_status_without_a_readable_row_is_reported_unread(monkeypatch, status) -> None:
     _no_pause(monkeypatch)
@@ -3083,10 +3090,10 @@ def test_unexpected_failure_reading_the_submission_answer_keeps_items_unresolved
 
 
 @pytest.mark.parametrize("posted", [
-    {"json_response": None}, {"json_response": "accepted"}, {"json_response": 3},
     {"text_response": "<html>ok</html>", "content_type": "text/html", "status_code": 200},
+    {"text_response": "", "content_type": None, "status_code": 204},
 ])
-def test_wrapped_submission_answer_is_unreadable_not_nothing_ingested(monkeypatch, posted) -> None:
+def test_non_json_submission_answer_is_unreadable_not_nothing_ingested(monkeypatch, posted) -> None:
     _no_pause(monkeypatch)
     client = _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], post=posted))
     result = _run(catalogs.batch_update_catalog_products(
@@ -3098,10 +3105,16 @@ def test_wrapped_submission_answer_is_unreadable_not_nothing_ingested(monkeypatc
 
 
 def test_handle_read_with_an_unreadable_status_says_so(monkeypatch) -> None:
-    _use(monkeypatch, _batch_client(status={"json_response": None}))
+    _use(monkeypatch, _batch_client(status={"data": []}))
     result = _run(catalogs.batch_update_catalog_products(catalog_id="123", handle="h1"))
     assert result["ok"] is False and result["outcome"] == "status_unreadable"
     assert result["batch"]["handle"] == "h1" and result["batch"]["status_error"]
+
+
+def test_handle_read_of_a_non_json_status_is_an_error_not_processing(monkeypatch) -> None:
+    _use(monkeypatch, _batch_client(status={"text_response": "<html>", "content_type": "text/html", "status_code": 200}))
+    with pytest.raises(MetaApiError, match="not JSON"):
+        _run(catalogs.batch_update_catalog_products(catalog_id="123", handle="h1"))
 
 
 # L1: a credential passed as the JSON text of its documented object has the object's privacy.
@@ -3194,3 +3207,190 @@ def test_a_next_link_is_still_believed_when_the_total_does_not_confirm_the_end(r
 def test_paged_without_limit_keeps_meta_next_link() -> None:
     summary = catalogs._paged(_live_page(5, 5))["summary"]
     assert summary["complete"] is False and summary["next_after"] == "A"
+
+
+# round nine ------------------------------------------------------------------------------
+
+
+def _over_real_client(monkeypatch, respond, call):
+    """Run call with the real Graph client over an in-process transport (no socket)."""
+    import httpx
+
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.graph_api import GraphAPIClient
+
+    monkeypatch.setenv("META_ACCESS_TOKEN", "test-token")
+    _no_pause(monkeypatch)
+
+    async def scenario():
+        graph = GraphAPIClient(reload_settings())
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda self, **kwargs: http)
+            monkeypatch.setattr(catalogs, "get_graph_api_client", lambda: graph)
+            return await call()
+
+    return _run(scenario())
+
+
+def _batch_reply(post_answer):
+    import httpx
+
+    methods: list[str] = []
+
+    def respond(request):
+        methods.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, content=json.dumps({"data": [{"id": "20", "retailer_id": "sku", "name": "Old"}]}))
+        return post_answer(request)
+
+    return respond, methods
+
+
+def _one_update():
+    return catalogs.batch_update_catalog_products(
+        "10", [{"method": "update", "retailer_id": "sku", "name": "New"}], wait_seconds=0,
+    )
+
+
+def test_batch_decoder_failure_after_post_keeps_item_outcomes(monkeypatch) -> None:
+    """R7 M4, as the reviewer wrote it: HTTP 200 whose body is an error object with an unreadable code.
+
+    Since 67433b7 the client reads that code as absent and raises an ordinary MetaApiError.
+    A 2xx status with an error body contradicts itself, so the outcome is unknown, not
+    "refused": every item stays outcome_unknown.
+    """
+    import httpx
+
+    respond, methods = _batch_reply(lambda request: httpx.Response(
+        200, content=json.dumps({"error": {"message": "Malformed reply", "code": []}}),
+    ))
+    result = _over_real_client(monkeypatch, respond, _one_update)
+    assert methods[-1] == "POST"
+    assert result["ok"] is False
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+
+
+def test_a_4xx_error_answer_still_means_nothing_was_ingested(monkeypatch) -> None:
+    import httpx
+
+    respond, _ = _batch_reply(lambda request: httpx.Response(
+        400, content=json.dumps({"error": {"message": "Invalid parameter", "code": 100}}),
+    ))
+    result = _over_real_client(monkeypatch, respond, _one_update)
+    assert result["items"][0]["outcome"] == "not_applied"
+
+
+@pytest.mark.parametrize("failure", [TypeError("decoder"), KeyError("x"), RuntimeError("late")])
+def test_unexpected_failure_from_the_submission_call_keeps_items_unknown(monkeypatch, failure) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1")], create_errors={("123", "items_batch"): failure},
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+    ))
+    assert client.kinds().count("create") == 1
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert type(failure).__name__ in result["answer_error"] and result["ok"] is False
+    assert "batch" not in result  # no handle is invented
+    assert result["retry"]["safe_now"] is True and result["retry"]["how"]
+
+
+def test_cancellation_of_the_submission_call_is_not_swallowed(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1")], create_errors={("123", "items_batch"): asyncio.CancelledError()},
+    ))
+    with pytest.raises(asyncio.CancelledError):
+        _run(catalogs.batch_update_catalog_products(
+            catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+        ))
+
+
+@pytest.mark.parametrize("body", [b"null", b'"accepted"', b"3", b"<html>ok</html>"])
+def test_unreadable_submission_answer_over_the_real_client_leaves_items_unknown(monkeypatch, body) -> None:
+    import httpx
+
+    headers = {"content-type": "text/html" if body.startswith(b"<") else "application/json"}
+    respond, methods = _batch_reply(lambda request: httpx.Response(200, content=body, headers=headers))
+    result = _over_real_client(monkeypatch, respond, _one_update)
+    assert methods == ["GET", "POST"]
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert result["batch"] == {"complete": False, "handles": [], "response_unreadable": True}
+    assert result["ok"] is False
+
+
+_NON_JSON = {"text_response": "<html>busy</html>", "content_type": "text/html", "status_code": 200}
+_CATALOG_WRITES = ("create", "update", "delete")
+
+
+class _NonJsonCatalogClient(FakeCatalogClient):
+    """Answers one method with the Graph client's object for a 2xx body that was not JSON."""
+
+    def __init__(self, non_json: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.non_json = non_json
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        answer = await super().get_object(object_id, fields=fields, params=params)
+        return dict(_NON_JSON) if self.non_json == "get_object" else answer
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        answer = await super().list_objects(parent_id, edge, fields=fields, params=params)
+        return dict(_NON_JSON) if self.non_json == "list_objects" else answer
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        answer = await super().create_edge_object(parent_id, edge, data=data, files=files)
+        return dict(_NON_JSON) if self.non_json == "create_edge_object" else answer
+
+    async def update_object(self, object_id, *, data):
+        answer = await super().update_object(object_id, data=data)
+        return dict(_NON_JSON) if self.non_json == "update_object" else answer
+
+    async def delete_object(self, object_id):
+        answer = await super().delete_object(object_id)
+        return dict(_NON_JSON) if self.non_json == "delete_object" else answer
+
+
+_BATCH_ITEMS = [{"method": "update", "retailer_id": "SKU-1", "name": "New"}]
+_CATALOG_PREREADS = {
+    "update_catalog": (lambda: catalogs.update_catalog("10", name="New"), "get_object"),
+    "update_catalog_product": (lambda: catalogs.update_catalog_product("p1", name="New"), "get_object"),
+    "delete_catalog_product": (lambda: catalogs.delete_catalog_product("p1"), "get_object"),
+    "update_product_set": (lambda: catalogs.update_product_set("ps1", name="New"), "get_object"),
+    "delete_product_set": (lambda: catalogs.delete_product_set("ps1"), "get_object"),
+    "batch_update_catalog_products": (lambda: catalogs.batch_update_catalog_products("123", _BATCH_ITEMS), "list_objects"),
+}
+
+
+@pytest.mark.parametrize("tool", list(_CATALOG_PREREADS))
+def test_a_non_json_pre_read_stops_the_catalog_write(monkeypatch, tool) -> None:
+    call, read = _CATALOG_PREREADS[tool]
+    client = _use(monkeypatch, _NonJsonCatalogClient(read))
+    with pytest.raises(MetaApiError, match="not JSON") as raised:
+        _run(call())
+    assert raised.value.mutation_outcome_unknown is False
+    assert not [kind for kind in client.kinds() if kind in _CATALOG_WRITES]
+
+
+_CATALOG_WRITE_CALLS = {
+    "create_catalog": (lambda: catalogs.create_catalog("10", "Catalog"), "create_edge_object"),
+    "update_catalog": (lambda: catalogs.update_catalog("10", name="New"), "update_object"),
+    "create_catalog_product": (lambda: catalogs.create_catalog_product(
+        "10", "SKU-1", "Shoe", 12.5, "USD", "https://shop.example/s", "https://shop.example/s.png"), "create_edge_object"),
+    "update_catalog_product": (lambda: catalogs.update_catalog_product("p1", name="New"), "update_object"),
+    "delete_catalog_product": (lambda: catalogs.delete_catalog_product("p1"), "delete_object"),
+    "create_product_set": (lambda: catalogs.create_product_set("10", "Set", {}), "create_edge_object"),
+    "update_product_set": (lambda: catalogs.update_product_set("ps1", name="New"), "update_object"),
+    "delete_product_set": (lambda: catalogs.delete_product_set("ps1"), "delete_object"),
+}
+
+
+@pytest.mark.parametrize("tool", list(_CATALOG_WRITE_CALLS))
+def test_a_non_json_answer_to_a_catalog_write_is_not_reported_as_done(monkeypatch, tool) -> None:
+    call, write = _CATALOG_WRITE_CALLS[tool]
+    _use(monkeypatch, _NonJsonCatalogClient(write))
+    with pytest.raises(MetaApiError, match="not known") as raised:
+        _run(call())
+    assert raised.value.mutation_outcome_unknown is True
+    assert "busy" not in str(raised.value)

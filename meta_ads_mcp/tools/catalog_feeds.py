@@ -250,6 +250,84 @@ _ACROSS_CATALOGS_NOTE = (
 )
 
 
+def _answer_unreadable(payload: Any) -> bool:
+    """Whether a Graph answer cannot be read as an object.
+
+    The Graph client raises for a bare JSON null, text or number. A 2xx body that was not
+    JSON at all still arrives as {"text_response": ..., "content_type": ..., "status_code": ...},
+    an object that holds none of the fields a tool reads.
+    """
+    return not isinstance(payload, dict) or "text_response" in payload
+
+
+class _CheckedClient:
+    """The Graph client as the catalog tools use it: an unreadable answer is never read as one.
+
+    A read whose answer cannot be read raises, so a tool that reads before it writes stops
+    before the write, and a list is never called complete from it. A write whose answer
+    cannot be read raises with the outcome unknown, so the write is never reported as a
+    plain success. Every other attribute is the client's own.
+    """
+
+    _READS = frozenset({"get_object", "list_objects"})
+    _WRITES = frozenset({"create_edge_object", "update_object", "delete_object", "delete_edge_object"})
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> Any:
+        method = getattr(self._client, name)
+        if name not in self._READS and name not in self._WRITES:
+            return method
+        write = name in self._WRITES
+
+        async def checked(*args: Any, **kwargs: Any) -> Any:
+            answer = await method(*args, **kwargs)
+            if _answer_unreadable(answer):
+                raise _unreadable_answer_error(answer, write=write)
+            return answer
+
+        return checked
+
+
+def _unreadable_answer_error(answer: Any, *, write: bool) -> MetaApiError:
+    """The error for an answer that is not a JSON object (its body is never quoted)."""
+    status = answer.get("status_code") if isinstance(answer, dict) else None
+    content_type = answer.get("content_type") if isinstance(answer, dict) else None
+    details: dict[str, Any] = {"unreadable_answer": True}
+    if isinstance(content_type, str):
+        details["content_type"] = content_type
+    if write:
+        return MetaApiError(
+            message=(
+                f"Meta answered the request{f' with HTTP {status}' if isinstance(status, int) else ''}, but the "
+                "answer was not JSON, so whether the change was made is not known. Read the object before "
+                "retrying."
+            ),
+            status_code=status if isinstance(status, int) else None,
+            details=details,
+            mutation_outcome_unknown=True,
+        )
+    return MetaApiError(
+        message="Meta's answer to a read was not JSON, so it could not be read; nothing was changed.",
+        status_code=status if isinstance(status, int) else None,
+        details=details,
+    )
+
+
+def _is_unreadable_answer_error(error: BaseException) -> bool:
+    """Whether an error says Meta's answer could not be read at all (this module's or the client's)."""
+    details = getattr(error, "details", None)
+    return isinstance(error, MetaApiError) and isinstance(details, dict) and (
+        details.get("unreadable_answer") is True or "json_type" in details
+    )
+
+
+def _client() -> _CheckedClient:
+    """This module's Graph client, checked for unreadable answers (see _CheckedClient)."""
+    return _CheckedClient(get_graph_api_client())
+
+
 def _require_id(value: str | None, name: str) -> str:
     """Return a stripped id or raise before any network call."""
     normalized = blank_to_none(value)
@@ -1291,7 +1369,7 @@ async def list_product_feeds(
     if (catalog_id is None) == (feed_id is None):
         raise ValidationError("Provide exactly one of catalog_id or feed_id.")
     _validate_limit(limit)
-    client = get_graph_api_client()
+    client = _client()
     if feed_id is not None:
         feed, unavailable = await _read_with_optional_fields(
             lambda fields: client.get_object(feed_id, fields=fields), FEED_FIELDS,
@@ -1379,7 +1457,7 @@ async def create_product_feed(
     }
     _refuse_url_logins(params, "params", _FEED_KNOWN_KEYS)
     data = merge_graph_payload(payload, params)
-    client = get_graph_api_client()
+    client = _client()
     created = await client.create_edge_object(catalog_id, "product_feeds", data=data)
     return creation_response(
         action="create_product_feed",
@@ -1427,7 +1505,7 @@ async def update_product_feed(
     if not data:
         raise ValidationError("At least one field must be provided for update_product_feed.")
     extra_reads = [key for key in data if key in FEED_READABLE_FIELDS and key not in FEED_UPDATE_READ_FIELDS]
-    client = get_graph_api_client()
+    client = _client()
     previous = await client.get_object(feed_id, fields=[*FEED_UPDATE_READ_FIELDS, *extra_reads])
     if data.get("deletion_enabled") is False and previous.get("deletion_enabled") is True:
         # Meta's reference: "Once enabled, we do not allow this field to be disabled."
@@ -1460,7 +1538,7 @@ async def update_product_feed(
 async def delete_product_feed(feed_id: str) -> dict[str, Any]:
     """Use only on an explicit request to delete a product catalog data feed and its schedule. Products the feed supplied are removed from the catalog afterwards unless another source also supplies them, and ads using them stop. Returns the feed's prior settings."""
     feed_id = _require_id(feed_id, "feed_id")
-    client = get_graph_api_client()
+    client = _client()
     previous = await client.get_object(feed_id, fields=FEED_FIELDS)
     result = await client.delete_object(feed_id)
     return mutation_response(
@@ -1550,7 +1628,7 @@ async def create_product_feed_upload(
             "would_send": would_send,
             "upload_source": source,
         }
-    client = get_graph_api_client()
+    client = _client()
     if files is None:
         created = await client.create_edge_object(feed_id, "uploads", data=data)
     else:
@@ -1592,7 +1670,7 @@ async def list_product_feed_uploads(
         or not 1 <= error_limit <= MAX_UPLOAD_ERRORS
     ):
         raise ValidationError(f"error_limit must be an integer from 1 to {MAX_UPLOAD_ERRORS}.")
-    client = get_graph_api_client()
+    client = _client()
     if upload_id is not None:
         upload = await client.get_object(upload_id, fields=UPLOAD_FIELDS)
         return {
@@ -1624,7 +1702,7 @@ async def list_feed_rules(
     """List the attribute mapping and transformation rules applied to a product catalog data feed's uploads."""
     feed_id = _require_id(feed_id, "feed_id")
     _validate_limit(limit)
-    client = get_graph_api_client()
+    client = _client()
     payload = await client.list_objects(
         feed_id, "rules", fields=RULE_FIELDS, params=_page_params(limit, after),
     )
@@ -1647,7 +1725,7 @@ async def create_feed_rule(
     if normalized_type not in FEED_RULE_TYPES:
         raise ValidationError(f"rule_type must be one of {', '.join(FEED_RULE_TYPES)}.")
     rule_params = _validate_rule_params(normalized_type, params)
-    client = get_graph_api_client()
+    client = _client()
     created = await client.create_edge_object(
         feed_id,
         "rules",
@@ -1671,7 +1749,7 @@ async def update_feed_rule(
     """Change the params of one product catalog feed rule, returning before and after. params replaces the rule's params in full, in the shape its rule_type takes (see create_feed_rule). A rule's attribute and rule_type cannot be changed: delete the rule and create a new one. dry_run=true reads the rule and returns the request without sending it."""
     rule_id = _require_id(rule_id, "rule_id")
     _check_rule_params_shape(params)
-    client = get_graph_api_client()
+    client = _client()
     rule = await client.get_object(rule_id, fields=RULE_FIELDS)
     rule_type = str(rule.get("rule_type") or "").strip().lower()
     notes: list[str] = []
@@ -1729,7 +1807,7 @@ def _is_retired_endpoint(error: MetaApiError) -> bool:
 async def delete_feed_rule(rule_id: str) -> dict[str, Any]:
     """Use only on an explicit request to delete one product catalog feed rule. The feed and its products are unaffected; later uploads are no longer transformed by the rule. Returns the rule as it was. Meta's live API has answered that this delete is retired; when it does, the rule is not deleted and the error says what to do."""
     rule_id = _require_id(rule_id, "rule_id")
-    client = get_graph_api_client()
+    client = _client()
     previous = await client.get_object(rule_id, fields=RULE_FIELDS)
     try:
         result = await client.delete_object(rule_id)
@@ -1755,7 +1833,7 @@ async def list_catalog_event_sources(
     """List the pixels, apps, and other event sources connected to a Meta product catalog."""
     catalog_id = _require_id(catalog_id, "catalog_id")
     _validate_limit(limit)
-    client = get_graph_api_client()
+    client = _client()
     payload = await client.list_objects(
         catalog_id, "external_event_sources",
         fields=EVENT_SOURCE_FIELDS, params=_page_params(limit, after),
@@ -1838,7 +1916,7 @@ async def list_event_source_catalogs(
     event_source_id = _require_id(event_source_id, "event_source_id")
     business_id = blank_to_none(business_id)
     event_name = _canonical_event_name(event_name, include_match_rates)
-    client = get_graph_api_client()
+    client = _client()
     if business_id is None:
         source = await client.get_object(event_source_id, fields=["id", "owner_business"])
         business_id = _object_id(source.get("owner_business"))
@@ -1932,7 +2010,7 @@ async def get_catalog_event_source_health(
     catalog_id = _require_id(catalog_id, "catalog_id")
     _validate_threshold(match_rate_threshold)
     scope_id = blank_to_none(event_source_id)
-    client = get_graph_api_client()
+    client = _client()
     inputs = await _catalog_signal_inputs(client, catalog_id)
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
@@ -2117,7 +2195,7 @@ async def get_catalog_event_source_recommendations(
     catalog_id = _require_id(catalog_id, "catalog_id")
     business_id = blank_to_none(business_id)
     _validate_threshold(match_rate_threshold)
-    client = get_graph_api_client()
+    client = _client()
     if business_id is None:
         catalog = await client.get_object(catalog_id, fields=["id", "business"])
         business_id = _object_id(catalog.get("business"))
@@ -2326,7 +2404,7 @@ async def connect_catalog_event_source(
     """Connect a pixel or app to a Meta product catalog so its catalog events can match items. Returns the connected sources before and after; an already connected source is left as is."""
     catalog_id = _require_id(catalog_id, "catalog_id")
     event_source_id = _require_id(event_source_id, "event_source_id")
-    client = get_graph_api_client()
+    client = _client()
     _, before, complete, gaps = await _connection_state(client, catalog_id)
     target = {"catalog_id": catalog_id, "event_source_id": event_source_id}
     if event_source_id in before:
@@ -2361,7 +2439,7 @@ async def disconnect_catalog_event_source(
     """Use only on an explicit request to disconnect a pixel or app from a Meta product catalog; catalog ads stop using its events. Returns the source and the connected list before and after."""
     catalog_id = _require_id(catalog_id, "catalog_id")
     event_source_id = _require_id(event_source_id, "event_source_id")
-    client = get_graph_api_client()
+    client = _client()
     sources, before, complete, gaps = await _connection_state(client, catalog_id)
     source = next((s for s in sources if _object_id(s.get("id")) == event_source_id), None)
     if source is None and complete:

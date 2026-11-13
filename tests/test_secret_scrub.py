@@ -247,3 +247,106 @@ def test_a_url_login_scan_of_a_long_text_finishes_in_bounded_time() -> None:
         masked = _mask_url_passwords(text)
         found = _caller_secrets({"username": text})
     assert SHORT not in masked and found == [SHORT]
+
+
+# Round nine: every cell of the module docstring's table of what is found.
+
+_MATRIX_SECRETS = {
+    "plain": "".join(("Plain-", "secret-77")),
+    "backslash": "".join(("Back\\", "slash-77")),
+    "quote": "".join(("Quote\"", "secret-77")),
+    "plus": "".join(("Plus+", "secret-77")),
+    "percent": "".join(("Pct%2F", "secret-77")),
+    "percent+backslash": "".join(("Pct%2F\\", "slash-77")),
+    "percent+quote": "".join(("Pct%2F\"", "quote-77")),
+    "percent+plus": "".join(("Pct%2F+", "plus-77")),
+    "backslash+plus": "".join(("Back\\+", "plus-77")),
+}
+
+
+def _percent_layers(text: str, layers: int) -> str:
+    for _ in range(layers):
+        text = quote(text, safe="")
+    return text
+
+
+def _json(text: str) -> str:
+    return json.dumps(text)[1:-1]
+
+
+def _echo(secret: str, json_place: str, layers: int) -> str:
+    if json_place == "none":
+        return _percent_layers(secret, layers)
+    if json_place == "outside":
+        return _json(_percent_layers(secret, layers))
+    return _percent_layers(_json(secret), layers)
+
+
+_MAX_LAYERS = secret_scrub.MAX_SINGLE_PERCENT_LAYERS
+
+
+@pytest.mark.parametrize("held", list(_MATRIX_SECRETS))
+@pytest.mark.parametrize("json_place", ["none", "outside", "inside"])
+@pytest.mark.parametrize("layers", [0, 1, 2, _MAX_LAYERS, _MAX_LAYERS + 1])
+def test_encoding_matrix(held, json_place, layers) -> None:
+    secret = _MATRIX_SECRETS[held]
+    echo = _echo(secret, json_place, layers)
+    cleaned = scrub_text(f"x {echo} y", [secret], policy=ERROR)
+    expected_found = not ("percent" in held and layers > _MAX_LAYERS)
+    if expected_found:
+        assert cleaned == "x [redacted] y", (echo, cleaned)
+    else:
+        # The documented limit: a literal %HH encoded more layers than are read one at a time.
+        assert cleaned == f"x {echo} y"
+
+
+@pytest.mark.parametrize("held", ["backslash", "quote"])
+def test_json_escaping_applied_twice_is_a_documented_miss(held) -> None:
+    secret = _MATRIX_SECRETS[held]
+    echo = _json(_json(secret))
+    assert scrub_text(f"x {echo} y", [secret], policy=ERROR) == f"x {echo} y"
+
+
+@pytest.mark.parametrize("json_character", [chr(34), chr(92)])
+@pytest.mark.parametrize("outcome", ["error", "success"])
+def test_json_escaped_password_with_its_own_percent_sequence_is_private(monkeypatch, json_character, outcome) -> None:
+    """R7 M1: JSON escaping only, of a password holding a literal %2F and a quote or backslash."""
+    import asyncio
+
+    from meta_ads_mcp.tools import catalog_feeds
+
+    secret = "".join(("R7", json_character, "percent", "%2FTail"))
+    encoded = json.dumps(secret)[1:-1]
+
+    class Echo:
+        async def create_edge_object(self, parent_id, edge, *, data):
+            if outcome == "error":
+                raise MetaApiError("Rejected credential " + encoded, code=100)
+            return {"id": "20", "detail": encoded}
+
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", Echo)
+    call = catalog_feeds.create_product_feed_upload(
+        "10", url="https://example.invalid/feed.csv", username="feed-user", password=secret,
+    )
+    if outcome == "error":
+        with pytest.raises(MetaApiError) as raised:
+            asyncio.run(call)
+        shown = str(raised.value)
+    else:
+        shown = asyncio.run(call)["created"]["detail"]
+    assert encoded not in shown and "[redacted]" in shown
+
+
+_PERCENT_SECRETS = ["".join(("Pct%2F", "\\slash-77")), "".join(("50%2B", "off\"x9"))]
+
+
+@pytest.mark.parametrize(("case", "text"), [
+    ("escaped backslashes and percent escapes", "%5C\\\\%25" * 100_000),
+    ("deeply nested percent escapes", "%" + "25" * 400_000 + "2F"),
+    ("many nested escapes", "%25252F\\u0025" * 80_000),
+], ids=lambda value: value if isinstance(value, str) and len(value) < 60 else "")
+@pytest.mark.parametrize("policy", [RESULT, ERROR])
+def test_every_reading_finishes_in_bounded_time(case, text, policy) -> None:
+    # Secrets holding a percent escape and a backslash turn on every reading.
+    with _deadline(5.0):
+        scrub_text(text, _PERCENT_SECRETS, policy=policy)

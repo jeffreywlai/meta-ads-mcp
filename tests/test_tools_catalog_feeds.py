@@ -3419,3 +3419,127 @@ def test_delete_feed_rule_keeps_any_other_meta_error(monkeypatch) -> None:
     _use(monkeypatch, RefusedDelete(objects={"rule_1": rule}))
     with pytest.raises(MetaApiError):
         run(catalog_feeds.delete_feed_rule(rule_id="rule_1"))
+
+
+# round nine: an answer that is not JSON never lets a write go ahead or count as done ----------
+
+_NON_JSON = {"text_response": "<html>busy</html>", "content_type": "text/html", "status_code": 200}
+_FEED_WRITES = ("create_edge_object", "update_object", "delete_object", "delete_edge_object")
+
+
+class _NonJsonFeedClient(FakeCatalogFeedClient):
+    """Answers the named method with the Graph client's object for a 2xx body that was not JSON."""
+
+    def __init__(self, non_json: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.non_json = non_json
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        answer = await super().get_object(object_id, fields=fields, params=params)
+        return dict(_NON_JSON) if self.non_json == "get_object" else answer
+
+    async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+        answer = await super().list_objects(parent_id, edge, fields=fields, params=params)
+        return dict(_NON_JSON) if self.non_json == "list_objects" else answer
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        answer = await super().create_edge_object(parent_id, edge, data=data, files=files)
+        return dict(_NON_JSON) if self.non_json == "create_edge_object" else answer
+
+    async def update_object(self, object_id: str, *, data):
+        answer = await super().update_object(object_id, data=data)
+        return dict(_NON_JSON) if self.non_json == "update_object" else answer
+
+    async def delete_object(self, object_id: str):
+        answer = await super().delete_object(object_id)
+        return dict(_NON_JSON) if self.non_json == "delete_object" else answer
+
+    async def delete_edge_object(self, parent_id: str, edge: str, *, data):
+        answer = await super().delete_edge_object(parent_id, edge, data=data)
+        return dict(_NON_JSON) if self.non_json == "delete_edge_object" else answer
+
+
+_RULE = {"id": "20", "attribute": "brand", "rule_type": "mapping_rule", "params": {"map_from": "old"}}
+_CONNECTED = {("10", "external_event_sources"): {"data": [{"id": "30", "name": "Pixel"}]}}
+
+# Every tool here that reads before it writes: the call, the read, and what the fake needs.
+_FEED_PREREADS = {
+    "update_product_feed": (lambda: catalog_feeds.update_product_feed("f1", name="New"), "get_object", {}),
+    "delete_product_feed": (lambda: catalog_feeds.delete_product_feed("f1"), "get_object", {}),
+    "update_feed_rule": (lambda: catalog_feeds.update_feed_rule("20", {"map_from": "new"}), "get_object",
+                         {"objects": {"20": dict(_RULE)}}),
+    "delete_feed_rule": (lambda: catalog_feeds.delete_feed_rule("20"), "get_object", {"objects": {"20": dict(_RULE)}}),
+    "connect_catalog_event_source": (lambda: catalog_feeds.connect_catalog_event_source("10", "31"), "list_objects", {}),
+    "disconnect_catalog_event_source": (lambda: catalog_feeds.disconnect_catalog_event_source("10", "30"),
+                                        "list_objects", {"edges": dict(_CONNECTED)}),
+}
+
+
+@pytest.mark.parametrize("tool", list(_FEED_PREREADS))
+def test_a_non_json_pre_read_stops_the_write(monkeypatch, tool) -> None:
+    call, read, setup = _FEED_PREREADS[tool]
+    client = _use(monkeypatch, _NonJsonFeedClient(read, **setup))
+    with pytest.raises(MetaApiError, match="not JSON") as raised:
+        run(call())
+    assert raised.value.mutation_outcome_unknown is False
+    assert not [method for method in client.methods() if method in _FEED_WRITES]
+
+
+# Every write here: the call, the write, and what the fake needs.
+_FEED_WRITE_CALLS = {
+    "create_product_feed": (lambda: catalog_feeds.create_product_feed("10", "Feed"), "create_edge_object", {}),
+    "update_product_feed": (lambda: catalog_feeds.update_product_feed("f1", name="New"), "update_object", {}),
+    "delete_product_feed": (lambda: catalog_feeds.delete_product_feed("f1"), "delete_object", {}),
+    "create_product_feed_upload": (lambda: catalog_feeds.create_product_feed_upload(
+        "10", url="https://example.invalid/f.csv"), "create_edge_object", {}),
+    "create_feed_rule": (lambda: catalog_feeds.create_feed_rule("10", "brand", "mapping_rule", {"map_from": "b"}),
+                         "create_edge_object", {}),
+    "update_feed_rule": (lambda: catalog_feeds.update_feed_rule("20", {"map_from": "new"}), "update_object",
+                         {"objects": {"20": dict(_RULE)}}),
+    "delete_feed_rule": (lambda: catalog_feeds.delete_feed_rule("20"), "delete_object", {"objects": {"20": dict(_RULE)}}),
+    "connect_catalog_event_source": (lambda: catalog_feeds.connect_catalog_event_source("10", "31"),
+                                     "create_edge_object", {}),
+    "disconnect_catalog_event_source": (lambda: catalog_feeds.disconnect_catalog_event_source("10", "30"),
+                                        "delete_edge_object", {"edges": dict(_CONNECTED)}),
+}
+
+
+@pytest.mark.parametrize("tool", list(_FEED_WRITE_CALLS))
+def test_a_non_json_answer_to_a_write_is_not_reported_as_done(monkeypatch, tool) -> None:
+    call, write, setup = _FEED_WRITE_CALLS[tool]
+    client = _use(monkeypatch, _NonJsonFeedClient(write, **setup))
+    with pytest.raises(MetaApiError, match="not known") as raised:
+        run(call())
+    assert raised.value.mutation_outcome_unknown is True
+    assert client.methods().count(write) == 1
+    assert "busy" not in str(raised.value)  # the body itself is never quoted
+
+
+@pytest.mark.parametrize("body", [None, 0, "text", "non-json"])
+def test_unreadable_pre_read_stops_a_feed_delete_over_the_real_client(monkeypatch, body) -> None:
+    """R7 M2's shape, extended to a 2xx body that is not JSON at all."""
+    import httpx
+
+    from meta_ads_mcp.graph_api import GraphAPIClient
+
+    monkeypatch.setenv("META_ACCESS_TOKEN", "test-token")
+    methods: list[str] = []
+
+    def respond(request):
+        methods.append(request.method)
+        if request.method != "GET":
+            return httpx.Response(200, content=json.dumps(True))
+        if body == "non-json":
+            return httpx.Response(200, content=b"<html>busy</html>", headers={"content-type": "text/html"})
+        return httpx.Response(200, content=json.dumps(body), headers={"content-type": "application/json"})
+
+    async def scenario():
+        graph = GraphAPIClient(reload_settings())
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda self, **kwargs: http)
+            monkeypatch.setattr(catalog_feeds, "get_graph_api_client", lambda: graph)
+            with pytest.raises(MetaApiError):
+                await catalog_feeds.delete_product_feed("10")
+
+    run(scenario())
+    assert methods == ["GET"]

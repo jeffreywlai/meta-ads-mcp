@@ -35,7 +35,14 @@ from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 # is replaced, keeping user, host and path, and a password or token the caller supplied
 # is removed; the URL-login check on inputs is shared too. catalog_feeds imports nothing
 # from here.
-from meta_ads_mcp.tools.catalog_feeds import _count_keys, _guard_secrets, _masked_json_text, _redact
+from meta_ads_mcp.tools.catalog_feeds import (
+    _CheckedClient,
+    _count_keys,
+    _is_unreadable_answer_error,
+    _guard_secrets,
+    _masked_json_text,
+    _redact,
+)
 from meta_ads_mcp.tools.catalog_feeds import _refuse_url_logins as _refuse_url_logins_shared
 
 # Fields documented on the Product Catalog reference page.
@@ -178,6 +185,16 @@ _SIGNAL_ERRORS = (MetaApiError, UnsupportedFeatureError, NotFoundError)
 _EMPTY_SET_MESSAGE = (
     "Meta documents that ads tied to an empty product set will not deliver."
 )
+
+
+def _client() -> _CheckedClient:
+    """This module's Graph client: an answer that is not a JSON object is never read as one.
+
+    A pre-read or a list page that cannot be read raises, so nothing is written after it and
+    no list is called complete; a write answered with something that is not JSON raises with
+    the outcome unknown (catalog_feeds._CheckedClient).
+    """
+    return _CheckedClient(get_graph_api_client())
 
 
 def _require(value: str | None, name: str) -> str:
@@ -584,7 +601,7 @@ async def list_catalogs(
     if edge is None:
         raise ValidationError("ownership must be owned or client.")
     requested = normalize_field_list(fields) or CATALOG_FIELDS
-    client = get_graph_api_client()
+    client = _client()
     if scope_name == "catalog_id":
         catalog = await client.get_object(scope_value, fields=requested)
         result = _single(catalog)
@@ -929,7 +946,7 @@ async def list_dpa_eligible_catalogs(
                 "ad_format must be A_PLUS_CA (Advantage catalog ads) or PE (product extensions)."
             )
     has_context = ad_domain is not None or pixel_id is not None or page_id is not None
-    client = get_graph_api_client()
+    client = _client()
     scope = await _business_scope(
         client,
         scope_value if scope_name == "business_id" else None,
@@ -1177,7 +1194,7 @@ async def get_catalog_diagnostics(
         if normalized not in DIAGNOSTIC_SEVERITIES:
             raise ValidationError(f"severity must be one of: {', '.join(DIAGNOSTIC_SEVERITIES)}.")
         params["severities"] = [normalized]
-    payload = await get_graph_api_client().list_objects(
+    payload = await _client().list_objects(
         catalog_id, "diagnostics", fields=DIAGNOSTIC_FIELDS, params=params,
     )
     result = _paged(payload)
@@ -1239,7 +1256,7 @@ async def get_catalog_dynamic_ads_health(
     """Whether a product catalog, or one product set in it, can serve catalog (dynamic) ads, and what blocks it. Combines the catalog's dynamic-ads diagnostics, product counts and connected event sources; lists the signals used."""
     catalog_id = _require(catalog_id, "catalog_id")
     product_set_id = blank_to_none(product_set_id)
-    client = get_graph_api_client()
+    client = _client()
     catalog = await client.get_object(catalog_id, fields=CATALOG_FIELDS)
     used = ["product_catalog.product_count"]
     missing: list[str] = []
@@ -1352,7 +1369,7 @@ async def list_catalog_data_sources(
         raise ValidationError(f"ingestion_source_type must be one of: {', '.join(DATA_SOURCE_TYPES)}.")
     params = _page_params(limit, after)
     params["ingestion_source_type"] = source_type
-    payload = await get_graph_api_client().list_objects(
+    payload = await _client().list_objects(
         catalog_id, "data_sources", fields=DATA_SOURCE_FIELDS, params=params,
     )
     result = _paged(payload)
@@ -1376,7 +1393,7 @@ async def create_catalog(
     _choice(vertical, CATALOG_VERTICALS, "vertical")
     _refuse_url_logins_in(name=name, params=params)
     payload = merge_graph_payload({"name": name, "vertical": vertical}, params)
-    result = await get_graph_api_client().create_edge_object(
+    result = await _client().create_edge_object(
         business_id, "owned_product_catalogs", data=payload,
     )
     return creation_response(action="create_catalog", target={"business_id": business_id}, result=result)
@@ -1400,7 +1417,7 @@ async def update_catalog(
     extra_reads = list(dict.fromkeys(
         CATALOG_EXTRA_READABLE[key] for key in payload if key in CATALOG_EXTRA_READABLE
     ))
-    client = get_graph_api_client()
+    client = _client()
     previous, refused = await _read_previous(client, catalog_id, CATALOG_UPDATE_READ_FIELDS, extra_reads)
     await client.update_object(catalog_id, data=payload)
     previous_values = {key: previous.get(key) for key in CATALOG_UPDATE_READ_FIELDS if key != "id"}
@@ -1490,7 +1507,7 @@ async def list_catalog_products(
                 "view=product_groups takes no filter, error_type or error_priority; Meta documents no "
                 "parameters on the product_groups edge."
             )
-    client = get_graph_api_client()
+    client = _client()
     if scope_name == "product_id":
         requested = normalize_field_list(fields) or PRODUCT_FIELDS
         result = _single(await client.get_object(scope_value, fields=requested))
@@ -1571,7 +1588,7 @@ async def create_catalog_product(
         "brand": product.get("brand", OMIT),
     })
     payload = merge_graph_payload(typed, params)
-    result = await get_graph_api_client().create_edge_object(catalog_id, "products", data=payload)
+    result = await _client().create_edge_object(catalog_id, "products", data=payload)
     return creation_response(
         action="create_catalog_product",
         target={"catalog_id": catalog_id, "retailer_id": typed["retailer_id"]},
@@ -1617,7 +1634,7 @@ async def update_catalog_product(
         shown.update(params)
     readable_fields = PRODUCT_READABLE_UPDATE_FIELDS | PRODUCT_SDK_READABLE_UPDATE_FIELDS
     readable = [key for key in payload if key in readable_fields]
-    client = get_graph_api_client()
+    client = _client()
     previous, refused = await _read_previous(
         client, product_id, PRODUCT_DETAIL_FIELDS, [key for key in readable if key not in PRODUCT_DETAIL_FIELDS],
     )
@@ -1642,7 +1659,7 @@ async def update_catalog_product(
 async def delete_catalog_product(product_id: str) -> dict[str, Any]:
     """Delete one product from its product catalog. Use only when the user explicitly asks; the product is read first and returned as previous."""
     product_id = _require(product_id, "product_id")
-    client = get_graph_api_client()
+    client = _client()
     previous = await client.get_object(product_id, fields=PRODUCT_DETAIL_FIELDS)
     result = await client.delete_object(product_id)
     response = mutation_response(
@@ -1990,14 +2007,14 @@ def _by_id(entries: Any) -> dict[str, list[str]]:
     return grouped
 
 
-# The Graph client's wrappers for an answer that was not a JSON object: a bare null, text or
-# number ({"json_response": ...}) or a body that was not JSON ({"text_response": ...}).
-_UNREADABLE_ANSWER_KEYS = ("json_response", "text_response")
-
-
 def _answer_unreadable(payload: Any) -> bool:
-    """Whether Meta's answer cannot be read as an object at all."""
-    return not isinstance(payload, dict) or any(key in payload for key in _UNREADABLE_ANSWER_KEYS)
+    """Whether Meta's answer cannot be read as an object at all.
+
+    The Graph client raises for a bare JSON null, text or number; a 2xx body that was not
+    JSON arrives as its {"text_response": ...} object (the checked client turns that into
+    an error too; this check also covers a client that does not).
+    """
+    return not isinstance(payload, dict) or "text_response" in payload
 
 
 def _batch_status_row(payload: Any) -> dict[str, Any] | None:
@@ -2005,7 +2022,7 @@ def _batch_status_row(payload: Any) -> dict[str, Any] | None:
 
     The documented answer is a data list whose first entry is the batch's status; an object
     without a data list is read as that entry itself. Anything else (not an object, one of
-    the client's wrappers for a non-object answer, or a data list with no object in front)
+    a non-JSON body's text_response object, or a data list with no object in front)
     holds no status this tool can read.
     """
     if _answer_unreadable(payload):
@@ -2400,7 +2417,7 @@ async def batch_update_catalog_products(
     if (items is None) == (handle is None):
         raise ValidationError("Pass either items or handle: items to send a batch, handle to read an earlier one.")
     if handle is not None:
-        return await _batch_status_only(get_graph_api_client(), catalog_id, handle)
+        return await _batch_status_only(_client(), catalog_id, handle)
     if not isinstance(items, list) or not 1 <= len(items) <= BATCH_MAX_ITEMS:
         raise ValidationError(f"items must hold 1 to {BATCH_MAX_ITEMS} products per call; split larger edits.")
     entries = [_batch_entry(index, item) for index, item in enumerate(items)]
@@ -2414,7 +2431,7 @@ async def batch_update_catalog_products(
             )
         seen[entry["retailer_id"]] = index
 
-    client = get_graph_api_client()
+    client = _client()
     current = await _read_batch_products(client, catalog_id, entries)
     if not current["complete"]:
         return {
@@ -2498,18 +2515,39 @@ async def batch_update_catalog_products(
         try:
             posted = await client.create_edge_object(catalog_id, "items_batch", data=request_data)
         except (MetaApiError, RateLimitError) as error:
-            unknown = isinstance(error, MetaApiError) and error.mutation_outcome_unknown
+            # A Meta error refuses the request, so nothing was ingested, unless the outcome is
+            # unknown: no readable answer came back, or the answer contradicts itself (a 2xx
+            # status whose body is an error object, which Meta's error responses never are).
+            unknown = isinstance(error, MetaApiError) and (
+                error.mutation_outcome_unknown
+                or (isinstance(error.status_code, int) and 200 <= error.status_code < 300)
+            )
             for item in to_send:
                 item["outcome"] = "outcome_unknown" if unknown else "not_applied"
-                item["reason"] = ("The request failed without a response, so Meta may have applied it."
+                item["reason"] = ("Meta's answer to the request could not be read as a result, so Meta may have "
+                                  "applied it. Read the product before retrying."
                                   if unknown else "Meta refused the whole request, so nothing was ingested.")
             response["error"] = error.to_public_dict()
+            if _is_unreadable_answer_error(error):
+                response["batch"] = {"complete": False, "handles": [], "response_unreadable": True}
+        except Exception as error:
+            # The request may have reached Meta before this failed (for example while its answer
+            # was decoded), so nothing is known about what was ingested and no handle is
+            # invented. CancelledError is not an Exception, so a cancelled call still stops.
+            answer_error = (
+                f"The request was sent, but it failed in this server ({type(error).__name__}) before Meta's "
+                "answer could be read, so whether each item was applied is not known. Read the products "
+                "before retrying."
+            )
+            for item in to_send:
+                item["outcome"] = "outcome_unknown"
+                item["reason"] = answer_error
+            response["answer_error"] = answer_error
         else:
             try:
-                # The write has gone out. An answer that is not an object (including the Graph
-                # client's json_response and text_response wrappers for a bare null, text, number
-                # or non-JSON body) says nothing about whether Meta ingested it, so it is never
-                # read as "no handle, nothing ingested".
+                # The write has gone out. An answer that is not an object (or a non-JSON body's
+                # text_response object) says nothing about whether Meta ingested it, so it is
+                # never read as "no handle, nothing ingested".
                 response_unreadable = _answer_unreadable(posted)
                 if response_unreadable:
                     posted = {}
@@ -2714,7 +2752,7 @@ async def build_product_set_filter(
     product_filter = rules[0] if len(rules) == 1 else {
         ("and" if normalized_match == "all" else "or"): rules
     }
-    payload = await get_graph_api_client().list_objects(
+    payload = await _client().list_objects(
         catalog_id, "products", fields=FILTER_SAMPLE_FIELDS,
         params={"filter": product_filter, "summary": "total_count", "limit": 5},
     )
@@ -2785,7 +2823,7 @@ async def list_catalog_attribute_values(
     if not 0 <= verify_top <= _ATTRIBUTE_MAX_VERIFY:
         raise ValidationError(f"verify_top must be from 0 to {_ATTRIBUTE_MAX_VERIFY}.")
     parent = product_set_id or catalog_id
-    client = get_graph_api_client()
+    client = _client()
     # id is requested so pages are compared by product, not by attribute value:
     # two pages of different products can hold identical values.
     scan = await _collect_edge(
@@ -2870,7 +2908,7 @@ async def list_product_sets(
     )
     _check_limit(limit)
     requested = normalize_field_list(fields) or PRODUCT_SET_FIELDS
-    client = get_graph_api_client()
+    client = _client()
     if scope_name == "product_set_id":
         result = _single(await client.get_object(scope_value, fields=requested))
         result["summary"]["scope"] = {"product_set_id": scope_value}
@@ -2904,7 +2942,7 @@ async def create_product_set(
         typed["retailer_id"] = _require(retailer_id, "retailer_id")
     _refuse_url_logins_in(name=name, filter=parsed_filter, params=params, retailer_id=retailer_id)
     payload = merge_graph_payload(typed, params)
-    result = await get_graph_api_client().create_edge_object(catalog_id, "product_sets", data=payload)
+    result = await _client().create_edge_object(catalog_id, "product_sets", data=payload)
     return creation_response(action="create_product_set", target={"catalog_id": catalog_id}, result=result)
 
 
@@ -2929,7 +2967,7 @@ async def update_product_set(
     if not payload:
         raise ValidationError("At least one field must be provided for update_product_set.")
     _refuse_url_logins_in(**payload)
-    client = get_graph_api_client()
+    client = _client()
     previous = await client.get_object(product_set_id, fields=PRODUCT_SET_FIELDS)
     await client.update_object(product_set_id, data=payload)
     previous_values = {key: previous.get(key) for key in payload}
@@ -2947,7 +2985,7 @@ async def update_product_set(
 async def delete_product_set(product_set_id: str) -> dict[str, Any]:
     """Delete a product set; its products stay in the catalog. Use only on explicit request. Meta refuses while an active ad uses the set."""
     product_set_id = _require(product_set_id, "product_set_id")
-    client = get_graph_api_client()
+    client = _client()
     previous = await client.get_object(product_set_id, fields=PRODUCT_SET_FIELDS)
     result = await client.delete_object(product_set_id)
     response = mutation_response(
