@@ -682,6 +682,19 @@ def test_create_ad_new_input_errors_make_no_call(monkeypatch, arguments, message
         asyncio.run(ads.create_ad(**AD_BASE, **arguments))
 
 
+@pytest.mark.parametrize("creative", [{"creative_id": "crt_1"}, {"creative_spec": INLINE_SPEC}])
+def test_create_ad_bid_amount_inside_params_is_refused_before_any_call(monkeypatch, creative) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError) as caught:
+        asyncio.run(ads.create_ad(**AD_BASE, **creative, params={"bid_amount": 98765}))
+    message = str(caught.value)
+    assert message.startswith("bid_amount cannot be given inside params")
+    assert "named bid_amount parameter" in message
+    assert "major units" in message
+    assert "bid_amount=50 means 50.00 in the account currency" in message
+    assert "98765" not in message
+
+
 def test_create_ad_without_any_creative_keeps_its_error(monkeypatch) -> None:
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(ads.ValidationError, match="creative_id"):

@@ -614,11 +614,14 @@ class RecordingCampaignClient(FakeCampaignClient):
 
 
 def test_create_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
-    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before."""
+    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before.
+
+    spend_cap is no longer accepted inside params (declared change; see
+    test_money_field_inside_params_is_refused_before_any_call); every other field is unchanged.
+    """
     client = RecordingCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     params = {
-        "spend_cap": 25000,
         "start_time": "2026-12-01T00:00:00-0500",
         "stop_time": "2026-12-31T00:00:00-0500",
         "promoted_object": {"pixel_id": "999", "custom_event_type": "PURCHASE"},
@@ -650,7 +653,11 @@ def test_create_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
 
 
 def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
-    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before."""
+    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before.
+
+    Spend caps and minimum spend targets are no longer accepted inside params (declared change; see
+    test_money_field_inside_params_is_refused_before_any_call); every other field is unchanged.
+    """
     client = RecordingCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     params = {
@@ -658,10 +665,6 @@ def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
         "attribution_spec": [{"event_type": "CLICK_THROUGH", "window_days": 7}],
         "adset_schedule": [{"start_minute": 540, "end_minute": 1020, "days": [1, 2, 3]}],
         "pacing_type": ["day_parting"],
-        "daily_spend_cap": 9000,
-        "lifetime_spend_cap": 90000,
-        "daily_min_spend_target": 1000,
-        "lifetime_min_spend_target": 10000,
         "dsa_beneficiary": "Acme GmbH",
         "dsa_payor": "Acme GmbH",
         "adlabels": [{"name": "Q4"}],
@@ -1368,11 +1371,14 @@ def test_create_campaign_params_only_budget_schedule_call_is_unchanged(monkeypat
 
 
 def test_update_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
-    """spend_cap, start_time, stop_time and adlabels inside params: same read, same write, same response."""
+    """start_time, stop_time and adlabels inside params: same read, same write, same response.
+
+    spend_cap is no longer accepted inside params (declared change; see
+    test_money_field_inside_params_is_refused_before_any_call).
+    """
     client = RecordingCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     params = {
-        "spend_cap": 25000,
         "start_time": "2026-12-01T00:00:00-0500",
         "stop_time": "2026-12-31T00:00:00-0500",
         "adlabels": [{"name": "Q4"}],
@@ -1836,3 +1842,253 @@ def test_absolute_budget_increase_is_refused_until_metas_unit_is_confirmed(monke
 
 def test_absolute_budget_increase_is_off_by_default() -> None:
     assert _ABSOLUTE_CONFIRMED_AS_SHIPPED is False
+
+
+# A money field inside params is refused: the named parameter takes major units,
+# a params value would reach Meta unconverted and be read as minor units.
+
+_CREATE_ADSET_ARGS = {
+    "account_id": "123", "campaign_id": "cmp_123", "name": "Ad set", "billing_event": "IMPRESSIONS",
+    "optimization_goal": "REACH", "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+_ADSET_SPEND_KEYS = ("daily_spend_cap", "lifetime_spend_cap", "daily_min_spend_target", "lifetime_min_spend_target")
+_MONEY_IN_PARAMS_CASES = [
+    *[("create_campaign", {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES"}, key)
+      for key in ("daily_budget", "lifetime_budget", "spend_cap")],
+    *[("update_campaign", {"campaign_id": "cmp_123"}, key) for key in ("daily_budget", "lifetime_budget", "spend_cap")],
+    *[("create_ad_set", _CREATE_ADSET_ARGS, key)
+      for key in ("bid_amount", "daily_budget", "lifetime_budget", *_ADSET_SPEND_KEYS)],
+    *[("update_adset", {"adset_id": "adset_1"}, key) for key in _ADSET_SPEND_KEYS],
+]
+
+
+@pytest.mark.parametrize(("tool", "arguments", "key"), _MONEY_IN_PARAMS_CASES)
+def test_money_field_inside_params_is_refused_before_any_call(monkeypatch, tool, arguments, key) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError) as caught:
+        asyncio.run(getattr(campaigns, tool)(**arguments, params={key: 98765, "is_skadnetwork_attribution": False}))
+    message = str(caught.value)
+    assert message.startswith(f"{key} cannot be given inside params")
+    assert f"named {key} parameter" in message
+    assert "major units" in message
+    assert f"{key}=50 means 50.00 in the account currency" in message
+    assert "98765" not in message
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("create_campaign", {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES", "spend_cap": 250}),
+        ("update_campaign", {"campaign_id": "cmp_123", "spend_cap": 250}),
+        ("create_ad_set", {**_CREATE_ADSET_ARGS, "daily_spend_cap": 90}),
+    ],
+)
+def test_money_field_named_and_inside_params_still_refused(monkeypatch, tool, arguments) -> None:
+    key = next(name for name in arguments if name.endswith("spend_cap"))
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(getattr(campaigns, tool)(**arguments, params={key: 25000}))
+
+
+def test_money_field_nested_inside_params_is_not_refused(monkeypatch) -> None:
+    """Only top-level params keys are checked; a same-named key deeper in an object is sent as given."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    nested = {"promoted_object": {"pixel_id": "999", "custom_event_type": "PURCHASE", "spend_cap": 1}}
+    asyncio.run(campaigns.create_campaign(account_id="123", name="C", objective="OUTCOME_SALES", params=dict(nested)))
+    assert client.calls[-1][3]["promoted_object"] == nested["promoted_object"]
+
+
+# create_ad_set with a schedule time that has no time zone: the request stays as
+# it was; the response warns and shows what Meta stored.
+
+ZONELESS_ADSET_ARGS = {
+    "account_id": "act_123",
+    "campaign_id": "cmp_123",
+    "name": "Black Friday",
+    "billing_event": "IMPRESSIONS",
+    "optimization_goal": "REACH",
+    "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+ZONELESS_ADSET_CREATE = {
+    "campaign_id": "cmp_123",
+    "name": "Black Friday",
+    "billing_event": "IMPRESSIONS",
+    "optimization_goal": "REACH",
+    "targeting": {"geo_locations": {"countries": ["US"]}},
+    "status": "PAUSED",
+}
+
+
+def test_create_ad_set_zoneless_start_time_request_is_unchanged(monkeypatch) -> None:
+    """The currency read and the create sent for a time with no zone are exactly what they were."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, daily_budget=20.0,
+        start_time="2026-11-27T00:00:00", end_time="2026-11-30T00:00:00",
+    ))
+    assert client.calls[:2] == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {
+            **ZONELESS_ADSET_CREATE,
+            "start_time": "2026-11-27T00:00:00",
+            "end_time": "2026-11-30T00:00:00",
+            "daily_budget": 2000,
+        }),
+    ]
+    assert list(client.calls[1][3]) == [*ZONELESS_ADSET_CREATE, "start_time", "end_time", "daily_budget"]
+
+
+class ScheduleReadClient(RecordingCampaignClient):
+    """Records calls; the create returns adset_new, whose stored schedule is read back as configured."""
+
+    def __init__(self, *, stored=None, read_error: BaseException | None = None, created=None) -> None:
+        super().__init__()
+        self.stored = {"id": "adset_new"} if stored is None else stored
+        self.read_error = read_error
+        self.created = {"id": "adset_new"} if created is None else created
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return self.created
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        if object_id == "act_123":
+            return await super().get_object(object_id, fields=fields, params=params)
+        self.calls.append(("get", object_id, list(fields or [])))
+        if self.read_error is not None:
+            raise self.read_error
+        return self.stored
+
+
+OLD_STYLE_ADSET_RESPONSE = {
+    "ok": True,
+    "action": "create_ad_set",
+    "target": {"account_id": "act_123", "campaign_id": "cmp_123"},
+    "validation_only": False,
+    "created": {"id": "adset_new"},
+}
+
+
+def test_create_ad_set_old_style_zoneless_response_keeps_every_field(monkeypatch) -> None:
+    """Every field an old-style call's response had is still there with the same value; two fields are added."""
+    client = ScheduleReadClient(stored={
+        "id": "adset_new", "start_time": "2026-11-27T00:00:00-0800", "end_time": "2026-11-30T00:00:00-0800",
+    })
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00", end_time="2026-11-30T00:00:00",
+    ))
+    assert {key: result[key] for key in OLD_STYLE_ADSET_RESPONSE} == OLD_STYLE_ADSET_RESPONSE
+    assert set(result) == {*OLD_STYLE_ADSET_RESPONSE, "warnings", "stored_schedule"}
+    assert client.calls == [
+        ("create", "act_123", "adsets", {
+            **ZONELESS_ADSET_CREATE, "start_time": "2026-11-27T00:00:00", "end_time": "2026-11-30T00:00:00",
+        }),
+        ("get", "adset_new", ["start_time", "end_time"]),
+    ]
+    assert result["stored_schedule"] == {
+        "start_time": "2026-11-27T00:00:00-0800", "end_time": "2026-11-30T00:00:00-0800",
+    }
+    [warning] = result["warnings"]
+    assert warning.startswith("start_time and end_time were given without a time zone")
+    assert "Meta chose how to read them" in warning
+    assert "2026-11-27T00:00:00-05:00" in warning
+    assert "stored_schedule" in warning
+
+
+def test_create_ad_set_warning_names_only_the_zoneless_time(monkeypatch) -> None:
+    client = ScheduleReadClient(stored={"id": "adset_new", "start_time": "2026-11-27T00:00:00-0500"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00-05:00", end_time="2026-11-30",
+    ))
+    [warning] = result["warnings"]
+    assert warning.startswith("end_time was given without a time zone")
+    assert "start_time" not in warning
+    assert "Meta chose how to read it." in warning
+    assert result["stored_schedule"] == {"start_time": "2026-11-27T00:00:00-0500", "end_time": None}
+    assert client.calls[-1] == ("get", "adset_new", ["start_time", "end_time"])
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        ScheduleReadClient(read_error=campaigns.MetaAdsError("Meta read failed")),
+        ScheduleReadClient(read_error=RuntimeError("connection dropped")),
+        ScheduleReadClient(stored=["not", "an", "object"]),
+    ],
+    ids=["meta-error", "other-error", "unreadable-shape"],
+)
+def test_create_ad_set_failed_read_back_still_reports_the_create(monkeypatch, client) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(**ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00"))
+    assert {key: result[key] for key in OLD_STYLE_ADSET_RESPONSE} == OLD_STYLE_ADSET_RESPONSE
+    assert "stored_schedule" not in result
+    [warning] = result["warnings"]
+    assert warning.startswith("start_time was given without a time zone")
+    assert "could not be read" in warning
+    assert "get_adset" in warning
+    assert client.calls[-1] == ("get", "adset_new", ["start_time", "end_time"])
+
+
+def test_create_ad_set_without_created_id_skips_the_read_back(monkeypatch) -> None:
+    client = ScheduleReadClient(created={"success": True})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(**ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00"))
+    assert result["created"] == {"success": True}
+    assert [call[0] for call in client.calls] == ["create"]
+    assert "could not be read" in result["warnings"][0]
+
+
+def test_create_ad_set_validate_only_warns_without_read_back(monkeypatch) -> None:
+    client = ScheduleReadClient(created={"success": True})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        **ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00", validate_only=True,
+    ))
+    assert client.calls == [
+        ("create", "act_123", "adsets", {
+            **ZONELESS_ADSET_CREATE, "start_time": "2026-11-27T00:00:00", "execution_options": ["validate_only"],
+        }),
+    ]
+    assert result["validation_only"] is True
+    assert result["validation"] == {"success": True}
+    assert "stored_schedule" not in result
+    [warning] = result["warnings"]
+    assert warning.startswith("start_time was given without a time zone")
+    assert "2026-11-27T00:00:00-05:00" in warning
+    assert "get_adset" not in warning
+
+
+@pytest.mark.parametrize(
+    "times",
+    [
+        {},
+        {"start_time": "2026-11-27T00:00:00-05:00", "end_time": "2026-11-30T00:00:00-0500"},
+        {"start_time": "2026-11-27T05:00:00Z"},
+        {"start_time": "1795000000", "end_time": "0"},
+        {"start_time": "next friday"},
+        {"start_time": "", "end_time": "   "},
+    ],
+    ids=["no-times", "offsets", "utc-z", "unix-seconds", "unparsable", "blank"],
+)
+def test_create_ad_set_times_with_a_zone_make_the_same_requests_and_response(monkeypatch, times) -> None:
+    client = ScheduleReadClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(**ZONELESS_ADSET_ARGS, daily_budget=20.0, **times))
+    sent_times = {key: value for key, value in times.items() if value}
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "adsets", {**ZONELESS_ADSET_CREATE, **sent_times, "daily_budget": 2000}),
+    ]
+    assert result == OLD_STYLE_ADSET_RESPONSE
+
+
+def test_create_ad_set_docstring_explains_zoneless_times_and_money_in_params() -> None:
+    doc = campaigns.create_ad_set.__doc__
+    assert "without a UTC offset" in doc
+    assert "stored_schedule" in doc
+    assert "refused inside params" in doc
+    assert "+" not in doc

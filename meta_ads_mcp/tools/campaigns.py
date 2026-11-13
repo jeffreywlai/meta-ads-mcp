@@ -59,6 +59,29 @@ def reject_named_and_params(named: dict[str, Any], params: dict[str, Any] | None
             )
 
 
+def reject_money_in_params(params: dict[str, Any] | None, money: tuple[str, ...]) -> None:
+    """Refuse, before any network call, a money field the tool converts by name when it is inside params.
+
+    The named parameter takes major units and is converted; a params value would be
+    sent unconverted, so Meta would read it in minor units. Only top-level keys are
+    checked. List only fields the tool itself converts from major units: amounts
+    that are not converted here (bid_constraints, roas_average_floor, percentages,
+    budget_schedule_specs) must keep passing through params unchanged.
+    """
+    if not params:
+        return
+    for key in money:
+        if key in params:
+            raise ValidationError(
+                f"{key} cannot be given inside params, where Meta would read it in minor units (cents in USD). "
+                f"Use the named {key} parameter, which takes major units of the account currency: "
+                f"{key}=50 means 50.00 in the account currency."
+            )
+
+
+_CAMPAIGN_MONEY_FIELDS = ("daily_budget", "lifetime_budget", "spend_cap")
+
+
 def _nonempty_object_list(value: Any, field_name: str) -> list[dict[str, Any]]:
     """Check a list of JSON objects, such as frequency_control_specs."""
     if not isinstance(value, list) or any(not isinstance(item, dict) or not item for item in value):
@@ -271,7 +294,7 @@ async def create_campaign(
     adlabels: list[dict[str, Any]] | None = None,
     budget_schedule_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours, account permission required): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. A named parameter and the same key inside params cannot both be given."""
+    """Use this when the user wants to create a new campaign shell before adding ad sets or ads. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds. special_ad_category_country lists two-letter country codes. adlabels is a list of {"name": ...} or {"id": ...}. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours, account permission required): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
     reject_named_and_params(
         {
             "spend_cap": spend_cap,
@@ -285,6 +308,7 @@ async def create_campaign(
         params,
         money=("spend_cap", "budget_schedule_specs"),
     )
+    reject_money_in_params(params, _CAMPAIGN_MONEY_FIELDS)
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
@@ -382,9 +406,10 @@ async def update_campaign(
     stop_time: str | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given."""
+    """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named = {"spend_cap": spend_cap, "start_time": start_time, "stop_time": stop_time, "adlabels": adlabels}
     reject_named_and_params(named, params, money=("spend_cap",))
+    reject_money_in_params(params, _CAMPAIGN_MONEY_FIELDS)
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
@@ -573,7 +598,7 @@ async def create_ad_set(
     optimization_sub_event: str | None = None,
     budget_schedule_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. A named parameter and the same key inside params cannot both be given."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER, and budget_value, a whole number sent unchanged (Meta's example: 140 means 140 percent); the ABSOLUTE type is refused until Meta's unit for it is confirmed. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. start_time and end_time are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named_spend = {
         "daily_spend_cap": daily_spend_cap,
         "lifetime_spend_cap": lifetime_spend_cap,
@@ -600,6 +625,7 @@ async def create_ad_set(
         params,
         money=(*_ADSET_SPEND_FIELDS, "budget_schedule_specs"),
     )
+    reject_money_in_params(params, ("bid_amount", "daily_budget", "lifetime_budget", *_ADSET_SPEND_FIELDS))
     if daily_budget is not None and lifetime_budget is not None:
         raise ValidationError("Provide at most one of daily_budget or lifetime_budget.")
     for field_name, value in (
@@ -697,12 +723,51 @@ async def create_ad_set(
         "adsets",
         data=merge_graph_payload(payload, params),
     )
-    return creation_response(
+    response = creation_response(
         action="create_ad_set",
         target={"account_id": account_id, "campaign_id": campaign_id},
         result=result,
         validate_only=validate_only,
     )
+    zoneless = [key for key, value in (("start_time", start_time), ("end_time", end_time)) if _time_without_zone(value)]
+    if zoneless:
+        await _add_zoneless_time_warning(response, client, zoneless, result, validate_only=validate_only)
+    return response
+
+
+async def _add_zoneless_time_warning(
+    response: dict[str, Any],
+    client: Any,
+    zoneless: list[str],
+    result: Any,
+    *,
+    validate_only: bool,
+) -> None:
+    """Warn that a schedule time had no time zone and, after a real create, show what Meta stored.
+
+    The ad set already exists here, so nothing in this function may raise: a
+    failed read-back only changes the warning's wording.
+    """
+    names = " and ".join(zoneless)
+    verb, pronoun = ("was", "it") if len(zoneless) == 1 else ("were", "them")
+    warning = (
+        f"{names} {verb} given without a time zone, so Meta chose how to read {pronoun}. "
+        "To be unambiguous, include a UTC offset, for example 2026-11-27T00:00:00-05:00."
+    )
+    if not validate_only:
+        new_id = result.get("id") if isinstance(result, dict) else None
+        stored = None
+        if new_id not in (None, ""):
+            try:
+                stored = await client.get_object(str(new_id), fields=["start_time", "end_time"])
+            except Exception:  # The create succeeded; a failed read-back must not turn it into an error.
+                stored = None
+        if isinstance(stored, dict):
+            response["stored_schedule"] = {"start_time": stored.get("start_time"), "end_time": stored.get("end_time")}
+            warning += " stored_schedule shows the times Meta stored; check they are what you meant."
+        else:
+            warning += " The time Meta stored could not be read back; check it with get_adset."
+    response["warnings"] = [warning]
 
 
 _ADSET_MONEY_FIELD_TOOLS = {
@@ -733,6 +798,22 @@ _UNREAD_ADSET_PREVIOUS = "Not a field this server reads back from an ad set."
 _ADSET_TIME_FORMAT = "an ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00) or Unix seconds"
 
 
+def _parse_iso_time(text: str) -> datetime | None:
+    """Parse an ISO 8601 time the way every schedule check in this module does; None when it is not one."""
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _time_without_zone(value: Any) -> bool:
+    """True for an ISO 8601 time with no UTC offset; Unix seconds, blanks and unparsable text are not flagged."""
+    if not isinstance(value, str) or not value.strip() or value.strip().isdigit():
+        return False
+    parsed = _parse_iso_time(value.strip())
+    return parsed is not None and parsed.tzinfo is None
+
+
 def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
     """Check an ad set schedule time; None when absent or end_time 0 (Meta's no-end-date value)."""
     if value is None:
@@ -747,10 +828,9 @@ def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
         if seconds == 0:
             raise ValidationError(f"{field_name} must be a positive Unix time.")
         return datetime.fromtimestamp(seconds, timezone.utc)
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.") from exc
+    parsed = _parse_iso_time(text)
+    if parsed is None:
+        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.")
     if parsed.tzinfo is None:
         raise ValidationError(
             f"{field_name} needs a UTC offset or Z (for example 2026-12-01T00:00:00-05:00) "
@@ -768,11 +848,8 @@ def _stored_adset_time(value: Any) -> datetime | None:
     """Read a stored ad set time such as 2026-12-01T00:00:00+0000; None when absent or unreadable."""
     if not isinstance(value, str) or not value.strip():
         return None
-    try:
-        parsed = datetime.fromisoformat(value.strip())
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
+    parsed = _parse_iso_time(value.strip())
+    return parsed if parsed is not None and parsed.tzinfo is not None else None
 
 
 @mcp_server.tool()
@@ -794,7 +871,7 @@ async def update_adset(
     lifetime_min_spend_target: StrictCurrencyAmount | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps, minimum spend targets or labels, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. targeting replaces the whole spec. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad set's whole label set, so include any label to keep. A changed field whose prior value Meta did not return is named in previous_unavailable."""
+    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps, minimum spend targets or labels, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. Spend caps and minimum spend targets are refused inside params; use the named parameters. targeting replaces the whole spec. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad set's whole label set, so include any label to keep. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     adset_id = blank_to_none(adset_id)
     if adset_id is None:
         raise ValidationError("adset_id is required.")
@@ -804,12 +881,7 @@ async def update_adset(
     for field_name, tool_name in _ADSET_MONEY_FIELD_TOOLS.items():
         if params and field_name in params:
             raise ValidationError(f"{field_name} cannot be changed with update_adset; use {tool_name}.")
-    for field_name in _ADSET_SPEND_FIELDS:
-        if params and field_name in params:
-            raise ValidationError(
-                f"{field_name} in params would be read as minor units; use the named {field_name} "
-                "parameter, which takes major units of the account currency."
-            )
+    reject_money_in_params(params, _ADSET_SPEND_FIELDS)
     for field_name, message in _ADSET_UNSUPPORTED_MONEY_PARAMS.items():
         if params and field_name in params:
             raise ValidationError(message)

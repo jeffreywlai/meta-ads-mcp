@@ -20,6 +20,7 @@ from meta_ads_mcp.schemas import collection_response, creation_response, mutatio
 from meta_ads_mcp.tools.campaigns import (
     build_copy_request,
     read_adlabels,
+    reject_money_in_params,
     reject_named_and_params,
     run_copy,
     validate_adlabels,
@@ -181,11 +182,12 @@ async def create_ad(
     ad_schedule_start_time: str | None = None,
     ad_schedule_end_time: str | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or Unix seconds); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. A named parameter and the same key inside params cannot both be given."""
+    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or Unix seconds); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. A named parameter and the same key inside params cannot both be given. bid_amount is refused inside params, where Meta would read it in minor units; use the named bid_amount."""
     schedule_times = {"ad_schedule_start_time": ad_schedule_start_time, "ad_schedule_end_time": ad_schedule_end_time}
     reject_named_and_params(
         {"conversion_domain": conversion_domain, "adlabels": adlabels, **schedule_times}, params
     )
+    reject_money_in_params(params, ("bid_amount",))
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
     schedule_start = validate_schedule_time(ad_schedule_start_time, "ad_schedule_start_time")
