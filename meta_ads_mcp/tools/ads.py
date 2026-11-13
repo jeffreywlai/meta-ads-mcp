@@ -19,9 +19,11 @@ from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
 from meta_ads_mcp.tools.campaigns import (
     build_copy_request,
+    read_adlabels,
     reject_named_and_params,
     run_copy,
     validate_adlabels,
+    validate_schedule_time,
 )
 from meta_ads_mcp.tool_types import CurrencyAmount, GraphId, StrictStringList, coerce_strict_csv_string_list
 
@@ -176,11 +178,20 @@ async def create_ad(
     conversion_domain: str | None = None,
     adlabels: list[dict[str, Any]] | None = None,
     creative_spec: dict[str, Any] | None = None,
+    ad_schedule_start_time: str | None = None,
+    ad_schedule_end_time: str | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. A named parameter and the same key inside params cannot both be given."""
-    reject_named_and_params({"conversion_domain": conversion_domain, "adlabels": adlabels}, params)
+    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or Unix seconds); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. A named parameter and the same key inside params cannot both be given."""
+    schedule_times = {"ad_schedule_start_time": ad_schedule_start_time, "ad_schedule_end_time": ad_schedule_end_time}
+    reject_named_and_params(
+        {"conversion_domain": conversion_domain, "adlabels": adlabels, **schedule_times}, params
+    )
     if status not in VALID_AD_STATUSES:
         raise ValidationError(f"status must be one of {sorted(VALID_AD_STATUSES)}.")
+    schedule_start = validate_schedule_time(ad_schedule_start_time, "ad_schedule_start_time")
+    schedule_end = validate_schedule_time(ad_schedule_end_time, "ad_schedule_end_time")
+    if schedule_start is not None and schedule_end is not None and schedule_end <= schedule_start:
+        raise ValidationError("ad_schedule_end_time must be after ad_schedule_start_time.")
     if bid_amount is not None:
         validate_positive_amount(bid_amount, field_name="bid_amount")
     if conversion_domain is not None:
@@ -199,7 +210,7 @@ async def create_ad(
             raise ValidationError("creative_spec is for a new creative; to use an existing one, use creative_id.")
         return await _create_ad(
             account_id, name, adset_id, creative_spec, status, bid_amount, tracking_specs,
-            conversion_domain, adlabels, validate_only, params,
+            conversion_domain, adlabels, validate_only, params, schedule_times,
         )
     nested_creative_id: str | None = None
     if creative is not None:
@@ -231,7 +242,7 @@ async def create_ad(
     )
     return await _create_ad(
         account_id, name, adset_id, {"creative_id": resolved_creative_id}, status, bid_amount,
-        tracking_specs, conversion_domain, adlabels, validate_only, params,
+        tracking_specs, conversion_domain, adlabels, validate_only, params, schedule_times,
     )
 
 
@@ -247,6 +258,7 @@ async def _create_ad(
     adlabels: list[dict[str, Any]] | None,
     validate_only: bool,
     params: dict[str, Any] | None,
+    schedule_times: dict[str, str | None],
 ) -> dict[str, Any]:
     """Send one validated ad creation."""
     payload: dict[str, Any] = {
@@ -259,7 +271,7 @@ async def _create_ad(
     }
     # New named fields join the payload only when given, so a call that puts
     # them in params (as callers did before they existed) is sent unchanged.
-    for key, value in (("conversion_domain", conversion_domain), ("adlabels", adlabels)):
+    for key, value in (("conversion_domain", conversion_domain), ("adlabels", adlabels), *schedule_times.items()):
         if value is not None:
             payload[key] = value
     add_validate_only(payload, validate_only=validate_only)
@@ -405,11 +417,15 @@ async def update_ad(
     status: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
+    adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad's name, creative, tracking specs or status (ACTIVE, PAUSED or ARCHIVED), with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
+    """Edit an ad's name, creative, tracking specs, status (ACTIVE, PAUSED or ARCHIVED) or labels, with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad's whole label set, so include any label to keep. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
         raise ValidationError("ad_id is required.")
+    reject_named_and_params({"adlabels": adlabels}, params)
+    if adlabels is not None:
+        validate_adlabels(adlabels)
     if creative_id is not None and blank_to_none(creative_id) is None:
         raise ValidationError("creative_id must be a nonblank creative id when provided.")
     for key, message in _AD_PARAMS_REJECTED.items():
@@ -424,6 +440,9 @@ async def update_ad(
         "tracking_specs": OMIT if tracking_specs is None else tracking_specs,
         "status": OMIT if status is None else status,
     }
+    # adlabels joins the payload only when given, so a params-only call is sent unchanged.
+    if adlabels is not None:
+        payload["adlabels"] = adlabels
     add_validate_only(payload, validate_only=validate_only)
     payload = merge_graph_payload(payload, params)
     changes = {key: value for key, value in payload.items() if key != "execution_options"}
@@ -441,6 +460,7 @@ async def update_ad(
     result = await client.update_object(ad_id, data=payload)
 
     unavailable: dict[str, str] = {}
+    incomplete: dict[str, str] = {}
 
     def _public(values: dict[str, Any], *, before: bool) -> dict[str, Any]:
         shaped: dict[str, Any] = {}
@@ -458,6 +478,10 @@ async def update_ad(
                     shaped["creative_id"] = creative.get("id") if isinstance(creative, dict) else creative
                 else:
                     shaped["creative_id"] = resolved_creative_id
+            elif key == "adlabels" and before:
+                shaped[key], note = read_adlabels(values.get(key))
+                if note:
+                    incomplete[key] = note
             else:
                 shaped[key] = values.get(key)
         return shaped
@@ -476,6 +500,8 @@ async def update_ad(
     })
     if unavailable:
         response["previous_unavailable"] = unavailable
+    if incomplete:
+        response["previous_incomplete"] = incomplete
     return response
 
 
