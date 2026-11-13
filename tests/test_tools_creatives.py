@@ -988,10 +988,9 @@ def test_boost_partnership_inputs_reach_the_creative(monkeypatch) -> None:
     [
         ({"daily_budget": None}, "daily_budget"),
         ({"targeting": None}, "targeting is required"),
-        ({"objective": "OUTCOME_APP_PROMOTION"}, "objective must be one of"),
+        ({"objective": "LINK_CLICKS"}, "objective must be one of"),
         ({"duration_days": 0}, "duration_days"),
         ({"duration_days": 366}, "duration_days"),
-        ({"page_id": None}, "page_id is required"),
         ({"validate_only": True}, "plan_only"),
         ({"daily_budget": -1}, "greater than 0"),
         ({"partnership_ad_format": 2}, "sponsor"),
@@ -1343,13 +1342,13 @@ def test_boost_one_step_default_objective_is_unchanged(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
-        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "MESSENGER"}, "destination_type for OUTCOME_TRAFFIC must be one of"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "ON_AD"}, "destination_type for OUTCOME_TRAFFIC must be one of"),
         ({"objective": "OUTCOME_AWARENESS", "destination_type": "WEBSITE"}, "OUTCOME_AWARENESS takes no destination_type"),
         ({"objective": "OUTCOME_TRAFFIC", "destination_type": "WEBSITE"}, "website link"),
         ({"objective": "OUTCOME_TRAFFIC", "destination_type": "WEBSITE", "call_to_action": {"type": "LEARN_MORE"}}, "website link"),
         ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA}, "pixel_id and custom_event_type"),
         ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA, "promoted_object": {"pixel_id": "abc", "custom_event_type": "PURCHASE"}}, "pixel_id"),
-        ({"objective": "OUTCOME_ENGAGEMENT", "promoted_object": PIXEL}, "promoted_object applies to OUTCOME_SALES and OUTCOME_LEADS"),
+        ({"objective": "OUTCOME_ENGAGEMENT", "promoted_object": PIXEL}, "promoted_object does not apply to OUTCOME_ENGAGEMENT"),
         ({"objective": "OUTCOME_SALES", "call_to_action": WEBSITE_CTA, "promoted_object": {**PIXEL, "object_store_url": "https://u:p@x.example/app"}}, "username or password"),
     ],
 )
@@ -1838,7 +1837,11 @@ async def _mcp_call(name, arguments):
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("daily_budget", True), ("daily_budget", False), ("duration_days", True), ("partnership_ad_format", True)],
+    [
+        ("daily_budget", True), ("daily_budget", False), ("duration_days", True), ("partnership_ad_format", True),
+        ("lifetime_budget", True), ("campaign_daily_budget", True), ("campaign_lifetime_budget", False),
+        ("bid_amount", True), ("start_time", True), ("end_time", True),
+    ],
 )
 def test_h3_boost_budget_bool_is_rejected_at_mcp_boundary(monkeypatch, field, value) -> None:
     from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
@@ -1846,8 +1849,11 @@ def test_h3_boost_budget_bool_is_rejected_at_mcp_boundary(monkeypatch, field, va
     client = FakeOneStepClient()
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
     arguments = {"account_id": "10", "instagram_media_id": "30", "instagram_account_id": "40", "page_id": "20",
-                 "daily_budget": 12.5, "targeting": {"geo_locations": {"countries": ["US"]}}, "sponsor_page_id": "22",
-                 field: value}
+                 "targeting": {"geo_locations": {"countries": ["US"]}}, "sponsor_page_id": "22", field: value}
+    if not field.endswith("budget"):
+        arguments["daily_budget"] = 12.5
+    if field == "bid_amount":
+        arguments["bid_strategy"] = "COST_CAP"
     with pytest.raises((ToolError, MCPValidationError)):
         asyncio.run(_mcp_call("boost_instagram_post", arguments))
     assert client.calls == []
@@ -2025,3 +2031,371 @@ def test_delete_ad_image_not_found_does_not_quote_the_hash(monkeypatch) -> None:
     with pytest.raises(creatives.ValidationError) as raised:
         asyncio.run(creatives.delete_ad_image("10", "pasted-private-value"))
     assert "pasted-private-value" not in str(raised.value)
+
+
+# Round four: one-step boost options that Meta's boost tool has (param_gap_report_v3 4.5).
+
+
+FIXED_NOW = __import__("datetime").datetime(2026, 11, 13, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+APP = {"application_id": "999", "object_store_url": "https://play.google.com/store/apps/details?id=com.example"}
+APP_CTA = {"type": "INSTALL_MOBILE_APP", "value": {"link": "https://play.google.com/store/apps/details?id=com.example"}}
+LEAD_CTA = {"type": "SIGN_UP", "value": {"lead_gen_form_id": "4455"}}
+CALL_CTA = {"type": "CALL_NOW", "value": {"link": "tel:+15551234567"}}
+
+
+@pytest.fixture
+def fixed_clock(monkeypatch):
+    monkeypatch.setattr(creatives, "_utc_now", lambda: FIXED_NOW)
+    return FIXED_NOW
+
+
+def _boost(monkeypatch, client=None, **arguments):
+    client = client or FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+    return client, result
+
+
+def test_boost_one_step_default_requests_are_exact(monkeypatch, fixed_clock) -> None:
+    """The default one-step requests, written out in full, so a new option cannot change them unnoticed."""
+    client, result = _boost(monkeypatch)
+    assert [call[2:] for call in client.calls if call[0] == "create"] == [
+        ("campaigns", {"name": "Instagram post 555 campaign", "objective": "OUTCOME_ENGAGEMENT", "status": "PAUSED",
+                       "special_ad_categories": [], "is_adset_budget_sharing_enabled": False}),
+        ("adsets", {"name": "Instagram post 555 ad set", "campaign_id": "1", "daily_budget": 1250,
+                    "billing_event": "IMPRESSIONS", "optimization_goal": "POST_ENGAGEMENT",
+                    "bid_strategy": "LOWEST_COST_WITHOUT_CAP", "targeting": {"geo_locations": {"countries": ["AU"]}},
+                    "end_time": "2026-11-19T12:00:00+00:00", "status": "PAUSED", "destination_type": "ON_POST"}),
+        ("adcreatives", {"name": "Instagram post 555 creative", "object_id": "777", "instagram_user_id": "666",
+                         "source_instagram_media_id": "555"}),
+        ("ads", {"name": "Instagram post 555", "adset_id": "2", "creative": {"creative_id": "3"}, "status": "PAUSED"}),
+    ]
+    assert result["budget"] == {"level": "ad set", "type": "daily", "parameter": "daily_budget", "major_units": 12.5, "sent_minor_units": 1250}
+    assert result["defaults_applied"]["buying_type"] == "AUCTION (Meta's default; not sent)"
+    assert result["defaults_applied"]["special_ad_categories"] == []
+
+
+def test_boost_one_step_app_promotion_sends_the_app_and_its_store_link(monkeypatch, fixed_clock) -> None:
+    client, result = _boost(monkeypatch, objective="OUTCOME_APP_PROMOTION", promoted_object=APP, call_to_action=APP_CTA)
+    campaign, adset, creative = _created(client, "campaigns"), _created(client, "adsets"), _created(client, "adcreatives")
+    assert campaign["objective"] == "OUTCOME_APP_PROMOTION"
+    assert adset["optimization_goal"] == "APP_INSTALLS"
+    assert adset["promoted_object"] == APP
+    assert adset["billing_event"] == "IMPRESSIONS"
+    assert "destination_type" not in adset
+    assert creative["call_to_action"] == APP_CTA
+    assert result["defaults_applied"]["optimization_goal"] == "APP_INSTALLS"
+
+
+@pytest.mark.parametrize(
+    ("objective", "destination", "cta"),
+    [
+        ("OUTCOME_ENGAGEMENT", "INSTAGRAM_DIRECT", {"type": "INSTAGRAM_MESSAGE", "value": {"link": "https://www.instagram.com"}}),
+        ("OUTCOME_ENGAGEMENT", "WHATSAPP", {"type": "WHATSAPP_MESSAGE", "value": {"link": "https://api.whatsapp.com/send", "app_destination": "WHATSAPP"}}),
+        ("OUTCOME_ENGAGEMENT", "MESSENGER", {"type": "MESSAGE_PAGE", "value": {"app_destination": "MESSENGER"}}),
+        ("OUTCOME_TRAFFIC", "INSTAGRAM_DIRECT", {"type": "INSTAGRAM_MESSAGE", "value": {"link": "https://www.instagram.com"}}),
+        ("OUTCOME_TRAFFIC", "MESSENGER", {"type": "MESSAGE_PAGE", "value": {"app_destination": "MESSENGER"}}),
+        ("OUTCOME_LEADS", "WHATSAPP", {"type": "WHATSAPP_MESSAGE", "value": {"link": "https://api.whatsapp.com/send", "app_destination": "WHATSAPP"}}),
+    ],
+)
+def test_boost_one_step_messaging_destinations_get_their_message_button(monkeypatch, fixed_clock, objective, destination, cta) -> None:
+    client, result = _boost(monkeypatch, objective=objective, destination_type=destination.lower())
+    adset, creative = _created(client, "adsets"), _created(client, "adcreatives")
+    assert (adset["destination_type"], adset["optimization_goal"], adset["billing_event"]) == (destination, "CONVERSATIONS", "IMPRESSIONS")
+    assert adset["promoted_object"] == {"page_id": "777"}
+    assert creative["call_to_action"] == cta
+    assert result["defaults_applied"]["call_to_action"] == cta
+
+
+def test_boost_one_step_messaging_button_type_may_be_named_and_whatsapp_number_added(monkeypatch, fixed_clock) -> None:
+    client, result = _boost(
+        monkeypatch, destination_type="WHATSAPP", call_to_action={"type": "whatsapp_message"},
+        promoted_object={"whatsapp_phone_number": "+15551234567"}, optimization_goal="link_clicks",
+    )
+    adset, creative = _created(client, "adsets"), _created(client, "adcreatives")
+    assert adset["promoted_object"] == {"page_id": "777", "whatsapp_phone_number": "+15551234567"}
+    assert adset["optimization_goal"] == "LINK_CLICKS"
+    assert creative["call_to_action"] == {"type": "WHATSAPP_MESSAGE", "value": {"link": "https://api.whatsapp.com/send", "app_destination": "WHATSAPP"}}
+    assert "call_to_action" not in result["defaults_applied"]
+
+
+@pytest.mark.parametrize("goal", [None, "QUALITY_LEAD"])
+def test_boost_one_step_instant_form_on_ad(monkeypatch, fixed_clock, goal) -> None:
+    arguments = {"objective": "OUTCOME_LEADS", "destination_type": "ON_AD", "call_to_action": LEAD_CTA}
+    if goal:
+        arguments["optimization_goal"] = goal
+    client, _ = _boost(monkeypatch, **arguments)
+    adset, creative = _created(client, "adsets"), _created(client, "adcreatives")
+    assert (adset["destination_type"], adset["optimization_goal"]) == ("ON_AD", goal or "LEAD_GENERATION")
+    assert adset["promoted_object"] == {"page_id": "777"}
+    assert creative["call_to_action"] == {"type": "SIGN_UP", "value": {"lead_gen_form_id": "4455"}}
+
+
+@pytest.mark.parametrize(
+    ("objective", "promoted"),
+    [("OUTCOME_TRAFFIC", None), ("OUTCOME_LEADS", {"page_id": "777"}), ("OUTCOME_SALES", {"page_id": "777"})],
+)
+def test_boost_one_step_phone_call(monkeypatch, fixed_clock, objective, promoted) -> None:
+    client, _ = _boost(monkeypatch, objective=objective, destination_type="PHONE_CALL", call_to_action=CALL_CTA)
+    adset, creative = _created(client, "adsets"), _created(client, "adcreatives")
+    assert (adset["destination_type"], adset["optimization_goal"], adset["billing_event"]) == ("PHONE_CALL", "QUALITY_CALL", "IMPRESSIONS")
+    assert adset.get("promoted_object") == promoted
+    assert creative["call_to_action"] == CALL_CTA
+
+
+def test_boost_one_step_explicit_goal_billing_and_bid_cap(monkeypatch, fixed_clock) -> None:
+    client, result = _boost(
+        monkeypatch, objective="OUTCOME_TRAFFIC", destination_type="WEBSITE", call_to_action=WEBSITE_CTA,
+        optimization_goal="LINK_CLICKS", billing_event="LINK_CLICKS", bid_strategy="cost_cap", bid_amount=1.25,
+    )
+    adset = _created(client, "adsets")
+    assert (adset["optimization_goal"], adset["billing_event"], adset["bid_strategy"], adset["bid_amount"]) == (
+        "LINK_CLICKS", "LINK_CLICKS", "COST_CAP", 125,
+    )
+    assert result["bid_amount"] == {"major_units": 1.25, "sent_minor_units": 125}
+    for key in ("optimization_goal", "billing_event", "bid_strategy"):
+        assert key not in result["defaults_applied"]
+
+
+def test_boost_one_step_thruplay_may_bill_on_thruplay(monkeypatch, fixed_clock) -> None:
+    client, _ = _boost(monkeypatch, destination_type="ON_VIDEO", billing_event="THRUPLAY")
+    assert _created(client, "adsets")["billing_event"] == "THRUPLAY"
+
+
+def test_boost_one_step_lifetime_budget_with_start_time_and_duration(monkeypatch, fixed_clock) -> None:
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "daily_budget"}
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        **arguments, lifetime_budget=300, start_time="2026-12-01T09:00:00-05:00", duration_days=10,
+    ))
+    adset, campaign = _created(client, "adsets"), _created(client, "campaigns")
+    assert adset["lifetime_budget"] == 30000 and "daily_budget" not in adset
+    assert adset["start_time"] == "2026-12-01T09:00:00-05:00"
+    assert adset["end_time"] == "2026-12-11T09:00:00-05:00"
+    assert campaign["is_adset_budget_sharing_enabled"] is False
+    assert result["budget"]["type"] == "lifetime" and "daily_budget" not in result
+    assert "start_time" not in result["defaults_applied"]
+
+
+def test_boost_one_step_unix_times_are_sent_as_given(monkeypatch, fixed_clock) -> None:
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "daily_budget"}
+    start, end = int(FIXED_NOW.timestamp()) + 3600, int(FIXED_NOW.timestamp()) + 3600 + 3 * 86400
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**arguments, lifetime_budget=50, start_time=str(start), end_time=end))
+    adset = _created(client, "adsets")
+    assert (adset["start_time"], adset["end_time"]) == (start, end)
+    assert "end_time" not in result["defaults_applied"] and "duration_days" not in result["defaults_applied"]
+
+
+@pytest.mark.parametrize("budget", ["campaign_daily_budget", "campaign_lifetime_budget"])
+def test_boost_one_step_campaign_budget_moves_budget_and_bidding_to_the_campaign(monkeypatch, fixed_clock, budget) -> None:
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "daily_budget"}
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        **arguments, **{budget: 40}, bid_strategy="LOWEST_COST_WITH_BID_CAP", bid_amount=2,
+    ))
+    campaign, adset = _created(client, "campaigns"), _created(client, "adsets")
+    field = "daily_budget" if budget == "campaign_daily_budget" else "lifetime_budget"
+    assert campaign == {
+        "name": "Instagram post 555 campaign", "objective": "OUTCOME_ENGAGEMENT", "status": "PAUSED",
+        "special_ad_categories": [], field: 4000, "bid_strategy": "LOWEST_COST_WITH_BID_CAP",
+    }
+    assert "daily_budget" not in adset and "lifetime_budget" not in adset and "bid_strategy" not in adset
+    assert adset["bid_amount"] == 200
+    assert adset["end_time"] == "2026-11-19T12:00:00+00:00"
+    assert result["budget"]["level"] == "campaign"
+    assert "is_adset_budget_sharing_enabled" not in result["defaults_applied"]
+
+
+def test_boost_one_step_campaign_budget_default_bid_strategy_is_sent_on_the_campaign(monkeypatch, fixed_clock) -> None:
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "daily_budget"}
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**arguments, campaign_daily_budget=40))
+    assert _created(client, "campaigns")["bid_strategy"] == "LOWEST_COST_WITHOUT_CAP"
+    assert result["defaults_applied"]["bid_strategy"] == "LOWEST_COST_WITHOUT_CAP (on the campaign)"
+
+
+def test_boost_one_step_special_ad_categories_and_buying_type(monkeypatch, fixed_clock) -> None:
+    client, result = _boost(monkeypatch, special_ad_categories="housing,employment", buying_type="auction")
+    campaign = _created(client, "campaigns")
+    assert campaign["special_ad_categories"] == ["HOUSING", "EMPLOYMENT"]
+    assert campaign["buying_type"] == "AUCTION"
+    assert "special_ad_categories" not in result["defaults_applied"] and "buying_type" not in result["defaults_applied"]
+
+
+class FakePageLookupClient(FakeOneStepClient):
+    def __init__(self, pages) -> None:
+        super().__init__()
+        self.pages = pages
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        self.calls.append(("list", parent_id, edge, fields, dict(params or {})))
+        return self.pages[(params or {}).get("after")]
+
+
+def test_boost_one_step_finds_the_page_from_the_instagram_account(monkeypatch, fixed_clock) -> None:
+    pages = {
+        None: {"data": [{"id": "100", "instagram_business_account": {"id": "1"}}, {"id": "101"}],
+               "paging": {"cursors": {"after": "c1"}, "next": "https://graph.facebook.com/next"}},
+        "c1": {"data": [{"id": "777", "instagram_business_account": {"id": "666"}}], "paging": {"cursors": {"after": "c2"}}},
+    }
+    client = FakePageLookupClient(pages)
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "page_id"}
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**arguments, objective="OUTCOME_AWARENESS"))
+    lists = [call for call in client.calls if call[0] == "list"]
+    assert lists == [
+        ("list", "me", "accounts", ["id", "instagram_business_account"], {"limit": 100}),
+        ("list", "me", "accounts", ["id", "instagram_business_account"], {"limit": 100, "after": "c1"}),
+    ]
+    assert _created(client, "adsets")["promoted_object"] == {"page_id": "777"}
+    assert _created(client, "adcreatives")["object_id"] == "777"
+    assert result["target"]["page_id"] == "777"
+    assert result["defaults_applied"]["page_id"].startswith("777 ")
+    assert result["page_lookup"] == {"source": "me/accounts instagram_business_account", "pages_read": 3, "requests": 2, "complete": True}
+
+
+@pytest.mark.parametrize(
+    ("pages", "reason"),
+    [
+        ({None: {"data": [{"id": "100"}]}}, "none of the 1 Pages"),
+        ({None: {"data": [{"id": "1", "instagram_business_account": {"id": "666"}}, {"id": "2", "instagram_business_account": {"id": "666"}}]}}, "2 Pages list"),
+        ({None: {"data": [{"id": "777", "instagram_business_account": {"id": "666"}}], "paging": {"next": "https://graph.facebook.com/next"}}}, "could not be read completely"),
+    ],
+)
+def test_boost_one_step_page_lookup_refuses_unless_exactly_one_page_after_a_complete_read(monkeypatch, fixed_clock, pages, reason) -> None:
+    client = FakePageLookupClient(pages)
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "page_id"}
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match=reason) as raised:
+        asyncio.run(creatives.boost_instagram_post(**arguments))
+    assert "page_id is required" in str(raised.value)
+    assert not [call for call in client.calls if call[0] == "create"]
+
+
+def test_boost_one_step_plan_only_shows_new_options_and_sends_nothing(monkeypatch, fixed_clock) -> None:
+    client = FakePageLookupClient({None: {"data": [{"id": "777", "instagram_business_account": {"id": "666"}}]}})
+    arguments = {key: value for key, value in ONE_STEP.items() if key not in {"page_id", "daily_budget"}}
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(
+        **arguments, plan_only=True, partnership_ad_code=None, objective="OUTCOME_LEADS", destination_type="ON_AD",
+        call_to_action=LEAD_CTA, campaign_lifetime_budget=500, end_time="2026-11-20T00:00:00Z",
+        start_time="2026-11-14T00:00:00Z", bid_strategy="COST_CAP", bid_amount=3, special_ad_categories=["NONE"],
+    ))
+    assert [call[0] for call in client.calls] == ["get", "list"]
+    assert result["sent"] is False and result["plan_only"] is True
+    campaign, adset, creative, _ = (request["data"] for request in result["plan"]["requests"])
+    assert campaign["lifetime_budget"] == 50000 and campaign["bid_strategy"] == "COST_CAP"
+    assert campaign["special_ad_categories"] == ["NONE"]
+    assert adset["bid_amount"] == 300 and adset["start_time"] == "2026-11-14T00:00:00Z" and adset["end_time"] == "2026-11-20T00:00:00Z"
+    assert adset["promoted_object"] == {"page_id": "777"} and adset["destination_type"] == "ON_AD"
+    assert creative["call_to_action"] == {"type": "SIGN_UP", "value": {"lead_gen_form_id": "4455"}}
+    assert result["plan"]["page_lookup"]["complete"] is True
+
+
+def test_boost_one_step_plan_with_messaging_and_a_partnership_code_never_shows_the_code(monkeypatch, fixed_clock) -> None:
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "instagram_media_id"}
+    client = FakeOneStepClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    plan = asyncio.run(creatives.boost_instagram_post(
+        **arguments, partnership_ad_code="AC-SECRET-9", destination_type="INSTAGRAM_DIRECT", plan_only=True,
+    ))
+    assert "AC-SECRET-9" not in str(plan)
+    assert plan["plan"]["requests"][2]["data"]["call_to_action"]["type"] == "INSTAGRAM_MESSAGE"
+
+
+def _without(*keys):
+    return {key: value for key, value in ONE_STEP.items() if key not in keys}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"optimization_goal": "CONVERSATIONS"}, "optimization_goal for OUTCOME_ENGAGEMENT with destination ON_POST must be one of"),
+        ({"destination_type": "INSTAGRAM_DIRECT", "optimization_goal": "QUALITY_CALL"}, "must be one of CONVERSATIONS, LINK_CLICKS"),
+        ({"objective": "OUTCOME_SALES", "destination_type": "INSTAGRAM_DIRECT"}, "destination_type for OUTCOME_SALES must be one of"),
+        ({"billing_event": "LINK_CLICKS"}, "billing_event for optimization_goal POST_ENGAGEMENT must be IMPRESSIONS"),
+        ({"destination_type": "WHATSAPP", "optimization_goal": "LINK_CLICKS", "billing_event": "LINK_CLICKS"}, "must be IMPRESSIONS"),
+        ({"billing_event": "POST_ENGAGEMENT"}, "billing_event"),
+        ({"bid_strategy": "COST_CAP"}, "needs bid_amount"),
+        ({"bid_amount": 1}, "bid_amount needs bid_strategy"),
+        ({"bid_strategy": "LOWEST_COST_WITH_MIN_ROAS"}, "create_ad_set"),
+        ({"bid_strategy": "COST_CAP", "bid_amount": -1}, "greater than 0"),
+        ({"campaign_daily_budget": 10}, "Give one budget"),
+        ({"lifetime_budget": 10}, "Give one budget"),
+        ({"start_time": "2026-12-01T00:00:00"}, "needs a UTC offset"),
+        ({"start_time": "next tuesday"}, "ISO 8601"),
+        ({"start_time": "2026-11-01T00:00:00Z"}, "in the past"),
+        ({"end_time": "2026-11-20T00:00:00Z", "duration_days": 3}, "not both"),
+        ({"end_time": "2026-11-14T00:00:00Z"}, "at least 24 hours"),
+        ({"end_time": "2027-12-01T00:00:00Z"}, "at most 365 days"),
+        ({"end_time": "0"}, "positive Unix time"),
+        ({"special_ad_categories": ["NONE", "HOUSING"]}, "NONE cannot be combined"),
+        ({"special_ad_categories": ["someone@example.invalid"]}, "1 unknown value"),
+        ({"buying_type": "RESERVED"}, "reach and frequency"),
+        ({"buying_type": "FIXED"}, "must be AUCTION"),
+        ({"destination_type": "WHATSAPP", "call_to_action": {"type": "MESSAGE_PAGE"}}, "needs destination_type MESSENGER"),
+        ({"call_to_action": {"type": "WHATSAPP_MESSAGE"}}, "needs destination_type WHATSAPP"),
+        ({"call_to_action": {"type": "CALL_NOW", "value": {"link": "tel:+15551234567"}}}, "needs destination_type PHONE_CALL"),
+        ({"destination_type": "MESSENGER", "call_to_action": {"type": "MESSAGE_PAGE", "value": {"app_destination": "WHATSAPP"}}}, "leave call_to_action.value out"),
+        ({"destination_type": "MESSENGER", "promoted_object": {"page_id": "1"}}, "is the Page, set from page_id"),
+        ({"destination_type": "WHATSAPP", "promoted_object": {"whatsapp_phone_number": "call me"}}, "whatsapp_phone_number"),
+        ({"objective": "OUTCOME_LEADS", "destination_type": "ON_AD"}, "lead_gen_form_id"),
+        ({"objective": "OUTCOME_LEADS", "destination_type": "ON_AD", "call_to_action": {"type": "SHOP_NOW", "value": {"lead_gen_form_id": "1"}}}, "lead_gen_form_id"),
+        ({"objective": "OUTCOME_LEADS", "destination_type": "ON_AD", "call_to_action": {"type": "SIGN_UP", "value": {"lead_gen_form_id": "abc"}}}, "numeric form id"),
+        ({"objective": "OUTCOME_LEADS", "destination_type": "ON_AD", "call_to_action": {"type": "SIGN_UP", "value": {"lead_gen_form_id": "1", "link": "https://x.example"}}}, "takes only lead_gen_form_id"),
+        ({"objective": "OUTCOME_LEADS", "destination_type": "ON_AD", "call_to_action": LEAD_CTA, "optimization_goal": "CONVERSATIONS"}, "must be one of LEAD_GENERATION, QUALITY_LEAD"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "PHONE_CALL"}, "CALL_NOW"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "PHONE_CALL", "call_to_action": {"type": "CALL_NOW", "value": {"link": "5551234567"}}}, "CALL_NOW"),
+        ({"objective": "OUTCOME_TRAFFIC", "destination_type": "PHONE_CALL", "call_to_action": CALL_CTA, "billing_event": "LINK_CLICKS", "optimization_goal": "LINK_CLICKS"}, "must be IMPRESSIONS"),
+        ({"objective": "OUTCOME_APP_PROMOTION", "call_to_action": APP_CTA}, "application_id"),
+        ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": {**APP, "application_id": "abc"}, "call_to_action": APP_CTA}, "application_id"),
+        ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": {**APP, "object_store_url": "store"}, "call_to_action": APP_CTA}, "object_store_url"),
+        ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": APP}, "store link"),
+        ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": APP, "call_to_action": APP_CTA, "optimization_goal": "OFFSITE_CONVERSIONS"}, "custom_event_type"),
+        ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": APP, "call_to_action": APP_CTA, "destination_type": "APP"}, "takes no destination_type"),
+        ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": {**APP, "object_store_url": "https://u:p@play.google.com/x"}, "call_to_action": APP_CTA}, "username or password"),
+    ],
+)
+def test_boost_one_step_new_option_validation_makes_no_call(monkeypatch, fixed_clock, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message) as raised:
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+    assert "someone@example.invalid" not in str(raised.value)
+
+
+def test_boost_one_step_without_any_budget_names_every_budget_choice(monkeypatch, fixed_clock) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match="campaign_lifetime_budget; this tool does not pick a budget"):
+        asyncio.run(creatives.boost_instagram_post(**_without("daily_budget")))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"optimization_goal": "REACH"}, {"billing_event": "IMPRESSIONS"}, {"bid_strategy": "COST_CAP"}, {"bid_amount": 1},
+        {"lifetime_budget": 5}, {"campaign_daily_budget": 5}, {"campaign_lifetime_budget": 5},
+        {"start_time": "2026-12-01T00:00:00Z"}, {"end_time": "2026-12-09T00:00:00Z"},
+        {"special_ad_categories": ["HOUSING"]}, {"buying_type": "AUCTION"},
+    ],
+)
+def test_boost_with_adset_refuses_every_one_step_option(monkeypatch, extra) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    base = _without("daily_budget", "targeting")
+    with pytest.raises(creatives.ValidationError, match=f"{next(iter(extra))} only apply in one-step mode"):
+        asyncio.run(creatives.boost_instagram_post(**base, adset_id="60", **extra))
+
+
+def test_boost_one_step_failure_after_a_campaign_budget_names_what_was_created(monkeypatch, fixed_clock) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    client = FakeOneStepClient(fail_on="adcreatives")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.boost_instagram_post(**_without("daily_budget"), campaign_daily_budget=20, destination_type="MESSENGER"))
+    message = raised.value.message
+    assert "campaign 1 (PAUSED, remove with delete_campaign)" in message and "ad set 2 (PAUSED" in message
