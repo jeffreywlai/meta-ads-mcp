@@ -32,6 +32,7 @@ from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.tools.tool import Tool, ToolResult
 from pydantic import WithJsonSchema
 
+from meta_ads_mcp.argument_privacy import install_validation_log_privacy
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.error_middleware import (
     StructuredMetaErrorMiddleware,
@@ -370,3 +371,4 @@ mcp_server.add_middleware(RESPONSE_LIMITING_MIDDLEWARE)
 mcp_server.add_middleware(StructuredMetaErrorMiddleware())
 mcp_server.add_middleware(ReadOnlyAdvertisingMiddleware())
 mcp_server.add_middleware(ToolParameterHelpMiddleware())
+install_validation_log_privacy(mcp_server)

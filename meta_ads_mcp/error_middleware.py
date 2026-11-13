@@ -5,28 +5,65 @@ from __future__ import annotations
 import json
 
 from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.middleware.middleware import CallNext, MiddlewareContext
+from pydantic import ValidationError as PydanticValidationError
 
+from meta_ads_mcp.argument_privacy import (
+    PRIVATE_ARGUMENT_TOOLS,
+    private_validation_message,
+    schema_parameter_names,
+    unknown_parameter_count,
+)
 from meta_ads_mcp.errors import MetaApiError, RateLimitError
 
 
 class ToolParameterHelpMiddleware(Middleware):
-    """Reject unknown keywords with the live schema before a tool executes."""
+    """Reject unknown keywords with the live schema before a tool executes.
+
+    For tools in PRIVATE_ARGUMENT_TOOLS, unknown parameters are counted rather
+    than named, and the framework's argument-validation error is replaced by one
+    that names parameters only: those arguments can hold personal data or
+    secrets, and a misplaced value can arrive as a parameter name.
+    """
 
     async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext):
+        tool = None
         if context.fastmcp_context is not None:
             tool = await context.fastmcp_context.fastmcp.get_tool(context.message.name)
-            if tool is not None and tool.parameters.get("additionalProperties") is False:
-                accepted = list(tool.parameters.get("properties", {}))
-                unexpected = sorted(set(context.message.arguments or {}) - set(accepted))
-                if unexpected:
-                    raise ToolError(
-                        f"Unknown parameters for {tool.name}: {', '.join(unexpected)}. "
-                        f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
-                        f"Inspect types and defaults with get_capabilities(tool_name='{tool.name}')."
-                    )
-        return await call_next(context)
+        private = tool is not None and tool.name in PRIVATE_ARGUMENT_TOOLS
+        if tool is not None and tool.parameters.get("additionalProperties") is False:
+            accepted = list(tool.parameters.get("properties", {}))
+            unexpected = sorted(set(context.message.arguments or {}) - set(accepted))
+            if unexpected:
+                described = (
+                    f"{unknown_parameter_count(len(unexpected))} (names not repeated because "
+                    "this tool's arguments can hold personal data or secrets)"
+                    if private
+                    else ", ".join(unexpected)
+                )
+                raise ToolError(
+                    f"Unknown parameters for {tool.name}: {described}. "
+                    f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
+                    f"Inspect types and defaults with get_capabilities(tool_name='{tool.name}')."
+                )
+        if not private:
+            return await call_next(context)
+        failure: ToolError | None = None
+        try:
+            return await call_next(context)
+        except (FastMCPValidationError, PydanticValidationError) as exc:
+            cause = exc if isinstance(exc, PydanticValidationError) else exc.__cause__
+            errors = cause.errors(include_url=False) if isinstance(cause, PydanticValidationError) else None
+            failure = ToolError(
+                private_validation_message(
+                    tool.name, errors, schema_parameter_names(tool.parameters)
+                )
+            )
+        # Raised outside the except block so the original error, which quotes
+        # the values, is neither the cause nor the context of this one.
+        raise failure
 
 
 class StructuredMetaErrorMiddleware(Middleware):
