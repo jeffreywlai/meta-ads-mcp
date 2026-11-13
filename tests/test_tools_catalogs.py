@@ -22,11 +22,15 @@ class FakeCatalogClient:
         edges: dict[tuple[str, str], Any] | None = None,
         get_errors: dict[str, Exception] | None = None,
         edge_errors: dict[tuple[str, str], Exception] | None = None,
+        create_responses: dict[tuple[str, str], Any] | None = None,
+        create_errors: dict[tuple[str, str], Exception] | None = None,
     ) -> None:
         self.objects = objects or {}
         self.edges = edges or {}
         self.get_errors = get_errors or {}
         self.edge_errors = edge_errors or {}
+        self.create_responses = create_responses or {}
+        self.create_errors = create_errors or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def kinds(self) -> list[str]:
@@ -49,7 +53,9 @@ class FakeCatalogClient:
 
     async def create_edge_object(self, parent_id, edge, *, data, files=None):
         self.calls.append(("create", {"parent_id": parent_id, "edge": edge, "data": data}))
-        return {"id": "new_1"}
+        if (parent_id, edge) in self.create_errors:
+            raise self.create_errors[(parent_id, edge)]
+        return self.create_responses.get((parent_id, edge), {"id": "new_1"})
 
     async def update_object(self, object_id, *, data):
         self.calls.append(("update", {"object_id": object_id, "data": data}))
@@ -1171,17 +1177,632 @@ def test_delete_product_set_read_failure_sends_no_delete(monkeypatch) -> None:
     assert client.kinds() == ["get"]
 
 
+# ------------------------------------------------- batch_update_catalog_products
+
+
+def _batch_item(method: str, retailer_id: str, **values: Any) -> dict[str, Any]:
+    return {"method": method, "retailer_id": retailer_id, **values}
+
+
+def _full_create(retailer_id: str, **overrides: Any) -> dict[str, Any]:
+    item = _batch_item(
+        "create", retailer_id, name="Shoe", description="Running shoe", url="https://shop.example/s",
+        image_url="https://shop.example/s.png", brand="Acme", availability="in stock",
+        condition="new", price=12.5, currency="usd",
+    )
+    item.update(overrides)
+    return item
+
+
+def _existing(retailer_id: str, product_id: str, **values: Any) -> dict[str, Any]:
+    return {"id": product_id, "retailer_id": retailer_id, "name": "Old", "price": "$10.00", **values}
+
+
+def _batch_client(existing: list[dict[str, Any]] | None = None, *, post: Any = None,
+                  status: Any = None, **kwargs) -> FakeCatalogClient:
+    edges = {("123", "products"): {"data": existing or []}}
+    if status is not None:
+        edges[("123", "check_batch_request_status")] = status
+    edges.update(kwargs.pop("edges", {}))
+    responses = {("123", "items_batch"): post if post is not None else {"handles": ["h1"], "validation_status": []}}
+    return FakeCatalogClient(edges=edges, create_responses=responses, **kwargs)
+
+
+def _no_pause(monkeypatch) -> list[float]:
+    pauses: list[float] = []
+
+    async def pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    monkeypatch.setattr(catalogs, "_pause", pause)
+    return pauses
+
+
+def _finished(**row: Any) -> dict[str, Any]:
+    return {"data": [{"handle": "h1", "status": "finished", "errors_total_count": 0, **row}]}
+
+
+def test_batch_products_dry_run_sends_nothing(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing("SKU-2", "p2")]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123",
+        items=[_full_create("SKU-1"), _batch_item("update", "SKU-2", price=9.99, currency="USD")],
+        dry_run=True,
+    ))
+    assert "create" not in client.kinds()
+    assert all(call["edge"] != "check_batch_request_status" for kind, call in client.calls if kind == "list")
+    assert result["dry_run"] is True
+    request = result["request"]
+    assert request["endpoint"] == "POST /123/items_batch"
+    assert request["data"]["item_type"] == "PRODUCT_ITEM"
+    assert request["data"]["allow_upsert"] is False
+    assert request["data"]["requests"] == [
+        {"method": "CREATE", "data": {
+            "id": "SKU-1", "title": "Shoe", "description": "Running shoe", "link": "https://shop.example/s",
+            "image": [{"url": "https://shop.example/s.png"}], "brand": "Acme", "availability": "in stock",
+            "condition": "new", "price": "12.50 USD",
+        }},
+        {"method": "UPDATE", "data": {"id": "SKU-2", "price": "9.99 USD"}},
+    ]
+    outcomes = {item["retailer_id"]: item["outcome"] for item in result["items"]}
+    assert outcomes == {"SKU-1": "would_send", "SKU-2": "would_send"}
+    update = next(item for item in result["items"] if item["retailer_id"] == "SKU-2")
+    assert update["previous"]["price"] == "$10.00"
+    assert update["product_id"] == "p2"
+
+
+def test_batch_products_reads_existing_skus_with_one_filtered_request(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing("SKU-2", "p2")], status=_finished()))
+    _run(catalogs.batch_update_catalog_products(
+        catalog_id="123",
+        items=[_batch_item("update", "SKU-2", name="New"), _batch_item("delete", "SKU-3")],
+    ))
+    read = client.calls[0][1]
+    assert (read["parent_id"], read["edge"]) == ("123", "products")
+    assert read["params"]["filter"] == {"retailer_id": {"is_any": ["SKU-2", "SKU-3"]}}
+    assert "product_feed" in read["fields"]
+    assert "retailer_id" in read["fields"]
+
+
+def test_batch_products_partial_failure_reports_each_item(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    status = _finished(
+        errors_total_count=1,
+        errors=[{"line": 2, "id": "SKU-2", "message": "Invalid price"}],
+        warnings=[{"line": 1, "id": "SKU-1", "message": "Missing GTIN"}],
+        ids_of_invalid_requests=["SKU-2"],
+    )
+    client = _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1"), _existing("SKU-2", "p2"), _existing("SKU-3", "p3")],
+        post={"handles": ["h1"], "validation_status": [
+            {"retailer_id": "SKU-1", "errors": [], "warnings": [{"message": "Short title"}]},
+        ]},
+        status=status,
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123",
+        items=[
+            _batch_item("update", "SKU-1", name="A"),
+            _batch_item("update", "SKU-2", price=5, currency="USD"),
+            _batch_item("delete", "SKU-3"),
+        ],
+    ))
+    by_sku = {item["retailer_id"]: item for item in result["items"]}
+    assert by_sku["SKU-1"]["outcome"] == "applied"
+    assert set(by_sku["SKU-1"]["warnings"]) == {"Short title", "Missing GTIN"}
+    assert by_sku["SKU-2"]["outcome"] == "failed"
+    assert by_sku["SKU-2"]["errors"] == ["Invalid price"]
+    assert by_sku["SKU-3"]["outcome"] == "applied"
+    assert result["summary"]["outcomes"] == {"applied": 2, "failed": 1}
+    assert result["batch"]["status"] == "finished"
+    assert result["batch"]["complete"] is True
+    assert result["ok"] is False
+    status_call = next(call for kind, call in client.calls if kind == "list" and call["edge"] == "check_batch_request_status")
+    assert status_call["params"] == {"handle": "h1", "load_ids_of_invalid_requests": True}
+
+
+def test_batch_products_unattributed_errors_leave_items_unknown(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1"), _existing("SKU-2", "p2")],
+        status=_finished(errors_total_count=1, errors=[], ids_of_invalid_requests=[]),
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123",
+        items=[_batch_item("update", "SKU-1", name="A"), _batch_item("update", "SKU-2", name="B")],
+    ))
+    assert [item["outcome"] for item in result["items"]] == ["outcome_unknown", "outcome_unknown"]
+    assert "did not name" in result["items"][0]["reason"]
+
+
+def test_batch_products_unfinished_batch_is_reported_as_processing(monkeypatch) -> None:
+    pauses = _no_pause(monkeypatch)
+    pending = {"data": [{"handle": "h1", "status": "started"}]}
+    client = _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], status=pending))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")], wait_seconds=6,
+    ))
+    checks = [call for kind, call in client.calls if kind == "list" and call["edge"] == "check_batch_request_status"]
+    assert len(checks) == 3
+    assert pauses == [2, 2, 2]
+    assert result["items"][0]["outcome"] == "processing"
+    assert result["batch"] == {
+        "handle": "h1", "status": "started", "complete": False, "status_checks": 3,
+        "errors_total_count": None, "warnings_total_count": None,
+    }
+    assert result["retry"]["safe_now"] is False
+    assert "handle" in result["retry"]["how"]
+
+
+def test_batch_products_wait_zero_does_not_check_status(monkeypatch) -> None:
+    pauses = _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")], wait_seconds=0,
+    ))
+    assert pauses == []
+    assert all(call["edge"] != "check_batch_request_status" for kind, call in client.calls if kind == "list")
+    assert result["items"][0]["outcome"] == "processing"
+
+
+def test_batch_products_no_handle_means_nothing_ingested(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1")],
+        post={"handles": [], "validation_status": [{"retailer_id": "SKU-1", "errors": [{"message": "Bad"}]}]},
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")],
+    ))
+    assert result["items"][0]["outcome"] == "not_applied"
+    assert result["items"][0]["errors"] == ["Bad"]
+    assert result["retry"]["safe_now"] is True
+
+
+def test_batch_products_states_whether_a_retry_is_safe(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    timeout = MetaApiError(
+        message="Meta API request failed before a response was received.",
+        is_transient=True, mutation_outcome_unknown=True,
+    )
+    client = _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1")], create_errors={("123", "items_batch"): timeout},
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A"), _full_create("SKU-9")],
+    ))
+    assert client.kinds().count("create") == 1
+    assert [item["outcome"] for item in result["items"]] == ["outcome_unknown", "outcome_unknown"]
+    retry = result["retry"]
+    assert retry["safe_now"] is True
+    assert "half" in retry["how"]
+    assert "skipped" in retry["why"] and "same values" in retry["why"]
+    assert "one product per retailer id" in retry["why"]
+    assert result["ok"] is False
+
+
+def test_batch_products_refused_request_is_not_applied(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    refused = MetaApiError(message="(#100) Invalid parameter", status_code=400, code=100)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], create_errors={("123", "items_batch"): refused}))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")],
+    ))
+    assert result["items"][0]["outcome"] == "not_applied"
+    assert result["error"]["code"] == 100
+    assert result["retry"]["safe_now"] is True
+
+
+def test_batch_products_retry_skips_work_already_done(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_full_create("SKU-1"), _batch_item("delete", "SKU-2")],
+    ))
+    by_sku = {item["retailer_id"]: item for item in result["items"]}
+    assert by_sku["SKU-1"]["outcome"] == "skipped_already_exists"
+    assert by_sku["SKU-1"]["product_id"] == "p1"
+    assert by_sku["SKU-2"]["outcome"] == "skipped_not_found"
+    assert "create" not in client.kinds()
+    assert result["ok"] is True
+
+
+def test_batch_products_update_of_missing_sku_is_skipped_unless_upsert(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-5", name="A")],
+    ))
+    assert result["items"][0]["outcome"] == "skipped_not_found"
+    assert "create" not in client.kinds()
+    client = _use(monkeypatch, _batch_client([], status=_finished()))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-5", name="A")], allow_upsert=True,
+    ))
+    post = next(call for kind, call in client.calls if kind == "create")
+    assert post["data"]["allow_upsert"] is True
+    assert result["items"][0]["outcome"] == "applied"
+
+
+def test_batch_products_warn_when_a_feed_supplies_the_product(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1", product_feed={"id": "feed_7"}), _existing("SKU-2", "p2")],
+        status=_finished(),
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123",
+        items=[_batch_item("update", "SKU-1", name="A"), _batch_item("delete", "SKU-2")],
+    ))
+    by_sku = {item["retailer_id"]: item for item in result["items"]}
+    assert "feed_7" in by_sku["SKU-1"]["feed_warning"]
+    assert "overwrite" in by_sku["SKU-1"]["feed_warning"]
+    assert "feed_warning" not in by_sku["SKU-2"]
+    assert result["feed_check"]["status"] == "read"
+    assert "not a guarantee" in result["feed_check"]["note"]
+
+
+def test_batch_products_feed_field_rejection_falls_back_without_it(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    rejected = MetaApiError(message="(#100) Tried accessing nonexisting field (product_feed)", code=100)
+
+    class Client(FakeCatalogClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            if edge == "products" and "product_feed" in (fields or []):
+                self.calls.append(("list", {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}))
+                raise rejected
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    client = _use(monkeypatch, Client(
+        edges={("123", "products"): {"data": [_existing("SKU-1", "p1")]},
+               ("123", "check_batch_request_status"): _finished()},
+        create_responses={("123", "items_batch"): {"handles": ["h1"]}},
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")],
+    ))
+    product_reads = [call for kind, call in client.calls if kind == "list" and call["edge"] == "products"]
+    assert len(product_reads) == 2
+    assert result["feed_check"]["status"] == "unavailable"
+    assert result["items"][0]["outcome"] == "applied"
+
+
+def test_batch_products_read_failure_writes_nothing(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client(edge_errors={("123", "products"): _permission_error()}))
+    with pytest.raises(MetaApiError):
+        _run(catalogs.batch_update_catalog_products(
+            catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")],
+        ))
+    assert "create" not in client.kinds()
+
+
+def test_batch_products_incomplete_read_writes_nothing(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    stalled = {"data": [_existing("SKU-1", "p1")], "paging": {"next": "https://graph/next"}}
+    client = _use(monkeypatch, _batch_client(edges={("123", "products"): stalled}))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="A")],
+    ))
+    assert "create" not in client.kinds()
+    assert result["ok"] is False
+    assert result["sent"] is False
+    assert "cursor" in result["reason"]
+
+
+def test_batch_products_prices_use_major_units_and_reject_booleans(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123",
+        items=[_batch_item("update", "SKU-1", price=14, sale_price=9.5, currency="gbp")],
+        dry_run=True,
+    ))
+    assert result["request"]["data"]["requests"][0]["data"] == {
+        "id": "SKU-1", "price": "14 GBP", "sale_price": "9.50 GBP",
+    }
+    assert result["items"][0]["changes"] == {"price": 14, "sale_price": 9.5, "currency": "GBP"}
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="price"):
+        _run(catalogs.batch_update_catalog_products(
+            catalog_id="123", items=[_batch_item("update", "SKU-1", price=True, currency="USD")],
+        ))
+
+
+def test_batch_products_extra_fields_pass_through_from_the_documented_list(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing("SKU-1", "p1", custom_label_0="old")]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123",
+        items=[_batch_item("update", "SKU-1", fields={"custom_label_0": "winter", "shipping_weight": "1 kg"})],
+        dry_run=True,
+    ))
+    assert result["request"]["data"]["requests"][0]["data"] == {
+        "id": "SKU-1", "custom_label_0": "winter", "shipping_weight": "1 kg",
+    }
+    item = result["items"][0]
+    assert item["previous"] == {"custom_label_0": "old"}
+    assert item["previous_unavailable"] == ["shipping_weight"]
+    assert "custom_label_0" in client.calls[0][1]["fields"]
+
+
+@pytest.mark.parametrize(("items", "match"), [
+    ([], "1 to 50"),
+    ([{"method": "update", "retailer_id": f"S{i}", "name": "x"} for i in range(51)], "1 to 50"),
+    ([{"method": "upsert", "retailer_id": "S1"}], "method"),
+    ([{"method": "update", "retailer_id": " "}], "retailer_id"),
+    ([{"method": "update", "retailer_id": "S1"}], "at least one"),
+    ([{"method": "update", "retailer_id": "S1", "name": "a"}, {"method": "delete", "retailer_id": "S1"}], "more than once"),
+    ([{"method": "delete", "retailer_id": "S1", "name": "a"}], "delete"),
+    ([{"method": "create", "retailer_id": "S1", "name": "a"}], "missing"),
+    ([{"method": "update", "retailer_id": "S1", "price": 5}], "currency"),
+    ([{"method": "update", "retailer_id": "S1", "colour": "red"}], "colour"),
+    ([{"method": "update", "retailer_id": "S1", "fields": {"title": "x"}}], "title"),
+    ([{"method": "update", "retailer_id": "S1", "fields": {"not_a_field": "x"}}], "not_a_field"),
+    ([{"method": "update", "retailer_id": "S1", "availability": "maybe"}], "availability"),
+    (["S1"], "object"),
+])
+def test_batch_products_validate_before_any_request(monkeypatch, items, match) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=match):
+        _run(catalogs.batch_update_catalog_products(catalog_id="123", items=items))
+
+
+def test_batch_products_validate_options_before_any_request(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    item = [{"method": "update", "retailer_id": "S1", "name": "a"}]
+    with pytest.raises(ValidationError, match="wait_seconds"):
+        _run(catalogs.batch_update_catalog_products(catalog_id="123", items=item, wait_seconds=61))
+    with pytest.raises(ValidationError, match="either items or handle"):
+        _run(catalogs.batch_update_catalog_products(catalog_id="123", items=item, handle="h1"))
+    with pytest.raises(ValidationError, match="either items or handle"):
+        _run(catalogs.batch_update_catalog_products(catalog_id="123"))
+
+
+def test_batch_products_handle_reads_an_earlier_batch_without_writing(monkeypatch) -> None:
+    pauses = _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client(status=_finished(
+        errors_total_count=1, errors=[{"line": 1, "id": "SKU-1", "message": "Bad"}],
+        ids_of_invalid_requests=["SKU-1"],
+    )))
+    result = _run(catalogs.batch_update_catalog_products(catalog_id="123", handle="h1"))
+    assert client.kinds() == ["list"]
+    assert pauses == []
+    assert result["batch"]["status"] == "finished"
+    assert result["batch"]["complete"] is True
+    assert result["failed_retailer_ids"] == ["SKU-1"]
+    assert result["errors"] == [{"line": 1, "id": "SKU-1", "message": "Bad"}]
+
+
+# --------------------------------------------- list_catalog_products extensions
+
+
+def test_list_catalog_products_old_style_call_is_unchanged(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    _run(catalogs.list_catalog_products(catalog_id="cat_1", limit=10, after="c1"))
+    assert client.calls == [("list", {
+        "parent_id": "cat_1", "edge": "products",
+        "fields": catalogs.PRODUCT_FIELDS,
+        "params": {"limit": 10, "after": "c1", "summary": "total_count"},
+    })]
+
+
+def test_list_catalog_products_filters_by_diagnostic(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    result = _run(catalogs.list_catalog_products(
+        product_set_id="ps_1", error_type="image_resolution_low", error_priority="high",
+    ))
+    params = client.calls[0][1]["params"]
+    assert params["error_type"] == "IMAGE_RESOLUTION_LOW"
+    assert params["error_priority"] == "HIGH"
+    assert result["summary"]["scope"] == {
+        "product_set_id": "ps_1", "error_type": "IMAGE_RESOLUTION_LOW", "error_priority": "HIGH",
+    }
+
+
+def test_list_catalog_products_product_group_view(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={("cat_1", "product_groups"): {
+        "data": [{"id": "g1", "retailer_id": "TEE"}], "summary": {"total_count": 7},
+    }}))
+    result = _run(catalogs.list_catalog_products(catalog_id="cat_1", view="product_groups", limit=5))
+    call = client.calls[0][1]
+    assert (call["parent_id"], call["edge"]) == ("cat_1", "product_groups")
+    assert call["fields"] == ["id", "retailer_id", "variants"]
+    assert call["params"] == {"limit": 5, "summary": "total_count"}
+    assert result["summary"]["total_count"] == 7
+    assert result["summary"]["scope"] == {"catalog_id": "cat_1", "view": "product_groups"}
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"product_id": "p", "error_type": "EMPTY_PRICE"}, "error_type"),
+    ({"catalog_id": "c", "error_type": "bad value!"}, "error_type"),
+    ({"catalog_id": "c", "error_priority": "urgent"}, "error_priority"),
+    ({"catalog_id": "c", "view": "groups"}, "view"),
+    ({"product_set_id": "p", "view": "product_groups"}, "catalog_id"),
+    ({"catalog_id": "c", "view": "product_groups", "filter": {"brand": {"eq": "A"}}}, "product_groups"),
+    ({"catalog_id": "c", "view": "product_groups", "error_type": "EMPTY_PRICE"}, "product_groups"),
+])
+def test_list_catalog_products_extension_validation(monkeypatch, kwargs, match) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=match):
+        _run(catalogs.list_catalog_products(**kwargs))
+
+
+# ------------------------------------------------ list_catalog_attribute_values
+
+
+def _scan_pages(*pages: list[dict[str, Any]], total: int | None = None) -> list[dict[str, Any]]:
+    payloads = []
+    for index, rows in enumerate(pages):
+        payload: dict[str, Any] = {"data": rows}
+        if index + 1 < len(pages):
+            payload["paging"] = {"next": "https://graph/next", "cursors": {"after": f"c{index + 1}"}}
+        if total is not None:
+            payload["summary"] = {"total_count": total}
+        payloads.append(payload)
+    return payloads
+
+
+def test_attribute_values_counts_values_across_a_complete_scan(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={("123", "products"): _scan_pages(
+        [{"id": "1", "brand": "Acme"}, {"id": "2", "brand": "Zed"}],
+        [{"id": "3", "brand": "Acme"}, {"id": "4"}, {"id": "5", "brand": " "}],
+        total=5,
+    )}))
+    result = _run(catalogs.list_catalog_attribute_values(catalog_id="123", attribute="brand"))
+    first = client.calls[0][1]
+    assert first["fields"] == ["brand"]
+    assert first["params"] == {"limit": 100, "summary": "total_count"}
+    assert client.calls[1][1]["params"]["after"] == "c1"
+    assert result["values"] == [{"value": "Acme", "count": 2}, {"value": "Zed", "count": 1}]
+    assert result["coverage"] == {
+        "products_examined": 5, "products_in_scope": 5, "complete": True, "stop_reason": None,
+        "requests": 2, "counts_are": "exact",
+    }
+    assert result["products_without_value"] == 2
+    assert result["distinct_values"] == 2
+
+
+def test_attribute_values_scan_reports_coverage(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={("123", "products"): _scan_pages(
+        [{"id": str(i), "custom_label_0": "sale" if i % 2 else "core"} for i in range(100)],
+        [{"id": str(i), "custom_label_0": "core"} for i in range(100, 200)],
+        [{"id": "x", "custom_label_0": "never read"}],
+        total=8391,
+    )}))
+    result = _run(catalogs.list_catalog_attribute_values(
+        catalog_id="123", attribute="custom_label_0", max_products=200,
+    ))
+    assert len([call for kind, call in client.calls if kind == "list"]) == 2
+    coverage = result["coverage"]
+    assert coverage["products_examined"] == 200
+    assert coverage["products_in_scope"] == 8391
+    assert coverage["complete"] is False
+    assert coverage["counts_are"] == "lower_bounds"
+    assert "200" in coverage["stop_reason"]
+    assert result["values"][0] == {"value": "core", "count": 150}
+    assert any("200 of 8391" in note for note in result["notes"])
+
+
+def test_attribute_values_verify_counts_reads_exact_totals(monkeypatch) -> None:
+    pages = _scan_pages([{"id": "1", "brand": "Acme"}, {"id": "2", "brand": "Zed"}],
+                        [{"id": "3", "brand": "Acme"}], total=9)
+
+    class Client(FakeCatalogClient):
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            if params and "filter" in params:
+                self.calls.append(("list", {"parent_id": parent_id, "edge": edge, "fields": fields, "params": params}))
+                value = params["filter"]["brand"]["eq"]
+                return {"data": [], "summary": {"total_count": {"Acme": 6, "Zed": 3}[value]}}
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+
+    client = _use(monkeypatch, Client(edges={("123", "products"): pages}))
+    result = _run(catalogs.list_catalog_attribute_values(
+        catalog_id="123", attribute="brand", max_products=100, verify_top=2,
+    ))
+    verify_calls = [call for kind, call in client.calls if "filter" in (call.get("params") or {})]
+    assert verify_calls[0]["params"] == {"filter": {"brand": {"eq": "Acme"}}, "summary": "total_count", "limit": 1}
+    assert result["values"] == [
+        {"value": "Acme", "count": 2, "verified_count": 6},
+        {"value": "Zed", "count": 1, "verified_count": 3},
+    ]
+
+
+def test_attribute_values_product_set_scope_and_validation(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    result = _run(catalogs.list_catalog_attribute_values(
+        catalog_id="123", product_set_id="456", attribute="product_type",
+    ))
+    assert client.calls[0][1]["parent_id"] == "456"
+    assert result["scope"] == {"catalog_id": "123", "product_set_id": "456", "attribute": "product_type"}
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="attribute"):
+        _run(catalogs.list_catalog_attribute_values(catalog_id="123", attribute="url"))
+    with pytest.raises(ValidationError, match="max_products"):
+        _run(catalogs.list_catalog_attribute_values(catalog_id="123", attribute="brand", max_products=0))
+    with pytest.raises(ValidationError, match="max_products"):
+        _run(catalogs.list_catalog_attribute_values(catalog_id="123", attribute="brand", max_products=5001))
+    with pytest.raises(ValidationError, match="verify_top"):
+        _run(catalogs.list_catalog_attribute_values(catalog_id="123", attribute="brand", verify_top=11))
+
+
+# --------------------------------------------- list_dpa_eligible_catalogs context
+
+
+def test_dpa_without_context_reads_no_products_and_skips_empty_catalogs(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client())
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    edges = [(call["parent_id"], call["edge"]) for kind, call in client.calls if kind == "list"]
+    assert ("cat_ready", "products") not in edges
+    assert all(parent != "cat_empty" for parent, _ in edges)
+    assert all("context_match" not in finding for finding in result["findings"])
+
+
+def test_dpa_skips_supporting_reads_for_catalogs_without_products(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client())
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_url="https://shop.example/x"))
+    assert all(call["parent_id"] != "cat_empty" for kind, call in client.calls if kind == "list")
+    empty = next(f for f in result["findings"] if f["catalog_id"] == "cat_empty")
+    assert empty["assessment"] == "blocked"
+
+
+def test_dpa_prefers_catalog_matching_the_ad_domain_and_pixel(monkeypatch) -> None:
+    client = _use(monkeypatch, _dpa_client(edges={
+        ("cat_nosrc", "external_event_sources"): {"data": [{"id": "777"}]},
+        ("cat_ready", "products"): {"data": [{"id": "a", "url": "https://other.example/p"}]},
+        ("cat_nosrc", "products"): {"data": [
+            {"id": "b", "url": "https://www.shop.example/p1"}, {"id": "c", "url": "https://shop.example/p2"},
+        ]},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(
+        business_id="biz_1", ad_url="https://www.shop.example/sale", pixel_id="777",
+    ))
+    assert [f["catalog_id"] for f in result["findings"]] == ["cat_nosrc", "cat_ready", "cat_empty"]
+    top = result["findings"][0]
+    assert top["context_match"]["ad_domain"] == {
+        "domain": "shop.example", "sampled_urls": 2, "matching_urls": 2, "match": "yes",
+    }
+    assert top["context_match"]["pixel"] == {"pixel_id": "777", "connected": True}
+    assert any("shop.example" in reason for reason in top["reasons"])
+    assert result["recommended_catalog_id"] == "cat_nosrc"
+    assert "ad_url" in result["recommendation_reason"]
+    url_read = next(call for kind, call in client.calls if kind == "list" and call["edge"] == "products")
+    assert url_read["fields"] == ["url"]
+    assert url_read["params"] == {"limit": 5}
+
+
+def test_dpa_context_with_no_matching_ready_catalog_recommends_nothing(monkeypatch) -> None:
+    _use(monkeypatch, _dpa_client(edges={
+        ("cat_ready", "products"): {"data": [{"id": "a", "url": "https://other.example/p"}]},
+        ("cat_nosrc", "products"): {"data": []},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_url="shop.example"))
+    assert result["recommended_catalog_id"] is None
+    assert "matched" in result["recommendation_reason"]
+    nosrc = next(f for f in result["findings"] if f["catalog_id"] == "cat_nosrc")
+    assert nosrc["context_match"]["ad_domain"]["match"] == "unknown"
+
+
+def test_dpa_context_validation(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="ad_url"):
+        _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1", ad_url="not a url"))
+
+
 # ---------------------------------------------------------------- registry
 
 
 WRITE_TOOLS = {
     "create_catalog", "update_catalog", "create_catalog_product", "update_catalog_product",
     "delete_catalog_product", "create_product_set", "update_product_set", "delete_product_set",
+    "batch_update_catalog_products",
 }
 READ_TOOLS = {
     "list_catalogs", "list_dpa_eligible_catalogs", "get_catalog_diagnostics",
     "get_catalog_dynamic_ads_health", "list_catalog_data_sources", "list_catalog_products",
-    "build_product_set_filter", "list_product_sets",
+    "build_product_set_filter", "list_product_sets", "list_catalog_attribute_values",
 }
 
 

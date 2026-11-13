@@ -6,11 +6,13 @@ that feeds Advantage+ catalog ads), never this server's own list of tools.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, TypeAlias
+from urllib.parse import urlparse
 
 from pydantic import BeforeValidator, Field
 
@@ -18,6 +20,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import (
     MetaApiError,
     NotFoundError,
+    RateLimitError,
     UnsupportedFeatureError,
     ValidationError,
 )
@@ -25,7 +28,7 @@ from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
-from meta_ads_mcp.tool_types import FieldList, normalize_field_list
+from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 
 # Fields documented on the Product Catalog reference page.
 CATALOG_FIELDS = ["id", "name", "vertical", "product_count", "feed_count", "is_catalog_segment"]
@@ -948,6 +951,24 @@ async def update_catalog(
     return response
 
 
+PRODUCT_LIST_VIEWS = ("items", "product_groups")
+# ProductGroup fields from the SDK at 26.0.2 (the edge is documented on the catalog).
+PRODUCT_GROUP_FIELDS = ["id", "retailer_id", "variants"]
+PRODUCT_ERROR_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
+
+
+def _error_type(value: str | None) -> str | None:
+    """Normalize a catalog diagnostic error type; Meta's enum values are upper snake case."""
+    if value is None:
+        return None
+    normalized = value.strip().upper() if isinstance(value, str) else ""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", normalized):
+        raise ValidationError(
+            "error_type must be one of Meta's catalog diagnostic error types, for example IMAGE_RESOLUTION_LOW."
+        )
+    return normalized
+
+
 @mcp_server.tool()
 async def list_catalog_products(
     catalog_id: str | None = None,
@@ -957,28 +978,69 @@ async def list_catalog_products(
     limit: int = 50,
     after: str | None = None,
     fields: FieldList | None = None,
+    error_type: str | None = None,
+    error_priority: str | None = None,
+    view: str = "items",
 ) -> dict[str, Any]:
-    """List products in a product catalog or product set, optionally narrowed by a Meta filter object, or read one product. Prices are returned as Meta formats them."""
+    """List products in a product catalog or product set, optionally narrowed by a Meta filter object, or read one product. error_type (a diagnostic type such as IMAGE_RESOLUTION_LOW) or error_priority (HIGH, MEDIUM, LOW) lists only products hit by catalog diagnostics; Meta rejects some types, which does not mean no products are affected. view=product_groups lists a catalog's product groups (one row per variant group) instead of items. Prices are returned as Meta formats them."""
     scope_name, scope_value = _one_scope(
         catalog_id=catalog_id, product_set_id=product_set_id, product_id=product_id,
     )
     _check_limit(limit)
     parsed_filter = _parse_filter(filter)
+    normalized_error_type = _error_type(error_type)
+    normalized_priority = None
+    if error_priority is not None:
+        normalized_priority = error_priority.strip().upper() if isinstance(error_priority, str) else ""
+        if normalized_priority not in PRODUCT_ERROR_PRIORITIES:
+            raise ValidationError(f"error_priority must be one of: {', '.join(PRODUCT_ERROR_PRIORITIES)}.")
+    if view not in PRODUCT_LIST_VIEWS:
+        raise ValidationError(f"view must be one of: {', '.join(PRODUCT_LIST_VIEWS)}.")
+    diagnostic = normalized_error_type is not None or normalized_priority is not None
     if scope_name == "product_id" and parsed_filter is not None:
         raise ValidationError("filter applies to catalog_id or product_set_id, not product_id.")
-    requested = normalize_field_list(fields) or PRODUCT_FIELDS
+    if scope_name == "product_id" and diagnostic:
+        raise ValidationError(
+            "error_type and error_priority apply to catalog_id or product_set_id; for one product, "
+            "request the errors field instead."
+        )
+    if view == "product_groups":
+        if scope_name != "catalog_id":
+            raise ValidationError("view=product_groups needs catalog_id; Meta documents product groups on catalogs only.")
+        if parsed_filter is not None or diagnostic:
+            raise ValidationError(
+                "view=product_groups takes no filter, error_type or error_priority; Meta documents no "
+                "parameters on the product_groups edge."
+            )
     client = get_graph_api_client()
     if scope_name == "product_id":
+        requested = normalize_field_list(fields) or PRODUCT_FIELDS
         result = _single(await client.get_object(scope_value, fields=requested))
         result["summary"]["scope"] = {"product_id": scope_value}
         return result
     params = _page_params(limit, after)
     params["summary"] = "total_count"
+    if view == "product_groups":
+        requested = normalize_field_list(fields) or PRODUCT_GROUP_FIELDS
+        payload = await client.list_objects(scope_value, "product_groups", fields=requested, params=params)
+        result = _paged(payload)
+        result["summary"]["scope"] = {scope_name: scope_value, "view": "product_groups"}
+        return result
+    requested = normalize_field_list(fields) or PRODUCT_FIELDS
     if parsed_filter is not None:
         params["filter"] = parsed_filter
+    if normalized_error_type is not None:
+        params["error_type"] = normalized_error_type
+    if normalized_priority is not None:
+        params["error_priority"] = normalized_priority
     payload = await client.list_objects(scope_value, "products", fields=requested, params=params)
     result = _paged(payload)
-    result["summary"]["scope"] = {scope_name: scope_value}
+    scope: dict[str, Any] = {scope_name: scope_value}
+    if normalized_error_type is not None:
+        scope["error_type"] = normalized_error_type
+    if normalized_priority is not None:
+        scope["error_priority"] = normalized_priority
+    result["summary"]["scope"] = scope
     return result
 
 
