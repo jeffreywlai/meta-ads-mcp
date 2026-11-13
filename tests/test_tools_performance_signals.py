@@ -4413,3 +4413,253 @@ def test_l3_id_list_error_does_not_quote_a_value_that_is_not_an_id(field) -> Non
     assert private not in message and "private" not in message
     assert f"{field}[1]" in message
     assert performance_signals._require_graph_ids(["10", " 11 ", "10"], field=field) == ["10", "11"]
+
+
+# ---------------------------------------------------------------------------
+# Round thirteen (R11 R6, R7): a statement about a whole scope needs a read that covered the scope
+# ---------------------------------------------------------------------------
+
+
+class _CappedRankingClient:
+    """Every scope has one ad with three AVERAGE rankings in the read, and more ads on a next page."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.lean_limits: list[int] = []
+
+    async def get_insights(self, object_id, *, fields, params):
+        if "ad_id" in fields and "spend" in fields:
+            self.lean_limits.append(params["limit"])
+            row = {"ad_id": object_id + "1", "spend": "10", "impressions": "1000"}
+            row.update({field: "AVERAGE" for field in performance_signals.RANKING_FIELDS})
+            return {"data": [row], "paging": {"next": "https://example.invalid/next", "cursors": {"after": "next"}}}
+        if "ad_id" in fields:
+            return {"data": [{"ad_id": object_id + "1", "clicks": "10"}]}
+        return {"data": [{"spend": "100", "impressions": "10000", "clicks": "100"}]}
+
+
+@pytest.mark.parametrize("several", [False, True])
+def test_r6_no_weak_ad_finding_is_scoped_to_examined_ads_when_capped(monkeypatch, several) -> None:
+    """Reviewer reproduction: a scan stopped at max_ads said 'No ad matched' for the whole scope."""
+    monkeypatch.setattr(performance_signals, "get_graph_api_client", _CappedRankingClient)
+    arguments: dict[str, Any] = dict(level="campaign", max_ads=2 if several else 1)
+    arguments.update({"object_ids": ["10", "20"]} if several else {"object_id": "10"})
+    result = asyncio.run(performance_signals.get_auction_ranking_report(**arguments))
+    findings = [finding for finding in result["findings"] if finding["type"] == "no_weak_ads_detected"]
+    assert findings, result
+    assert all("examined" in finding["summary"].lower() for finding in findings), findings
+    assert all("not every ad in the window was examined" in finding["summary"] for finding in findings)
+
+
+def test_r6_control_a_whole_scope_read_keeps_the_scope_wide_sentence(monkeypatch) -> None:
+    ads = _many_ads(2)
+    _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(ads, scope_spend=1e5, more=False)))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=5))
+    (finding,) = [finding for finding in result["findings"] if finding["type"] == "no_weak_ads_detected"]
+    assert finding["summary"] == "No ad matched the weak-ranking or high-cost rules."
+    assert result["examined"]["more_ads_exist"] is False
+
+
+def test_r6_no_weak_ad_finding_says_when_the_cost_rule_could_not_be_checked(monkeypatch) -> None:
+    ads = _many_ads(2)
+    handler = _meta_like_ranking_handler(ads, scope_spend=1e5, more=False, cost_error=_permission_error())
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=5))
+    (finding,) = [finding for finding in result["findings"] if finding["type"] == "no_weak_ads_detected"]
+    assert "high-cost rule could be checked only for the 0 of 2 examined ads" in finding["summary"]
+
+
+def test_r6_a_page_longer_than_max_ads_is_not_all_ads(monkeypatch) -> None:
+    ads = _many_ads(3)
+    base = _meta_like_ranking_handler(ads, scope_spend=1e5, more=False)
+
+    def handler(object_id, fields, params):
+        if params["level"] == "ad" and "sort" in params:
+            # Meta returns more rows than the limit asked for, with no next page.
+            return base(object_id, fields, {**params, "limit": 3})
+        return base(object_id, fields, params)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=2))
+    assert result["examined"]["ads_examined"] == 2
+    assert result["examined"]["more_ads_exist"] is True
+    assert not result["examined"]["note"].startswith("Examined all")
+
+
+def test_r6_unordered_capped_ranking_does_not_claim_the_highest_spending_ads(monkeypatch) -> None:
+    ads = list(reversed(_many_ads(2)))  # lowest spend first
+    _patch(monkeypatch, RecordingClient(insights_handler=_meta_like_ranking_handler(ads, scope_spend=1e5, more=True)))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=2))
+    assert result["examined"]["meta_order_confirmed"] is False
+    assert "highest-spending ads in the window" not in result["examined"]["note"]
+    assert "may not be the highest-spending" in result["examined"]["note"]
+
+
+def test_r7_multi_scope_ranking_honors_the_shared_max_ads(monkeypatch) -> None:
+    """Reviewer reproduction: max_ads=1 over two scopes read two ads."""
+    monkeypatch.setattr(performance_signals, "get_graph_api_client", lambda: pytest.fail("refuse before any read"))
+    with pytest.raises(ValidationError) as raised:
+        asyncio.run(performance_signals.get_auction_ranking_report("campaign", object_ids=["10", "20"], max_ads=1))
+    assert "at least 2" in str(raised.value)
+
+
+@pytest.mark.parametrize(("max_ads", "per_scope"), [(2, 1), (3, 1), (5, 2), (6, 3)])
+def test_r7_scopes_share_max_ads_without_exceeding_it(monkeypatch, max_ads, per_scope) -> None:
+    client = _CappedRankingClient()
+    monkeypatch.setattr(performance_signals, "get_graph_api_client", lambda: client)
+    result = asyncio.run(performance_signals.get_auction_ranking_report(
+        "campaign", object_ids=["10", "20"], max_ads=max_ads,
+    ))
+    assert client.lean_limits == [per_scope, per_scope]
+    assert sum(client.lean_limits) <= max_ads
+    assert result["coverage"]["max_ads"] == max_ads and result["coverage"]["max_ads_per_scope"] == per_scope
+    assert result["ads_analyzed"] <= max_ads
+
+
+def _anomaly_rows(spend_for_day: Callable[[int], float], *, days: int = 35) -> list[dict[str, Any]]:
+    start = date(2026, 10, 4)
+    return [
+        _day_row((start + timedelta(days=offset)).isoformat(), spend=spend_for_day(offset), impressions=1000, clicks=10)
+        for offset in range(days)
+    ]
+
+
+def _run_anomalies(monkeypatch, rows, metrics) -> dict[str, Any]:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: {"data": [dict(row) for row in rows]}))
+    return asyncio.run(performance_signals.detect_performance_anomalies(
+        "campaign", "10", metrics=metrics, end_date="2026-11-07",
+    ))
+
+
+def test_sweep_anomaly_none_found_is_not_claimed_when_nothing_could_be_scored(monkeypatch) -> None:
+    result = _run_anomalies(monkeypatch, _anomaly_rows(lambda _offset: 10.0), ["spend"])
+    (finding,) = result["findings"]
+    assert finding["type"] == "insufficient_data"
+    assert "no anomaly check was made" in finding["summary"]
+
+
+def test_sweep_anomaly_none_found_names_what_was_not_scored(monkeypatch) -> None:
+    result = _run_anomalies(monkeypatch, _anomaly_rows(lambda offset: 10.0 + offset % 3), ["spend", "roas"])
+    (finding,) = result["findings"]
+    assert finding["type"] == "no_anomalies_detected"
+    assert "not everything was scored" in finding["summary"] and "roas could not be judged" in finding["summary"]
+
+
+def test_sweep_anomaly_control_fully_scored_keeps_the_plain_sentence(monkeypatch) -> None:
+    result = _run_anomalies(monkeypatch, _anomaly_rows(lambda offset: 10.0 + offset % 3), ["spend"])
+    (finding,) = result["findings"]
+    assert finding["summary"] == "No examined day fell outside the flag range for the selected metrics."
+
+
+def test_sweep_anomaly_children_not_all_read_qualify_the_none_found(monkeypatch) -> None:
+    rows = _anomaly_rows(lambda offset: 10.0 + offset % 3)
+
+    def handler(object_id, fields, params):
+        if "sort" in params:
+            return _paged([{"campaign_id": "1", "campaign_name": "A", "spend": "5"}], "more", more=True)
+        return {"data": [dict(row, campaign_id="1") for row in rows]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.detect_performance_anomalies(
+        "account", "act_10", child_level="campaign", max_entities=1, metrics=["spend"], end_date="2026-11-07",
+    ))
+    (finding,) = result["findings"]
+    assert finding["type"] == "no_anomalies_detected"
+    assert "not every entity in scope was read" in finding["summary"]
+
+
+@pytest.mark.parametrize("rows", [
+    [{"campaign_id": "1", "campaign_name": "A", "spend": "5"}, {"campaign_id": "2", "campaign_name": "B", "spend": "9"}],
+    [{"campaign_id": "1", "campaign_name": "A"}, {"campaign_id": "2", "campaign_name": "B", "spend": "9"}],
+])
+def test_sweep_child_selection_out_of_spend_order_is_not_the_highest_spending(monkeypatch, rows) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: _paged(rows, "more", more=True)))
+    children, more, issue = asyncio.run(performance_signals._select_children(
+        "act_10", "campaign", date(2026, 11, 1), date(2026, 11, 7), 2,
+    ))
+    assert more is True and issue is not None and "spend order" in issue
+
+
+def test_sweep_child_selection_longer_than_the_limit_says_more_exist(monkeypatch) -> None:
+    rows = [{"campaign_id": str(index), "campaign_name": "A", "spend": str(10 - index)} for index in range(3)]
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: {"data": rows}))
+    children, more, issue = asyncio.run(performance_signals._select_children(
+        "act_10", "campaign", date(2026, 11, 1), date(2026, 11, 7), 2,
+    ))
+    assert len(children) == 2 and more is True and issue is None
+
+
+def test_sweep_child_selection_control_ordered_and_whole_is_complete(monkeypatch) -> None:
+    rows = [{"campaign_id": "1", "campaign_name": "A", "spend": "9"}, {"campaign_id": "2", "campaign_name": "B", "spend": "5"}]
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: {"data": rows}))
+    children, more, issue = asyncio.run(performance_signals._select_children(
+        "act_10", "campaign", date(2026, 11, 1), date(2026, 11, 7), 5,
+    ))
+    assert len(children) == 2 and more is False and issue is None
+
+
+def test_sweep_briefing_selection_out_of_spend_order_withdraws_the_highest_spending_claim(monkeypatch) -> None:
+    base = _top_spender_handler(lambda params, rows: _paged([rows["20"], rows["21"]]))
+
+    def handler(object_id, fields, params):
+        if "sort" in params:
+            return _paged([{"adset_id": "20", "spend": "5"}, {"adset_id": "21", "spend": "50"}], "more", more=True)
+        return base(object_id, fields, params)
+
+    _client, rows, coverage = _context_rows_for(monkeypatch, handler)
+    assert coverage["complete"] is False
+    assert "spend order" in coverage["selection_incomplete_reason"]
+    signals = performance_signals._coverage_signal(coverage)
+    assert any("may not be the highest-spending" in signal for signal in signals)
+
+
+def test_sweep_goal_verdicts_about_all_or_none_name_whom_they_cover() -> None:
+    rows = [{"adset_id": "20", "optimization_goal": "LINK_CLICKS", "metrics": {"spend": 10},
+             "actions_map": {"link_click": 500}, "meta_result": {"status": "absent"}}]
+    (whole,) = performance_signals._goal_volume(rows, 7)
+    (partial,) = performance_signals._goal_volume(rows, 7, complete=False)
+    assert whole["verdict"] == "all_adsets_meet_threshold"
+    assert partial["verdict"] == "examined_adsets_meet_threshold"
+    below = [{**rows[0], "actions_map": {"link_click": 1}}]
+    assert performance_signals._goal_volume(below, 7, complete=False)[0]["verdict"] == "no_examined_adsets_meet_threshold"
+    unjudged = [*below, {"adset_id": "21", "optimization_goal": "LINK_CLICKS", "metrics": {"spend": 5},
+                         "meta_result": {"status": "mixed", "indicators": ["a", "b"]}}]
+    assert performance_signals._goal_volume(unjudged, 7)[0]["verdict"] == "no_judged_adsets_meet_threshold"
+
+
+def test_sweep_partial_briefing_says_its_spend_is_not_the_whole_scope(monkeypatch) -> None:
+    def full(params, rows):
+        return _paged([rows["20"]], "second", more=True)
+
+    client = _context_client()
+    client.insights_handler = _top_spender_handler(full)
+    _patch(monkeypatch, client)
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=7))
+    assert result["adset_coverage"]["complete"] is False
+    assert result["metrics"]["spend_covers"].startswith("only the ad sets examined")
+
+
+def test_sweep_named_scope_briefing_says_its_adset_cap_is_per_read(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "30"}]}
+        return {"data": []}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    _found, _error, coverage = asyncio.run(performance_signals._context_adset_rows(
+        "act_10", date(2026, 11, 1), date(2026, 11, 7), ["777"],
+    ))
+    assert coverage["max_adsets"] == performance_signals.CONTEXT_MAX_ADSETS
+    assert coverage["max_adsets_applies_to"] == "each of the two filtered reads"
+
+
+def test_sweep_top_recommendations_from_one_page_say_so(monkeypatch) -> None:
+    payload = {**REC_PAYLOAD, "paging": {"next": "https://graph.example/next", "cursors": {"after": "r2"}}}
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_42": {"id": "act_42", "currency": "USD", "opportunity_score": 74}},
+        edges={("act_42", "opportunity_score_history"): _history_payload},
+        recommendations_payload=payload,
+    ))
+    result = asyncio.run(performance_signals.get_opportunity_score(account_id="42", include_history=False))
+    top = result["top_recommendations"]
+    assert top["complete"] is False and top["ranked_among"].startswith("only the first page")
+    assert any("ranks only those" in signal for signal in result["missing_signals"])

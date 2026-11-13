@@ -361,9 +361,18 @@ async def get_opportunity_score(
                 "returned_count": min(len(items), top_n),
                 "available_count": len(items),
                 "complete": bool(collection.get("complete", True)),
+                "ranked_among": "every recommendation Meta returned" if collection.get("complete", True)
+                else "only the first page of recommendations Meta returned",
                 "ranked_by": "estimated_score_gain_desc",
                 "note": "estimated_score_gain is Meta's opportunity_score_lift: the points Meta expects the score to rise if the recommendation is applied.",
             }
+            if not collection.get("complete", True):
+                # The ranking is over the page read; a recommendation on a later page may have a larger gain.
+                missing_signals.append(
+                    f"recommendations: Meta has more than the {len(items)} recommendations read (one page), so "
+                    "top_recommendations ranks only those; a recommendation not read may have a larger estimated "
+                    "score gain. Use get_recommendations to page through the rest."
+                )
 
     return analysis_response(
         scope={"level": "account", "object_id": resolved_account_id},
@@ -1417,7 +1426,26 @@ async def _select_children(
         {"object_id": str(row[id_field]), "name": row.get(name_field), "spend": _finite(row.get("spend"))}
         for row in rows
     ]
-    return children[:max_entities], bool(extract_paging(payload).get("next")) or issue is not None, issue
+    # A page longer than the limit still has children beyond max_entities, which are not reported.
+    more = bool(extract_paging(payload).get("next")) or len(children) > max_entities
+    children = children[:max_entities]
+    if more and not _spend_order_confirmed([child["spend"] for child in children]):
+        # Which children are the highest-spending rests on Meta's order; without it, others may spend more.
+        issue = "; ".join(filter(None, [issue, SPEND_ORDER_UNCONFIRMED]))
+    return children, more or issue is not None, issue
+
+
+SPEND_ORDER_UNCONFIRMED = (
+    "Meta's rows were not in spend order, or a spend could not be read, so the rows read cannot show which are "
+    "the highest-spending"
+)
+
+
+def _spend_order_confirmed(spends: list[float | None]) -> bool:
+    """True when every spend is known and they never rise: the order a spend-sorted read promises."""
+    return all(spend is not None for spend in spends) and all(
+        earlier >= later for earlier, later in zip(spends, spends[1:])  # type: ignore[operator]
+    )
 
 
 async def _read_entities_one_by_one(
@@ -2214,14 +2242,50 @@ def _anomaly_finding(anomaly: dict[str, Any], multiplier: float, entity: dict[st
     return finding
 
 
-def _no_anomaly_finding() -> dict[str, Any]:
+def _days_scored(analysis: dict[str, Any]) -> int:
+    """How many (day, metric) pairs were actually scored against a baseline with variation."""
+    return sum(
+        status["days_examined"] - status["days_with_no_baseline_variation"]
+        for status in analysis["metric_status"].values()
+    )
+
+
+def _scoring_limits(analysis: dict[str, Any], lookback_days: int) -> list[str]:
+    """What the anomaly screen could not score for one object: metrics not judged, and lookback days left out."""
+    limits: list[str] = []
+    unjudged = [metric for metric, status in analysis["metric_status"].items() if status.get("status") != "analyzed"]
+    if unjudged:
+        limits.append(f"{', '.join(unjudged)} could not be judged")
+    for metric, status in analysis["metric_status"].items():
+        if status.get("status") != "analyzed":
+            continue
+        unscored = lookback_days - (status["days_examined"] - status["days_with_no_baseline_variation"])
+        if unscored:
+            limits.append(f"{metric} was scored on {lookback_days - unscored} of {lookback_days} lookback days")
+    return limits
+
+
+def _no_anomaly_finding(limits: list[str] | None = None, *, nothing_scored: bool = False) -> dict[str, Any]:
+    """The finding when no day was flagged. It speaks only for what was scored, and says what was not.
+
+    With nothing scored at all, no anomaly check was made, so the finding is insufficient_data, not a clean result.
+    """
+    if nothing_scored:
+        summary = "No lookback day could be scored against a baseline, so no anomaly check was made."
+        if limits:
+            summary += " " + "; ".join(limits).capitalize() + "."
+        finding_type = "insufficient_data"
+    elif limits:
+        summary = (
+            "No scored day fell outside the flag range, but not everything was scored: "
+            + "; ".join(limits) + "."
+        )
+        finding_type = "no_anomalies_detected"
+    else:
+        summary = "No examined day fell outside the flag range for the selected metrics."
+        finding_type = "no_anomalies_detected"
     return {
-        **build_finding(
-            "no_anomalies_detected",
-            "No examined day fell outside the flag range for the selected metrics.",
-            severity="low",
-            confidence=None,
-        ),
+        **build_finding(finding_type, summary, severity="low", confidence=None),
         "confidence_status": "uncalibrated",
     }
 
@@ -2323,10 +2387,13 @@ async def detect_performance_anomalies(
                 },
             )
         findings = [_anomaly_finding(anomaly, multiplier, scope) for anomaly in analysis["anomalies"]]
+        none_found = _no_anomaly_finding(
+            _scoring_limits(analysis, lookback_days), nothing_scored=not _days_scored(analysis),
+        )
         return analysis_response(
             scope=scope,
             metrics={},
-            findings=findings or [_no_anomaly_finding()],
+            findings=findings or [none_found],
             missing_signals=[*timezone_signals, *result_signals, *analysis["missing_signals"]],
             extra={
                 **windows,
@@ -2346,6 +2413,8 @@ async def detect_performance_anomalies(
     if targets["mode"] == "children":
         coverage["child_level"] = targets["child_level"]
     scored: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    days_scored = 0
+    partly_scored: list[str] = []
     for entity in entities:
         rows = entity.pop("_rows", None)
         result_error = entity.pop("_result_error", None)
@@ -2368,6 +2437,22 @@ async def detect_performance_anomalies(
             *_result_signals(basis, entity["level"], rows_exist=bool(rows)), *analysis["missing_signals"],
         ]
         scored.extend((anomaly, reference) for anomaly in analysis["anomalies"])
+        entity_scored = 0 if analysis["insufficient"] else _days_scored(analysis)
+        days_scored += entity_scored
+        if not entity_scored or _scoring_limits(analysis, lookback_days):
+            partly_scored.append(entity["object_id"])
+    # A "none found" covers only the entities and days scored: say which entities were not, and whether others exist.
+    limits: list[str] = []
+    not_read = [entity["object_id"] for entity in entities if entity["status"] in ("unreadable", "not_read")]
+    if not_read:
+        limits.append(f"{len(not_read)} entit(ies) could not be read ({', '.join(not_read)})")
+    if partly_scored:
+        limits.append(
+            f"{len(partly_scored)} entit(ies) were scored only in part or not at all ({', '.join(partly_scored)}; "
+            "see each entity's missing_signals)"
+        )
+    if not coverage["complete"]:
+        limits.append("not every entity in scope was read (see coverage)")
     scored.sort(key=lambda item: (-abs(item[0]["robust_score"]), item[0]["day"], item[1]["object_id"], item[0]["metric"]))
     findings = []
     for anomaly, reference in scored[:MULTI_ENTITY_MAX_FINDINGS]:
@@ -2388,7 +2473,7 @@ async def detect_performance_anomalies(
     return analysis_response(
         scope=_multi_scope(resolved_level, targets),
         metrics={"anomaly_count": len(scored)},
-        findings=findings or [_no_anomaly_finding()],
+        findings=findings or [_no_anomaly_finding(limits, nothing_scored=not days_scored)],
         missing_signals=missing_signals,
         extra={
             **windows,
@@ -2631,6 +2716,8 @@ async def _ranking_entity(
     # is not an object) is an ad that was not examined. Either way the read is not all the highest-spending ads.
     lean_identity = _RowIdentity(("ad_id",))
     lean_rows, lean_repeated, lean_unidentified, lean_disputed = _split_rows(lean_page_rows, lean_identity, {})
+    # A page longer than the limit asked for still has ads beyond max_ads; they are not examined.
+    beyond_limit = len(lean_rows) > max_ads
     lean_rows = lean_rows[:max_ads]
     lean_issue = _stop_reason(
         PAGE_UNREADABLE if lean_page_bad else None, lean_unreadable + lean_unidentified,
@@ -2643,7 +2730,7 @@ async def _ranking_entity(
         if str(row.get("ad_id")) in lean_contradicted else row
         for row in lean_rows
     ]
-    more_ads_exist = bool(extract_paging(ad_payload).get("next")) or lean_issue is not None
+    more_ads_exist = bool(extract_paging(ad_payload).get("next")) or lean_issue is not None or beyond_limit
     cost_ids = list(dict.fromkeys(
         str(row["ad_id"]) for row in lean_rows
         if row.get("ad_id") and any(_known_ranking(row.get(field)) for field in RANKING_FIELDS)
@@ -2713,13 +2800,23 @@ async def _ranking_entity(
         missing_signals.append(note)
     elif more_ads_exist:
         coverage = f"; they cover {share:.0%} of the scope's spend" if share is not None else ""
-        note = (
-            f"Examined the {len(rows)} highest-spending ads in the window{coverage}. "
-            "More ads exist; lower-spending ads were not ranked. Raise max_ads to examine more."
-        )
+        if order_confirmed:
+            note = (
+                f"Examined the {len(rows)} highest-spending ads in the window{coverage}. "
+                "More ads exist; lower-spending ads were not ranked. Raise max_ads to examine more."
+            )
+        else:
+            # "Highest-spending" needs Meta's rows in spend order; without it the ads read are only the first ones.
+            note = (
+                f"Examined the first {len(rows)} ads Meta returned for a read sorted by spend{coverage}; their "
+                "spend order could not be confirmed, so they may not be the highest-spending ones. More ads exist "
+                "and were not ranked. Raise max_ads to examine more."
+            )
         missing_signals.append(note)
     else:
-        note = f"Examined all {len(rows)} ads with insights in the window, highest spend first."
+        note = f"Examined all {len(rows)} ads with insights in the window" + (
+            ", highest spend first." if order_confirmed else "."
+        )
     if not order_confirmed and all(spend is not None for spend in spends):
         missing_signals.append(
             "Meta returned the ad rows not ordered by spend, so the examined ads may not be the highest-spending ones."
@@ -2994,6 +3091,21 @@ def _ranking_findings(
                 if has_ranked
                 else "No examined ad had all three Meta rankings; not every ad in the window was examined."
             )
+        if has_ranked:
+            # The rules need evidence each ad may lack: an ad with an UNKNOWN ranking is judged only on the rankings
+            # it has, and the high-cost rule needs the ad's results from the cost-evidence read.
+            unranked = sum(1 for ad in ads if ad["ranking_points"] is None)
+            with_cost = sum(1 for ad in ads if ad.get("result_status") not in (None, "not_requested", "contradictory_rows"))
+            limits = []
+            if unranked:
+                limits.append(f"{unranked} of the {len(ads)} examined ads lack at least one Meta ranking")
+            if with_cost < len(ads):
+                limits.append(
+                    f"the high-cost rule could be checked only for the {with_cost} of {len(ads)} examined ads with "
+                    "cost evidence"
+                )
+            if limits:
+                summary += " " + "; ".join(limits).capitalize() + "."
         findings.append({
             **build_finding(
                 "no_weak_ads_detected" if has_ranked else "insufficient_data",
@@ -3017,7 +3129,7 @@ async def get_auction_ranking_report(
     max_ads: int = RANKING_DEFAULT_MAX_ADS,
     object_ids: StringList | None = None,
 ) -> dict[str, Any]:
-    """Rank the ads under an account, campaign, ad set (or one ad) by Meta's quality, engagement-rate and conversion-rate rankings with spend and results, and say for each weak ad whether the evidence points at creative quality, the post-click path, or bid and budget. Results follow Meta's own result for each ad, and an ad's cost is compared only with cost for the same result. Reads only the max_ads highest-spending ads (default 200, at most 500) and reports what share of the scope's spend they cover. object_ids (up to 5 numeric campaign, ad set or ad ids) ranks the ads of several scopes together, max_ads shared between them. Rankings compare ads competing for the same audience."""
+    """Rank the ads under an account, campaign, ad set (or one ad) by Meta's quality, engagement-rate and conversion-rate rankings with spend and results, and say for each weak ad whether the evidence points at creative quality, the post-click path, or bid and budget. Results follow Meta's own result for each ad, and an ad's cost is compared only with cost for the same result. Reads only the max_ads highest-spending ads (default 200, at most 500) and reports what share of the scope's spend they cover. object_ids (up to 5 numeric campaign, ad set or ad ids) ranks the ads of several scopes together, max_ads shared equally between them (so at least one per scope). Rankings compare ads competing for the same audience."""
     resolved_level = _require_level(level, RANKING_REPORT_LEVELS)
     has_ids = object_ids is not None and coerce_csv_string_list(object_ids) not in ([], "")
     if has_ids:
@@ -3040,8 +3152,11 @@ async def get_auction_ranking_report(
     if not has_ids:
         resolved_object_id = entity_ids[0]
         report = await _ranking_entity(resolved_level, resolved_object_id, window, max_ads)
+        # "No ad matched" speaks for the whole scope only when every ad in it was examined: not after a read fault,
+        # and not when the scan stopped at max_ads with more ads left (more_ads_exist covers both).
         ranked, weak, findings, ranking_coverage = _ranking_findings(
-            report["ads"], top_n, examined_all="read_incomplete_reason" not in report["examined"],
+            report["ads"], top_n, examined_all=not report["examined"]["more_ads_exist"]
+            and "read_incomplete_reason" not in report["examined"],
         )
         return analysis_response(
             scope={"level": resolved_level, "object_id": resolved_object_id},
@@ -3067,7 +3182,14 @@ async def get_auction_ranking_report(
             },
         )
 
-    per_entity_ads = max(1, max_ads // len(entity_ids))
+    if max_ads < len(entity_ids):
+        # max_ads is shared between the scopes and each scope needs at least one ad, so a smaller cap cannot be kept.
+        raise ValidationError(
+            f"max_ads is shared between the {len(entity_ids)} object_ids, so it must be at least {len(entity_ids)} "
+            "(one ad per scope)."
+        )
+    # At most max_ads in total: each scope reads the same whole share, and any remainder is not used.
+    per_entity_ads = max_ads // len(entity_ids)
     semaphore = asyncio.Semaphore(2)
 
     async def run(entity_id: str) -> tuple[str, dict[str, Any] | None, str | None]:
@@ -3106,7 +3228,8 @@ async def get_auction_ranking_report(
     unreadable = [entity["object_id"] for entity in entities if entity["status"] != "read"]
     ranked, weak, findings, ranking_coverage = _ranking_findings(
         all_ads, top_n, examined_all=not unreadable and not any(
-            "read_incomplete_reason" in report["examined"] for _, report, _ in outcomes if report is not None
+            report["examined"]["more_ads_exist"] or "read_incomplete_reason" in report["examined"]
+            for _, report, _ in outcomes if report is not None
         ),
     )
     return analysis_response(
@@ -3122,6 +3245,7 @@ async def get_auction_ranking_report(
             "coverage": {
                 "mode": "object_ids",
                 "data_read": "one lean sorted read, one scope total and one cost read per scope",
+                "max_ads": max_ads,
                 "max_ads_per_scope": per_entity_ads,
                 "entities_requested": len(entity_ids),
                 "entities_read": len(entity_ids) - len(unreadable),
@@ -3452,13 +3576,15 @@ _SHORT_WINDOW_REASON = (
 )
 
 
-def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[str, Any]]:
+def _goal_volume(rows: list[dict[str, Any]], lookback_days: int, *, complete: bool = True) -> list[dict[str, Any]]:
     """Summarize, per optimization goal, how many ad sets reach the learning-phase weekly volume, with the top spenders.
 
     Each ad set is judged on its own data only. An ad set whose row reports Meta's result is judged on that
     result. An ad set whose row reports no result is judged on its goal's own event when the goal identifies it
     (GOAL_EVENT_BASIS); otherwise it is not judged. Another ad set's result never decides how this one is read.
     Ad sets with zero spend are skipped; an ad set whose spend is missing is kept and makes its goal's spend null.
+    complete says the rows are every ad set in scope; when they are not, a verdict about all or none of a goal's
+    ad sets is about the examined ones (examined_adsets_meet_threshold, no_examined_adsets_meet_threshold).
     """
     by_goal: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -3560,9 +3686,22 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
         if not_judged:
             entry_out["adsets_not_judged"] = len(not_judged)
             entry_out["not_judged_reasons"] = reasons
-            entry_out["verdict"] = verdict if verdict != "all_adsets_meet_threshold" else "judged_adsets_meet_threshold"
+            # "all" and "no" speak for every ad set of the goal; with some not judged they speak for the judged ones.
+            entry_out["verdict"] = {
+                "all_adsets_meet_threshold": "judged_adsets_meet_threshold",
+                "no_adsets_meet_threshold": "no_judged_adsets_meet_threshold",
+            }.get(verdict, verdict)
+        if not complete and entry_out["verdict"] in _WHOLE_GOAL_VERDICTS:
+            # The rows read are not every ad set in scope, so "all" and "no" speak only for the examined ones.
+            entry_out["verdict"] = _WHOLE_GOAL_VERDICTS[entry_out["verdict"]]
         output.append(entry_out)
     return output
+
+
+_WHOLE_GOAL_VERDICTS = {
+    "all_adsets_meet_threshold": "examined_adsets_meet_threshold",
+    "no_adsets_meet_threshold": "no_examined_adsets_meet_threshold",
+}
 
 
 MAX_CONTEXT_OBJECT_IDS = 50
@@ -3636,6 +3775,8 @@ async def _context_adset_rows(
                 f"page by page until Meta reports no more, {CONTEXT_MAX_ADSETS} rows or {INSIGHTS_MAX_PAGES} "
                 "requests"
             ),
+            # The cap bounds each read, so the two together can examine up to twice as many ad sets.
+            "max_adsets_applies_to": "each of the two filtered reads",
         })
         reads = await asyncio.gather(*(
             _read_pages_with_results(
@@ -3721,6 +3862,10 @@ async def _context_adset_rows(
                 repeated=picked_repeated, identity=picked_identity,
             )
             more = bool(extract_paging(picked).get("next")) or len(all_ids) > len(ids) or selection_issue is not None
+            picked_spends = [_finite(row.get("spend")) for row in picked_rows[:CONTEXT_MAX_ADSETS]]
+            if more and not _spend_order_confirmed(picked_spends):
+                # "Highest-spending" rests on Meta's spend order; without it other ad sets may spend more.
+                selection_issue = "; ".join(filter(None, [selection_issue, SPEND_ORDER_UNCONFIRMED]))
             if picked_unreadable:
                 coverage["selection_rows_unreadable"] = picked_unreadable
             if picked_repeated:
@@ -4080,7 +4225,10 @@ async def get_advertiser_context(
     section_errors = {name: section["error"] for name, section in sections.items() if not section["available"]}
     for name, error in section_errors.items():
         missing_signals.append(f"{name}: Meta returned an error, so this section is unknown ({error.get('message')}).")
-    goal_volume = _ad_scope_goal_volume(rows) if ad_scope else _goal_volume(rows, window_days)
+    goal_volume = (
+        _ad_scope_goal_volume(rows) if ad_scope
+        else _goal_volume(rows, window_days, complete=row_coverage["complete"])
+    )
     unassessed = [entry for entry in goal_volume if entry["verdict"] == "not_assessed"]
     if unassessed:
         count_key = "ad_count" if ad_scope else "adset_count"
@@ -4133,7 +4281,9 @@ async def get_advertiser_context(
             "otherwise its goal's own event where the goal identifies it; a result that is not an action count "
             "(for example reach) is not judged, and windows shorter than 7 days are not judged. Only ad sets with "
             f"spend in the window are counted. Each goal lists counts and the {GOAL_VOLUME_TOP_ADSETS} "
-            "highest-spending ad sets that meet and that miss the threshold, not every ad set."
+            "highest-spending ad sets that meet and that miss the threshold, not every ad set. A verdict about all "
+            "or none of a goal's ad sets names whom it covers: judged_ when some ad sets could not be judged, "
+            "examined_ when the briefing did not read every ad set in scope (see adset_coverage)."
         ),
         **sections,
         "section_errors": section_errors,
@@ -4146,6 +4296,11 @@ async def get_advertiser_context(
         scope=scope,
         metrics={
             "spend": total_spend,
+            # spend is the sum of the rows read, so it is the scope's spend only when the read covered the scope.
+            "spend_covers": (
+                f"every {unit} in scope with insights in the window" if row_coverage["complete"]
+                else f"only the {units} examined (see {'ad' if ad_scope else 'adset'}_coverage); not the whole scope"
+            ),
             ("ad_rows" if ad_scope else "adset_rows"): len(rows),
             "account_spend": row_coverage["account_spend"],
         },
