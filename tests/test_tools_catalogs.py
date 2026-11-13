@@ -373,6 +373,19 @@ def test_dpa_catalog_listing_next_page_without_cursor_is_incomplete(monkeypatch)
     assert client.kinds() == ["list"]
 
 
+def test_dpa_incomplete_catalog_list_recommends_nothing(monkeypatch) -> None:
+    """One ready catalog on a partly read list is not 'the only catalog that passed'."""
+    listing = {
+        "data": [{"id": "cat_ready", "name": "Ready", "product_count": 500}],
+        "paging": {"next": "https://graph.invalid/?after=unextracted"},
+    }
+    _use(monkeypatch, _dpa_client(edges={("biz_1", "owned_product_catalogs"): listing}))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="biz_1"))
+    assert result["findings"][0]["assessment"] == "ready"
+    assert result["recommended_catalog_id"] is None
+    assert "incomplete" in result["recommendation_reason"]
+
+
 def test_dpa_catalog_listing_empty_cursor_cycle_terminates(monkeypatch) -> None:
     class Cycle(FakeCatalogClient):
         async def list_objects(self, parent_id, edge, *, fields=None, params=None):

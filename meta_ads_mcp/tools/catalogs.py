@@ -429,8 +429,63 @@ async def list_catalogs(
     return result
 
 
-async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any]:
-    """Collect the documented per-catalog signals used to rank catalog-ad readiness."""
+_DPA_URL_SAMPLE_SIZE = 5
+
+
+def _host(url: Any) -> str | None:
+    """Return a URL's lowercased host without a leading www., or None."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    text = url.strip()
+    if "://" not in text:
+        text = "https://" + text
+    try:
+        host = (urlparse(text).hostname or "").lower()
+    except ValueError:
+        return None
+    if not host or "." not in host or " " in host:
+        return None
+    return host[4:] if host.startswith("www.") else host
+
+
+def _same_site(host: str, domain: str) -> bool:
+    return host == domain or host.endswith("." + domain) or domain.endswith("." + host)
+
+
+async def _ad_domain_match(client, catalog_id: str, domain: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Compare a small sample of product URLs with the ad's domain (one request)."""
+    try:
+        payload = await client.list_objects(catalog_id, "products", fields=["url"],
+                                            params={"limit": _DPA_URL_SAMPLE_SIZE})
+    except _SIGNAL_ERRORS as error:
+        return {"domain": domain, "sampled_urls": 0, "matching_urls": 0, "match": "unknown"}, \
+            _error_entry("products (url sample)", error)
+    hosts = [host for row in payload.get("data") or [] if isinstance(row, dict)
+             if (host := _host(row.get("url"))) is not None]
+    matching = sum(_same_site(host, domain) for host in hosts)
+    if not hosts:
+        match = "unknown"
+    elif matching == len(hosts):
+        match = "yes"
+    elif matching:
+        match = "partial"
+    else:
+        match = "no"
+    return {"domain": domain, "sampled_urls": len(hosts), "matching_urls": matching, "match": match}, None
+
+
+async def _catalog_dpa_signals(
+    client,
+    catalog: dict[str, Any],
+    *,
+    ad_domain: str | None = None,
+    pixel_id: str | None = None,
+) -> dict[str, Any]:
+    """Collect the documented per-catalog signals used to rank catalog-ad readiness.
+
+    A catalog Meta reports with no products is blocked whatever else is true, so
+    its supporting edges are not read.
+    """
     catalog_id = str(catalog.get("id"))
     signals: dict[str, Any] = {
         "product_count": to_int(catalog.get("product_count")),
@@ -442,6 +497,14 @@ async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any
     }
     unavailable: list[dict[str, Any]] = []
     partial: list[dict[str, Any]] = []
+    context: dict[str, Any] = {}
+    if signals["product_count"] == 0:
+        if ad_domain is not None:
+            context["ad_domain"] = {"domain": ad_domain, "sampled_urls": 0, "matching_urls": 0, "match": "unknown"}
+        if pixel_id is not None:
+            context["pixel"] = {"pixel_id": pixel_id, "connected": None}
+        return {"signals": signals, "unavailable": unavailable, "partial": partial, "context": context,
+                "skipped": "The catalog has no products, so its product sets, event sources and diagnostics were not read."}
 
     def note_partial(signal: str, read: dict[str, Any], rows_read: int) -> None:
         partial.append({
@@ -472,8 +535,14 @@ async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any
         else:
             note_partial("external_event_sources", sources, len(sources["rows"]))
             signals["event_source_count"] = len(sources["rows"]) or None
+        if pixel_id is not None:
+            source_ids = {str(row.get("id")) for row in sources["rows"] if isinstance(row, dict)}
+            connected = True if pixel_id in source_ids else (False if sources["complete"] else None)
+            context["pixel"] = {"pixel_id": pixel_id, "connected": connected}
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("external_event_sources", error))
+        if pixel_id is not None:
+            context["pixel"] = {"pixel_id": pixel_id, "connected": None}
     try:
         diagnostics = await _collect_edge(
             client, catalog_id, "diagnostics", fields=DPA_DIAGNOSTIC_FIELDS,
@@ -489,7 +558,13 @@ async def _catalog_dpa_signals(client, catalog: dict[str, Any]) -> dict[str, Any
             note_partial("diagnostics", diagnostics, len(groups))
     except _SIGNAL_ERRORS as error:
         unavailable.append(_error_entry("diagnostics", error))
-    return {"signals": signals, "unavailable": unavailable, "partial": partial}
+    context_errors: list[dict[str, Any]] = []
+    if ad_domain is not None:
+        context["ad_domain"], error_entry = await _ad_domain_match(client, catalog_id, ad_domain)
+        if error_entry is not None:
+            context_errors.append(error_entry)
+    return {"signals": signals, "unavailable": unavailable, "partial": partial, "context": context,
+            "context_errors": context_errors}
 
 
 _DPA_REQUIRED_SIGNALS = (
@@ -562,13 +637,59 @@ def _assess_catalog(
 _ASSESSMENT_RANK = {"ready": 0, "needs_attention": 1, "unknown": 2, "blocked": 3}
 
 
+_ELIGIBLE_GROUP = {"ready": 0, "needs_attention": 0, "unknown": 1, "blocked": 2}
+
+
+def _context_reasons(context: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    domain = context.get("ad_domain")
+    if domain is not None:
+        if domain["match"] == "unknown":
+            reasons.append(f"Could not compare product URLs with {domain['domain']} (no product URL was read).")
+        else:
+            reasons.append(
+                f"{domain['matching_urls']} of {domain['sampled_urls']} sampled product URL(s) are on "
+                f"{domain['domain']}."
+            )
+    pixel = context.get("pixel")
+    if pixel is not None:
+        if pixel["connected"] is True:
+            reasons.append(f"Connected to pixel {pixel['pixel_id']}.")
+        elif pixel["connected"] is False:
+            reasons.append(f"Not connected to pixel {pixel['pixel_id']}.")
+        else:
+            reasons.append(f"Whether pixel {pixel['pixel_id']} is connected could not be established.")
+    return reasons
+
+
+def _context_score(context: dict[str, Any]) -> tuple[int, int]:
+    """Return (checks matched, checks supplied) for the optional ad context."""
+    matched = supplied = 0
+    if (domain := context.get("ad_domain")) is not None:
+        supplied += 1
+        matched += domain["match"] in {"yes", "partial"}
+    if (pixel := context.get("pixel")) is not None:
+        supplied += 1
+        matched += pixel["connected"] is True
+    return matched, supplied
+
+
 @mcp_server.tool()
 async def list_dpa_eligible_catalogs(
     business_id: str | None = None,
     account_id: str | None = None,
+    ad_url: str | None = None,
+    pixel_id: GraphId | None = None,
 ) -> dict[str, Any]:
-    """Rank a business's product catalogs (or an ad account's owning business's) by readiness for Advantage catalog (dynamic) ads, with the reasons and a recommended catalog when exactly one is ready. Derived locally from documented catalog data; Meta publishes no eligibility endpoint."""
+    """Rank a business's product catalogs (or an ad account's owning business's) by readiness for Advantage catalog (dynamic) ads, with the reasons and a recommended catalog when exactly one is ready. Optional ad_url and pixel_id put first the eligible catalogs whose sampled product URLs are on the ad's domain or that are connected to that pixel, and say why. Derived locally from documented catalog data; Meta publishes no eligibility endpoint."""
     scope_name, scope_value = _one_scope(business_id=business_id, account_id=account_id)
+    ad_domain = None
+    if ad_url is not None:
+        ad_domain = _host(ad_url)
+        if ad_domain is None:
+            raise ValidationError("ad_url must be a web address such as https://shop.example.com/product.")
+    pixel_id = blank_to_none(pixel_id) if isinstance(pixel_id, str) else None
+    has_context = ad_domain is not None or pixel_id is not None
     client = get_graph_api_client()
     scope = await _business_scope(
         client,
@@ -587,7 +708,7 @@ async def list_dpa_eligible_catalogs(
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
     for catalog in catalogs:
-        collected = await _catalog_dpa_signals(client, catalog)
+        collected = await _catalog_dpa_signals(client, catalog, ad_domain=ad_domain, pixel_id=pixel_id)
         assessment, reasons = _assess_catalog(
             collected["signals"], collected["unavailable"], collected["partial"],
         )
@@ -598,7 +719,9 @@ async def list_dpa_eligible_catalogs(
                 f"{catalog.get('id')}: {entry['signal']} was only partly read "
                 f"({entry['rows_read']} row(s) read). {entry['reason']}"
             )
-        findings.append({
+        for entry in collected.get("context_errors", []):
+            missing_signals.append(f"{catalog.get('id')}: {entry['signal']} could not be read ({entry['error']}).")
+        finding = {
             "catalog_id": str(catalog.get("id")),
             "name": catalog.get("name"),
             "vertical": catalog.get("vertical"),
@@ -607,8 +730,16 @@ async def list_dpa_eligible_catalogs(
             "signals": collected["signals"],
             "unavailable_signals": collected["unavailable"],
             "partial_signals": collected["partial"],
-        })
+        }
+        if collected.get("skipped"):
+            finding["signals_skipped"] = collected["skipped"]
+        if has_context:
+            finding["context_match"] = collected["context"]
+            reasons.extend(_context_reasons(collected["context"]))
+        findings.append(finding)
     findings.sort(key=lambda item: (
+        _ELIGIBLE_GROUP[item["assessment"]],
+        -_context_score(item.get("context_match") or {})[0],
         _ASSESSMENT_RANK[item["assessment"]],
         item["signals"]["da_must_fix_affected_items"] or 0,
         -(item["signals"]["product_count"] or 0),
@@ -616,7 +747,24 @@ async def list_dpa_eligible_catalogs(
     for rank, finding in enumerate(findings, start=1):
         finding["rank"] = rank
     ready = [finding for finding in findings if finding["assessment"] == "ready"]
-    if len(ready) == 1:
+    supplied = ", ".join(name for name, value in (("ad_url", ad_domain), ("pixel_id", pixel_id)) if value)
+    if has_context:
+        matched_ready = [
+            finding for finding in ready
+            if (score := _context_score(finding["context_match"]))[0] == score[1]
+        ]
+        if len(matched_ready) == 1:
+            recommended = matched_ready[0]["catalog_id"]
+            reason = f"It is the only catalog that passed every readiness rule and matched {supplied}."
+        elif matched_ready:
+            recommended = None
+            reason = (f"{len(matched_ready)} ready catalogs matched {supplied}; choose by which products the "
+                      "campaign should promote.")
+        else:
+            recommended = None
+            reason = (f"No ready catalog matched {supplied}; check that the ad's site and pixel belong to "
+                      "one of these catalogs.")
+    elif len(ready) == 1:
         recommended = ready[0]["catalog_id"]
         reason = "It is the only catalog that passed every readiness rule."
     elif ready:
@@ -627,10 +775,38 @@ async def list_dpa_eligible_catalogs(
         recommended = None
         reason = "No catalog passed every readiness rule; see each catalog's reasons."
     if not complete:
-        reason = listing["stop_reason"] or f"Stopped at the {_DPA_MAX_CATALOGS}-catalog cap."
+        stop = listing["stop_reason"] or f"Stopped at the {_DPA_MAX_CATALOGS}-catalog cap."
+        recommended = None
+        reason = (f"The catalog list is incomplete, so no catalog can be called the only choice. {stop}")
         missing_signals.append(
-            f"The catalog list is incomplete: only {len(catalogs)} catalog(s) were evaluated. {reason}"
+            f"The catalog list is incomplete: only {len(catalogs)} catalog(s) were evaluated. {stop}"
         )
+    signals_used = [
+        "product_catalog.product_count",
+        "product_catalog/product_sets",
+        "product_catalog/external_event_sources",
+        "product_catalog/diagnostics",
+    ]
+    rules = {
+        "blocked": "product_count is 0. Supporting edges are not read for such a catalog.",
+        "ready": ("Has products, at least one product set, at least one connected event source, "
+                  "and no must-fix dynamic-ads diagnostics."),
+        "needs_attention": "Has products but fails one of the ready rules.",
+        "unknown": ("A signal could not be read, was only partly read without a deciding result, "
+                    "or Meta omitted product_count."),
+        "eligible": "ready or needs_attention.",
+    }
+    ordering = "assessment, then fewest items affected by must-fix diagnostics, then most products."
+    if ad_domain is not None:
+        signals_used.append(f"product_catalog/products (url of up to {_DPA_URL_SAMPLE_SIZE} products)")
+        rules["ad_url"] = (f"Matches when at least one of up to {_DPA_URL_SAMPLE_SIZE} sampled product URLs is on "
+                           "the ad's domain or a subdomain of it; a small sample, not every product.")
+    if pixel_id is not None:
+        rules["pixel_id"] = "Matches when the pixel is among the catalog's connected event sources."
+    if has_context:
+        ordering = ("eligible catalogs first, then the most context checks matched (ad_url, pixel_id), then "
+                    "assessment, fewest items affected by must-fix diagnostics, and most products.")
+        rules["recommended"] = "The only ready catalog that matched every context check supplied."
     return analysis_response(
         scope={**scope, "ownership": "owned"},
         metrics={
@@ -647,22 +823,9 @@ async def list_dpa_eligible_catalogs(
             "basis": {
                 "note": ("This ranking is derived here from documented catalog data; Meta publishes no "
                          "catalog-ad eligibility endpoint."),
-                "signals_used": [
-                    "product_catalog.product_count",
-                    "product_catalog/product_sets",
-                    "product_catalog/external_event_sources",
-                    "product_catalog/diagnostics",
-                ],
-                "rules": {
-                    "blocked": "product_count is 0.",
-                    "ready": ("Has products, at least one product set, at least one connected event source, "
-                              "and no must-fix dynamic-ads diagnostics."),
-                    "needs_attention": "Has products but fails one of the ready rules.",
-                    "unknown": ("A signal could not be read, was only partly read without a deciding result, "
-                                "or Meta omitted product_count."),
-                    "eligible": "ready or needs_attention.",
-                },
-                "ordering": "assessment, then fewest items affected by must-fix diagnostics, then most products.",
+                "signals_used": signals_used,
+                "rules": rules,
+                "ordering": ordering,
             },
         },
     )
