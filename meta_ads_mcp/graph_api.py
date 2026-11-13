@@ -403,9 +403,20 @@ class GraphAPIClient:
             elif isinstance(payload, list):
                 payload = {"data": payload}
             elif not isinstance(payload, dict):
-                # A bare null, text or number. Wrapped so callers always get an object
-                # and its wording is never mistaken for an error field.
-                payload = {"json_response": payload}
+                # A bare null, text or number cannot be read as an answer. It is an error,
+                # never something shaped like an object: a caller that reads before it
+                # writes must stop, and after a write the outcome is not known.
+                transient_status = response.status_code in TRANSIENT_HTTP_STATUSES
+                raise MetaApiError(
+                    message="Meta's answer was not a JSON object, so it could not be read.",
+                    status_code=response.status_code,
+                    details={"json_type": type(payload).__name__},
+                    operation=operation,
+                    is_transient=response.is_error and transient_status,
+                    mutation_outcome_unknown=(
+                        not safe_to_retry and (transient_status if response.is_error else True)
+                    ),
+                )
             if response.is_error or "error" in payload:
                 error = MetaApiError.from_payload(payload, status_code=response.status_code)
                 error.operation = operation

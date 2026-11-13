@@ -1075,14 +1075,22 @@ def test_upload_ad_image_needs_exactly_one_complete_source(monkeypatch, argument
 
 
 @pytest.mark.parametrize("body", [None, "ok", "an error word in plain text", 7, 1.5])
-def test_a_json_answer_that_is_not_an_object_is_returned_as_an_object(monkeypatch, body) -> None:
-    # Meta documents object answers. A bare null, text or number must not crash the
-    # client (null and numbers raised TypeError; text holding "error" raised
-    # AttributeError), and must not be mistaken for an error by its wording.
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+def test_a_json_answer_that_is_not_an_object_is_an_error_not_a_result(monkeypatch, body, method) -> None:
+    # Meta documents object answers. A bare null, text or number is unreadable: it must not
+    # crash the client (null and numbers raised TypeError), must not reach a caller as
+    # something that looks like an object (a read-before-write would then be followed by
+    # the write), and after a write it must say the outcome is not known.
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     FakeAsyncClient.responses = deque([FakeResponse(200, body)])
-    result = asyncio.run(_client().request("GET", "123"))
-    assert result == {"json_response": body}
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data=None if method == "GET" else {"name": "x"}))
+    public = error.value.to_public_dict()
+    assert "not a JSON object" in public["message"]
+    assert error.value.status_code == 200
+    assert public["mutation_outcome_unknown"] is (method != "GET")
+    assert public["retryable"] is False
+    assert len(FakeAsyncClient.requests) == 1
 
 
 @pytest.mark.parametrize("body", [None, "refused", 7])
@@ -1090,8 +1098,20 @@ def test_an_error_status_with_a_non_object_json_answer_is_a_meta_error(monkeypat
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     FakeAsyncClient.responses = deque([FakeResponse(400, body)])
     with pytest.raises(MetaApiError) as error:
-        asyncio.run(_client().request("GET", "123"))
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
     assert error.value.status_code == 400
+    assert error.value.to_public_dict()["mutation_outcome_unknown"] is False
+
+
+@pytest.mark.parametrize("code", [[], {}, "613", 1.5, True])
+def test_an_error_code_of_the_wrong_type_does_not_crash_the_client(monkeypatch, code) -> None:
+    # A list code raised TypeError (unhashable) while classifying the error, after a write had gone out.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"error": {"message": "Malformed reply", "code": code, "error_subcode": code}})])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.message == "Malformed reply"
+    assert error.value.code is None and error.value.subcode is None
 
 
 def test_bool_and_list_answers_keep_their_existing_wrappers(monkeypatch) -> None:
