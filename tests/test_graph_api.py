@@ -999,3 +999,31 @@ def test_account_scoped_helpers_reject_an_account_id_with_a_path(recording_clien
     with pytest.raises(ValidationError):
         asyncio.run(call(_client()))
     assert recording_client.sent == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014],
+)
+def test_business_use_case_throttling_codes_are_rate_limits(monkeypatch, code) -> None:
+    """Meta's per-product throttling codes carry messages that do not say "rate limit"."""
+    FakeAsyncClient.responses = deque(
+        [FakeResponse(400, {"error": {"message": "There have been too many requests for this object.", "code": code}})]
+    )
+    asyncio.run(close_graph_api_clients())
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError):
+        asyncio.run(_client().request("GET", "123/products"))
+    asyncio.run(close_graph_api_clients())
+
+
+def test_an_ordinary_error_code_is_not_a_rate_limit(monkeypatch) -> None:
+    FakeAsyncClient.responses = deque(
+        [FakeResponse(400, {"error": {"message": "Invalid parameter", "code": 100}})]
+    )
+    asyncio.run(close_graph_api_clients())
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("GET", "123/products"))
+    assert not isinstance(error.value, RateLimitError)
+    asyncio.run(close_graph_api_clients())

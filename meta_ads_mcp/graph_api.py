@@ -135,10 +135,18 @@ def _is_unsupported_surface_error(error: MetaApiError) -> bool:
     return False
 
 
+# Meta's documented throttling codes (Graph API "Rate Limits" page): the platform
+# limits, then one code per product for business use case limits, including catalog
+# management (80009) and catalog batch (80014).
+_RATE_LIMIT_CODES = frozenset(
+    {4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014}
+)
+
+
 def _is_rate_limit_error(error: MetaApiError) -> bool:
     """Decide whether a Graph API error is actually throttling."""
     message = error.message.lower()
-    if error.code in {4, 17, 32, 613}:
+    if error.code in _RATE_LIMIT_CODES:
         return True
     return "rate limit" in message or "limit reached" in message or "too many calls" in message
 
