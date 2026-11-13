@@ -157,10 +157,12 @@ def _audience_labels(value: Any) -> list[str]:
     ):
         raise ValidationError("audience_labels must be one or more nonblank labels, as a list or comma-separated string.")
     normalized = list(dict.fromkeys(label.strip().upper() for label in labels))
-    unknown = [label for label in normalized if label not in AUDIENCE_LABELS]
+    # Counted, never quoted: a misplaced name or email address can arrive here.
+    unknown = sum(1 for label in normalized if label not in AUDIENCE_LABELS)
     if unknown:
         raise ValidationError(
-            f"Unknown audience_labels: {', '.join(unknown)}. Meta accepts: {', '.join(sorted(AUDIENCE_LABELS))}."
+            f"audience_labels has {unknown} value{'' if unknown == 1 else 's'} that {'is' if unknown == 1 else 'are'} "
+            f"not a recognised label (not repeated here). Meta accepts: {', '.join(sorted(AUDIENCE_LABELS))}."
         )
     return normalized
 
