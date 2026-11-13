@@ -73,7 +73,7 @@ def reject_money_in_params(params: dict[str, Any] | None, money: tuple[str, ...]
     for key in money:
         if key in params:
             raise ValidationError(
-                f"{key} cannot be given inside params, where Meta would read it in minor units (cents). "
+                f"{key} cannot be given inside params, where Meta would read it in minor units (cents in USD). "
                 f"Use the named {key} parameter, which takes major units of the account currency: "
                 f"{key}=50 means 50.00 in the account currency."
             )
