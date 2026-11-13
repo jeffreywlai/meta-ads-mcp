@@ -614,11 +614,14 @@ class RecordingCampaignClient(FakeCampaignClient):
 
 
 def test_create_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
-    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before."""
+    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before.
+
+    spend_cap is no longer accepted inside params (declared change; see
+    test_money_field_inside_params_is_refused_before_any_call); every other field is unchanged.
+    """
     client = RecordingCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     params = {
-        "spend_cap": 25000,
         "start_time": "2026-12-01T00:00:00-0500",
         "stop_time": "2026-12-31T00:00:00-0500",
         "promoted_object": {"pixel_id": "999", "custom_event_type": "PURCHASE"},
@@ -650,7 +653,11 @@ def test_create_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
 
 
 def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
-    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before."""
+    """A call that puts the new fields in params, as callers do today, sends exactly what it sent before.
+
+    Spend caps and minimum spend targets are no longer accepted inside params (declared change; see
+    test_money_field_inside_params_is_refused_before_any_call); every other field is unchanged.
+    """
     client = RecordingCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     params = {
@@ -658,10 +665,6 @@ def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
         "attribution_spec": [{"event_type": "CLICK_THROUGH", "window_days": 7}],
         "adset_schedule": [{"start_minute": 540, "end_minute": 1020, "days": [1, 2, 3]}],
         "pacing_type": ["day_parting"],
-        "daily_spend_cap": 9000,
-        "lifetime_spend_cap": 90000,
-        "daily_min_spend_target": 1000,
-        "lifetime_min_spend_target": 10000,
         "dsa_beneficiary": "Acme GmbH",
         "dsa_payor": "Acme GmbH",
         "adlabels": [{"name": "Q4"}],
@@ -1368,11 +1371,14 @@ def test_create_campaign_params_only_budget_schedule_call_is_unchanged(monkeypat
 
 
 def test_update_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
-    """spend_cap, start_time, stop_time and adlabels inside params: same read, same write, same response."""
+    """start_time, stop_time and adlabels inside params: same read, same write, same response.
+
+    spend_cap is no longer accepted inside params (declared change; see
+    test_money_field_inside_params_is_refused_before_any_call).
+    """
     client = RecordingCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     params = {
-        "spend_cap": 25000,
         "start_time": "2026-12-01T00:00:00-0500",
         "stop_time": "2026-12-31T00:00:00-0500",
         "adlabels": [{"name": "Q4"}],
@@ -1836,6 +1842,61 @@ def test_absolute_budget_increase_is_refused_until_metas_unit_is_confirmed(monke
 
 def test_absolute_budget_increase_is_off_by_default() -> None:
     assert _ABSOLUTE_CONFIRMED_AS_SHIPPED is False
+
+
+# A money field inside params is refused: the named parameter takes major units,
+# a params value would reach Meta unconverted and be read as minor units.
+
+_CREATE_ADSET_ARGS = {
+    "account_id": "123", "campaign_id": "cmp_123", "name": "Ad set", "billing_event": "IMPRESSIONS",
+    "optimization_goal": "REACH", "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+_ADSET_SPEND_KEYS = ("daily_spend_cap", "lifetime_spend_cap", "daily_min_spend_target", "lifetime_min_spend_target")
+_MONEY_IN_PARAMS_CASES = [
+    *[("create_campaign", {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES"}, key)
+      for key in ("daily_budget", "lifetime_budget", "spend_cap")],
+    *[("update_campaign", {"campaign_id": "cmp_123"}, key) for key in ("daily_budget", "lifetime_budget", "spend_cap")],
+    *[("create_ad_set", _CREATE_ADSET_ARGS, key)
+      for key in ("bid_amount", "daily_budget", "lifetime_budget", *_ADSET_SPEND_KEYS)],
+    *[("update_adset", {"adset_id": "adset_1"}, key) for key in _ADSET_SPEND_KEYS],
+]
+
+
+@pytest.mark.parametrize(("tool", "arguments", "key"), _MONEY_IN_PARAMS_CASES)
+def test_money_field_inside_params_is_refused_before_any_call(monkeypatch, tool, arguments, key) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError) as caught:
+        asyncio.run(getattr(campaigns, tool)(**arguments, params={key: 98765, "is_skadnetwork_attribution": False}))
+    message = str(caught.value)
+    assert message.startswith(f"{key} cannot be given inside params")
+    assert f"named {key} parameter" in message
+    assert "major units" in message
+    assert f"{key}=50 means 50.00 in the account currency" in message
+    assert "98765" not in message
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("create_campaign", {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES", "spend_cap": 250}),
+        ("update_campaign", {"campaign_id": "cmp_123", "spend_cap": 250}),
+        ("create_ad_set", {**_CREATE_ADSET_ARGS, "daily_spend_cap": 90}),
+    ],
+)
+def test_money_field_named_and_inside_params_still_refused(monkeypatch, tool, arguments) -> None:
+    key = next(name for name in arguments if name.endswith("spend_cap"))
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
+        asyncio.run(getattr(campaigns, tool)(**arguments, params={key: 25000}))
+
+
+def test_money_field_nested_inside_params_is_not_refused(monkeypatch) -> None:
+    """Only top-level params keys are checked; a same-named key deeper in an object is sent as given."""
+    client = RecordingCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    nested = {"promoted_object": {"pixel_id": "999", "custom_event_type": "PURCHASE", "spend_cap": 1}}
+    asyncio.run(campaigns.create_campaign(account_id="123", name="C", objective="OUTCOME_SALES", params=dict(nested)))
+    assert client.calls[-1][3]["promoted_object"] == nested["promoted_object"]
 
 
 # create_ad_set with a schedule time that has no time zone: the request stays as

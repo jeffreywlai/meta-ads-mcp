@@ -7,6 +7,27 @@
       "what_changed": "An id that contains a slash, a question mark, a hash, two dots in a row or a space is now refused before any request is sent. Before, such an id was placed in the request address as written, so get_creative('123/') read creative 123 and an id like '123/ads' read a different object than the tool was meant to read.",
       "why_better": "A tool can only reach the object type it was built for. An id copied from text that strangers wrote (an ad comment, a Page review) can no longer steer a read or a delete to a different object or attach extra options to the request.",
       "migration": "Pass the plain id with nothing before or after it, for example '123' or 'act_123'. Trim a trailing slash or any address fragment before calling."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "spend_cap inside params is now refused before any request is sent, with a message pointing to the named spend_cap parameter. Before, params={'spend_cap': 25000} was sent to Meta as written and read in minor units (250.00 USD), while the named spend_cap takes major units (spend_cap=250 is 250.00). daily_budget and lifetime_budget inside params were already refused; only their message changed.",
+      "why_better": "The same field no longer has two units, so an amount cannot silently be 100 times too small (or too large) because it was put in params instead of the named parameter.",
+      "migration": "Move the amount to the named spend_cap parameter in major units: divide the minor-unit amount you sent in params by the currency's minor-unit factor, 100 for most currencies and 1 for currencies without minor units such as JPY or KRW. params={'spend_cap': 25000} in USD becomes spend_cap=250."
+    },
+    {
+      "tool": "update_campaign",
+      "kind": "behaviour",
+      "what_changed": "spend_cap inside params is now refused before any request is sent, including the read of the campaign, with a message pointing to the named spend_cap parameter. Before, params={'spend_cap': 25000} was sent to Meta as written and read in minor units (250.00 USD), while the named spend_cap takes major units. daily_budget and lifetime_budget inside params were already refused; only their message changed.",
+      "why_better": "The same field no longer has two units, so an amount cannot silently be 100 times too small (or too large) because it was put in params instead of the named parameter.",
+      "migration": "Move the amount to the named spend_cap parameter in major units: divide the minor-unit amount you sent in params by the currency's minor-unit factor, 100 for most currencies and 1 for currencies without minor units such as JPY or KRW. params={'spend_cap': 25000} in USD becomes spend_cap=250."
+    },
+    {
+      "tool": "create_ad_set",
+      "kind": "behaviour",
+      "what_changed": "daily_spend_cap, lifetime_spend_cap, daily_min_spend_target and lifetime_min_spend_target inside params are now refused before any request is sent, with a message pointing to the named parameter of the same name. Before, they were sent to Meta as written and read in minor units, while the named parameters take major units. bid_amount, daily_budget and lifetime_budget inside params were already refused; only their message changed.",
+      "why_better": "The same field no longer has two units, so an amount cannot silently be 100 times too small (or too large) because it was put in params instead of the named parameter.",
+      "migration": "Move each amount to the named parameter of the same name in major units: divide the minor-unit amount you sent in params by the currency's minor-unit factor, 100 for most currencies and 1 for currencies without minor units such as JPY or KRW. params={'daily_spend_cap': 9000} in USD becomes daily_spend_cap=90."
     }
   ]
 }
