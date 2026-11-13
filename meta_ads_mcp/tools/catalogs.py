@@ -7,9 +7,11 @@ that feeds Advantage+ catalog ads), never this server's own list of tools.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import re
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, TypeAlias
 from urllib.parse import urlparse
@@ -29,6 +31,10 @@ from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, to_int
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
+# The feed tools' masking: a URL password in a result or in a raised error's text
+# is replaced, keeping user, host and path. catalog_feeds imports nothing from here.
+from meta_ads_mcp.tools.catalog_feeds import _URL_LOGIN, _mask_error, _redact
+from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 # Fields documented on the Product Catalog reference page.
 CATALOG_FIELDS = ["id", "name", "vertical", "product_count", "feed_count", "is_catalog_segment"]
@@ -360,6 +366,56 @@ def _mask_secrets(value: Any) -> Any:
     return value
 
 
+def _refuse_url_logins(value: Any, name: str) -> None:
+    """Refuse a caller value holding a URL with a username or password, at any depth.
+
+    Every string inside value is checked, whether it is the URL itself or text with
+    a URL in it (a description, a filter value), so a login cannot reach Meta,
+    where it would be stored and shown back. The message names the field, never
+    the URL.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_url_logins(item, f"{name}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _refuse_url_logins(item, f"{name}[{index}]")
+    elif isinstance(value, str):
+        refuse_url_credentials(value, name)
+        if (match := _URL_LOGIN.search(value)) is not None:
+            refuse_url_credentials(value[match.start():].split()[0], name)
+
+
+def _refuse_url_logins_in(**values: Any) -> None:
+    for name, value in values.items():
+        _refuse_url_logins(value, name)
+
+
+def _shown(value: Any) -> Any:
+    """Copy a value for a response: URL passwords and credential keys are masked."""
+    return _mask_secrets(_redact(value))
+
+
+def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Run a tool so that neither its result nor an error it raises shows a password.
+
+    Every tool in this module goes through this, so a value read back from Meta
+    (a stored product or checkout URL, a diagnostic, an error message) cannot
+    show a URL password, whichever field it arrives in.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = await fn(*args, **kwargs)
+        except Exception as exc:
+            _mask_error(exc)
+            raise
+        return _shown(result)
+
+    return wrapper
+
+
 def _row_identity(row: Any) -> str | None:
     """Return a row's Meta id, or None when the row carries none."""
     if not isinstance(row, dict):
@@ -483,6 +539,7 @@ _ACCOUNT_SCOPE_NOTE = (
 
 
 @mcp_server.tool()
+@_masked
 async def list_catalogs(
     business_id: str | None = None,
     account_id: str | None = None,
@@ -819,6 +876,7 @@ async def _page_catalog_ids(client, page_id: str) -> dict[str, Any]:
 
 
 @mcp_server.tool()
+@_masked
 async def list_dpa_eligible_catalogs(
     business_id: str | None = None,
     account_id: str | None = None,
@@ -830,6 +888,7 @@ async def list_dpa_eligible_catalogs(
     """Rank a business's product catalogs (or an ad account's owning business's) by readiness for Advantage catalog (dynamic) ads, with the reasons and a recommended catalog when exactly one is ready. Optional ad_url, pixel_id and page_id put first the eligible catalogs whose sampled product URLs are on the ad's domain, that are connected to that pixel, or that the Page lists as its catalogs, and say why. ad_format PE (product extensions) applies that format's documented needs, a catalog with a product set, instead of A_PLUS_CA, the default. Derived locally from documented catalog data; Meta publishes no eligibility endpoint."""
     scope_name, scope_value = _one_scope(business_id=business_id, account_id=account_id)
     ad_domain = None
+    _refuse_url_logins(ad_url, "ad_url")
     if ad_url is not None:
         ad_domain = _host(ad_url)
         if ad_domain is None:
@@ -1075,6 +1134,7 @@ def _compact_diagnostic_group(group: dict[str, Any], *, with_sample: bool) -> di
 
 
 @mcp_server.tool()
+@_masked
 async def get_catalog_diagnostics(
     catalog_id: str,
     severity: str | None = None,
@@ -1145,6 +1205,7 @@ async def _health_edge(client, parent_id, edge, fields, params, used, missing, l
 
 
 @mcp_server.tool()
+@_masked
 async def get_catalog_dynamic_ads_health(
     catalog_id: str,
     product_set_id: str | None = None,
@@ -1250,6 +1311,7 @@ async def get_catalog_dynamic_ads_health(
 
 
 @mcp_server.tool()
+@_masked
 async def list_catalog_data_sources(
     catalog_id: str,
     ingestion_source_type: str = "ALL",
@@ -1275,6 +1337,7 @@ async def list_catalog_data_sources(
 
 
 @mcp_server.tool()
+@_masked
 async def create_catalog(
     business_id: str,
     name: str,
@@ -1285,6 +1348,7 @@ async def create_catalog(
     business_id = _require(business_id, "business_id")
     name = _require(name, "name")
     _choice(vertical, CATALOG_VERTICALS, "vertical")
+    _refuse_url_logins_in(name=name, params=params)
     payload = merge_graph_payload({"name": name, "vertical": vertical}, params)
     result = await get_graph_api_client().create_edge_object(
         business_id, "owned_product_catalogs", data=payload,
@@ -1293,6 +1357,7 @@ async def create_catalog(
 
 
 @mcp_server.tool()
+@_masked
 async def update_catalog(
     catalog_id: str,
     name: str | None = None,
@@ -1300,6 +1365,7 @@ async def update_catalog(
 ) -> dict[str, Any]:
     """Edit a product catalog's name or other documented settings (params), returning previous and current values. A changed setting Meta cannot read back is named in previous_unavailable."""
     catalog_id = _require(catalog_id, "catalog_id")
+    _refuse_url_logins_in(name=name, params=params)
     payload = merge_graph_payload({"name": name if name is not None else OMIT}, params)
     if not payload:
         raise ValidationError("At least one field must be provided for update_catalog.")
@@ -1354,6 +1420,7 @@ def _error_type(value: str | None) -> str | None:
 
 
 @mcp_server.tool()
+@_masked
 async def list_catalog_products(
     catalog_id: str | None = None,
     product_set_id: str | None = None,
@@ -1372,6 +1439,7 @@ async def list_catalog_products(
     )
     _check_limit(limit)
     parsed_filter = _parse_filter(filter)
+    _refuse_url_logins(parsed_filter, "filter")
     normalized_error_type = _error_type(error_type)
     normalized_priority = None
     if error_priority is not None:
@@ -1429,6 +1497,7 @@ async def list_catalog_products(
 
 
 @mcp_server.tool()
+@_masked
 async def create_catalog_product(
     catalog_id: str,
     retailer_id: str,
@@ -1448,6 +1517,10 @@ async def create_catalog_product(
 ) -> dict[str, Any]:
     """Create one product in a product catalog. price and sale_price are major units (12.5 means 12.50). Created hidden (visibility=staging) until updated to published; fails if retailer_id exists unless allow_upsert."""
     catalog_id = _require(catalog_id, "catalog_id")
+    _refuse_url_logins_in(
+        retailer_id=retailer_id, name=name, url=url, image_url=image_url, description=description,
+        brand=brand, params=params,
+    )
     typed: dict[str, Any] = {
         "retailer_id": _require(retailer_id, "retailer_id"),
         "name": _require(name, "name"),
@@ -1481,6 +1554,7 @@ async def create_catalog_product(
 
 
 @mcp_server.tool()
+@_masked
 async def update_catalog_product(
     product_id: str,
     name: str | None = None,
@@ -1498,6 +1572,9 @@ async def update_catalog_product(
 ) -> dict[str, Any]:
     """Edit a catalog product's fields, returning previous and current values. price and sale_price are major units; previous prices are shown as Meta formats them. A changed field Meta cannot read back is named in previous_unavailable."""
     product_id = _require(product_id, "product_id")
+    _refuse_url_logins_in(
+        name=name, url=url, image_url=image_url, description=description, brand=brand, params=params,
+    )
     payload, shown = _product_fields(
         name=name, price=price, currency=currency, sale_price=sale_price,
         availability=availability, condition=condition, visibility=visibility,
@@ -1535,6 +1612,7 @@ async def update_catalog_product(
 
 
 @mcp_server.tool()
+@_masked
 async def delete_catalog_product(product_id: str) -> dict[str, Any]:
     """Delete one product from its product catalog. Use only when the user explicitly asks; the product is read first and returned as previous."""
     product_id = _require(product_id, "product_id")
@@ -1565,6 +1643,8 @@ BATCH_MAX_ITEMS = 50
 BATCH_METHODS = {"create": "CREATE", "update": "UPDATE", "delete": "DELETE"}
 _BATCH_POLL_INTERVAL = 2
 _BATCH_MAX_WAIT = 60
+# Status requests one call may make across all of a batch's handles.
+_BATCH_MAX_STATUS_CHECKS = 60
 _BATCH_READ_PAGE_SIZE = 100
 _BATCH_READ_MAX_PAGES = 2
 _BATCH_ITEM_KEYS = frozenset({
@@ -1647,6 +1727,9 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
     label = f"items[{index}]"
     if not isinstance(item, dict):
         raise ValidationError(f"{label} must be an object with method and retailer_id.")
+    # Every value, including image, video, additional image and app links nested
+    # in fields, is checked before the catalog is read.
+    _refuse_url_logins(item, label)
     unknown = sorted(set(item) - _BATCH_ITEM_KEYS)
     if unknown:
         raise ValidationError(
@@ -1800,15 +1883,46 @@ def _feed_warning(entry: dict[str, Any], product: dict[str, Any]) -> str | None:
             "this change unless the feed is changed too.")
 
 
-def _messages(entries: Any) -> list[str]:
-    return [str(entry.get("message")) for entry in entries or [] if isinstance(entry, dict) and entry.get("message")]
+_NO_MESSAGE_ERROR = "Meta reported an error for this item without a message."
+_NO_MESSAGE_WARNING = "Meta reported a warning for this item without a message."
+
+
+def _entry_list(entries: Any) -> list[Any]:
+    """Return Meta's error or warning entries as a list; an empty value means none."""
+    if entries is None or entries == "" or entries == [] or entries == {}:
+        return []
+    if isinstance(entries, list):
+        return [entry for entry in entries if entry is not None]
+    return [entries]
+
+
+def _entry_text(entry: Any, generic: str) -> str:
+    """Return one entry's message, or a generic one when Meta gave none.
+
+    An entry with no message still counts: it is replaced by generic text, with
+    its code when it has one, and never dropped.
+    """
+    message = entry.get("message") if isinstance(entry, dict) else entry
+    if isinstance(message, str) and message.strip():
+        return message
+    if message is not None and not isinstance(message, (str, dict, list)):
+        return str(message)
+    code = entry.get("code") if isinstance(entry, dict) else None
+    if code is not None and not isinstance(code, (dict, list, bool)):
+        return f"{generic[:-1]} (code {code})."
+    return generic
+
+
+def _messages(entries: Any, generic: str = _NO_MESSAGE_ERROR) -> list[str]:
+    """One text per entry Meta listed, so the number of texts is the number of entries."""
+    return [_entry_text(entry, generic) for entry in _entry_list(entries)]
 
 
 def _by_id(entries: Any) -> dict[str, list[str]]:
     grouped: dict[str, list[str]] = {}
-    for entry in entries or []:
-        if isinstance(entry, dict) and entry.get("id") is not None and entry.get("message"):
-            grouped.setdefault(str(entry["id"]), []).append(str(entry["message"]))
+    for entry in _entry_list(entries):
+        if isinstance(entry, dict) and entry.get("id") is not None:
+            grouped.setdefault(str(entry["id"]), []).append(_entry_text(entry, _NO_MESSAGE_WARNING))
     return grouped
 
 
@@ -1883,17 +1997,45 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
             "reason": reason, "errors_total_count": error_total, "unattributed_errors": unnamed}
 
 
-def _settle(item: dict[str, Any], row: dict[str, Any]) -> None:
-    """Set a sent item's final outcome from a finished batch status."""
-    attribution = _batch_attribution(row)
-    errors = attribution["errors_by_id"]
-    warnings = _by_id(row.get("warnings"))
+_UNFINISHED_REASON = (
+    "Meta accepted the batch; it had not reported it finished when this tool stopped checking."
+)
+
+
+def _settle(
+    item: dict[str, Any],
+    rows: dict[str, Any] | list[dict[str, Any]],
+    *,
+    unfinished_reason: str | None = None,
+    unattributed_submission_errors: int = 0,
+) -> None:
+    """Set a sent item's outcome from the status of every handle of its batch.
+
+    rows are the finished status rows; unfinished_reason is given when at least
+    one handle has not been reported finished. Meta does not say which handle
+    holds which item, so an item is applied only when every handle is finished
+    and every error in every handle is attributed to a named item. An item Meta
+    named as failed in any handle is failed. An item flagged when the batch was
+    submitted (validation_status), even by an error without a message, is never
+    called applied; nor is any item when a submission error named no item.
+    """
+    rows = [rows] if isinstance(rows, dict) else list(rows)
+    attributions = [_batch_attribution(row) for row in rows]
     retailer_id = item["retailer_id"]
-    item["warnings"] = [*item["warnings"], *warnings.get(retailer_id, [])]
-    if retailer_id in attribution["failed_ids"]:
+    failed_errors: list[str] = []
+    named_failed = False
+    for row, attribution in zip(rows, attributions):
+        item["warnings"] = [*item["warnings"], *_by_id(row.get("warnings")).get(retailer_id, [])]
+        if retailer_id in attribution["failed_ids"]:
+            named_failed = True
+            failed_errors.extend(attribution["errors_by_id"].get(retailer_id, []))
+    if named_failed:
         item["outcome"] = "failed"
-        item["errors"] = [*item["errors"], *errors.get(retailer_id, [])] or ["Meta listed this item as invalid."]
-    elif item["errors"]:
+        item["errors"] = [*item["errors"], *failed_errors] or ["Meta listed this item as invalid."]
+    elif unfinished_reason is not None:
+        item["outcome"] = "processing"
+        item["reason"] = unfinished_reason
+    elif item["errors"] or item.get("submission_error_count"):
         # Meta's answer to the submission already listed errors for this item
         # (validation_status), yet the finished batch does not name it as failed.
         # The two disagree, so the item is not called applied.
@@ -1902,20 +2044,38 @@ def _settle(item: dict[str, Any], row: dict[str, Any]) -> None:
             "Meta listed errors for this item when the batch was submitted, but the finished batch "
             "did not name it as failed. Read the product before resending."
         )
-    elif attribution["complete"]:
+    elif unattributed_submission_errors:
+        item["outcome"] = "outcome_unknown"
+        item["reason"] = (
+            f"Meta listed {unattributed_submission_errors} error(s) when the batch was submitted that name no "
+            "item in it, so this item may be among them. Read the product before resending."
+        )
+    elif attributions and all(attribution["complete"] for attribution in attributions):
         item["outcome"] = "applied"
     else:
         item["outcome"] = "outcome_unknown"
-        item["reason"] = attribution["reason"]
+        item["reason"] = next(
+            (attribution["reason"] for attribution in attributions if not attribution["complete"]),
+            "No finished batch status was read, so the outcome is unknown.",
+        )
 
 
-def _retry_statement(outcomes: set[str], handle: str | None) -> dict[str, Any]:
+def _retry_statement(outcomes: set[str], handles: list[str] | str | None) -> dict[str, Any]:
+    if isinstance(handles, str):
+        handles = [handles]
+    handles = list(handles or [])
     if "processing" in outcomes:
+        if len(handles) == 1:
+            read = f"Call this tool again with catalog_id and handle={handles[0]!r} to read the outcome"
+        else:
+            listed = ", ".join(repr(value) for value in handles)
+            read = (f"Meta returned several handles for this batch and these are not known to be finished: "
+                    f"{listed}. Call this tool again with catalog_id and each of these as handle, one call "
+                    "per handle, to read the outcome")
         return {
             "safe_now": False,
-            "how": (f"Do not resend yet: Meta accepted the batch and is still processing it. Call this tool "
-                    f"again with catalog_id and handle={handle!r} to read the outcome, then resend only "
-                    "the items reported failed."),
+            "how": (f"Do not resend yet: Meta accepted the batch and is still processing it. {read}, then "
+                    "resend only the items reported failed."),
             "why": _BATCH_RETRY_WHY,
         }
     if "outcome_unknown" in outcomes:
@@ -1977,7 +2137,90 @@ async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, 
     }
 
 
+async def _poll_handles(
+    client, catalog_id: str, handles: list[str], wait_seconds: int,
+) -> dict[str, dict[str, Any]]:
+    """Check every batch handle until each is finished, its check fails, or the wait or request cap ends.
+
+    Each round waits once, then checks every handle not yet finished; a handle
+    whose check fails is not checked again and keeps its error.
+    """
+    tracks = {handle: {"row": None, "checks": 0, "error": None} for handle in handles}
+    requests = 0
+    capped = False
+    for _ in range(wait_seconds // _BATCH_POLL_INTERVAL):
+        pending = [handle for handle, track in tracks.items()
+                   if not _is_finished(track["row"]) and track["error"] is None]
+        if not pending:
+            break
+        if requests >= _BATCH_MAX_STATUS_CHECKS:
+            capped = True
+            break
+        await _pause(_BATCH_POLL_INTERVAL)
+        for handle in pending:
+            if requests >= _BATCH_MAX_STATUS_CHECKS:
+                capped = True
+                break
+            requests += 1
+            try:
+                tracks[handle]["row"] = await _check_batch(client, catalog_id, handle)
+            except (MetaApiError, RateLimitError, UnsupportedFeatureError, NotFoundError) as error:
+                tracks[handle]["error"] = str(error)
+                continue
+            tracks[handle]["checks"] += 1
+    if capped:
+        for track in tracks.values():
+            if not _is_finished(track["row"]) and track["error"] is None:
+                track["capped"] = True
+    return tracks
+
+
+def _batch_view(handles: list[str], tracks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Describe every handle Meta returned, and the batch as a whole."""
+    entries: list[dict[str, Any]] = []
+    for handle in handles:
+        track = tracks.get(handle) or {"row": None, "checks": 0, "error": None}
+        row = track["row"] or {}
+        entry: dict[str, Any] = {
+            "handle": handle,
+            "status": row.get("status"),
+            "complete": _is_finished(track["row"]),
+            "status_checks": track["checks"],
+            "errors_total_count": to_int(row.get("errors_total_count")),
+            "warnings_total_count": to_int(row.get("warnings_total_count")),
+        }
+        if track["error"] is not None:
+            entry["status_error"] = track["error"]
+        if track.get("capped"):
+            entry["status_note"] = f"Not checked again: this call's cap of {_BATCH_MAX_STATUS_CHECKS} status requests was reached."
+        entries.append(entry)
+
+    def total(key: str) -> int | None:
+        values = [entry[key] for entry in entries]
+        return None if any(value is None for value in values) else sum(values)
+
+    view: dict[str, Any] = {
+        "handle": handles[0] if len(handles) == 1 else None,
+        "status": entries[0]["status"] if len(entries) == 1 else None,
+        "complete": all(entry["complete"] for entry in entries),
+        "status_checks": sum(entry["status_checks"] for entry in entries),
+        "errors_total_count": total("errors_total_count"),
+        "warnings_total_count": total("warnings_total_count"),
+        "handles": entries,
+    }
+    if len(entries) == 1 and "status_error" in entries[0]:
+        view["status_error"] = entries[0]["status_error"]
+    if len(entries) > 1:
+        view["note"] = (
+            f"Meta returned {len(entries)} handles for this batch. Each was checked; Meta does not say which "
+            "items each holds, so an item is called applied only when every handle is finished with every "
+            "error attributed to a named item."
+        )
+    return view
+
+
 @mcp_server.tool()
+@_masked
 async def batch_update_catalog_products(
     catalog_id: GraphId,
     items: list[dict[str, Any]] | None = None,
@@ -2075,10 +2318,8 @@ async def batch_update_catalog_products(
     if any(entry["method"] == "create" for entry in entries):
         notes.append("Meta's batch documentation lists no visibility field for products, so products created "
                      "here are not held in staging; use create_catalog_product for one that must start hidden.")
-    handle_value: str | None = None
-    row: dict[str, Any] | None = None
-    checks = 0
-    status_error: str | None = None
+    handles: list[str] = []
+    tracks: dict[str, dict[str, Any]] = {}
 
     if dry_run:
         for item in to_send:
@@ -2095,51 +2336,64 @@ async def batch_update_catalog_products(
                                   if unknown else "Meta refused the whole request, so nothing was ingested.")
             response["error"] = error.to_public_dict()
         else:
-            validation = {}
-            for entry in posted.get("validation_status") or []:
-                if isinstance(entry, dict) and entry.get("retailer_id") is not None:
-                    validation[str(entry["retailer_id"])] = entry
+            sent_ids = {item["retailer_id"] for item in to_send}
+            flagged: dict[str, list[dict[str, Any]]] = {}
+            unattributed: list[str] = []
+            for entry in _entry_list(posted.get("validation_status")):
+                if not isinstance(entry, dict):
+                    continue
+                raw_id = entry.get("retailer_id")
+                entry_id = str(raw_id).strip() if raw_id is not None else ""
+                if entry_id in sent_ids:
+                    flagged.setdefault(entry_id, []).append(entry)
+                else:
+                    unattributed.extend(_messages(entry.get("errors")))
             for item in to_send:
-                status = validation.get(item["retailer_id"]) or {}
-                item["errors"] = _messages(status.get("errors"))
-                item["warnings"] = _messages(status.get("warnings"))
-            handles = [str(value) for value in posted.get("handles") or [] if value]
+                statuses = flagged.get(item["retailer_id"], [])
+                item["errors"] = [text for status in statuses for text in _messages(status.get("errors"))]
+                item["warnings"] = [
+                    text for status in statuses for text in _messages(status.get("warnings"), _NO_MESSAGE_WARNING)
+                ]
+                # The count is kept apart from the texts, so an error is never lost for want of a message.
+                if item["errors"]:
+                    item["submission_error_count"] = len(item["errors"])
+            if unattributed:
+                response["submission"] = {
+                    "unattributed_errors": unattributed[:20],
+                    "unattributed_error_count": len(unattributed),
+                    "note": ("Meta's answer to the submission listed these errors without naming an item in "
+                             "this batch, so no item can be called applied."),
+                }
+            raw_handles = posted.get("handles")
+            raw_handles = raw_handles if isinstance(raw_handles, list) else _entry_list(raw_handles)
+            handles = list(dict.fromkeys(
+                text for value in raw_handles
+                if value is not None and not isinstance(value, (dict, list, bool)) and (text := str(value).strip())
+            ))
             if not handles:
                 for item in to_send:
                     item["outcome"] = "not_applied"
                     item["reason"] = "Meta returned no batch handle, which it documents as meaning nothing was ingested."
             else:
-                handle_value = handles[0]
-                for round_number in range(wait_seconds // _BATCH_POLL_INTERVAL):
-                    await _pause(_BATCH_POLL_INTERVAL)
-                    try:
-                        row = await _check_batch(client, catalog_id, handle_value)
-                    except (MetaApiError, RateLimitError, UnsupportedFeatureError, NotFoundError) as error:
-                        status_error = str(error)
-                        break
-                    checks += 1
-                    if _is_finished(row):
-                        break
+                tracks = await _poll_handles(client, catalog_id, handles, wait_seconds)
+                finished_rows = [track["row"] for track in tracks.values() if _is_finished(track["row"])]
+                unfinished = [handle for handle in handles if not _is_finished(tracks[handle]["row"])]
+                unfinished_reason = None
+                if unfinished:
+                    unfinished_reason = _UNFINISHED_REASON
+                    if len(handles) > 1:
+                        unfinished_reason = (
+                            f"Meta returned {len(handles)} handles for this batch and "
+                            f"{len(unfinished)} had not been reported finished when this tool stopped "
+                            "checking; Meta does not say which items each handle holds."
+                        )
                 for item in to_send:
-                    if _is_finished(row):
-                        _settle(item, row)
-                    else:
-                        item["outcome"] = "processing"
-                        item["reason"] = ("Meta accepted the batch; it had not reported it finished when this "
-                                          "tool stopped checking.")
+                    _settle(item, finished_rows, unfinished_reason=unfinished_reason,
+                            unattributed_submission_errors=len(unattributed))
     for item in to_send:
         item.pop("request", None)
-    if handle_value is not None or row is not None:
-        response["batch"] = {
-            "handle": handle_value,
-            "status": (row or {}).get("status"),
-            "complete": _is_finished(row),
-            "status_checks": checks,
-            "errors_total_count": to_int((row or {}).get("errors_total_count")),
-            "warnings_total_count": to_int((row or {}).get("warnings_total_count")),
-        }
-        if status_error:
-            response["batch"]["status_error"] = status_error
+    if handles:
+        response["batch"] = _batch_view(handles, tracks)
     outcomes = Counter(item["outcome"] for item in results)
     response["summary"] = {
         "submitted": len(results),
@@ -2147,7 +2401,9 @@ async def batch_update_catalog_products(
         "outcomes": dict(outcomes),
     }
     response["ok"] = dry_run or set(outcomes) <= {"applied", "skipped_already_exists", "skipped_not_found"}
-    response["retry"] = _retry_statement(set(outcomes), handle_value)
+    response["retry"] = _retry_statement(
+        set(outcomes), [handle for handle in handles if not _is_finished(tracks.get(handle, {}).get("row"))],
+    )
     if notes:
         response["notes"] = notes
     return response
@@ -2195,6 +2451,7 @@ def _filter_condition(index: int, condition: Any) -> dict[str, Any]:
 
 
 @mcp_server.tool(tags={"read-only"})
+@_masked
 async def build_product_set_filter(
     catalog_id: str,
     conditions: list[dict[str, Any]],
@@ -2207,6 +2464,7 @@ async def build_product_set_filter(
     normalized_match = (match or "").strip().lower()
     if normalized_match not in {"all", "any"}:
         raise ValidationError("match must be all or any.")
+    _refuse_url_logins(conditions, "conditions")
     rules = [_filter_condition(index, condition) for index, condition in enumerate(conditions)]
     product_filter = rules[0] if len(rules) == 1 else {
         ("and" if normalized_match == "all" else "or"): rules
@@ -2262,6 +2520,7 @@ def _attribute_values(value: Any) -> list[str]:
 
 
 @mcp_server.tool()
+@_masked
 async def list_catalog_attribute_values(
     catalog_id: GraphId,
     attribute: str,
@@ -2351,6 +2610,7 @@ async def list_catalog_attribute_values(
 
 
 @mcp_server.tool()
+@_masked
 async def list_product_sets(
     catalog_id: str | None = None,
     product_set_id: str | None = None,
@@ -2380,22 +2640,31 @@ async def list_product_sets(
 
 
 @mcp_server.tool()
+@_masked
 async def create_product_set(
     catalog_id: str,
     name: str,
     filter: dict[str, Any] | str,
     params: dict[str, Any] | None = None,
+    retailer_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a product set in a product catalog from a Meta filter object ({} means every product). Build and test the filter first with build_product_set_filter."""
+    """Create a product set in a product catalog from a Meta filter object ({} means every product). Build and test the filter first with build_product_set_filter. retailer_id is your own id for the set."""
     catalog_id = _require(catalog_id, "catalog_id")
     name = _require(name, "name")
     parsed_filter = _parse_filter(filter)
-    payload = merge_graph_payload({"name": name, "filter": parsed_filter}, params)
+    typed: dict[str, Any] = {"name": name, "filter": parsed_filter}
+    if retailer_id is not None:
+        # Meta's product_sets edge reference: retailer_id, "External product set retailer id" (string).
+        # params may still carry it for older callers; merge_graph_payload refuses both at once.
+        typed["retailer_id"] = _require(retailer_id, "retailer_id")
+    _refuse_url_logins_in(name=name, filter=parsed_filter, params=params, retailer_id=retailer_id)
+    payload = merge_graph_payload(typed, params)
     result = await get_graph_api_client().create_edge_object(catalog_id, "product_sets", data=payload)
     return creation_response(action="create_product_set", target={"catalog_id": catalog_id}, result=result)
 
 
 @mcp_server.tool()
+@_masked
 async def update_product_set(
     product_set_id: str,
     name: str | None = None,
@@ -2414,6 +2683,7 @@ async def update_product_set(
         payload["retailer_id"] = retailer_id
     if not payload:
         raise ValidationError("At least one field must be provided for update_product_set.")
+    _refuse_url_logins_in(**payload)
     client = get_graph_api_client()
     previous = await client.get_object(product_set_id, fields=PRODUCT_SET_FIELDS)
     await client.update_object(product_set_id, data=payload)
@@ -2428,6 +2698,7 @@ async def update_product_set(
 
 
 @mcp_server.tool()
+@_masked
 async def delete_product_set(product_set_id: str) -> dict[str, Any]:
     """Delete a product set; its products stay in the catalog. Use only on explicit request. Meta refuses while an active ad uses the set."""
     product_set_id = _require(product_set_id, "product_set_id")

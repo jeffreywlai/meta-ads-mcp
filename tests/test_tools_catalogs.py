@@ -1479,10 +1479,11 @@ def test_batch_products_unfinished_batch_is_reported_as_processing(monkeypatch) 
     assert len(checks) == 3
     assert pauses == [2, 2, 2]
     assert result["items"][0]["outcome"] == "processing"
-    assert result["batch"] == {
+    one_handle = {
         "handle": "h1", "status": "started", "complete": False, "status_checks": 3,
         "errors_total_count": None, "warnings_total_count": None,
     }
+    assert result["batch"] == {**one_handle, "handles": [one_handle]}
     assert result["retry"]["safe_now"] is False
     assert "handle" in result["retry"]["how"]
 
@@ -2276,3 +2277,342 @@ def test_batch_item_with_submission_errors_is_not_called_applied() -> None:
     untouched = {"retailer_id": "other", "warnings": [], "errors": []}
     catalogs._settle(untouched, clean)
     assert untouched["outcome"] == "applied"
+
+
+# ------------------------------------------------- round four: URL logins, submission errors, handles
+
+_LOGIN_SECRET = "synthetic-url-password"
+_LOGIN_URL = f"https://user:{_LOGIN_SECRET}@example.invalid/p"
+
+
+@pytest.mark.parametrize("mode", ["single_update", "batch_preview"])
+def test_h8_new_catalog_writes_refuse_login_urls(monkeypatch, mode) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(
+        objects={"20": {"id": "20", "url": "https://example.invalid"}},
+        edges={("10", "products"): {"data": [{"id": "20", "retailer_id": "sku"}]}},
+    ))
+    with pytest.raises(ValidationError) as info:
+        if mode == "single_update":
+            _run(catalogs.update_catalog_product("20", url=_LOGIN_URL))
+        else:
+            _run(catalogs.batch_update_catalog_products(
+                "10", items=[{"method": "update", "retailer_id": "sku", "url": _LOGIN_URL}], dry_run=True,
+            ))
+    assert _LOGIN_SECRET not in str(info.value)
+    assert client.calls == []
+
+
+_LOGIN_INPUTS = [
+    ("create_catalog_product", lambda: catalogs.create_catalog_product(
+        "10", "sku", "Shoe", 10, "USD", "https://shop.example/s", _LOGIN_URL)),
+    ("create_catalog_product.params", lambda: catalogs.create_catalog_product(
+        "10", "sku", "Shoe", 10, "USD", "https://shop.example/s", "https://shop.example/s.png",
+        params={"additional_image_urls": ["https://shop.example/a.png", _LOGIN_URL]})),
+    ("update_catalog_product.image_url", lambda: catalogs.update_catalog_product("20", image_url=_LOGIN_URL)),
+    ("update_catalog_product.params", lambda: catalogs.update_catalog_product(
+        "20", params={"mobile_link": _LOGIN_URL})),
+    ("update_catalog_product.text", lambda: catalogs.update_catalog_product(
+        "20", description=f"See {_LOGIN_URL} for details")),
+    ("batch.image_url", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku", "image_url": _LOGIN_URL}], dry_run=True)),
+    ("batch.additional_image_link", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku",
+                      "fields": {"additional_image_link": ["https://shop.example/a.png", _LOGIN_URL]}}],
+        dry_run=True)),
+    ("batch.video", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku", "fields": {"video": [{"url": _LOGIN_URL}]}}],
+        dry_run=True)),
+    ("batch.applink", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku",
+                      "fields": {"applink": {"ios_url": "app://x", "web_url": _LOGIN_URL}}}], dry_run=True)),
+    ("batch.create", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[_full_create("sku", url=_LOGIN_URL)], dry_run=True)),
+    ("create_catalog.params", lambda: catalogs.create_catalog(
+        "1", "Shop", params={"default_image_url": _LOGIN_URL})),
+    ("update_catalog.params", lambda: catalogs.update_catalog(
+        "10", params={"checkout_url": _LOGIN_URL, "checkout_country": "US"})),
+    ("update_catalog.fallback", lambda: catalogs.update_catalog(
+        "10", params={"fallback_image_url": [_LOGIN_URL]})),
+    ("create_product_set.metadata", lambda: catalogs.create_product_set(
+        "10", "Set", {}, params={"metadata": {"cover_image_url": _LOGIN_URL}})),
+    ("create_product_set.filter", lambda: catalogs.create_product_set(
+        "10", "Set", {"url": {"eq": _LOGIN_URL}})),
+    ("update_product_set.filter", lambda: catalogs.update_product_set(
+        "ps_1", filter={"url": {"i_contains": _LOGIN_URL}})),
+    ("list_catalog_products.filter", lambda: catalogs.list_catalog_products(
+        catalog_id="10", filter={"url": {"eq": _LOGIN_URL}})),
+    ("build_product_set_filter", lambda: catalogs.build_product_set_filter(
+        "10", [{"field": "url", "operator": "eq", "value": _LOGIN_URL}])),
+    ("list_dpa_eligible_catalogs.ad_url", lambda: catalogs.list_dpa_eligible_catalogs(
+        business_id="1", ad_url=_LOGIN_URL)),
+]
+
+
+@pytest.mark.parametrize("case", [case for _, case in _LOGIN_INPUTS], ids=[name for name, _ in _LOGIN_INPUTS])
+def test_every_caller_url_with_a_login_is_refused_before_any_request(monkeypatch, case) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="username or password") as info:
+        _run(case())
+    assert _LOGIN_SECRET not in str(info.value)
+
+
+def test_url_with_only_a_user_name_is_refused_too(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="username or password"):
+        _run(catalogs.update_catalog_product("20", url="https://someone@example.invalid/p"))
+
+
+def test_ordinary_text_with_at_signs_is_not_refused(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(objects={"20": {"id": "20"}}))
+    _run(catalogs.update_catalog_product(
+        "20", description="Mail help@shop.example or see https://shop.example/@brand?ref=a@b",
+    ))
+    assert client.kinds() == ["get", "update"]
+
+
+def test_h9_catalog_previous_checkout_urls_mask_existing_password(monkeypatch) -> None:
+    secret = "synthetic-existing-checkout-password"
+    _use(monkeypatch, FakeCatalogClient(objects={"10": {"id": "10", "checkout_urls": [
+        {"country": "US", "url": f"https://user:{secret}@example.invalid/checkout"},
+    ]}}))
+    result = _run(catalogs.update_catalog("10", params={
+        "checkout_url": "https://example.invalid/new-checkout", "checkout_country": "US",
+    }))
+    assert secret not in json.dumps(result)
+    assert result["previous"]["checkout_urls"] == [
+        {"country": "US", "url": "https://user:[redacted]@example.invalid/checkout"},
+    ]
+
+
+def test_stored_url_passwords_are_masked_in_every_read_back_value(monkeypatch) -> None:
+    secret = "synthetic-stored-password"
+    stored = f"https://user:{secret}@example.invalid/x"
+    product = {"id": "20", "retailer_id": "sku", "url": stored, "image_url": stored,
+               "additional_image_urls": [stored]}
+    _use(monkeypatch, FakeCatalogClient(
+        objects={"20": product, "10": {"id": "10", "default_image_url": stored, "fallback_image_url": [stored]},
+                 "ps_1": {"id": "ps_1", "name": "S", "filter": json.dumps({"url": {"eq": stored}})}},
+        edges={("10", "products"): {"data": [product]},
+               ("10", "product_sets"): {"data": [{"id": "ps_1", "filter": {"url": {"eq": stored}}}]},
+               ("10", "diagnostics"): {"data": [{"type": "X", "severity": "MUST_FIX", "title": stored,
+                                                 "diagnostics": [{"url": stored}]}]}},
+    ))
+    results = [
+        _run(catalogs.update_catalog_product("20", url="https://example.invalid/new")),
+        _run(catalogs.update_catalog_product("20", params={"additional_image_urls": ["https://example.invalid/a"]})),
+        _run(catalogs.delete_catalog_product("20")),
+        _run(catalogs.update_catalog("10", params={"fallback_image_url": ["https://example.invalid/f"]})),
+        _run(catalogs.list_catalog_products(catalog_id="10")),
+        _run(catalogs.list_catalog_products(product_id="20", fields=["url"])),
+        _run(catalogs.list_catalogs(catalog_id="10", fields=["default_image_url"])),
+        _run(catalogs.list_product_sets(catalog_id="10")),
+        _run(catalogs.update_product_set("ps_1", name="New")),
+        _run(catalogs.delete_product_set("ps_1")),
+        _run(catalogs.get_catalog_diagnostics("10", include_details=True)),
+        _run(catalogs.get_catalog_diagnostics("10")),
+        _run(catalogs.batch_update_catalog_products(
+            "10", items=[{"method": "update", "retailer_id": "sku", "url": "https://example.invalid/n"}],
+            dry_run=True)),
+        _run(catalogs.batch_update_catalog_products(
+            "10", items=[{"method": "delete", "retailer_id": "sku"}], dry_run=True)),
+    ]
+    for result in results:
+        text = json.dumps(result)
+        assert secret not in text, text
+    assert results[0]["previous"]["url"] == "https://user:[redacted]@example.invalid/x"
+
+
+def test_meta_error_text_with_a_url_password_is_masked(monkeypatch) -> None:
+    secret = "synthetic-error-password"
+    refused = MetaApiError(message=f"(#100) Bad image https://user:{secret}@example.invalid/i", code=100)
+    _use(monkeypatch, FakeCatalogClient(get_errors={"20": refused}))
+    with pytest.raises(MetaApiError) as info:
+        _run(catalogs.update_catalog_product("20", name="New"))
+    assert secret not in str(info.value)
+    assert secret not in json.dumps(info.value.to_public_dict())
+
+
+def test_batch_submission_and_status_errors_with_url_passwords_are_masked(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    secret = "synthetic-status-password"
+    _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1")],
+        post={"handles": ["h1"], "validation_status": [
+            {"retailer_id": "SKU-1", "errors": [], "warnings": [{"message": f"Slow https://u:{secret}@x.invalid/a"}]},
+        ]},
+        status=_finished(warnings=[{"id": "SKU-1", "message": f"see https://u:{secret}@x.invalid/b"}]),
+    ))
+    result = _run(catalogs.batch_update_catalog_products("123", items=[_batch_item("update", "SKU-1", name="A")]))
+    assert secret not in json.dumps(result)
+    status = _run(catalogs.batch_update_catalog_products("123", handle="h1"))
+    assert secret not in json.dumps(status)
+
+
+def test_h10_submission_error_without_message_still_blocks_applied(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [{"id": "20", "retailer_id": "sku", "name": "Old"}],
+        post={"handles": ["h1"], "validation_status": [{"retailer_id": "sku", "errors": [{"code": 100}]}]},
+        status={"data": [{"status": "finished", "errors_total_count": 0}]},
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        "123", items=[{"method": "update", "retailer_id": "sku", "name": "New"}], wait_seconds=2,
+    ))
+    item = result["items"][0]
+    assert item["outcome"] != "applied"
+    assert item["outcome"] == "outcome_unknown"
+    assert item["submission_error_count"] == 1
+    assert item["errors"] and all(isinstance(text, str) and text for text in item["errors"])
+    assert result["ok"] is False
+
+
+@pytest.mark.parametrize("errors", [[{}], [{"message": ""}], [{"message": None, "code": 1}], [""], {"code": 7}])
+def test_submission_errors_of_any_shape_are_counted(monkeypatch, errors) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing("sku", "20")],
+        post={"handles": ["h1"], "validation_status": [{"retailer_id": "sku", "errors": errors}]},
+        status=_finished(),
+    ))
+    result = _run(catalogs.batch_update_catalog_products("123", items=[_batch_item("update", "sku", name="N")]))
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert result["ok"] is False
+
+
+def test_submission_error_for_no_named_item_leaves_every_item_unknown(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing("SKU-1", "p1"), _existing("SKU-2", "p2")],
+        post={"handles": ["h1"], "validation_status": [{"errors": [{"message": "Something failed"}]}]},
+        status=_finished(),
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        "123", items=[_batch_item("update", "SKU-1", name="A"), _batch_item("update", "SKU-2", name="B")],
+    ))
+    assert [item["outcome"] for item in result["items"]] == ["outcome_unknown", "outcome_unknown"]
+    assert "submitted" in result["items"][0]["reason"]
+    assert result["submission"]["unattributed_errors"] == ["Something failed"]
+
+
+def test_empty_submission_errors_do_not_block_applied(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing("sku", "20")],
+        post={"handles": ["h1"], "validation_status": [{"retailer_id": "sku", "errors": [], "warnings": []}]},
+        status=_finished(),
+    ))
+    result = _run(catalogs.batch_update_catalog_products("123", items=[_batch_item("update", "sku", name="N")]))
+    assert result["items"][0]["outcome"] == "applied"
+    assert "submission_error_count" not in result["items"][0]
+
+
+class _ShardClient(FakeCatalogClient):
+    """Answers each handle's status from its own row."""
+
+    def __init__(self, rows: dict[str, Any], handles: list[str], **kwargs) -> None:
+        super().__init__(
+            edges={("123", "products"): {"data": [_existing("sku", "20"), _existing("sku2", "21")]}},
+            create_responses={("123", "items_batch"): {"handles": handles}}, **kwargs,
+        )
+        self.rows = rows
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        if edge != "check_batch_request_status":
+            return await super().list_objects(parent_id, edge, fields=fields, params=params)
+        self.calls.append(("status", {"handle": params["handle"]}))
+        row = self.rows[params["handle"]]
+        if isinstance(row, Exception):
+            raise row
+        return {"data": [row]}
+
+
+def test_h11_multiple_batch_handles_are_not_settled_from_first_only(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _ShardClient(
+        {"h1": {"status": "finished", "errors_total_count": 0}, "h2": {"status": "processing"}}, ["h1", "h2"],
+    ))
+    result = _run(catalogs.batch_update_catalog_products(
+        "123", items=[{"method": "update", "retailer_id": "sku", "name": "New"}], wait_seconds=2,
+    ))
+    assert result["ok"] is False
+    assert result["items"][0]["outcome"] == "processing"
+    assert [call["handle"] for kind, call in client.calls if kind == "status"] == ["h1", "h2"]
+    handles = {entry["handle"]: entry for entry in result["batch"]["handles"]}
+    assert handles["h1"]["complete"] is True and handles["h2"]["complete"] is False
+    assert handles["h2"]["status"] == "processing"
+    assert result["batch"]["complete"] is False
+    assert "h2" in result["retry"]["how"] and "h1" not in result["retry"]["how"]
+
+
+def test_multiple_handles_all_finished_settle_from_every_row(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _ShardClient({
+        "h1": {"status": "finished", "errors_total_count": 0},
+        "h2": {"status": "finished", "errors_total_count": 1, "errors": [{"id": "sku2", "message": "Bad"}]},
+    }, ["h1", "h2"]))
+    result = _run(catalogs.batch_update_catalog_products(
+        "123", items=[_batch_item("update", "sku", name="A"), _batch_item("update", "sku2", name="B")],
+        wait_seconds=4,
+    ))
+    by_sku = {item["retailer_id"]: item for item in result["items"]}
+    assert by_sku["sku"]["outcome"] == "applied"
+    assert by_sku["sku2"]["outcome"] == "failed" and by_sku["sku2"]["errors"] == ["Bad"]
+    assert result["batch"]["complete"] is True
+    assert result["batch"]["errors_total_count"] == 1
+    # A finished handle is not checked again.
+    assert [call["handle"] for kind, call in client.calls if kind == "status"] == ["h1", "h2"]
+
+
+def test_multiple_handles_one_unattributed_error_leaves_others_unknown(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _ShardClient({
+        "h1": {"status": "finished", "errors_total_count": 0},
+        "h2": {"status": "finished", "errors_total_count": 1, "errors": [{"message": "Something"}]},
+    }, ["h1", "h2"]))
+    result = _run(catalogs.batch_update_catalog_products(
+        "123", items=[_batch_item("update", "sku", name="A")], wait_seconds=2,
+    ))
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert result["ok"] is False
+
+
+def test_multiple_handles_status_read_failure_is_reported_per_handle(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _ShardClient({
+        "h1": {"status": "finished", "errors_total_count": 0},
+        "h2": MetaApiError(message="(#100) Unknown handle", code=100),
+    }, ["h1", "h2"]))
+    result = _run(catalogs.batch_update_catalog_products(
+        "123", items=[_batch_item("update", "sku", name="A")], wait_seconds=6,
+    ))
+    assert result["items"][0]["outcome"] == "processing"
+    handles = {entry["handle"]: entry for entry in result["batch"]["handles"]}
+    assert "Unknown handle" in handles["h2"]["status_error"]
+    assert handles["h2"]["status_checks"] == 0
+    assert result["ok"] is False
+
+
+def test_handle_parameter_still_reads_one_handle(monkeypatch) -> None:
+    client = _use(monkeypatch, _ShardClient({"h2": {"status": "finished", "errors_total_count": 0}}, []))
+    result = _run(catalogs.batch_update_catalog_products("123", handle="h2"))
+    assert [call["handle"] for kind, call in client.calls if kind == "status"] == ["h2"]
+    assert result["outcome"] == "all_applied"
+
+
+def test_create_product_set_names_retailer_id(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    _run(catalogs.create_product_set(catalog_id="cat_1", name="Shoes", filter={}, retailer_id=" set-1 "))
+    assert client.calls[0][1]["data"] == {"name": "Shoes", "filter": {}, "retailer_id": "set-1"}
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="retailer_id"):
+        _run(catalogs.create_product_set(catalog_id="cat_1", name="Shoes", filter={}, retailer_id="  "))
+    with pytest.raises(ValidationError, match="retailer_id"):
+        _run(catalogs.create_product_set(
+            catalog_id="cat_1", name="Shoes", filter={}, retailer_id="a", params={"retailer_id": "b"},
+        ))
+
+
+def test_create_product_set_without_retailer_id_sends_the_same_request(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient())
+    _run(catalogs.create_product_set(catalog_id="cat_1", name="Shoes", filter={"brand": {"eq": "A"}}))
+    assert client.calls[0][1]["data"] == {"name": "Shoes", "filter": {"brand": {"eq": "A"}}}
