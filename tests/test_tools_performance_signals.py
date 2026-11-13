@@ -762,10 +762,19 @@ RANKING_ROWS = [
 ]
 
 
+RANKING_SCOPE_ROW = {
+    # The campaign's own total over the window is one row: the sum of RANKING_ROWS.
+    **_day_row("2026-10-01", spend=1320, impressions=50000, clicks=500, purchases=50),
+    "date_stop": "2026-10-30",
+}
+
+
 def test_auction_ranking_report_diagnoses_each_weak_ad(monkeypatch) -> None:
     client = _patch(
         monkeypatch,
-        RecordingClient(insights_handler=lambda object_id, fields, params: {"data": RANKING_ROWS}),
+        RecordingClient(insights_handler=lambda object_id, fields, params: {
+            "data": RANKING_ROWS if params["level"] == "ad" else [RANKING_SCOPE_ROW],
+        }),
     )
 
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="cmp_1"))
@@ -1171,7 +1180,11 @@ def _context_client(overrides: dict[tuple[str, str], Any] | None = None) -> Reco
             }
         },
         edges=edges,
-        insights_handler=lambda object_id, fields, params: {"data": CONTEXT_ROWS},
+        # The account's own total is one row, as Meta returns for an unsplit account-level read.
+        insights_handler=lambda object_id, fields, params: (
+            {"data": [{"spend": "1000.0", "date_start": "2026-10-13", "date_stop": "2026-11-11"}]}
+            if params["level"] == "account" else {"data": CONTEXT_ROWS}
+        ),
     )
 
 
@@ -3470,7 +3483,9 @@ def test_ranking_scope_spend_is_unknown_if_any_row_omits_it(monkeypatch) -> None
                               **{key: "AVERAGE" for key in performance_signals.RANKING_FIELDS}}]}
         if params["level"] == "ad":
             return {"data": [{"ad_id": "20", "clicks": "1"}]}
-        return {"data": [{"spend": "10", "impressions": "100", "clicks": "1"}, {"impressions": "100", "clicks": "1"}]}
+        # Two distinct scope rows (different date ranges), so neither is a repeat of the other.
+        return {"data": [{"spend": "10", "impressions": "100", "clicks": "1", "date_start": "2026-10-01"},
+                         {"impressions": "100", "clicks": "1", "date_start": "2026-10-02"}]}
 
     _patch(monkeypatch, RecordingClient(insights_handler=handler))
     result = asyncio.run(performance_signals.get_auction_ranking_report("campaign", "10"))
@@ -3556,7 +3571,9 @@ def test_delivery_spend_repeated_page_is_not_counted_twice(monkeypatch) -> None:
     problems = {problem["object_id"]: problem for problem in result["problems"]}
     assert problems["ad_0000"]["spend"] == 40.0
     assert result["spend_lookup"]["all_spending_objects_read"] is False
-    assert problems["ad_0001"]["spend_status"] == "not_in_top_spenders"
+    # A repeated row shows Meta's paging is not stable, so it cannot bound the spend of an object it did not show.
+    assert problems["ad_0001"]["spend_status"] == "spend_unavailable"
+    assert not any("at most" in signal for signal in result["missing_signals"])
     assert len(_calls(client, "get_insights")) == 2
 
 
@@ -3571,15 +3588,6 @@ def test_delivery_spend_missing_value_is_unavailable_not_zero(monkeypatch) -> No
     assert len(_calls(client, "get_insights")) == 1
 
 
-def test_delivery_spend_unreadable_row_means_no_problem_is_assumed_unspent(monkeypatch) -> None:
-    _delivery_client(monkeypatch, lambda params: {"data": [{"ad_id": "ad_0001", "spend": "3"}, None, {"spend": "9"}]})
-    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
-    problems = {problem["object_id"]: problem for problem in result["problems"]}
-    assert result["spend_lookup"]["all_spending_objects_read"] is False
-    assert result["spend_lookup"]["rows_unreadable"] == 2
-    assert problems["ad_0000"]["spend_status"] == "not_in_top_spenders"
-
-
 def test_delivery_scan_repeated_page_does_not_list_problems_twice(monkeypatch) -> None:
     ads = [_old_problem_ad(0, updated_day=1)]
 
@@ -3592,7 +3600,7 @@ def test_delivery_scan_repeated_page_does_not_list_problems_twice(monkeypatch) -
     ))
     result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
     assert [problem["object_id"] for problem in result["problems"]] == ["ad_0000"]
-    assert result["scan"]["complete"] is False and result["scan"]["stop_reason"] == "page_repeated"
+    assert result["scan"]["complete"] is False and result["scan"]["stop_reason"] == "row_repeated"
     assert result["scan"]["objects_examined"] == 1
     assert len(_calls(client, "list_objects")) == 2
     assert any("already been read" in signal for signal in result["missing_signals"])
@@ -3659,18 +3667,471 @@ def test_ranking_ad_row_that_cannot_be_read_is_not_claimed_examined(monkeypatch)
     result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=5))
     assert result["examined"]["more_ads_exist"] is True
     assert not result["examined"]["note"].startswith("Examined all")
-    assert any("1 ad row(s) that could not be read" in signal for signal in result["missing_signals"])
+    assert any(
+        "highest-spending ads was incomplete" in signal and "1 row(s) that could not be read" in signal
+        for signal in result["missing_signals"]
+    )
 
 
 def test_trend_child_selection_with_an_unreadable_row_says_more_children_exist(monkeypatch) -> None:
     _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: {"data": [
         {"campaign_id": "1", "campaign_name": "A", "spend": "5"}, {"campaign_name": "no id", "spend": "4"},
     ]}))
-    children, more = asyncio.run(performance_signals._select_children("act_10", "campaign", date(2026, 11, 1), date(2026, 11, 7), 5))
+    children, more, issue = asyncio.run(performance_signals._select_children(
+        "act_10", "campaign", date(2026, 11, 1), date(2026, 11, 7), 5,
+    ))
     assert [child["object_id"] for child in children] == ["1"] and more is True
+    assert issue is not None and "1 row(s) that could not be read" in issue
 
 
 def test_optional_edge_section_with_an_unreadable_row_is_not_complete(monkeypatch) -> None:
     client = RecordingClient(edges={("act_10", "adrules_library"): {"data": [{"id": "1"}, "x"]}})
     section = asyncio.run(performance_signals._optional_edge_section(client, "act_10", "adrules_library", ["id"]))
     assert section["items"] == [{"id": "1"}] and section["complete"] is False and section["rows_unreadable"] == 1
+
+
+# R5 K10: a page whose data is missing, null or not a list is an unreadable page, never an empty one
+
+
+UNREADABLE_PAGES = [{}, {"data": None}, {"paging": {}}]
+
+
+@pytest.mark.parametrize("terminal", [{}, {"data": None}])
+def test_unreadable_insights_page_never_becomes_a_complete_spend_total(monkeypatch, terminal) -> None:
+    """Reviewer reproduction: spend 10 followed by {} or {"data": None} read as a complete total of 10."""
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return {"data": [{"spend": "10"}], "paging": {"next": "more", "cursors": {"after": "a"}}}
+        return dict(terminal)
+
+    _client, (total, reason) = _account_spend(monkeypatch, handler)
+    assert total is None and reason
+    assert "page" in reason and "could not be read" in reason
+
+
+def test_empty_data_list_is_still_a_complete_empty_page(monkeypatch) -> None:
+    _client, result = _account_spend(monkeypatch, lambda *_: {"data": []})
+    assert result == (0.0, None)
+
+
+@pytest.mark.parametrize("terminal", UNREADABLE_PAGES)
+def test_bounded_reader_stops_on_an_unreadable_page(monkeypatch, terminal) -> None:
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return _paged([{"adset_id": "1", "spend": "4"}], "p2", more=True)
+        return dict(terminal)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    rows, stopped = asyncio.run(performance_signals._read_bounded_pages(
+        "act_10", ["adset_id", "spend"], {"level": "adset"},
+    ))
+    assert [row["adset_id"] for row in rows] == ["1"]
+    assert stopped == performance_signals.PAGE_UNREADABLE
+
+
+@pytest.mark.parametrize("terminal", UNREADABLE_PAGES)
+def test_strict_insights_reader_refuses_an_unreadable_page(monkeypatch, terminal) -> None:
+    row = {"date_start": "2026-11-01", "date_stop": "2026-11-01", "spend": "5"}
+
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return _paged([dict(row)], "p2", more=True)
+        return dict(terminal)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    with pytest.raises(ValidationError, match="page"):
+        asyncio.run(performance_signals._read_insights_pages("act_10", ["spend"], {"time_increment": 1}))
+
+
+@pytest.mark.parametrize("terminal", UNREADABLE_PAGES)
+def test_history_with_an_unreadable_last_page_is_not_complete(monkeypatch, terminal) -> None:
+    def pages(params):
+        if params.get("after"):
+            return dict(terminal)
+        return {"data": [{"date": "2026-11-01", "opportunity_score": "70"}],
+                "paging": {"next": "https://graph.example/next", "cursors": {"after": "h2"}}}
+
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_42": {"id": "act_42", "currency": "USD", "opportunity_score": 74}},
+        edges={("act_42", "opportunity_score_history"): pages},
+        recommendations_payload=REC_PAYLOAD,
+    ))
+    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+    result = asyncio.run(performance_signals.get_opportunity_score(account_id="42", history_days=14))
+    assert result["history"]["complete"] is False
+    assert "page" in result["history"]["incomplete_reason"]
+
+
+@pytest.mark.parametrize("terminal", UNREADABLE_PAGES)
+def test_delivery_scan_with_an_unreadable_page_is_not_complete(monkeypatch, terminal) -> None:
+    def pages(params):
+        if params.get("after"):
+            return dict(terminal)
+        return {"data": [_old_problem_ad(0, updated_day=1)],
+                "paging": {"cursors": {"after": "s2"}, "next": "https://graph.example/next"}}
+
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): pages}, insights_handler=_spend_handler({}),
+    ))
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    assert result["scan"]["complete"] is False and result["scan"]["stop_reason"] == "page_unreadable"
+    assert any("Scan incomplete" in signal and "page" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize("terminal", UNREADABLE_PAGES)
+def test_delivery_spend_unreadable_page_never_means_no_spend(monkeypatch, terminal) -> None:
+    """A spend read whose only page is {} used to be complete and empty, so every problem had 'no spend'."""
+    _delivery_client(monkeypatch, lambda params: dict(terminal))
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    statuses = {problem["object_id"]: problem["spend_status"] for problem in result["problems"]}
+    assert statuses == {"ad_0000": "spend_unavailable", "ad_0001": "spend_unavailable"}
+    assert result["spend_lookup"]["all_spending_objects_read"] is False
+    assert result["metrics"]["problems_without_recent_spend"] == 0
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_single_page_readers_treat_an_unreadable_page_as_incomplete(monkeypatch, payload) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: dict(payload)))
+    children, more, issue = asyncio.run(performance_signals._select_children(
+        "act_10", "campaign", date(2026, 11, 1), date(2026, 11, 7), 5,
+    ))
+    assert children == [] and more is True and issue == performance_signals.PAGE_UNREADABLE
+
+    client = RecordingClient(edges={("act_10", "adrules_library"): dict(payload)})
+    section = asyncio.run(performance_signals._optional_edge_section(client, "act_10", "adrules_library", ["id"]))
+    assert section["complete"] is False and section["page_unreadable"] is True
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_trend_child_selection_unreadable_page_is_not_called_no_children(monkeypatch, payload) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: dict(payload)))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        "account", "act_10", child_level="campaign", since="2026-11-01", until="2026-11-03",
+    ))
+    assert result["coverage"]["complete"] is False
+    assert not any("returned no campaign" in signal for signal in result["missing_signals"])
+    assert any("selection read was incomplete" in signal for signal in result["missing_signals"])
+
+
+def _briefing_client(monkeypatch, handler) -> RecordingClient:
+    return _patch(monkeypatch, RecordingClient(
+        objects={"act_10": {"id": "act_10", "currency": "USD", "timezone_name": "UTC"}},
+        edges={("act_10", edge): {"data": []} for _, edge, _ in performance_signals.CONTEXT_EDGE_SECTIONS},
+        insights_handler=handler,
+    ))
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_context_selection_unreadable_page_is_not_called_no_rows(monkeypatch, payload) -> None:
+    base = _top_spender_handler(lambda params, rows: _paged([rows["20"], rows["21"]]))
+
+    def handler(object_id, fields, params):
+        if "sort" in params:
+            return dict(payload)
+        return base(object_id, fields, params)
+
+    _briefing_client(monkeypatch, handler)
+    result = asyncio.run(performance_signals.get_advertiser_context("act_10", since="2026-11-01", until="2026-11-07"))
+    coverage = result["adset_coverage"]
+    assert coverage["complete"] is False and coverage["selection_page_unreadable"] is True
+    assert not any("Meta returned no ad set insights rows" in signal for signal in result["missing_signals"])
+    assert any("selection read was incomplete" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize("payload", UNREADABLE_PAGES)
+def test_ranking_unreadable_ad_page_is_not_called_all_ads(monkeypatch, payload) -> None:
+    base = _meta_like_ranking_handler(_many_ads(2), scope_spend=1e5, more=False)
+
+    def handler(object_id, fields, params):
+        if params["level"] == "ad" and "sort" in params:
+            return dict(payload)
+        return base(object_id, fields, params)
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10"))
+    assert result["examined"]["more_ads_exist"] is True
+    assert not result["examined"]["note"].startswith("Examined all")
+    assert not any("in the window had all three" in finding["summary"] for finding in result["findings"])
+
+
+# R5 K11: a row read twice (same object, dates and breakdowns) is never added twice
+
+
+DAY_ROWS = [
+    {"date_start": f"2026-11-0{day}", "date_stop": f"2026-11-0{day}", "spend": str(day * 10)} for day in (1, 2, 3)
+]
+
+
+def test_overlapping_insights_pages_are_not_silently_summed_twice(monkeypatch) -> None:
+    """Reviewer reproduction: pages [day1, day2] then [day2, day3] gave day 2 a spend of 40."""
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return {"data": [dict(row) for row in DAY_ROWS[:2]], "paging": {"next": "more", "cursors": {"after": "a"}}}
+        return {"data": [dict(row) for row in DAY_ROWS[1:]]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    try:
+        result = asyncio.run(performance_signals.get_performance_trend(
+            "campaign", "10", metrics=["spend"], since="2026-11-01", until="2026-11-03",
+        ))
+    except ValidationError as exc:
+        assert "more than once" in str(exc)  # refusing overlapping evidence is also honest
+        return
+    day_two = next(period for period in result["periods"] if period["period_start"] == "2026-11-02")
+    assert day_two["metrics"]["spend"] == 20
+
+
+def test_distinct_daily_pages_still_add_up(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return {"data": [dict(row) for row in DAY_ROWS[:2]], "paging": {"next": "more", "cursors": {"after": "a"}}}
+        return {"data": [dict(DAY_ROWS[2])]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        "campaign", "10", metrics=["spend"], since="2026-11-01", until="2026-11-03",
+    ))
+    assert [period["metrics"]["spend"] for period in result["periods"]] == [10, 20, 30]
+
+
+@pytest.mark.parametrize("second", [
+    [{"adset_id": "2", "spend": "20"}, {"adset_id": "3", "spend": "30"}],
+    [{"adset_id": "2", "spend": "99"}],  # same identity, different values: still a repeat
+])
+def test_bounded_reader_never_adds_a_row_twice(monkeypatch, second) -> None:
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return _paged([{"adset_id": "1", "spend": "10"}, {"adset_id": "2", "spend": "20"}], "p2", more=True)
+        return {"data": [dict(row) for row in second]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    rows, stopped = asyncio.run(performance_signals._read_bounded_pages(
+        "act_10", ["adset_id", "spend"], {"level": "adset"},
+    ))
+    assert [row["adset_id"] for row in rows].count("2") == 1
+    assert next(row for row in rows if row["adset_id"] == "2")["spend"] == "20"
+    assert stopped is not None and "more than once" in stopped
+
+
+def test_bounded_reader_keeps_rows_that_differ_by_breakdown_or_date(monkeypatch) -> None:
+    rows_in = [
+        {"adset_id": "1", "age": "18-24", "date_start": "2026-11-01", "spend": "1"},
+        {"adset_id": "1", "age": "25-34", "date_start": "2026-11-01", "spend": "2"},
+        {"adset_id": "1", "age": "18-24", "date_start": "2026-11-02", "spend": "3"},
+    ]
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: {"data": [dict(row) for row in rows_in]}))
+    rows, stopped = asyncio.run(performance_signals._read_bounded_pages(
+        "act_10", ["adset_id", "spend"], {"level": "adset", "breakdowns": "age", "time_increment": 1},
+    ))
+    assert len(rows) == 3 and stopped is None
+
+
+def test_bounded_reader_row_without_its_identity_is_unreadable_not_deduplicated(monkeypatch) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: {"data": [
+        {"adset_id": "1", "spend": "1"}, {"spend": "2"}, {"spend": "2"},
+    ]}))
+    rows, stopped = asyncio.run(performance_signals._read_bounded_pages(
+        "act_10", ["adset_id", "spend"], {"level": "adset"},
+    ))
+    assert [row.get("adset_id") for row in rows] == ["1"]
+    assert "2 row(s) that could not be read" in stopped and "more than once" not in stopped
+
+
+def test_overlapping_account_total_pages_never_give_a_total(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return _paged([dict(ACCOUNT_SPEND_ROW)], "a", more=True)
+        return {"data": [dict(ACCOUNT_SPEND_ROW, spend="15")]}
+
+    _client, (total, reason) = _account_spend(monkeypatch, handler)
+    assert total is None and "more than once" in reason
+
+
+def test_strict_reader_refuses_a_partly_overlapping_page(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        if not params.get("after"):
+            return _paged([dict(row) for row in DAY_ROWS[:2]], "p2", more=True)
+        return {"data": [dict(row) for row in DAY_ROWS[1:]]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    with pytest.raises(ValidationError, match="more than once"):
+        asyncio.run(performance_signals._read_insights_pages("act_10", ["spend"], {"time_increment": 1}))
+
+
+def test_strict_daily_reader_refuses_a_row_without_its_day(monkeypatch) -> None:
+    _patch(monkeypatch, RecordingClient(insights_handler=lambda *_: {"data": [dict(DAY_ROWS[0]), {"spend": "5"}]}))
+    with pytest.raises(ValidationError, match="could not be read"):
+        asyncio.run(performance_signals._read_insights_pages("act_10", ["spend"], {"time_increment": 1}))
+
+
+def test_history_overlapping_pages_count_each_day_once_and_say_so(monkeypatch) -> None:
+    def pages(params):
+        if params.get("after"):
+            return {"data": [{"date": "2026-11-02", "opportunity_score": "99"},
+                             {"date": "2026-11-03", "opportunity_score": "80"}]}
+        return {"data": [{"date": "2026-11-01", "opportunity_score": "70"},
+                         {"date": "2026-11-02", "opportunity_score": "75"}],
+                "paging": {"next": "https://graph.example/next", "cursors": {"after": "h2"}}}
+
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_42": {"id": "act_42", "currency": "USD", "opportunity_score": 74}},
+        edges={("act_42", "opportunity_score_history"): pages},
+        recommendations_payload=REC_PAYLOAD,
+    ))
+    monkeypatch.setattr(performance_signals, "_today", lambda: date(2026, 11, 12))
+    result = asyncio.run(performance_signals.get_opportunity_score(account_id="42", history_days=14))
+    history = result["history"]
+    assert [point["date"] for point in history["points"]].count("2026-11-02") == 1
+    assert next(point for point in history["points"] if point["date"] == "2026-11-02")["opportunity_score"] == 75
+    assert history["complete"] is False and "more than once" in history["incomplete_reason"]
+
+
+def test_delivery_scan_overlapping_pages_list_each_problem_once_and_say_so(monkeypatch) -> None:
+    ads = [_old_problem_ad(index, updated_day=index) for index in range(3)]
+
+    def pages(params):
+        if params.get("after"):
+            return {"data": [dict(ad) for ad in ads[1:]]}
+        return {"data": [dict(ad) for ad in ads[:2]],
+                "paging": {"cursors": {"after": "s2"}, "next": "https://graph.example/next"}}
+
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_42": ACTIVE_ACCOUNT}, edges={("act_42", "ads"): pages}, insights_handler=_spend_handler({}),
+    ))
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    listed = [problem["object_id"] for problem in result["problems"]]
+    assert listed.count("ad_0001") == 1
+    assert result["scan"]["complete"] is False and result["scan"]["stop_reason"] == "row_repeated"
+    assert any("more than once" in signal for signal in result["missing_signals"])
+
+
+def test_delivery_spend_overlapping_rows_are_not_summed_twice(monkeypatch) -> None:
+    def pages(params):
+        if params.get("after"):
+            return {"data": [{"ad_id": "ad_0000", "spend": "40"}]}
+        return {"data": [{"ad_id": "ad_0000", "spend": "40"}, {"ad_id": "other", "spend": "30"}],
+                "paging": {"cursors": {"after": "c2"}, "next": "https://graph.example/next"}}
+
+    _delivery_client(monkeypatch, pages)
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    problems = {problem["object_id"]: problem for problem in result["problems"]}
+    assert problems["ad_0000"]["spend"] == 40.0
+    assert result["spend_lookup"]["all_spending_objects_read"] is False
+    assert problems["ad_0001"]["spend_status"] == "spend_unavailable"
+    assert any("more than once" in signal for signal in result["missing_signals"])
+
+
+def test_ranking_repeated_ad_row_is_examined_once(monkeypatch) -> None:
+    base = _meta_like_ranking_handler(_many_ads(2), scope_spend=1e5, more=False)
+
+    def handler(object_id, fields, params):
+        payload = base(object_id, fields, params)
+        if params["level"] == "ad" and "sort" in params:
+            payload["data"].append(dict(payload["data"][1]))
+        return payload
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_auction_ranking_report(level="campaign", object_id="10", max_ads=5))
+    examined = result["examined"]
+    assert examined["ads_examined"] == 2
+    assert examined["examined_spend"] == pytest.approx(5000.0 + 4999.0)
+    assert examined["more_ads_exist"] is True
+    assert any("more than once" in signal for signal in result["missing_signals"])
+
+
+# R5 K14: an incomplete spend read never supports an upper bound, a rank or a 'none found'
+
+
+def test_unidentified_spend_row_cannot_support_an_upper_bound_for_a_problem(monkeypatch) -> None:
+    """Reviewer reproduction: ad 20 was not_in_top_spenders with spend at most 10 beside a 100 row with no id."""
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_10": {"id": "act_10", "account_status": 1, "disable_reason": 0, "currency": "USD"}},
+        edges={("act_10", "ads"): {"data": [{"id": "20", "effective_status": "DISAPPROVED"}]}},
+        insights_handler=lambda *_: {"data": [{"ad_id": "30", "spend": "10"}, {"spend": "100"}]},
+    ))
+    result = asyncio.run(performance_signals.get_delivery_errors("10"))
+    problem = next(problem for problem in result["problems"] if problem["object_id"] == "20")
+    assert problem["spend"] is None
+    assert problem["spend_status"] == "spend_unavailable"
+    assert not any("at most 10" in signal for signal in result["missing_signals"])
+    assert any("no upper bound" in signal for signal in result["missing_signals"])
+
+
+def test_delivery_spend_unreadable_row_means_no_problem_is_assumed_unspent_or_bounded(monkeypatch) -> None:
+    _delivery_client(monkeypatch, lambda params: {"data": [{"ad_id": "ad_0001", "spend": "3"}, None, {"spend": "9"}]})
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    problems = {problem["object_id"]: problem for problem in result["problems"]}
+    assert result["spend_lookup"]["rows_unreadable"] == 2
+    assert problems["ad_0000"]["spend_status"] == "spend_unavailable" and problems["ad_0000"]["spend"] is None
+    assert not any("at most" in signal for signal in result["missing_signals"])
+
+
+def test_delivery_spend_not_ordered_by_spend_gives_no_upper_bound(monkeypatch) -> None:
+    def pages(params):
+        return {"data": [{"ad_id": "x", "spend": "5"}, {"ad_id": "y", "spend": "50"}],
+                "paging": {"cursors": {"after": f"{params.get('after', '')}n"}, "next": "https://graph.example/next"}}
+
+    _delivery_client(monkeypatch, pages)
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    statuses = {problem["object_id"]: problem["spend_status"] for problem in result["problems"]}
+    assert statuses == {"ad_0000": "spend_unavailable", "ad_0001": "spend_unavailable"}
+    assert not any("at most" in signal for signal in result["missing_signals"])
+
+
+def test_delivery_spend_sorted_identified_read_still_gives_its_bound(monkeypatch) -> None:
+    handler = _spend_handler({f"other_{index}": 1000.0 - index for index in range(450)})
+    _delivery_client(monkeypatch, lambda params: handler("act_42", ["ad_id", "spend"], params))
+    result = asyncio.run(performance_signals.get_delivery_errors(account_id="act_42"))
+    statuses = {problem["object_id"]: problem["spend_status"] for problem in result["problems"]}
+    assert statuses == {"ad_0000": "not_in_top_spenders", "ad_0001": "not_in_top_spenders"}
+    assert any("their spend is at most 601.0" in signal for signal in result["missing_signals"])
+
+
+def test_trend_selection_with_an_unidentified_row_withdraws_the_highest_spending_claim(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        if "sort" in params:
+            return {"data": [{"campaign_id": "1", "campaign_name": "A", "spend": "5"},
+                             {"campaign_name": "?", "spend": "9"}]}
+        return {"data": [dict(row, campaign_id="1") for row in DAY_ROWS]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        "account", "act_10", child_level="campaign", since="2026-11-01", until="2026-11-03", metrics=["spend"],
+    ))
+    assert result["coverage"]["complete"] is False
+    assert "could not be read" in result["coverage"]["selection"]["incomplete_reason"]
+    assert not any("Only the" in signal for signal in result["missing_signals"])
+    assert any("may not be the highest-spending" in signal for signal in result["missing_signals"])
+
+
+def test_context_selection_with_an_unidentified_row_withdraws_the_highest_spending_claim(monkeypatch) -> None:
+    base = _top_spender_handler(lambda params, rows: _paged([rows["20"], rows["21"]]))
+
+    def handler(object_id, fields, params):
+        if "sort" in params:
+            return {"data": [{"adset_id": "20", "spend": "20"}, {"spend": "500"}, {"adset_id": "21", "spend": "10"}]}
+        return base(object_id, fields, params)
+
+    _client, rows, coverage = _context_rows_for(monkeypatch, handler)
+    signals = performance_signals._coverage_signal(coverage)
+    assert coverage["complete"] is False and coverage["selection_rows_unreadable"] == 1
+    assert not any("examined the 2 highest-spending" in signal for signal in signals)
+    assert any("may not be the highest-spending" in signal for signal in signals)
+
+
+def test_context_named_scope_with_a_failed_read_does_not_call_an_id_unmatched(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "30"}]}
+        (selector,) = params["filtering"]
+        if selector["field"] == "campaign.id":
+            raise _permission_error()
+        return {"data": []}
+
+    _briefing_client(monkeypatch, handler)
+    result = asyncio.run(performance_signals.get_advertiser_context(
+        "act_10", since="2026-11-01", until="2026-11-07", object_ids=["777"],
+    ))
+    assert result["adset_coverage"]["status"] == "partly_read"
+    assert not any("not a campaign or ad set of this account" in signal for signal in result["missing_signals"])
+    assert any("may not have been read" in signal for signal in result["missing_signals"])
