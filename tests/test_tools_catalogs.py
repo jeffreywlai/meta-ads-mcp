@@ -2792,3 +2792,181 @@ def test_only_unreadable_batch_handles_do_not_claim_nothing_was_ingested(monkeyp
     assert result["ok"] is False
     assert result["items"][0]["outcome"] == "outcome_unknown"
     assert result["batch"]["unreadable_handles"] == 1
+
+
+# round six: credentials by key name, data maps, unreadable submission evidence ----------------
+
+
+@pytest.mark.parametrize("token", ["abc", "".join(("tk", "9x2q")), "".join(("integration-", "token-r6"))])
+def test_catalog_credential_key_is_masked_in_a_result_whatever_its_length(monkeypatch, token) -> None:
+    _use(monkeypatch, FakeCatalogClient(create_responses={("10", "owned_product_catalogs"): {
+        "id": "1", "partner_integration": {"external_access_token": token}, "access_token": token,
+    }}))
+    result = _run(catalogs.create_catalog(
+        "10", "C", params={"partner_integration": {"external_access_token": token}},
+    ))
+    assert result["created"]["partner_integration"] == {"external_access_token": "[redacted]"}
+    assert result["created"]["access_token"] == "[redacted]"
+
+
+def test_catalog_token_in_successful_text_is_removed_by_its_length(monkeypatch) -> None:
+    token = "".join(("tk", "9x2q"))
+    _use(monkeypatch, FakeCatalogClient(create_responses={("10", "owned_product_catalogs"): {
+        "id": "1", "note": "linked with " + token + "; batch x" + token + "9 kept",
+    }}))
+    result = _run(catalogs.create_catalog(
+        "10", "C", params={"partner_integration": {"external_access_token": token}},
+    ))
+    assert result["created"]["note"] == "linked with [redacted]; batch x" + token + "9 kept"
+
+
+_CUSTOM_DATA = {"password": "Yes", "Secret": "Secret Escapes", "access_token": "Gold tier"}
+
+
+def test_product_custom_data_keys_are_data_not_credentials(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(objects={"20": {"id": "20", "custom_data": {"password": "No"}}}))
+    result = _run(catalogs.update_catalog_product("20", params={"custom_data": dict(_CUSTOM_DATA)}))
+    update = next(call for kind, call in client.calls if kind == "update")
+    assert update["data"] == {"custom_data": _CUSTOM_DATA}
+    # What the response says was sent is what was sent.
+    assert result["sent"] == update["data"]
+    assert result["current"]["custom_data"] == _CUSTOM_DATA
+    assert result["previous"]["custom_data"] == {"password": "No"}
+    _use(monkeypatch, FakeCatalogClient(objects={"20": {"id": "20", "custom_data": dict(_CUSTOM_DATA)}}))
+    listed = _run(catalogs.list_catalog_products(product_id="20", fields=["id", "custom_data"]))
+    assert listed["items"][0]["custom_data"] == _CUSTOM_DATA
+
+
+def test_product_set_filter_on_a_credential_like_field_is_shown_as_sent(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): {"data": [], "summary": {"total_count": 3}}}))
+    built = _run(catalogs.build_product_set_filter(
+        "10", conditions=[{"field": "password", "operator": "eq", "value": "Yes"}],
+    ))
+    listed = next(call for kind, call in client.calls if kind == "list")
+    assert built["filter"] == listed["params"]["filter"] == {"password": {"eq": "Yes"}}
+    client = _use(monkeypatch, FakeCatalogClient(objects={"30": {"id": "30", "filter": "{}"}}))
+    updated = _run(catalogs.update_product_set("30", filter={"secret": {"eq": "Secret Escapes"}}))
+    update = next(call for kind, call in client.calls if kind == "update")
+    assert updated["current"]["filter"] == update["data"]["filter"] == {"secret": {"eq": "Secret Escapes"}}
+
+
+def test_batch_dry_run_request_equals_the_request_a_real_run_sends(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    items = [_batch_item("update", "sku", name="Secret Escapes", fields={"custom_label_0": "password"})]
+    _use(monkeypatch, _batch_client([_existing("sku", "20")], status=_finished()))
+    planned = _run(catalogs.batch_update_catalog_products("123", items=json.loads(json.dumps(items)), dry_run=True))
+    real = _use(monkeypatch, _batch_client([_existing("sku", "20")], status=_finished()))
+    sent = _run(catalogs.batch_update_catalog_products("123", items=json.loads(json.dumps(items))))
+    posted = next(call for kind, call in real.calls if kind == "create")
+    assert planned["request"]["data"] == posted["data"]
+    assert planned["items"][0]["changes"] == sent["items"][0]["changes"] == {
+        "name": "Secret Escapes", "custom_label_0": "password",
+    }
+
+
+def _submitted(monkeypatch, validation_status: Any, *, status: Any = None, skus: tuple[str, ...] = ("sku",)) -> dict:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client(
+        [_existing(sku, f"2{index}") for index, sku in enumerate(skus)],
+        post={"handles": ["h1"], "validation_status": validation_status},
+        status=status if status is not None else _finished(),
+    ))
+    return _run(catalogs.batch_update_catalog_products(
+        "123", items=[_batch_item("update", sku, name="New") for sku in skus], wait_seconds=2,
+    ))
+
+
+@pytest.mark.parametrize("validation_status", [
+    [{"retailer_id": "sku", "errors": [None]}],
+    [None],
+    ["unreadable validation entry"],
+])
+def test_unreadable_submission_evidence_cannot_be_reported_as_applied(monkeypatch, validation_status) -> None:
+    result = _submitted(monkeypatch, validation_status)
+    assert result["ok"] is False
+    assert result["items"][0]["outcome"] == "outcome_unknown"
+    assert "could not be read" in result["items"][0]["reason"]
+
+
+def test_unreadable_error_entry_for_one_item_leaves_only_that_item_unknown(monkeypatch) -> None:
+    result = _submitted(monkeypatch, [{"retailer_id": "sku", "errors": [None, None]}], skus=("sku", "sku2"))
+    first, second = result["items"]
+    assert first["outcome"] == "outcome_unknown"
+    assert first["submission_unreadable_error_count"] == 2
+    assert "2 error entries for this item" in first["reason"]
+    assert "submission_error_count" not in first
+    assert second["outcome"] == "applied"
+    assert "submission" not in result
+
+
+@pytest.mark.parametrize(("validation_status", "counts"), [
+    ([None, "text", 5], {"unreadable_entries": 3}),
+    ({"errors": [None]}, {"unreadable_error_entries": 1}),
+    ([{"retailer_id": "other", "errors": [None, {"message": "Bad"}]}],
+     {"unreadable_error_entries": 1, "unattributed_error_count": 1}),
+    ("unreadable", {"unreadable_entries": 1}),
+])
+def test_unreadable_submission_evidence_naming_no_item_leaves_every_item_unknown(
+    monkeypatch, validation_status, counts,
+) -> None:
+    result = _submitted(monkeypatch, validation_status, skus=("sku", "sku2"))
+    assert [item["outcome"] for item in result["items"]] == ["outcome_unknown", "outcome_unknown"]
+    assert all(item["reason"] for item in result["items"])
+    for key, value in counts.items():
+        assert result["submission"][key] == value
+    assert "could not be read" in result["submission"]["note"]
+    assert result["ok"] is False
+
+
+def test_unreadable_submission_evidence_does_not_hide_a_named_failure_or_processing(monkeypatch) -> None:
+    failed = _submitted(monkeypatch, [None], status=_finished(
+        errors_total_count=1, errors=[{"id": "sku", "message": "Bad price"}],
+    ))
+    assert failed["items"][0]["outcome"] == "failed"
+    assert failed["items"][0]["errors"] == ["Bad price"]
+    processing = _submitted(monkeypatch, [None], status={"data": [{"status": "in_progress"}]})
+    assert processing["items"][0]["outcome"] == "processing"
+
+
+@pytest.mark.parametrize("validation_status", [None, [], {}, "", [{"retailer_id": "sku", "errors": []}]])
+def test_empty_submission_evidence_still_allows_applied(monkeypatch, validation_status) -> None:
+    result = _submitted(monkeypatch, validation_status)
+    assert result["items"][0]["outcome"] == "applied"
+    assert "submission" not in result
+
+
+_R6_INVALID_ID_MATRIX = [
+    # An invalid-request entry that cannot be read as an id could be any item.
+    ({"status": "finished", "errors_total_count": 1, "errors": [{"id": "bad", "message": "m"}],
+      "ids_of_invalid_requests": ["bad", None]}, "outcome_unknown"),
+    ({"status": "finished", "errors_total_count": 1, "errors": [{"id": "bad", "message": "m"}],
+      "ids_of_invalid_requests": [" "]}, "outcome_unknown"),
+    ({"status": "finished", "errors_total_count": 1, "errors": [{"id": "bad", "message": "m"}],
+      "ids_of_invalid_requests": [True]}, "outcome_unknown"),
+    ({"status": "finished", "errors_total_count": 0, "ids_of_invalid_requests": [{"id": "target"}]},
+     "outcome_unknown"),
+    # One id given without a list is read as that id, never character by character.
+    ({"status": "finished", "errors_total_count": 1, "ids_of_invalid_requests": "target"}, "failed"),
+    ({"status": "finished", "errors_total_count": 1, "ids_of_invalid_requests": "bad"}, "applied"),
+]
+
+
+@pytest.mark.parametrize(("status", "expected"), _R6_INVALID_ID_MATRIX)
+def test_unreadable_invalid_request_ids_are_not_skipped(status, expected) -> None:
+    item = {"retailer_id": "target", "warnings": [], "errors": []}
+    catalogs._settle(item, status)
+    assert item["outcome"] == expected, item
+    if expected == "outcome_unknown":
+        assert "could not be read" in item["reason"]
+
+
+def test_handle_read_reports_unreadable_invalid_ids_and_a_single_error_object(monkeypatch) -> None:
+    _use(monkeypatch, _batch_client(status=_finished(
+        errors_total_count=1, errors={"id": "SKU-1", "message": "Bad"}, ids_of_invalid_requests=["SKU-1", None],
+    )))
+    result = _run(catalogs.batch_update_catalog_products(catalog_id="123", handle="h1"))
+    assert result["outcome"] == "some_failed_others_unknown"
+    assert result["error_attribution"]["unreadable_invalid_ids"] == 1
+    assert "could not be read" in result["error_attribution"]["reason"]
+    assert result["errors"] == [{"id": "SKU-1", "message": "Bad"}]
+    assert result["ok"] is False

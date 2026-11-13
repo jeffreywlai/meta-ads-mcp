@@ -14,7 +14,7 @@ import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Annotated, Any
-from urllib.parse import quote, quote_plus, urlsplit
+from urllib.parse import urlsplit
 
 from pydantic import WithJsonSchema
 
@@ -430,23 +430,35 @@ def _distinct_key(shown: dict[Any, Any], key: Any) -> Any:
     return f"{key} ({number})"
 
 
-def _redact(value: Any) -> Any:
+# Keys whose value is a data map: its own keys are the advertiser's data (a feed rule's
+# params, where value_mapping_rule maps one product value to another), not field names.
+# A key inside one is never taken to name a password, so a mapping such as
+# {"password": "Kennwort"} is shown and sent as written. URL passwords are still masked.
+_FEED_DATA_MAP_KEYS = frozenset({"params"})
+
+
+def _redact(value: Any, data_map_keys: frozenset[str] = _FEED_DATA_MAP_KEYS, *, in_data: bool = False) -> Any:
     """Copy a response for display: any password key, and any password inside a URL, is masked.
 
     Every tool in this module returns through this function (see _secrets_masked), so a
     new field that carries a URL, such as an upload's url, cannot be missed. Keys are
-    masked as well as values, since Meta can return a map keyed by a URL.
+    masked as well as values, since Meta can return a map keyed by a URL. A key is taken
+    to name a password only where keys are field names: not inside a data map
+    (data_map_keys), whose keys are product values.
     """
     if isinstance(value, dict):
         shown: dict[Any, Any] = {}
         for key, item in value.items():
-            masked = "[redacted]" if str(key).lower() == "password" and item is not None else _redact(item)
+            if not in_data and str(key).lower() == "password" and item is not None:
+                masked: Any = "[redacted]"
+            else:
+                masked = _redact(item, data_map_keys, in_data=in_data or key in data_map_keys)
             shown[_distinct_key(shown, _mask_text(key) if isinstance(key, str) else key)] = masked
         return shown
     if isinstance(value, list):
-        return [_redact(item) for item in value]
+        return [_redact(item, data_map_keys, in_data=in_data) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact(item) for item in value)
+        return tuple(_redact(item, data_map_keys, in_data=in_data) for item in value)
     if isinstance(value, str):
         return _mask_text(value)
     return value
@@ -505,29 +517,96 @@ def _mask_error(exc: BaseException) -> None:
 
 
 # Secrets a caller supplies (a feed or upload password, a catalog integration token) are
-# removed from any text a tool hands back. A secret this long or longer is removed wherever
-# it occurs; a shorter one only where it stands as a whole token (not inside a longer word),
-# so that a short password such as "abc" does not garble ordinary words around it.
+# removed from any text a tool hands back, in every form an upstream text can repeat them
+# (see _char_pattern). How much is removed depends on the secret's length:
+# - from an error, every supplied secret: one of MIN_SECRET_SUBSTRING_LENGTH characters or
+#   more wherever it occurs, a shorter one where it stands as a whole token;
+# - from a successful result, one of MIN_SECRET_SUBSTRING_LENGTH characters or more
+#   wherever it occurs, one of MIN_SECRET_TOKEN_LENGTH characters up to that where it stands
+#   as a whole token, and a shorter one not by value at all, because a password such as
+#   "csv" equals ordinary words a result has every right to contain.
+# Masking by key name (a password key, a URL password) applies whatever the length. A whole
+# token is one whose neighbouring characters are not letters or digits; the start and the
+# end of the text count as such neighbours.
 MIN_SECRET_SUBSTRING_LENGTH = 8
+MIN_SECRET_TOKEN_LENGTH = 4
 _SECRET_SHOWN = "[redacted]"
 # An input key holding any of these (in any letter case) holds a secret; matches the
 # credential key parts errors.py strips from Meta's diagnostic data.
 _SECRET_KEY_PARTS = ("password", "secret", "token", "authorization", "credential", "api_key")
+# Where an input's keys are field names, so that a key naming a password or token holds
+# one: the arguments themselves (the tool's named parameters), a feed schedule
+# (username, password), and the Graph params passed through to Meta with the schedules they
+# can carry. Every other mapping in an input is data (a feed rule's value mapping, a
+# product's custom_data, a filter), whose keys are the advertiser's own values: a key there
+# never makes its value a secret. A password inside a URL is found anywhere.
+_FEED_CREDENTIAL_PATHS = frozenset({
+    (), ("schedule",), ("update_schedule",),
+    ("params",), ("params", "schedule"), ("params", "update_schedule"),
+})
+# For a tool whose params is itself a data map (a feed rule's params).
+_ARGUMENTS_ONLY = frozenset({()})
+_LETTER_OR_DIGIT = r"[^\W_]"
 
 
-def _secret_forms(secret: str) -> list[str]:
-    """A secret as given, trimmed, URL-encoded both ways and JSON-escaped: the ways an error can repeat it."""
-    forms = {secret, secret.strip()}
-    forms |= {quote(form, safe="") for form in list(forms)} | {quote_plus(form) for form in list(forms)}
-    forms |= {json.dumps(form)[1:-1] for form in list(forms)}
-    return [form for form in forms if form.strip()]
+def _hex_digits(text: str) -> str:
+    """The hex digits of an escape as a pattern, each letter matched in either case."""
+    return "".join(f"[{digit.upper()}{digit.lower()}]" if digit.isalpha() else digit for digit in text)
 
 
-def _caller_secrets(arguments: dict[str, Any]) -> list[str]:
-    """Every secret the caller supplied in this call, in each form an error could repeat it.
+def _char_pattern(char: str) -> str:
+    """Every way an upstream text can write one character of a secret, as a pattern.
 
-    A secret is a string under a key (or parameter name) that names a password, token,
-    secret or authorization, at any depth, or the password of a URL login in any string.
+    A letter or digit only as itself, in its own case. Any other character as itself or as
+    a percent escape of its UTF-8 bytes, encoded once or more (%2F, %252F), with or without
+    '/' and the like left as they are, and with hex digits in either case; as a JSON escape
+    (a \\u escape in either case, or the short escapes \\" \\\\ \\/ \\n and the like); and a
+    space also as + (form encoding) and %2B (form encoding, then URL encoding).
+    """
+    if char.isascii() and char.isalnum():
+        return re.escape(char)
+    options = [re.escape(char)]
+    options.append("".join("%(?:25)*" + _hex_digits(f"{byte:02X}") for byte in char.encode("utf-8")))
+    code = ord(char)
+    units = [code] if code <= 0xFFFF else [0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF)]
+    options.append("".join(r"\\u" + _hex_digits(f"{unit:04X}") for unit in units))
+    short_escape = json.dumps(char)[1:-1]
+    if short_escape != char and not short_escape.startswith("\\u"):
+        options.append(re.escape(short_escape))
+    if char == "/":
+        options.append(re.escape("\\/"))
+    if char == " ":
+        options.extend([r"\+", "%(?:25)*2" + _hex_digits("B")])
+    return "(?:" + "|".join(options) + ")"
+
+
+def _secret_matcher(secrets: list[str], *, in_error: bool) -> re.Pattern[str] | None:
+    """One pattern that finds every given secret a text must not show, in every form, or None.
+
+    The length rules above decide which secrets it finds and where: in_error is true for
+    an error's text, false for a successful result. Longer secrets are tried first.
+    """
+    alternatives: list[str] = []
+    distinct = {secret.strip() for secret in secrets if isinstance(secret, str) and secret.strip()}
+    for secret in sorted(distinct, key=lambda text: (-len(text), text)):
+        if not in_error and len(secret) < MIN_SECRET_TOKEN_LENGTH:
+            continue
+        pattern = "".join(_char_pattern(char) for char in secret)
+        if len(secret) < MIN_SECRET_SUBSTRING_LENGTH:
+            pattern = f"(?<!{_LETTER_OR_DIGIT})(?:{pattern})(?!{_LETTER_OR_DIGIT})"
+        alternatives.append(f"(?:{pattern})")
+    return re.compile("|".join(alternatives)) if alternatives else None
+
+
+def _caller_secrets(
+    arguments: dict[str, Any], credential_paths: frozenset[tuple[str, ...]] = _FEED_CREDENTIAL_PATHS,
+) -> list[str]:
+    """Every secret the caller supplied in this call, trimmed, longest first.
+
+    A secret is a string under a key that names a password, token, secret, authorization,
+    credential or api key, where keys are field names (credential_paths: the arguments
+    themselves and the documented places a credential sits), or the password of a URL
+    login in any string or key at any depth.
     """
     found: set[str] = set()
 
@@ -535,66 +614,62 @@ def _caller_secrets(arguments: dict[str, Any]) -> list[str]:
         if "@" in text and "://" in text:
             for match in _URL_LOGIN.finditer(text):
                 _user, colon, password = match.group("login").partition(":")
-                if colon and password:
-                    found.add(password)
+                if colon and password.strip():
+                    found.add(password.strip())
 
-    def visit(value: Any, key: Any = None) -> None:
-        if isinstance(key, str):
-            add_url_passwords(key)
-        if isinstance(value, str):
-            if isinstance(key, str) and any(part in key.lower() for part in _SECRET_KEY_PARTS) and value.strip():
-                found.add(value)
-            add_url_passwords(value)
-        elif isinstance(value, dict):
-            for inner_key, item in value.items():
-                visit(item, inner_key)
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            found.add(value.strip())
         elif isinstance(value, (list, tuple)):
             for item in value:
-                visit(item, key)
+                add(item)
 
-    for name, value in arguments.items():
-        visit(value, name)
-    forms = {form for secret in found for form in _secret_forms(secret)}
-    return sorted(forms, key=len, reverse=True)
+    def visit(value: Any, path: tuple[str, ...] | None) -> None:
+        if isinstance(value, str):
+            add_url_passwords(value)
+        elif isinstance(value, dict):
+            fields = path is not None and path in credential_paths
+            for key, item in value.items():
+                if isinstance(key, str):
+                    add_url_passwords(key)
+                    if fields and any(part in key.lower() for part in _SECRET_KEY_PARTS):
+                        add(item)
+                visit(item, (*path, key) if fields and isinstance(key, str) else None)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, None)
+
+    visit(arguments, ())
+    return sorted(found, key=lambda text: (-len(text), text))
 
 
-def _scrub_text(text: str, secrets: list[str]) -> str:
-    for secret in secrets:
-        if secret not in text:
-            continue
-        if len(secret.strip()) >= MIN_SECRET_SUBSTRING_LENGTH:
-            text = text.replace(secret, _SECRET_SHOWN)
-        else:
-            text = re.sub(rf"(?<!\w){re.escape(secret)}(?!\w)", _SECRET_SHOWN, text)
-    return text
-
-
-def _scrub_value(value: Any, secrets: list[str]) -> Any:
-    """value with every known secret removed, from strings, mapping keys and values, lists and tuples."""
-    if not secrets:
+def _scrub_value(value: Any, matcher: re.Pattern[str] | None) -> Any:
+    """value with every secret matcher finds removed, from strings, mapping keys and values, lists and tuples."""
+    if matcher is None:
         return value
     if isinstance(value, str):
-        return _scrub_text(value, secrets)
+        return matcher.sub(_SECRET_SHOWN, value)
     if isinstance(value, dict):
         shown: dict[Any, Any] = {}
         for key, item in value.items():
-            shown[_distinct_key(shown, _scrub_value(key, secrets))] = _scrub_value(item, secrets)
+            shown[_distinct_key(shown, _scrub_value(key, matcher))] = _scrub_value(item, matcher)
         return shown
     if isinstance(value, list):
-        return [_scrub_value(item, secrets) for item in value]
+        return [_scrub_value(item, matcher) for item in value]
     if isinstance(value, tuple):
-        return tuple(_scrub_value(item, secrets) for item in value)
+        return tuple(_scrub_value(item, matcher) for item in value)
     return value
 
 
 def _scrub_known_secrets(exc: BaseException, secrets: list[str]) -> None:
-    """Remove known secrets from a raised error and every error behind it, in place.
+    """Remove the given secrets from a raised error and every error behind it, in place.
 
-    Like _mask_error: every error reachable through __cause__, __context__ and exception
-    groups is cleaned (fields, args and notes), each once, so a cycle ends.
+    Every secret is removed, whatever its length (the error rules above). Like _mask_error:
+    every error reachable through __cause__, __context__ and exception groups is cleaned
+    (fields, args and notes), each once, so a cycle ends.
     """
-    secrets = sorted({secret for secret in secrets if secret.strip()}, key=len, reverse=True)
-    if not secrets:
+    matcher = _secret_matcher(secrets, in_error=True)
+    if matcher is None:
         return
     pending: list[BaseException | None] = [exc]
     seen: set[int] = set()
@@ -610,17 +685,17 @@ def _scrub_known_secrets(exc: BaseException, secrets: list[str]) -> None:
                 continue
             if value is None or isinstance(value, BaseException):
                 continue
-            cleaned = _scrub_value(value, secrets)
+            cleaned = _scrub_value(value, matcher)
             if cleaned != value:
                 try:
                     setattr(current, name, cleaned)
                 except (AttributeError, TypeError):
                     pass
         if current.args:
-            current.args = tuple(_scrub_value(arg, secrets) for arg in current.args)
+            current.args = tuple(_scrub_value(arg, matcher) for arg in current.args)
         notes = getattr(current, "__notes__", None)
         if isinstance(notes, list):
-            current.__notes__ = [_scrub_value(note, secrets) for note in notes]
+            current.__notes__ = [_scrub_value(note, matcher) for note in notes]
         pending.extend([current.__cause__, current.__context__])
         pending.extend(getattr(current, "exceptions", None) or ())
 
@@ -634,14 +709,16 @@ def _call_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[
 
 
 def _guard_secrets(
-    fn: Callable[..., Awaitable[Any]], show: Callable[[Any], Any],
+    fn: Callable[..., Awaitable[Any]],
+    show: Callable[[Any], Any],
+    credential_paths: frozenset[tuple[str, ...]] = _FEED_CREDENTIAL_PATHS,
 ) -> Callable[..., Awaitable[Any]]:
     """Run a tool so that neither its result nor an error it raises shows a password or token.
 
     show masks the result (password keys and URL passwords); an error is masked the same
-    way. Then every secret the caller supplied in this call is removed from both, so a
-    secret Meta repeats as plain text in an error message cannot reach the response or a
-    traceback log.
+    way. Then every secret the caller supplied in this call (found where credential_paths
+    says keys are field names, and in any URL) is removed from both, by the length rules
+    above, so a secret Meta repeats as text cannot reach the response or a traceback log.
     """
 
     @functools.wraps(fn)
@@ -650,24 +727,26 @@ def _guard_secrets(
             result = await fn(*args, **kwargs)
         except Exception as exc:
             _mask_error(exc)
-            _scrub_known_secrets(exc, _caller_secrets(_call_arguments(fn, args, kwargs)))
+            _scrub_known_secrets(exc, _caller_secrets(_call_arguments(fn, args, kwargs), credential_paths))
             raise
-        # In a successful result only a long secret is removed wherever it occurs. A short
-        # one (a password such as "DAILY" or "csv") equals ordinary words the result has
-        # every right to contain; password keys and URL passwords are already masked by show.
-        secrets = [
-            secret
-            for secret in _caller_secrets(_call_arguments(fn, args, kwargs))
-            if len(secret.strip()) >= MIN_SECRET_SUBSTRING_LENGTH
-        ]
-        return _scrub_value(show(result), secrets)
+        secrets = _caller_secrets(_call_arguments(fn, args, kwargs), credential_paths)
+        return _scrub_value(show(result), _secret_matcher(secrets, in_error=False))
 
     return wrapper
 
 
-def _secrets_masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    """Run a tool so that neither its result nor an error it raises shows a password."""
-    return _guard_secrets(fn, _redact)
+def _secrets_masked(
+    fn: Callable[..., Awaitable[Any]] | None = None,
+    *,
+    credential_paths: frozenset[tuple[str, ...]] = _FEED_CREDENTIAL_PATHS,
+) -> Any:
+    """Run a tool so that neither its result nor an error it raises shows a password.
+
+    Used bare, or with credential_paths for a tool whose params is a data map.
+    """
+    if fn is None:
+        return lambda tool: _guard_secrets(tool, _redact, credential_paths)
+    return _guard_secrets(fn, _redact, credential_paths)
 
 
 def _key_label(key: Any, position: int, known_keys: frozenset[str]) -> str:
@@ -1630,7 +1709,8 @@ async def list_feed_rules(
 
 
 @mcp_server.tool()
-@_secrets_masked
+# params is a data map here (value_mapping_rule keys are product values), not field names.
+@_secrets_masked(credential_paths=_ARGUMENTS_ONLY)
 async def create_feed_rule(
     feed_id: str,
     attribute: str,
@@ -1658,7 +1738,8 @@ async def create_feed_rule(
 
 
 @mcp_server.tool()
-@_secrets_masked
+# params is a data map here (value_mapping_rule keys are product values), not field names.
+@_secrets_masked(credential_paths=_ARGUMENTS_ONLY)
 async def update_feed_rule(
     rule_id: GraphId,
     params: dict[str, Any],
