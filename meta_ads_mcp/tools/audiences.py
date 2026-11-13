@@ -135,6 +135,32 @@ async def get_audience(
     return {"item": audience, "summary": {"count": 1}}
 
 
+# Labels Meta accepts on custom audience creation (AdAccount create_custom_audience,
+# audience_labels: list<audience_labels_enum>, facebook-python-business-sdk 26.0.2).
+AUDIENCE_LABELS = frozenset({
+    "APP_USERS", "AT_RISK", "CART_ABANDONERS", "DISENGAGED", "DISQUALIFIED_LEADS", "ENGAGED_USERS",
+    "GENERAL_CUSTOMERS", "HIGH_VALUE_CUSTOMERS", "LOW_VALUE_CUSTOMERS", "OTHER_1", "OTHER_2", "OTHER_3",
+    "QUALIFIED_LEADS", "RECENT_PURCHASERS", "TRIAL_USERS",
+})
+
+
+def _audience_labels(value: Any) -> list[str]:
+    labels = coerce_csv_string_list(value)
+    if (
+        not isinstance(labels, list)
+        or not labels
+        or any(not isinstance(label, str) or not label.strip() for label in labels)
+    ):
+        raise ValidationError("audience_labels must be one or more nonblank labels, as a list or comma-separated string.")
+    normalized = list(dict.fromkeys(label.strip().upper() for label in labels))
+    unknown = [label for label in normalized if label not in AUDIENCE_LABELS]
+    if unknown:
+        raise ValidationError(
+            f"Unknown audience_labels: {', '.join(unknown)}. Meta accepts: {', '.join(sorted(AUDIENCE_LABELS))}."
+        )
+    return normalized
+
+
 @mcp_server.tool()
 async def create_custom_audience(
     account_id: str,
@@ -146,8 +172,14 @@ async def create_custom_audience(
     rule: dict[str, Any] | None = None,
     prefill: bool = False,
     params: dict[str, Any] | None = None,
+    is_value_based: bool | None = None,
+    audience_labels: StringList | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants to create a first-party or rule-based custom audience."""
+    """Use this when the user wants to create a first-party or rule-based custom audience.
+
+    is_value_based=true makes a value-based customer list (subtype CUSTOM) for value optimization.
+    audience_labels tags the audience, for example HIGH_VALUE_CUSTOMERS or QUALIFIED_LEADS.
+    """
     payload: dict[str, Any] = {
         "name": name,
         "subtype": subtype,
@@ -157,6 +189,17 @@ async def create_custom_audience(
         "retention_days": OMIT if retention_days is None else retention_days,
         "rule": rule or OMIT,
     }
+    # Added only when named, so a call that passes these through params (as callers did
+    # before they were named) sends exactly what it sent before, while giving one both
+    # ways is rejected by merge_graph_payload.
+    if is_value_based is not None:
+        if not isinstance(is_value_based, bool):
+            raise ValidationError("is_value_based must be true or false.")
+        if is_value_based and str(subtype or "").strip().upper() != "CUSTOM":
+            raise ValidationError("is_value_based applies only to customer list audiences (subtype CUSTOM).")
+        payload["is_value_based"] = is_value_based
+    if audience_labels is not None:
+        payload["audience_labels"] = _audience_labels(audience_labels)
     payload = merge_graph_payload(payload, params)
     client = get_graph_api_client()
     created = await client.create_edge_object(

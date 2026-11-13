@@ -1268,6 +1268,98 @@ def test_g18_decode_failure_chain_is_clean_through_the_mcp_boundary(tmp_path, ca
     assert SYNTHETIC_CUSTOMER not in caplog.text
 
 
+# create_custom_audience: named is_value_based and audience_labels (round three, P4)
+
+
+class CreateRecorder(FakeAudienceClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple] = []
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return {"id": "aud_created"}
+
+
+def test_create_custom_audience_old_style_call_is_unchanged(monkeypatch) -> None:
+    """Calls made before the named parameters existed send exactly the same request and get the same response."""
+    client = CreateRecorder()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    minimal = asyncio.run(audiences.create_custom_audience(account_id="123", name="Audience"))
+    full = asyncio.run(audiences.create_custom_audience(
+        account_id="act_123", name="VBA", subtype="CUSTOM", description="Value list",
+        customer_file_source="PARTNER_PROVIDED_ONLY", retention_days=90, prefill=True,
+        params={"is_value_based": 1, "audience_labels": ["HIGH_VALUE_CUSTOMERS"], "use_in_campaigns": True},
+    ))
+    website = asyncio.run(audiences.create_custom_audience(
+        account_id="123", name="Site", subtype="WEBSITE", rule={"inclusions": {"operator": "or"}},
+    ))
+    assert client.calls == [
+        ("create", "act_123", "customaudiences", {"name": "Audience", "subtype": "CUSTOM", "prefill": False}),
+        ("create", "act_123", "customaudiences", {
+            "name": "VBA", "subtype": "CUSTOM", "prefill": True, "description": "Value list",
+            "customer_file_source": "PARTNER_PROVIDED_ONLY", "retention_days": 90,
+            "is_value_based": 1, "audience_labels": ["HIGH_VALUE_CUSTOMERS"], "use_in_campaigns": True,
+        }),
+        ("create", "act_123", "customaudiences", {
+            "name": "Site", "subtype": "WEBSITE", "prefill": False, "rule": {"inclusions": {"operator": "or"}},
+        }),
+    ]
+    for result in (minimal, full, website):
+        assert result == {
+            "ok": True, "action": "create_custom_audience", "target": {"account_id": "act_123"},
+            "created": {"id": "aud_created"},
+        }
+
+
+def test_create_custom_audience_named_value_based_and_labels_join_the_request(monkeypatch) -> None:
+    client = CreateRecorder()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    asyncio.run(audiences.create_custom_audience(
+        account_id="123", name="VBA", customer_file_source="PARTNER_PROVIDED_ONLY",
+        is_value_based=True, audience_labels=" high_value_customers, Recent_Purchasers ",
+    ))
+    asyncio.run(audiences.create_custom_audience(
+        account_id="123", name="Not value based", is_value_based=False, audience_labels=["AT_RISK"],
+    ))
+    assert client.calls == [
+        ("create", "act_123", "customaudiences", {
+            "name": "VBA", "subtype": "CUSTOM", "prefill": False, "customer_file_source": "PARTNER_PROVIDED_ONLY",
+            "is_value_based": True, "audience_labels": ["HIGH_VALUE_CUSTOMERS", "RECENT_PURCHASERS"],
+        }),
+        ("create", "act_123", "customaudiences", {
+            "name": "Not value based", "subtype": "CUSTOM", "prefill": False,
+            "is_value_based": False, "audience_labels": ["AT_RISK"],
+        }),
+    ]
+
+
+def test_create_custom_audience_named_values_through_the_mcp_boundary(monkeypatch) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = CreateRecorder()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    asyncio.run(mcp_server.call_tool("create_custom_audience", {
+        "account_id": "123", "name": "VBA", "is_value_based": True, "audience_labels": "QUALIFIED_LEADS",
+    }))
+    assert client.calls[0][3]["is_value_based"] is True
+    assert client.calls[0][3]["audience_labels"] == ["QUALIFIED_LEADS"]
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"is_value_based": True, "params": {"is_value_based": 1}}, "is_value_based"),
+    ({"audience_labels": ["AT_RISK"], "params": {"audience_labels": ["AT_RISK"]}}, "audience_labels"),
+    ({"audience_labels": ["NOT_A_LABEL"]}, "NOT_A_LABEL"),
+    ({"audience_labels": [" "]}, "audience_labels"),
+    ({"audience_labels": []}, "audience_labels"),
+    ({"is_value_based": True, "subtype": "WEBSITE"}, "CUSTOM"),
+])
+def test_create_custom_audience_named_values_are_validated_before_any_request(monkeypatch, kwargs, match) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(audiences.ValidationError, match=match):
+        asyncio.run(audiences.create_custom_audience(account_id="123", name="Audience", **kwargs))
+
+
 def test_g18_rule_that_is_not_json_has_a_clean_exception_chain(monkeypatch) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     rule = '{"inclusions": "' + SYNTHETIC_CUSTOMER
