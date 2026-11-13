@@ -782,6 +782,148 @@ def test_end_to_end_search_in_each_mode(monkeypatch, locked) -> None:
             assert expected in found[:3], (query, found)
 
 
+# Round-seven review M3: a numbered page that a report owns is a page of the
+# report. "page" is also a Facebook Page, so the L10 rule that sets aside an
+# id after an entity noun must not read "#2" as a Page id when a report owns
+# the phrase.
+
+M3_REVIEWER_QUERIES = [
+    ("add audience users to page #2 of the report", "add_audience_users"),
+    ("add audience users to the report's page #2", "add_audience_users"),
+    ("remove audience users from page #2 of the report", "remove_audience_users"),
+]
+
+M3_MORE_REPORTING_QUERIES = [
+    "add audience users to page 2 of the report",
+    "add audience users to the report's page no. 2",
+    "add audience users to page number 2 of the dashboard",
+    "remove audience users from the dashboard's page 12",
+    "add customers to the spreadsheet's page #3",
+    "add audience users to the report's pages 2 and 3",
+    "copy the campaign into the deck's page #4",
+    "duplicate the campaign onto page 2 of the slide deck",
+    "add audience users to the report's page 'Summary'",
+    "add audience users to the report's page",
+]
+
+M3_COMMANDS = [
+    # A Facebook Page, with no report owning the phrase.
+    ("add audience users to the Page 123456789012345", "add_audience_users"),
+    ("add users to the page #2", "add_audience_users"),
+    # A report that says which entity is meant, with a short number after the entity.
+    ("add users to the report's audience 2", "add_audience_users"),
+    ("remove customers from the audience #2 of the dashboard", "remove_audience_users"),
+    ("duplicate the report's campaign no. 3", "duplicate_campaign"),
+]
+
+
+@pytest.mark.parametrize(("query", "tool"), M3_REVIEWER_QUERIES)
+def test_numbered_report_page_does_not_offer_a_write(query, tool) -> None:
+    result = asyncio.run(mcp_server.call_tool("search_tools", {"query": query}))
+    text = "\n".join(item.text for item in result.content if item.type == "text")
+    assert f"`{tool}`" not in text, text
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize("query", [query for query, _tool in M3_REVIEWER_QUERIES] + M3_MORE_REPORTING_QUERIES)
+def test_m3_a_page_a_report_owns_offers_read_tools_only(query, locked) -> None:
+    assert _decision(query).suppress_mutations is True, sorted(_decision(query).compatible_tools)
+    _assert_read_tools_only(query, locked)
+
+
+@pytest.mark.usefixtures("read_only_searches")
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize(("query", "expected"), M3_COMMANDS)
+def test_m3_an_entity_with_a_number_still_offers_the_write_tool(query, expected, locked) -> None:
+    _assert_command_offered(query, expected, locked)
+
+
+# A grid over the phrasing families that have collided across rounds: each verb,
+# object, destination noun, report owner and what follows the noun. The expected
+# answer comes from _grid_write_tool, a rule written here from the routing
+# policy, not from the router's output.
+
+GRID_VERBS = ("add", "remove", "copy", "duplicate", "move")
+GRID_OBJECTS = ("audience users", "the campaign", "the pixel")
+GRID_DESTINATIONS = ("audience", "campaign", "catalog", "page", "section")
+GRID_OWNERS = ("", "the report's", "of the dashboard")
+GRID_TRAILING = ("", "2", "#2", "12345", "1234567890", "id 42", '"Spring Sale"')
+_GRID_PREPOSITIONS = {"add": "to", "remove": "from", "copy": "into", "duplicate": "into", "move": "to"}
+# The write tool each verb and object can name. "move" is no write verb, and no
+# verb in the grid has a tool that acts on a pixel (that is connect/disconnect).
+_GRID_TOOLS = {
+    ("add", "audience users"): "add_audience_users",
+    ("remove", "audience users"): "remove_audience_users",
+    ("copy", "the campaign"): "duplicate_campaign",
+    ("duplicate", "the campaign"): "duplicate_campaign",
+}
+
+
+def _grid_query(verb: str, obj: str, destination: str, owner: str, trailing: str) -> str:
+    noun = f"{destination} {trailing}".strip()
+    if owner == "the report's":
+        place = f"the report's {noun}"
+    elif owner:
+        place = f"the {noun} {owner}"
+    else:
+        place = f"the {noun}"
+    return f"{verb} {obj} {_GRID_PREPOSITIONS[verb]} {place}"
+
+
+def _grid_write_tool(verb: str, obj: str, destination: str, owner: str, trailing: str) -> str | None:
+    """The write tool the request may be offered, or None when it must offer none.
+
+    - Only a verb and object pair with a tool can offer a write.
+    - Without a report owner nothing says the place is in a report, so the
+      destination is the entity it names (a section with no owner is not known
+      to be in a report; "the page" is a Facebook Page).
+    - With a report owner, a page or section is a place in the report whatever
+      follows it (a number is its position, a name is its title).
+    - With a report owner, an entity noun (audience, campaign, catalog) says
+      which entity is meant: the report only identifies it, and what follows
+      the noun (a number in any form, or a name) identifies it too.
+    """
+    tool = _GRID_TOOLS.get((verb, obj))
+    if tool is None:
+        return None
+    if owner and destination in ("page", "section"):
+        return None
+    return tool
+
+
+GRID_CELLS = [
+    (verb, obj, destination, owner, trailing)
+    for verb in GRID_VERBS
+    for obj in GRID_OBJECTS
+    for destination in GRID_DESTINATIONS
+    for owner in GRID_OWNERS
+    for trailing in GRID_TRAILING
+]
+
+
+def _grid_mismatches() -> list[tuple[str, str | None, list[str]]]:
+    contracts = _contracts()
+    router = StructuredIntentRouter()
+    wrong = []
+    for cell in GRID_CELLS:
+        query = _grid_query(*cell)
+        expected = _grid_write_tool(*cell)
+        offered = sorted(
+            name for name in router.decide(query, tool_contracts=contracts).compatible_tools
+            if intent_routing._is_mutation(name, contracts)
+        )
+        if (expected is None and offered) or (expected is not None and expected not in offered):
+            wrong.append((query, expected, offered))
+    return wrong
+
+
+def test_m3_routing_grid_matches_the_written_rule() -> None:
+    assert len(GRID_CELLS) == 1575
+    wrong = _grid_mismatches()
+    assert not wrong, f"{len(wrong)} cells: " + "\n".join(map(str, wrong[:40]))
+
+
 # Every query a read-only case checks. read_only_searches runs them all through
 # the real search in read-only mode at once; a query missing here is still
 # searched for real, on its own, at the cost of switching mode for it.
@@ -803,4 +945,7 @@ READ_ONLY_QUERIES = [
     *(query for query, _expected in K13_COMMANDS),
     *(query for query, _expected in L10_REVIEWER_COMMANDS + L10_MORE_COMMANDS),
     *L10_MORE_REPORTING_QUERIES,
+    *(query for query, _tool in M3_REVIEWER_QUERIES),
+    *M3_MORE_REPORTING_QUERIES,
+    *(query for query, _expected in M3_COMMANDS),
 ]
