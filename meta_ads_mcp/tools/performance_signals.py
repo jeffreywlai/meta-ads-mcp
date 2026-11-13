@@ -2926,6 +2926,13 @@ def _results_reported(rows: list[dict[str, Any]]) -> bool:
     return any((row.get("meta_result") or {}).get("status") in ("read", "mixed", "unreadable") for row in rows)
 
 
+GOAL_VOLUME_MIN_DAYS = 7
+_SHORT_WINDOW_REASON = (
+    "The window has fewer than 7 days. Meta's learning-phase guidance counts events over 7 days, and a shorter "
+    "window is not scaled up to a week, so the goal is not assessed."
+)
+
+
 def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[str, Any]]:
     """Summarize, per optimization goal, how many ad sets reach the learning-phase weekly volume, with the top spenders.
 
@@ -2947,14 +2954,15 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
         unknown_spend = sum(1 for row in goal_rows if to_float((row.get("metrics") or {}).get("spend")) is None)
         mapping = GOAL_EVENT_BASIS.get(goal)
         unidentified = GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal.")
-        if mapping is None and not _results_reported(goal_rows):
+        short_window = lookback_days < GOAL_VOLUME_MIN_DAYS
+        if short_window or (mapping is None and not _results_reported(goal_rows)):
             output.append({
                 "optimization_goal": goal,
                 "adset_count": len(goal_rows),
                 "spend": goal_spend,
                 "adsets_with_unknown_spend": unknown_spend,
                 "verdict": "not_assessed",
-                "reason": unidentified,
+                "reason": _SHORT_WINDOW_REASON if short_window else unidentified,
                 "top_adsets_by_spend": _top_by_spend([_adset_volume_entry(row, None, None) for row in goal_rows]),
             })
             continue
@@ -3192,23 +3200,112 @@ async def _context_adset_rows(
     return rows, result_error, coverage
 
 
+CONTEXT_AD_FIELDS = [*CONTEXT_INSIGHTS_FIELDS, "ad_id", "ad_name"]
+
+
+async def _context_ad_rows(
+    account_id: str, start: date, end: date, ad_ids: list[str],
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
+    """Read the named ads' rows in one ad-level request filtered to their ids (ad.id IN). Never raises for a read failure."""
+    params = insights_tools._insights_params(
+        level="ad", since=start.isoformat(), until=end.isoformat(), limit=len(ad_ids),
+        filtering=[{"field": "ad.id", "operator": "IN", "value": list(ad_ids)}],
+    )
+    coverage: dict[str, Any] = {
+        "mode": "ad_ids",
+        "row_level": "ad",
+        "method": "one ad-level insights request filtered to the named ad ids (ad.id IN), one page",
+        "status": "read",
+        "error": None,
+    }
+    rows: list[dict[str, Any]] = []
+    result_error: str | None = None
+    more = False
+
+    async def read() -> tuple[list[dict[str, Any]], bool, str | None] | BaseException:
+        try:
+            return await _read_one_page_with_results(account_id, CONTEXT_AD_FIELDS, params, level="ad")
+        except _CONTEXT_READ_ERRORS as exc:
+            return exc
+
+    outcome, (account_spend, spend_error) = await asyncio.gather(
+        read(), _context_account_spend(account_id, start, end),
+    )
+    if isinstance(outcome, BaseException):
+        coverage.update({"status": "failed", "error": str(_public_error(outcome).get("message"))})
+    else:
+        read_rows, more, result_error = outcome
+        wanted = set(ad_ids)
+        seen: set[str] = set()
+        for row in read_rows:
+            key = str(row.get("ad_id") or "")
+            if key in wanted and key not in seen:
+                seen.add(key)
+                rows.append(row)
+    examined_spend = _known_total_spend(rows)
+    share = _ratio(examined_spend, account_spend)
+    coverage.update({
+        "ads_examined": len(rows),
+        "more_ads_exist": more,
+        "examined_spend": examined_spend,
+        "account_spend": account_spend,
+        "account_spend_error": spend_error,
+        "share_of_account_spend": None if share is None else min(share, 1.0),
+        "complete": coverage["status"] == "read" and not more,
+    })
+    return rows, result_error, coverage
+
+
+_AD_SCOPE_GOAL_REASON = (
+    "ad_ids names ads, but Meta's learning phase counts optimization events per ad set, and the named ads may be "
+    "only part of their ad sets' delivery, so weekly volume per ad set is not assessed. Pass the ad set ids "
+    "(adset_ids_of_named_ads) in object_ids to assess it."
+)
+
+
+def _ad_scope_goal_volume(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per goal, the named ads and their ad sets; the learning-phase volume itself is not judged for ads."""
+    by_goal: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_goal.setdefault(str(row.get("optimization_goal") or "UNKNOWN"), []).append(row)
+    output = []
+    for goal in sorted(by_goal):
+        goal_rows = by_goal[goal]
+        adset_ids = list(dict.fromkeys(str(row["adset_id"]) for row in goal_rows if row.get("adset_id")))
+        output.append({
+            "optimization_goal": goal,
+            "ad_count": len(goal_rows),
+            "spend": _known_total_spend(goal_rows),
+            "verdict": "not_assessed",
+            "reason": _AD_SCOPE_GOAL_REASON,
+            "adset_ids_of_named_ads": adset_ids[:MAX_CONTEXT_OBJECT_IDS],
+        })
+    return output
+
+
 def _coverage_signal(coverage: dict[str, Any]) -> list[str]:
-    """Plain statements of how much of the account's ad set activity the briefing examined."""
+    """Plain statements of how much of the account's ad set (or named ad) activity the briefing examined."""
+    unit = "ad" if coverage.get("row_level") == "ad" else "ad set"
     if coverage["status"] == "failed":
         return [
-            f"Ad set insights could not be read ({coverage['error']}), so spend by objective and goal, the funnel "
-            "and goal volume are empty; account settings and asset lists are still reported."
+            f"{unit.capitalize()} insights could not be read ({coverage['error']}), so spend by objective and goal, "
+            "the funnel and goal volume are empty; account settings and asset lists are still reported."
         ]
     signals = []
     if coverage["status"] == "partly_read":
         signals.append(f"One of the filtered ad set reads failed ({coverage['error']}); the other was used.")
-    if coverage["more_adsets_exist"]:
+    if coverage.get("more_adsets_exist") or coverage.get("more_ads_exist"):
         share = coverage["share_of_account_spend"]
         covered = f", covering {share:.0%} of the account's spend in the window" if share is not None else ""
-        which = "highest-spending ad sets" if coverage["mode"] == "top_spenders" else "ad sets under the named objects"
+        which = {
+            "top_spenders": "highest-spending ad sets",
+            "object_ids": "ad sets under the named objects",
+            "ad_ids": "named ads",
+        }[coverage["mode"]]
+        examined = coverage.get("adsets_examined", coverage.get("ads_examined"))
         signals.append(
-            f"Partial briefing: examined the {coverage['adsets_examined']} {which}{covered}; the remaining ad sets "
-            "were not examined, so spend, funnel and goal sections describe only the examined ones."
+            f"Partial briefing: examined the {examined} {which}{covered}; the remaining {unit}s were not examined, "
+            "so spend, funnel and goal sections describe only the examined ones."
         )
     if coverage.get("account_spend_error"):
         signals.append(
@@ -3218,36 +3315,77 @@ def _coverage_signal(coverage: dict[str, Any]) -> list[str]:
     return signals
 
 
+def _context_window(
+    lookback_days: int | None, since: str | None, until: str | None,
+) -> tuple[tuple[date, date] | None, int]:
+    """Validate the briefing window before any network call: lookback_days, or an explicit since and until."""
+    explicit = _explicit_window(since, until)
+    if explicit is not None and lookback_days is not None:
+        raise ValidationError("Give lookback_days or since and until, not both.")
+    if explicit is None:
+        days = CONTEXT_DEFAULT_LOOKBACK_DAYS if lookback_days is None else lookback_days
+        if isinstance(days, bool) or not 7 <= days <= 90:
+            raise ValidationError("lookback_days must be between 7 and 90.")
+        return None, days
+    return explicit, (explicit[1] - explicit[0]).days + 1
+
+
+CONTEXT_DEFAULT_LOOKBACK_DAYS = 30
+
+
 @mcp_server.tool()
 async def get_advertiser_context(
     account_id: str,
-    lookback_days: int = 30,
+    lookback_days: int | None = None,
     object_ids: StringList | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    ad_ids: StringList | None = None,
 ) -> dict[str, Any]:
-    """Briefing built from this account's data: account and business settings, spend by objective and optimization goal, funnel event volumes with drop-off, pixels/datasets and custom conversions, Pages and Instagram identities, and which optimization goals get about 50 events per ad set per week, judged on Meta's own result for each ad set. object_ids (up to 50 numeric campaign or ad set ids in this account) limits the spend, funnel and goal sections to those; account settings and the asset lists stay account-wide. Derived here; not Meta's own summary."""
+    """Briefing built from this account's data: account and business settings, spend by objective and optimization goal, funnel event volumes with drop-off, pixels/datasets and custom conversions, Pages and Instagram identities, and which optimization goals get about 50 events per ad set per week, judged on each ad set's own Meta result. Window: lookback_days (7 to 90, default 30, ending yesterday in the account's time zone) or since and until (YYYY-MM-DD, up to 366 days). object_ids (up to 50 numeric campaign or ad set ids) or ad_ids (up to 50 numeric ad ids) limits the spend, funnel and goal sections to those; account settings and the asset lists stay account-wide. Derived here; not Meta's own summary."""
     resolved_account_id = _require_account_id(account_id)
-    if not 7 <= lookback_days <= 90:
-        raise ValidationError("lookback_days must be between 7 and 90.")
+    explicit, window_days = _context_window(lookback_days, since, until)
     has_ids = object_ids is not None and coerce_csv_string_list(object_ids) not in ([], "")
+    has_ad_ids = ad_ids is not None and coerce_csv_string_list(ad_ids) not in ([], "")
+    if has_ids and has_ad_ids:
+        raise ValidationError("Give object_ids (campaigns or ad sets) or ad_ids, not both.")
     scope_ids = _require_graph_ids(object_ids, limit=MAX_CONTEXT_OBJECT_IDS) if has_ids else None
+    scope_ad_ids = _require_graph_ids(ad_ids, field="ad_ids", limit=MAX_CONTEXT_OBJECT_IDS) if has_ad_ids else None
     client = get_graph_api_client()
     account = await client.get_object(resolved_account_id, fields=CONTEXT_ACCOUNT_FIELDS)
     today, reporting_timezone, timezone_signal = await _reporting_today(
         "account", resolved_account_id, account=account,
     )
-    end = today - timedelta(days=1)
-    start = end - timedelta(days=lookback_days - 1)
-    (rows, result_error, adset_coverage), *edge_sections = await asyncio.gather(
-        _context_adset_rows(resolved_account_id, start, end, scope_ids),
+    if explicit is None:
+        end = today - timedelta(days=1)
+        start = end - timedelta(days=window_days - 1)
+        window_source = "lookback_days"
+    else:
+        start, end = explicit
+        window_source = "since_until"
+    if scope_ad_ids is not None:
+        rows_read = _context_ad_rows(resolved_account_id, start, end, scope_ad_ids)
+    else:
+        rows_read = _context_adset_rows(resolved_account_id, start, end, scope_ids)
+    (rows, result_error, row_coverage), *edge_sections = await asyncio.gather(
+        rows_read,
         *(
             _optional_edge_section(client, resolved_account_id, edge, fields)
             for _, edge, fields in CONTEXT_EDGE_SECTIONS
         ),
     )
+    ad_scope = scope_ad_ids is not None
+    unit, units = ("ad", "ads") if ad_scope else ("ad set", "ad sets")
     missing_signals: list[str] = [timezone_signal] if timezone_signal else []
-    missing_signals.extend(_coverage_signal(adset_coverage))
+    if explicit is not None and end >= today:
+        missing_signals.append(
+            f"The window ends on {end.isoformat()}, on or after today ({today.isoformat()}) in the account's time "
+            "zone, so its last days are incomplete or empty."
+        )
+    missing_signals.extend(_coverage_signal(row_coverage))
     scope: dict[str, Any] = {"level": "account", "object_id": resolved_account_id}
     object_scope: dict[str, Any] | None = None
+    account_wide = ["account", "datasets", "custom_conversions", "pages", "instagram_accounts"]
     if scope_ids is not None:
         matched = {str(row.get(key)) for row in rows for key in ("campaign_id", "adset_id") if row.get(key)}
         unmatched = [value for value in scope_ids if value not in matched]
@@ -3256,13 +3394,29 @@ async def get_advertiser_context(
             "object_ids": scope_ids,
             "matched_adset_rows": len(rows),
             "unmatched_object_ids": unmatched,
-            "method": adset_coverage["method"],
-            "account_wide_sections": ["account", "datasets", "custom_conversions", "pages", "instagram_accounts"],
+            "method": row_coverage["method"],
+            "account_wide_sections": account_wide,
         }
-        if unmatched and adset_coverage["status"] != "failed":
+        if unmatched and row_coverage["status"] != "failed":
             missing_signals.append(
                 "No ad set insights rows in the window matched " + ", ".join(unmatched)
                 + " (not a campaign or ad set of this account, or no delivery in the window)."
+            )
+    if scope_ad_ids is not None:
+        matched = {str(row.get("ad_id")) for row in rows if row.get("ad_id")}
+        unmatched = [value for value in scope_ad_ids if value not in matched]
+        scope["ad_ids"] = scope_ad_ids
+        object_scope = {
+            "ad_ids": scope_ad_ids,
+            "matched_ad_rows": len(rows),
+            "unmatched_ad_ids": unmatched,
+            "method": row_coverage["method"],
+            "account_wide_sections": account_wide,
+        }
+        if unmatched and row_coverage["status"] != "failed":
+            missing_signals.append(
+                "No ad insights rows in the window matched " + ", ".join(unmatched)
+                + " (not an ad of this account, or no delivery in the window)."
             )
     currency = _supported_currency(account.get("currency"))
     money: dict[str, float | None] = {}
@@ -3274,21 +3428,21 @@ async def get_advertiser_context(
     business = account.get("business") if isinstance(account.get("business"), dict) else None
 
     total_spend = _known_total_spend(rows)
-    if not rows and adset_coverage["status"] != "failed":
-        missing_signals.append("Meta returned no ad set insights rows for the lookback window.")
+    if not rows and row_coverage["status"] != "failed":
+        missing_signals.append(f"Meta returned no {unit} insights rows for the window.")
     elif total_spend is None:
         missing_signals.append(
-            "At least one ad set row had no spend, so total spend and spend shares are null rather than computed "
+            f"At least one {unit} row had no spend, so total spend and spend shares are null rather than computed "
             "from zero."
         )
     if result_error is not None:
         missing_signals.append(
-            f"Meta rejected the request for its result fields ({result_error}), so ad set results are null and goal "
+            f"Meta rejected the request for its result fields ({result_error}), so {unit} results are null and goal "
             "volume falls back to the goal's own event where that is known."
         )
     elif rows and not _results_reported(rows):
         missing_signals.append(
-            "Meta reported no result for any ad set, so results are null and goal volume is judged only for goals "
+            f"Meta reported no result for any {unit}, so results are null and goal volume is judged only for goals "
             "whose event is known from the goal itself (LEAD_GENERATION, LINK_CLICKS, LANDING_PAGE_VIEWS)."
         )
     sections = {
@@ -3297,14 +3451,14 @@ async def get_advertiser_context(
     section_errors = {name: section["error"] for name, section in sections.items() if not section["available"]}
     for name, error in section_errors.items():
         missing_signals.append(f"{name}: Meta returned an error, so this section is unknown ({error.get('message')}).")
-    goal_volume = _goal_volume(rows, lookback_days)
+    goal_volume = _ad_scope_goal_volume(rows) if ad_scope else _goal_volume(rows, window_days)
     unassessed = [entry for entry in goal_volume if entry["verdict"] == "not_assessed"]
     if unassessed:
+        count_key = "ad_count" if ad_scope else "adset_count"
         missing_signals.append(
             "Weekly optimization event volume was not assessed for "
-            + ", ".join(f"{entry['optimization_goal']} ({entry['adset_count']} ad sets)" for entry in unassessed)
-            + " because no ad set's optimization events could be identified or read from its own insights; see "
-            "each goal's reason in optimization_goal_volume."
+            + ", ".join(f"{entry['optimization_goal']} ({entry[count_key]} {units})" for entry in unassessed)
+            + "; see each goal's reason in optimization_goal_volume."
         )
 
     extra: dict[str, Any] = {
@@ -3312,7 +3466,12 @@ async def get_advertiser_context(
         "derived_note": (
             "Built by this server from the account's own data. This is not Meta's own advertiser summary."
         ),
-        "window": {"since": start.isoformat(), "until": end.isoformat(), "days": lookback_days},
+        "window": {
+            "since": start.isoformat(), "until": end.isoformat(), "days": window_days, "source": window_source,
+            "weekly_volume_basis": (
+                f"events in these {window_days} days / {window_days} x 7; there is no comparison period"
+            ),
+        },
         "reporting_timezone": reporting_timezone,
         "account": {
             "id": str(account.get("id") or resolved_account_id),
@@ -3330,28 +3489,37 @@ async def get_advertiser_context(
             "money_units": f"major units of {currency}" if currency else None,
             "created_time": account.get("created_time"),
         },
-        "spend_by_objective": _group_spend(rows, "objective", total_spend, result_error=result_error),
-        "spend_by_optimization_goal": _group_spend(rows, "optimization_goal", total_spend, result_error=result_error),
+        "spend_by_objective": _group_spend(
+            rows, "objective", total_spend, result_error=result_error, unit="ad" if ad_scope else "adset",
+        ),
+        "spend_by_optimization_goal": _group_spend(
+            rows, "optimization_goal", total_spend, result_error=result_error, unit="ad" if ad_scope else "adset",
+        ),
         "funnel": _funnel(_sum_actions(rows)),
         "optimization_goal_volume": goal_volume,
         "optimization_goal_volume_rule": (
-            f"An ad set meets the threshold when its events / lookback_days x 7 is at least "
+            f"An ad set meets the threshold when its events / window days x 7 is at least "
             f"{LEARNING_EVENTS_PER_WEEK}, following Meta's learning-phase guidance of about 50 optimization "
-            "events per ad set in a 7-day period. Events are Meta's own result for the ad set when Meta reports "
-            "results; a result that is not an action count (for example reach) is not judged. Only ad sets with "
+            "events per ad set in a 7-day period. Events are each ad set's own Meta result when it reports one, "
+            "otherwise its goal's own event where the goal identifies it; a result that is not an action count "
+            "(for example reach) is not judged, and windows shorter than 7 days are not judged. Only ad sets with "
             f"spend in the window are counted. Each goal lists counts and the {GOAL_VOLUME_TOP_ADSETS} "
             "highest-spending ad sets that meet and that miss the threshold, not every ad set."
         ),
         **sections,
         "section_errors": section_errors,
         "results_definition": RESULTS_DEFINITION,
-        "adset_coverage": adset_coverage,
+        ("ad_coverage" if ad_scope else "adset_coverage"): row_coverage,
     }
     if object_scope is not None:
         extra["object_scope"] = object_scope
     return analysis_response(
         scope=scope,
-        metrics={"spend": total_spend, "adset_rows": len(rows), "account_spend": adset_coverage["account_spend"]},
+        metrics={
+            "spend": total_spend,
+            ("ad_rows" if ad_scope else "adset_rows"): len(rows),
+            "account_spend": row_coverage["account_spend"],
+        },
         missing_signals=missing_signals,
         extra=extra,
     )

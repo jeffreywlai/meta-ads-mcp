@@ -2969,3 +2969,144 @@ def test_series_periods_validation_makes_no_calls(monkeypatch, kwargs) -> None:
     with pytest.raises(ValidationError):
         asyncio.run(performance_signals.get_performance_trend(since="2026-11-01", until="2026-11-02", **kwargs))
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Round three: advertiser context with an explicit date range and with ad ids
+# ---------------------------------------------------------------------------
+
+
+def test_advertiser_context_explicit_range_is_sent_and_stated(monkeypatch) -> None:
+    client = _patch(monkeypatch, _context_client())
+    _pin_now(monkeypatch, datetime(2026, 11, 12, 17, tzinfo=timezone.utc))
+
+    result = asyncio.run(performance_signals.get_advertiser_context(
+        account_id="act_42", since="2026-10-01", until="2026-10-14",
+    ))
+
+    for call in _calls(client, "get_insights"):
+        assert json.loads(call["params"]["time_range"]) == {"since": "2026-10-01", "until": "2026-10-14"}
+    assert result["window"]["since"] == "2026-10-01" and result["window"]["until"] == "2026-10-14"
+    assert result["window"]["days"] == 14 and result["window"]["source"] == "since_until"
+    assert "no comparison period" in result["window"]["weekly_volume_basis"]
+    clicks = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}["LINK_CLICKS"]
+    assert clicks["top_meeting_threshold"][0]["events_per_week"] == pytest.approx(1000 / 14 * 7)
+    assert not any("incomplete" in signal for signal in result["missing_signals"])
+
+
+def test_advertiser_context_default_window_is_still_thirty_days_to_yesterday(monkeypatch) -> None:
+    client = _patch(monkeypatch, _context_client())
+    _pin_now(monkeypatch, datetime(2026, 11, 12, 17, tzinfo=timezone.utc))
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+    assert result["window"] == {
+        "since": "2026-10-13", "until": "2026-11-11", "days": 30, "source": "lookback_days",
+        "weekly_volume_basis": "events in these 30 days / 30 x 7; there is no comparison period",
+    }
+    assert json.loads(_calls(client, "get_insights")[0]["params"]["time_range"])["until"] == "2026-11-11"
+
+
+def test_advertiser_context_range_reaching_today_says_its_last_days_are_incomplete(monkeypatch) -> None:
+    _patch(monkeypatch, _context_client())
+    _pin_now(monkeypatch, datetime(2026, 11, 12, 17, tzinfo=timezone.utc))
+    result = asyncio.run(performance_signals.get_advertiser_context(
+        account_id="act_42", since="2026-11-01", until="2026-11-12",
+    ))
+    assert any("incomplete" in signal and "2026-11-12" in signal for signal in result["missing_signals"])
+
+
+def test_advertiser_context_short_range_does_not_scale_goal_volume_up_to_a_week(monkeypatch) -> None:
+    _patch(monkeypatch, _context_client())
+    result = asyncio.run(performance_signals.get_advertiser_context(
+        account_id="act_42", since="2026-11-01", until="2026-11-03",
+    ))
+    assert result["window"]["days"] == 3
+    assert {entry["verdict"] for entry in result["optimization_goal_volume"]} == {"not_assessed"}
+    assert all("fewer than 7 days" in entry["reason"] for entry in result["optimization_goal_volume"])
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"since": "2026-11-01"},
+    {"until": "2026-11-01"},
+    {"since": "2026-11-05", "until": "2026-11-01"},
+    {"since": "2026-11-01", "until": "2026-13-01"},
+    {"since": "2025-01-01", "until": "2026-11-01"},
+    {"since": "2026-11-01", "until": "2026-11-05", "lookback_days": 30},
+    {"lookback_days": True},
+    {"ad_ids": ["1"], "object_ids": ["2"]},
+    {"ad_ids": ["ad_1"]},
+    {"ad_ids": [str(index) for index in range(51)]},
+])
+def test_advertiser_context_window_and_ad_ids_validation_makes_no_calls(monkeypatch, kwargs) -> None:
+    client = _patch(monkeypatch, RecordingClient())
+    with pytest.raises(ValidationError):
+        asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", **kwargs))
+    assert client.calls == []
+
+
+def _ad_context_rows() -> list[dict[str, Any]]:
+    rows = []
+    for ad_id, adset_id, goal, spend, clicks in (("901", "301", "LINK_CLICKS", 60, 600), ("902", "301", "LINK_CLICKS", 40, 300),
+                                                 ("903", "302", "OFFSITE_CONVERSIONS", 100, 50)):
+        row = _adset_row(adset_id, objective="OUTCOME_TRAFFIC", goal=goal, spend=spend,
+                         actions={"link_click": clicks})
+        row.update({"ad_id": ad_id, "ad_name": f"Ad {ad_id}"})
+        rows.append(row)
+    rows[0]["results"] = _meta_result("actions:link_click", 600)
+    rows[1]["results"] = _meta_result("actions:link_click", 300)
+    return rows
+
+
+def test_advertiser_context_ad_ids_read_only_the_named_ads(monkeypatch) -> None:
+    rows = _ad_context_rows()
+
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "1000"}]}
+        assert params["level"] == "ad"
+        (selector,) = params["filtering"]
+        assert selector == {"field": "ad.id", "operator": "IN", "value": ["901", "902", "903", "999"]}
+        return {"data": [row for row in rows if row["ad_id"] in selector["value"]]}
+
+    client = _context_client()
+    client.insights_handler = handler
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(
+        account_id="act_42", ad_ids=["901", "902", "903", "999"], lookback_days=7,
+    ))
+
+    calls = _calls(client, "get_insights")
+    assert sorted(call["params"]["level"] for call in calls) == ["account", "ad"]
+    ad_call = next(call for call in calls if call["params"]["level"] == "ad")
+    assert {"ad_id", "results", "optimization_goal"} <= set(ad_call["fields"])
+    assert result["scope"]["ad_ids"] == ["901", "902", "903", "999"]
+    assert result["metrics"]["ad_rows"] == 3 and result["metrics"]["spend"] == 200.0
+    assert result["object_scope"]["unmatched_ad_ids"] == ["999"]
+    assert any("999" in signal for signal in result["missing_signals"])
+    assert result["ad_coverage"]["share_of_account_spend"] == pytest.approx(0.2)
+    assert "adset_coverage" not in result
+    by_goal = {row["optimization_goal"]: row for row in result["spend_by_optimization_goal"]}
+    assert by_goal["LINK_CLICKS"]["ad_count"] == 2
+    assert by_goal["LINK_CLICKS"]["results"] == 900.0
+    assert by_goal["LINK_CLICKS"]["cost_per_result"] == pytest.approx(100 / 900)
+    volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
+    assert volume["LINK_CLICKS"]["verdict"] == "not_assessed"
+    assert volume["LINK_CLICKS"]["adset_ids_of_named_ads"] == ["301"]
+    assert "per ad set" in volume["LINK_CLICKS"]["reason"]
+    assert result["funnel"]["steps"][0]["count"] == 950
+    assert result["datasets"]["items"][0]["id"] == "px_1"
+
+
+def test_advertiser_context_ad_read_failure_is_reported_not_raised(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        if params["level"] == "account":
+            return {"data": [{"spend": "1000"}]}
+        raise _permission_error()
+
+    client = _context_client()
+    client.insights_handler = handler
+    _patch(monkeypatch, client)
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", ad_ids=["901"]))
+    assert result["ad_coverage"]["status"] == "failed"
+    assert result["metrics"]["ad_rows"] == 0
+    assert any(signal.startswith("Ad insights could not be read") for signal in result["missing_signals"])
