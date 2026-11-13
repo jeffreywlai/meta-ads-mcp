@@ -649,7 +649,7 @@ def test_eligibility_reports_incomplete_entity_study_read(monkeypatch, paging) -
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"level": "ad", "entity_ids": ["a1"]},
+    {"level": "creative", "entity_ids": ["a1"]},
     {"level": "campaign", "entity_ids": []},
     {"level": "campaign", "entity_ids": [" "]},
 ])
@@ -1599,3 +1599,108 @@ def test_g15_study_cells_and_objectives_on_a_repeated_page_are_read_once(monkeyp
     assert summary["objectives_complete"] is False
     assert "already been read" in summary["cells_stop_reason"]
     assert "already been read" in summary["objectives_stop_reason"]
+
+
+# --- round three (P4): ad-level eligibility for creative tests --------------------------
+
+
+def _ad(ad_id, adset_id="20", campaign_id="30", account="123", status="ACTIVE"):
+    return {"id": ad_id, "name": f"Ad {ad_id}", "account_id": account, "adset_id": adset_id,
+            "campaign_id": campaign_id, "effective_status": status}
+
+
+def _adset(adset_id, campaign_id="30", account="123", status="ACTIVE"):
+    return {"id": adset_id, "name": f"Ad set {adset_id}", "account_id": account, "campaign_id": campaign_id,
+            "effective_status": status, "optimization_goal": "OFFSITE_CONVERSIONS", "billing_event": "IMPRESSIONS"}
+
+
+def test_ad_level_eligibility_reads_each_ad_its_parents_and_their_studies(monkeypatch) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={
+        "41": _ad("41"), "42": _ad("42"), "20": _adset("20"), "30": _campaign("30"),
+    }))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="ad", entity_ids=["41", "42"]))
+    gets = [(call[1], call[2]) for call in client.calls if call[0] == "get"]
+    # Shared parents are read once, with documented Ad, Ad Set and Campaign fields.
+    assert gets == [
+        ("41", ["id", "name", "account_id", "adset_id", "campaign_id", "effective_status"]),
+        ("20", ["id", "name", "account_id", "campaign_id", "effective_status", "optimization_goal", "billing_event"]),
+        ("30", ["id", "name", "account_id", "effective_status", "objective", "buying_type"]),
+        ("42", ["id", "name", "account_id", "adset_id", "campaign_id", "effective_status"]),
+    ]
+    edges = [(call[1], call[2]) for call in client.calls if call[0] == "list"]
+    # No ad_studies read on the ads themselves: Meta documents no such edge on ads.
+    assert edges == [("20", "ad_studies"), ("30", "ad_studies"), ("act_123", "impacting_ad_studies")]
+    assert result["precheck_outcome"] == "passed"
+    entity = result["entities"][0]
+    assert entity["level"] == "ad"
+    assert (entity["adset_id"], entity["campaign_id"], entity["effective_status"]) == ("20", "30", "ACTIVE")
+    assert entity["parents"]["adset"]["effective_status"] == "ACTIVE"
+    assert entity["parents"]["campaign"]["objective"] == "OUTCOME_SALES"
+    assert entity["active_studies"] == []
+    assert entity["active_studies_complete"] is True
+    assert entity["own_study_membership"].startswith("not_checked")
+    assert any("ad_studies edge on ads" in item for item in result["not_checked"])
+    assert any("2 to 7 cells" in rule["rule"] for rule in result["rules_applied"])
+
+
+def test_ad_level_eligibility_settles_what_the_parents_show(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={
+            "41": _ad("41", account="999"),
+            "42": _ad("42", adset_id="21"),
+            "21": _adset("21", status="ARCHIVED"),
+            "30": _campaign("30"),
+            "20": _adset("20"),
+        },
+        edges={("30", "ad_studies"): {"data": [_study("s9", "SPLIT_TEST", *RUNNING)]}},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="ad", entity_ids=["41", "42"]))
+    first, second = result["entities"]
+    assert first["outcome"] == "failed"
+    assert any("999" in blocker for blocker in first["blockers"])
+    assert second["outcome"] == "inconclusive"
+    assert any("parent ad set 21" in message and "ARCHIVED" in message for message in second["unresolved"])
+    assert any("parent campaign 30 is already in 1" in message for message in second["unresolved"])
+    assert second["active_studies"] == [
+        {"id": "s9", "name": "Study s9", "type": "SPLIT_TEST", "state": "running",
+         "found_on": "campaign", "found_on_id": "30"},
+    ]
+    assert result["precheck_outcome"] == "failed"
+
+
+def test_ad_level_eligibility_unreadable_parent_is_inconclusive(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"41": _ad("41"), "30": _campaign("30")},
+        errors={"20": MetaApiError(message="(#200) Permissions error", code=200),
+                ("20", "ad_studies"): MetaApiError(message="(#200) Permissions error", code=200)},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="ad", entity_ids=["41"]))
+    entity = result["entities"][0]
+    assert entity["outcome"] == "inconclusive"
+    assert entity["parents"]["adset"]["read_error"]
+    assert entity["active_studies_complete"] is False
+    assert any("parent ad set 20" in signal for signal in result["missing_signals"])
+    assert result["precheck_outcome"] == "inconclusive"
+
+
+def test_ad_level_eligibility_missing_parent_ids_are_not_a_pass(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(objects={"41": {"id": "41", "account_id": "123", "effective_status": "ACTIVE"}}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="ad", entity_ids=["41"]))
+    entity = result["entities"][0]
+    assert entity["outcome"] == "inconclusive"
+    assert entity["parents"] == {"adset": None, "campaign": None}
+    assert entity["active_studies_complete"] is False
+
+
+def test_ad_level_eligibility_warns_beyond_seven_ads(monkeypatch) -> None:
+    ads = {str(40 + index): _ad(str(40 + index)) for index in range(8)}
+    use(monkeypatch, FakeStudyClient(objects={**ads, "20": _adset("20"), "30": _campaign("30")}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="ad", entity_ids=list(ads)))
+    assert any("2 to 7 cells" in warning for warning in result["account"]["warnings"])
+    assert not any("at least 10" in warning for warning in result["account"]["warnings"])
+
+
+def test_ad_level_eligibility_through_the_mcp_boundary(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(objects={"41": _ad("41"), "20": _adset("20"), "30": _campaign("30")}))
+    result = _mcp_call("check_ab_test_eligibility", {"account_id": "123", "level": "ad", "entity_ids": "41"})
+    assert result.structured_content["precheck_outcome"] == "passed"
