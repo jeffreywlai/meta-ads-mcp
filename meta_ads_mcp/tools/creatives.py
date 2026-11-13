@@ -5,9 +5,11 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Annotated, Any, TypeAlias
 from urllib.parse import quote, quote_plus
 
@@ -413,6 +415,34 @@ def _read_image_file(file_path: str) -> LocalUpload:
     )
 
 
+def _legacy_image_file_name(file_path: str, resolved_name: str) -> str:
+    """The multipart file name master sent: the last part of the caller's path.
+
+    master's Graph client sent Path(file_path).name, so an accepted link inside the upload
+    folder (hero.jpg pointing to source.png) went up as hero.jpg, and Meta keys its answer
+    by that name. Only a single, plain path component is used; anything else (empty, . or
+    .., a separator, a control or invisible character) falls back to the real file's name.
+    """
+    name = Path(file_path.strip()).expanduser().name if isinstance(file_path, str) else ""
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or any(unicodedata.category(character).startswith("C") for character in name)
+    ):
+        return resolved_name
+    return name
+
+
+def _image_file_forms(file_path: str, *names: str) -> list[str]:
+    """Every way an error could repeat a local image's path or name, for scrubbing."""
+    forms: list[str] = []
+    for text in (file_path, file_path.strip(), str(Path(file_path.strip()).expanduser()), *names):
+        forms.extend(_secret_forms(text))
+    return forms
+
+
 @mcp_server.tool()
 async def upload_creative_asset(
     account_id: str,
@@ -426,12 +456,20 @@ async def upload_creative_asset(
     image_file = _read_image_file(file_path) if file_path else None
     client = get_graph_api_client()
     if image_file is not None:
-        result = await client.upload_ad_image(
-            normalize_account_id(account_id),
-            file_name=image_file.name,
-            file_content=image_file.content,
-            name=name,
-        )
+        # Accepted: send the name master's Graph client sent, the last part of the caller's path.
+        file_name = _legacy_image_file_name(file_path, image_file.name)
+        try:
+            result = await client.upload_ad_image(
+                normalize_account_id(account_id),
+                file_name=file_name,
+                file_content=image_file.content,
+                name=name,
+            )
+        except Exception as exc:
+            # A file name can itself be private: no error or log line names the file or its
+            # path, even when Meta's own error text repeats it.
+            _scrub_error(exc, _image_file_forms(file_path, image_file.name, file_name), FILE_SHOWN)
+            raise
     else:
         result = await client.upload_ad_image(
             normalize_account_id(account_id),
@@ -677,6 +715,9 @@ async def _chunked_video_upload(
         )
         if not (isinstance(finished, dict) and finished.get("success") is True):
             raise _ChunkedUploadStopped("Meta did not confirm the finish (no success: true in its answer).")
+        # Meta has finished the video; a change while the finish was in flight is reported
+        # with the result, never as a failure.
+        changed_after = _video_file_change(video)
     except _ChunkedUploadStopped as stop:
         raise MetaApiError(message=stopped_message(str(stop))) from None
     except ValidationError as exc:
@@ -691,6 +732,7 @@ async def _chunked_video_upload(
     return {
         "video_id": video_id or None,
         "finish": finished,
+        "changed_after_send": changed_after,
         "upload": {
             "mode": "chunked",
             "upload_session_id": session_id,
@@ -828,10 +870,13 @@ async def _upload_video_file(
                     "file_path changed while it was being read (its size or modification time differs from when it "
                     "was opened), so nothing was sent. Upload it again once it is complete."
                 )
-        return await _upload_video_request(
+        response = await _upload_video_request(
             account, target, data=dict(meta_fields), files={"source": (video.name, content)},
             shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
         )
+        if not dry_run:
+            _note_change_after_send(response, _video_file_change(video))
+        return response
     if dry_run:
         return {
             "ok": True,
@@ -846,7 +891,39 @@ async def _upload_video_file(
     response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
     response.update(await _read_video_status(client, outcome["video_id"]))
+    _note_change_after_send(response, outcome["changed_after_send"])
     return response
+
+
+def _note_change_after_send(response: dict[str, Any], change: str | None) -> None:
+    """Keep a finished upload's success, and say plainly when the local file changed after its bytes were sent.
+
+    Meta already has the video, so this is never an error and does not suggest uploading
+    again blindly: the caller checks the uploaded video first.
+    """
+    if change is None:
+        return
+    video_id = response.get("video_id")
+    video = f"video {video_id}" if video_id else "the video"
+    check = f"list_ad_videos(video_ids=['{video_id}'])" if video_id else "list_ad_videos"
+    if change == _FILE_CHANGED:
+        response["file_changed"] = True
+        warning = (
+            f"The upload finished on Meta's side ({video}), but the local file changed after its last bytes were "
+            "sent (its size or modification time differs from when it was opened). The uploaded video may be "
+            "missing the end of the file or differ from it now. Check the video with "
+            f"{check} and watch it before using it; upload the finished file again only if the video is incomplete."
+        )
+    else:
+        response["file_changed"] = None
+        warning = (
+            f"The upload finished on Meta's side ({video}), but the local file could not be checked for changes "
+            f"after its last bytes were sent. Check the video with {check} and watch it before using it."
+        )
+    response["warnings"] = [*response.get("warnings", []), warning]
+    response["status_note"] = (
+        f"Check the video with {check} before using it: the local file may not match what was uploaded (see warnings)."
+    )
 
 
 async def _upload_video_request(
@@ -1251,6 +1328,12 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _ceil_second(moment: datetime) -> datetime:
+    """moment rounded up to a whole second (unchanged when it already is one)."""
+    whole = moment.replace(microsecond=0)
+    return whole if whole == moment else whole + timedelta(seconds=1)
+
+
 def _upper(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
@@ -1262,15 +1345,17 @@ def _upper(value: Any, field_name: str) -> str | None:
 def _boost_billing_events(goal: str, destination: str | None) -> tuple[str, ...]:
     """Billing events for a goal, from Meta's optimization goal and billing event table.
 
-    The messaging and call ads guides require IMPRESSIONS for their destinations.
+    The messaging and call ads guides require IMPRESSIONS for their destinations. The
+    table (bidding/overview/billing-events) pairs each of LINK_CLICKS, THRUPLAY and
+    TWO_SECOND_CONTINUOUS_VIDEO_VIEWS with itself as a billing event. POST_ENGAGEMENT
+    billing ("not an option" since v2.11) and VIDEO_VIEWS billing (in no labelled row)
+    are not offered.
     """
     allowed = [BOOST_BILLING_EVENT]
     if destination in _MESSAGING_DESTINATIONS or destination == "PHONE_CALL":
         return tuple(allowed)
-    if goal == "LINK_CLICKS":
-        allowed.append("LINK_CLICKS")
-    if goal == "THRUPLAY":
-        allowed.append("THRUPLAY")
+    if goal in ("LINK_CLICKS", "THRUPLAY", "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS"):
+        allowed.append(goal)
     return tuple(allowed)
 
 
@@ -1570,11 +1655,15 @@ def _boost_settings(
         days = BOOST_DEFAULT_DURATION_DAYS if duration_days is None else duration_days
         if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= BOOST_MAX_DURATION_DAYS:
             raise ValidationError(f"duration_days must be a whole number from 1 to {BOOST_MAX_DURATION_DAYS}.")
-        end_at = (start_at + timedelta(days=days)).replace(microsecond=0)
+        # Sent in whole seconds, rounded up: a clock (or a start_time) with a fraction of a
+        # second must never make the run shorter than the days asked for.
+        end_at = _ceil_second(start_at + timedelta(days=days))
         end_sent = end_at.isoformat()
+    # Both checks compare the exact start (with its fraction of a second) and the exact end.
     if end_at - start_at < BOOST_MIN_RUN:
         raise ValidationError("end_time must be at least 24 hours after the start (start_time, or now when it is omitted).")
-    if end_at - start_at > timedelta(days=BOOST_MAX_DURATION_DAYS):
+    # A computed end is at most days (already checked) plus the rounding up above.
+    if end_time is not None and end_at - start_at > timedelta(days=BOOST_MAX_DURATION_DAYS):
         raise ValidationError(f"The ad set can run for at most {BOOST_MAX_DURATION_DAYS} days.")
     given = {
         name for name, value in (
