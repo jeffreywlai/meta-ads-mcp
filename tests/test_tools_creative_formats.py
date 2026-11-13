@@ -2124,3 +2124,373 @@ def test_placement_fallback_note_counts_from_zero(monkeypatch) -> None:
         placement_customizations=[{"image_hash": "a", **_PLACED}, {"image_hash": "b"}],
     ))
     assert any(note.startswith("placement_customizations[1] has no publisher_platforms") for note in result["notes"])
+
+
+# Round ten, X1 to X3: what Meta's live API (v26.0, 2026-11-13) did with enhancement copies.
+# Each fake below serves a creative in the shape Meta's live read returned, and refuses a create
+# body the way Meta did: a top-level call_to_action beside the creative's own story (subcode
+# 2238146), and both thumbnails in video_data (subcode 1443051).
+
+LIVE_LINK = "https://example.com/p"
+LIVE_FEATURES = {"creative_features_spec": {"image_touchups": {"enroll_status": "OPT_IN"}}}
+OPTED_OUT = {"creative_features_spec": {"image_touchups": {"enroll_status": "OPT_OUT"}}}
+# The live read returned creative_sourcing_spec; its value was not recorded, so this one is synthetic.
+LIVE_SOURCING = {"associated_product_set_id": "888"}
+_INLINE = ("link_data", "video_data", "photo_data", "template_data", "text_data")
+
+
+class MetaLikeClient(ProjectingClient):
+    """Serves a live-shaped creative and refuses a create body as Meta's live API did."""
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, data))
+        story = data.get("object_story_spec") if isinstance(data.get("object_story_spec"), dict) else {}
+        if "call_to_action" in data and any(key in story for key in _INLINE):
+            raise MetaApiError(
+                "Invalid parameter", status_code=400, code=100, subcode=2238146,
+                user_title="Call to Action Requires an Existing Instagram Post",
+                user_message="Call to Action field must be used with existing post promotion.",
+            )
+        video = story.get("video_data") if isinstance(story.get("video_data"), dict) else {}
+        if "image_hash" in video and "image_url" in video:
+            raise MetaApiError(
+                "Invalid parameter", status_code=400, code=100, subcode=1443051, user_title="ObjectStorySpecRedundant",
+                user_message="Only one of image_url and image_hash should be specified in the field video_data of object_story_spec.",
+            )
+        return {"id": "999"}
+
+
+LIVE_IMAGE_STORY = {"page_id": "111", "link_data": {
+    "call_to_action": {"type": "LEARN_MORE", "value": {"link": LIVE_LINK}},
+    "description": "Desc", "image_hash": "h1", "link": LIVE_LINK, "message": "Body", "name": "Head",
+}}
+LIVE_SINGLE_IMAGE = {
+    "id": "20", "account_id": "123", "name": "Image",
+    "call_to_action": {"type": "LEARN_MORE", "value": {"link": LIVE_LINK}},
+    "creative_sourcing_spec": LIVE_SOURCING, "instagram_user_id": "222",
+    "object_story_spec": LIVE_IMAGE_STORY, "degrees_of_freedom_spec": LIVE_FEATURES,
+}
+LIVE_VIDEO_STORY = {"page_id": "111", "video_data": {
+    "call_to_action": {"type": "LEARN_MORE", "value": {"link": LIVE_LINK}},
+    "image_hash": "thumb", "image_url": "https://scontent.example.invalid/thumb.jpg?oe=1&sig=2",
+    "message": "Watch", "title": "Title", "video_id": "555",
+}}
+LIVE_SINGLE_VIDEO = {
+    "id": "20", "account_id": "123", "name": "Video",
+    "call_to_action": {"type": "LEARN_MORE", "value": {"link": LIVE_LINK}},
+    "instagram_user_id": "222", "object_story_spec": LIVE_VIDEO_STORY, "degrees_of_freedom_spec": LIVE_FEATURES,
+}
+LIVE_POOL_FEED = {"optimization_type": "DEGREES_OF_FREEDOM", "images": [{"hash": "h1"}, {"hash": "h2"}],
+                  "bodies": [{"text": "Body"}], "call_to_action_types": ["LEARN_MORE"], "link_urls": [{"website_url": LIVE_LINK}]}
+LIVE_POOL_SOURCING = {"images": [{"hash": "h2", "source": "multi_media", "opt_in_status": "opt_in"}]}
+LIVE_ASSET_POOL = {
+    "id": "20", "account_id": "123", "name": "Pool",
+    "call_to_action": {"type": "LEARN_MORE", "value": {"link": LIVE_LINK}},
+    "asset_feed_spec": LIVE_POOL_FEED, "media_sourcing_spec": LIVE_POOL_SOURCING, "instagram_user_id": "222",
+    "object_story_spec": LIVE_IMAGE_STORY, "degrees_of_freedom_spec": LIVE_FEATURES,
+}
+
+
+def _live_run(monkeypatch, creative: dict[str, Any], *, dry_run: bool = False):
+    client = MetaLikeClient(deepcopy(creative))
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}, dry_run=dry_run))
+    return client, result
+
+
+def _sent(client: FakeClient) -> dict[str, Any]:
+    return next(call[3] for call in client.calls if call[0] == "create")
+
+
+def _left_out(result: dict[str, Any]) -> list[str]:
+    return [entry["field"] for entry in result["derived_fields_left_out"]]
+
+
+LIVE_X1_X2_CASES = {
+    "single_image": (LIVE_SINGLE_IMAGE, {
+        "name": "Image (enhancements updated)", "object_story_spec": LIVE_IMAGE_STORY, "instagram_user_id": "222",
+        "creative_sourcing_spec": LIVE_SOURCING, "degrees_of_freedom_spec": OPTED_OUT,
+    }, ["call_to_action"]),
+    "single_video": (LIVE_SINGLE_VIDEO, {
+        "name": "Video (enhancements updated)", "instagram_user_id": "222", "degrees_of_freedom_spec": OPTED_OUT,
+        "object_story_spec": {"page_id": "111", "video_data": {
+            key: value for key, value in LIVE_VIDEO_STORY["video_data"].items() if key != "image_url"
+        }},
+    }, ["call_to_action", "object_story_spec.video_data.image_url"]),
+    "asset_pool": (LIVE_ASSET_POOL, {
+        "name": "Pool (enhancements updated)", "object_story_spec": LIVE_IMAGE_STORY, "asset_feed_spec": LIVE_POOL_FEED,
+        "instagram_user_id": "222", "media_sourcing_spec": LIVE_POOL_SOURCING, "degrees_of_freedom_spec": OPTED_OUT,
+    }, ["call_to_action"]),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(LIVE_X1_X2_CASES))
+def test_x1_x2_live_shapes_send_a_body_meta_accepts_and_attach_it(monkeypatch, shape) -> None:
+    creative, expected, left_out = LIVE_X1_X2_CASES[shape]
+    client, result = _live_run(monkeypatch, creative)
+    assert _sent(client) == expected
+    assert client.calls[-1] == ("update", "10", {"creative": {"creative_id": "999"}})
+    assert result["current"]["creative_id"] == "999"
+    assert _left_out(result) == left_out
+    assert all(entry["reason"] for entry in result["derived_fields_left_out"])
+    # A derived value left out because the copy already carries it is not a lost setting.
+    assert result["fields_not_copied"] == []
+
+
+@pytest.mark.parametrize("shape", sorted(LIVE_X1_X2_CASES))
+def test_x1_x2_dry_run_shows_exactly_the_requests_a_real_run_sends(monkeypatch, shape) -> None:
+    creative, expected, left_out = LIVE_X1_X2_CASES[shape]
+    real_client, real = _live_run(monkeypatch, creative)
+    dry_client, dry = _live_run(monkeypatch, creative, dry_run=True)
+    assert [call[0] for call in dry_client.calls] == ["get", "get", "get"]
+    create, attach = dry["would_send"]
+    assert create == {"method": "POST", "path": "act_123/adcreatives", "data": _sent(real_client)}
+    assert create["data"] == expected
+    assert attach == {"method": "POST", "path": "10", "data": {"creative": {"creative_id": "<new creative id>"}}}
+    assert real_client.calls[-1] == ("update", "10", {"creative": {"creative_id": "999"}})
+    assert dry["derived_fields_left_out"] == real["derived_fields_left_out"]
+    assert _left_out(dry) == left_out
+    assert dry["fields_not_copied"] == [] and dry["settings_that_cannot_be_copied"] == []
+
+
+def test_x1_the_left_out_call_to_action_says_where_the_story_keeps_it(monkeypatch) -> None:
+    _, result = _live_run(monkeypatch, LIVE_SINGLE_IMAGE)
+    assert "object_story_spec.link_data.call_to_action" in result["derived_fields_left_out"][0]["reason"]
+    _, result = _live_run(monkeypatch, LIVE_SINGLE_VIDEO)
+    assert "object_story_spec.video_data.call_to_action" in result["derived_fields_left_out"][0]["reason"]
+
+
+def test_x1_the_read_creative_is_not_changed_by_the_copy(monkeypatch) -> None:
+    client, _ = _live_run(monkeypatch, LIVE_SINGLE_VIDEO)
+    assert client.creative == LIVE_SINGLE_VIDEO
+
+
+def test_x1_an_asset_feed_call_to_action_type_is_a_counterpart(monkeypatch) -> None:
+    """The story carries no call to action; the asset feed's call_to_action_types does."""
+    story = {"page_id": "111", "link_data": {"image_hash": "h1", "link": LIVE_LINK}}
+    client, result = _live_run(monkeypatch, {**LIVE_ASSET_POOL, "object_story_spec": story})
+    sent = _sent(client)
+    assert "call_to_action" not in sent
+    assert sent["asset_feed_spec"] == LIVE_POOL_FEED
+    assert _left_out(result) == ["call_to_action"]
+    assert "asset_feed_spec.call_to_action_types" in result["derived_fields_left_out"][0]["reason"]
+
+
+def test_x1_an_asset_feed_call_to_actions_entry_is_a_counterpart(monkeypatch) -> None:
+    story = {"page_id": "111", "link_data": {"image_hash": "h1", "link": LIVE_LINK}}
+    feed = {**{key: value for key, value in LIVE_POOL_FEED.items() if key != "call_to_action_types"},
+            "call_to_actions": [{"type": "LEARN_MORE", "value": {"link": LIVE_LINK}}]}
+    client, result = _live_run(monkeypatch, {**LIVE_ASSET_POOL, "object_story_spec": story, "asset_feed_spec": feed})
+    assert "call_to_action" not in _sent(client)
+    assert _left_out(result) == ["call_to_action"]
+    assert "asset_feed_spec.call_to_actions[0]" in result["derived_fields_left_out"][0]["reason"]
+
+
+NO_COUNTERPART_CASES = {
+    "different_type": {**LIVE_SINGLE_IMAGE, "call_to_action": {"type": "SHOP_NOW", "value": {"link": LIVE_LINK}}},
+    "different_link": {**LIVE_SINGLE_IMAGE, "call_to_action": {"type": "LEARN_MORE", "value": {"link": "https://example.com/other"}}},
+    "story_without_one": {**LIVE_SINGLE_IMAGE, "object_story_spec": {"page_id": "111", "link_data": {"image_hash": "h1", "link": LIVE_LINK}}},
+    "no_type": {**LIVE_SINGLE_IMAGE, "call_to_action": {"value": {"link": LIVE_LINK}}},
+    "not_an_object": {**LIVE_SINGLE_IMAGE, "call_to_action": "LEARN_MORE"},
+    "text_story": {**LIVE_SINGLE_IMAGE, "object_story_spec": {"page_id": "111", "text_data": {"message": "Hi"}}},
+    "asset_feed_other_type": {**LIVE_ASSET_POOL, "object_story_spec": {"page_id": "111", "link_data": {"image_hash": "h1", "link": LIVE_LINK}},
+                              "asset_feed_spec": {**LIVE_POOL_FEED, "call_to_action_types": ["SHOP_NOW"]}},
+}
+
+
+@pytest.mark.parametrize("shape", sorted(NO_COUNTERPART_CASES))
+def test_x1_a_call_to_action_the_story_does_not_carry_stops_a_real_run(monkeypatch, shape) -> None:
+    client = MetaLikeClient(deepcopy(NO_COUNTERPART_CASES[shape]))
+    _patch(monkeypatch, client)
+    with pytest.raises(ValidationError) as info:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    message = str(info.value)
+    assert "top-level call_to_action" in message
+    assert "Nothing was created or attached; ad 10 still uses creative 20" in message
+    assert "https://example.com" not in message
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
+
+
+@pytest.mark.parametrize("shape", sorted(NO_COUNTERPART_CASES))
+def test_x1_a_call_to_action_the_story_does_not_carry_is_reported_by_a_dry_run(monkeypatch, shape) -> None:
+    client, result = _live_run(monkeypatch, NO_COUNTERPART_CASES[shape], dry_run=True)
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
+    assert "call_to_action" in result["fields_not_copied"]
+    assert "call_to_action" in result["settings_that_cannot_be_copied"]
+    assert "call_to_action" not in _left_out(result)
+    assert "call_to_action" not in result["would_send"][0]["data"]
+    note = next(note for note in result["notes"] if "top-level call_to_action" in note)
+    assert "A real run would refuse and change nothing" in note
+
+
+def test_x1_a_derived_value_holding_fewer_keys_than_the_story_still_matches(monkeypatch) -> None:
+    """A lead form story's call to action holds the form and fb.me link; Meta's derived view may hold one of them."""
+    story = {"page_id": "111", "link_data": {"image_hash": "h1", "link": "https://fb.me/", "call_to_action": {
+        "type": "SIGN_UP", "value": {"lead_gen_form_id": "888", "link": "https://fb.me/"}}}}
+    creative = {**LIVE_SINGLE_IMAGE, "object_story_spec": story,
+                "call_to_action": {"type": "SIGN_UP", "value": {"lead_gen_form_id": "888"}}}
+    client, result = _live_run(monkeypatch, creative)
+    assert _sent(client)["object_story_spec"] == story
+    assert "call_to_action" not in _sent(client)
+    assert _left_out(result) == ["call_to_action"]
+
+
+CAROUSEL_STORY = {"page_id": "111", "link_data": {
+    "link": LIVE_LINK, "message": "Pick", "multi_share_end_card": True, "multi_share_optimized": True,
+    "child_attachments": [
+        {"link": "https://example.com/1", "image_hash": "c1", "name": "One",
+         "call_to_action": {"type": "SHOP_NOW", "value": {"link": "https://example.com/1"}}},
+        {"link": "https://example.com/2", "image_hash": "c2", "name": "Two",
+         "call_to_action": {"type": "LEARN_MORE", "value": {"link": "https://example.com/2"}}},
+    ],
+}}
+
+
+def test_x1_a_carousel_call_to_action_that_a_card_carries_is_left_out(monkeypatch) -> None:
+    """Decision: on a carousel each card's call to action counts as the story's, since the cards are copied whole."""
+    creative = {"id": "20", "account_id": "123", "name": "Cards", "object_story_spec": CAROUSEL_STORY,
+                "call_to_action": {"type": "LEARN_MORE", "value": {"link": "https://example.com/2"}}}
+    client, result = _live_run(monkeypatch, creative)
+    assert _sent(client)["object_story_spec"] == CAROUSEL_STORY
+    assert "call_to_action" not in _sent(client)
+    assert _left_out(result) == ["call_to_action"]
+    assert "object_story_spec.link_data.child_attachments[1].call_to_action" in result["derived_fields_left_out"][0]["reason"]
+
+
+def test_x1_a_carousel_call_to_action_no_card_carries_stops_a_real_run(monkeypatch) -> None:
+    creative = {"id": "20", "account_id": "123", "name": "Cards", "object_story_spec": CAROUSEL_STORY,
+                "call_to_action": {"type": "SIGN_UP", "value": {"link": LIVE_LINK}}}
+    with pytest.raises(ValidationError, match="top-level call_to_action"):
+        _live_run(monkeypatch, creative)
+
+
+@pytest.mark.parametrize("post", [
+    {"source_instagram_media_id": "444", "object_id": "111", "instagram_user_id": "333"},
+    {"object_story_id": "111_222"},
+    {"object_story_id": "111_222", "source_facebook_post_id": "68"},
+    # A bare object_story_spec (no story of its own) beside an existing post.
+    {"source_instagram_media_id": "444", "object_story_spec": {"page_id": "111", "instagram_user_id": "333"}},
+])
+def test_x1_an_existing_post_keeps_its_top_level_call_to_action(monkeypatch, post) -> None:
+    button = {"type": "WHATSAPP_MESSAGE", "value": {"link": "https://api.whatsapp.com/send", "app_destination": "WHATSAPP"}}
+    creative = {"id": "20", "account_id": "123", "name": "Post", **post, "call_to_action": button}
+    client = ProjectingClient(deepcopy(creative))
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    assert _sent(client) == {"name": "Post (enhancements updated)", **post, "call_to_action": button,
+                             "degrees_of_freedom_spec": OPTED_OUT}
+    assert result["derived_fields_left_out"] == []
+    assert result["fields_not_copied"] == []
+
+
+# X2 beyond video_data: a pair is reduced to image_hash only where Meta's reference says "not both".
+
+REDUNDANT_IMAGE_CASES = {
+    "link_data": ({"page_id": "111", "link_data": {"link": LIVE_LINK, "image_hash": "h1", "picture": "https://cdn.example.invalid/p.jpg"}},
+                  "link_data", "picture"),
+    "photo_data": ({"page_id": "111", "photo_data": {"image_hash": "h1", "url": "https://cdn.example.invalid/p.jpg", "caption": "Hi"}},
+                   "photo_data", "url"),
+    "template_data": ({"page_id": "111", "template_data": {"link": LIVE_LINK, "image_hash": "h1",
+                                                           "picture": "https://cdn.example.invalid/p.jpg",
+                                                           "call_to_action": {"type": "SHOP_NOW"}}},
+                      "template_data", "picture"),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(REDUNDANT_IMAGE_CASES))
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_x2_a_documented_either_or_image_pair_keeps_the_hash(monkeypatch, shape, dry_run) -> None:
+    story, key, dropped = REDUNDANT_IMAGE_CASES[shape]
+    creative = {"id": "20", "account_id": "123", "name": "C", "object_story_spec": story, "product_set_id": "777"}
+    client, result = _live_run(monkeypatch, creative, dry_run=dry_run)
+    sent = result["would_send"][0]["data"] if dry_run else _sent(client)
+    expected = deepcopy(story)
+    del expected[key][dropped]
+    assert sent["object_story_spec"] == expected
+    assert _left_out(result) == [f"object_story_spec.{key}.{dropped}"]
+    assert result["fields_not_copied"] == []
+
+
+def test_x2_a_single_image_reference_is_sent_unchanged(monkeypatch) -> None:
+    for video in ({"video_id": "555", "image_url": "https://cdn.example.invalid/t.jpg"}, {"video_id": "555", "image_hash": "t"}):
+        story = {"page_id": "111", "video_data": video}
+        client, result = _live_run(monkeypatch, {"id": "20", "account_id": "123", "name": "V", "object_story_spec": story})
+        assert _sent(client)["object_story_spec"] == story
+        assert result["derived_fields_left_out"] == []
+
+
+def test_x2_pairs_meta_does_not_document_as_either_or_are_sent_as_read(monkeypatch) -> None:
+    """child_attachments and asset feed images: Meta's reference does not say "not both", and the live carousel
+    copy was accepted as read, so they are not changed."""
+    story = {"page_id": "111", "link_data": {"link": LIVE_LINK, "child_attachments": [
+        {"link": LIVE_LINK, "image_hash": "c1", "picture": "https://cdn.example.invalid/c1.jpg"},
+        {"link": LIVE_LINK, "image_hash": "c2"},
+    ]}}
+    feed = {"images": [{"hash": "h1", "url": "https://cdn.example.invalid/h1.jpg"}], "optimization_type": "PLACEMENT"}
+    creative = {"id": "20", "account_id": "123", "name": "C", "object_story_spec": story, "asset_feed_spec": feed}
+    client, result = _live_run(monkeypatch, creative)
+    assert _sent(client)["object_story_spec"] == story
+    assert _sent(client)["asset_feed_spec"] == feed
+    assert result["derived_fields_left_out"] == []
+
+
+# X3: shapes whose copy Meta accepted as the tool built it. Each create body is pinned exactly,
+# and is the body the tool built before round ten.
+
+LIVE_INSTAGRAM_POST = {
+    "id": "20", "account_id": "123", "name": "Boost",
+    "creative_sourcing_spec": LIVE_SOURCING, "instagram_user_id": "333", "source_instagram_media_id": "444",
+    "degrees_of_freedom_spec": LIVE_FEATURES,
+}
+LIVE_CAROUSEL = {
+    "id": "20", "account_id": "123", "name": "Cards",
+    "object_story_spec": {"page_id": "111", "link_data": {
+        "link": LIVE_LINK, "message": "Pick", "multi_share_end_card": True, "multi_share_optimized": True,
+        "child_attachments": [
+            {"link": "https://example.com/1", "image_hash": "c1", "name": "One"},
+            {"link": "https://example.com/2", "image_hash": "c2", "name": "Two"},
+        ],
+    }},
+    "portrait_customizations": {"specifications": [{"background_color": {"bottom": "000000"}}]},
+}
+LIVE_PLACEMENT_FEED = {
+    "optimization_type": "PLACEMENT",
+    "images": [{"hash": "feed", "adlabels": [{"name": "placement_1", "id": "71"}]},
+               {"hash": "fallback", "adlabels": [{"name": "placement_2", "id": "72"}]}],
+    "asset_customization_rules": [
+        {"customization_spec": {"publisher_platforms": ["facebook"], "facebook_positions": ["feed"]},
+         "image_label": {"name": "placement_1", "id": "71"}, "priority": 1},
+        {"customization_spec": {}, "image_label": {"name": "placement_2", "id": "72"}, "priority": 2},
+    ],
+    "bodies": [{"text": "Body"}], "link_urls": [{"website_url": LIVE_LINK}], "call_to_action_types": ["LEARN_MORE"],
+    "ad_formats": ["SINGLE_IMAGE"], "additional_data": {"multi_share_end_card": False},
+}
+LIVE_PLACEMENT = {
+    "id": "20", "account_id": "123", "name": "Placed",
+    "asset_feed_spec": LIVE_PLACEMENT_FEED, "object_story_spec": {"page_id": "111", "instagram_user_id": "333"},
+}
+
+X3_CASES = {
+    "instagram_post": (LIVE_INSTAGRAM_POST, {
+        "name": "Boost (enhancements updated)", "source_instagram_media_id": "444", "instagram_user_id": "333",
+        "creative_sourcing_spec": LIVE_SOURCING, "degrees_of_freedom_spec": OPTED_OUT,
+    }),
+    "carousel": (LIVE_CAROUSEL, {
+        "name": "Cards (enhancements updated)", "object_story_spec": LIVE_CAROUSEL["object_story_spec"],
+        "portrait_customizations": LIVE_CAROUSEL["portrait_customizations"], "degrees_of_freedom_spec": OPTED_OUT,
+    }),
+    "placement": (LIVE_PLACEMENT, {
+        "name": "Placed (enhancements updated)", "object_story_spec": {"page_id": "111", "instagram_user_id": "333"},
+        "asset_feed_spec": LIVE_PLACEMENT_FEED, "degrees_of_freedom_spec": OPTED_OUT,
+    }),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(X3_CASES))
+def test_x3_shapes_meta_accepted_send_the_same_body(monkeypatch, shape) -> None:
+    creative, expected = X3_CASES[shape]
+    client, result = _live_run(monkeypatch, creative)
+    assert _sent(client) == expected
+    assert client.calls[-1] == ("update", "10", {"creative": {"creative_id": "999"}})
+    assert result["fields_not_copied"] == []
+    assert result.get("derived_fields_left_out", []) == []
