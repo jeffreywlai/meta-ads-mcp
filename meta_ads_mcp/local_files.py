@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,8 +62,16 @@ _SAFE_OPEN_SUPPORTED = (
     and hasattr(os, "O_NOFOLLOW")
     and hasattr(os, "O_NONBLOCK")
 )
+# Older Python builds for macOS do not define os.O_SEARCH although the system
+# has it; the value is O_EXEC | O_DIRECTORY from <sys/fcntl.h>.
+_DARWIN_O_SEARCH = 0x40100000 if sys.platform == "darwin" else 0
 _FOLDER_FLAGS = (
-    (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY)
+    (
+        getattr(os, "O_PATH", 0)
+        or getattr(os, "O_SEARCH", 0)
+        or _DARWIN_O_SEARCH
+        or os.O_RDONLY
+    )
     | getattr(os, "O_DIRECTORY", 0)
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
@@ -104,6 +113,95 @@ def _open_without_links(resolved: Path) -> int:
         os.close(current)
 
 
+@dataclass(frozen=True, slots=True)
+class OpenUpload:
+    """A local file opened for upload. The caller reads from, then closes, the descriptor."""
+
+    descriptor: int
+    name: str
+    size: int
+    content_type: str
+
+
+def open_upload_file(
+    file_path: object,
+    *,
+    allowed_types: Mapping[str, str],
+    max_bytes: int,
+    parameter: str = "file_path",
+    too_large_hint: str = "",
+    too_large_message: str | None = None,
+) -> OpenUpload:
+    """Check a path and return the file opened for reading, or refuse without quoting the path.
+
+    The path may be absolute or relative to the upload folder. Links are followed
+    first and the real location is what gets checked, so a link inside the folder
+    cannot point the read somewhere else. The file type is judged from the real
+    file's name. The size is read from the opened file, so what was checked is
+    what gets read. Use this for files too large to hold in memory; otherwise
+    use read_upload_file.
+    """
+    if not isinstance(file_path, str) or not file_path.strip() or "\x00" in file_path:
+        raise ValidationError(f"{parameter} must be a non-blank local file path.")
+    unreadable = f"{parameter} does not point to a file that can be read."
+    too_large = too_large_message or (
+        f"{parameter} is larger than this server's {max_bytes}-byte limit for this upload."
+        + (f" {too_large_hint}" if too_large_hint else "")
+    )
+    folder = _upload_folder()
+    candidate = Path(file_path.strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = folder / candidate
+    resolved = _resolved_or_none(candidate)
+    if resolved is None:
+        raise ValidationError(unreadable)
+    if not resolved.is_relative_to(folder):
+        raise ValidationError(
+            f"{parameter} must be inside the upload folder set by META_UPLOAD_DIR."
+        )
+    content_type = allowed_types.get(resolved.suffix.lower()) if resolved.stem else None
+    if content_type is None:
+        raise ValidationError(f"{parameter} must end in one of: {', '.join(allowed_types)}.")
+    opened = _opened_or_none(resolved)
+    if opened is None:
+        raise ValidationError(unreadable)
+    descriptor, details = opened
+    problem = None
+    if not stat.S_ISREG(details.st_mode):
+        problem = unreadable
+    elif details.st_size == 0:
+        problem = f"{parameter} points to an empty file."
+    elif details.st_size > max_bytes:
+        problem = too_large
+    if problem is not None:
+        os.close(descriptor)
+        raise ValidationError(problem)
+    return OpenUpload(
+        descriptor=descriptor, name=resolved.name, size=details.st_size, content_type=content_type
+    )
+
+
+def _resolved_or_none(candidate: Path) -> Path | None:
+    """Resolve links, or None. The caller raises outside this handler, so the
+    system error, which names the path, is not kept behind the clean error."""
+    try:
+        return candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _opened_or_none(resolved: Path) -> tuple[int, os.stat_result] | None:
+    """Open the resolved file and read its details, or None, closing on failure."""
+    descriptor = None
+    try:
+        descriptor = _open_without_links(resolved)
+        return descriptor, os.fstat(descriptor)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        return None
+
+
 def read_upload_file(
     file_path: object,
     *,
@@ -114,50 +212,30 @@ def read_upload_file(
 ) -> LocalUpload:
     """Return a file's name, bytes and content type, or refuse without quoting the path.
 
-    The path may be absolute or relative to the upload folder. Links are followed
-    first and the real location is what gets checked, so a link inside the folder
-    cannot point the read somewhere else. The file type is judged from the real
-    file's name. The read uses the same open file that was checked.
+    Same checks as open_upload_file; the read uses the same open file that was checked.
     """
-    if not isinstance(file_path, str) or not file_path.strip() or "\x00" in file_path:
-        raise ValidationError(f"{parameter} must be a non-blank local file path.")
-    too_large = (
-        f"{parameter} is larger than this server's {max_bytes}-byte limit for this upload."
-        + (f" {too_large_hint}" if too_large_hint else "")
+    opened = open_upload_file(
+        file_path,
+        allowed_types=allowed_types,
+        max_bytes=max_bytes,
+        parameter=parameter,
+        too_large_hint=too_large_hint,
     )
-    folder = _upload_folder()
-    candidate = Path(file_path.strip()).expanduser()
-    if not candidate.is_absolute():
-        candidate = folder / candidate
-    try:
-        resolved = candidate.resolve(strict=True)
-    except (OSError, RuntimeError):
-        raise ValidationError(f"{parameter} does not point to a file that can be read.") from None
-    if not resolved.is_relative_to(folder):
-        raise ValidationError(
-            f"{parameter} must be inside the upload folder set by META_UPLOAD_DIR."
-        )
-    content_type = allowed_types.get(resolved.suffix.lower()) if resolved.stem else None
-    if content_type is None:
-        raise ValidationError(f"{parameter} must end in one of: {', '.join(allowed_types)}.")
-    descriptor = None
-    try:
-        descriptor = _open_without_links(resolved)
-        details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode):
-            raise ValidationError(f"{parameter} does not point to a file that can be read.")
-        if details.st_size == 0:
-            raise ValidationError(f"{parameter} points to an empty file.")
-        if details.st_size > max_bytes:
-            raise ValidationError(too_large)
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = None
-            content = handle.read(max_bytes + 1)
-    except OSError:
-        raise ValidationError(f"{parameter} does not point to a file that can be read.") from None
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+    content = _read_all_or_none(opened.descriptor, max_bytes + 1)
+    if content is None:
+        raise ValidationError(f"{parameter} does not point to a file that can be read.")
     if len(content) > max_bytes:
-        raise ValidationError(too_large)
-    return LocalUpload(name=resolved.name, content=content, content_type=content_type)
+        raise ValidationError(
+            f"{parameter} is larger than this server's {max_bytes}-byte limit for this upload."
+            + (f" {too_large_hint}" if too_large_hint else "")
+        )
+    return LocalUpload(name=opened.name, content=content, content_type=opened.content_type)
+
+
+def _read_all_or_none(descriptor: int, limit: int) -> bytes | None:
+    """Read up to limit bytes and close the descriptor; None when the read fails."""
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            return handle.read(limit)
+    except OSError:
+        return None

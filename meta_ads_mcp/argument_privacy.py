@@ -41,10 +41,12 @@ PRIVATE_ARGUMENT_TOOLS: frozenset[str] = frozenset(
         "create_product_feed_upload",
         # A Partnership Ad authorization code, local file paths, media URLs.
         "create_ad_creative_from_inputs",
+        "boost_instagram_post",
         "upload_ad_video",
         "upload_creative_asset",
         # People searched for and the access granted to them.
         "list_business_users",
+        "list_catalog_partners",
         "set_catalog_access",
         "preview_catalog_access_change",
         # Product and landing-page URLs can carry a login.

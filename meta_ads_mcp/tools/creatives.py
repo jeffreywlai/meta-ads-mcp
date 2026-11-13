@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import os
-import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
-from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
+from meta_ads_mcp.local_files import open_upload_file
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
@@ -349,23 +347,6 @@ def _video_processing_status(video: dict[str, Any]) -> str | None:
     return None
 
 
-def _video_upload_folder() -> Path:
-    """The folder named by META_UPLOAD_DIR, with local_files' rules and messages."""
-    configured = get_settings().upload_directory
-    if not configured or not configured.strip():
-        raise ValidationError(
-            "Reading local files is off. Set the META_UPLOAD_DIR environment variable to the "
-            "one folder this server may read uploads from, put the file there, and try again."
-        )
-    try:
-        folder = Path(configured.strip()).expanduser().resolve(strict=True)
-    except (OSError, RuntimeError):
-        raise ValidationError("The folder named by META_UPLOAD_DIR does not exist or cannot be read.") from None
-    if not folder.is_dir():
-        raise ValidationError("META_UPLOAD_DIR must name a folder.")
-    return folder
-
-
 @dataclass(slots=True)
 class _OpenVideo:
     """A local video opened for upload: the open descriptor is what gets read."""
@@ -378,58 +359,21 @@ class _OpenVideo:
 def _open_upload_video(file_path: str, parameter: str = "file_path") -> _OpenVideo:
     """Open a video inside the upload folder without reading it all into memory.
 
-    Same rules and messages as local_files.read_upload_file (folder from META_UPLOAD_DIR,
-    links resolved and checked, type from the real name, size checked on the open file),
-    which reads the whole file and so cannot serve multi-gigabyte uploads. In addition,
-    every folder below the upload folder is opened relative to its parent and refuses
-    links, so a folder swapped for a link after the check cannot redirect the read.
+    local_files.open_upload_file does every check (folder from META_UPLOAD_DIR, links
+    resolved and checked, type from the real name, no link followed on the way to the
+    file, size read from the open file). The caller closes the descriptor.
     """
-    if not isinstance(file_path, str) or not file_path.strip() or "\x00" in file_path:
-        raise ValidationError(f"{parameter} must be a non-blank local file path.")
-    unreadable = f"{parameter} does not point to a file that can be read."
-    folder = _video_upload_folder()
-    candidate = Path(file_path.strip()).expanduser()
-    if not candidate.is_absolute():
-        candidate = folder / candidate
-    try:
-        resolved = candidate.resolve(strict=True)
-    except (OSError, RuntimeError):
-        raise ValidationError(unreadable) from None
-    if not resolved.is_relative_to(folder):
-        raise ValidationError(f"{parameter} must be inside the upload folder set by META_UPLOAD_DIR.")
-    if not resolved.stem or resolved.suffix.lower() not in VIDEO_FILE_TYPES:
-        raise ValidationError(f"{parameter} must end in one of: {', '.join(VIDEO_FILE_TYPES)}.")
-    parts = resolved.relative_to(folder).parts
-    if not parts:
-        raise ValidationError(unreadable)
-    directory: int | None = None
-    descriptor: int | None = None
-    try:
-        directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
-        for part in parts[:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = child
-        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        details = os.fstat(descriptor)
-    except OSError:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise ValidationError(unreadable) from None
-    finally:
-        if directory is not None:
-            os.close(directory)
-    problem = None
-    if not stat.S_ISREG(details.st_mode):
-        problem = unreadable
-    elif details.st_size == 0:
-        problem = f"{parameter} points to an empty file."
-    elif details.st_size > MAX_CHUNKED_VIDEO_BYTES:
-        problem = f"{parameter} is larger than this server's {MAX_CHUNKED_VIDEO_BYTES}-byte limit for video uploads (Meta's limit for ad videos is 4 GB)."
-    if problem is not None:
-        os.close(descriptor)
-        raise ValidationError(problem)
-    return _OpenVideo(descriptor=descriptor, name=resolved.name, size=details.st_size)
+    opened = open_upload_file(
+        file_path,
+        allowed_types=VIDEO_FILE_TYPES,
+        max_bytes=MAX_CHUNKED_VIDEO_BYTES,
+        parameter=parameter,
+        too_large_message=(
+            f"{parameter} is larger than this server's {MAX_CHUNKED_VIDEO_BYTES}-byte limit for "
+            "video uploads (Meta's limit for ad videos is 4 GB)."
+        ),
+    )
+    return _OpenVideo(descriptor=opened.descriptor, name=opened.name, size=opened.size)
 
 
 def _read_video_bytes(video: _OpenVideo, offset: int, length: int) -> bytes:
