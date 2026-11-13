@@ -81,3 +81,22 @@ def test_graph_id_and_account_id_types_accept_real_ids_and_reject_everything_els
     # Ids stay strings: a number is not silently converted.
     with pytest.raises(PydanticValidationError):
         graph_id.validate_python(123)
+
+
+def test_strict_currency_amount_refuses_true_and_false_and_keeps_numbers() -> None:
+    from pydantic import TypeAdapter
+    from pydantic import ValidationError as PydanticValidationError
+
+    from meta_ads_mcp.tool_types import StrictCurrencyAmount
+
+    adapter = TypeAdapter(StrictCurrencyAmount)
+    assert adapter.validate_python(12.5) == 12.5
+    assert adapter.validate_python(3) == 3.0
+    assert adapter.validate_python("7.25") == 7.25
+    for flag in (True, False):
+        try:
+            adapter.validate_python(flag)
+        except PydanticValidationError as error:
+            assert "not true or false" in str(error)
+        else:
+            raise AssertionError(f"{flag} was accepted as an amount")

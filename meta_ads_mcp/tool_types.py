@@ -108,6 +108,27 @@ CurrencyAmount: TypeAlias = Annotated[
     ),
 ]
 
+def _refuse_true_false_amount(value: Any) -> Any:
+    """Refuse true or false where an amount is expected; MCP would otherwise read true as 1.0."""
+    if isinstance(value, bool):
+        raise ValueError("an amount must be a number, not true or false")
+    return value
+
+
+# For money parameters added after master. CurrencyAmount stays as it is for the
+# parameters that existing callers already use.
+StrictCurrencyAmount: TypeAlias = Annotated[
+    float,
+    BeforeValidator(_refuse_true_false_amount),
+    Field(
+        description=(
+            "Amount in major units of the owning ad account currency "
+            "(for example, 12.50 means USD 12.50, not 1,250 cents). "
+            "The server converts to Meta's minor units using the account currency."
+        )
+    ),
+]
+
 BidConstraints: TypeAlias = Annotated[
     dict[str, Any],
     Field(
