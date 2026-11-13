@@ -1188,7 +1188,7 @@ def test_advertiser_context_builds_each_section_from_account_data(monkeypatch) -
 
     result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
 
-    insights_call = _calls(client, "get_insights")[0]
+    insights_call = next(call for call in _calls(client, "get_insights") if "filtering" in call["params"])
     assert insights_call["object_id"] == "act_42"
     assert insights_call["params"]["level"] == "adset"
     assert json.loads(insights_call["params"]["time_range"]) == {"since": "2026-10-15", "until": "2026-11-11"}
@@ -1265,14 +1265,16 @@ def test_advertiser_context_summarizes_goal_volume_with_top_spenders(monkeypatch
 
     volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
     leads = volume["LEAD_GENERATION"]
-    assert leads["adset_count"] == 60
+    # The fake returns rows unsorted; the tool examines the first 250 the sorted read returns.
+    assert result["adset_coverage"]["adsets_examined"] == 250 and result["adset_coverage"]["complete"] is False
+    assert leads["adset_count"] == 50
     assert leads["adsets_meeting_threshold"] == 0
-    assert leads["adsets_below_threshold"] == 60
+    assert leads["adsets_below_threshold"] == 50
     below = leads["top_below_threshold"]
     assert len(below) == performance_signals.GOAL_VOLUME_TOP_ADSETS
     assert [row["spend"] for row in below] == sorted((row["spend"] for row in below), reverse=True)
-    assert below[0]["adset_id"] == "as_0298"
-    assert volume["LINK_CLICKS"]["adsets_meeting_threshold"] == 60
+    assert below[0]["adset_id"] == "as_0248"
+    assert volume["LINK_CLICKS"]["adsets_meeting_threshold"] == 50
     assert volume["OFFSITE_CONVERSIONS"]["verdict"] == "not_assessed"
     assert len(volume["OFFSITE_CONVERSIONS"]["top_adsets_by_spend"]) == performance_signals.GOAL_VOLUME_TOP_ADSETS
     assert volume["REACH"]["verdict"] == "not_assessed"
@@ -1330,7 +1332,7 @@ def test_advertiser_context_response_stays_small_for_300_adsets(monkeypatch) -> 
 
     result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
 
-    assert result["metrics"]["adset_rows"] == 300
+    assert result["metrics"]["adset_rows"] == performance_signals.CONTEXT_MAX_ADSETS
     assert len(json.dumps(result).encode()) < 20_000
 
 
@@ -2272,7 +2274,8 @@ def test_advertiser_context_judges_offsite_conversion_goals_on_metas_result(monk
 
     result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
 
-    assert "results" in _calls(client, "get_insights")[0]["fields"]
+    full_read = next(call for call in _calls(client, "get_insights") if "filtering" in call["params"])
+    assert "results" in full_read["fields"]
     volume = {row["optimization_goal"]: row for row in result["optimization_goal_volume"]}
     conversions = volume["OFFSITE_CONVERSIONS"]
     assert conversions["verdict"] == "some_adsets_meet_threshold"
@@ -2329,7 +2332,8 @@ def test_advertiser_context_object_ids_keep_only_named_campaigns_and_adsets(monk
         account_id="act_42", object_ids=["100", "202", "999"],
     ))
 
-    assert len(_calls(client, "get_insights")) == 1
+    # Two reads filtered to the named ids (campaign.id IN, adset.id IN) and one for the account's total spend.
+    assert len(_calls(client, "get_insights")) == 3
     assert result["scope"]["object_ids"] == ["100", "202", "999"]
     assert result["metrics"]["adset_rows"] == 2
     assert result["metrics"]["spend"] == 800.0
@@ -2355,3 +2359,157 @@ def test_child_level_with_no_delivering_children_says_so(monkeypatch) -> None:
     assert result["entities"] == []
     assert result["coverage"]["complete"] is True
     assert any("no ad with insights" in signal for signal in result["missing_signals"])
+
+
+# ---------------------------------------------------------------------------
+# Advertiser context on a large account (live fix: the ad set read must never fail on size)
+# ---------------------------------------------------------------------------
+
+
+def _large_account_rows(count: int) -> list[dict[str, Any]]:
+    return [
+        _adset_row(str(100000 + index), objective="OUTCOME_SALES", goal="OFFSITE_CONVERSIONS",
+                   spend=float(5000 - index), actions={"link_click": 100, "purchase": 10})
+        for index in range(count)
+    ]
+
+
+def _large_account_handler(rows: list[dict[str, Any]], *, filtered_error: Exception | None = None,
+                           sorted_error: Exception | None = None):
+    """Models an account with thousands of ad sets.
+
+    The sorted read fails when it carries action fields (as live); the unsorted full read never ends (pages of
+    100 rows, always another page), so a tool that reads it would hit any cap.
+    """
+    total = sum(float(row["spend"]) for row in rows)
+
+    def handler(object_id: str, fields: list[str], params: dict[str, Any]) -> dict[str, Any]:
+        if params["level"] == "account":
+            return {"data": [{"spend": str(total)}]}
+        if "sort" in params:
+            if sorted_error is not None:
+                raise sorted_error
+            if {"actions", "action_values"} & set(fields):
+                raise _unknown_error()
+            return {
+                "data": [{"adset_id": row["adset_id"], "spend": row["spend"]} for row in rows[: params["limit"]]],
+                "paging": {"cursors": {"after": "n"}, "next": "https://graph.example/next"},
+            }
+        if "filtering" in params:
+            if filtered_error is not None:
+                raise filtered_error
+            (selector,) = params["filtering"]
+            wanted = set(selector["value"])
+            data = [row for row in rows if row["adset_id"] in wanted or row["campaign_id"] in wanted]
+            return {"data": data[: params["limit"]]}
+        page = int(params.get("after") or 0)
+        return {"data": rows[page * 100:(page + 1) * 100],
+                "paging": {"cursors": {"after": str(page + 1)}, "next": "https://graph.example/next"}}
+
+    return handler
+
+
+def test_advertiser_context_large_account_returns_a_labelled_partial_briefing(monkeypatch) -> None:
+    rows = _large_account_rows(2500)
+    client = _context_client()
+    client.insights_handler = _large_account_handler(rows)
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42", lookback_days=28))
+
+    insights_calls = _calls(client, "get_insights")
+    assert len(insights_calls) == 3
+    sorted_call = next(call for call in insights_calls if "sort" in call["params"])
+    assert sorted_call["params"]["sort"] == ["spend_descending"]
+    assert sorted_call["params"]["limit"] == performance_signals.CONTEXT_MAX_ADSETS
+    assert set(sorted_call["fields"]) == {"adset_id", "spend"}
+    full_call = next(call for call in insights_calls if "filtering" in call["params"])
+    (selector,) = full_call["params"]["filtering"]
+    assert selector["field"] == "adset.id" and selector["operator"] == "IN"
+    assert len(selector["value"]) == performance_signals.CONTEXT_MAX_ADSETS
+    assert {"objective", "optimization_goal", "actions", "results"} <= set(full_call["fields"])
+    assert "sort" not in full_call["params"]
+
+    coverage = result["adset_coverage"]
+    examined_spend = sum(5000.0 - index for index in range(performance_signals.CONTEXT_MAX_ADSETS))
+    account_spend = sum(5000.0 - index for index in range(2500))
+    assert coverage["adsets_examined"] == performance_signals.CONTEXT_MAX_ADSETS
+    assert coverage["more_adsets_exist"] is True and coverage["complete"] is False
+    assert coverage["examined_spend"] == pytest.approx(examined_spend)
+    assert coverage["account_spend"] == pytest.approx(account_spend)
+    assert coverage["share_of_account_spend"] == pytest.approx(examined_spend / account_spend)
+    assert result["metrics"]["adset_rows"] == performance_signals.CONTEXT_MAX_ADSETS
+    assert any("highest-spending ad sets" in signal and "were not examined" in signal
+               for signal in result["missing_signals"])
+    assert result["optimization_goal_volume"][0]["adset_count"] == performance_signals.CONTEXT_MAX_ADSETS
+    assert len(json.dumps(result).encode()) < 20_000
+
+
+def test_advertiser_context_small_account_is_complete(monkeypatch) -> None:
+    rows = _large_account_rows(3)
+    client = _context_client()
+
+    def handler(object_id, fields, params):
+        payload = _large_account_handler(rows)(object_id, fields, params)
+        payload.pop("paging", None)
+        return payload
+
+    client.insights_handler = handler
+    _patch(monkeypatch, client)
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+    coverage = result["adset_coverage"]
+    assert coverage["complete"] is True and coverage["adsets_examined"] == 3
+    assert coverage["share_of_account_spend"] == pytest.approx(1.0)
+    assert not any("were not examined" in signal for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize("failing", ["sorted", "filtered"])
+def test_advertiser_context_adset_read_failure_is_reported_not_raised(monkeypatch, failing) -> None:
+    rows = _large_account_rows(10)
+    client = _context_client()
+    error = _permission_error()
+    client.insights_handler = _large_account_handler(
+        rows, sorted_error=error if failing == "sorted" else None, filtered_error=error if failing == "filtered" else None,
+    )
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(account_id="act_42"))
+
+    assert len(_calls(client, "get_insights")) <= 3
+    coverage = result["adset_coverage"]
+    assert coverage["status"] == "failed" and "Permissions" in coverage["error"]
+    assert result["metrics"]["adset_rows"] == 0
+    assert result["account"]["name"] == "Shop"
+    assert result["datasets"]["items"][0]["id"] == "px_1"
+    assert any("Ad set insights could not be read" in signal for signal in result["missing_signals"])
+
+
+def test_advertiser_context_object_ids_read_only_the_named_objects(monkeypatch) -> None:
+    rows = _large_account_rows(2500)
+    rows[1]["campaign_id"] = "777"
+    client = _context_client()
+    client.insights_handler = _large_account_handler(rows)
+    _patch(monkeypatch, client)
+
+    result = asyncio.run(performance_signals.get_advertiser_context(
+        account_id="act_42", object_ids=["100000", "777", "999"],
+    ))
+
+    filtered = [call for call in _calls(client, "get_insights") if "filtering" in call["params"]]
+    assert sorted(call["params"]["filtering"][0]["field"] for call in filtered) == ["adset.id", "campaign.id"]
+    assert not any("sort" in call["params"] for call in _calls(client, "get_insights"))
+    assert len(_calls(client, "get_insights")) == 3
+    assert result["metrics"]["adset_rows"] == 2
+    assert result["object_scope"]["unmatched_object_ids"] == ["999"]
+    assert result["adset_coverage"]["mode"] == "object_ids"
+
+
+def test_insights_page_cap_says_pages_not_rows(monkeypatch) -> None:
+    def handler(object_id, fields, params):
+        page = int(params.get("after") or 0)
+        return {"data": [_day_row(f"2026-10-{page + 1:02d}", spend=1, impressions=1, clicks=1)],
+                "paging": {"cursors": {"after": str(page + 1)}, "next": "https://graph.example/next"}}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    with pytest.raises(ValidationError, match="pages"):
+        asyncio.run(performance_signals._read_insights_pages("cmp_1", ["spend"], {"level": "campaign"}))
