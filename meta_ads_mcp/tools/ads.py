@@ -18,7 +18,6 @@ from meta_ads_mcp.money import (
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import collection_response, creation_response, mutation_response
 from meta_ads_mcp.tools.campaigns import (
-    ADLABELS_PREVIOUS_INCOMPLETE,
     build_copy_request,
     read_adlabels,
     reject_named_and_params,
@@ -480,9 +479,9 @@ async def update_ad(
                 else:
                     shaped["creative_id"] = resolved_creative_id
             elif key == "adlabels" and before:
-                shaped[key], labels_complete = read_adlabels(values.get(key))
-                if not labels_complete:
-                    incomplete[key] = ADLABELS_PREVIOUS_INCOMPLETE
+                shaped[key], note = read_adlabels(values.get(key))
+                if note:
+                    incomplete[key] = note
             else:
                 shaped[key] = values.get(key)
         return shaped

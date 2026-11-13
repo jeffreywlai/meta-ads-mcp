@@ -84,29 +84,31 @@ def _nonblank_text(value: str, field_name: str) -> str:
     return value
 
 
-def read_adlabels(value: Any) -> tuple[list[dict[str, Any]] | None, bool]:
-    """Shape labels read from Meta as a list of {id, name}; the flag is False when Meta reported another page."""
+ADLABELS_PREVIOUS_INCOMPLETE = (
+    "Meta returned more labels than one page; previous lists the first page only. "
+    "The update replaced the whole label set."
+)
+ADLABELS_PREVIOUS_UNREADABLE = "Meta returned labels in a shape this server could not read; previous shows none."
+
+
+def read_adlabels(value: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Shape labels read from Meta as a list of {id, name}, with a note when the list may not be complete."""
     if value is None:
-        return None, True
-    complete = True
+        return None, None
+    note = None
     items = value
     if isinstance(value, dict):
         items = value.get("data")
-        complete = not (value.get("paging") or {}).get("next")
+        if (value.get("paging") or {}).get("next"):
+            note = ADLABELS_PREVIOUS_INCOMPLETE
     if not isinstance(items, list):
-        return None, False
+        return None, ADLABELS_PREVIOUS_UNREADABLE
     labels = [
         {key: str(item[key]) if key == "id" else item[key] for key in ("id", "name") if item.get(key) is not None}
         for item in items
         if isinstance(item, dict)
     ]
-    return labels, complete
-
-
-ADLABELS_PREVIOUS_INCOMPLETE = (
-    "Meta returned more labels than one page; previous lists the first page only. "
-    "The update replaced the whole label set."
-)
+    return labels, note
 
 # Values from Meta's ad set reference (POST /act_{id}/adsets) and
 # AdAccount.create_ad_set in facebook-python-business-sdk 26.0.2.
@@ -155,12 +157,11 @@ def _nonblank_string_list(value: Any, field_name: str) -> list[str]:
 
 def _schedule_seconds(value: Any, field_name: str) -> int:
     """Read a high demand period bound (ISO 8601 with a UTC offset, or Unix seconds) as Unix seconds."""
-    if isinstance(value, bool):
-        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.")
-    if isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool):
         value = str(value)
-    parsed = _validate_adset_time(value, field_name)
-    assert parsed is not None  # Only an end_time named exactly "end_time" may be 0.
+    parsed = _validate_adset_time(value, field_name) if isinstance(value, str) else None
+    if parsed is None:
+        raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.")
     return int(parsed.timestamp())
 
 
@@ -489,10 +490,9 @@ async def update_campaign(
         elif key == "spend_cap":
             previous_response[key] = from_minor_units(previous.get(key), currency, field_name=key)
         elif key == "adlabels":
-            labels, complete = read_adlabels(previous.get(key))
-            previous_response[key] = labels
-            if not complete:
-                incomplete[key] = ADLABELS_PREVIOUS_INCOMPLETE
+            previous_response[key], note = read_adlabels(previous.get(key))
+            if note:
+                incomplete[key] = note
         else:
             previous_response[key] = previous.get(key)
     await client.update_object(campaign_id, data=payload)
@@ -862,9 +862,9 @@ async def update_adset(
             )
     incomplete: dict[str, str] = {}
     if "adlabels" in previous_values:
-        previous_values["adlabels"], labels_complete = read_adlabels(previous_values["adlabels"])
-        if not labels_complete:
-            incomplete["adlabels"] = ADLABELS_PREVIOUS_INCOMPLETE
+        previous_values["adlabels"], note = read_adlabels(previous_values["adlabels"])
+        if note:
+            incomplete["adlabels"] = note
     unavailable = {key: _OMITTED_PREVIOUS for key in read_fields if key not in previous}
     unavailable.update({key: _UNREAD_ADSET_PREVIOUS for key in not_read})
     stored = _stored_adset_time(previous.get(other_bound)) if other_bound else None

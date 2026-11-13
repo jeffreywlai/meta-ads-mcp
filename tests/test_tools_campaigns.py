@@ -1510,6 +1510,9 @@ _GOOD_PERIOD = {"time_start": 1798000000, "time_end": 1798010800, "budget_value"
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 1798010799}]}, "at least 3 hours"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": "2026-12-01T00:00:00"}]}, "UTC offset"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": True}]}, "time_start"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_start": None}]}, "time_start must be"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 0}]}, "time_end must be"),
+        ({"budget_schedule_specs": [{**_GOOD_PERIOD, "time_end": 1798010800.5}]}, "time_end must be"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": True}]}, "must be a number"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": "20"}]}, "must be a number"),
         ({"budget_schedule_specs": [{**_GOOD_PERIOD, "budget_value": 0}]}, "greater than 0"),
@@ -1671,6 +1674,14 @@ def test_update_campaign_labels_on_an_unread_page_are_flagged(monkeypatch) -> No
     result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", adlabels=[{"id": "2"}]))
     assert result["previous"]["adlabels"] == [{"id": "1", "name": "A"}]
     assert "first page only" in result["previous_incomplete"]["adlabels"]
+
+
+def test_update_campaign_unreadable_previous_labels_are_named(monkeypatch) -> None:
+    client = StoredCampaignClient(extra={"adlabels": "unexpected"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", adlabels=[{"id": "2"}]))
+    assert result["previous"]["adlabels"] is None
+    assert "could not read" in result["previous_incomplete"]["adlabels"]
 
 
 def test_update_campaign_one_sided_start_is_checked_against_stored_stop(monkeypatch) -> None:
