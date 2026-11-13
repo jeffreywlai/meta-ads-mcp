@@ -237,3 +237,139 @@ def test_a_real_write_clause_is_still_offered_next_to_an_analytical_one(monkeypa
 )
 def test_a_command_whose_target_is_described_by_a_number_is_still_a_command(query, expected) -> None:
     assert expected in _decision(query).compatible_tools
+
+
+# Round-three review H12: a reporting destination after the preposition ("to the
+# report") or a count noun in the object ("event source counts") makes the
+# request about numbers, even when the object names what a write tool acts on.
+
+H12_REVIEWER_QUERIES = [
+    "add audience users to the report",
+    "remove audience users from the report",
+    "connect catalog event source counts to the chart",
+    "disconnect the pixel from the report",
+]
+
+H12_MORE_REPORTING_QUERIES = [
+    "add audience users to the weekly dashboard",
+    "add the customer counts to the spreadsheet",
+    "add instagram post counts to the table",
+    "add the audience size to the report",
+    "add audience users into the graph",
+    "remove customers from the summary table",
+    "remove audience user numbers from the export",
+    "remove the pixel from the chart",
+    "connect the pixel to the dashboard",
+    "connect event source counts to the report",
+    "disconnect the dataset from the dashboard",
+    "duplicate the campaign into the report",
+    "copy the ad set into the spreadsheet",
+    "clone the ad onto the slide deck",
+    "copy the campaign to the presentation",
+    "boost instagram post counts by week",
+    "cancel ad study counts for last month",
+    "add customers to the report audience tab",
+    "add audience users in the report",
+    "add audience users to the Weekly Report",
+    "Add Audience Performance To The Report",
+    "boost instagram post CTR",
+    "remove audience users off the dashboard",
+]
+
+
+@pytest.mark.parametrize("query", H12_REVIEWER_QUERIES)
+def test_h12_reporting_objects_are_read_safe_after_prepositions(query) -> None:
+    decision = _decision(query)
+    assert decision.suppress_mutations is True, sorted(decision.compatible_tools)
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "read_only"])
+@pytest.mark.parametrize("query", H12_REVIEWER_QUERIES + H12_MORE_REPORTING_QUERIES)
+def test_h12_reporting_destinations_and_counts_offer_read_tools_only(monkeypatch, query, locked) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "true" if locked else "false")
+    reload_settings()
+    assert _decision(query).suppress_mutations is True
+    found = _search(query)
+    assert found, "a reporting request should still find read tools"
+    assert not ALL_SUBJECT_VERB_WRITE_TOOLS & set(found), found
+
+
+# Commands whose wording is close to the reporting requests above.
+H12_COMMANDS = [
+    ("add customers to the audience", "add_audience_users"),
+    ("add customers from the spreadsheet to the audience", "add_audience_users"),
+    ("add customers from the report to the custom audience", "add_audience_users"),
+    ("add users to the report viewers audience", "add_audience_users"),
+    ("remove customers from the dashboard audience", "remove_audience_users"),
+    ("remove the customers listed in the report from the audience", "remove_audience_users"),
+    ("connect the pixel to the catalog", "connect_catalog_event_source"),
+    ("disconnect the pixel shown in the report from the catalog", "disconnect_catalog_event_source"),
+    ("duplicate the campaign listed in the report", "duplicate_campaign"),
+    ("copy the ad set into another campaign", "duplicate_adset"),
+    ("boost the instagram post with the most reach", "boost_instagram_post"),
+    ("add the customers in the spreadsheet to the custom audience", "add_audience_users"),
+]
+
+
+@pytest.mark.parametrize(("query", "expected"), H12_COMMANDS)
+def test_h12_commands_near_reporting_wording_still_offer_the_write_tool(monkeypatch, query, expected) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    assert expected in _decision(query).compatible_tools
+    assert expected in _search(query)[:3], _search(query)
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    assert expected not in _search(query)
+
+
+# Round-three review H13: a reporting word inside an entity's name is the name,
+# not the thing acted on.
+
+H13_REVIEWER_COMMANDS = [
+    ('duplicate campaign named "Reach"', "duplicate_campaign"),
+    ('copy the ad set called "Performance"', "duplicate_adset"),
+    ('clone the ad named "Spend"', "duplicate_ad"),
+    ('boost the Instagram post called "Reach"', "boost_instagram_post"),
+]
+
+H13_MORE_COMMANDS = [
+    ("duplicate the campaign called Spend Test", "duplicate_campaign"),
+    ("copy the campaign titled 'Performance Max'", "duplicate_campaign"),
+    ('clone the ad set named "Weekly Report"', "duplicate_adset"),
+    ('boost the instagram post called "Engagement Totals"', "boost_instagram_post"),
+    ('add customers to the audience named "Spend Report"', "add_audience_users"),
+    ('remove users from the audience called "Reach Chart"', "remove_audience_users"),
+    ('connect the pixel to the catalog named "Performance Report"', "connect_catalog_event_source"),
+    ('disconnect the pixel from the catalog called "Dashboard"', "disconnect_catalog_event_source"),
+    ('cancel the ad study named "Reach Test"', "cancel_ad_study"),
+    ('duplicate campaign "Spend"', "duplicate_campaign"),
+    ("duplicate the campaign labelled Results", "duplicate_campaign"),
+    ("duplicate the Reach campaign", "duplicate_campaign"),
+    ("copy the performance ad set", "duplicate_adset"),
+    ("boost the highest engagement instagram post", "boost_instagram_post"),
+    # An unquoted Title-case name written after the entity.
+    ("Duplicate the campaign Reach Test", "duplicate_campaign"),
+    ("boost the instagram post Reach", "boost_instagram_post"),
+    ("copy the ad set Spend into another campaign", "duplicate_adset"),
+    # A description of the entity, not what is acted on.
+    ("cancel the brand lift study measuring reach", "cancel_ad_study"),
+    ("cancel the study tracking spend", "cancel_ad_study"),
+    ("cancel the running study measuring reach", "cancel_ad_study"),
+]
+
+
+@pytest.mark.parametrize(("query", "expected"), H13_REVIEWER_COMMANDS)
+def test_h13_reporting_words_in_entity_names_do_not_hide_commands(query, expected) -> None:
+    decision = _decision(query)
+    assert expected in decision.compatible_tools, sorted(decision.compatible_tools)
+
+
+@pytest.mark.parametrize(("query", "expected"), H13_REVIEWER_COMMANDS + H13_MORE_COMMANDS)
+def test_h13_named_entities_offer_the_write_tool_and_read_only_hides_it(monkeypatch, query, expected) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    assert expected in _decision(query).compatible_tools, sorted(_decision(query).compatible_tools)
+    assert expected in _search(query)[:3], _search(query)
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    assert expected not in _search(query)
