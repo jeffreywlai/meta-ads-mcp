@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import stat
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
-from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.schemas import creation_response, mutation_response
@@ -311,6 +315,13 @@ async def upload_creative_asset(
 
 
 MAX_DIRECT_VIDEO_BYTES = 25 * 1024 * 1024
+# Meta's Ads Guide gives 4 GB as the largest video file for ads.
+MAX_CHUNKED_VIDEO_BYTES = 4_000_000_000
+# Meta chooses each chunk's size; this server refuses to hold more than this in memory at once.
+MAX_VIDEO_CHUNK_BYTES = 256 * 1024 * 1024
+# Separate from the file size: a cap on requests, so a stalled session cannot run forever.
+MAX_CHUNKED_TRANSFER_REQUESTS = 10_000
+VIDEO_UPLOAD_HOST = "graph-video.facebook.com"
 # Container formats Meta lists as supported for ad videos.
 VIDEO_FILE_TYPES = {
     ".mp4": "video/mp4",
@@ -338,6 +349,283 @@ def _video_processing_status(video: dict[str, Any]) -> str | None:
     return None
 
 
+def _video_upload_folder() -> Path:
+    """The folder named by META_UPLOAD_DIR, with local_files' rules and messages."""
+    configured = get_settings().upload_directory
+    if not configured or not configured.strip():
+        raise ValidationError(
+            "Reading local files is off. Set the META_UPLOAD_DIR environment variable to the "
+            "one folder this server may read uploads from, put the file there, and try again."
+        )
+    try:
+        folder = Path(configured.strip()).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValidationError("The folder named by META_UPLOAD_DIR does not exist or cannot be read.") from None
+    if not folder.is_dir():
+        raise ValidationError("META_UPLOAD_DIR must name a folder.")
+    return folder
+
+
+@dataclass(slots=True)
+class _OpenVideo:
+    """A local video opened for upload: the open descriptor is what gets read."""
+
+    descriptor: int
+    name: str
+    size: int
+
+
+def _open_upload_video(file_path: str, parameter: str = "file_path") -> _OpenVideo:
+    """Open a video inside the upload folder without reading it all into memory.
+
+    Same rules and messages as local_files.read_upload_file (folder from META_UPLOAD_DIR,
+    links resolved and checked, type from the real name, size checked on the open file),
+    which reads the whole file and so cannot serve multi-gigabyte uploads. In addition,
+    every folder below the upload folder is opened relative to its parent and refuses
+    links, so a folder swapped for a link after the check cannot redirect the read.
+    """
+    if not isinstance(file_path, str) or not file_path.strip() or "\x00" in file_path:
+        raise ValidationError(f"{parameter} must be a non-blank local file path.")
+    unreadable = f"{parameter} does not point to a file that can be read."
+    folder = _video_upload_folder()
+    candidate = Path(file_path.strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = folder / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValidationError(unreadable) from None
+    if not resolved.is_relative_to(folder):
+        raise ValidationError(f"{parameter} must be inside the upload folder set by META_UPLOAD_DIR.")
+    if not resolved.stem or resolved.suffix.lower() not in VIDEO_FILE_TYPES:
+        raise ValidationError(f"{parameter} must end in one of: {', '.join(VIDEO_FILE_TYPES)}.")
+    parts = resolved.relative_to(folder).parts
+    if not parts:
+        raise ValidationError(unreadable)
+    directory: int | None = None
+    descriptor: int | None = None
+    try:
+        directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        details = os.fstat(descriptor)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ValidationError(unreadable) from None
+    finally:
+        if directory is not None:
+            os.close(directory)
+    problem = None
+    if not stat.S_ISREG(details.st_mode):
+        problem = unreadable
+    elif details.st_size == 0:
+        problem = f"{parameter} points to an empty file."
+    elif details.st_size > MAX_CHUNKED_VIDEO_BYTES:
+        problem = f"{parameter} is larger than this server's {MAX_CHUNKED_VIDEO_BYTES}-byte limit for video uploads (Meta's limit for ad videos is 4 GB)."
+    if problem is not None:
+        os.close(descriptor)
+        raise ValidationError(problem)
+    return _OpenVideo(descriptor=descriptor, name=resolved.name, size=details.st_size)
+
+
+def _read_video_bytes(video: _OpenVideo, offset: int, length: int) -> bytes:
+    """Read exactly length bytes at offset from the opened file, or refuse."""
+    pieces: list[bytes] = []
+    remaining = length
+    position = offset
+    while remaining > 0:
+        piece = os.pread(video.descriptor, remaining, position)
+        if not piece:
+            raise ValidationError("file_path changed size while it was being uploaded.")
+        pieces.append(piece)
+        remaining -= len(piece)
+        position += len(piece)
+    return b"".join(pieces)
+
+
+def _offset(value: Any) -> int | None:
+    """Meta returns offsets as numeric strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+class _ChunkedUploadStopped(Exception):
+    """Meta's chunked-upload answer could not be followed safely."""
+
+
+async def _chunked_video_upload(
+    client: Any,
+    account: str,
+    video: _OpenVideo,
+    meta_fields: dict[str, Any],
+) -> dict[str, Any]:
+    """Run start, transfer and finish on the advideos edge; on failure name the session and what was sent."""
+    try:
+        started = await client.post_ad_video_upload_phase(
+            account, data={"upload_phase": "start", "file_size": video.size},
+        )
+    except Exception as exc:
+        prefix = f"Starting the chunked upload of {video.name} failed, so nothing was transferred."
+        if _outcome_unknown(exc):
+            prefix = (
+                f"Starting the chunked upload of {video.name} may or may not have opened an upload session; "
+                "no video bytes were sent."
+            )
+        wrapped = _with_context(exc, f"{prefix} Reason:")
+        if wrapped is exc:
+            raise
+        raise wrapped from exc
+    session_id = str(started.get("upload_session_id") or "") if isinstance(started, dict) else ""
+    video_id = str(started.get("video_id") or "") if isinstance(started, dict) else ""
+    if not session_id:
+        raise MetaApiError(message=f"Meta did not return an upload session for {video.name}; nothing was transferred.")
+    progress = {"phase": "transfer", "confirmed": 0, "requests": 0}
+
+    def stopped_message(reason: str) -> str:
+        message = (
+            f"The chunked upload of {video.name} stopped during the {progress['phase']} step: upload session {session_id}, "
+            f"video {video_id or 'not returned'}. Meta confirmed {progress['confirmed']} of {video.size} bytes "
+            f"({progress['requests']} transfer requests sent)."
+        )
+        if progress["phase"] == "finish":
+            message += (
+                " The finish may have been accepted even so; check "
+                f"list_ad_videos(video_ids=['{video_id}']) before uploading again."
+                if progress.get("unknown")
+                else " The session was not finished, so the video is not ready; upload the file again to retry."
+            )
+        else:
+            message += " The session was not finished, so the video is not ready; upload the file again to retry."
+        return f"{message} Reason: {reason}"
+
+    try:
+        start = _offset(started.get("start_offset"))
+        end = _offset(started.get("end_offset"))
+        while True:
+            if start is None or end is None or not 0 <= start <= end <= video.size:
+                raise _ChunkedUploadStopped(
+                    f"Meta asked for bytes {started.get('start_offset') if start is None else start} to "
+                    f"{started.get('end_offset') if end is None else end}, outside the {video.size}-byte file."
+                )
+            progress["confirmed"] = start
+            if start == end:
+                break
+            if end - start > MAX_VIDEO_CHUNK_BYTES:
+                raise _ChunkedUploadStopped(
+                    f"Meta asked for a {end - start}-byte chunk, larger than this server reads at once ({MAX_VIDEO_CHUNK_BYTES} bytes)."
+                )
+            if progress["requests"] >= MAX_CHUNKED_TRANSFER_REQUESTS:
+                raise _ChunkedUploadStopped(
+                    f"The upload reached this server's {MAX_CHUNKED_TRANSFER_REQUESTS}-request limit for one video."
+                )
+            chunk = _read_video_bytes(video, start, end - start)
+            progress["requests"] += 1
+            answer = await client.post_ad_video_upload_phase(
+                account,
+                data={"upload_phase": "transfer", "upload_session_id": session_id, "start_offset": start},
+                files={"video_file_chunk": (video.name, chunk)},
+            )
+            next_start = _offset(answer.get("start_offset")) if isinstance(answer, dict) else None
+            next_end = _offset(answer.get("end_offset")) if isinstance(answer, dict) else None
+            if next_start is not None and next_end is not None and next_start != next_end and next_start <= start:
+                raise _ChunkedUploadStopped(
+                    f"Meta's next chunk (from byte {next_start}) did not move forward from byte {start}."
+                )
+            started = answer if isinstance(answer, dict) else {}
+            start, end = next_start, next_end
+        progress["phase"] = "finish"
+        finished = await client.post_ad_video_upload_phase(
+            account, data={"upload_phase": "finish", "upload_session_id": session_id, **meta_fields},
+        )
+        if not (isinstance(finished, dict) and finished.get("success") is True):
+            raise _ChunkedUploadStopped("Meta did not confirm the finish (no success: true in its answer).")
+    except _ChunkedUploadStopped as stop:
+        raise MetaApiError(message=stopped_message(str(stop))) from None
+    except ValidationError as exc:
+        raise MetaApiError(message=stopped_message(str(exc))) from None
+    except Exception as exc:
+        progress["unknown"] = _outcome_unknown(exc)
+        message = stopped_message(_failure_reason(exc))
+        if isinstance(exc, (MetaApiError, RateLimitError)):
+            exc.message = message
+            raise
+        raise MetaApiError(message=message) from exc
+    return {
+        "video_id": video_id or None,
+        "finish": finished,
+        "upload": {
+            "mode": "chunked",
+            "upload_session_id": session_id,
+            "file_name": video.name,
+            "bytes": video.size,
+            "bytes_confirmed": progress["confirmed"],
+            "transfer_requests": progress["requests"],
+        },
+    }
+
+
+def _chunked_plan(account: str, video: _OpenVideo, meta_fields: dict[str, Any]) -> dict[str, Any]:
+    """What a chunked upload sends, for dry_run."""
+    path = f"{account}/advideos"
+    return {
+        "method": "POST",
+        "path": path,
+        "host": VIDEO_UPLOAD_HOST,
+        "upload": "chunked",
+        "source": {"file_name": video.name, "bytes": video.size},
+        "requests": [
+            {"method": "POST", "path": path, "data": {"upload_phase": "start", "file_size": video.size}},
+            {
+                "method": "POST",
+                "path": path,
+                "data": {"upload_phase": "transfer", "upload_session_id": "<from start>", "start_offset": "<from Meta>"},
+                "files": {"video_file_chunk": "<the bytes from start_offset to end_offset that Meta names>"},
+                "repeats": "until Meta answers with start_offset equal to end_offset",
+            },
+            {"method": "POST", "path": path, "data": {"upload_phase": "finish", "upload_session_id": "<from start>", **meta_fields}},
+        ],
+    }
+
+
+async def _read_video_status(client: Any, video_id: str | None) -> dict[str, Any]:
+    """Read processing status after an upload; a failed read never hides the video id."""
+    if video_id is None:
+        return {
+            "processing_status": None,
+            "status": None,
+            "status_note": "Meta returned no video id; check list_ad_videos before uploading again.",
+        }
+    try:
+        video = await client.get_object(video_id, fields=VIDEO_STATUS_FIELDS)
+    except Exception as exc:
+        return {
+            "processing_status": None,
+            "status": None,
+            "status_note": (
+                f"The upload succeeded (video {video_id}) but its status could not be read: {_failure_reason(exc)} "
+                "Check list_ad_videos(video_ids=...) before using it."
+            ),
+        }
+    processing_status = _video_processing_status(video)
+    return {
+        "processing_status": processing_status,
+        "status": video.get("status"),
+        "status_note": (
+            "Video is ready to use." if processing_status == "ready"
+            else "Meta is still processing or reported a problem; check list_ad_videos(video_ids=...) before using it."
+        ),
+    }
+
+
 @mcp_server.tool()
 async def upload_ad_video(
     account_id: AccountId,
@@ -348,7 +636,7 @@ async def upload_ad_video(
     description: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Upload a video to the ad account's video library from a public http(s) URL (video_url) or a local file of at most 25 MB (file_path), and return the video id and Meta's processing status. Meta processes the video after upload; check list_ad_videos(video_ids=...) until processing_status is ready before using it in a creative. Larger local files need Meta's chunked upload, which this tool does not do; host the file and use video_url. dry_run returns what would be sent and sends nothing."""
+    """Upload a video to the ad account's video library from a public http(s) URL (video_url) or a local file in the upload folder (file_path, up to 4 GB), and return the video id and Meta's processing status. Files above 25 MB go through Meta's chunked upload; if it stops, the error names the upload session and how many bytes Meta confirmed. Meta processes the video after upload; check list_ad_videos(video_ids=...) until processing_status is ready before using it in a creative. dry_run returns what would be sent and sends nothing."""
     account = blank_to_none(account_id)
     if account is None:
         raise ValidationError("account_id is required.")
@@ -359,35 +647,63 @@ async def upload_ad_video(
     title = blank_to_none(title)
     if title is not None and len(title) >= 255:
         raise ValidationError("title must be under 255 characters.")
-    data: dict[str, Any] = {}
-    files: dict[str, Any] | None = None
-    shown: dict[str, Any]
     if url:
         refuse_url_credentials(url, "video_url")
         if not url.startswith(("http://", "https://")):
             raise ValidationError("video_url must be a public http:// or https:// URL.")
-        data["file_url"] = url
-        shown = {"file_url": url}
-    else:
-        # Only from the operator's upload folder: a path from the model must not be able
-        # to send some other file on this machine to Meta. Files above the limit need
-        # Meta's chunked upload, which this tool does not do; host them and pass video_url.
-        local_video = read_upload_file(
-            path_text,
-            allowed_types=VIDEO_FILE_TYPES,
-            max_bytes=MAX_DIRECT_VIDEO_BYTES,
-            too_large_hint=(
-                "Larger files need Meta's chunked upload, which this tool does not do. "
-                "Host the file and pass video_url."
-            ),
-        )
-        shown = {"source": {"file_name": local_video.name, "bytes": len(local_video.content)}}
-    for key, value in (("name", blank_to_none(name)), ("title", title), ("description", blank_to_none(description))):
-        if value is not None:
-            data[key] = value
-            shown[key] = value
+    meta_fields = {
+        key: value
+        for key, value in (("name", blank_to_none(name)), ("title", title), ("description", blank_to_none(description)))
+        if value is not None
+    }
     resolved_account = normalize_account_id(account)
     target = {"account_id": resolved_account}
+    if url:
+        return await _upload_video_request(
+            resolved_account, target, data={"file_url": url, **meta_fields}, files=None,
+            shown={"file_url": url, **meta_fields}, upload={"mode": "url"}, dry_run=dry_run,
+        )
+    # Only from the operator's upload folder: a path from the model must not be able
+    # to send some other file on this machine to Meta.
+    video = _open_upload_video(path_text)
+    try:
+        if video.size <= MAX_DIRECT_VIDEO_BYTES:
+            source = {"file_name": video.name, "bytes": video.size}
+            content = b"" if dry_run else _read_video_bytes(video, 0, video.size)
+            return await _upload_video_request(
+                resolved_account, target, data=dict(meta_fields), files={"source": (video.name, content)},
+                shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
+            )
+        if dry_run:
+            return {
+                "ok": True,
+                "action": "upload_ad_video",
+                "dry_run": True,
+                "sent": False,
+                "target": target,
+                "would_send": _chunked_plan(resolved_account, video, meta_fields),
+            }
+        client = get_graph_api_client()
+        outcome = await _chunked_video_upload(client, resolved_account, video, meta_fields)
+    finally:
+        os.close(video.descriptor)
+    response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
+    response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
+    response.update(await _read_video_status(client, outcome["video_id"]))
+    return response
+
+
+async def _upload_video_request(
+    account: str,
+    target: dict[str, Any],
+    *,
+    data: dict[str, Any],
+    files: dict[str, Any] | None,
+    shown: dict[str, Any],
+    upload: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    """One-request upload (URL or a small file), then a status read."""
     if dry_run:
         return {
             "ok": True,
@@ -395,40 +711,14 @@ async def upload_ad_video(
             "dry_run": True,
             "sent": False,
             "target": target,
-            "would_send": {"method": "POST", "path": f"{resolved_account}/advideos", "data": shown},
+            "would_send": {"method": "POST", "path": f"{account}/advideos", "data": shown},
         }
-    if path_text:
-        files = {"source": (local_video.name, local_video.content)}
     client = get_graph_api_client()
-    uploaded = await client.create_edge_object(resolved_account, "advideos", data=data, files=files)
+    uploaded = await client.create_edge_object(account, "advideos", data=data, files=files)
     video_id = str(uploaded.get("id") or uploaded.get("video_id") or "") or None
-    processing_status: str | None = None
-    status_detail: Any = None
-    status_note: str
-    if video_id is None:
-        status_note = "Meta returned no video id; check list_ad_videos before uploading again."
-    else:
-        try:
-            video = await client.get_object(video_id, fields=VIDEO_STATUS_FIELDS)
-            status_detail = video.get("status")
-            processing_status = _video_processing_status(video)
-            status_note = (
-                "Video is ready to use." if processing_status == "ready"
-                else "Meta is still processing or reported a problem; check list_ad_videos(video_ids=...) before using it."
-            )
-        except Exception as exc:
-            # The video exists now; a failed status read must never hide its id.
-            status_note = (
-                f"The upload succeeded (video {video_id}) but its status could not be read: {_failure_reason(exc)} "
-                "Check list_ad_videos(video_ids=...) before using it."
-            )
     response = creation_response(action="upload_ad_video", target=target, result=uploaded)
-    response.update({
-        "video_id": video_id,
-        "processing_status": processing_status,
-        "status": status_detail,
-        "status_note": status_note,
-    })
+    response.update({"video_id": video_id, "upload": upload})
+    response.update(await _read_video_status(client, video_id))
     return response
 
 

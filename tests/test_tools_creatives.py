@@ -596,6 +596,7 @@ def test_upload_ad_video_status_read_failure_still_returns_the_id(monkeypatch) -
 
 def test_upload_ad_video_validation_makes_no_call(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    monkeypatch.setattr(creatives, "MAX_CHUNKED_VIDEO_BYTES", creatives.MAX_DIRECT_VIDEO_BYTES)
     big = tmp_path / "big.mp4"
     with big.open("wb") as handle:
         handle.truncate(creatives.MAX_DIRECT_VIDEO_BYTES + 1)
@@ -604,7 +605,7 @@ def test_upload_ad_video_validation_makes_no_call(monkeypatch, tmp_path) -> None
         ({"video_url": "https://x/v.mp4", "file_path": str(big)}, "exactly one"),
         ({"video_url": "ftp://x/v.mp4"}, "http"),
         ({"file_path": str(tmp_path / "missing.mp4")}, "does not point to a file"),
-        ({"file_path": str(big)}, "chunked upload"),
+        ({"file_path": str(big)}, "byte limit for video uploads"),
         ({"video_url": "https://x/v.mp4", "title": "t" * 255}, "255"),
     ]
     for arguments, message in cases:
@@ -1087,6 +1088,237 @@ def test_g20_video_url_with_login_is_refused_before_any_request(monkeypatch) -> 
             asyncio.run(creatives.upload_ad_video("10", video_url=url, dry_run=dry_run))
         assert secret not in str(raised.value)
         assert "username or password" in str(raised.value)
+
+
+# upload_ad_video: chunked upload for local files above the direct-upload limit
+
+
+class ChunkedVideoClient:
+    """Plays Meta's side of a chunked advideos upload: start, transfers, finish."""
+
+    def __init__(self, *, chunk: int = 10, fail: dict | None = None, transfer_offsets=None, finish=None) -> None:
+        self.chunk = chunk
+        self.fail = fail or {}
+        self.transfer_offsets = list(transfer_offsets) if transfer_offsets is not None else None
+        self.finish = finish if finish is not None else {"success": True}
+        self.calls: list[tuple] = []
+        self.size = 0
+
+    async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+        phase = data["upload_phase"]
+        chunk = files["video_file_chunk"][1] if files else None
+        self.calls.append((phase, account_id, dict(data), chunk))
+        transfers = sum(1 for call in self.calls if call[0] == "transfer")
+        if (phase, transfers if phase == "transfer" else 0) in self.fail:
+            raise self.fail[(phase, transfers if phase == "transfer" else 0)]
+        if phase == "start":
+            self.size = int(data["file_size"])
+            return {"upload_session_id": "5001", "video_id": "7001", "start_offset": "0", "end_offset": str(min(self.chunk, self.size))}
+        if phase == "transfer":
+            if self.transfer_offsets is not None:
+                start, end = self.transfer_offsets.pop(0)
+                return {"start_offset": str(start), "end_offset": str(end)}
+            start = int(data["start_offset"]) + len(chunk)
+            return {"start_offset": str(start), "end_offset": str(min(start + self.chunk, self.size))}
+        return self.finish
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields, None))
+        return {"id": object_id, "status": {"video_status": "processing"}}
+
+
+def _large_video(monkeypatch, tmp_path, size: int = 25, name: str = "film.mp4"):
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 8)
+    path = tmp_path / name
+    path.write_bytes(bytes(range(65, 65 + size)))
+    return path
+
+
+def test_upload_ad_video_large_file_uses_the_chunked_upload(monkeypatch, tmp_path) -> None:
+    path = _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4", title="Spring", description="Launch"))
+
+    content = path.read_bytes()
+    assert client.calls == [
+        ("start", "act_123", {"upload_phase": "start", "file_size": 25}, None),
+        ("transfer", "act_123", {"upload_phase": "transfer", "upload_session_id": "5001", "start_offset": 0}, content[0:10]),
+        ("transfer", "act_123", {"upload_phase": "transfer", "upload_session_id": "5001", "start_offset": 10}, content[10:20]),
+        ("transfer", "act_123", {"upload_phase": "transfer", "upload_session_id": "5001", "start_offset": 20}, content[20:25]),
+        ("finish", "act_123", {"upload_phase": "finish", "upload_session_id": "5001", "title": "Spring", "description": "Launch"}, None),
+        ("get", "7001", ["id", "status"], None),
+    ]
+    assert result["video_id"] == "7001"
+    assert result["processing_status"] == "processing"
+    assert result["upload"] == {
+        "mode": "chunked", "upload_session_id": "5001", "file_name": "film.mp4", "bytes": 25,
+        "bytes_confirmed": 25, "transfer_requests": 3,
+    }
+    assert result["created"] == {"finish": {"success": True}}
+
+
+def test_upload_ad_video_small_file_still_uses_one_request(monkeypatch, tmp_path) -> None:
+    client = FakeVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    (tmp_path / "clip.mp4").write_bytes(b"12345678")
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 8)
+    result = asyncio.run(creatives.upload_ad_video("123", file_path="clip.mp4"))
+    assert client.calls[0] == ("create", "act_123", "advideos", {}, {"source": ("clip.mp4", b"12345678")})
+    assert result["upload"]["mode"] == "direct"
+
+
+def test_upload_ad_video_chunked_dry_run_sends_nothing(monkeypatch, tmp_path) -> None:
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    result = asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4", name="Film", dry_run=True))
+    assert result["sent"] is False
+    would_send = result["would_send"]
+    assert would_send["upload"] == "chunked"
+    assert would_send["host"] == "graph-video.facebook.com"
+    assert would_send["source"] == {"file_name": "film.mp4", "bytes": 25}
+    assert [request["data"]["upload_phase"] for request in would_send["requests"]] == ["start", "transfer", "finish"]
+    assert would_send["requests"][0]["data"] == {"upload_phase": "start", "file_size": 25}
+    assert would_send["requests"][2]["data"] == {"upload_phase": "finish", "upload_session_id": "<from start>", "name": "Film"}
+
+
+def test_upload_ad_video_chunked_failure_reports_session_and_bytes(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import RateLimitError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(fail={("transfer", 2): RateLimitError("Synthetic limit", code=4)})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(RateLimitError) as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    message = str(raised.value)
+    for expected in ("upload session 5001", "video 7001", "10 of 25 bytes", "transfer step", "2 transfer requests", "Synthetic limit"):
+        assert expected in message, message
+    assert [call[0] for call in client.calls] == ["start", "transfer", "transfer"]
+
+
+def test_upload_ad_video_chunked_lost_finish_says_check_before_retrying(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    lost = MetaApiError(message="Meta API request failed before a response was received.", is_transient=True, mutation_outcome_unknown=True)
+    client = ChunkedVideoClient(fail={("finish", 0): lost})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    message = str(raised.value)
+    assert "25 of 25 bytes" in message
+    assert "may have been accepted" in message
+    assert "list_ad_videos(video_ids=['7001'])" in message
+
+
+def test_upload_ad_video_chunked_start_failure_says_nothing_was_sent(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(fail={("start", 0): MetaApiError(message="Invalid parameter", code=100)})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="nothing was transferred"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+
+
+@pytest.mark.parametrize(
+    ("offsets", "reason"),
+    [
+        ([(0, 10)], "did not move forward"),
+        ([(10, 40)], "outside the 25-byte file"),
+        ([(10, 5)], "outside the 25-byte file"),
+    ],
+)
+def test_upload_ad_video_chunked_stops_on_offsets_it_cannot_follow(monkeypatch, tmp_path, offsets, reason) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(transfer_offsets=offsets)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert reason in str(raised.value)
+    assert "upload session 5001" in str(raised.value)
+    assert [call[0] for call in client.calls] == ["start", "transfer"]
+
+
+def test_upload_ad_video_chunked_finish_without_success_is_not_reported_as_uploaded(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(finish={"success": False})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="did not confirm"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+
+
+def test_upload_ad_video_chunked_transfer_request_cap(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "MAX_CHUNKED_TRANSFER_REQUESTS", 2)
+    client = ChunkedVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="2-request limit"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert [call[0] for call in client.calls] == ["start", "transfer", "transfer"]
+
+
+def test_upload_ad_video_refuses_files_above_the_chunked_limit(monkeypatch, tmp_path) -> None:
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "MAX_CHUNKED_VIDEO_BYTES", 20)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    for dry_run in (False, True):
+        with pytest.raises(creatives.ValidationError, match="20-byte limit"):
+            asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4", dry_run=dry_run))
+
+
+def test_upload_ad_video_chunk_size_above_the_read_cap_is_refused(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    monkeypatch.setattr(creatives, "MAX_VIDEO_CHUNK_BYTES", 5)
+    client = ChunkedVideoClient(chunk=10)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="larger than this server reads at once"):
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert [call[0] for call in client.calls] == ["start"]
+
+
+def test_upload_ad_video_swapped_parent_folder_cannot_escape_the_upload_folder(monkeypatch, tmp_path) -> None:
+    """A folder inside the upload folder replaced by a link after the check must not be followed."""
+    from meta_ads_mcp.config import reload_settings
+
+    root = tmp_path / "uploads"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (nested / "clip.mp4").write_bytes(b"inside")
+    (outside / "clip.mp4").write_bytes(b"synthetic-outside-secret")
+    monkeypatch.setenv("META_UPLOAD_DIR", str(root))
+    reload_settings()
+    original_open = creatives.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and str(path) in {"nested", str(nested)}:
+            swapped = True
+            nested.rename(root / "saved-nested")
+            nested.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(creatives.os, "open", swap_before_open)
+    client = FakeVideoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    try:
+        asyncio.run(creatives.upload_ad_video("123", file_path="nested/clip.mp4"))
+    except creatives.ValidationError as error:
+        assert "outside" not in str(error)
+    assert swapped
+    assert all(call[4] != {"source": ("clip.mp4", b"synthetic-outside-secret")} for call in client.calls if call[0] == "create")
 
 
 def test_g20_boost_call_to_action_link_with_login_is_refused(monkeypatch) -> None:
