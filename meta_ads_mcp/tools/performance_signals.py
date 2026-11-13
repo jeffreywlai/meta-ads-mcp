@@ -217,23 +217,29 @@ def _history_summary(points: list[dict[str, Any]]) -> dict[str, Any]:
 
 async def _history_pages(client: Any, account_id: str, params: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     """Read every page of the score history edge (bounded); return the rows and why the read stopped early."""
-    rows: list[Any] = []
+    rows: list[dict[str, Any]] = []
     page_params = dict(params)
     seen: set[str] = set()
+    seen_pages: set[str] = set()
+    unreadable = 0
     for _request in range(INSIGHTS_MAX_PAGES):
         payload = await client.list_objects(account_id, "opportunity_score_history", params=page_params)
-        rows.extend(payload.get("data", []) or [])
+        page_rows, page_unreadable = _page_rows(payload)
+        if _seen_page(page_rows, seen_pages):
+            return {"data": rows}, _stop_reason(PAGE_REPEATED, unreadable)
+        rows.extend(page_rows)
+        unreadable += page_unreadable
         paging = extract_paging(payload)
         if not paging.get("next"):
-            return {"data": rows}, None
+            return {"data": rows}, _stop_reason(None, unreadable)
         cursor = paging.get("after")
         if not cursor:
-            return {"data": rows}, CURSOR_MISSING
+            return {"data": rows}, _stop_reason(CURSOR_MISSING, unreadable)
         if cursor in seen:
-            return {"data": rows}, CURSOR_REPEATED
+            return {"data": rows}, _stop_reason(CURSOR_REPEATED, unreadable)
         seen.add(cursor)
         page_params = {**params, "after": cursor}
-    return {"data": rows}, f"stopped after {INSIGHTS_MAX_PAGES} requests with more pages left"
+    return {"data": rows}, _stop_reason(f"stopped after {INSIGHTS_MAX_PAGES} requests with more pages left", unreadable)
 
 
 @mcp_server.tool()
@@ -571,11 +577,23 @@ async def _read_insights_pages(
     rows: list[dict[str, Any]] = []
     page_params = dict(params)
     seen: set[str] = set()
+    seen_pages: set[str] = set()
     pages = 0
     while True:
         payload = await client.get_insights(object_id, fields=fields, params=page_params)
         pages += 1
-        rows.extend(_normalize_with_results(payload))
+        page_rows, unreadable = _page_rows(payload)
+        if unreadable:
+            raise ValidationError(
+                f"Insights returned {unreadable} row(s) that could not be read, so totals built from them would be "
+                "wrong. No partial result was returned."
+            )
+        if _seen_page(page_rows, seen_pages):
+            raise ValidationError(
+                "Insights pagination could not finish: Meta returned a page that had already been read. "
+                "No partial result was returned."
+            )
+        rows.extend(_normalize_with_results({**payload, "data": page_rows}))
         paging = extract_paging(payload)
         if not paging.get("next"):
             return rows
@@ -599,6 +617,62 @@ async def _read_insights_pages(
 ROW_BOUND_REACHED = "row_bound_reached"
 CURSOR_MISSING = "Meta reported another page but gave no cursor to read it"
 CURSOR_REPEATED = "Meta returned the same page cursor twice, so the read stopped"
+PAGE_REPEATED = "Meta returned a page that had already been read, so it was not counted again and the read stopped"
+
+
+def _page_rows(payload: Any) -> tuple[list[dict[str, Any]], int]:
+    """A page's rows that are objects, and how many entries could not be read.
+
+    A data value that is not a list (or a payload that is not an object) counts as one unreadable entry: rows
+    may have been there, so the page must not pass as empty.
+    """
+    if not isinstance(payload, dict):
+        return [], 1
+    data = payload.get("data")
+    if data is None:
+        return [], 0
+    if not isinstance(data, list):
+        return [], 1
+    rows = [row for row in data if isinstance(row, dict)]
+    return rows, len(data) - len(rows)
+
+
+def _seen_page(rows: list[dict[str, Any]], seen_pages: set[str]) -> bool:
+    """True when a page with exactly these rows was already read; otherwise remember it.
+
+    Empty pages are not compared: they add nothing, and a cursor loop over them is caught by the cursor check.
+    """
+    if not rows:
+        return False
+    fingerprint = json.dumps(rows, sort_keys=True, default=str)
+    if fingerprint in seen_pages:
+        return True
+    seen_pages.add(fingerprint)
+    return False
+
+
+def _unreadable_rows_reason(count: int) -> str:
+    return f"Meta returned {count} row(s) that could not be read, so the rows read are incomplete"
+
+
+def _stop_reason(stopped: str | None, unreadable: int) -> str | None:
+    """Combine why a read stopped with any rows it could not read; either makes the read partial."""
+    if not unreadable:
+        return stopped
+    reason = _unreadable_rows_reason(unreadable)
+    if stopped is None:
+        return reason
+    if stopped == ROW_BOUND_REACHED:
+        return f"{reason}; the row limit was also reached"
+    return f"{reason}; {stopped}"
+
+
+def _finite(value: Any) -> float | None:
+    """A known, finite number, or None (missing, unreadable, true or false, NaN or infinite)."""
+    if isinstance(value, bool):
+        return None
+    number = to_float(value)
+    return number if number is not None and math.isfinite(number) else None
 
 
 async def _read_bounded_pages(
@@ -609,30 +683,37 @@ async def _read_bounded_pages(
     """Read one insights request page by page, keeping what was read when the read cannot finish.
 
     Returns the raw rows and None when Meta reported no further page (or `enough` says the rows already hold
-    everything the caller needs), or the reason the read stopped first: ROW_BOUND_REACHED once max_rows rows
-    are read, a next page without a cursor, a repeated cursor, or the request cap. Callers label the result
-    partial instead of failing.
+    everything the caller needs), or the reason the read is partial: ROW_BOUND_REACHED once max_rows rows
+    are read, a next page without a cursor, a repeated cursor, a page whose rows were already read (not added
+    a second time), rows that could not be read, or the request cap. Callers label the result partial instead
+    of failing.
     """
     client = get_graph_api_client()
     rows: list[dict[str, Any]] = []
     page_params = dict(params)
     seen: set[str] = set()
+    seen_pages: set[str] = set()
+    unreadable = 0
     for _request in range(max_pages):
         payload = await client.get_insights(object_id, fields=fields, params=page_params)
-        rows.extend(row for row in payload.get("data", []) or [] if isinstance(row, dict))
+        page_rows, page_unreadable = _page_rows(payload)
+        if _seen_page(page_rows, seen_pages):
+            return rows, _stop_reason(PAGE_REPEATED, unreadable)
+        rows.extend(page_rows)
+        unreadable += page_unreadable
         paging = extract_paging(payload)
         if not paging.get("next") or (enough is not None and enough(rows)):
-            return rows, None
+            return rows, _stop_reason(None, unreadable)
         if max_rows is not None and len(rows) >= max_rows:
-            return rows, ROW_BOUND_REACHED
+            return rows, _stop_reason(ROW_BOUND_REACHED, unreadable)
         cursor = paging.get("after")
         if not cursor:
-            return rows, CURSOR_MISSING
+            return rows, _stop_reason(CURSOR_MISSING, unreadable)
         if cursor in seen:
-            return rows, CURSOR_REPEATED
+            return rows, _stop_reason(CURSOR_REPEATED, unreadable)
         seen.add(cursor)
         page_params = {**params, "after": cursor}
-    return rows, f"stopped after {max_pages} requests with more pages left"
+    return rows, _stop_reason(f"stopped after {max_pages} requests with more pages left", unreadable)
 
 
 def _covers(key: str, ids: list[str]) -> Callable[[list[dict[str, Any]]], bool]:
@@ -839,8 +920,8 @@ def _period_inputs(
     """
     totals: dict[str, float | None] = {}
     for name, source in _DELIVERY_INPUT_SOURCES.items():
-        values = [to_float((row.get("metrics") or {}).get(source)) for row in rows]
-        totals[name] = None if not values or any(value is None for value in values) else sum(values)
+        values = [_finite((row.get("metrics") or {}).get(source)) for row in rows]
+        totals[name] = None if not values or any(value is None for value in values) else sum(values)  # type: ignore[arg-type]
     results: float | None = None
     conversion_value: float | None = None
     meta_cost: float | None = None
@@ -1101,13 +1182,15 @@ async def _select_children(
     params["sort"] = ["spend_descending"]
     id_field, name_field = f"{child_level}_id", f"{child_level}_name"
     payload = await get_graph_api_client().get_insights(object_id, fields=[id_field, name_field, "spend"], params=params)
+    rows, unreadable = _page_rows(payload)
     children: list[dict[str, Any]] = []
-    for row in payload.get("data", []) or []:
-        if isinstance(row, dict) and row.get(id_field) is not None and str(row[id_field]) not in {
-            child["object_id"] for child in children
-        }:
-            children.append({"object_id": str(row[id_field]), "name": row.get(name_field), "spend": to_float(row.get("spend"))})
-    return children[:max_entities], bool(extract_paging(payload).get("next"))
+    for row in rows:
+        if row.get(id_field) is None:
+            # A row without its id may be a child that was not selected, so the selection is not all of them.
+            unreadable += 1
+        elif str(row[id_field]) not in {child["object_id"] for child in children}:
+            children.append({"object_id": str(row[id_field]), "name": row.get(name_field), "spend": _finite(row.get("spend"))})
+    return children[:max_entities], bool(extract_paging(payload).get("next")) or unreadable > 0
 
 
 async def _read_entities_one_by_one(
@@ -2259,8 +2342,14 @@ def _known_ranking(value: Any) -> bool:
     return RANKING_POINTS.get(str(value or "").upper()) is not None
 
 
-def _row_spend(row: dict[str, Any]) -> float:
-    return to_float((row.get("metrics") or {}).get("spend")) or 0.0
+def _row_spend(row: dict[str, Any]) -> float | None:
+    """A normalized row's spend when it is known and finite; None otherwise, never zero in its place."""
+    return _finite((row.get("metrics") or {}).get("spend"))
+
+
+def _known_sum(values: list[float | None]) -> float | None:
+    """The sum of values only when every one is known; an empty list sums to zero."""
+    return None if any(value is None for value in values) else sum(values)  # type: ignore[arg-type]
 
 
 def _is_action_indicator(indicator: str, row: dict[str, Any]) -> bool:
@@ -2281,7 +2370,7 @@ def _pooled_costs(rows: list[dict[str, Any]]) -> dict[str, float | None]:
         indicator, count = result["indicator"], result["value"] or 0.0
         if not _is_action_indicator(indicator, row):
             continue
-        spend = to_float((row.get("metrics") or {}).get("spend"))
+        spend = _row_spend(row)
         total = sums.setdefault(indicator, [0.0, 0.0])
         total[0] = None if spend is None or total[0] is None else total[0] + spend
         total[1] = (total[1] or 0.0) + count
@@ -2304,8 +2393,10 @@ async def _ranking_entity(
         return await _ranking_scope_rows(level, object_id, window)
 
     ad_payload, (scope_rows, scope_error, scope_has_results) = await asyncio.gather(read_ads(), read_scope())
-    lean_rows = [row for row in (ad_payload.get("data", []) or []) if isinstance(row, dict)][:max_ads]
-    more_ads_exist = bool(extract_paging(ad_payload).get("next"))
+    lean_rows, lean_unreadable = _page_rows(ad_payload)
+    lean_rows = lean_rows[:max_ads]
+    # An ad row that could not be read is an ad that was not examined.
+    more_ads_exist = bool(extract_paging(ad_payload).get("next")) or lean_unreadable > 0
     cost_ids = list(dict.fromkeys(
         str(row["ad_id"]) for row in lean_rows
         if row.get("ad_id") and any(_known_ranking(row.get(field)) for field in RANKING_FIELDS)
@@ -2317,10 +2408,23 @@ async def _ranking_entity(
         for row in lean_rows
     ]})
     spends = [_row_spend(row) for row in rows]
-    order_confirmed = all(earlier >= later for earlier, later in zip(spends, spends[1:]))
+    spend_unknown = sum(1 for spend in spends if spend is None)
+    # Order can be confirmed only from known spends; a missing one is reported below, not read as zero.
+    order_confirmed = not spend_unknown and all(
+        earlier >= later for earlier, later in zip(spends, spends[1:])  # type: ignore[operator]
+    )
 
     missing_signals: list[str] = []
-    examined_spend = sum(spends)
+    if lean_unreadable:
+        missing_signals.append(
+            f"Meta returned {lean_unreadable} ad row(s) that could not be read; those ads were not examined or ranked."
+        )
+    examined_spend = _known_sum(spends)
+    if spend_unknown:
+        missing_signals.append(
+            f"{spend_unknown} examined ad(s) had no readable spend, so the examined spend, the share of the scope's "
+            "spend they cover, and whether Meta returned them highest spend first are unknown."
+        )
     if level == "ad":
         scope_spend: float | None = examined_spend
     elif scope_rows is None:
@@ -2329,7 +2433,12 @@ async def _ranking_entity(
             f"The scope's total spend could not be read, so the share of spend covered is unknown ({scope_error})."
         )
     else:
-        scope_spend = sum(_row_spend(row) for row in scope_rows)
+        scope_spend = _known_sum([_row_spend(row) for row in scope_rows])
+        if scope_spend is None:
+            missing_signals.append(
+                f"{sum(1 for row in scope_rows if _row_spend(row) is None)} of the scope's {len(scope_rows)} total "
+                "row(s) had no readable spend, so the scope's spend and the share covered are unknown."
+            )
     share = _ratio(examined_spend, scope_spend)
     if share is not None:
         share = min(share, 1.0)
@@ -2342,7 +2451,7 @@ async def _ranking_entity(
         missing_signals.append(note)
     else:
         note = f"Examined all {len(rows)} ads with insights in the window, highest spend first."
-    if not order_confirmed:
+    if not order_confirmed and not spend_unknown:
         missing_signals.append(
             "Meta returned the ad rows not ordered by spend, so the examined ads may not be the highest-spending ones."
         )
@@ -2855,21 +2964,23 @@ async def _optional_edge_section(client: Any, account_id: str, edge: str, fields
         payload = await client.list_objects(account_id, edge, fields=fields, params={"limit": CONTEXT_EDGE_LIMIT})
     except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
         return {"available": False, "edge": edge, "items": None, "count": None, "complete": None, "error": _public_error(exc)}
-    items = [item for item in payload.get("data", []) or [] if isinstance(item, dict)]
-    return {
+    items, unreadable = _page_rows(payload)
+    section = {
         "available": True,
         "edge": edge,
         "items": items,
         "count": len(items),
-        "complete": not bool(extract_paging(payload).get("next")),
+        "complete": not bool(extract_paging(payload).get("next")) and not unreadable,
         "page_limit": CONTEXT_EDGE_LIMIT,
     }
+    if unreadable:
+        section["rows_unreadable"] = unreadable
+    return section
 
 
 def _known_total_spend(rows: list[dict[str, Any]]) -> float | None:
     """Sum spend across rows; a row without spend makes the total unknown rather than smaller."""
-    values = [to_float((row.get("metrics") or {}).get("spend")) for row in rows]
-    return None if any(value is None for value in values) else sum(values)  # type: ignore[arg-type]
+    return _known_sum([_row_spend(row) for row in rows])
 
 
 def _group_spend(
@@ -2984,7 +3095,7 @@ def _adset_volume_entry(row: dict[str, Any], events: float | None, per_week: flo
     entry: dict[str, Any] = {
         "adset_id": row.get("adset_id"),
         "adset_name": row.get("adset_name"),
-        "spend": to_float((row.get("metrics") or {}).get("spend")),
+        "spend": _row_spend(row),
     }
     if events is not None:
         entry["events"] = events
@@ -3042,7 +3153,7 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
     """
     by_goal: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        spend = to_float((row.get("metrics") or {}).get("spend"))
+        spend = _row_spend(row)
         if spend is not None and spend <= 0:
             continue
         by_goal.setdefault(str(row.get("optimization_goal") or "UNKNOWN"), []).append(row)
@@ -3050,7 +3161,7 @@ def _goal_volume(rows: list[dict[str, Any]], lookback_days: int) -> list[dict[st
     for goal in sorted(by_goal):
         goal_rows = by_goal[goal]
         goal_spend = _known_total_spend(goal_rows)
-        unknown_spend = sum(1 for row in goal_rows if to_float((row.get("metrics") or {}).get("spend")) is None)
+        unknown_spend = sum(1 for row in goal_rows if _row_spend(row) is None)
         mapping = GOAL_EVENT_BASIS.get(goal)
         unidentified = GOAL_EVENT_UNIDENTIFIED.get(goal, "No event mapping is defined for this optimization goal.")
         short_window = lookback_days < GOAL_VOLUME_MIN_DAYS
@@ -3186,10 +3297,12 @@ async def _context_account_spend(account_id: str, start: date, end: date) -> tup
         return None, str(_public_error(exc).get("message"))
     if stopped is not None:
         return None, f"Meta's account total could not be read to its last page ({stopped})"
-    values = [to_float(row.get("spend")) for row in rows]
+    values = [_finite(row.get("spend")) for row in rows]
     if not rows:
         return 0.0, None
-    return (None, "Meta's account total had no spend value") if any(v is None for v in values) else (sum(values), None)
+    if any(value is None for value in values):
+        return None, "Meta's account total had a row without a readable spend value"
+    return sum(values), None  # type: ignore[arg-type]
 
 
 async def _context_adset_rows(
@@ -3272,12 +3385,16 @@ async def _context_adset_rows(
         if isinstance(picked, BaseException):
             coverage.update({"status": "failed", "error": str(_public_error(picked).get("message"))})
         else:
+            picked_rows, picked_unreadable = _page_rows(picked)
+            # A selection row that cannot be read (or has no ad set id) is an ad set that was not examined.
+            picked_unreadable += sum(1 for row in picked_rows if row.get("adset_id") is None)
             all_ids = list(dict.fromkeys(
-                str(row["adset_id"]) for row in picked.get("data", []) or []
-                if isinstance(row, dict) and row.get("adset_id") is not None
+                str(row["adset_id"]) for row in picked_rows if row.get("adset_id") is not None
             ))
             ids = all_ids[:CONTEXT_MAX_ADSETS]
-            more = bool(extract_paging(picked).get("next")) or len(all_ids) > len(ids)
+            more = bool(extract_paging(picked).get("next")) or len(all_ids) > len(ids) or picked_unreadable > 0
+            if picked_unreadable:
+                coverage["selection_rows_unreadable"] = picked_unreadable
             if ids:
                 try:
                     read_rows, stopped, result_error = await _read_pages_with_results(
@@ -3812,15 +3929,24 @@ def _updated_timestamp(value: Any) -> float:
 async def _delivery_spend(
     client: Any, account_id: str, level: str, params: dict[str, Any], wanted: set[str],
 ) -> dict[str, Any]:
-    """Read recent spend per object at one level with at most two lean, spend-sorted insights pages. Never raises."""
+    """Read recent spend per object at one level with at most two lean, spend-sorted insights pages. Never raises.
+
+    A page Meta repeats is not added again and ends the read; a row that cannot be read (not an object, or no
+    id) makes the read incomplete; an object whose row has no readable spend is listed in spend_unreadable
+    rather than read as zero.
+    """
     id_field = DELIVERY_ID_FIELDS[level]
     spend: dict[str, float] = {}
+    spend_unreadable: set[str] = set()
+    unreadable_rows = 0
     requests = 0
     complete = False
     error: str | None = None
     after: str | None = None
     lowest: float | None = None
     order_confirmed = True
+    seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
     while requests < DELIVERY_SPEND_MAX_REQUESTS:
         page_params = {**params, "limit": DELIVERY_SPEND_PAGE, "sort": ["spend_descending"]}
         if after:
@@ -3831,28 +3957,39 @@ async def _delivery_spend(
         except Exception as exc:  # a spend failure must not hide the problems found
             error = str(_public_error(exc).get("message"))
             break
-        for row in payload.get("data", []) or []:
-            if not isinstance(row, dict) or row.get(id_field) is None:
+        page_rows, page_unreadable = _page_rows(payload)
+        if _seen_page(page_rows, seen_pages):
+            break
+        unreadable_rows += page_unreadable
+        for row in page_rows:
+            if row.get(id_field) is None:
+                unreadable_rows += 1
                 continue
-            value = to_float(row.get("spend")) or 0.0
+            object_id = str(row[id_field])
+            value = _finite(row.get("spend"))
+            if value is None:
+                spend_unreadable.add(object_id)
+                continue
             if lowest is not None and value > lowest:
                 order_confirmed = False
             lowest = value if lowest is None else min(lowest, value)
-            object_id = str(row[id_field])
             spend[object_id] = spend.get(object_id, 0.0) + value
         paging = extract_paging(payload)
         if not paging.get("next"):
             complete = True
             break
         following = paging.get("after")
-        if not following or following == after or wanted <= set(spend):
+        if not following or following == after or following in seen_cursors or wanted <= set(spend) | spend_unreadable:
             break
+        seen_cursors.add(following)
         after = following
     return {
-        "spend": spend,
+        "spend": {key: value for key, value in spend.items() if key not in spend_unreadable},
+        "spend_unreadable": spend_unreadable,
+        "rows_unreadable": unreadable_rows,
         "requests": requests,
-        "status": "failed" if error and not spend else "read",
-        "complete": complete and error is None,
+        "status": "failed" if error and not spend and not spend_unreadable else "read",
+        "complete": complete and error is None and not unreadable_rows,
         "lowest_spend_read": lowest,
         "order_confirmed": order_confirmed,
         "error": error,
@@ -3951,6 +4088,8 @@ async def get_delivery_errors(
         next_after: str | None = None
         stop_reason: str | None = None
         seen_cursors: set[str] = {cursor} if cursor else set()
+        seen_pages: set[str] = set()
+        rows_unreadable = 0
         while True:
             params: dict[str, Any] = {
                 "limit": min(MAX_DELIVERY_PAGE, limit - len(scanned)),
@@ -3963,7 +4102,13 @@ async def get_delivery_errors(
                 fields=DELIVERY_OBJECT_FIELDS[resolved_level], params=params,
             )
             pages += 1
-            scanned.extend(item for item in payload.get("data", []) or [] if isinstance(item, dict))
+            page_rows, page_unreadable = _page_rows(payload)
+            if _seen_page(page_rows, seen_pages):
+                # Its objects are already listed; adding them again would list each problem twice.
+                stop_reason = "page_repeated"
+                break
+            rows_unreadable += page_unreadable
+            scanned.extend(page_rows)
             paging = extract_paging(payload)
             if not paging.get("next"):
                 complete = True
@@ -3982,9 +4127,15 @@ async def get_delivery_errors(
                 break
             seen_cursors.add(following)
             cursor = following
+        if rows_unreadable:
+            # An object row that could not be read may hold a problem, so the scan is not complete.
+            complete = False
+            stop_reason = stop_reason or "rows_unreadable"
         scan = {"mode": "account_scan", "level": resolved_level, "objects_examined": len(scanned),
                 "complete": complete, "next_after": next_after, "stop_reason": stop_reason,
                 "pages_fetched": pages, "limit": limit, "effective_status_filter": statuses}
+        if rows_unreadable:
+            scan["rows_unreadable"] = rows_unreadable
     scan["paused_included"] = include_paused
     scan["active_included"] = include_active or scan["mode"] == "named_objects"
 
@@ -4046,9 +4197,13 @@ async def get_delivery_errors(
             "meta_order_confirmed": read["order_confirmed"],
             "error": _short(read["error"]),
         })
+        if read["spend_unreadable"]:
+            spend_lookup["objects_with_unreadable_spend"] = len(read["spend_unreadable"])
+        if read["rows_unreadable"]:
+            spend_lookup["rows_unreadable"] = read["rows_unreadable"]
         for problem in object_problems:
             value = read["spend"].get(problem["object_id"] or "")
-            if read["status"] == "failed":
+            if read["status"] == "failed" or (problem["object_id"] or "") in read["spend_unreadable"]:
                 problem["spend"], problem["spend_status"] = None, "spend_unavailable"
             elif value:
                 problem["spend"], problem["spend_status"] = value, "read"
@@ -4094,14 +4249,26 @@ async def get_delivery_errors(
 
     missing_signals: list[str] = []
     if not scan["complete"]:
-        detail = (
-            f"pass after={scan['next_after']!r} to continue" if scan["next_after"]
-            else "Meta's pagination cursor was missing or repeated an earlier one, so the scan cannot continue"
-        )
+        if scan["next_after"]:
+            detail = f"pass after={scan['next_after']!r} to continue"
+        elif scan["stop_reason"] == "page_repeated":
+            detail = (
+                "Meta returned a page that had already been read, so it was not counted again and the scan "
+                "cannot continue"
+            )
+        elif scan["stop_reason"] == "rows_unreadable":
+            detail = f"Meta returned {scan.get('rows_unreadable')} object row(s) that could not be read"
+        else:
+            detail = "Meta's pagination cursor was missing or repeated an earlier one, so the scan cannot continue"
         cap = f" after the {MAX_DELIVERY_PAGES}-page cap" if scan["stop_reason"] == "page_cap_reached" else ""
         missing_signals.append(
             f"Scan incomplete: examined {scan['objects_examined']} {resolved_level}(s) in {scan['pages_fetched']} "
             f"page(s){cap} and more may exist; {detail}. Problems on objects not yet examined are not listed."
+        )
+    if scan.get("rows_unreadable") and scan["stop_reason"] != "rows_unreadable":
+        missing_signals.append(
+            f"Meta also returned {scan['rows_unreadable']} object row(s) that could not be read; problems on them "
+            "are not listed."
         )
     if len(problems) > max_problems:
         missing_signals.append(
@@ -4129,6 +4296,16 @@ async def get_delivery_errors(
         )
     if spend_lookup["meta_order_confirmed"] is False:
         missing_signals.append("Meta returned the spend rows not ordered by spend, so spend coverage may be uneven.")
+    if spend_lookup.get("objects_with_unreadable_spend"):
+        missing_signals.append(
+            f"{spend_lookup['objects_with_unreadable_spend']} {resolved_level}(s) had a spend row without a readable "
+            "spend value; their spend is null (spend_unavailable), not zero."
+        )
+    if spend_lookup.get("rows_unreadable"):
+        missing_signals.append(
+            f"{spend_lookup['rows_unreadable']} spend row(s) could not be read, so the spend read is incomplete and "
+            "a problem without spend is not assumed to have had none."
+        )
 
     if problems:
         counts = ", ".join(f"{by_severity[name]} {name}" for name in SEVERITY_RANK if name in by_severity)
