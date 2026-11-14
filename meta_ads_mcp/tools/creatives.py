@@ -2190,6 +2190,8 @@ def _graph_id_text(value: Any) -> str | None:
     """An id read from Meta as text (Graph ids are text; a whole number is read as the same id), or None."""
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
+    if isinstance(value, int) and value < 0:
+        return None
     return str(value).strip() or None
 
 

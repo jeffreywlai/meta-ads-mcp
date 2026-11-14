@@ -15,7 +15,13 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
-from meta_ads_mcp.normalize import blank_to_none, collection_fault, names_other_object, read_collection_page
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    collection_fault,
+    names_other_object,
+    read_collection_page,
+    same_object_id,
+)
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.tool_types import GraphId, StringList
 
@@ -430,6 +436,12 @@ async def _catalog_business_id(client: Any, catalog_id: str) -> str:
         )
     business = catalog.get("business") if isinstance(catalog, dict) else None
     business_id = business.get("id") if isinstance(business, dict) else None
+    # Not an id (true or false, a container, a negative number), or the catalog itself: not a
+    # business this catalog can be owned by. The form of an id's text is not judged.
+    if isinstance(business_id, bool) or not isinstance(business_id, (str, int)) or (
+        isinstance(business_id, int) and business_id < 0
+    ) or same_object_id(business_id, catalog_id):
+        business_id = None
     if not business_id:
         raise ValidationError(
             "Meta did not return an owning business for this catalog; pass business_id."

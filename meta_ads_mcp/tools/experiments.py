@@ -26,6 +26,7 @@ from meta_ads_mcp.normalize import (
     names_other_object,
     normalize_collection,
     read_collection_page,
+    same_object_id,
 )
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
@@ -699,6 +700,12 @@ async def _resolve_business_id(client: Any, account_id: str, business_id: str | 
         )
     business = account.get("business")
     resolved = business.get("id") if isinstance(business, dict) else business
+    # Not an id (true or false, a container, a negative number), or the account itself: not a
+    # business this account can be owned by. The form of an id's text is not judged.
+    if isinstance(resolved, bool) or not isinstance(resolved, (str, int)) or (
+        isinstance(resolved, int) and resolved < 0
+    ) or same_object_id(resolved, account_id):
+        resolved = None
     if not resolved:
         raise ValidationError(
             "Meta returned no owning business for this ad account. Meta creates studies on a business "

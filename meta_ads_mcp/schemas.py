@@ -61,13 +61,21 @@ def mutation_response(
     }
 
 
+# The values in a create's target that are Graph objects the new object can never be: the account
+# or business it belongs to and the parent it is created under. Nothing else in target is
+# compared. A target also holds values that are not Graph ids at all (a product's retailer_id
+# is the merchant's own SKU, and a numeric SKU can equal the product's Graph id), and comparing
+# those refused an ordinary answer (review R35, GG2).
+_PARENT_TARGET_KEYS = frozenset({"account_id", "business_id", "catalog_id", "campaign_id", "adset_id", "feed_id"})
+
+
 def _cannot_be_the_new_object(named: Any, target: dict[str, Any]) -> bool:
     """Whether the id in a create's answer cannot be the new object's id.
 
     True for a value that is not an id at all (true or false, a container, a fraction, a
-    negative number) and for an id that is one of the objects the call names in target (the
-    account, the parent, the source). Any other text or whole number is taken as the id, as
-    before: this does not judge the form of an id's text.
+    negative number) and for an id that is the account, business or parent named in target
+    (_PARENT_TARGET_KEYS). Any other text or whole number is taken as the id, as before: this
+    does not judge the form of an id's text, and it compares with no other value in target.
     """
     from meta_ads_mcp.normalize import same_object_id
 
@@ -75,13 +83,7 @@ def _cannot_be_the_new_object(named: Any, target: dict[str, Any]) -> bool:
         return True
     if isinstance(named, int) and named < 0:
         return True
-    text = str(named).strip()
-    for known in target.values():
-        if isinstance(known, bool) or not isinstance(known, (str, int)):
-            continue
-        if same_object_id(text, known) or text == str(known).strip():
-            return True
-    return False
+    return any(same_object_id(named, target.get(key)) for key in _PARENT_TARGET_KEYS)
 
 
 def creation_response(

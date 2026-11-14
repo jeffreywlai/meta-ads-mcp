@@ -1996,7 +1996,13 @@ async def _update_enhancements(ad_id: str, features: dict[str, str], name: str |
             f"not known. Nothing was created or attached; ad {ad_id} was not changed."
         )
     creative_ref = ad.get("creative")
-    old_creative_id = str(creative_ref.get("id") or "") if isinstance(creative_ref, dict) else str(creative_ref or "")
+    named_creative = creative_ref.get("id") if isinstance(creative_ref, dict) else creative_ref
+    # True or false, a container or a negative number is not a creative's id and is never read as one.
+    if isinstance(named_creative, bool) or not isinstance(named_creative, (str, int)) or (
+        isinstance(named_creative, int) and named_creative < 0
+    ):
+        named_creative = None
+    old_creative_id = str(named_creative or "").strip()
     if not old_creative_id:
         raise ValidationError("Meta returned no creative for this ad, so nothing was changed.")
     account_id = blank_to_none(str(ad.get("account_id") or ""))

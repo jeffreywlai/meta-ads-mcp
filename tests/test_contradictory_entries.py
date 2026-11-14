@@ -356,7 +356,7 @@ def test_zero_and_positive_occurrence_counts_give_the_same_rates_as_before(monke
 def test_a_create_answer_whose_id_cannot_be_the_new_object_shows_nothing_as_created(result):
     from meta_ads_mcp.schemas import creation_response
 
-    response = creation_response(action="create_thing", target={"account_id": "act_800", "parent_id": "900"}, result=result)
+    response = creation_response(action="create_thing", target={"account_id": "act_800", "campaign_id": "900"}, result=result)
     assert response["created"] is None and response["created_id_unresolved"] is True
     assert response["unresolved_result"] == result and "may have been created" in response["warning"]
 
@@ -430,3 +430,78 @@ def test_a_batch_error_naming_an_item_that_was_not_sent_confirms_no_item():
     assert catalogs._batch_attribution(own, {"QA-SKU", "OTHER"})["complete"] is True
     clean = {"status": "finished", "errors_total_count": 0, "errors": [], "ids_of_invalid_requests": []}
     assert catalogs._batch_attribution(clean, {"QA-SKU"})["complete"] is True
+
+
+
+# Round thirty-five (review R35, GG2): a value in target that is not a Graph id is never compared.
+
+
+@pytest.mark.parametrize("target", [
+    {"catalog_id": "976000", "retailer_id": "976010"}, {"catalog_id": "976000", "retailer_id": 976010},
+    {"account_id": "act_1", "instagram_media_id": "976010"}, {"account_id": "act_1", "name": "976010"},
+    {"account_id": "act_1", "parent_id": "976010"},
+])
+def test_a_new_id_equal_to_a_target_value_that_is_not_a_parent_is_shown_as_created(target):
+    """A product's retailer_id is the merchant's SKU: an upsert can return a Graph id with the same digits."""
+    from meta_ads_mcp.schemas import creation_response
+
+    response = creation_response(action="create_thing", target=target, result={"id": "976010"})
+    assert response["created"] == {"id": "976010"} and "created_id_unresolved" not in response
+
+
+def test_a_product_upsert_whose_sku_has_the_same_digits_as_its_id_is_shown_as_created(monkeypatch):
+    class Client:
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            return {"id": "976010"}
+
+    monkeypatch.setattr(catalogs, "get_graph_api_client", lambda: Client())
+    result = asyncio.run(catalogs.create_catalog_product(
+        catalog_id="976000", retailer_id="976010", allow_upsert=True, name="QA upsert", price=12.5, currency="USD",
+        url="https://example.com/product", image_url="https://example.com/image.jpg",
+    ))
+    assert result["created"] == {"id": "976010"} and "created_id_unresolved" not in result
+
+
+# Round thirty-five (review R35, GG1, the members that decide a write).
+
+
+@pytest.mark.parametrize("business", [True, -12, {"id": True}, {"id": -12}, {"id": "982000"}, {"id": ["9"]}])
+def test_an_owning_business_that_is_not_an_id_or_is_the_object_itself_is_not_used(business):
+    from meta_ads_mcp.errors import ValidationError
+    from meta_ads_mcp.tools import business_access
+
+    class Client:
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": "982000", "business": business}
+
+    if isinstance(business, dict):
+        with pytest.raises(ValidationError, match="pass business_id"):
+            asyncio.run(business_access._catalog_business_id(Client(), "982000"))
+    with pytest.raises(ValidationError, match="pass business_id"):
+        asyncio.run(experiments._resolve_business_id(Client(), "act_982000", None))
+
+
+@pytest.mark.parametrize("business", [{"id": "30"}, {"id": 30}, {"id": "biz_1"}, "30"])
+def test_an_ordinary_owning_business_is_used_as_before(business):
+    from meta_ads_mcp.tools import business_access
+
+    class Client:
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": "982000", "business": business}
+
+    expected = str(business["id"] if isinstance(business, dict) else business)
+    assert asyncio.run(experiments._resolve_business_id(Client(), "act_982000", None)) == expected
+    if isinstance(business, dict):
+        assert asyncio.run(business_access._catalog_business_id(Client(), "982000")) == expected
+
+
+def test_a_copy_listed_as_the_copy_of_another_source_is_a_contradiction():
+    from meta_ads_mcp.tools import campaigns
+
+    check = lambda rows: campaigns._copy_list_contradicts("983020", rows, source_id="983001", own_type="campaign")
+    assert check([{"ad_object_type": "campaign", "source_id": "983010", "copied_id": "983020"}]) is True
+    assert check([{"ad_object_type": "campaign", "source_id": "983001", "copied_id": "983020"}]) is False
+    assert check([{"ad_object_type": "campaign", "source_id": " 983001 ", "copied_id": 983020}]) is False
+    assert check([{"ad_object_type": "campaign", "copied_id": "983020"}]) is False
+    assert check([{"ad_object_type": "ad_set", "source_id": "983010", "copied_id": "983021"}]) is False
+    assert check(None) is False

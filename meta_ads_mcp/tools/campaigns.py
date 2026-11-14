@@ -1577,8 +1577,9 @@ _COPY_ANSWER_TYPES = {"campaign": "campaign", "adset": "ad_set", "ad": "ad"}
 def _copy_list_contradicts(new_id: str, copied: Any, *, source_id: str, own_type: str) -> bool:
     """True when a readable row of the copied-objects list contradicts new_id as the copy of source_id.
 
-    Two contradictions count: a row of another known type whose copy is new_id, and a row of
-    this type for source_id whose copy is a different id. Only explicit rows are compared: a
+    Three contradictions count: a row of another known type whose copy is new_id, a row of
+    this type for source_id whose copy is a different id, and a row of this type whose copy is
+    new_id but whose source is a different object. Only explicit rows are compared: a
     missing list, a row that is not an object, an unknown or missing type, or a missing or
     unusual id is not a contradiction.
     """
@@ -1598,6 +1599,13 @@ def _copy_list_contradicts(new_id: str, copied: Any, *, source_id: str, own_type
             and same_object_id(source_id, item.get("source_id"))
             and names_other_object(new_id, {"id": item.get("copied_id")})
         ):
+            return True
+        if (
+            row_type == own_type
+            and same_object_id(new_id, item.get("copied_id"))
+            and names_other_object(source_id, {"id": item.get("source_id")})
+        ):
+            # The list says new_id is the copy of a different object of this type.
             return True
     return False
 
