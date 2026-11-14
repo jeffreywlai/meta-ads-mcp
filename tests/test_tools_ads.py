@@ -741,6 +741,15 @@ def test_create_ad_params_only_schedule_call_is_unchanged(monkeypatch) -> None:
     assert result["created"] == {"id": "ad_created"}
 
 
+def test_update_ad_empty_adlabels_removes_every_label(monkeypatch) -> None:
+    """R24 F1."""
+    client = FakeUpdateAdClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    result = asyncio.run(ads.update_ad(ad_id="ad_1", adlabels=[]))
+    assert client.calls[-1] == ("update", "ad_1", {"adlabels": []})
+    assert result["current"] == {"adlabels": []}
+
+
 def test_update_ad_params_only_adlabels_call_is_unchanged(monkeypatch) -> None:
     client = FakeUpdateAdClient()
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
@@ -860,7 +869,6 @@ def test_update_ad_named_adlabels_reads_first_and_returns_previous(monkeypatch) 
     [
         ({"adlabels": [{"name": "A"}], "params": {"adlabels": [{"name": "A"}]}}, "adlabels was given both"),
         ({"adlabels": ["Q4"]}, "adlabels"),
-        ({"adlabels": []}, "adlabels must not be empty"),
     ],
 )
 def test_update_ad_adlabels_errors_make_no_call(monkeypatch, arguments, message) -> None:

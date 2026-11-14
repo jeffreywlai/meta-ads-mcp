@@ -97,7 +97,12 @@ def _nonempty_object_list(value: Any, field_name: str) -> list[dict[str, Any]]:
 
 
 def validate_adlabels(adlabels: Any) -> list[dict[str, Any]]:
-    """Check Meta ad labels: objects naming an existing label by id or a label by name."""
+    """Check Meta ad labels: objects naming an existing label by id or a label by name.
+
+    An empty list is valid: adlabels replaces the whole set, so it removes every label.
+    """
+    if isinstance(adlabels, list) and not adlabels:
+        return []
     labels = _nonempty_object_list(adlabels, "adlabels")
     for label in labels:
         if not any(isinstance(label.get(key), str) and label[key].strip() for key in ("id", "name")):
@@ -764,7 +769,7 @@ async def update_campaign(
     stop_time: str | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. Meta takes a campaign's schedule from its ad sets and may not store these, so after the update they are read back into stored_schedule, and a time Meta did not store is listed under sent, not current, with a warning. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
+    """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. Meta takes a campaign's schedule from its ad sets and may not store these, so after the update they are read back into stored_schedule, and a time Meta did not store is listed under sent, not current, with a warning. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep; an empty list removes every label. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named = {"spend_cap": spend_cap, "start_time": start_time, "stop_time": stop_time, "adlabels": adlabels}
     reject_named_and_params(named, params, money=("spend_cap",))
     reject_money_in_params(params, _CAMPAIGN_MONEY_FIELDS)
@@ -1313,7 +1318,7 @@ async def update_adset(
     lifetime_min_spend_target: StrictCurrencyAmount | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps, minimum spend targets or labels, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. Spend caps and minimum spend targets are refused inside params; use the named parameters. targeting replaces the whole spec. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad set's whole label set, so include any label to keep. A changed field whose prior value Meta did not return is named in previous_unavailable."""
+    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps, minimum spend targets or labels, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. Spend caps and minimum spend targets are refused inside params; use the named parameters. targeting replaces the whole spec. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad set's whole label set, so include any label to keep; an empty list removes every label. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     adset_id = blank_to_none(adset_id)
     if adset_id is None:
         raise ValidationError("adset_id is required.")

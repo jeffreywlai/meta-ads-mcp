@@ -471,7 +471,7 @@ async def update_ad(
     params: dict[str, Any] | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad's name, creative, tracking specs, status (ACTIVE, PAUSED or ARCHIVED) or labels, with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad's whole label set, so include any label to keep. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
+    """Edit an ad's name, creative, tracking specs, status (ACTIVE, PAUSED or ARCHIVED) or labels, with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad's whole label set, so include any label to keep; an empty list removes every label. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
         raise ValidationError("ad_id is required.")

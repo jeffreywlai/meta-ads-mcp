@@ -811,7 +811,6 @@ def test_create_campaign_named_parameters_are_sent(monkeypatch) -> None:
         ({"special_ad_category_country": ["USA"]}, "two-letter"),
         ({"special_ad_category_country": []}, "special_ad_category_country must not be empty"),
         ({"adlabels": [{"color": "red"}]}, "adlabels"),
-        ({"adlabels": []}, "adlabels must not be empty"),
         ({"promoted_object": {}}, "promoted_object must not be empty"),
     ],
 )
@@ -1820,7 +1819,6 @@ def test_update_campaign_named_parameter_and_same_params_key_together_raise(monk
         ({"stop_time": "0"}, "positive"),
         ({"start_time": "2026-12-31T00:00:00Z", "stop_time": "2026-12-01T00:00:00Z"}, "stop_time must be after start_time"),
         ({"adlabels": [{"color": "red"}]}, "adlabels"),
-        ({"adlabels": []}, "adlabels must not be empty"),
     ],
 )
 def test_update_campaign_named_parameter_errors_make_no_call(monkeypatch, arguments, message) -> None:
@@ -1866,6 +1864,30 @@ def test_update_adset_named_adlabels_reads_first_and_returns_previous(monkeypatc
     assert "replaces the ad set's whole label set" in campaigns.update_adset.__doc__
 
 
+def test_update_adset_empty_adlabels_removes_every_label(monkeypatch) -> None:
+    """R24 F1: adlabels replaces the whole set, so an empty list is how every label is removed."""
+    client = MoneyAdsetClient(stored={"adlabels": {"data": [{"id": "5", "name": "Old"}]}})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="adset_1", adlabels=[]))
+    assert client.calls == [
+        ("get", "adset_1", ["id", "adlabels"]),
+        ("update", "adset_1", {"adlabels": []}),
+    ]
+    assert result["previous"] == {"adlabels": [{"id": "5", "name": "Old"}]}
+    assert result["current"] == {"adlabels": []}
+    assert "an empty list removes every label" in campaigns.update_adset.__doc__
+
+
+def test_empty_adlabels_is_valid_and_other_empty_lists_are_still_refused() -> None:
+    assert campaigns.validate_adlabels([]) == []
+    with pytest.raises(campaigns.ValidationError, match="adlabels"):
+        campaigns.validate_adlabels([{}])
+    with pytest.raises(campaigns.ValidationError, match="adlabels"):
+        campaigns.validate_adlabels("Q4")
+    with pytest.raises(campaigns.ValidationError, match="must not be empty"):
+        campaigns._nonempty_object_list([], "frequency_control_specs")
+
+
 def test_update_adset_params_only_adlabels_call_is_unchanged(monkeypatch) -> None:
     client = MoneyAdsetClient(stored={})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
@@ -1881,7 +1903,6 @@ def test_update_adset_params_only_adlabels_call_is_unchanged(monkeypatch) -> Non
     [
         ({"adlabels": [{"name": "A"}], "params": {"adlabels": [{"name": "A"}]}}, "adlabels was given both"),
         ({"adlabels": [{}]}, "adlabels"),
-        ({"adlabels": []}, "adlabels must not be empty"),
     ],
 )
 def test_update_adset_adlabels_errors_make_no_call(monkeypatch, arguments, message) -> None:

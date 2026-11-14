@@ -91,9 +91,12 @@ PARTNERSHIP_AD_FORMATS = {1: "both identities", 2: "first identity only", 3: "au
 _OBJECT_STORY_ID = re.compile(r"^[0-9]+_[0-9]+$")
 # A display link must be a URL or a bare domain (Meta: "The caption must be an actual URL").
 # After the host comes a path, or a query or fragment with no path before it (RFC 3986 allows
-# an empty path: https://example.com?ref=x).
+# an empty path: https://example.com?ref=x). The scheme may be in any letter case. The last
+# label is letters, or an internationalised name in its ASCII form (xn--...).
 _DISPLAY_LINK = re.compile(
-    r"^(?:https?://)?(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?::[0-9]{1,5})?(?:[/?#]\S*)?$"
+    r"^(?:https?://)?(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{0,58}[A-Za-z0-9])(?::[0-9]{1,5})?(?:[/?#]\S*)?$",
+    re.IGNORECASE,
 )
 
 # Keys accepted inside cards, placement_customizations and multi_media entries.
@@ -140,7 +143,7 @@ def _refuse_logins(value: Any, name: str) -> None:
 
 def _require_url(value: str, name: str) -> str:
     refuse_url_credentials(value, name)
-    if not re.match(r"^https?://\S+$", value):
+    if not re.match(r"^https?://\S+$", value, re.IGNORECASE):
         raise ValidationError(f"{name} must be a full http:// or https:// URL.")
     return value
 

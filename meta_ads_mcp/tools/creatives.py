@@ -293,6 +293,11 @@ def _failure_reason(exc: BaseException) -> str:
     return str(message if isinstance(message, str) and message else exc) or type(exc).__name__
 
 
+def is_http_url(value: Any) -> bool:
+    """Whether a text starts with http:// or https://, in any letter case (schemes are not case-sensitive)."""
+    return isinstance(value, str) and value.strip()[:8].lower().startswith(("http://", "https://"))
+
+
 def _outcome_unknown(exc: BaseException) -> bool:
     """Whether a failed write may have been carried out.
 
@@ -1041,7 +1046,7 @@ async def upload_ad_video(
         raise ValidationError("title must be under 255 characters.")
     if url:
         refuse_url_credentials(url, "video_url")
-        if not url.startswith(("http://", "https://")):
+        if not is_http_url(url):
             raise ValidationError("video_url must be a public http:// or https:// URL.")
     meta_fields = {
         key: value
@@ -1774,7 +1779,7 @@ def _boost_call_to_action(
         return deepcopy(expected), False
     if kind == "website":
         link = value.get("link")
-        if not isinstance(link, str) or not link.strip().startswith(("http://", "https://")):
+        if not is_http_url(link):
             raise ValidationError(
                 f"{objective} with destination {destination} sends people to a website, so call_to_action "
                 "needs a website link, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}."
@@ -1801,7 +1806,7 @@ def _boost_call_to_action(
         return {"type": "CALL_NOW", "value": {"link": link.strip()}}, False
     if kind == "app":
         link = value.get("link")
-        if call_to_action is None or not isinstance(link, str) or not link.strip().startswith(("http://", "https://")):
+        if call_to_action is None or not is_http_url(link):
             raise ValidationError(
                 "OUTCOME_APP_PROMOTION needs call_to_action with the app's store link, for example "
                 "{\"type\": \"INSTALL_MOBILE_APP\", \"value\": {\"link\": \"https://play.google.com/store/apps/details?id=...\"}}."
@@ -1836,7 +1841,7 @@ def _boost_promoted_object(
                 "OUTCOME_APP_PROMOTION needs promoted_object with application_id (numeric) and object_store_url, for "
                 "example {\"application_id\": \"123\", \"object_store_url\": \"https://play.google.com/store/apps/details?id=...\"}."
             )
-        if not isinstance(store_url, str) or not store_url.strip().startswith(("http://", "https://")):
+        if not is_http_url(store_url):
             raise ValidationError("promoted_object.object_store_url must be the app's http(s) store address.")
         if goal == "OFFSITE_CONVERSIONS" and not blank_to_none(str(promoted_object.get("custom_event_type") or "")):
             raise ValidationError(

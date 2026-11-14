@@ -278,13 +278,16 @@ def _usage_headers(response: Any) -> dict[str, Any] | None:
     return usage or None
 
 
-def _says_success(response: httpx.Response) -> bool:
-    """Whether a response's body is a JSON object holding success: true."""
+def _outcome_left_open(response: httpx.Response) -> bool:
+    """Whether a response's body says success: true or marks its error transient."""
     try:
         body = response.json()
     except (ValueError, RecursionError):
         return False
-    return isinstance(body, dict) and body.get("success") is True
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    return body.get("success") is True or (isinstance(error, dict) and error.get("is_transient") is True)
 
 
 def is_bare_answer_wrapper(payload: Any) -> bool:
@@ -427,10 +430,11 @@ class GraphAPIClient:
             delay = retry_timing.delay_seconds
             usage = _usage_headers(response)
             if response.status_code == 404 and not (
-                not safe_to_retry and _says_success(response)
+                not safe_to_retry and _outcome_left_open(response)
             ):
-                # A write answered 404 with success: true in its body is not proof that nothing
-                # was done; it falls through and is read as the contradiction it is.
+                # A write answered 404 whose body says success: true, or marks its error
+                # transient, is not proof that nothing was done; it falls through and is
+                # read as the uncertain answer it is.
                 raise NotFoundError(f"Meta object or edge not found: {endpoint}")
             if (
                 response.status_code in TRANSIENT_HTTP_STATUSES
@@ -552,7 +556,9 @@ class GraphAPIClient:
                             (not safe_to_retry and not response.is_error) or contradictory
                         ),
                     ) from error
-                if _is_unsupported_surface_error(error) and not contradictory:
+                if _is_unsupported_surface_error(error) and not error.mutation_outcome_unknown:
+                    # UnsupportedFeatureError cannot say a write's outcome is unknown, so an
+                    # uncertain answer (transient, or contradictory) stays the flagged error.
                     raise UnsupportedFeatureError(error.message) from error
                 if (
                     error.is_transient

@@ -2860,3 +2860,39 @@ def test_display_link_accepts_a_query_or_fragment_with_or_without_a_path(link) -
 def test_display_link_still_refuses_what_is_not_a_url_or_domain(link) -> None:
     with pytest.raises(ValidationError, match="must be a URL or a domain"):
         cf._display_link(link)
+
+
+# Round twenty-five (review R24, F2): a scheme in any letter case, and an internationalised domain.
+
+
+@pytest.mark.parametrize("link", [
+    "HTTPS://shop.example.com/Item?Ref=A", "hTtP://shop.example.com", "https://shop.xn--q9jyb4c/item",
+    "shop.xn--q9jyb4c", "HTTPS://SHOP.XN--Q9JYB4C#offers",
+])
+def test_display_link_accepts_any_scheme_case_and_an_idna_top_level_domain(link) -> None:
+    assert cf._display_link(link) == link
+
+
+@pytest.mark.parametrize("link", ["example.x1", "example.xn--", "example.xn---", "httpx://example.com", "example.1com"])
+def test_display_link_still_refuses_a_malformed_top_level_domain(link) -> None:
+    with pytest.raises(ValidationError, match="must be a URL or a domain"):
+        cf._display_link(link)
+
+
+@pytest.mark.parametrize("url", ["HTTPS://shop.example.com/item", "hTtP://shop.example.com/a?B=c", "https://shop.example.com"])
+def test_require_url_accepts_any_scheme_case_and_keeps_the_text_as_sent(url) -> None:
+    assert cf._require_url(url, "link_url") == url
+
+
+@pytest.mark.parametrize("url", ["ftp://example.com", "HTTPS://", "shop.example.com", "https://a b", "javascript:alert(1)"])
+def test_require_url_still_refuses_what_is_not_an_http_url(url) -> None:
+    with pytest.raises(ValidationError, match="full http:// or https:// URL"):
+        cf._require_url(url, "link_url")
+
+
+@pytest.mark.parametrize("url", ["HTTPS://user:pw@shop.example.com/x", "hTtP://user:pw@shop.example.com"])
+def test_a_login_in_a_url_is_refused_in_any_scheme_case(url) -> None:
+    with pytest.raises(ValidationError):
+        cf._require_url(url, "link_url")
+    with pytest.raises(ValidationError):
+        cf._display_link(url)

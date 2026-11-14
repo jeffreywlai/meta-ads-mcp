@@ -4185,3 +4185,14 @@ def test_delete_ad_image_equal_copies_add_nothing(monkeypatch) -> None:
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
     result = asyncio.run(creatives.delete_ad_image(account_id="123", image_hash="h1"))
     assert "previous_copies" not in result and "previous_note" not in result
+
+
+# Round twenty-five (review R24, F2): the scheme check used by video, boost and app inputs.
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("https://a.example", True), ("HTTPS://a.example", True), ("hTtP://a.example", True), ("  https://a.example ", True),
+    ("ftp://a.example", False), ("a.example", False), ("httpsx://a", False), ("", False), (None, False), (5, False),
+])
+def test_is_http_url_ignores_the_scheme_letter_case(value, expected) -> None:
+    assert creatives.is_http_url(value) is expected

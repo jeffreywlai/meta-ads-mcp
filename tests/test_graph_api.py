@@ -1394,6 +1394,28 @@ def test_a_read_keeps_its_specific_error_whatever_the_body_says(monkeypatch, sta
     assert type(error.value) is error_type
 
 
+@pytest.mark.parametrize("status", [400, 404])
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+def test_a_transient_unsupported_or_not_found_answer_to_a_write_stays_unknown(monkeypatch, status, method) -> None:
+    # R24 F3: the unsupported and not-found branches turned a transient write error into a plain refusal.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    body = {"error": {"code": 100, "message": "Unsupported post request.", "is_transient": True}}
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert type(error.value) is MetaApiError
+    assert error.value.mutation_outcome_unknown is True
+
+
+@pytest.mark.parametrize(("status", "error_type"), [(400, UnsupportedFeatureError), (404, NotFoundError)])
+def test_a_transient_unsupported_or_not_found_answer_to_a_read_is_unchanged(monkeypatch, status, error_type) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    body = {"error": {"code": 100, "message": "Unsupported get request.", "is_transient": True}}
+    FakeAsyncClient.responses = deque([FakeResponse(status, body) for _ in range(6)])
+    with pytest.raises(error_type):
+        asyncio.run(_client().request("GET", "123"))
+
+
 class _TooDeepResponse(FakeResponse):
     """A response whose body the JSON decoder cannot get through."""
 
