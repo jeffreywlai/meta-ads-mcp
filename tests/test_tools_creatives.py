@@ -3571,7 +3571,7 @@ def test_video_status_without_a_processing_status_says_so(monkeypatch) -> None:
         async def get_object(self, object_id, *, fields=None, params=None):
             return {"id": object_id}
 
-    status = asyncio.run(creatives._read_video_status(Client(), "55", creatives.NO_SECRETS))
+    status = asyncio.run(creatives._read_video_status(Client(), "55"))
     assert status["processing_status"] is None
     assert "did not include its processing status" in status["status_note"]
     assert "still processing" not in status["status_note"]
@@ -3754,3 +3754,191 @@ def test_a_video_upload_answer_and_status_that_repeat_the_file_name_are_cleaned(
     assert S3_PRIVATE_NAME not in json.dumps(shown)
     assert result["status"] == {"video_status": "error", "message": "bad file <file>"}
     assert result["upload"]["file_name"] == S3_PRIVATE_NAME
+
+
+# Round fifteen (review R13, U1): in a call given a secret, nothing from Meta enters the result without
+# passing through that call's CallSecrets, at the one exit keeps_call_secrets puts on every such tool.
+
+from meta_ads_mcp.tools import creative_formats  # noqa: E402
+
+U1_CODE = "".join(["Synthetic", "Creator", "Code", "_", "r13-x7y9"])
+
+
+class U1EchoClient:
+    """Every write succeeds with an ordinary id, and Meta repeats the supplied code beside it."""
+
+    def __init__(self, *, echo_edges=("adcreatives", "ads")) -> None:
+        self.count = 50
+        self.echo_edges = echo_edges
+
+    async def get_object(self, object_id, **kwargs):
+        return {"id": object_id, "currency": "USD"}
+
+    async def create_edge_object(self, parent_id, edge, *, data, **kwargs):
+        self.count += 1
+        result = {"id": str(self.count)}
+        if edge in self.echo_edges:
+            result["diagnostic"] = "Accepted supplied code: " + U1_CODE
+        return result
+
+
+def _u1_call(tool: str, routed: bool):
+    if tool == "builder":
+        name = "create_ad_creative_from_inputs"
+        args = {"account_id": "10", "name": "Example", "page_id": "20", "sponsor_page_id": "30", "partnership_ad_code": U1_CODE}
+    else:
+        name = "boost_instagram_post"
+        args = {"account_id": "10", "page_id": "20", "instagram_account_id": "30", "partnership_ad_code": U1_CODE}
+        if tool == "boost_one_step":
+            args.update(daily_budget=5, targeting={"geo_locations": {"countries": ["US"]}})
+        else:
+            args["adset_id"] = "40"
+        if tool == "boost_validate":
+            args["validate_only"] = True
+    return _call_tool(name, args, routed)
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("tool", ["builder", "boost_existing", "boost_one_step", "boost_validate"])
+def test_partnership_code_echo_is_scrubbed_from_success(monkeypatch, routed, tool) -> None:
+    fake = U1EchoClient()
+    monkeypatch.setattr(creative_formats, "get_graph_api_client", lambda: fake)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = _u1_call(tool, routed)
+    assert U1_CODE not in json.dumps(result.structured_content)
+
+
+def test_every_one_step_create_answer_is_cleaned_and_ids_survive(monkeypatch, fixed_clock) -> None:
+    fake = U1EchoClient(echo_edges=("campaigns", "adsets", "adcreatives", "ads"))
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.boost_instagram_post(
+        account_id="10", page_id="20", instagram_account_id="30", partnership_ad_code=U1_CODE,
+        daily_budget=5, targeting={"geo_locations": {"countries": ["US"]}},
+    ))
+    shown = json.dumps(result)
+    assert U1_CODE not in shown
+    assert shown.count(creatives.PARTNERSHIP_CODE_SHOWN) >= 4
+    assert (result["campaign_id"], result["adset_id"], result["creative_id"], result["ad_id"]) == ("51", "52", "53", "54")
+    assert result["target"]["partnership_ad_code"] == "<given, not shown>"
+
+
+def test_one_step_plan_only_still_shows_the_masked_code_and_nothing_else_changes(monkeypatch, fixed_clock) -> None:
+    fake = U1EchoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.boost_instagram_post(
+        account_id="10", page_id="20", instagram_account_id="30", partnership_ad_code=U1_CODE,
+        daily_budget=5, targeting={"geo_locations": {"countries": ["US"]}}, plan_only=True,
+    ))
+    creative_request = result["plan"]["requests"][2]["data"]
+    assert creative_request["branded_content"]["instagram_boost_post_access_token"] == creatives.PARTNERSHIP_CODE_SHOWN
+    assert U1_CODE not in json.dumps(result)
+
+
+def test_kept_places_show_the_callers_own_file_name(monkeypatch, tmp_path) -> None:
+    name = "".join(["holiday", "-", "person@example.test", ".png"])
+    (tmp_path / name).write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+
+    class Client:
+        async def upload_ad_image(self, account_id, **kwargs):
+            return {"images": {kwargs["file_name"]: {"hash": "h1", "url": "https://cdn.example/x.png", "note": "from " + name}}}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Client)
+    result = asyncio.run(creatives.upload_creative_asset("10", file_path=name))
+    # Meta keys the answer by the name the file was sent under, which this tool chose: the key stays.
+    assert list(result["uploaded"]["images"]) == [name]
+    assert result["uploaded"]["images"][name]["note"] == "from <file>"
+
+
+@pytest.mark.parametrize("size", [5, 40])
+def test_video_dry_run_and_upload_keep_the_sent_name_on_purpose(monkeypatch, tmp_path, size) -> None:
+    monkeypatch.setattr(creatives, "MAX_DIRECT_VIDEO_BYTES", 10)
+    (tmp_path / S3_PRIVATE_NAME).write_bytes(b"v" * size)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("A dry run makes no request"))
+    plan = asyncio.run(creatives.upload_ad_video("10", file_path=S3_PRIVATE_NAME, dry_run=True))
+    would_send = plan["would_send"]
+    source = would_send["source"] if size > 10 else would_send["data"]["source"]
+    assert source["file_name"] == S3_PRIVATE_NAME
+
+
+def test_update_creative_current_still_shows_the_callers_own_change(monkeypatch) -> None:
+    spec = {"object_id": "1", "branded_content": {"instagram_boost_post_access_token": R2_CODE}}
+
+    class Client(SuccessfulRawClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": object_id, "name": "Old " + R2_CODE}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Client)
+    result = asyncio.run(creatives.update_creative("30", params=spec))
+    assert result["current"] == spec
+    # previous came from Meta, so it passes through the call's secrets.
+    assert result["previous"]["name"] == "Old " + creatives.PARTNERSHIP_CODE_SHOWN
+
+
+# The guard: a tool in these modules that takes a secret-bearing argument goes through the shared exit.
+
+SECRET_BEARING_PARAMETERS = {
+    "partnership_ad_code", "facebook_partnership_ad_code",  # a code itself
+    "object_story_spec", "asset_feed_spec", "degrees_of_freedom_spec", "creative", "creative_spec",  # raw specs
+    "file_path",  # a local file
+}
+# Tools that read a creative that can hold a code and return what they built from it.
+READS_CODES = {"update_ad_creative_enhancements"}
+GUARDED_MODULES = {
+    "meta_ads_mcp.tools.creatives", "meta_ads_mcp.tools.ads", "meta_ads_mcp.tools.creative_formats",
+    "meta_ads_mcp.tools.campaigns", "meta_ads_mcp.tools.execution",
+}
+
+
+def _guarded_tools():
+    import meta_ads_mcp.server  # noqa: F401 - registers every tool
+    from meta_ads_mcp.coordinator import mcp_server
+
+    found = {}
+    for component in mcp_server.local_provider._components.values():
+        function = getattr(component, "fn", None)
+        if function is not None and getattr(function, "__module__", None) in GUARDED_MODULES:
+            found[component.name] = function
+    return found
+
+
+def test_every_tool_given_a_secret_goes_through_the_shared_exit() -> None:
+    import inspect
+
+    tools = _guarded_tools()
+    assert len(tools) > 30  # the five modules were found
+    missing, undeclared = [], []
+    for name, function in sorted(tools.items()):
+        parameters = set(inspect.signature(function).parameters)
+        bearing = parameters & SECRET_BEARING_PARAMETERS
+        if not bearing and name not in READS_CODES:
+            continue
+        declared = getattr(function, "__secret_arguments__", None)
+        if declared is None:
+            missing.append(name)
+            continue
+        covered = set(declared.codes) | set(declared.raw_specs) | set(declared.files)
+        if bearing - covered:
+            undeclared.append((name, sorted(bearing - covered)))
+        assert covered <= parameters, (name, sorted(covered - parameters))
+        if name in READS_CODES:
+            assert declared.reads_codes, name
+    assert missing == [], f"tools given a secret without keeps_call_secrets: {missing}"
+    assert undeclared == [], f"secret-bearing arguments not declared: {undeclared}"
+    covered_tools = {name for name, function in tools.items() if hasattr(function, "__secret_arguments__")}
+    assert covered_tools == {
+        "create_ad_creative", "update_creative", "preview_ad", "upload_creative_asset", "upload_ad_video",
+        "boost_instagram_post", "create_ad", "create_ad_creative_from_inputs", "update_ad_creative_enhancements",
+    }
+
+
+def test_the_shared_exit_cleans_a_new_field_it_has_never_seen(monkeypatch) -> None:
+    @creatives.keeps_call_secrets(creatives.SecretArguments(codes=("code",), keep=(("shown",),)))
+    async def future_tool(code: str) -> dict:
+        return {"brand_new_field": ["Meta said " + code], "shown": code}
+
+    result = asyncio.run(future_tool(U1_CODE))
+    assert result == {"brand_new_field": ["Meta said " + creatives.PARTNERSHIP_CODE_SHOWN], "shown": U1_CODE}
+    with pytest.raises(RuntimeError):
+        creatives.current_call_secrets()
+    with pytest.raises(RuntimeError):
+        creatives.NO_SECRETS.add(codes=["x"])

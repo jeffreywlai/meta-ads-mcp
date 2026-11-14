@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import os
 import re
 import unicodedata
+from collections.abc import Callable, Iterable
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -22,7 +26,7 @@ from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.secret_scrub import ANYWHERE, SecretScrubber, scrub_exception
+from meta_ads_mcp.secret_scrub import ANYWHERE, SecretScrubber, distinct_key
 from meta_ads_mcp.tool_types import (
     AccountId,
     FieldList,
@@ -113,22 +117,26 @@ class CallSecrets:
 
     Partnership Ad codes (shown as PARTNERSHIP_CODE_SHOWN) and a local file's path and names (shown
     as FILE_SHOWN) are removed by meta_ads_mcp.secret_scrub at any length, written plainly or encoded.
-    Every text from Meta or from an exception goes through one of these:
-
-    - ``with secrets: ...`` around a tool's body: an error leaving the block is cleaned (message,
-      fields, args and the errors chained behind it) before the MCP error or a traceback log is built.
-    - failure_text(exc) and public_error(exc) for an error a tool catches and keeps in its result
-      (a note, a warning, a failed list): the error is cleaned the same way, then its text is returned.
-    - value(answer) for Meta's answer to a request that carried a secret, before it goes into a result.
+    A tool that is given a secret is decorated with keeps_call_secrets, which builds the call's
+    CallSecrets, cleans every error leaving the tool and passes the whole result once through value()
+    at the tool's exit. Inside the call, current_call_secrets() returns it: add() registers a secret
+    learned during the call (a file's resolved name, a code read from Meta), and failure_text(exc) and
+    public_error(exc) clean a caught error's text where it is kept.
     """
 
-    __slots__ = ("_scrubbers",)
+    __slots__ = ("_codes", "_files", "_scrubbers", "_frozen")
 
-    def __init__(self, *, codes: Any = (), files: Any = ()) -> None:
+    def __init__(self, *, codes: Any = (), files: Any = (), frozen: bool = False) -> None:
+        self._codes: list[Any] = list(codes)
+        self._files: list[Any] = list(files)
+        self._frozen = frozen
+        self._build()
+
+    def _build(self) -> None:
         self._scrubbers = [
             scrubber for scrubber in (
-                SecretScrubber(codes, policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN),
-                SecretScrubber(files, policy=ANYWHERE, shown=FILE_SHOWN),
+                SecretScrubber(self._codes, policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN),
+                SecretScrubber(self._files, policy=ANYWHERE, shown=FILE_SHOWN),
             ) if scrubber
         ]
 
@@ -141,6 +149,14 @@ class CallSecrets:
     def for_local_file(cls, file_path: str, *names: str) -> CallSecrets:
         """A local file's path, as given and resolved, and the names it was opened and sent under."""
         return cls(files=local_file_forms(file_path, *names))
+
+    def add(self, *, codes: Any = (), files: Any = ()) -> None:
+        """Register secrets learned during the call; from here on they are removed too."""
+        if self._frozen:
+            raise RuntimeError("NO_SECRETS is shared and takes no secrets; use the call's own CallSecrets.")
+        self._codes.extend(codes)
+        self._files.extend(files)
+        self._build()
 
     def __enter__(self) -> CallSecrets:
         return self
@@ -160,14 +176,42 @@ class CallSecrets:
             text = scrubber.text(text)
         return text
 
-    def value(self, value: Any) -> Any:
-        """A copy of Meta's answer (any nested value) cleaned, for a result: Meta may repeat what it was sent."""
+    def value(self, value: Any, keep: Iterable[tuple[str, ...]] = ()) -> Any:
+        """A cleaned copy of a result (any nested value), leaving only the places in keep as they are.
+
+        A path in keep names keys from the top (``"*"`` matches any key or list position); its value is
+        kept as it is. A path ending in ``"*keys"`` keeps that mapping's keys and cleans its values.
+        These are the places that show the caller's own choice on purpose, such as the name a file
+        was sent under.
+        """
+        paths = [tuple(path) for path in keep]
+        if not self._scrubbers:
+            return value
+        return self._clean(value, paths) if paths else self._clean_all(value)
+
+    def _clean_all(self, value: Any) -> Any:
         for scrubber in self._scrubbers:
             value = scrubber.value(value)
         return value
 
+    def _clean(self, value: Any, paths: list[tuple[str, ...]]) -> Any:
+        if any(not path for path in paths):
+            return value
+        if isinstance(value, dict):
+            keys_kept = any(path == ("*keys",) for path in paths)
+            shown: dict[Any, Any] = {}
+            for key, item in value.items():
+                below = [path[1:] for path in paths if path[0] in ("*", key)]
+                shown_key = key if keys_kept else self._clean_all(key)
+                shown[distinct_key(shown, shown_key)] = self._clean(item, below) if below else self._clean_all(item)
+            return shown
+        if isinstance(value, list):
+            below = [path[1:] for path in paths if path[0] == "*"]
+            return [self._clean(item, below) if below else self._clean_all(item) for item in value]
+        return self._clean_all(value)
+
     def failure_text(self, exc: BaseException) -> str:
-        """A caught error's text, cleaned, for a result: the only way such text goes into one."""
+        """A caught error's text, cleaned, for a result."""
         self.scrub(exc)
         return _failure_reason(exc)
 
@@ -178,8 +222,68 @@ class CallSecrets:
         return public() if callable(public) else {"type": type(exc).__name__}
 
 
-# A call that knows no secret: its caught error text still goes through the same helper.
-NO_SECRETS = CallSecrets()
+# A call that knows no secret (the duplicate tools): its caught error text still goes through the same helper.
+NO_SECRETS = CallSecrets(frozen=True)
+
+_CURRENT_CALL_SECRETS: ContextVar[CallSecrets | None] = ContextVar("current_call_secrets", default=None)
+
+
+def current_call_secrets() -> CallSecrets:
+    """The CallSecrets of the keeps_call_secrets tool running now."""
+    secrets = _CURRENT_CALL_SECRETS.get()
+    if secrets is None:
+        raise RuntimeError("current_call_secrets() is only available inside a keeps_call_secrets tool.")
+    return secrets
+
+
+@dataclass(frozen=True, slots=True)
+class SecretArguments:
+    """Which arguments of a tool carry secrets, and which result places show the caller's choice on purpose."""
+
+    codes: tuple[str, ...] = ()  # arguments that are a Partnership Ad code themselves
+    raw_specs: tuple[str, ...] = ()  # raw creative inputs, searched for codes (partnership_codes)
+    files: tuple[str, ...] = ()  # local file paths
+    keep: tuple[tuple[str, ...], ...] = ()  # result places left as they are (CallSecrets.value)
+    reads_codes: bool = False  # the tool reads a creative that can hold a code and adds it with add()
+
+
+def keeps_call_secrets(arguments: SecretArguments) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """The one exit for a tool that is given a secret, or reads one: errors and the whole result are cleaned.
+
+    The call's CallSecrets is built from the declared arguments before the body runs; an error leaving
+    the tool is cleaned in place, and the result is passed once through CallSecrets.value (minus the
+    keep places) just before it is returned, so no field, present or added later, can carry a secret
+    Meta repeated. tests/test_tools_creatives.py fails for any tool in these modules that takes a
+    secret-bearing argument without this decorator.
+    """
+
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        async def tool(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind_partial(*args, **kwargs)
+            given = bound.arguments
+            secrets = CallSecrets(
+                codes=[given[name] for name in arguments.codes if isinstance(given.get(name), str)]
+                + partnership_codes(*(given.get(name) for name in arguments.raw_specs)),
+                files=[
+                    form for name in arguments.files if isinstance(given.get(name), str)
+                    for form in local_file_forms(given[name])
+                ],
+            )
+            token = _CURRENT_CALL_SECRETS.set(secrets)
+            try:
+                with secrets:
+                    result = await function(*args, **kwargs)
+                    return secrets.value(result, arguments.keep)
+            finally:
+                _CURRENT_CALL_SECRETS.reset(token)
+
+        tool.__secret_arguments__ = arguments  # type: ignore[attr-defined]
+        return tool
+
+    return decorate
 
 
 
@@ -317,6 +421,7 @@ async def get_creative(
 
 
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(raw_specs=("object_story_spec", "asset_feed_spec", "degrees_of_freedom_spec", "params")))
 async def create_ad_creative(
     account_id: str,
     name: str,
@@ -342,14 +447,12 @@ async def create_ad_creative(
         "image_hash": image_hash or OMIT,
         "degrees_of_freedom_spec": degrees_of_freedom_spec or OMIT,
     }
-    # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
-    with CallSecrets.for_creative_inputs(object_story_spec, asset_feed_spec, degrees_of_freedom_spec, params) as secrets:
-        client = get_graph_api_client()
-        created = secrets.value(await client.create_edge_object(
-            normalize_account_id(account_id),
-            "adcreatives",
-            data=merge_graph_payload(payload, params),
-        ))
+    client = get_graph_api_client()
+    created = await client.create_edge_object(
+        normalize_account_id(account_id),
+        "adcreatives",
+        data=merge_graph_payload(payload, params),
+    )
     return {
         "ok": True,
         "action": "create_ad_creative",
@@ -406,14 +509,14 @@ async def _preview_many(
     creative_id: str | None,
     creative: dict[str, Any] | None,
     formats: list[str],
-    hidden: CallSecrets,
 ) -> dict[str, Any]:
     """Request one preview per format, keeping the formats Meta refused.
 
-    A refused format's error is kept as text in the result, so it goes through
-    hidden.failure_text, which removes the creative's Partnership Ad codes first.
+    A refused format's error is kept as text in the result, so it goes through the call's
+    failure_text, which removes the creative's Partnership Ad codes first.
     """
     client = get_graph_api_client()
+    hidden = current_call_secrets()
     items: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     for position, ad_format in enumerate(formats):
@@ -441,7 +544,7 @@ async def _preview_many(
                 for remaining in formats[position + 1:]
             )
             break
-        items.append({"ad_format": ad_format, "preview": hidden.value(preview)})
+        items.append({"ad_format": ad_format, "preview": preview})
     return {
         "items": items,
         "failed": failed,
@@ -455,6 +558,7 @@ async def _preview_many(
 
 
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(raw_specs=("creative",)))
 async def preview_ad(
     ad_id: str | None = None,
     account_id: str | None = None,
@@ -470,27 +574,23 @@ async def preview_ad(
         raise ValidationError("Provide ad_id, creative_id, or creative.")
     if (creative_id or creative) and not account_id and not ad_id:
         raise ValidationError("account_id is required when previewing from creative_id or creative.")
-    # A Partnership Ad code in the draft creative never reaches an error, a log or a failed format's text.
-    with CallSecrets.for_creative_inputs(creative) as hidden:
-        if ad_formats is not None:
-            formats = _preview_formats(ad_formats, ad_format)
-            return await _preview_many(
-                ad_id=ad_id,
-                account_id=normalize_account_id(account_id) if account_id else None,
-                creative_id=creative_id,
-                creative=creative,
-                formats=formats,
-                hidden=hidden,
-            )
-        client = get_graph_api_client()
-        result = await client.preview_ad(
+    if ad_formats is not None:
+        formats = _preview_formats(ad_formats, ad_format)
+        return await _preview_many(
             ad_id=ad_id,
             account_id=normalize_account_id(account_id) if account_id else None,
             creative_id=creative_id,
             creative=creative,
-            ad_format=ad_format,
+            formats=formats,
         )
-        result = hidden.value(result)
+    client = get_graph_api_client()
+    result = await client.preview_ad(
+        ad_id=ad_id,
+        account_id=normalize_account_id(account_id) if account_id else None,
+        creative_id=creative_id,
+        creative=creative,
+        ad_format=ad_format,
+    )
     return {"item": result, "summary": {"count": 1}}
 
 
@@ -532,7 +632,9 @@ def _legacy_image_file_name(file_path: str, resolved_name: str) -> str:
     return name
 
 
+# Meta keys its adimages answer by the name the file was sent under, which this tool chose on purpose.
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(files=("file_path",), keep=(("uploaded", "images", "*keys"),)))
 async def upload_creative_asset(
     account_id: str,
     file_path: str | None = None,
@@ -547,18 +649,14 @@ async def upload_creative_asset(
     if image_file is not None:
         # Accepted: send the name master's Graph client sent, the last part of the caller's path.
         file_name = _legacy_image_file_name(file_path, image_file.name)
-        try:
-            result = await client.upload_ad_image(
-                normalize_account_id(account_id),
-                file_name=file_name,
-                file_content=image_file.content,
-                name=name,
-            )
-        except Exception as exc:
-            # A file name can itself be private: no error or log line names the file or its
-            # path, even when Meta's own error text repeats it.
-            CallSecrets.for_local_file(file_path, image_file.name, file_name).scrub(exc)
-            raise
+        # A file name can itself be private: no error, log line or answer from Meta names the file.
+        current_call_secrets().add(files=local_file_forms(file_path, image_file.name, file_name))
+        result = await client.upload_ad_image(
+            normalize_account_id(account_id),
+            file_name=file_name,
+            file_content=image_file.content,
+            name=name,
+        )
     else:
         result = await client.upload_ad_image(
             normalize_account_id(account_id),
@@ -867,10 +965,10 @@ def _chunked_plan(account: str, video: _OpenVideo, meta_fields: dict[str, Any]) 
     }
 
 
-async def _read_video_status(client: Any, video_id: str | None, secrets: CallSecrets) -> dict[str, Any]:
+async def _read_video_status(client: Any, video_id: str | None) -> dict[str, Any]:
     """Read processing status after an upload; a failed read never hides the video id.
 
-    A failed read's text is kept in status_note, so it goes through secrets.failure_text, which
+    A failed read's text is kept in status_note, so it goes through the call's failure_text, which
     removes the local file's path and names first, as for an error that escapes.
     """
     if video_id is None:
@@ -886,7 +984,7 @@ async def _read_video_status(client: Any, video_id: str | None, secrets: CallSec
             "processing_status": None,
             "status": None,
             "status_note": (
-                f"The upload succeeded (video {video_id}) but its status could not be read: {secrets.failure_text(exc)} "
+                f"The upload succeeded (video {video_id}) but its status could not be read: {current_call_secrets().failure_text(exc)} "
                 "Check list_ad_videos(video_ids=...) before using it."
             ),
         }
@@ -901,10 +999,14 @@ async def _read_video_status(client: Any, video_id: str | None, secrets: CallSec
         )
     else:
         note = "Meta is still processing or reported a problem; check list_ad_videos(video_ids=...) before using it."
-    return {"processing_status": processing_status, "status": secrets.value(video.get("status")), "status_note": note}
+    return {"processing_status": processing_status, "status": video.get("status"), "status_note": note}
 
 
+# The name a file is sent under is shown on purpose in upload and in a dry run's plan.
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(files=("file_path",), keep=(
+    ("upload", "file_name"), ("would_send", "source", "file_name"), ("would_send", "data", "source", "file_name"),
+)))
 async def upload_ad_video(
     account_id: AccountId,
     video_url: str | None = None,
@@ -939,17 +1041,15 @@ async def upload_ad_video(
     if url:
         return await _upload_video_request(
             resolved_account, target, data={"file_url": url, **meta_fields}, files=None,
-            shown={"file_url": url, **meta_fields}, upload={"mode": "url"}, dry_run=dry_run, secrets=NO_SECRETS,
+            shown={"file_url": url, **meta_fields}, upload={"mode": "url"}, dry_run=dry_run,
         )
     # Only from the operator's upload folder: a path from the model must not be able
     # to send some other file on this machine to Meta.
     video = _open_upload_video(path_text)
-    # A file name can itself be private: no error, log line or note names the file, even when
-    # Meta's own error text repeats it.
-    secrets = CallSecrets.for_local_file(path_text, video.name, video.sent_name)
+    # A file name can itself be private: no error, log line, note or answer from Meta names the file.
+    current_call_secrets().add(files=local_file_forms(path_text, video.name, video.sent_name))
     try:
-        with secrets:
-            return await _upload_video_file(resolved_account, target, video, meta_fields, dry_run=dry_run, secrets=secrets)
+        return await _upload_video_file(resolved_account, target, video, meta_fields, dry_run=dry_run)
     finally:
         os.close(video.descriptor)
 
@@ -961,7 +1061,6 @@ async def _upload_video_file(
     meta_fields: dict[str, Any],
     *,
     dry_run: bool,
-    secrets: CallSecrets,
 ) -> dict[str, Any]:
     """Upload an opened local video in one request or in chunks; the caller closes it."""
     if video.size <= MAX_DIRECT_VIDEO_BYTES:
@@ -977,7 +1076,6 @@ async def _upload_video_file(
         response = await _upload_video_request(
             account, target, data=dict(meta_fields), files={"source": (video.sent_name, content)},
             shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
-            secrets=secrets,
         )
         if not dry_run:
             _note_change_after_send(response, _video_file_change(video))
@@ -993,9 +1091,9 @@ async def _upload_video_file(
         }
     client = get_graph_api_client()
     outcome = await _chunked_video_upload(client, account, video, meta_fields)
-    response = creation_response(action="upload_ad_video", target=target, result={"finish": secrets.value(outcome["finish"])})
+    response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
-    response.update(await _read_video_status(client, outcome["video_id"], secrets))
+    response.update(await _read_video_status(client, outcome["video_id"]))
     # The last await is the status read: check the open file again after it, so a change
     # while it was in flight is reported (as the direct path does). A change already seen
     # right after the finish still counts if this later check cannot be made.
@@ -1044,7 +1142,6 @@ async def _upload_video_request(
     shown: dict[str, Any],
     upload: dict[str, Any],
     dry_run: bool,
-    secrets: CallSecrets,
 ) -> dict[str, Any]:
     """One-request upload (URL or a small file), then a status read."""
     if dry_run:
@@ -1059,9 +1156,9 @@ async def _upload_video_request(
     client = get_graph_api_client()
     uploaded = await client.create_edge_object(account, "advideos", data=data, files=files)
     video_id = str(uploaded.get("id") or uploaded.get("video_id") or "") or None
-    response = creation_response(action="upload_ad_video", target=target, result=secrets.value(uploaded))
+    response = creation_response(action="upload_ad_video", target=target, result=uploaded)
     response.update({"video_id": video_id, "upload": upload})
-    response.update(await _read_video_status(client, video_id, secrets))
+    response.update(await _read_video_status(client, video_id))
     return response
 
 
@@ -1331,7 +1428,9 @@ def _changed_fields(payload: dict[str, Any]) -> str:
     return ", ".join(named)
 
 
+# current is the caller's own change as sent (master's contract), so it is shown as given.
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(raw_specs=("object_story_spec", "asset_feed_spec", "params"), keep=(("current",),)))
 async def update_creative(
     creative_id: str,
     name: str | None = None,
@@ -1385,13 +1484,11 @@ async def update_creative(
     payload = merge_graph_payload(payload, params)
     if not payload and operation not in {"add", "remove"}:
         raise ValidationError("At least one field must be provided for update_creative.")
-    # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
-    with CallSecrets.for_creative_inputs(object_story_spec, asset_feed_spec, params):
-        client = get_graph_api_client()
-        if labels is not None and operation is not None:
-            return await _update_creative_labels(client, creative_id, payload, labels, operation)
-        previous = await client.get_object(creative_id, fields=CREATIVE_FIELDS)
-        await client.update_object(creative_id, data=payload)
+    client = get_graph_api_client()
+    if labels is not None and operation is not None:
+        return await _update_creative_labels(client, creative_id, payload, labels, operation)
+    previous = await client.get_object(creative_id, fields=CREATIVE_FIELDS)
+    await client.update_object(creative_id, data=payload)
     return mutation_response(
         action="update_creative",
         target={"creative_id": creative_id},
@@ -2255,6 +2352,7 @@ _ONE_STEP_ONLY = (
 
 
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(codes=("partnership_ad_code",)))
 async def boost_instagram_post(
     account_id: str,
     instagram_media_id: str | None = None,
@@ -2289,8 +2387,7 @@ async def boost_instagram_post(
     buying_type: str | None = None,
 ) -> dict[str, Any]:
     """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, with every default stated; plan_only returns the exact requests and creates nothing; if a later step fails the error names every object already created. One-step needs targeting and exactly one budget, never defaulted, in major units: daily_budget or lifetime_budget on the ad set, or campaign_daily_budget or campaign_lifetime_budget (bid_strategy then goes on the campaign). The run is duration_days (default 6) or end_time, from start_time or creation; times are ISO 8601 with a UTC offset or Unix seconds. objective and destination_type: OUTCOME_ENGAGEMENT (default; ON_POST, ON_VIDEO, INSTAGRAM_DIRECT, WHATSAPP, MESSENGER), OUTCOME_AWARENESS, OUTCOME_TRAFFIC (INSTAGRAM_PROFILE default, WEBSITE, the three messaging destinations, PHONE_CALL), OUTCOME_SALES (WEBSITE with promoted_object pixel_id and custom_event_type, or PHONE_CALL), OUTCOME_LEADS (WEBSITE with a pixel, ON_AD instant form, WHATSAPP, PHONE_CALL), OUTCOME_APP_PROMOTION (promoted_object application_id and object_store_url). Messaging destinations get their message button automatically; WEBSITE and app promotion need call_to_action value.link; ON_AD needs call_to_action value.lead_gen_form_id; PHONE_CALL needs CALL_NOW with a tel: link. optimization_goal, billing_event, bid_strategy (LOWEST_COST_WITHOUT_CAP default, LOWEST_COST_WITH_BID_CAP or COST_CAP with bid_amount), special_ad_categories and buying_type (AUCTION) are checked against Meta's documented combinations. Without page_id, the Page is found from the Instagram account when exactly one of your Pages lists it. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3; for a creator's post, partnership_ad_code instead of instagram_media_id. Check list_instagram_media boost_eligible first."""
-    try:
-        return await _boost_instagram_post(
+    return await _boost_instagram_post(
             account_id=account_id,
             instagram_media_id=instagram_media_id,
             instagram_account_id=instagram_account_id,
@@ -2324,11 +2421,7 @@ async def boost_instagram_post(
             end_time=end_time,
             special_ad_categories=special_ad_categories,
             buying_type=buying_type,
-        )
-    except Exception as exc:
-        # Meta's error text may repeat the creator's code; it never reaches the caller or a log.
-        scrub_exception(exc, [partnership_ad_code], policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN)
-        raise
+    )
 
 
 async def _boost_instagram_post(
@@ -2362,7 +2455,7 @@ async def _boost_instagram_post(
     special_ad_categories: Any,
     buying_type: str | None,
 ) -> dict[str, Any]:
-    """The boost itself; boost_instagram_post wraps it so no error shows the Partnership Ad code."""
+    """The boost itself; keeps_call_secrets on boost_instagram_post keeps the Partnership Ad code out of its errors and result."""
     ids = {
         "account_id": blank_to_none(account_id),
         "instagram_account_id": blank_to_none(instagram_account_id),

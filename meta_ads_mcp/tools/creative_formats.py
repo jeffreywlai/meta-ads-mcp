@@ -20,9 +20,16 @@ from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, Vali
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_exception
 from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
-from meta_ads_mcp.tools.creatives import PARTNERSHIP_CODE_FIELDS, PARTNERSHIP_CODE_SHOWN, label_identity, read_label_set
+from meta_ads_mcp.tools.creatives import (
+    PARTNERSHIP_CODE_FIELDS,
+    PARTNERSHIP_CODE_SHOWN,
+    SecretArguments,
+    current_call_secrets,
+    keeps_call_secrets,
+    label_identity,
+    read_label_set,
+)
 from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 # AdCreativeLinkDataCallToAction.type values from Meta's reference page, plus
@@ -1117,18 +1124,11 @@ def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
     return shown
 
 
-def _scrub_codes(exc: BaseException, codes: list[Any]) -> None:
-    """Remove Partnership Ad codes from a raised error and from every error behind it, in place.
-
-    Meta's error text may repeat a code it was sent, plainly or encoded. The error is returned
-    to the caller and a traceback log prints it with its __cause__ and __context__ chain, so
-    meta_ads_mcp.secret_scrub removes each code, at any length and wherever it occurs, from
-    every error reachable that way.
-    """
-    scrub_exception(exc, codes, policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN)
-
-
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(
+    codes=("partnership_ad_code", "facebook_partnership_ad_code"),
+    raw_specs=("cards", "placement_customizations", "multi_media"),
+))
 async def create_ad_creative_from_inputs(
     account_id: AccountId,
     name: str,
@@ -1164,13 +1164,7 @@ async def create_ad_creative_from_inputs(
     product_extensions_product_set_id: GraphId | None = None,
 ) -> dict[str, Any]:
     """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image or video; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash, image_url or video_id with publisher_platforms and positions; all images or all videos; at most one entry without platforms), multi_media asset pool (2 to 10 entries, images and videos may mix, each image_hash, image_url or video_id with optional thumbnail_url; the first is the main media; Meta mixes them with the text variants), catalog carousel (product_set_id with link_url; texts may use tags like {{product.name}}), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on a single image; MESSAGE_PAGE or INSTAGRAM_MESSAGE on a video; INSTAGRAM_MESSAGE on a carousel, every card opening the same chat; WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on an existing Instagram post), instant form (lead_gen_form_id) and Partnership Ads: sponsor ids on an Instagram post, on a Facebook post (object_story_id, sponsor_page_id required) or on a new single image or video; or an ad code (partnership_ad_code for Instagram, facebook_partnership_ad_code for Facebook). display_link is the address shown on the ad (Meta's caption) and needs link_url. product_extensions_product_set_id shows products from that product set below a single image or video link ad. dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
-    arguments = dict(locals())
-    try:
-        return await _create_from_inputs(**arguments)
-    except BaseException as exc:
-        # The ad code is masked in results; an error can repeat it, so it is removed there too.
-        _scrub_codes(exc, [partnership_ad_code, facebook_partnership_ad_code])
-        raise
+    return await _create_from_inputs(**dict(locals()))
 
 
 async def _create_from_inputs(
@@ -1826,7 +1820,9 @@ def _features_of(spec: Any) -> dict[str, str]:
     return features
 
 
+# The old creative's Partnership Ad code is read from Meta, so it is added to the call's secrets once read.
 @mcp_server.tool()
+@keeps_call_secrets(SecretArguments(reads_codes=True))
 async def update_ad_creative_enhancements(
     ad_id: GraphId,
     features: dict[str, str],
@@ -1834,18 +1830,10 @@ async def update_ad_creative_enhancements(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Turn Advantage creative enhancements on or off for a live ad. Meta does not edit a published creative, so this reads the ad's creative, creates a copy with features changed (for example {"image_touchups": "OPT_OUT", "text_optimizations": "OPT_IN"}), and attaches the copy. The copy carries every creative setting Meta accepts when a creative is created; if the creative has a setting Meta does not accept on create, nothing is changed. The ad is expected to go back to review because its creative changed. dry_run reads the ad and creative and returns the new creative, the ad update, fields_not_copied and settings_not_read without sending anything."""
-    codes: list[Any] = []
-    try:
-        return await _update_enhancements(ad_id, features, name, dry_run, codes)
-    except BaseException as exc:
-        # A Partnership Ad code read from the old creative is never shown, even when an error repeats it.
-        _scrub_codes(exc, codes)
-        raise
+    return await _update_enhancements(ad_id, features, name, dry_run)
 
 
-async def _update_enhancements(
-    ad_id: str, features: dict[str, str], name: str | None, dry_run: bool, codes: list[Any]
-) -> dict[str, Any]:
+async def _update_enhancements(ad_id: str, features: dict[str, str], name: str | None, dry_run: bool) -> dict[str, Any]:
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
         raise ValidationError("ad_id is required.")
@@ -1897,7 +1885,8 @@ async def _update_enhancements(
     # The one shape check: a field present but not in the shape expected is never copied from or rebuilt.
     unreadable = _unreadable_fields({}, creative)
     branded = creative.get("branded_content") if isinstance(creative.get("branded_content"), dict) else {}
-    codes.extend(branded.get(key) for key in _AD_CODE_FIELDS)
+    # A code read from the old creative is a secret of this call from here on, as a supplied one is.
+    current_call_secrets().add(codes=[branded[key] for key in _AD_CODE_FIELDS if isinstance(branded.get(key), str)])
     account_id = account_id or blank_to_none(str(creative.get("account_id") or ""))
     if account_id is None:
         raise ValidationError("Meta did not return the ad's account_id, so nothing was changed.")
