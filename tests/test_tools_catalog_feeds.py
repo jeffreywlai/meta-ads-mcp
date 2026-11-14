@@ -3719,3 +3719,107 @@ def test_pixel_strength_is_unknown_when_its_checks_cannot_all_be_read(monkeypatc
     [recommendation] = result["recommendations"]
     assert recommendation["event_source_id"] == "p1" and recommendation["strength"] == "unknown"
     assert any("without an id" in note or "had no id" in note for note in result["missing_signals"])
+
+
+# round fourteen --------------------------------------------------------------------------
+# S5: a list result is complete only when collection_fault finds nothing wrong with every page.
+
+
+@pytest.mark.parametrize(("tool", "arguments", "edge"), [
+    ("list_feed_rules", {"feed_id": "10"}, ("10", "rules")),
+    ("list_product_feeds", {"catalog_id": "10"}, ("10", "product_feeds")),
+    ("list_catalog_event_sources", {"catalog_id": "10"}, ("10", "external_event_sources")),
+    ("list_product_feed_uploads", {"feed_id": "10"}, ("10", "uploads")),
+])
+def test_list_does_not_claim_complete_when_a_row_cannot_be_read(monkeypatch, tool, arguments, edge) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={edge: {"data": [None]}}))
+    result = run(getattr(catalog_feeds, tool)(**arguments))
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["unreadable_entries"] == 1
+    assert "could not be read" in summary["stop_reason"]
+    assert result["items"] == [] and summary["count"] == 0
+
+
+def test_feed_page_shaping_keeps_meta_s_cursor_beside_an_unreadable_entry() -> None:
+    shaped = catalog_feeds._paged_collection(
+        {"data": [{"id": "1"}, 5], "paging": {"next": "n", "cursors": {"after": "a"}}},
+    )
+    assert shaped["items"] == [{"id": "1"}]
+    assert shaped["summary"]["complete"] is False and shaped["summary"]["truncated"] is True
+    assert shaped["summary"]["next_after"] == "a"
+
+
+def test_a_clean_last_feed_page_is_still_complete() -> None:
+    shaped = catalog_feeds._paged_collection({"data": [{"id": "1"}]})
+    assert shaped["summary"] == {"count": 1, "complete": True, "truncated": False, "next_after": None}
+
+
+# S6: no per-source absence, zero, weakness or rate unless every event_stats row was attributed.
+
+_UNATTRIBUTED_ROW = {"date_start": "2026-11-01", "event": "Purchase",
+                     "total_matched_content_ids": 100, "total_unmatched_content_ids": 0}
+
+
+def _event_stats_client(stat_rows, **edges):
+    return FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"id": "20", "source_type": "PIXEL"}]},
+        ("10", "event_stats"): {"data": stat_rows},
+        ("20", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        **edges,
+    })
+
+
+@pytest.mark.parametrize("tool", ["get_catalog_event_source_health", "get_catalog_event_source_recommendations"])
+def test_unattributed_event_stats_do_not_prove_source_sent_no_events(monkeypatch, tool) -> None:
+    _use(monkeypatch, _event_stats_client([dict(_UNATTRIBUTED_ROW)]))
+    arguments = {"catalog_id": "10", **({"business_id": "30"} if tool.endswith("recommendations") else {})}
+    result = run(getattr(catalog_feeds, tool)(**arguments))
+    assert not any(f["type"] in {"no_event_stats", "weak_catalog_signal_coverage"} for f in result["findings"])
+    # The unattributed rows' own counts are reported, not dropped to zero.
+    assert result["metrics"]["unattributed_event_stats"] == {
+        "rows": 1, "matched_content_ids": 100, "unmatched_content_ids": 0,
+    }
+    assert any("named no readable event source" in note for note in result["missing_signals"])
+
+
+def test_an_unattributed_row_suppresses_a_source_s_low_rate_and_rates(monkeypatch) -> None:
+    low = {"date_start": "2026-11-01", "event": "Purchase", "event_source": {"id": "20"},
+           "total_matched_content_ids": 1, "total_unmatched_content_ids": 99}
+    _use(monkeypatch, _event_stats_client([low, dict(_UNATTRIBUTED_ROW)]))
+    result = run(catalog_feeds.get_catalog_event_source_health("10", event_source_id="20"))
+    assert not any(f["type"] == "low_match_rate" for f in result["findings"])
+    [report] = result["sources"]
+    assert report["attribution_complete"] is False and report["window_match_rate"] is None
+    assert report["across_catalogs"]["this_catalog_match_rate"] is None
+    assert result["metrics"]["this_catalog_match_rate"] is None
+
+
+def test_attributed_rows_still_support_the_findings(monkeypatch) -> None:
+    low = {"date_start": "2026-11-01", "event": "Purchase", "event_source": {"id": "20"},
+           "total_matched_content_ids": 1, "total_unmatched_content_ids": 99}
+    _use(monkeypatch, _event_stats_client([low]))
+    health = run(catalog_feeds.get_catalog_event_source_health("10"))
+    assert any(f["type"] == "low_match_rate" for f in health["findings"])
+    _use(monkeypatch, _event_stats_client([]))
+    health = run(catalog_feeds.get_catalog_event_source_health("10"))
+    assert any(f["type"] == "no_event_stats" for f in health["findings"])
+    recommendations = run(catalog_feeds.get_catalog_event_source_recommendations("10", business_id="30"))
+    assert any(f["type"] == "weak_catalog_signal_coverage" for f in recommendations["findings"])
+
+
+@pytest.mark.parametrize(("rows", "event_name"), [
+    ([dict(_UNATTRIBUTED_ROW)], None),
+    ([{**_UNATTRIBUTED_ROW, "event_source": {"id": "s1"}, "event": None}], "Purchase"),
+])
+def test_match_rate_in_another_catalog_is_not_given_from_partly_attributed_rows(monkeypatch, rows, event_name) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("b1", "owned_product_catalogs"): {"data": [{"id": "c1"}]},
+        ("c1", "external_event_sources"): {"data": [{"id": "s1"}]},
+        ("c1", "event_stats"): {"data": rows},
+    }))
+    result = run(catalog_feeds.list_event_source_catalogs(
+        "s1", business_id="b1", include_match_rates=True, event_name=event_name,
+    ))
+    rate = result["items"][0]["match_rate"]
+    assert rate["status"] == "attribution_incomplete" and rate["match_rate"] is None
+    assert rate["unattributed_event_stats"]["rows"] == 1

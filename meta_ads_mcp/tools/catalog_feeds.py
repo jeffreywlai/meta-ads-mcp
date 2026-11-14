@@ -25,7 +25,13 @@ from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError, Validatio
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page, to_int
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    collection_fault,
+    normalize_collection,
+    read_collection_page,
+    to_int,
+)
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.secret_scrub import (  # noqa: F401 - the length thresholds stay importable from here
     ANYWHERE,
@@ -388,26 +394,42 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
 
 
 def _paged_collection(payload: dict[str, Any], after: str | None = None) -> dict[str, Any]:
-    """Shape one Graph page the way list_audiences does.
+    """Shape one Graph page the way list_audiences does; every list tool here returns through it.
 
-    When Meta hands back the cursor that was just read, following it would return this
-    page again, so no next cursor is offered and the stop reason says why.
+    A page is complete only when Meta's paging has no next link and
+    normalize.collection_fault finds nothing wrong with it: a page without a data list, or
+    with entries that are not objects, may hold rows that were not read, so the result is
+    not complete and its stop_reason says why. Entries that are not objects are left out
+    of items and counted in unreadable_entries. When Meta hands back the cursor that was
+    just read, following it would return this page again, so no next cursor is offered
+    and the stop reason says why.
     """
     normalized = normalize_collection(payload)
+    rows, unreadable, _ = read_collection_page(payload)
+    fault = collection_fault(payload)
+    normalized["items"] = rows
     has_more = bool(normalized["paging"].get("next"))
     next_after = normalized["paging"].get("after") if has_more else None
     requested = blank_to_none(after)
     repeated = has_more and next_after is not None and next_after == requested
     normalized["summary"].update({
-        "complete": not has_more,
+        "count": len(rows),
+        "complete": not has_more and fault is None,
         "truncated": has_more,
         "next_after": None if repeated else next_after,
     })
+    reasons: list[str] = []
     if repeated:
-        normalized["summary"]["stop_reason"] = (
+        reasons.append(
             "Meta returned the cursor that was just read, so following it would repeat this page; "
             "the rest of the list cannot be read with this cursor."
         )
+    if fault is not None:
+        reasons.append(fault)
+        if unreadable:
+            normalized["summary"]["unreadable_entries"] = unreadable
+    if reasons:
+        normalized["summary"]["stop_reason"] = " ".join(reasons)
     return normalized
 
 
@@ -1270,18 +1292,23 @@ def _known_sum(values: Any) -> int | None:
     return total
 
 
-def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], int]:
+def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Group event_stats rows per source: daily match history and per-event totals.
 
     A counter Meta omitted is unknown, not zero: any total it feeds is None, and
-    match rates are computed only when both counters are known.
+    match rates are computed only when both counters are known. A row that names no
+    readable event_source is not dropped: it is counted, with its own matched and
+    unmatched content ids, in the second value (see _attribution_gap).
     """
     per_source: dict[str, dict[str, Any]] = {}
-    unattributed = 0
+    unattributed_totals = [0, 0, 0, 0]
+    unattributed_rows = 0
     for row in rows:
         source_id = _object_id(row.get("event_source"))
         if source_id is None:
-            unattributed += 1
+            unattributed_rows += 1
+            _add_counts(unattributed_totals, to_int(row.get("total_matched_content_ids")),
+                        to_int(row.get("total_unmatched_content_ids")))
             continue
         matched = to_int(row.get("total_matched_content_ids"))
         unmatched = to_int(row.get("total_unmatched_content_ids"))
@@ -1319,13 +1346,40 @@ def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[s
                 for event, totals in sorted(bucket["events"].items())
             },
         }
+    unattributed = {"rows": unattributed_rows, **_counts_view(unattributed_totals)}
+    unattributed.pop("match_rate")
     return summaries, unattributed
 
 
-def _across_catalogs(stats: dict[str, Any] | None, stats_complete: bool) -> dict[str, Any]:
+def _attribution_gap(unattributed: dict[str, Any], *, about: str = "a source") -> str | None:
+    """Why no per-source absence, zero, weakness or rate can be concluded, or None when every row was attributed.
+
+    The rule for every per-source conclusion in this module: something may be called
+    absent, zero or weak for a source, or given a rate, only when every row that could
+    belong to that source was attributed. A row naming no readable source could be any
+    source's, so its own counts are given instead.
+    """
+    rows = unattributed.get("rows") or 0
+    if not rows:
+        return None
+    matched, unmatched = unattributed.get("matched_content_ids"), unattributed.get("unmatched_content_ids")
+    counts = (
+        f"{matched if matched is not None else 'an unknown number of'} matched and "
+        f"{unmatched if unmatched is not None else 'an unknown number of'} unmatched content ids"
+    )
+    return (
+        f"{rows} event_stats row(s) named no readable event source ({counts}). They may belong to {about}, so no "
+        "source's events are called absent, zero or weak and no per-source match rate is given."
+    )
+
+
+def _across_catalogs(
+    stats: dict[str, Any] | None, stats_complete: bool, attribution_gap: str | None = None,
+) -> dict[str, Any]:
     """This catalog's rate for a source beside the share that matched its other catalogs.
 
-    Computed only from a finished event_stats read with both counters known.
+    Computed only from a finished event_stats read with both counters known and every
+    row attributed to a source.
     """
     view: dict[str, Any] = {
         "this_catalog_match_rate": None,
@@ -1339,6 +1393,9 @@ def _across_catalogs(stats: dict[str, Any] | None, stats_complete: bool) -> dict
         return view
     if not stats_complete:
         view["note"] = "event_stats was only partly read, so the rates were not computed."
+        return view
+    if attribution_gap is not None:
+        view["note"] = attribution_gap
         return view
     matched, unmatched = stats["matched_content_ids"], stats["unmatched_content_ids"]
     other = stats["content_ids_matched_other_catalogs"]
@@ -1382,6 +1439,7 @@ async def _catalog_signal_inputs(client: Any, catalog_id: str) -> dict[str, Any]
         stop_reasons=stat_reasons,
     )
     stats, unattributed = _summarize_event_stats(stat_rows)
+    attribution_gap = _attribution_gap(unattributed)
     scan_gaps: list[str] = []
     if not sources_complete:
         scan_gaps.append(
@@ -1399,8 +1457,9 @@ async def _catalog_signal_inputs(client: Any, catalog_id: str) -> dict[str, Any]
         "stat_rows": len(stat_rows),
         "stats_complete": stats_complete,
         "stats": stats,
-        "unattributed_rows": unattributed,
-        "scan_gaps": scan_gaps,
+        "unattributed": unattributed,
+        "attribution_gap": attribution_gap,
+        "scan_gaps": scan_gaps + ([attribution_gap] if attribution_gap else []),
     }
 
 
@@ -1770,24 +1829,11 @@ async def list_product_feed_uploads(
         feed_id, "uploads", fields=UPLOAD_FIELDS, params=_page_params(limit, after),
     )
     collection = _paged_collection(payload, after)
-    uploads, unreadable, _ = read_collection_page(payload)
     collection["items"] = [
         await _upload_with_errors(client, upload, include_samples=include_samples)
-        for upload in uploads
+        for upload in collection["items"]
     ]
-    _note_unreadable_entries(collection["summary"], unreadable, len(uploads))
     return collection
-
-
-def _note_unreadable_entries(summary: dict[str, Any], unreadable: int, readable: int) -> None:
-    """Say in a page's summary that it held entries that are not objects, which are left out."""
-    summary["count"] = readable
-    if unreadable:
-        summary["unreadable_entries"] = unreadable
-        summary["complete"] = False
-        summary["stop_reason"] = " ".join(filter(None, (
-            summary.get("stop_reason"), _unreadable_entries_reason(unreadable) + " They are left out.",
-        )))
 
 
 @mcp_server.tool()
@@ -1963,9 +2009,23 @@ async def _source_rate_in_catalog(
         client, catalog_id, "event_stats", fields=EVENT_STAT_FIELDS, page_size=500,
         max_pages=MATCH_RATE_STATS_PAGES, stop_reasons=reasons,
     )
+    def event_readable(row: dict[str, Any]) -> bool:
+        return isinstance(row.get("event"), str) and bool(row["event"].strip())
+
+    def may_be_event(row: dict[str, Any]) -> bool:
+        return event_name is None or row.get("event") == event_name or not event_readable(row)
+
     own = [row for row in rows if _object_id(row.get("event_source")) == source_id]
     if event_name is not None:
         own = [row for row in own if row.get("event") == event_name]
+    # A row that names no readable source, or (with event_name) no readable event, may be one
+    # of this source's: it is counted, never taken as a known nonmatch.
+    unclear = [
+        row for row in rows if may_be_event(row) and (
+            _object_id(row.get("event_source")) is None
+            or (_object_id(row.get("event_source")) == source_id and not event_readable(row))
+        )
+    ]
     stats = _summarize_event_stats(own)[0].get(source_id)
     matched = stats["matched_content_ids"] if stats else None
     unmatched = stats["unmatched_content_ids"] if stats else None
@@ -1980,6 +2040,20 @@ async def _source_rate_in_catalog(
             "status": "partial_read", **empty, **base,
             "partial_counts_from_pages_read": {"matched_content_ids": matched, "unmatched_content_ids": unmatched},
             "note": f"event_stats was only partly read, so no rate is given: {' '.join(reasons)}",
+        }
+    unclear_totals = [0, 0, 0, 0]
+    for row in unclear:
+        _add_counts(unclear_totals, to_int(row.get("total_matched_content_ids")),
+                    to_int(row.get("total_unmatched_content_ids")))
+    unclear_view = {"rows": len(unclear), **_counts_view(unclear_totals)}
+    unclear_view.pop("match_rate")
+    gap = _attribution_gap(unclear_view, about="this source" + (" and event" if event_name else ""))
+    if gap is not None:
+        return {
+            "status": "attribution_incomplete", **empty, **base,
+            "attributed_counts": {"matched_content_ids": matched, "unmatched_content_ids": unmatched},
+            "unattributed_event_stats": unclear_view,
+            "note": gap,
         }
     if stats is None:
         return {
@@ -2118,6 +2192,9 @@ async def get_catalog_event_source_health(
     scope_id = blank_to_none(event_source_id)
     client = _client()
     inputs = await _catalog_signal_inputs(client, catalog_id)
+    gap = inputs["attribution_gap"]
+    # A per-source rate or absence needs the whole window read and every row attributed.
+    rates_known = inputs["stats_complete"] and gap is None
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
     reports: list[dict[str, Any]] = []
@@ -2152,12 +2229,14 @@ async def get_catalog_event_source_health(
             # False when event_stats stopped early: the counts below then cover only the
             # pages read, are not 28-day totals, and no window rate is given from them.
             "counts_complete": inputs["stats_complete"],
+            # False when some event_stats rows named no readable source: they may be this one's.
+            "attribution_complete": gap is None,
             "match_rate_history": stats["match_rate_history"] if stats else [],
-            "window_match_rate": stats["window_match_rate"] if stats and inputs["stats_complete"] else None,
+            "window_match_rate": stats["window_match_rate"] if stats and rates_known else None,
             "matched_content_ids": stats["matched_content_ids"] if stats else None,
             "unmatched_content_ids": stats["unmatched_content_ids"] if stats else None,
             "by_event": stats["by_event"] if stats else {},
-            "across_catalogs": _across_catalogs(stats, inputs["stats_complete"]),
+            "across_catalogs": _across_catalogs(stats, inputs["stats_complete"], gap),
             "checks": [],
             "failed_checks": [],
             "unevaluated_checks": [],
@@ -2166,6 +2245,11 @@ async def get_catalog_event_source_health(
             missing.append(
                 f"No event_stats rows for source {source_id} were among the pages read; event_stats "
                 "has more pages, so whether it sent catalog events in the 28-day window is unknown."
+            )
+        elif stats is None and gap is not None:
+            missing.append(
+                f"No event_stats rows named source {source_id}, but some rows named no readable source, so "
+                "whether it sent catalog events in the 28-day window is unknown."
             )
         elif stats is None:
             missing.append(
@@ -2181,7 +2265,7 @@ async def get_catalog_event_source_health(
                 next_actions=["Confirm the pixel or app fires ViewContent, AddToCart and Purchase with content_ids."],
             ))
         elif (
-            inputs["stats_complete"]
+            rates_known
             and stats["window_match_rate"] is not None
             and stats["window_match_rate"] < match_rate_threshold
         ):
@@ -2263,13 +2347,14 @@ async def get_catalog_event_source_health(
     missing.extend(inputs["scan_gaps"])
     if not inputs["stats_complete"]:
         missing.append("Low-match-rate findings were not made because event_stats was only partly read.")
-    if inputs["unattributed_rows"]:
-        missing.append(f"{inputs['unattributed_rows']} event_stats rows had no event_source and were not attributed.")
+    elif gap is not None:
+        missing.append("Low-match-rate and no-event findings were not made because some event_stats rows named no source.")
     metrics: dict[str, Any] = {
         "connected_sources": len(reports),
         "sources_complete": inputs["sources_complete"],
         "event_stat_rows": inputs["stat_rows"],
         "stats_complete": inputs["stats_complete"],
+        "unattributed_event_stats": inputs["unattributed"],
         "match_rate_threshold": match_rate_threshold,
     }
     scope: dict[str, Any] = {"catalog_id": catalog_id}
@@ -2340,16 +2425,20 @@ async def get_catalog_event_source_recommendations(
             "is not known."
         )
     stats_complete = inputs["stats_complete"]
+    gap = inputs["attribution_gap"]
+    # Coverage of the connected sources is known only when every row was attributed to a source.
+    totals_known = stats_complete and gap is None
     coverage_evidence: dict[str, Any] = {
         "connected_sources": len(inputs["sources"]),
         "sources_complete": sources_complete,
         "stats_complete": stats_complete,
-        "matched_content_ids_28d": matched if stats_complete else None,
-        "unmatched_content_ids_28d": unmatched if stats_complete else None,
-        "match_rate_28d": overall_rate if stats_complete else None,
+        "matched_content_ids_28d": matched if totals_known else None,
+        "unmatched_content_ids_28d": unmatched if totals_known else None,
+        "match_rate_28d": overall_rate if totals_known else None,
         "threshold": match_rate_threshold,
+        "unattributed_event_stats": inputs["unattributed"],
     }
-    if not stats_complete:
+    if not totals_known:
         coverage_evidence["partial_counts_from_pages_read"] = {
             "event_stat_rows": inputs["stat_rows"],
             "matched_content_ids": matched,
@@ -2372,6 +2461,11 @@ async def get_catalog_event_source_recommendations(
         missing.append(
             "Whether the connected sources' catalog signal coverage is weak could not be determined "
             "because event_stats was only partly read."
+        )
+    elif gap is not None:
+        missing.append(
+            "Whether the connected sources' catalog signal coverage is weak could not be determined "
+            "because some event_stats rows named no source; their counts are in unattributed_event_stats."
         )
     elif matched != 0 and overall_rate is None:
         missing.append(

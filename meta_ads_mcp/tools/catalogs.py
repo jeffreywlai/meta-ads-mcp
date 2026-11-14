@@ -28,7 +28,13 @@ from meta_ads_mcp.errors import (
 )
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page, to_int
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    collection_fault,
+    normalize_collection,
+    read_collection_page,
+    to_int,
+)
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 # The feed tools' masking: a URL password in a result or in a raised error's text
@@ -40,7 +46,6 @@ from meta_ads_mcp.tools.catalog_feeds import (
     _count_keys,
     _is_unreadable_answer_error,
     _is_unreadable_collection_error,
-    _note_unreadable_entries,
     _unreadable_entries_reason,
     _guard_secrets,
     _masked_json_text,
@@ -239,25 +244,40 @@ def _paged(payload: dict[str, Any], *, limit: int | None = None, after: str | No
     Meta's products edge returns a next link even when every row has already been
     returned (seen live: 5 of 5 rows, limit 50, and the page after it is empty). So
     a next link is not believed when this is the first page, it is shorter than the
-    limit, and it already holds as many rows as Meta's own total_count.
+    limit, it already holds as many rows as Meta's own total_count, and the page
+    itself was read in full.
+
+    Every list tool here returns through this function. A page is complete only when
+    normalize.collection_fault finds nothing wrong with it: a page without a data list,
+    or with entries that are not objects, may hold rows that were not read, so the result
+    is not complete and its stop_reason says why. Entries that are not objects are left
+    out of items and counted in unreadable_entries.
     """
     normalized = normalize_collection(payload)
+    readable, unreadable, _ = read_collection_page(payload)
+    fault = collection_fault(payload)
+    normalized["items"] = readable
     has_more = bool(normalized["paging"].get("next"))
-    stated_total = to_int((payload.get("summary") or {}).get("total_count"))
-    rows = len(normalized["items"])
+    summary = payload.get("summary") if isinstance(payload, dict) else None
+    stated_total = to_int((summary or {}).get("total_count")) if isinstance(summary, dict) else None
+    rows = len(readable)
     if (
-        has_more and limit is not None and blank_to_none(after) is None
+        has_more and fault is None and limit is not None and blank_to_none(after) is None
         and stated_total is not None and rows < limit and rows >= stated_total
     ):
         has_more = False
     normalized["summary"].update({
-        "complete": not has_more,
+        "count": rows,
+        "complete": not has_more and fault is None,
         "truncated": has_more,
         "next_after": normalized["paging"].get("after") if has_more else None,
     })
-    total = (payload.get("summary") or {}).get("total_count")
-    if total is not None:
-        normalized["summary"]["total_count"] = to_int(total)
+    if fault is not None:
+        normalized["summary"]["stop_reason"] = fault
+        if unreadable:
+            normalized["summary"]["unreadable_entries"] = unreadable
+    if stated_total is not None:
+        normalized["summary"]["total_count"] = stated_total
     return normalized
 
 
@@ -770,7 +790,9 @@ async def _catalog_dpa_signals(
             max_pages=_SIGNAL_MAX_PAGES,
         )
         groups = [group for group in diagnostics["rows"] if isinstance(group, dict)]
-        affected = sum(to_int(group.get("number_of_affected_items")) or 0 for group in groups)
+        counts = [to_int(group.get("number_of_affected_items")) for group in groups]
+        # A group whose count cannot be read makes the total unknown, never a smaller number.
+        affected = None if any(count is None for count in counts) else sum(counts)
         if diagnostics["complete"] or groups:
             signals["da_must_fix_groups"] = len(groups)
             signals["da_must_fix_affected_items"] = affected
@@ -845,7 +867,9 @@ def _assess_catalog(
         problems = True
         reasons.append(
             f"{signals['da_must_fix_groups']} must-fix diagnostic group(s) for dynamic ads affecting "
-            f"{signals['da_must_fix_affected_items']} item(s)."
+            + (f"{signals['da_must_fix_affected_items']} item(s)."
+               if signals["da_must_fix_affected_items"] is not None
+               else "a number of items Meta did not report for every group.")
         )
     elif signals["da_must_fix_groups"] == 0:
         reasons.append("No must-fix diagnostics for dynamic ads.")
@@ -1044,7 +1068,9 @@ async def list_dpa_eligible_catalogs(
         _ELIGIBLE_GROUP[item["assessment"]],
         -_context_score(item.get("context_match") or {})[0],
         _ASSESSMENT_RANK[item["assessment"]],
-        item["signals"]["da_must_fix_affected_items"] or 0,
+        # Fewest affected items first; an unknown number goes after every known one.
+        (item["signals"]["da_must_fix_affected_items"]
+         if item["signals"]["da_must_fix_affected_items"] is not None else float("inf")),
         -(item["signals"]["product_count"] or 0),
     ))
     for rank, finding in enumerate(findings, start=1):
@@ -1235,9 +1261,7 @@ async def get_catalog_diagnostics(
         catalog_id, "diagnostics", fields=DIAGNOSTIC_FIELDS, params=params,
     )
     result = _paged(payload)
-    readable, unreadable, _ = read_collection_page(payload)
-    _note_unreadable_entries(result["summary"], unreadable, len(readable))
-    groups = sorted(readable, key=_diagnostic_sort_key)
+    groups = sorted(result["items"], key=_diagnostic_sort_key)
     result["summary"].update({
         "ordered_by": "number_of_affected_items",
         "order_scope": "page",
@@ -1419,11 +1443,8 @@ async def list_catalog_data_sources(
         catalog_id, "data_sources", fields=DATA_SOURCE_FIELDS, params=params,
     )
     result = _paged(payload)
-    readable, unreadable, _ = read_collection_page(payload)
-    result["items"] = readable
-    _note_unreadable_entries(result["summary"], unreadable, len(readable))
     result["summary"]["by_upload_type"] = dict(
-        Counter(item.get("upload_type") or "UNKNOWN" for item in readable)
+        Counter(item.get("upload_type") or "UNKNOWN" for item in result["items"])
     )
     return result
 
@@ -2725,6 +2746,17 @@ async def batch_update_catalog_products(
                                 f"{len(unfinished)} had not been reported finished when this tool stopped "
                                 "checking; Meta does not say which items each handle holds."
                             )
+                    unnamed_warnings = sum(
+                        1 for row in finished_rows for entry in _entry_list(row.get("warnings"))
+                        if _identified(entry) is None
+                    )
+                    if unnamed_warnings:
+                        # Warnings are listed per item by the item's id; one without an id may be any item's.
+                        response["warnings_naming_no_item"] = {
+                            "count": unnamed_warnings,
+                            "note": ("Meta's finished batch listed warnings that name no item, so an item "
+                                     "showing no warnings may still have one."),
+                        }
                     for item in to_send:
                         _settle(item, finished_rows, unfinished_reason=unfinished_reason,
                                 unattributed_submission_errors=len(unattributed),
@@ -2843,13 +2875,16 @@ async def build_product_set_filter(
         warnings.append(f"No products match this filter. {_EMPTY_SET_MESSAGE}")
     if match_count is None:
         missing.append("Meta did not return summary.total_count, so the match count is unknown.")
+    sample, _, _ = read_collection_page(payload)
+    if (fault := collection_fault(payload)) is not None:
+        missing.append(f"The sample of matching products is partial: {fault}")
     return {
         "catalog_id": catalog_id,
         "match": normalized_match,
         "filter": product_filter,
         "filter_json": json.dumps(product_filter, separators=(",", ":")),
         "match_count": match_count,
-        "sample": (payload.get("data") or [])[:5],
+        "sample": sample[:5],
         "warnings": warnings,
         "missing_signals": missing,
         "next_step": "Pass filter to create_product_set or update_product_set to save it.",

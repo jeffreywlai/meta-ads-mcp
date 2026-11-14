@@ -3510,3 +3510,73 @@ def test_dpa_pixel_connection_is_unknown_when_a_source_has_no_id(monkeypatch) ->
 def test_page_catalog_list_with_an_unidentified_row_is_incomplete() -> None:
     read = _run(catalogs._page_catalog_ids(_RawPages({"data": [{"id": "c1"}, {"name": "x"}]}), "p1"))
     assert read["ids"] == {"c1"} and read["complete"] is False
+
+
+# round fourteen --------------------------------------------------------------------------
+# S5: a list result is complete only when collection_fault finds nothing wrong with every page.
+
+
+@pytest.mark.parametrize(("tool", "arguments", "edge"), [
+    ("list_catalogs", {"business_id": "10"}, ("10", "owned_product_catalogs")),
+    ("list_catalog_products", {"catalog_id": "10"}, ("10", "products")),
+    ("list_product_sets", {"catalog_id": "10"}, ("10", "product_sets")),
+    ("list_catalog_data_sources", {"catalog_id": "10"}, ("10", "data_sources")),
+    ("get_catalog_diagnostics", {"catalog_id": "10"}, ("10", "diagnostics")),
+])
+def test_list_does_not_claim_complete_when_a_row_cannot_be_read(monkeypatch, tool, arguments, edge) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={edge: {"data": [None]}}))
+    result = _run(getattr(catalogs, tool)(**arguments))
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["unreadable_entries"] == 1
+    assert "could not be read" in summary["stop_reason"]
+    assert result["items"] == [] and summary["count"] == 0
+
+
+def test_products_last_page_exception_holds_only_for_a_page_read_in_full(monkeypatch) -> None:
+    # Live: Meta's products edge gives a next link on its last page; a short first page that
+    # already holds total_count is complete, but not when an entry on it could not be read.
+    clean = {"data": [{"id": "1"}], "paging": {"next": "n", "cursors": {"after": "a"}}, "summary": {"total_count": 1}}
+    _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): clean}))
+    assert _run(catalogs.list_catalog_products(catalog_id="10"))["summary"]["complete"] is True
+    faulty = {**clean, "data": [{"id": "1"}, None]}
+    _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): faulty}))
+    summary = _run(catalogs.list_catalog_products(catalog_id="10"))["summary"]
+    assert summary["complete"] is False and summary["next_after"] == "a" and summary["total_count"] == 1
+
+
+def test_product_set_filter_sample_leaves_out_unreadable_entries(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): {
+        "data": [{"id": "1", "name": "Shoe"}, None], "summary": {"total_count": 2},
+    }}))
+    result = _run(catalogs.build_product_set_filter("10", [{"field": "brand", "operator": "eq", "value": "Acme"}]))
+    assert result["sample"] == [{"id": "1", "name": "Shoe"}]
+    assert any("sample of matching products is partial" in note for note in result["missing_signals"])
+
+
+# S6 sweep: a total built by grouping rows is never smaller because a row's value was missing.
+
+
+def test_dpa_affected_items_are_unknown_when_a_group_count_is_missing(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogClient(edges={
+        ("b1", "owned_product_catalogs"): {"data": [{"id": "c1", "product_count": 5}]},
+        ("c1", "product_sets"): {"data": [{"id": "ps"}]},
+        ("c1", "external_event_sources"): {"data": [{"id": "s1"}]},
+        ("c1", "diagnostics"): {"data": [{"type": "A", "number_of_affected_items": 4}, {"type": "B"}]},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="b1"))
+    [finding] = result["findings"]
+    assert finding["signals"]["da_must_fix_groups"] == 2
+    assert finding["signals"]["da_must_fix_affected_items"] is None
+    assert any("did not report for every group" in reason for reason in finding["reasons"])
+
+
+def test_batch_warnings_that_name_no_item_are_counted(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "p1")], status=_finished(
+        warnings=[{"message": "Image is small"}, {"id": "SKU-1", "message": "Price rounded"}],
+    )))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+    ))
+    assert result["items"][0]["warnings"] == ["Price rounded"]
+    assert result["warnings_naming_no_item"]["count"] == 1
