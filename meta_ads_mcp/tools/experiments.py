@@ -257,6 +257,7 @@ ENTITY_FIELDS = {
     "adset": ["id", "name", "account_id", "campaign_id", "effective_status", "optimization_goal", "billing_event"],
     "ad": ["id", "name", "account_id", "adset_id", "campaign_id", "effective_status"],
 }
+ENTITY_NOUNS = {"campaign": "campaign", "adset": "ad set", "ad": "ad"}
 AD_PARENTS = (
     ("adset", "adset_id", "ad set", ENTITY_FIELDS["adset"]),
     ("campaign", "campaign_id", "campaign", ENTITY_FIELDS["campaign"]),
@@ -413,9 +414,9 @@ def _percentage(value: Any, *, label: str, minimum: float = 0.0) -> float:
         raise ValidationError(f"{label} must be a number.")
     if value > 100 or value < minimum or value <= 0:
         lower = f"at least {minimum:g}" if minimum else "greater than 0"
-        raise ValidationError(f"{label} must be {lower} and at most 100; got {value}.")
+        raise ValidationError(f"{label} must be {lower} and at most 100.")
     if abs(round(value, 2) - value) > 1e-9:
-        raise ValidationError(f"{label} allows at most two decimal places; got {value}.")
+        raise ValidationError(f"{label} allows at most two decimal places.")
     return value
 
 
@@ -475,7 +476,7 @@ def _build_ab_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
             payload["description"] = cell["description"]
         built.append(payload)
     if round(total, 2) != 100:
-        raise ValidationError(f"Cell treatment_percentage values must total 100; they total {round(total, 2):g}.")
+        raise ValidationError("Cell treatment_percentage values must total 100; these cells do not.")
     return built
 
 
@@ -518,7 +519,7 @@ def _build_creative_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if share != int(share):
             raise ValidationError(
                 f"cells[{index}].treatment_percentage must be a whole number for a creative test "
-                f"(Meta's split testing guide); got {share}."
+                "(Meta's split testing guide)."
             )
         total += int(share)
         payload: dict[str, Any] = {"name": cell["name"].strip(), "treatment_percentage": int(share), "ads": [ad_id]}
@@ -526,7 +527,7 @@ def _build_creative_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
             payload["description"] = cell["description"]
         built.append(payload)
     if total != 100:
-        raise ValidationError(f"Cell treatment_percentage values must total 100; they total {total}.")
+        raise ValidationError("Cell treatment_percentage values must total 100; these cells do not.")
     return built
 
 
@@ -575,12 +576,12 @@ def _build_lift_cells(cells: list[dict[str, Any]], account_id: str) -> list[dict
         population += treatment + control
         if combined > 100:
             raise ValidationError(
-                f"cells[{index}] treatment_percentage plus control_percentage is {combined:g}; it cannot exceed 100."
+                f"cells[{index}] treatment_percentage plus control_percentage cannot exceed 100."
             )
         if len(cells) == 1 and combined != 100:
             raise ValidationError(
                 "With a single cell, treatment_percentage plus control_percentage must equal 100 "
-                f"(Meta's lift study rule); got {combined:g}."
+                "(Meta's lift study rule)."
             )
         payload: dict[str, Any] = {
             "name": cell["name"].strip(),
@@ -602,7 +603,7 @@ def _build_lift_cells(cells: list[dict[str, Any]], account_id: str) -> list[dict
     if round(population, 2) > 100:
         raise ValidationError(
             "Lift study percentages are shares of the whole study population: treatment_percentage plus "
-            f"control_percentage across all cells can total at most 100; these cells total {round(population, 2):g}."
+            "control_percentage across all cells can total at most 100; these cells total more."
         )
     return built
 
@@ -676,7 +677,7 @@ async def _resolve_business_id(client: Any, account_id: str, business_id: str | 
     resolved = business.get("id") if isinstance(business, dict) else business
     if not resolved:
         raise ValidationError(
-            f"Meta returned no owning business for {account_id}. Meta creates studies on a business "
+            "Meta returned no owning business for this ad account. Meta creates studies on a business "
             "(POST /{business_id}/ad_studies); pass business_id."
         )
     return str(resolved)
@@ -1484,7 +1485,7 @@ async def _count_account_active_studies(client: Any, account_id: str, now: datet
         "count_complete": scan["complete"],
         "stop_reason": scan["stop_reason"],
         "unclassified_note": (
-            _unclassified_message(scan, f"on {account_id}'s impacting_ad_studies") if scan["unclassified"] else None
+            _unclassified_message(scan, "on the account's impacting_ad_studies") if scan["unclassified"] else None
         ),
     }
 
@@ -1511,7 +1512,8 @@ def _check_account_and_status(
         )
     elif entity_account != account_number:
         result["blockers"].append(
-            f"{subject or entity_id} belongs to ad account {entity_account}, not {account_number}."
+            f"{('The ' + subject) if subject else 'It'} belongs to ad account {entity_account}, not the account "
+            "being checked."
         )
     raw_status = entity.get("effective_status")
     status = raw_status.strip().upper() if isinstance(raw_status, str) else ""
@@ -1662,7 +1664,9 @@ async def check_ab_test_eligibility(
     entities: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     missing_signals: list[str] = []
-    for entity_id in ids:
+    for position, entity_id in enumerate(ids, start=1):
+        # Messages name the entity by its position in entity_ids, never by the id the caller typed.
+        where = f"the {ENTITY_NOUNS[normalized_level]} at entity_ids entry {position}"
         result: dict[str, Any] = {
             "entity_id": entity_id, "level": normalized_level, "blockers": [], "unresolved": [], "warnings": [],
         }
@@ -1670,12 +1674,14 @@ async def check_ab_test_eligibility(
             entity = await client.get_object(entity_id, fields=fields)
         except NotFoundError as exc:
             result.update({"exists": False, "active_studies": None})
-            result["blockers"].append(f"{entity_id} was not found: {exc}")
+            result["blockers"].append(f"Meta did not find {where}: {exc}")
             entities.append(_with_outcome(result))
             continue
         except (MetaApiError, UnsupportedFeatureError) as exc:
             result.update({"exists": None, "active_studies": None})
-            result["unresolved"].append(f"Could not read {entity_id}, so none of its checks were performed: {exc}")
+            result["unresolved"].append(
+                f"Could not read {where}, so none of its checks were performed: {exc}"
+            )
             entities.append(_with_outcome(result))
             continue
         result["exists"] = True
@@ -1687,7 +1693,9 @@ async def check_ab_test_eligibility(
             entities.append(_with_outcome(result))
             continue
         scan, error = await _studies_containing(client, entity_id, now, cache)
-        active = _note_studies(result, entity_id, "Already in", scan, error, missing_signals)
+        active = _note_studies(
+            result, where, "Already in", scan, error, missing_signals,
+        )
         result["active_studies"] = active
         if scan is not None:
             result["active_studies_complete"] = scan["complete"]
@@ -1698,7 +1706,7 @@ async def check_ab_test_eligibility(
         account_check = await _count_account_active_studies(client, account_id, now)
     except (NotFoundError, MetaApiError, UnsupportedFeatureError, RateLimitError) as exc:
         message = (
-            f"The account's concurrent-study limit check was not performed: reading {account_id}'s "
+            "The account's concurrent-study limit check was not performed: reading its "
             f"impacting_ad_studies failed ({exc}). The {MAX_CONCURRENT_STUDIES}-study limit was not confirmed."
         )
         account_check = {
@@ -2014,9 +2022,8 @@ def _check_effective_times(
         and effective_end <= effective_start
     ):
         raise ValidationError(
-            f"After this edit the study would start at {_iso(effective_start)} and end at "
-            f"{_iso(effective_end)}; end_time must be after start_time. Unchanged times are "
-            "taken from the study's current values."
+            "After this edit the study's end_time would not be after its start_time; end_time must be "
+            "after start_time. Unchanged times are taken from the study's current values."
         )
     stored_observation = _stored_unix(previous, "observation_end_time")
     is_lift = str(previous.get("type") or "").upper() == "LIFT"
@@ -2030,9 +2037,8 @@ def _check_effective_times(
         and effective_observation < effective_end
     ):
         raise ValidationError(
-            f"After this edit observation_end_time ({_iso(effective_observation)}) would be before "
-            f"end_time ({_iso(effective_end)}); Meta's lift guide sets observation_end_time at or after "
-            "end_time. Pass a later observation_end_time in params as well."
+            "After this edit observation_end_time would be before end_time; Meta's lift guide sets "
+            "observation_end_time at or after end_time. Pass a later observation_end_time in params as well."
         )
 
 

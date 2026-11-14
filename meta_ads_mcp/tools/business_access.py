@@ -353,7 +353,7 @@ def _search_response(
         needs = "a readable numeric id" if search.isdigit() else f"a readable {text_fields[0]}"
         reasons.append(f"Meta returned {unsearchable} row(s) without {needs}, so whether they match is unknown.")
     if len(matches) > limit:
-        reasons.append(f"{len(matches)} rows matched; only the first {limit} are returned. Narrow the search.")
+        reasons.append(f"{len(matches)} rows matched; only the first `limit` of them are returned. Narrow the search.")
     if reasons:
         summary["incomplete_reason"] = " ".join(reasons)
     return {"items": items, "paging": {"before": None, "after": scan["next_after"], "next": None}, "summary": summary}
@@ -908,11 +908,11 @@ async def _plan_access_change(
         refusal = "This person has no direct access to the catalog; there is nothing to remove."
     if lost:
         what = "; ".join(f"{task}: {TASK_MEANINGS[task]}" for task in lost)
-        warnings.insert(0, f"After this change user {user_id} can no longer: {what}.")
+        warnings.insert(0, f"After this change this person can no longer: {what}.")
     if change == "remove":
-        warnings.insert(1, f"User {user_id} loses all direct access to catalog {catalog_id}.")
+        warnings.insert(1, "This person loses all direct access to the catalog.")
     if "MANAGE" in gained:
-        warnings.append(f"MANAGE gives user {user_id} full control of catalog {catalog_id}.")
+        warnings.append("MANAGE gives this person full control of the catalog.")
     if change in {"increase", "reduce", "change"}:
         warnings.append(
             "Meta documents granting and removing, not editing in place; the new task set is sent as a "
@@ -1077,14 +1077,14 @@ async def _plan_partner_change(
         refusal = "This partner business has no direct share of the catalog; there is nothing to remove."
     if lost:
         what = "; ".join(f"{task}: {TASK_MEANINGS[task]}" for task in lost)
-        warnings.insert(0, f"After this change partner business {partner_id} can no longer: {what}.")
+        warnings.insert(0, f"After this change the partner business can no longer: {what}.")
     if change == "remove":
         warnings.insert(
-            1, f"Partner business {partner_id} loses its direct share of catalog {catalog_id}, and its people "
+            1, "The partner business loses its direct share of the catalog, and its people "
             "lose the access they had through it.",
         )
     if "MANAGE" in gained:
-        warnings.append(f"MANAGE gives partner business {partner_id} full control of catalog {catalog_id}.")
+        warnings.append("MANAGE gives the partner business full control of the catalog.")
     if change == "increase":
         warnings.append(
             "Meta documents sharing and removing, not editing a share; the full new set is sent as a share "

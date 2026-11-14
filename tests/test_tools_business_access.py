@@ -445,7 +445,7 @@ def test_set_catalog_access_reduction_states_what_is_lost(monkeypatch) -> None:
     result = run(business_access.set_catalog_access(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON, tasks=["ADVERTISE"]))
     assert result["change"] == "reduce"
     assert list(result["can_no_longer"]) == ["MANAGE"]
-    assert result["warnings"][0].startswith(f"After this change user {PERSON} can no longer: MANAGE")
+    assert result["warnings"][0].startswith("After this change this person can no longer: MANAGE")
 
 
 def test_set_catalog_access_reports_when_meta_did_not_replace_the_set(monkeypatch) -> None:
@@ -2106,3 +2106,33 @@ def test_partner_catalog_scan_checks_each_catalog_once_and_shows_no_first_copy_n
         {"id": "2", "name": "Bags", "access_type": "AGENCY"},
     ]
     assert result["summary"]["catalogs_checked"] == 2
+
+
+# R16 (review V4): warnings never repeat an id the caller typed; it stays in target -------------
+
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+@pytest.mark.parametrize(("previous", "tasks"), [(["MANAGE", "ADVERTISE"], []), (["ADVERTISE"], ["ADVERTISE", "MANAGE"])])
+def test_access_warnings_do_not_repeat_typed_ids(monkeypatch, kind, previous, tasks) -> None:
+    typed = "".join(["2025", "550198"])
+    edge, key = ("assigned_users", "tasks") if kind == "PERSON" else ("agencies", "permitted_tasks")
+    business = {"business_id": BUSINESS} if kind == "PERSON" else {}
+    _use(monkeypatch, FakeClient(
+        objects={"me": {"id": "100"}},
+        edges={
+            (CATALOG, edge): _page([{"id": typed, key: previous}]),
+            ("me", "business_users"): {"data": [{"id": CALLER, "business": {"id": OTHER_BUSINESS}}]},
+        },
+    ))
+    preview = run(business_access.preview_catalog_access_change(
+        CATALOG, typed, tasks, user_type=kind, allow_self_removal=True, **business,
+    ))
+    assert preview["warnings"], preview
+    assert not any(typed in warning or CATALOG in warning for warning in preview["warnings"])
+    assert preview["target"]["user_id"] == typed, "the structured target keeps the id"
+
+
+def test_search_overflow_names_the_limit_parameter_not_its_value(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={("me", "businesses"): _page([{"id": str(n), "name": "Acme"} for n in range(1, 4)])}))
+    result = run(business_access.list_businesses(name_contains="acme", limit=2))
+    assert "only the first `limit` of them" in result["summary"]["incomplete_reason"]
