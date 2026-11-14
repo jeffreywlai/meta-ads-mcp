@@ -125,3 +125,16 @@ def test_schedule_time_refuses_true_false_fractions_and_other_shapes(value) -> N
 
     with pytest.raises(PydanticValidationError):
         TypeAdapter(ScheduleTime).validate_python(value)
+
+
+# Round twenty-five (review R25 B5): Meta's guide writes recommendation stages in lower case.
+
+
+def test_recommendation_stages_are_accepted_in_any_letter_case_and_sent_in_upper_case() -> None:
+    from meta_ads_mcp.errors import ValidationError
+    from meta_ads_mcp.tool_types import normalize_recommendation_filters
+
+    for given in (["mfr", "pcr"], "mfr,pcr", ["MFR", "Pcr"], " mfr , PCR "):
+        assert normalize_recommendation_filters(None, given, api_version="v26.0") == (None, ["MFR", "PCR"])
+    with pytest.raises(ValidationError, match="MFR, PCR, or PFR"):
+        normalize_recommendation_filters(None, ["mfr", "unknown"], api_version="v26.0")

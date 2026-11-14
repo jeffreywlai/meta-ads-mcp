@@ -178,10 +178,12 @@ def normalize_recommendation_filters(
                 f"{parameter} must be a list of nonblank strings or a comma-separated string."
             )
         normalized = [item.strip() for item in normalized]
-        if parameter == "recommendation_stages" and any(
-            stage not in {"MFR", "PCR", "PFR"} for stage in normalized
-        ):
-            raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
+        if parameter == "recommendation_stages":
+            # Meta's guide writes the stages in lower case (mfr, pcr) and its SDK in upper case;
+            # either is accepted here and the upper-case form, the one the SDK lists, is sent.
+            normalized = [stage.upper() for stage in normalized]
+            if any(stage not in {"MFR", "PCR", "PFR"} for stage in normalized):
+                raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
         filters.append(normalized)
     if any(value is not None for value in filters):
         api_version = get_settings().api_version if api_version is None else api_version

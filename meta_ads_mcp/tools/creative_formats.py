@@ -32,7 +32,7 @@ from meta_ads_mcp.tools.creatives import (
 )
 from meta_ads_mcp.url_secrets import refuse_url_credentials
 
-# AdCreativeLinkDataCallToAction.type values from Meta's reference page, plus
+# AdCreativeLinkDataCallToAction.Type values from Meta's SDK (26.0.2), plus
 # INSTAGRAM_MESSAGE, which Meta's click-to-Instagram examples use, and the two profile visit
 # buttons from Meta's profile visit ads guides (VIEW_INSTAGRAM_PROFILE for an Instagram profile,
 # VISIT_PROFILE for a Facebook Page), which also appear in the call_to_action type list of
