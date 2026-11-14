@@ -12,9 +12,11 @@ from pydantic import ValidationError as PydanticValidationError
 
 from meta_ads_mcp.argument_privacy import (
     PRIVATE_ARGUMENT_TOOLS,
+    misspelling_hint,
     private_validation_message,
     schema_parameter_names,
     unknown_parameter_count,
+    validation_message,
 )
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.errors import MetaApiError, RateLimitError
@@ -45,13 +47,42 @@ def unknown_tool_message() -> str:
     return READ_ONLY_UNKNOWN_TOOL_MESSAGE if get_settings().read_only else UNKNOWN_TOOL_MESSAGE
 
 
+def _unknown_parameters_message(
+    tool_name: str, unexpected: list[str], accepted: list[str], private: bool, proxy: bool,
+) -> str:
+    """The refusal of argument names a tool does not accept, for every tool.
+
+    The names given are counted, never repeated: a value put in the wrong place,
+    a customer's email or a password, can arrive as a parameter name. The accepted
+    names come from the tool's own schema, and so does the one misspelling hint.
+    """
+    if private and proxy:
+        reason = "the tool being called can receive personal data or secrets"
+    elif private:
+        reason = "this tool's arguments can hold personal data or secrets"
+    else:
+        reason = "a value put in the wrong place can arrive as a parameter name"
+    hint = misspelling_hint(unexpected, accepted)
+    return (
+        f"Unknown parameters for {tool_name}: {unknown_parameter_count(len(unexpected))} "
+        f"(names not repeated because {reason}). "
+        + (f"One of them looks like a misspelling of '{hint}'. " if hint else "")
+        + f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
+        f"Inspect types and defaults with get_capabilities(tool_name='{tool_name}')."
+    )
+
+
 class ToolParameterHelpMiddleware(Middleware):
     """Reject unknown keywords with the live schema before a tool executes.
 
-    For tools in PRIVATE_ARGUMENT_TOOLS, unknown parameters are counted rather
-    than named, and the framework's argument-validation error is replaced by one
-    that names parameters only: those arguments can hold personal data or
-    secrets, and a misplaced value can arrive as a parameter name.
+    For every tool, unknown parameters are counted rather than named: a
+    misplaced value can arrive as a parameter name. The framework's
+    argument-validation error, which quotes the values sent, is replaced for
+    every tool: validation_message keeps each fault's location, type and
+    Pydantic's message unless the message repeats the input; for tools in
+    PRIVATE_ARGUMENT_TOOLS, private_validation_message is stricter and keeps
+    only Pydantic's built-in messages, since those arguments can hold personal
+    data or secrets.
 
     The call_tool proxy's own envelope (name, arguments, tool_name) gets the
     same handling unless every target it names is a registered tool outside
@@ -124,38 +155,23 @@ class ToolParameterHelpMiddleware(Middleware):
             accepted = list(tool.parameters.get("properties", {}))
             unexpected = sorted(set(context.message.arguments or {}) - set(accepted))
             if unexpected:
-                reason = (
-                    "the tool being called can receive personal data or secrets"
-                    if proxy
-                    else "this tool's arguments can hold personal data or secrets"
-                )
-                described = (
-                    f"{unknown_parameter_count(len(unexpected))} (names not repeated because {reason})"
-                    if private
-                    else ", ".join(unexpected)
-                )
-                raise ToolError(
-                    f"Unknown parameters for {tool.name}: {described}. "
-                    f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
-                    f"Inspect types and defaults with get_capabilities(tool_name='{tool.name}')."
-                )
+                raise ToolError(_unknown_parameters_message(tool.name, unexpected, accepted, private, proxy))
         if proxy and await self._names_an_unknown_target(context):
             # Refused before dispatch: the nested call's "Unknown tool" error
             # would repeat the target in the returned error and the log.
             raise ToolError(unknown_tool_message())
-        if not private:
+        if tool is None:
             return await call_next(context)
         failure: ToolError | None = None
         try:
             return await call_next(context)
         except (FastMCPValidationError, PydanticValidationError) as exc:
+            # FastMCP raises its own ValidationError with Pydantic's ValidationError as
+            # the cause; the input is read only to check a message does not repeat it.
             cause = exc if isinstance(exc, PydanticValidationError) else exc.__cause__
             errors = cause.errors(include_url=False) if isinstance(cause, PydanticValidationError) else None
-            failure = ToolError(
-                private_validation_message(
-                    tool.name, errors, schema_parameter_names(tool.parameters)
-                )
-            )
+            build = private_validation_message if private else validation_message
+            failure = ToolError(build(tool.name, errors, schema_parameter_names(tool.parameters)))
         # Raised outside the except block so the original error, which quotes
         # the values, is neither the cause nor the context of this one.
         raise failure

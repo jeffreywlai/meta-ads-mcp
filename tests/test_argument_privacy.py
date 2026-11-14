@@ -361,16 +361,23 @@ def test_other_tools_keep_naming_unknown_parameters_exactly():
         _call("list_adsets", {"account_id": "act_1", "not_a_parameter": True}, routed=False)
     accepted = ", ".join(_tools()["list_adsets"].parameters["properties"])
     assert str(info.value) == (
-        "Unknown parameters for list_adsets: not_a_parameter. "
+        "Unknown parameters for list_adsets: 1 unknown parameter (names not repeated because a value put in the "
+        "wrong place can arrive as a parameter name). "
         f"Accepted parameters: {accepted}. "
         "Inspect types and defaults with get_capabilities(tool_name='list_adsets')."
     )
 
 
 def test_other_tools_keep_the_framework_validation_error():
-    with pytest.raises(MCPValidationError) as info:
+    """Round fifteen: the location, type and Pydantic's message are kept; the value sent is not."""
+    with pytest.raises(ToolError) as info:
         _call("list_adsets", {"account_id": "act_1", "limit": "not-a-number"}, routed=False)
-    assert "not-a-number" in str(info.value)
+    assert str(info.value) == (
+        "Invalid arguments for list_adsets: limit: Input should be a valid integer, unable to parse string as an "
+        "integer [type=int_parsing]. The values sent are not repeated. "
+        "Inspect types and defaults with get_capabilities(tool_name='list_adsets')."
+    )
+    assert "not-a-number" not in _rendered_chain(info.value)
 
 
 # --- Guard: a tool with a secret- or person-shaped parameter must be listed --------
@@ -577,12 +584,15 @@ def test_an_ordinary_target_keeps_naming_unknown_envelope_keys_exactly():
     with pytest.raises(ToolError) as info:
         _call_proxy({"name": "list_adsets", "arguments": {"account_id": "act_1"}, "bogus": 1})
     assert str(info.value) == (
-        "Unknown parameters for call_tool: bogus. Accepted parameters: name, arguments, tool_name. "
+        "Unknown parameters for call_tool: 1 unknown parameter (names not repeated because a value put in the "
+        "wrong place can arrive as a parameter name). Accepted parameters: name, arguments, tool_name. "
         "Inspect types and defaults with get_capabilities(tool_name='call_tool')."
     )
     with pytest.raises(ToolError) as info:
         _call_proxy({"tool_name": "list_adsets", "bogus": 1})
-    assert str(info.value).startswith("Unknown parameters for call_tool: bogus. ")
+    assert str(info.value).startswith(
+        "Unknown parameters for call_tool: 1 unknown parameter (names not repeated because a value put in the wrong "
+    )
 
 
 def test_a_wrong_type_target_beside_an_ordinary_one_is_treated_as_unclear():
@@ -739,11 +749,15 @@ def test_an_unknown_direct_tool_name_is_not_repeated(caplog):
 
 def test_a_registered_proxy_target_behaves_as_before():
     # The nested call's own framework error, exactly as a direct call gets it.
-    with pytest.raises(MCPValidationError) as routed:
+    with pytest.raises(ToolError) as direct:
+        _call("list_adsets", {"account_id": "act_1", "limit": "not-a-number"}, routed=False)
+    with pytest.raises(ToolError) as routed:
         _call_proxy({"name": "list_adsets", "arguments": {"account_id": "act_1", "limit": "not-a-number"}})
-    assert "not-a-number" in str(routed.value)
-    with pytest.raises(MCPValidationError):
+    assert str(routed.value) == str(direct.value)
+    assert str(routed.value).startswith("Invalid arguments for list_adsets: limit: Input should be a valid integer")
+    with pytest.raises(ToolError) as aliased:
         _call_proxy({"tool_name": " list_adsets ", "arguments": {"account_id": "act_1", "limit": "not-a-number"}})
+    assert str(aliased.value) == str(direct.value)
     # The proxy's own refusals keep their messages.
     with pytest.raises(ToolError, match="synthetic search tool"):
         _call_proxy({"name": "search_tools", "arguments": {"query": "x"}})
@@ -1625,3 +1639,191 @@ def test_owned_tool_errors_are_built_without_caller_text(module_name):
                 ) == "ValidationError":
                     problems.append(f"{function.name}: ValidationError raised inside an except block")
     assert problems == [], problems
+
+
+# --- Round-thirteen review U4: an unknown argument name is never repeated, for any tool --
+#
+# Rule: an argument name the tool does not accept is never repeated; the error says how
+# many there were and lists the accepted names. ToolParameterHelpMiddleware applies it
+# to every tool, directly and through call_tool, so a new tool cannot be missed.
+
+
+def _lift_study_arguments() -> dict:
+    return {
+        "account_id": "10", "business_id": "30", "name": "Example",
+        "cells": [{"name": "Treatment", "treatment_percentage": 90, "control_percentage": 10}],
+        "objectives": [{"name": "Purchase", "is_primary": True,
+                        "adspixels": [{"id": "20", "event_names": ["Purchase"]}]}],
+        "start_time": "2080-01-01T00:00:00+00:00",
+        "end_time": "2080-01-08T00:00:00+00:00",
+    }
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+@pytest.mark.parametrize("name", ["create_lift_study", "get_dataset_stats"])
+def test_new_tools_do_not_repeat_misplaced_private_argument_names(caplog, routed, name):
+    """Reviewer reproduction (round thirteen, U4)."""
+    caplog.set_level(logging.DEBUG)
+    marker = "".join(["person", "-", "r13", "@", "example.invalid"])
+    if name == "create_lift_study":
+        args = _lift_study_arguments()
+    else:
+        args = {"dataset_id": "20", "since": "2026-11-01", "until": "2026-11-02"}
+    args[marker] = "extra"
+    with pytest.raises(ToolError) as error:
+        _call(name, args, routed)
+    assert marker not in str(error.value)
+    assert marker not in _rendered_chain(error.value)
+    _assert_not_logged(caplog, marker)
+    assert f"Unknown parameters for {name}: 1 unknown parameter (names not repeated" in str(error.value)
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+def test_every_tool_counts_unknown_argument_names_and_lists_accepted_ones(routed, caplog):
+    """The rule holds at the boundary for every registered tool, not only those on the private list."""
+    caplog.set_level(logging.DEBUG)
+    marker = "".join(["private.person", "@u4-every.invalid"])
+    for tool in _tools().values():
+        if tool.name in {"call_tool", "search_tools"}:
+            continue
+        arguments = {marker: "x", "".join(["second", "@u4.invalid"]): "y"}
+        name, sent = ("call_tool", {"name": tool.name, "arguments": arguments}) if routed else (tool.name, arguments)
+        try:
+            asyncio.run(mcp_server.call_tool(name, sent))
+        except Exception as error:  # read-only refusals and unknown-parameter refusals alike
+            rendered = _rendered_chain(error)
+        else:  # pragma: no cover - a tool that accepted unknown names would fail here
+            pytest.fail(f"{tool.name} accepted unknown argument names")
+        assert marker not in rendered and "second@" not in rendered, tool.name
+        if "Unknown parameters" in rendered:
+            assert f"Unknown parameters for {tool.name}: 2 unknown parameters (names not repeated" in rendered
+    _assert_not_logged(caplog, marker)
+
+
+def test_the_proxy_and_a_direct_call_give_the_same_refusal():
+    marker = "".join(["person", "@u4-same.invalid"])
+    arguments = {"dataset_id": "20", marker: "extra"}
+    with pytest.raises(ToolError) as direct:
+        _call("get_dataset_stats", dict(arguments), routed=False)
+    with pytest.raises(ToolError) as routed:
+        _call("get_dataset_stats", dict(arguments), routed=True)
+    assert str(direct.value) == str(routed.value)
+
+
+def test_every_tool_refuses_names_its_schema_does_not_declare():
+    """The boundary covers a tool only when its schema forbids other names; every tool's does."""
+    open_tools = [tool.name for tool in _tools().values() if tool.parameters.get("additionalProperties") is not False]
+    assert open_tools == []
+
+
+def test_a_close_misspelling_names_only_the_accepted_parameter(caplog):
+    caplog.set_level(logging.DEBUG)
+    misspelt = "".join(["datset", "_id"])
+    with pytest.raises(ToolError) as error:
+        _call("get_dataset_stats", {misspelt: "20"}, routed=False)
+    message = str(error.value)
+    assert "One of them looks like a misspelling of 'dataset_id'." in message
+    assert misspelt not in message
+    _assert_not_logged(caplog, misspelt)
+
+
+@pytest.mark.parametrize(("unknown", "accepted", "expected"), [
+    (["sincee"], ["since", "until"], "since"),
+    (["Account_ID"], ["account_id", "limit"], "account_id"),
+    # No hint when it would be ambiguous or far off.
+    (["sincee", "untill"], ["since", "until"], None),
+    (["dataset"], ["dataset_id", "datasets"], None),
+    (["".join(["person", "@example.invalid"])], ["since", "until"], None),
+    (["x"], [], None),
+])
+def test_the_misspelling_hint_returns_only_an_accepted_name(unknown, accepted, expected):
+    from meta_ads_mcp.argument_privacy import misspelling_hint
+
+    hint = misspelling_hint(unknown, accepted)
+    assert hint == expected
+    assert hint is None or hint in accepted
+
+
+# --- Round fifteen: a validation error never repeats the value sent, for any tool ------
+#
+# Rule: a validation error returned to the caller names where the fault is and what was
+# expected, and never repeats the value that was sent. FastMCP raises its own
+# ValidationError with Pydantic's ValidationError as the cause; the middleware rebuilds
+# the error from Pydantic's structured errors. Tools outside the private list keep
+# Pydantic's message, and a validator's own message unless it contains the input.
+
+
+def _typed_email() -> str:
+    return "".join(["person", "@round15.invalid"])
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+@pytest.mark.parametrize(("tool", "arguments", "expected"), [
+    ("list_adsets", lambda value: {"account_id": "act_1", "limit": value},
+     "limit: Input should be a valid integer, unable to parse string as an integer [type=int_parsing]"),
+    ("get_dataset_stats", lambda value: {"dataset_id": "20", "since": ["2026-11-01", value]},
+     "since: Input should be a valid string [type=string_type]"),
+])
+def test_a_wrong_typed_value_is_not_repeated_for_an_ordinary_tool(caplog, routed, tool, arguments, expected):
+    assert tool not in PRIVATE_ARGUMENT_TOOLS
+    caplog.set_level(logging.DEBUG)
+    value = _typed_email()
+    with pytest.raises(ToolError) as error:
+        _call(tool, arguments(value), routed)
+    assert value not in str(error.value)
+    assert value not in _rendered_chain(error.value)
+    _assert_not_logged(caplog, value)
+    # Where the fault is and what was expected are still there.
+    assert str(error.value).startswith(f"Invalid arguments for {tool}: {expected}. The values sent are not repeated. ")
+
+
+def test_an_ordinary_custom_message_survives_for_an_ordinary_tool():
+    """StrictCurrencyAmount's own message does not depend on the value, so it is kept."""
+    assert "create_campaign" not in PRIVATE_ARGUMENT_TOOLS
+    with pytest.raises(ToolError) as error:
+        _call("create_campaign", {
+            "account_id": "act_1", "name": "Example", "objective": "OUTCOME_SALES", "spend_cap": True,
+        }, routed=False)
+    assert "spend_cap: Value error, an amount must be a number, not true or false [type=value_error]" in str(error.value)
+
+
+def test_a_message_that_repeats_the_input_is_replaced():
+    from meta_ads_mcp.argument_privacy import validation_message
+
+    value = _typed_email()
+    errors = [
+        {"type": "value_error", "loc": ("since",), "msg": f"Value error, {value} is not a date", "input": value},
+        {"type": "value_error", "loc": ("cells", 0, value), "msg": "Value error, fixed text", "input": {value: 1}},
+        {"type": "union_tag_invalid", "loc": ("spec",), "msg": f"Input tag '{value}' found is not valid",
+         "input": {"type": value}},
+        {"type": "missing", "loc": ("account_id",), "msg": "Field required", "input": {"other": value}},
+        {"type": "int_parsing", "loc": ("limit",), "msg": "Input should be a valid integer", "input": "ab"},
+    ]
+    message = validation_message("example_tool", errors, {"since", "cells", "spec", "account_id", "limit"})
+    assert value not in message
+    assert message == (
+        "Invalid arguments for example_tool: since: Value is not valid [type=value_error]; "
+        "cells[0].<key>: Value error, fixed text [type=value_error]; spec: Value is not valid [type=union_tag_invalid]; "
+        "account_id: Field required [type=missing]; limit: Input should be a valid integer [type=int_parsing]. "
+        "The values sent are not repeated. Inspect types and defaults with get_capabilities(tool_name='example_tool')."
+    )
+
+
+def test_every_validator_this_server_defines_for_tool_arguments_has_a_fixed_message():
+    """The custom messages a tool argument can produce; none of them is built from the input."""
+    sources = {
+        "tool_types.py": ['"an amount must be a number, not true or false"'],
+        "tools/catalogs.py": ['"a price must be a number, not true or false"'],
+        "tools/experiments.py": ['"expected a number or time, not true or false"'],
+        "tools/creatives.py": ['"must be a whole number, not true or false"'],
+    }
+    root = Path(argument_privacy.__file__).parent
+    for path in [*root.glob("*.py"), *(root / "tools").glob("*.py")]:
+        source = path.read_text(encoding="utf-8")
+        validators = re.findall(r"(?:Before|After|Plain|Wrap)Validator\((\w+)", source)
+        assert "field_validator" not in source and "model_validator" not in source, path
+        for name in set(validators) - {"coerce_csv_string_list", "coerce_strict_csv_string_list"}:
+            body = re.search(rf"def {name}\(.*?\n(?=\S|\n\n)", source, re.S).group(0)
+            raised = re.findall(r"raise \w+\(([^)]*)\)", body)
+            relative = str(path.relative_to(root))
+            assert raised and all(message in sources[relative] for message in raised), (relative, name, raised)

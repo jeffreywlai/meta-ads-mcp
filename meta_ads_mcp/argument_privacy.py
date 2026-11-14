@@ -14,8 +14,11 @@ Two measures, both applied before any tool code runs:
   tool is covered without registering anything.
 * ``PRIVATE_ARGUMENT_TOOLS`` names the tools whose arguments can carry personal
   data or secrets. For those, ``ToolParameterHelpMiddleware`` returns validation
-  errors that name parameters only and counts unknown parameters instead of
-  quoting them (a misplaced customer value can arrive as an argument name).
+  errors that name parameters only.
+* For every tool, ``ToolParameterHelpMiddleware`` counts unknown parameter names
+  instead of quoting them (a misplaced customer value can arrive as an argument
+  name), lists the accepted ones, and may name the one accepted parameter an
+  unknown name looks like a misspelling of (``misspelling_hint``).
 
 ``HandlerLogPrivacyFilter`` does the same for FastMCP's DEBUG record of each
 MCP tool call, which otherwise carries the tool name and every argument value.
@@ -913,6 +916,116 @@ def private_validation_message(
 
 def unknown_parameter_count(count: int) -> str:
     return f"{count} unknown parameter{'s' if count != 1 else ''}"
+
+
+# Values shorter than this are not compared against a message: two characters cannot
+# identify anyone, and they occur in ordinary words by accident.
+_MIN_COMPARED_VALUE = 3
+_MAX_COMPARED_VALUES = 500
+
+
+def _input_texts(value: Any) -> set[str]:
+    """Every text a rejected input holds: its strings, numbers and mapping keys, nested."""
+    texts: set[str] = set()
+    pending = [value]
+    while pending and len(texts) < _MAX_COMPARED_VALUES:
+        current = pending.pop()
+        if isinstance(current, Mapping):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple, set, frozenset)):
+            pending.extend(current)
+        elif isinstance(current, (str, int, float)) and not isinstance(current, bool):
+            text = str(current)
+            if len(text) >= _MIN_COMPARED_VALUE:
+                texts.add(text)
+        elif isinstance(current, bytes):
+            texts.add(current.decode("utf-8", "replace"))
+    return texts
+
+
+def _message_without_input(error: Mapping[str, Any]) -> str:
+    """Pydantic's message for one error, or a fixed one when the message repeats the input.
+
+    A built-in message is written by Pydantic from the schema; a validator's own message
+    is written by this server. Either is kept unless it contains, as written, any text the
+    rejected input holds (three characters or more).
+    """
+    message = error.get("msg")
+    if not isinstance(message, str):
+        return "Value is not valid"
+    given = error.get("input", _NO_INPUT)
+    if given is not _NO_INPUT and any(text in message for text in _input_texts(given)):
+        return "Value is not valid"
+    return message
+
+
+def validation_message(
+    tool_name: str,
+    errors: Iterable[Any] | None,
+    known_names: Iterable[str],
+) -> str:
+    """An argument error for a tool outside the private list: where, what was expected, never the value.
+
+    Each error keeps its location (declared parameter names and positions; anything
+    taken from the input becomes <key> or <unknown>), its type and Pydantic's message,
+    unless the message repeats the input. The value sent, its type and Pydantic's
+    documentation link are left out.
+    """
+    known = set(known_names)
+    unknown = 0
+    problems: list[str] = []
+    for error in errors or []:
+        if not isinstance(error, Mapping):
+            problems.append("arguments: Value is not valid")
+            continue
+        error_type = str(error.get("type", ""))
+        if error_type in _UNKNOWN_NAME_ERROR_TYPES:
+            unknown += 1
+            continue
+        shown_type = error_type if error_type in _BUILTIN_ERROR_TYPES else "custom_error"
+        problem = (
+            f"{_describe_location(_safe_location(error, known))}: {_message_without_input(error)} [type={shown_type}]"
+        )
+        if problem not in problems:
+            problems.append(problem)
+    if unknown:
+        problems.append(unknown_parameter_count(unknown))
+    if not problems:
+        problems.append("the arguments do not match the tool's input schema")
+    return (
+        f"Invalid arguments for {tool_name}: {'; '.join(problems)}. "
+        "The values sent are not repeated. "
+        f"Inspect types and defaults with get_capabilities(tool_name='{tool_name}')."
+    )
+
+
+# A fixed measure for "looks like a misspelling": difflib's similarity of the two
+# names, case ignored. 0.8 lets one wrong, missing or swapped letter through in a
+# name of five or more letters.
+_MISSPELLING_RATIO = 0.8
+
+
+def misspelling_hint(unknown: Iterable[str], accepted: Iterable[str]) -> str | None:
+    """The one accepted parameter an unknown name looks like a misspelling of, or None.
+
+    Only a name from the tool's own schema is returned, never the caller's spelling.
+    It is returned only when exactly one pair of an unknown name and an accepted name
+    is close, so the hint cannot be ambiguous.
+    """
+    import difflib
+
+    try:
+        accepted_names = [name for name in accepted if isinstance(name, str)]
+        pairs = [
+            name
+            for given in unknown if isinstance(given, str)
+            for name in accepted_names
+            if difflib.SequenceMatcher(None, given.casefold(), name.casefold()).ratio() >= _MISSPELLING_RATIO
+        ]
+    except Exception:
+        return None
+    return pairs[0] if len(pairs) == 1 else None
 
 
 # --- A tool's own error messages ----------------------------------------------------
