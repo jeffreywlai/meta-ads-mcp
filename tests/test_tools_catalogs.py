@@ -3280,6 +3280,20 @@ def test_a_4xx_error_answer_still_means_nothing_was_ingested(monkeypatch) -> Non
     assert result["items"][0]["outcome"] == "not_applied"
 
 
+@pytest.mark.parametrize("body", [False, {"success": False}, {"success": False, "id": "99"}])
+def test_a_batch_meta_answers_with_success_false_was_not_applied(monkeypatch, body) -> None:
+    """R17 Y1: the client's plain refusal is the one 2xx error that is not uncertain."""
+    import httpx
+
+    respond, methods = _batch_reply(lambda request: httpx.Response(200, content=json.dumps(body)))
+    result = _over_real_client(monkeypatch, respond, _one_update)
+    assert methods == ["GET", "POST"]
+    assert result["ok"] is False
+    assert result["error"]["mutation_outcome_unknown"] is False
+    assert result["items"][0]["outcome"] == "not_applied"
+    assert "nothing was ingested" in result["items"][0]["reason"]
+
+
 @pytest.mark.parametrize("failure", [TypeError("decoder"), KeyError("x"), RuntimeError("late")])
 def test_unexpected_failure_from_the_submission_call_keeps_items_unknown(monkeypatch, failure) -> None:
     _no_pause(monkeypatch)

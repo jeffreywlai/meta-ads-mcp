@@ -2658,11 +2658,16 @@ async def batch_update_catalog_products(
             # unknown: no readable answer came back, or the answer contradicts itself (a 2xx
             # status whose body is an error object, which Meta's error responses never are).
             # The client turns a throttling error into RateLimitError and keeps the original
-            # as its cause, so the status is read from whichever one carries it.
+            # as its cause, so the status is read from whichever one carries it. One 2xx error
+            # is not uncertain: the client's own, raised when Meta answers a write with an
+            # explicit false, which says the request was not carried out.
             source = error if isinstance(error, MetaApiError) else error.__cause__
             status = getattr(source, "status_code", None)
+            details = getattr(source, "details", None)
+            refused_plainly = isinstance(details, dict) and details.get("negative_acknowledgement") is True
             unknown = bool(getattr(source, "mutation_outcome_unknown", False)) or (
-                isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300
+                not refused_plainly
+                and isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300
             )
             for item in to_send:
                 item["outcome"] = "outcome_unknown" if unknown else "not_applied"
