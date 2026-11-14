@@ -2433,8 +2433,9 @@ _AUDITED_INTERPOLATIONS: dict[str, dict[str, set[str]]] = {
         # The upload's progress: the tool name, counts, the locally chosen session id and a fixed verb.
         "_upload_progress": {"accepted", "action", "batch_seq", "rows_accepted", "session_id", "total_batches", "verb"},
         "_sanitized_upload_error": {"progress", "type(exc).__name__", "withheld"},
-        # The audience asked for and the audience id Meta's answer named (a plain id: names_other_object read it).
-        "_other_audience_error": {"audience_id", "batch_seq", "progress", "str(answered_id).strip()"},
+        # The audience or session asked for and the id Meta's answer named (a plain id: names_other_object
+        # read it); what is "audience" or "upload session".
+        "_other_identity_error": {"asked", "batch_seq", "progress", "str(answered_id).strip()", "what"},
     },
     "business_access": {
         "_lookup_identity": {"copies", "problems[0]", "scan['reason']", "task_field", "unidentified"},

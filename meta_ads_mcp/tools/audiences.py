@@ -763,20 +763,21 @@ def _upload_progress(
     )
 
 
-def _other_audience_error(
+def _other_identity_error(
     *,
     action: str,
-    audience_id: str,
+    what: str,
+    asked: Any,
     answered_id: Any,
     batch_seq: int,
     total_batches: int,
     rows_accepted: int,
     session_id: int,
 ) -> MetaApiError:
-    """A batch whose answer named a different audience: its acceptance is unknown, and no batch follows.
+    """A batch whose answer named a different audience or upload session: its acceptance is unknown, and no batch follows.
 
-    The message holds the upload's progress and the two audience ids (diagnostic context the tool
-    already shows), never an uploaded value or hash.
+    The message holds the upload's progress and the two ids (diagnostic context the tool already
+    shows), never an uploaded value or hash.
     """
     progress = _upload_progress(
         action, "stopped", batch_seq=batch_seq, total_batches=total_batches, rows_accepted=rows_accepted,
@@ -784,8 +785,8 @@ def _other_audience_error(
     )
     return MetaApiError(
         message=(
-            f"{progress} Meta's answer to batch {batch_seq} named a different audience ({str(answered_id).strip()}) "
-            f"than {audience_id}, so whether this batch was accepted is not known, and no further batch was sent. "
+            f"{progress} Meta's answer to batch {batch_seq} named a different {what} ({str(answered_id).strip()}) "
+            f"than {asked}, so whether this batch was accepted is not known, and no further batch was sent. "
             "Check the audience with get_audience before uploading again."
         ),
         mutation_outcome_unknown=True,
@@ -955,17 +956,21 @@ async def _send_audience_users(
             # Raised outside the except block so the original error, which can
             # echo uploaded values, is not chained as __context__.
             raise failure
-        if names_other_object(audience_id, result, key="audience_id"):
-            # An acknowledgement for another audience does not say this batch was accepted.
-            raise _other_audience_error(
-                action=action,
-                audience_id=audience_id,
-                answered_id=result.get("audience_id"),
-                batch_seq=batch_seq,
-                total_batches=len(batches),
-                rows_accepted=rows_accepted,
-                session_id=session_id,
-            )
+        # An acknowledgement for another audience, or for another upload session (Meta's guide: the
+        # answer's session_id is the one the caller passed), does not say this batch was accepted.
+        # Compared by value; how Meta writes the session id back has not been seen in a live answer.
+        for what, asked, key in (("audience", audience_id, "audience_id"), ("upload session", session_id, "session_id")):
+            if names_other_object(asked, result, key=key):
+                raise _other_identity_error(
+                    action=action,
+                    what=what,
+                    asked=asked,
+                    answered_id=result.get(key),
+                    batch_seq=batch_seq,
+                    total_batches=len(batches),
+                    rows_accepted=rows_accepted,
+                    session_id=session_id,
+                )
         counts = {
             key: result.get(key) if _is_count(result.get(key)) else None
             for key in ("num_received", "num_invalid_entries")

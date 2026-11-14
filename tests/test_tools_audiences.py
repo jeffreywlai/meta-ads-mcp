@@ -968,6 +968,8 @@ def test_remove_audience_users_sends_delete_with_body_not_query(monkeypatch) -> 
     from meta_ads_mcp.graph_api import GraphAPIClient
 
     seen = []
+    # The answer names session 1, the session sent: Meta's guide says it is the session id the caller passed.
+    monkeypatch.setattr(audiences.secrets, "randbelow", lambda bound: 0)
 
     def handler(request):
         seen.append(request)
@@ -1717,3 +1719,63 @@ def test_ee4_upload_control_ordinary_acknowledgements_as_before(monkeypatch, too
     assert result["ok"] is True
     assert result["meta"]["num_received"] == 2
     assert [batch["rows_sent"] for batch in result["batches"]] == [1, 1]
+
+
+# The answer's session_id (Meta's guide: the session id the caller passed), compared by value.
+# How Meta writes it back (text, a number) has not been seen in a live answer.
+
+R33_SESSION = 954010
+
+
+class R33SessionUsersClient(FakeUsersClient):
+    """Answers every batch for the audience asked about, with the session id session_answer(sent) gives."""
+
+    def __init__(self, session_answer) -> None:
+        super().__init__()
+        self.session_answer = session_answer
+
+    def _record(self, method: str, parent_id: str, edge: str, data: dict) -> dict:
+        answer = super()._record(method, parent_id, edge, data)
+        answered = self.session_answer(data["session"]["session_id"])
+        if isinstance(answered, str) and answered == R33_MISSING:
+            answer.pop("session_id")
+        else:
+            answer["session_id"] = answered
+        return answer
+
+
+def _r33_session_upload(monkeypatch, tool: str, session_answer):
+    monkeypatch.setattr(audiences.secrets, "randbelow", lambda bound: R33_SESSION - 1)
+    client = R33SessionUsersClient(session_answer)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+    return client, (lambda: asyncio.run(_users_tool(tool)(
+        audience_id="954001", schema=["EMAIL"], rows=[[email] for email in R33_EMAILS],
+    )))
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+def test_ee4_upload_does_not_claim_success_from_another_session(monkeypatch, tool) -> None:
+    client, run = _r33_session_upload(monkeypatch, tool, lambda sent: "954098")
+    with pytest.raises(audiences.MetaApiError) as raised:
+        run()
+    assert len(client.requests) == 1
+    assert raised.value.mutation_outcome_unknown is True
+    message = str(raised.value)
+    assert f"{tool} stopped on batch 1 of 2 in session {R33_SESSION}" in message
+    assert f"named a different upload session (954098) than {R33_SESSION}" in message
+    _r33_assert_no_values(message)
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize("form", ["text", "whole number", "spaced text", "missing", "number with a fraction"])
+def test_ee4_upload_control_ordinary_session_ids_as_before(monkeypatch, tool, form) -> None:
+    """Control: the session id sent, as text, a whole number or spaced text; none; or a form that cannot be compared."""
+    answer = {
+        "text": str, "whole number": int, "spaced text": lambda sent: f" {sent} ",
+        "missing": lambda sent: R33_MISSING, "number with a fraction": float,
+    }[form]
+    client, run = _r33_session_upload(monkeypatch, tool, answer)
+    result = run()
+    assert len(client.requests) == 2
+    assert result["ok"] is True and result["session"]["session_id"] == str(R33_SESSION)
