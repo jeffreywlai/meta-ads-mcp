@@ -14,7 +14,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
+from meta_ads_mcp.normalize import blank_to_none, collection_fault, read_collection_page
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.tool_types import GraphId, StringList
 
@@ -113,12 +113,9 @@ def _catalog_recipient_kind(value: Any) -> str:
     """Return PERSON or AGENCY for the catalog access tools, accepting the other tools' kinds."""
     if str(value or "").strip().upper() == "PERSON":
         return "PERSON"
-    try:
-        kind = _user_kind(value)
-    except ValidationError:
-        raise ValidationError(
-            f"user_type is not recognised. Accepted values: PERSON, {_USER_TYPE_ACCEPTED}."
-        ) from None
+    kind = _known_kind(value)
+    if kind is None:
+        raise ValidationError(f"user_type is not recognised. Accepted values: PERSON, {_USER_TYPE_ACCEPTED}.")
     return "AGENCY" if kind == "AGENCY" else "PERSON"
 
 
@@ -162,10 +159,12 @@ def _non_object_rows_reason(count: int) -> str:
 def _page_response(payload: Any, fields: list[str]) -> dict[str, Any]:
     """Shape one Graph page the way list_audiences does, keeping only listed fields.
 
-    A page without a readable data list is not an empty page: it is reported as not
-    complete, with the reason. Rows that are not objects cannot be shown, so they are
-    counted and the page is not complete either.
+    The one place a single listing page in this module is called complete or not: complete
+    only when collection_fault finds nothing wrong with the page and Meta reported no next
+    page. A page without a readable data list returns no items and no cursor; rows that are
+    not objects cannot be shown, so they are counted. Either way incomplete_reason says why.
     """
+    fault = collection_fault(payload)
     rows, bad_rows, page_unreadable = read_collection_page(payload)
     if page_unreadable:
         return {
@@ -173,7 +172,7 @@ def _page_response(payload: Any, fields: list[str]) -> dict[str, Any]:
             "paging": {"before": None, "after": None, "next": None},
             "summary": {
                 "count": 0, "complete": False, "truncated": False, "next_after": None,
-                "page_unreadable": True, "incomplete_reason": PAGE_UNREADABLE_REASON,
+                "page_unreadable": True, "incomplete_reason": fault,
             },
         }
     paging = extract_paging(payload)
@@ -189,9 +188,9 @@ def _page_response(payload: Any, fields: list[str]) -> dict[str, Any]:
     reasons = []
     if has_more and not after:
         reasons.append("Meta reported another page but gave no cursor to read it.")
-    if bad_rows:
+    if fault:
         summary["unreadable_rows"] = bad_rows
-        reasons.append(_non_object_rows_reason(bad_rows))
+        reasons.append(fault)
     if reasons:
         summary["incomplete_reason"] = " ".join(reasons)
     return {"items": items, "paging": paging, "summary": summary}
@@ -305,11 +304,21 @@ def _unidentified_rows(scan: dict[str, Any]) -> int:
     return scan.get("unreadable_rows", 0) + sum(1 for row in scan["rows"] if _row_identity(row.get("id")) is None)
 
 
-def _matches(row: dict[str, Any], search: str, text_fields: tuple[str, ...]) -> bool:
+def _matches(row: dict[str, Any], search: str, text_fields: tuple[str, ...]) -> bool | None:
+    """True or False for a search, or None when the row lacks what the search needs.
+
+    An exact id search needs a readable numeric id. A text search needs the row's first text
+    field (a name, which every business, person and partner has); later fields, such as a
+    person's business email, are optional in Meta's answer and can only add a match.
+    """
     if search.isdigit():
-        return _is_row(row, search)
+        identity = _row_identity(row.get("id"))
+        return None if identity is None else identity == search
     needle = search.casefold()
-    return any(needle in str(row.get(field) or "").casefold() for field in text_fields)
+    values = [row.get(field) for field in text_fields]
+    if any(isinstance(value, str) and needle in value.casefold() for value in values):
+        return True
+    return None if not isinstance(values[0], str) or not values[0].strip() else False
 
 
 def _search_response(
@@ -319,14 +328,16 @@ def _search_response(
     text_fields: tuple[str, ...],
     limit: int,
 ) -> dict[str, Any]:
-    matches = [_project(row, fields) for row in scan["rows"] if _matches(row, search, text_fields)]
+    verdicts = [(row, _matches(row, search, text_fields)) for row in scan["rows"]]
+    matches = [_project(row, fields) for row, verdict in verdicts if verdict]
     items = matches[:limit]
-    # A row that could not be read could be the one searched for. Rows that are not
-    # objects already make the scan incomplete; for an exact id search with no match, an
-    # object row without a readable id could be it too.
-    unsearchable = 0
-    if search.isdigit() and not matches:
-        unsearchable = _unidentified_rows(scan) - scan.get("unreadable_rows", 0)
+    # A row that could not be judged could be the one searched for. Rows that are not
+    # objects already make the scan incomplete. An object row without what the search needs
+    # (a readable id, or a name) is counted too, except that an exact id search that found
+    # its row is settled, because ids are unique.
+    unsearchable = sum(1 for _, verdict in verdicts if verdict is None)
+    if search.isdigit() and matches:
+        unsearchable = 0
     summary: dict[str, Any] = {
         "count": len(items),
         "matched": len(matches),
@@ -343,9 +354,8 @@ def _search_response(
     if not scan["complete"]:
         reasons.append(f"Not every row was read: {scan['reason']}")
     if unsearchable:
-        reasons.append(
-            f"Meta returned {unsearchable} row(s) without a readable numeric id, so whether they match is unknown."
-        )
+        needs = "a readable numeric id" if search.isdigit() else f"a readable {text_fields[0]}"
+        reasons.append(f"Meta returned {unsearchable} row(s) without {needs}, so whether they match is unknown.")
     if len(matches) > limit:
         reasons.append(f"{len(matches)} rows matched; only the first {limit} are returned. Narrow the search.")
     if reasons:

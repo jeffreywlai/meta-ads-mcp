@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.normalize import collection_fault
 from meta_ads_mcp.tools import datasets, utility
 
 
@@ -708,7 +709,7 @@ def test_listings_do_not_call_an_unreadable_page_complete(monkeypatch, payload) 
     ):
         assert result["items"] == []
         assert result["summary"]["complete"] is False and result["summary"]["next_after"] is None
-        assert "readable data list" in result["summary"]["incomplete_reason"]
+        assert result["summary"]["incomplete_reason"] == collection_fault(payload)
 
 
 @pytest.mark.parametrize("payload", UNREADABLE_PAGES)
@@ -790,3 +791,61 @@ def test_dataset_quality_entries_that_are_not_objects_are_disclosed(monkeypatch,
     result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel=channel))
     assert result["metrics"]["events"] == 1
     assert any("1 " + channel + " event entry" in signal for signal in result["missing_signals"])
+
+
+# ------------------------------- R14 (review S4): a pasted date never reaches errors or logs
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("field", ["since", "until"])
+def test_dataset_stats_bad_date_never_logs_or_returns_private_input(caplog, routed, field) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    import meta_ads_mcp.server  # noqa: F401 -- register the complete real server
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    private = "".join(["Synthetic", "Private", "Value", "_", "x7y9"])
+    name, arguments = "get_dataset_stats", {"dataset_id": "10", field: private}
+    if routed:
+        name, arguments = "call_tool", {"name": name, "arguments": arguments}
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(mcp_server.call_tool(name, arguments))
+    leaks = {"mcp_error": private in str(caught.value), "logs": private in caplog.text}
+    assert not any(leaks.values()), leaks
+
+
+def test_bad_date_error_has_no_exception_chain() -> None:
+    with pytest.raises(ValidationError) as error:
+        datasets._parse_day("".join(["not", "-a-date"]), "since")
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+# ------------------------- R14 (review S5): an entry that cannot be read leaves a listing incomplete
+
+
+@pytest.mark.parametrize("more", [False, True])
+def test_listings_with_an_entry_that_is_not_an_object_are_incomplete(monkeypatch, more) -> None:
+    payload: dict[str, Any] = {"data": [{"id": "px1"}, None]}
+    if more:
+        payload["paging"] = {"next": "https://graph/next", "cursors": {"after": "c2"}}
+    _use(monkeypatch, FakeDatasetClient(list_pages={"adspixels": [payload], "customconversions": [payload]}))
+    for result in (
+        asyncio.run(datasets.list_datasets(account_id="1")),
+        asyncio.run(datasets.list_custom_conversions(account_id="1")),
+    ):
+        assert result["items"] == [{"id": "px1"}, None]
+        assert result["summary"]["complete"] is False
+        assert result["summary"]["incomplete_reason"] == collection_fault(payload)
+        assert result["summary"]["next_after"] == ("c2" if more else None)
+
+
+def test_listings_with_readable_pages_are_still_complete(monkeypatch) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"adspixels": [{"data": []}], "customconversions": [{"data": [{"id": "1"}]}]}))
+    for result in (
+        asyncio.run(datasets.list_datasets(account_id="1")),
+        asyncio.run(datasets.list_custom_conversions(account_id="1")),
+    ):
+        assert result["summary"]["complete"] is True and "incomplete_reason" not in result["summary"]

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.normalize import collection_fault
 from meta_ads_mcp.tools import assets
 
 
@@ -940,7 +941,7 @@ def test_plain_listings_do_not_call_an_unreadable_page_complete(monkeypatch, pay
     for result in results:
         assert result["items"] == []
         assert result["summary"]["complete"] is False and result["summary"]["next_after"] is None
-        assert "readable data list" in result["summary"]["incomplete_reason"]
+        assert result["summary"]["incomplete_reason"] == collection_fault(payload)
 
 
 def test_instagram_media_rows_that_are_not_objects_are_counted_not_fatal(monkeypatch) -> None:
@@ -949,7 +950,7 @@ def test_instagram_media_rows_that_are_not_objects_are_counted_not_fatal(monkeyp
         result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", boost_eligible_only=eligible_only))
         assert [item["id"] for item in result["items"]] == ["m1"]
         assert result["summary"]["unreadable_rows"] == 2 and result["summary"]["complete"] is False
-        assert "not objects" in result["summary"]["incomplete_reason"]
+        assert "2 entries in Meta's answer could not be read" in result["summary"]["incomplete_reason"]
 
 
 @pytest.mark.parametrize("payload", UNREADABLE_PAGES)
@@ -1039,3 +1040,91 @@ def test_audience_adsets_targeting_without_audience_lists_is_readable(monkeypatc
     ))
     result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting"))
     assert result["summary"]["complete"] is True
+
+
+# R14 (review S4): a pasted date never reaches errors or logs ----------------------------------
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("field", ["since", "until"])
+def test_instagram_media_bad_date_never_logs_or_returns_private_input(caplog, routed, field) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    import meta_ads_mcp.server  # noqa: F401 -- register the complete real server
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    private = "".join(["Synthetic", "Private", "Value", "_", "x7y9"])
+    name, arguments = "list_instagram_media", {"instagram_account_id": "10", field: private}
+    if routed:
+        name, arguments = "call_tool", {"name": name, "arguments": arguments}
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(mcp_server.call_tool(name, arguments))
+    leaks = {"mcp_error": private in str(caught.value), "logs": private in caplog.text}
+    assert not any(leaks.values()), leaks
+
+
+def test_media_window_error_has_no_exception_chain() -> None:
+    with pytest.raises(ValidationError) as error:
+        assets._media_window("".join(["not", "-a-date"]), None)
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+# R14 (review S5): an entry or a filter field that cannot be read never yields a complete result -------
+
+
+def test_plain_listings_with_an_entry_that_is_not_an_object_are_incomplete(monkeypatch) -> None:
+    payload = _paged([{"id": "1"}, None])
+    _patch(monkeypatch, FakeAssetsClient(pages={
+        ("me", "accounts"): [payload], ("act_1", "adimages"): [payload], ("act_1", "advideos"): [payload],
+    }))
+    for result in (
+        asyncio.run(assets.list_pages(source="user")),
+        asyncio.run(assets.list_ad_images(account_id="1")),
+        asyncio.run(assets.list_ad_videos(account_id="1")),
+    ):
+        assert len(result["items"]) == 2, "rows are still shown as Meta returned them"
+        assert result["summary"]["complete"] is False
+        assert result["summary"]["incomplete_reason"] == collection_fault(payload)
+
+
+def test_plain_listings_with_readable_pages_are_still_complete(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("me", "accounts"): [{"data": []}], ("act_1", "adimages"): [_paged([{"id": "1"}])]}))
+    for result in (asyncio.run(assets.list_pages(source="user")), asyncio.run(assets.list_ad_images(account_id="1"))):
+        assert result["summary"]["complete"] is True and "incomplete_reason" not in result["summary"]
+
+
+@pytest.mark.parametrize(("arguments", "row"), [
+    ({"since": "2026-11-01"}, {"id": "20", "boost_eligibility_info": {"eligible_to_boost": True}}),
+    ({"since": "2026-11-01"}, {**_media("20", True), "timestamp": "yesterday"}),
+    ({"media_types": ["VIDEO"]}, {"id": "20", "boost_eligibility_info": {"eligible_to_boost": True}}),
+    ({"media_product_types": ["REELS"]}, _media("20", True)),
+    ({}, _media("20", None)),
+])
+def test_instagram_media_row_that_cannot_be_judged_is_not_a_definite_nonmatch(monkeypatch, arguments, row) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("ig_1", "media"): [_paged([row])]}))
+    result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", **arguments))
+    assert result["items"] == []
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["unjudged_rows"] == 1
+    assert "whether they match the filter is unknown" in summary["incomplete_reason"]
+
+
+def test_instagram_media_definite_nonmatches_keep_the_page_complete(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("ig_1", "media"): [_paged([
+        _media("20", True), _media("21", False, "NOT_ALLOWED"), {**_media("22", True), "media_type": "VIDEO"},
+    ])]}))
+    result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1", media_types=["IMAGE"]))
+    assert [item["id"] for item in result["items"]] == ["20"]
+    assert result["summary"]["complete"] is True
+
+
+def test_video_title_that_is_not_text_cannot_be_judged(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("act_1", "advideos"): [_paged([
+        {"id": "v1", "title": "Launch"}, {"id": "v2", "title": {"text": "launch"}}, {"id": "v3"},
+    ])]}))
+    summary = asyncio.run(assets.list_ad_videos(account_id="1", title_contains="launch"))["summary"]
+    assert summary["count"] == 1 and summary["unjudged_rows"] == 1
+    assert summary["complete"] is False and "readable title" in summary["incomplete_reason"]

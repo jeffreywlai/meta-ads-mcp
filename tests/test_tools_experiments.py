@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 
 import pytest
 
 from meta_ads_mcp.errors import MetaApiError, NotFoundError
+from meta_ads_mcp.normalize import collection_fault
 from meta_ads_mcp.tools import experiments
 
 NOW = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
@@ -715,8 +717,9 @@ def test_create_ab_test_rejects_entity_in_two_cells(monkeypatch) -> None:
     no_client(monkeypatch)
     cells = [{"name": "A", "treatment_percentage": 50, "adset_ids": ["as_1"]},
              {"name": "B", "treatment_percentage": 50, "adset_ids": ["as_2", "as_1"]}]
-    with pytest.raises(experiments.ValidationError, match="as_1"):
+    with pytest.raises(experiments.ValidationError, match=r"same id appears in cells\[0\] and cells\[1\]") as error:
         run(_ab(cells=cells))
+    assert "as_1" not in str(error.value), "any text can arrive in an id list, so it is not repeated"
 
 
 def test_create_ab_test_requires_two_cells(monkeypatch) -> None:
@@ -1213,7 +1216,7 @@ def test_create_ab_test_more_than_five_ad_cells_is_sent_with_a_warning(monkeypat
     (_ad_cells(50.5, 49.5), {"creative_test_daily_budget": 10}, "whole number"),
     ([{"name": "A", "treatment_percentage": 50, "ad_ids": ["ad_1"]},
       {"name": "B", "treatment_percentage": 50, "ad_ids": ["ad_1"]}],
-     {"creative_test_daily_budget": 10}, "ad_1"),
+     {"creative_test_daily_budget": 10}, r"same ad id appears in cells\[0\] and cells\[1\]"),
     (_ad_cells(50, 50), {"creative_test_daily_budget": 0}, "creative_test_daily_budget"),
     (_ad_cells(50, 50), {"creative_test_daily_budget": float("nan")}, "creative_test_daily_budget"),
     (_ad_cells(50, 50), {"creative_test_lifetime_budget_percentage": 0}, "creative_test_lifetime_budget_percentage"),
@@ -1943,7 +1946,7 @@ def test_list_ad_studies_unreadable_page_is_not_complete(monkeypatch, payload) -
     result = run(experiments.list_ad_studies(account_id="123"))
     assert result["items"] == []
     assert result["summary"]["complete"] is False and result["summary"]["next_after"] is None
-    assert "readable data list" in result["summary"]["stop_reason"]
+    assert result["summary"]["stop_reason"] == collection_fault(payload)
 
 
 def test_list_ad_studies_shows_rows_that_are_not_objects_without_failing(monkeypatch) -> None:
@@ -1975,3 +1978,146 @@ def test_update_study_refuses_a_time_change_when_the_state_cannot_be_read(monkey
     with pytest.raises(experiments.ValidationError, match="could not be read"):
         run(experiments.update_ad_study(study_id="study_1", **change))
     assert client.kinds() == ["get"]
+
+
+# --- R14 (review S4): caller text never reaches an error or a logged exception chain ----------
+
+
+def _routed_call(name, arguments, routed):
+    import meta_ads_mcp.server  # noqa: F401 -- register the complete real server
+    from meta_ads_mcp.coordinator import mcp_server
+
+    if routed:
+        name, arguments = "call_tool", {"name": name, "arguments": arguments}
+    return run(mcp_server.call_tool(name, arguments))
+
+
+def _private_marker() -> str:
+    return "".join(["Synthetic", "Private", "Value", "_", "x7y9"])
+
+
+def _lift_args() -> dict:
+    return {
+        "account_id": "10", "name": "Example", "business_id": "30",
+        "cells": [{"name": "Cell", "treatment_percentage": 90, "control_percentage": 10}],
+        "objectives": [{"name": "Purchase", "adspixels": [{"id": "20", "event_names": ["Purchase"]}]}],
+        "start_time": "2027-01-01T00:00:00Z", "end_time": "2027-01-05T00:00:00Z",
+    }
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("where", ["cell_key", "objective_key", "time"])
+def test_study_validation_never_logs_or_returns_private_input(monkeypatch, caplog, routed, where) -> None:
+    from fastmcp.exceptions import ToolError
+
+    caplog.set_level(logging.DEBUG)
+    private = _private_marker()
+    args = _lift_args()
+    if where == "cell_key":
+        args["cells"][0][private] = "unexpected"
+    elif where == "objective_key":
+        args["objectives"][0][private] = "unexpected"
+    else:
+        args["start_time"] = private
+    with pytest.raises(ToolError) as caught:
+        _routed_call("create_lift_study", args, routed)
+    leaks = {"mcp_error": private in str(caught.value), "logs": private in caplog.text}
+    assert not any(leaks.values()), leaks
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("case", [
+    "ab_cell_key", "ab_duplicate_id", "creative_duplicate_id", "ab_end_time", "update_start_time",
+    "eligibility_unknown_level",
+])
+def test_other_study_validation_never_logs_or_returns_private_input(monkeypatch, caplog, routed, case) -> None:
+    from fastmcp.exceptions import ToolError
+
+    caplog.set_level(logging.DEBUG)
+    use(monkeypatch, FakeStudyClient(objects={"study_1": SCHEDULED_STUDY}))
+    private = _private_marker()
+    ab = {"account_id": "10", "business_id": "30", "name": "Test",
+          "start_time": FUTURE_START, "end_time": FUTURE_END,
+          "cells": [{"name": "A", "treatment_percentage": 50, "adset_ids": ["1"]},
+                    {"name": "B", "treatment_percentage": 50, "adset_ids": ["2"]}]}
+    if case == "ab_cell_key":
+        ab["cells"][1][private] = "x"
+        name, args = "create_ab_test", ab
+    elif case == "ab_duplicate_id":
+        ab["cells"][0]["adset_ids"] = [private]
+        ab["cells"][1]["adset_ids"] = [private]
+        name, args = "create_ab_test", ab
+    elif case == "creative_duplicate_id":
+        ab["cells"] = [{"name": "A", "treatment_percentage": 50, "ad_ids": [private]},
+                       {"name": "B", "treatment_percentage": 50, "ad_ids": [private]}]
+        ab["creative_test_daily_budget"] = 10
+        name, args = "create_ab_test", ab
+    elif case == "ab_end_time":
+        ab["end_time"] = private
+        name, args = "create_ab_test", ab
+    elif case == "update_start_time":
+        name, args = "update_ad_study", {"study_id": "study_1", "start_time": private}
+    else:
+        name, args = "check_ab_test_eligibility", {"account_id": "10", "level": private, "entity_ids": ["1"]}
+    with pytest.raises(ToolError) as caught:
+        _routed_call(name, args, routed)
+    leaks = {"mcp_error": private in str(caught.value), "logs": private in caplog.text}
+    assert not any(leaks.values()), leaks
+
+
+def test_unknown_keys_are_counted_and_the_accepted_keys_listed(monkeypatch) -> None:
+    no_client(monkeypatch)
+    args = _lift_args()
+    args["cells"][0].update({"first": 1, "second": 2})
+    with pytest.raises(experiments.ValidationError) as error:
+        run(experiments.create_lift_study(**args))
+    message = str(error.value)
+    assert "cells[0] has 2 unsupported keys" in message and "first" not in message and "second" not in message
+    assert "treatment_percentage" in message
+
+
+def test_bad_study_time_error_has_no_exception_chain(monkeypatch) -> None:
+    no_client(monkeypatch)
+    args = _lift_args()
+    args["start_time"] = _private_marker()
+    with pytest.raises(experiments.ValidationError) as error:
+        run(experiments.create_lift_study(**args))
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+# --- R14 (review S5): an entry or a type that cannot be read never yields a complete list ---------
+
+
+@pytest.mark.parametrize("study_type", [None, "LIFT"])
+def test_list_ad_studies_with_an_entry_that_is_not_an_object_is_incomplete(monkeypatch, study_type) -> None:
+    payload = {"data": [_study("s1", "LIFT", *RUNNING), None]}
+    use(monkeypatch, FakeStudyClient(edges={("act_123", "impacting_ad_studies"): payload}))
+    result = run(experiments.list_ad_studies(account_id="123", study_type=study_type))
+    assert result["items"][0]["id"] == "s1"
+    assert result["summary"]["complete"] is False
+    assert collection_fault(payload) in result["summary"]["stop_reason"]
+
+
+@pytest.mark.parametrize("row", [
+    {"id": "20", "name": "No type"}, {"id": "20", "type": None}, {"id": "20", "type": 5}, {"id": "20", "type": " "},
+])
+def test_list_ad_studies_row_without_a_type_is_not_a_definite_nonmatch(monkeypatch, row) -> None:
+    use(monkeypatch, FakeStudyClient(edges={
+        ("act_123", "impacting_ad_studies"): {"data": [row, _study("s2", "SPLIT_TEST", *RUNNING)]},
+    }))
+    result = run(experiments.list_ad_studies(account_id="123", study_type="LIFT"))
+    assert result["items"] == []
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["unjudged_rows"] == 1
+    assert summary["study_type_filter"]["removed_on_this_page"] == 1
+    assert summary["study_type_filter"]["unjudged_rows"] == 1
+    assert "readable study type" in summary["stop_reason"]
+
+
+def test_list_ad_studies_definite_type_mismatch_keeps_the_page_complete(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(edges={
+        ("act_123", "impacting_ad_studies"): {"data": [_study("s1", "lift", *RUNNING), _study("s2", "SPLIT_TEST", *RUNNING)]},
+    }))
+    result = run(experiments.list_ad_studies(account_id="123", study_type="LIFT"))
+    assert [item["id"] for item in result["items"]] == ["s1"]
+    assert result["summary"]["complete"] is True and result["summary"]["stop_reason"] is None
