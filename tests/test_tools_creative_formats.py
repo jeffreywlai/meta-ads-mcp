@@ -3187,3 +3187,19 @@ def test_r25_a4_a_nested_video_id_that_is_not_an_id_is_refused(monkeypatch, bad,
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match=where + " video_id must be a numeric Meta video id"):
         asyncio.run(cf.create_ad_creative_from_inputs(**R25_BASE, dry_run=True, **arguments))
+
+
+# Round thirty-one (after review R31, CC1): a copy that comes back as the ad's own creative is not attached.
+
+
+def test_enhancements_do_not_attach_the_existing_creative_returned_as_the_copy(monkeypatch) -> None:
+    class SameIdClient(FakeClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            self.calls.append(("create", parent_id, edge, data))
+            return {"id": "20"}
+
+    client = SameIdClient(objects={"10": AD, "20": CREATIVE})
+    _patch(monkeypatch, client)
+    with pytest.raises(ValidationError, match="named the ad's existing creative as the new copy"):
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
+    assert [call[0] for call in client.calls] == ["get", "get", "get", "create"]

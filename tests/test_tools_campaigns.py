@@ -3634,3 +3634,57 @@ def test_r25_update_campaign_empty_adlabels_is_sent(monkeypatch) -> None:
     result = asyncio.run(campaigns.update_campaign(campaign_id="20", adlabels=[]))
     assert _r25_sent(client) == {"adlabels": []}
     assert result["current"] == {"adlabels": []}
+
+
+
+# Round thirty-one (review R31, CC1): an answer that names the source as its own copy.
+
+
+class SourceReturnedAsCopyClient:
+    def __init__(self, kind, source_id):
+        self.kind = kind
+        self.source_id = source_id
+        self.calls = []
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(('POST', parent_id, edge, __import__('copy').deepcopy(data)))
+        assert edge == 'copies'
+        return {f'copied_{self.kind}_id': self.source_id}
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(('POST', object_id, __import__('copy').deepcopy(data)))
+        return {'success': True}
+
+
+@pytest.mark.parametrize('kind', ['campaign', 'adset', 'ad'])
+def test_cc1_duplicate_never_renames_the_source_returned_as_its_copy(monkeypatch, kind):
+    source_id = '910001'
+    client = SourceReturnedAsCopyClient(kind, source_id)
+    from meta_ads_mcp.tools import ads
+    module = ads if kind == 'ad' else campaigns
+    monkeypatch.setattr(module, 'get_graph_api_client', lambda: client)
+    tool = getattr(module, f'duplicate_{kind}')
+    result = None
+    try:
+        result = asyncio.run(tool(**{f'{kind}_id': source_id, 'new_name': 'QA copy'}))
+    except campaigns.MetaAdsError:
+        # Refusing an unusable copy id, or returning an unresolved rename, is safe.
+        pass
+    source_updates = [call for call in client.calls if len(call) == 3 and call[1] == source_id]
+    assert not source_updates, {
+        'unexpected_source_updates': source_updates,
+        'result': result,
+    }
+    if result is not None:
+        assert result.get('rename', {}).get('applied') is not True
+        assert result["new_id"] is None
+        assert "named the source object as its own copy" in result["warning"]
+        assert result["rename"]["reason"] == "The copy's id is unknown, so it was not renamed."
+
+
+def test_r31_a_copy_with_its_own_id_is_still_renamed(monkeypatch) -> None:
+    client = CopyClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="Black Friday 2"))
+    assert result["new_id"] == "222" and result["rename"] == {"requested": "Black Friday 2", "applied": True}
+    assert "warning" not in result

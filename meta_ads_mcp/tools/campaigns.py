@@ -1547,6 +1547,12 @@ async def run_copy(
     result = await client.create_edge_object(source_id, "copies", data=data)
     raw_new_id = result.get(f"copied_{object_type}_id") if isinstance(result, dict) else None
     new_id = str(raw_new_id) if raw_new_id not in (None, "") else None
+    # A copy is a new object. An answer that names the source as its own copy does not say
+    # which object the copy is, so its id is treated as not returned: nothing later in this
+    # call (the rename) is sent to the source.
+    named_source = new_id is not None and new_id == str(source_id)
+    if named_source:
+        new_id = None
     copied = result.get("ad_object_ids") if isinstance(result, dict) else None
     response.update({
         "sent": True,
@@ -1575,7 +1581,12 @@ async def run_copy(
         response["copied_objects_note"] = (
             "Meta listed the copied objects in a shape this server could not read; copied_objects is empty."
         )
-    if new_id is None:
+    if named_source:
+        response["warning"] = (
+            "Meta's response named the source object as its own copy, so the new copy's id is not known; "
+            "find the copy under its parent before acting on it or copying again."
+        )
+    elif new_id is None:
         response["warning"] = (
             "Meta's response did not include the new copy's id; find the copy under its parent "
             "before acting on it."

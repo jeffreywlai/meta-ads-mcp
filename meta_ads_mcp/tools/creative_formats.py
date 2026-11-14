@@ -2100,6 +2100,13 @@ async def _update_enhancements(ad_id: str, features: dict[str, str], name: str |
             "Meta accepted the creative request but did not return a creative id, so the ad was not changed. "
             "A replacement creative may have been created; look for it in the account before retrying."
         )
+    if new_creative_id == str(old_creative_id):
+        # A copy is a new creative. Attaching the ad's own creative would change nothing and be
+        # reported as the change asked for.
+        raise ValidationError(
+            "Meta's answer named the ad's existing creative as the new copy, so the ad was not changed. "
+            "A replacement creative may have been created; look for it in the account before retrying."
+        )
     try:
         await client.update_object(ad_id, data={"creative": {"creative_id": new_creative_id}})
     except Exception as exc:
