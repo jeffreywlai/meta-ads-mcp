@@ -2108,6 +2108,9 @@ async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, 
                                 "which SKUs already exist is not known.")}
     wanted = set(ids)
     found: dict[str, Any] = {}
+    # SKUs Meta returned more than once with rows that differ. A SKU names one product in a
+    # catalog (Meta's catalog reference), so which row holds its values is not known.
+    ambiguous: set[str] = set()
     unidentified = 0
     for row in read["rows"]:
         if not isinstance(row, dict):
@@ -2117,6 +2120,8 @@ async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, 
             unidentified += 1
             continue
         if retailer_id in wanted:
+            if retailer_id in found and found[retailer_id] != row:
+                ambiguous.add(retailer_id)
             found[retailer_id] = row
     complete, stop_reason = read["complete"], read["stop_reason"]
     if unidentified:
@@ -2125,7 +2130,7 @@ async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, 
             f"Meta returned {unidentified} product(s) without a readable retailer_id, so whether they are "
             "SKUs in this batch is not known."
         ))))
-    return {"found": found, "complete": complete, "stop_reason": stop_reason,
+    return {"found": found, "ambiguous": ambiguous, "complete": complete, "stop_reason": stop_reason,
             "feed_check": feed_check, "refused_fields": refused}
 
 
@@ -2687,7 +2692,8 @@ async def batch_update_catalog_products(
             "errors": [],
             "warnings": [],
         }
-        if product is not None:
+        unclear = entry["retailer_id"] in current.get("ambiguous", ())
+        if product is not None and not unclear:
             item["product_id"] = _row_identity(product)
         if entry["method"] == "create" and product is not None:
             item["outcome"] = "skipped_already_exists"
@@ -2700,7 +2706,18 @@ async def batch_update_catalog_products(
             item["reason"] = ("No product with this retailer_id is in the catalog; pass allow_upsert=true to "
                               "create it from this update.")
         else:
-            if product is not None:
+            if product is not None and unclear:
+                # The SKU exists; which of the differing rows is the product is not known, so no
+                # previous value and no product id is shown for it.
+                previous, unavailable = _previous_for(entry, product, set(current["refused_fields"]))
+                item["previous"] = {}
+                item["previous_unavailable"] = [*previous, *(name for name in unavailable if name not in previous)]
+                item["previous_note"] = (
+                    "Meta returned more than one product with this retailer_id and they differ, so the "
+                    "previous values and the product id are not shown. The request is unchanged: it names "
+                    "the product by retailer_id."
+                )
+            elif product is not None:
                 previous, unavailable = _previous_for(entry, product, set(current["refused_fields"]))
                 item["previous"] = previous
                 if unavailable:

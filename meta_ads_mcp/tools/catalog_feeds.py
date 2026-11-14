@@ -1335,6 +1335,16 @@ async def _connected_sources(
     )
 
 
+def _occurrences(value: Any) -> int | None:
+    """A count of content-id occurrences from Meta's event statistics; None when it is not one.
+
+    Meta defines these counters as numbers of occurrences, so a negative value is not a count.
+    It is read as unknown, like a missing counter, rather than added into a total or a rate.
+    """
+    count = to_int(value)
+    return None if count is None or count < 0 else count
+
+
 def _match_rate(matched: int | None, unmatched: int | None) -> float | None:
     """Matched share of content ids; None unless both counters are known."""
     if matched is None or unmatched is None:
@@ -1391,18 +1401,18 @@ def _summarize_event_stats(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[s
         source_id = _object_id(row.get("event_source"))
         if source_id is None:
             unattributed_rows += 1
-            _add_counts(unattributed_totals, to_int(row.get("total_matched_content_ids")),
-                        to_int(row.get("total_unmatched_content_ids")))
+            _add_counts(unattributed_totals, _occurrences(row.get("total_matched_content_ids")),
+                        _occurrences(row.get("total_unmatched_content_ids")))
             continue
-        matched = to_int(row.get("total_matched_content_ids"))
-        unmatched = to_int(row.get("total_unmatched_content_ids"))
+        matched = _occurrences(row.get("total_matched_content_ids"))
+        unmatched = _occurrences(row.get("total_unmatched_content_ids"))
         bucket = per_source.setdefault(
             source_id,
             {"days": {}, "events": {}, "window": [0, 0, 0, 0], "rows_missing_counters": 0, "other": [0, 0]},
         )
         if matched is None or unmatched is None:
             bucket["rows_missing_counters"] += 1
-        other = to_int(row.get("total_content_ids_matched_other_catalogs"))
+        other = _occurrences(row.get("total_content_ids_matched_other_catalogs"))
         if other is None:
             bucket["other"][1] += 1
         else:
@@ -2127,8 +2137,8 @@ async def _source_rate_in_catalog(
         }
     unclear_totals = [0, 0, 0, 0]
     for row in unclear:
-        _add_counts(unclear_totals, to_int(row.get("total_matched_content_ids")),
-                    to_int(row.get("total_unmatched_content_ids")))
+        _add_counts(unclear_totals, _occurrences(row.get("total_matched_content_ids")),
+                    _occurrences(row.get("total_unmatched_content_ids")))
     unclear_view = {"rows": len(unclear), **_counts_view(unclear_totals)}
     unclear_view.pop("match_rate")
     gap = _attribution_gap(unclear_view, about="this source" + (" and event" if event_name else ""))

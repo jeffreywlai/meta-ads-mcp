@@ -1011,19 +1011,29 @@ def _split_outcome(
         str(entry["winner_ad_object_id"]) for entry in recognised
         if entry.get("winner_ad_object_id") not in (None, "")
     })
-    if len(winners) > 1:
-        # The objective's results name different winners, with nothing here to tell them apart:
-        # none is taken. One result, or results naming the same winner, are read as before.
-        return {
+    performer_sets = sorted({
+        tuple(sorted(str(ad_id) for ad_id in entry["high_performer_ids"])) for entry in recognised
+        if isinstance(entry.get("high_performer_ids"), list)
+    })
+    if len(winners) > 1 or len(performer_sets) > 1:
+        # The objective's results name different winners, or different sets of high performers,
+        # with nothing here to tell them apart: none is taken. One result, or results that agree,
+        # are read as before.
+        conflict: dict[str, Any] = {
             "objective_id": objective.get("id"),
             "is_primary": objective.get("is_primary"),
             "winner": None,
-            "conflicting_winner_ids": winners,
+            "high_performer_ids": None,
             "winner_conflict_note": (
-                "Meta's results for this objective name more than one winner, so no winner is named here; "
-                "see conflicting_winner_ids and check the study in Meta."
+                "Meta's results for this objective disagree with each other, so no outcome is named here; "
+                "see the conflicting ids and check the study in Meta."
             ),
         }
+        if len(winners) > 1:
+            conflict["conflicting_winner_ids"] = winners
+        if len(performer_sets) > 1:
+            conflict["conflicting_high_performer_ids"] = [list(ids) for ids in performer_sets]
+        return conflict
     for entry in recognised:
         winner_id = entry.get("winner_ad_object_id")
         response: dict[str, Any] = {
@@ -1159,6 +1169,8 @@ def _split_results(
         response["message"] = "Meta reported a winning cell."
     elif outcome.get("conflicting_winner_ids"):
         response["message"] = "Meta's results name more than one winner, so no winner is named."
+    elif outcome.get("conflicting_high_performer_ids"):
+        response["message"] = "Meta's results name different sets of high performers, so no outcome is named."
     else:
         response["message"] = (
             "Meta reported no single winner. For creative tests Meta's authoritative "
