@@ -31,7 +31,7 @@ from meta_ads_mcp.tools.campaigns import (
     validate_schedule_time,
 )
 from meta_ads_mcp.tool_types import CurrencyAmount, GraphId, StrictStringList, coerce_strict_csv_string_list
-from meta_ads_mcp.tools.creatives import PartnershipCodesHidden
+from meta_ads_mcp.tools.creatives import CallSecrets
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -228,11 +228,11 @@ async def create_ad(
         if {"creative_id", "id"} & set(creative_spec):
             raise ValidationError("creative_spec is for a new creative; to use an existing one, use creative_id.")
         # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
-        with PartnershipCodesHidden(creative_spec, params):
-            return await _create_ad(
+        with CallSecrets.for_creative_inputs(creative_spec, params) as secrets:
+            return secrets.value(await _create_ad(
                 account_id, name, adset_id, creative_spec, status, bid_amount, tracking_specs,
                 conversion_domain, adlabels, validate_only, params, later_fields,
-            )
+            ))
     nested_creative_id: str | None = None
     if creative is not None:
         if not isinstance(creative, dict):
@@ -265,11 +265,11 @@ async def create_ad(
         alias_name="creative.creative_id",
         required=True,
     )
-    with PartnershipCodesHidden(params):
-        return await _create_ad(
+    with CallSecrets.for_creative_inputs(params) as secrets:
+        return secrets.value(await _create_ad(
             account_id, name, adset_id, {"creative_id": resolved_creative_id}, status, bid_amount,
             tracking_specs, conversion_domain, adlabels, validate_only, params, later_fields,
-        )
+        ))
 
 
 async def _create_ad(

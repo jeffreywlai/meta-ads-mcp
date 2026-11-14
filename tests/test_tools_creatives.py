@@ -3571,7 +3571,186 @@ def test_video_status_without_a_processing_status_says_so(monkeypatch) -> None:
         async def get_object(self, object_id, *, fields=None, params=None):
             return {"id": object_id}
 
-    status = asyncio.run(creatives._read_video_status(Client(), "55"))
+    status = asyncio.run(creatives._read_video_status(Client(), "55", creatives.NO_SECRETS))
     assert status["processing_status"] is None
     assert "did not include its processing status" in status["status_note"]
     assert "still processing" not in status["status_note"]
+
+
+# Round fourteen (review R12, S3): text from Meta or from an exception that is kept in a result goes
+# through the same cleaning (CallSecrets) as an error that escapes.
+
+S3_PRIVATE_NAME = "".join(["customer", "-", "example", "@", "example.test", ".mp4"])
+
+
+class StatusEchoClient(FakeVideoClient):
+    """The upload succeeds; the status read fails and repeats the local file name."""
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        raise MetaApiError(message="Could not inspect uploaded video " + S3_PRIVATE_NAME, code=100)
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+def test_local_video_status_error_text_hides_filename(monkeypatch, tmp_path, routed) -> None:
+    path = tmp_path / S3_PRIVATE_NAME
+    path.write_bytes(b"synthetic video bytes")
+    monkeypatch.setattr(creatives, "get_graph_api_client", StatusEchoClient)
+    result = _call_tool("upload_ad_video", {"account_id": "10", "file_path": str(path)}, routed)
+    content = result.structured_content
+    content = content.get("result", content)
+    # The intended upload metadata can name the caller's file; an upstream error must not.
+    assert S3_PRIVATE_NAME not in content["status_note"]
+    assert "<file>" in content["status_note"] and "Could not inspect uploaded video" in content["status_note"]
+
+
+def test_chunked_video_status_error_text_hides_filename(monkeypatch, tmp_path) -> None:
+    _large_video(monkeypatch, tmp_path, name=S3_PRIVATE_NAME)
+
+    class Client(ChunkedVideoClient):
+        async def get_object(self, object_id, *, fields=None, params=None):
+            raise MetaApiError(message="Status read failed for " + S3_PRIVATE_NAME, code=100)
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Client)
+    result = asyncio.run(creatives.upload_ad_video("123", file_path=S3_PRIVATE_NAME))
+    assert result["video_id"] == "7001"
+    assert S3_PRIVATE_NAME not in result["status_note"] and "<file>" in result["status_note"]
+
+
+def test_url_video_status_error_text_is_kept_as_meta_gave_it(monkeypatch) -> None:
+    client = FakeVideoClient(fail_status=MetaApiError(message="Temporary status failure", code=2))
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video(account_id="123", video_url="https://cdn.example.com/v.mp4"))
+    assert result["status_note"] == (
+        "The upload succeeded (video 777) but its status could not be read: Temporary status failure "
+        "Check list_ad_videos(video_ids=...) before using it."
+    )
+
+
+def test_call_secrets_cleans_kept_text_and_escaping_errors_alike() -> None:
+    code = "".join(["Code", "For", "Partner", "77"])
+    secrets = creatives.CallSecrets(codes=[code], files=creatives.local_file_forms(" ~/private/" + S3_PRIVATE_NAME, S3_PRIVATE_NAME))
+    kept = MetaApiError(message="echo " + code + " and " + S3_PRIVATE_NAME, code=100)
+    kept.__cause__ = ValueError("cause " + S3_PRIVATE_NAME)
+    text = secrets.failure_text(kept)
+    assert text == "echo <partnership_ad_code> and <file>"
+    assert S3_PRIVATE_NAME not in str(kept.__cause__)
+    public = secrets.public_error(MetaApiError(message="again " + code, code=100))
+    assert code not in json.dumps(public)
+    escaping = RuntimeError("boom " + S3_PRIVATE_NAME)
+    with pytest.raises(RuntimeError) as raised:
+        with secrets:
+            raise escaping
+    assert S3_PRIVATE_NAME not in str(raised.value)
+    assert creatives.NO_SECRETS.failure_text(MetaApiError(message="plain", code=1)) == "plain"
+
+
+def test_duplicate_rename_error_goes_through_the_shared_helper_unchanged(monkeypatch) -> None:
+    from meta_ads_mcp.tools import campaigns
+
+    calls = []
+    original = creatives.CallSecrets.public_error
+
+    def recording(self, exc):
+        calls.append(type(exc).__name__)
+        return original(self, exc)
+
+    monkeypatch.setattr(creatives.CallSecrets, "public_error", recording)
+
+    class Client:
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            return {"copied_campaign_id": "222"}
+
+        async def update_object(self, object_id, *, data):
+            raise MetaApiError(message="Name refused", code=100)
+
+    monkeypatch.setattr(campaigns, "get_graph_api_client", Client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="Copy"))
+    assert calls == ["MetaApiError"]
+    assert result["rename"]["error"] == MetaApiError(message="Name refused", code=100).to_public_dict()
+
+
+# Round fourteen (S2 rule beyond the enhancement copy): absent, readable and malformed state stay apart.
+
+
+@pytest.mark.parametrize("adlabels", [{}, False, {"data": "x"}, 0])
+def test_label_removal_refuses_a_present_label_set_that_is_not_a_list_or_page(monkeypatch, adlabels) -> None:
+    fake = R3LabelClient(adlabels)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    with pytest.raises(creatives.ValidationError, match="could not all be read"):
+        asyncio.run(creatives.update_creative("10", adlabels=[{"id": "11"}], adlabels_operation="remove"))
+    assert fake.writes == []
+
+
+@pytest.mark.parametrize("promoted_object", ["page_9", ["page_9"], {"page_id": {"id": "9"}}, {"page_id": True}])
+def test_boost_refuses_an_ad_set_promoted_object_it_cannot_read(monkeypatch, promoted_object) -> None:
+    client = FakeBoostClient(promoted_object=promoted_object)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match="shape this server could not read"):
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="123", adset_id="adset_1", instagram_media_id="media_1", instagram_account_id="ig_1",
+        ))
+    assert [call[0] for call in client.calls] == ["get"]
+
+
+@pytest.mark.parametrize("promoted_object", [None, {}, {"page_id": None}])
+def test_boost_with_no_page_in_the_ad_set_still_asks_for_page_id(monkeypatch, promoted_object) -> None:
+    client = FakeBoostClient(promoted_object=promoted_object)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match="promoted_object has no page_id"):
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="123", adset_id="adset_1", instagram_media_id="media_1", instagram_account_id="ig_1",
+        ))
+    assert [call[0] for call in client.calls] == ["get"]
+
+
+# Round fourteen (S3 rule): Meta's answer to a request that carried a secret is cleaned before it goes
+# into a successful result. Without an echo, results are unchanged (see the R2 unchanged-call test).
+
+
+class SuccessEchoClient(SuccessfulRawClient):
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.requests.append(("create", parent_id, edge, deepcopy(data)))
+        return {"id": "900", "debug": "accepted " + R2_CODE}
+
+    async def preview_ad(self, **kwargs):
+        self.requests.append(("preview", deepcopy(kwargs)))
+        return {"data": [{"body": "<iframe data='" + R2_CODE + "'></iframe>"}]}
+
+
+@pytest.mark.parametrize("tool_name", ["create_ad_creative", "preview_ad", "preview_ad_many", "create_ad"])
+def test_a_success_answer_that_repeats_a_code_is_cleaned(monkeypatch, tool_name) -> None:
+    spec = {"branded_content": {"instagram_boost_post_access_token": R2_CODE}}
+    client = SuccessEchoClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    if tool_name == "create_ad_creative":
+        result = asyncio.run(creatives.create_ad_creative("10", "Example", params=spec))
+    elif tool_name == "preview_ad":
+        result = asyncio.run(creatives.preview_ad(account_id="10", creative=spec))
+    elif tool_name == "preview_ad_many":
+        result = asyncio.run(creatives.preview_ad(account_id="10", creative=spec, ad_formats=["MOBILE_FEED_STANDARD"]))
+    else:
+        result = asyncio.run(ads.create_ad("10", "Example", "20", creative_spec=spec))
+    assert R2_CODE not in json.dumps(result)
+    assert creatives.PARTNERSHIP_CODE_SHOWN in json.dumps(result)
+
+
+def test_a_video_upload_answer_and_status_that_repeat_the_file_name_are_cleaned(monkeypatch, tmp_path) -> None:
+    path = tmp_path / S3_PRIVATE_NAME
+    path.write_bytes(b"synthetic video bytes")
+
+    class Client(FakeVideoClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            return {"id": "777", "source_name": S3_PRIVATE_NAME}
+
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": object_id, "status": {"video_status": "error", "message": "bad file " + S3_PRIVATE_NAME}}
+
+    monkeypatch.setattr(creatives, "get_graph_api_client", Client)
+    result = asyncio.run(creatives.upload_ad_video("10", file_path=str(path)))
+    # upload.file_name names the file on purpose; Meta's own answers do not repeat it.
+    shown = {key: value for key, value in result.items() if key != "upload"}
+    assert S3_PRIVATE_NAME not in json.dumps(shown)
+    assert result["status"] == {"video_status": "error", "message": "bad file <file>"}
+    assert result["upload"]["file_name"] == S3_PRIVATE_NAME

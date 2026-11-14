@@ -31,6 +31,7 @@ from meta_ads_mcp.tool_types import (
     StringList,
     coerce_csv_string_list,
 )
+from meta_ads_mcp.tools.creatives import NO_SECRETS
 
 
 def _encode_budget_field(
@@ -1558,8 +1559,9 @@ async def run_copy(
         try:
             await client.update_object(new_id, data={"name": new_name})
         except MetaAdsError as exc:
-            public = getattr(exc, "to_public_dict", None)
-            rename["error"] = public() if callable(public) else {"type": type(exc).__name__}
+            # A caught error kept in the result goes through the one helper that cleans such text;
+            # a copy call holds no secret of its own.
+            rename["error"] = NO_SECRETS.public_error(exc)
         except Exception as exc:  # The copy exists; keep its id in the answer whatever the rename did.
             rename["error"] = {"type": type(exc).__name__}
         else:
