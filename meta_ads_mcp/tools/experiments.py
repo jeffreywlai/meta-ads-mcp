@@ -122,6 +122,10 @@ MIN_SPLIT_TREATMENT_PERCENTAGE = 10
 MAX_CELLS_PER_STUDY = 150
 MAX_ENTITIES_PER_CELL = 100
 MAX_CONCURRENT_STUDIES = 100
+# check_ab_test_eligibility's own per-call limit, not one of Meta's: it reads every entity and
+# scans the studies containing it (and, for ads, both parents), so each entity costs several
+# requests against the app's shared rate limit. Larger sets are checked in batches.
+MAX_ELIGIBILITY_ENTITIES = 150
 CONCURRENCY_SCAN_PAGES = 10
 ENTITY_STUDY_SCAN_PAGES = 5
 # Request cap for reading one study's cells or objectives. 150 cells fit on one page when Meta
@@ -229,7 +233,10 @@ ELIGIBILITY_RULES = [
     {
         "rule": "At most 150 cells per study and 100 ad objects per cell.",
         "source": SPLIT_TEST_GUIDE,
-        "applied_as": "more than 150 entity_ids is rejected as input.",
+        "applied_as": (
+            "not judged here, because how the entities will be grouped into cells is not known; "
+            "create_ab_test refuses more than 150 cells or more than 100 ad objects in one cell."
+        ),
     },
     {
         "rule": "At most 100 concurrent studies per advertiser.",
@@ -475,8 +482,10 @@ def _build_ab_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if cell.get("description"):
             payload["description"] = cell["description"]
         built.append(payload)
-    if round(total, 2) != 100:
-        raise ValidationError("Cell treatment_percentage values must total 100; these cells do not.")
+    if round(total, 2) > 100:
+        # Meta's Ad Study reference: the shares of a campaign or ad set test total at most 100,
+        # so a test can cover part of the population. Creative tests keep their exact 100.
+        raise ValidationError("Cell treatment_percentage values can total at most 100; these cells total more.")
     return built
 
 
@@ -656,7 +665,8 @@ def _build_objectives(objectives: list[dict[str, Any]]) -> list[dict[str, Any]]:
     primaries = sum(1 for objective in built if objective.get("is_primary") is True)
     if primaries > 1:
         raise ValidationError("A lift study can have only one primary objective.")
-    if primaries == 0 and len(built) == 1:
+    if len(built) == 1 and "is_primary" not in built[0]:
+        # Only an omitted flag is defaulted; an explicit false is sent as given.
         built[0]["is_primary"] = True
     return built
 
@@ -1645,6 +1655,8 @@ async def check_ab_test_eligibility(
     objective, buying type, and any scheduled or running study it is already in. Level ad is for
     creative tests (create_ab_test cells with ad_ids): each ad's parent ad set and campaign are
     read and checked, but studies holding the ad itself cannot be read (see not_checked).
+    This tool checks at most 150 entities per call, its own limit because it reads each one;
+    check more in batches.
     """
     account_id = _required_account_id(account_id)
     normalized_level = (blank_to_none(level) or "").lower().replace("ad_set", "adset")
@@ -1653,8 +1665,11 @@ async def check_ab_test_eligibility(
     ids = _id_list(entity_ids, label="entity_ids")
     if not ids:
         raise ValidationError("entity_ids needs at least one campaign, ad set or ad id.")
-    if len(ids) > MAX_CELLS_PER_STUDY:
-        raise ValidationError(f"Check at most {MAX_CELLS_PER_STUDY} entities, Meta's documented maximum cells per study.")
+    if len(ids) > MAX_ELIGIBILITY_ENTITIES:
+        raise ValidationError(
+            f"This tool checks at most {MAX_ELIGIBILITY_ENTITIES} entities per call, because it reads each "
+            "one; check the rest in batches."
+        )
     account_number = account_id.removeprefix("act_")
     fields = ENTITY_FIELDS[normalized_level]
     client = get_graph_api_client()
@@ -1827,9 +1842,11 @@ async def create_ab_test(
     """Create an A/B test (Meta split test) comparing campaigns, ad sets, or single ads. Run check_ab_test_eligibility first.
 
     cells: at least two, each {name, treatment_percentage, campaign_ids or adset_ids, description?}.
-    Shares are at least 10 each and must total 100; no campaign or ad set may be in two cells.
+    Shares are at least 10 each and total at most 100 (less tests part of the population); no
+    campaign or ad set may be in two cells.
     Creative test: give every cell ad_ids with exactly one ad (2 to 7 cells, whole-number shares) and
-    a budget, creative_test_daily_budget (account currency) or creative_test_lifetime_budget_percentage.
+    a budget, creative_test_daily_budget (account currency) or creative_test_lifetime_budget_percentage;
+    creative test shares must total exactly 100.
     Meta decides the winner; its documented API offers no choice of winning metric.
     Times are ISO 8601 with offset or Unix seconds. Meta creates studies on the account's business;
     pass business_id if the account has none. hypothesis is stored as the study description.
@@ -1946,7 +1963,8 @@ async def create_lift_study(
     cells: each {name, treatment_percentage, control_percentage, campaign_ids or ad_account_ids?};
     a cell without ids measures the whole account. Percentages are shares of the whole population,
     so all cells' treatment and control together total at most 100. objectives: each {name, type (default
-    CONVERSIONS), is_primary, adspixels or applications [{id, event_names}], ...}; one primary.
+    CONVERSIONS), is_primary, adspixels or applications [{id, event_names}], ...}; at most one primary,
+    and a single objective with is_primary left out is sent as primary.
     start_time must be in the future. observation_end_time defaults to end_time.
     """
     account_id = _required_account_id(account_id)
