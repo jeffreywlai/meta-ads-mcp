@@ -1514,3 +1514,114 @@ def test_the_http_client_filters_sit_where_the_libraries_log():
     for path in Path(hpack.__file__).parent.rglob("*.py"):
         for call in re.findall(r"\blog\.\w+\(\s*(\S[^\n]*)", path.read_text(encoding="utf-8")):
             assert call.startswith('"'), (path, call)  # a template literal, never preformatted text
+
+
+# --- Round-twelve review S4: a tool's own errors never quote a pasted value ---------
+#
+# Rule: no error message quotes a value the caller typed as free text; it names the
+# parameter and position, or says what was expected. A name is repeated only when it
+# is a registered tool or one of Meta's official tool names.
+
+
+def _pasted_value() -> str:
+    return "".join(["Synthetic", "Private", "Value", "_", "x7y9"])
+
+
+@pytest.mark.parametrize("tool_name", ["search_ads_archive", "get_capabilities_official_tool", "get_capabilities_tool_name"])
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+def test_other_new_validation_paths_do_not_expose_pasted_private_text(caplog, tool_name, routed):
+    """Reviewer reproduction (round twelve, S4), for the archive Page ids and the tool-name lookups."""
+    caplog.set_level(logging.DEBUG)
+    private = _pasted_value()
+    name, arguments = {
+        "search_ads_archive": ("search_ads_archive", {"search_page_ids": ["10", private], "ad_reached_countries": ["US"]}),
+        "get_capabilities_official_tool": ("get_capabilities", {"official_tool": private}),
+        "get_capabilities_tool_name": ("get_capabilities", {"tool_name": private}),
+    }[tool_name]
+    with pytest.raises(ToolError) as caught:
+        _call(name, arguments, routed)
+    assert private not in str(caught.value)
+    assert private not in _rendered_chain(caught.value)
+    _assert_not_logged(caplog, private)
+    # The error still says where the problem is.
+    assert {
+        "search_ads_archive": "not numeric: entry 2, counting from 1",
+        "get_capabilities_official_tool": "official_tool value is not one of Meta's official",
+        "get_capabilities_tool_name": "tool_name value matches no tool on this server",
+    }[tool_name] in str(caught.value)
+
+
+def test_a_name_from_a_fixed_list_is_still_repeated():
+    with pytest.raises(ToolError, match="'list_campaigns' is a tool on this server, not one of Meta's official"):
+        _call("get_capabilities", {"official_tool": "list_campaigns"}, False)
+    with pytest.raises(ToolError, match="'ads_get_help_article' is one of Meta's official Ads MCP tool names"):
+        _call("get_capabilities", {"tool_name": "ads_get_help_article"}, False)
+
+
+def test_entry_positions_count_from_one():
+    from meta_ads_mcp.argument_privacy import entry_positions, name_if_known
+
+    assert entry_positions([1]) == "entry 2"
+    assert entry_positions([0, 2, 3]) == "entries 1, 3 and 4"
+    assert entry_positions(range(10)) == "entries 1, 2, 3, 4, 5, 6, 7 and 3 more"
+    assert name_if_known("a", ["a"]) == "'a'" and name_if_known("b", ["a"]) is None
+
+
+# The tool modules whose error messages this group owns. Every f-string in a raise, or in
+# a function that builds a message, may show only module constants, positions from
+# entry_positions, or a name that name_if_known found in a fixed list. A validation
+# error is never raised inside an except block, where the caught exception (which can
+# quote the input) would stay chained to it and be printed when FastMCP logs the error.
+_OWNED_TOOL_MODULES = ["research", "utility", "discovery"]
+# entry_positions renders only numbers and name_if_known only names from a fixed list,
+# whatever they are given; the others are safe only on module constants.
+_SAFE_HELPERS = {"entry_positions", "name_if_known"}
+_CONSTANT_HELPERS = {"list", "len", "sorted"}
+
+
+def _formatted_values_are_safe(node, known_safe: set[str]) -> list[str]:
+    import ast
+
+    def constant(item) -> bool:
+        return isinstance(item, ast.Name) and (item.id.isupper() or item.id in known_safe)
+
+    problems = []
+    for value in [item.value for item in node.values if isinstance(item, ast.FormattedValue)]:
+        call = value.func.id if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) else None
+        if constant(value) or call in _SAFE_HELPERS or (
+            call in _CONSTANT_HELPERS and all(constant(arg) for arg in value.args)
+        ):
+            continue
+        problems.append(ast.unparse(value))
+    return problems
+
+
+@pytest.mark.parametrize("module_name", _OWNED_TOOL_MODULES)
+def test_owned_tool_errors_are_built_without_caller_text(module_name):
+    import ast
+    import importlib
+
+    module = importlib.import_module(f"meta_ads_mcp.tools.{module_name}")
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    problems: list[str] = []
+    for function in [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        known_safe = {
+            target.id
+            for node in ast.walk(function) if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call) and getattr(node.value.func, "id", None) == "name_if_known"
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+        scopes = [node for node in ast.walk(function) if isinstance(node, ast.Raise)]
+        if function.name.endswith("_message"):
+            scopes.append(function)
+        for scope in scopes:
+            for node in ast.walk(scope):
+                if isinstance(node, ast.JoinedStr):
+                    problems += [f"{function.name}: {item}" for item in _formatted_values_are_safe(node, known_safe)]
+        for handler in [node for node in ast.walk(function) if isinstance(node, ast.ExceptHandler)]:
+            for node in ast.walk(handler):
+                if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call) and getattr(
+                    node.exc.func, "id", None
+                ) == "ValidationError":
+                    problems.append(f"{function.name}: ValidationError raised inside an except block")
+    assert problems == [], problems

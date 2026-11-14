@@ -913,3 +913,36 @@ def private_validation_message(
 
 def unknown_parameter_count(count: int) -> str:
     return f"{count} unknown parameter{'s' if count != 1 else ''}"
+
+
+# --- A tool's own error messages ----------------------------------------------------
+#
+# Rule: no error message quotes a value the caller typed as free text. A value that
+# fails a check may be a customer's email, a password or a code put in the wrong
+# field, and an error is shown to the caller and logged. An error names the parameter
+# and the position, or says what was expected. A name is repeated only when it is one
+# of a fixed list (a registered tool, one of Meta's official tool names), so it is
+# known not to be a customer value. tests/test_argument_privacy.py checks the tool
+# modules that use these helpers for messages built any other way.
+
+
+def name_if_known(value: Any, known: Iterable[str]) -> str | None:
+    """The value quoted when it is one of a fixed list of names, otherwise None."""
+    try:
+        return repr(value) if isinstance(value, str) and value in set(known) else None
+    except Exception:
+        return None
+
+
+def entry_positions(positions: Iterable[int]) -> str:
+    """Positions in a list the caller gave, counted from 1, e.g. 'entries 2 and 5'."""
+    shown = [str(position + 1) for position in positions]
+    if not shown:
+        return "no entry"
+    if len(shown) == 1:
+        return f"entry {shown[0]}"
+    listed = ", ".join(shown[:_MAX_FAULTS - 1])
+    more = f" and {len(shown) - (_MAX_FAULTS - 1)} more" if len(shown) > _MAX_FAULTS - 1 else ""
+    if more:
+        return f"entries {listed}{more}"
+    return f"entries {', '.join(shown[:-1])} and {shown[-1]}"

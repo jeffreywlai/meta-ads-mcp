@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from meta_ads_mcp.argument_privacy import entry_positions
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
@@ -27,16 +28,19 @@ def _page_ids(values: Any) -> list[str] | None:
     """Validate Page ids for the Ad Library search before any network call."""
     if values is None:
         return None
-    ids = list(dict.fromkeys(
-        str(value).strip() for value in (coerce_csv_string_list(values) or []) if str(value).strip()
-    ))
+    entries = [str(value).strip() for value in (coerce_csv_string_list(values) or [])]
+    ids = list(dict.fromkeys(entry for entry in entries if entry))
     if not ids:
         raise ValidationError("search_page_ids must contain at least one Page id.")
     if len(ids) > MAX_SEARCH_PAGE_IDS:
         raise ValidationError(f"Meta's Ad Library accepts at most {MAX_SEARCH_PAGE_IDS} search_page_ids per search.")
-    bad = [value for value in ids if not value.isdigit()]
+    bad = [position for position, entry in enumerate(entries) if entry and not entry.isdigit()]
     if bad:
-        raise ValidationError(f"search_page_ids must be numeric Page ids passed as strings; not valid: {bad[:3]}.")
+        # The entries are not repeated: a value that is not a Page id may be anything the caller pasted.
+        raise ValidationError(
+            "search_page_ids must be numeric Page ids passed as strings; not numeric: "
+            f"{entry_positions(bad)}, counting from 1. The entries are not repeated."
+        )
     return ids
 
 

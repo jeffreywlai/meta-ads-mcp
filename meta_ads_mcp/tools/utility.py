@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from meta_ads_mcp.argument_privacy import name_if_known
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.build_info import BUILD_IDENTITY
 from meta_ads_mcp.errors import ValidationError
@@ -952,6 +953,42 @@ async def health_check() -> dict[str, object]:
         }
 
 
+def _registered_tool_names() -> set[str]:
+    return {str(getattr(component, "name", "")) for component in list(mcp_server.local_provider._components.values())}
+
+
+def _unknown_official_tool_message(name: str) -> str:
+    """Say an official_tool value matched nothing, repeating it only when it is a tool here.
+
+    A name that is neither one of Meta's official names nor a tool on this server may be
+    anything the caller pasted, so it is not repeated.
+    """
+    shown = name_if_known(name, _registered_tool_names())
+    if shown is not None:
+        return (
+            f"{shown} is a tool on this server, not one of Meta's official Ads MCP tool names. "
+            f"Call it directly, or pass it as tool_name to see its input schema."
+        )
+    return (
+        "The official_tool value is not one of Meta's official Ads MCP tool names, so it is not repeated. "
+        "Use search_tools to find a tool by what it does."
+    )
+
+
+def _unknown_tool_name_message(name: str) -> str:
+    """Say a tool_name value matched no tool, repeating it only when it is one of Meta's official names."""
+    shown = name_if_known(name, OFFICIAL_TOOLS)
+    if shown is not None:
+        return (
+            f"{shown} is one of Meta's official Ads MCP tool names, not a tool on this server. "
+            "Pass it as official_tool to learn which tool here serves it."
+        )
+    return (
+        "The tool_name value matches no tool on this server, so it is not repeated. "
+        "Use search_tools to find a tool by what it does."
+    )
+
+
 @mcp_server.tool()
 async def get_capabilities(
     intent: str | None = None,
@@ -965,10 +1002,7 @@ async def get_capabilities(
             raise ValidationError("Provide official_tool alone to look up one of Meta's official tool names.")
         entry = OFFICIAL_TOOLS.get(official_tool.strip())
         if entry is None:
-            raise ValidationError(
-                f"'{official_tool}' is not one of Meta's official Ads MCP tool names. "
-                "Use search_tools to find a tool by what it does."
-            )
+            raise ValidationError(_unknown_official_tool_message(official_tool.strip()))
         return {
             "server": _server_metadata(),
             "official_tool": entry.to_dict(official_tool.strip()),
@@ -979,7 +1013,7 @@ async def get_capabilities(
             raise ValidationError("Provide tool_name alone to inspect one tool's input schema.")
         tool = await mcp_server.get_tool(tool_name.strip())
         if tool is None:
-            raise ValidationError(f"Unknown tool: {tool_name}.")
+            raise ValidationError(_unknown_tool_name_message(tool_name.strip()))
         return {
             "server": _server_metadata(),
             "tool": {"name": tool.name, "description": tool.description, "input_schema": tool.parameters},
