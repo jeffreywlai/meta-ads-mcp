@@ -13,9 +13,11 @@ from meta_ads_mcp.money import (
 )
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import BidConstraints, CurrencyAmount
+from meta_ads_mcp.tools.campaigns import refuse_read_about_other_object
 
 
 SETTABLE_STATUSES = ("ACTIVE", "PAUSED", "ARCHIVED")
+_READ_NAMES = {"campaign": "campaign", "adset": "ad set"}
 
 
 def _validate_status(status: str) -> str:
@@ -114,6 +116,7 @@ async def _update_budget(
         object_id,
         fields=["id", "account_id", "daily_budget", "lifetime_budget"],
     )
+    refuse_read_about_other_object(object_id, previous, read=_READ_NAMES[object_type], needed_for="its account currency")
     currency = await resolve_account_currency(client, previous.get("account_id"))
     data: dict[str, object] = {}
     current: dict[str, object] = {}
@@ -163,6 +166,7 @@ async def _update_bid_amount(
         object_id,
         fields=["id", "account_id", "bid_amount"],
     )
+    refuse_read_about_other_object(object_id, previous, read=_READ_NAMES[object_type], needed_for="its account currency")
     currency = await resolve_account_currency(client, previous.get("account_id"))
     encoded_bid_amount = to_minor_units(
         bid_amount,
@@ -201,6 +205,9 @@ async def _update_bid_strategy(
         object_id,
         fields=["id", "account_id", "bid_strategy", "bid_amount", "bid_constraints"],
     )
+    # Only an amount to send depends on the read; without one it only supplies previous.
+    if bid_amount is not None:
+        refuse_read_about_other_object(object_id, previous, read=_READ_NAMES[object_type], needed_for="its account currency")
     has_bid_amount = bid_amount is not None or previous.get("bid_amount") is not None
     currency = (
         await resolve_account_currency(client, previous.get("account_id"))
