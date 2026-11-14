@@ -9,7 +9,8 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation, localcontext
 from io import StringIO
-from typing import Any, Literal
+from collections.abc import Callable
+from typing import Any, Literal, TypeVar
 
 from meta_ads_mcp.api_compat import validate_insights_fields
 from meta_ads_mcp.coordinator import mcp_server
@@ -220,15 +221,32 @@ def _build_date_params(
     if (normalized_since and not normalized_until) or (normalized_until and not normalized_since):
         raise ValidationError("Provide both since and until.")
     if normalized_since and normalized_until:
-        try:
-            since_date = date.fromisoformat(normalized_since)
-            until_date = date.fromisoformat(normalized_until)
-        except ValueError as exc:
-            raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.") from exc
+        since_date = parse_or_none(date.fromisoformat, normalized_since)
+        until_date = parse_or_none(date.fromisoformat, normalized_until)
+        if since_date is None or until_date is None:
+            raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.")
         if until_date < since_date:
             raise ValidationError("until must be on or after since.")
         return {"time_range": json.dumps({"since": normalized_since, "until": normalized_until})}
     return {"date_preset": normalized_date_preset or _normalize_date_preset(default_date_preset)}
+
+
+_T = TypeVar("_T")
+
+
+def parse_or_none(
+    parse: Callable[[Any], _T], text: Any, *, errors: tuple[type[BaseException], ...] = (ValueError, TypeError),
+) -> _T | None:
+    """parse(text), or None when it fails with one of errors.
+
+    The one place a parser runs on a value the caller typed. The parser's exception, whose message holds that
+    value, ends inside this function; the caller raises its own value-free ValidationError after a None, outside
+    any exception handler, so no chained exception (cause or context) carries the text into a logged traceback.
+    """
+    try:
+        return parse(text)
+    except errors:
+        return None
 
 
 def _normalize_date_preset(date_preset: str | None) -> str | None:
@@ -1716,10 +1734,9 @@ async def summarize_async_insights_report(
                         if value is None or value == "":
                             totals[key][metric] = None
                             continue
-                        try:
-                            number = Decimal(str(value))
-                        except (InvalidOperation, ValueError) as exc:
-                            raise ValidationError(f"Report metric '{metric}' is not numeric.") from exc
+                        number = parse_or_none(Decimal, str(value), errors=(InvalidOperation, ValueError))
+                        if number is None:
+                            raise ValidationError(f"Report metric '{metric}' is not numeric.")
                         if not number.is_finite():
                             raise ValidationError(f"Report metric '{metric}' is not finite.")
                         if metric != "spend" and number != number.to_integral_value():

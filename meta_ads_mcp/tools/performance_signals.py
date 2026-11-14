@@ -15,7 +15,7 @@ from meta_ads_mcp.diagnostics import build_finding, metric_evidence
 from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, normalize_currency
-from meta_ads_mcp.normalize import blank_to_none, read_collection_page, to_float
+from meta_ads_mcp.normalize import blank_to_none, collection_fault, read_collection_page, to_float
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tool_types import StringList, coerce_csv_string_list
@@ -122,10 +122,10 @@ async def _reporting_today(
         timezone_name = blank_to_none(str(account.get("timezone_name") or ""))
         if timezone_name is None:
             raise ValueError("the ad account did not report timezone_name")
-        try:
-            zone = ZoneInfo(timezone_name)
-        except (KeyError, ValueError) as exc:
-            raise ValueError(f"unrecognized time zone {timezone_name!r}") from exc
+        zone = insights_tools.parse_or_none(ZoneInfo, timezone_name, errors=(KeyError, ValueError, TypeError))
+        if zone is None:
+            # Meta's own value, not the caller's; raised outside the handler like every other parse failure.
+            raise ValueError(f"unrecognized time zone {timezone_name!r}")
     except (MetaApiError, NotFoundError, UnsupportedFeatureError) as exc:
         error = str(_public_error(exc).get("message"))
     except ValueError as exc:
@@ -344,35 +344,7 @@ async def get_opportunity_score(
 
     top_recommendations: dict[str, Any] | None = None
     if include_recommendations:
-        collection = await recommendation_tools._recommendation_collection(account_id=resolved_account_id)
-        if not collection.get("supported", True):
-            missing_signals.append("recommendations: Meta's recommendations edge is unavailable for this account.")
-            top_recommendations = {"supported": False, "reason": collection.get("reason"), "items": []}
-        else:
-            items = []
-            for item in collection.get("items", []):
-                ranked = dict(item)
-                ranked["estimated_score_gain"] = to_float(item.get("opportunity_score_lift"))
-                items.append(ranked)
-            items.sort(key=lambda item: (item["estimated_score_gain"] is None, -(item["estimated_score_gain"] or 0.0)))
-            top_recommendations = {
-                "supported": True,
-                "items": items[:top_n],
-                "returned_count": min(len(items), top_n),
-                "available_count": len(items),
-                "complete": bool(collection.get("complete", True)),
-                "ranked_among": "every recommendation Meta returned" if collection.get("complete", True)
-                else "only the first page of recommendations Meta returned",
-                "ranked_by": "estimated_score_gain_desc",
-                "note": "estimated_score_gain is Meta's opportunity_score_lift: the points Meta expects the score to rise if the recommendation is applied.",
-            }
-            if not collection.get("complete", True):
-                # The ranking is over the page read; a recommendation on a later page may have a larger gain.
-                missing_signals.append(
-                    f"recommendations: Meta has more than the {len(items)} recommendations read (one page), so "
-                    "top_recommendations ranks only those; a recommendation not read may have a larger estimated "
-                    "score gain. Use get_recommendations to page through the rest."
-                )
+        top_recommendations = await _top_recommendations(client, resolved_account_id, top_n, missing_signals)
 
     return analysis_response(
         scope={"level": "account", "object_id": resolved_account_id},
@@ -387,6 +359,86 @@ async def get_opportunity_score(
             "top_recommendations": top_recommendations,
         },
     )
+
+
+async def _top_recommendations(
+    client: Any, account_id: str, top_n: int, missing_signals: list[str],
+) -> dict[str, Any]:
+    """Meta's recommendations ranked by estimated score gain, from one strictly read page.
+
+    The page is read here rather than through the shared recommendations collection, whose lenient reader shows
+    an answer without a data list as an empty, complete list. collection_fault decides whether the page was read
+    whole; nested recommendation entries that are not objects count as unread too. When the page could not be
+    read the recommendations are not known; when some entries could not be read, the ranking covers the rest and
+    says so. Only a page read whole, with no further page, ranks every recommendation Meta returned.
+    """
+    try:
+        payload = await client.get_recommendations(account_id)
+    except UnsupportedFeatureError as exc:
+        missing_signals.append("recommendations: Meta's recommendations edge is unavailable for this account.")
+        return {"supported": False, "reason": str(exc), "items": []}
+    rows, _unreadable, page_unreadable = _page_rows(payload)
+    reasons = [reason for reason in [collection_fault(payload)] if reason]
+    nested_unreadable = sum(
+        sum(1 for entry in row["recommendations"] if not isinstance(entry, dict))
+        for row in rows if isinstance(row.get("recommendations"), list)
+    )
+    if nested_unreadable:
+        reasons.append(
+            f"{nested_unreadable} nested recommendation entr{'y' if nested_unreadable == 1 else 'ies'} could not be "
+            "read, so the list may be missing recommendations."
+        )
+    base: dict[str, Any] = {
+        "supported": True,
+        "ranked_by": "estimated_score_gain_desc",
+        "note": "estimated_score_gain is Meta's opportunity_score_lift: the points Meta expects the score to rise if the recommendation is applied.",
+    }
+    if page_unreadable:
+        reason = " ".join(reasons)
+        missing_signals.append(f"recommendations: not known. {reason}")
+        return {
+            **base, "items": None, "returned_count": None, "available_count": None, "complete": False,
+            "incomplete_reason": reason, "ranked_among": None,
+        }
+    paging = extract_paging(payload)
+    collection = recommendation_tools._normalize_recommendations(
+        {"data": rows, **({"paging": payload["paging"]} if isinstance(payload.get("paging"), dict) else {})},
+    )
+    items = []
+    for item in collection.get("items", []):
+        ranked = dict(item)
+        ranked["estimated_score_gain"] = to_float(item.get("opportunity_score_lift"))
+        items.append(ranked)
+    items.sort(key=lambda item: (item["estimated_score_gain"] is None, -(item["estimated_score_gain"] or 0.0)))
+    more_pages = bool(paging.get("next"))
+    complete = not more_pages and not reasons
+    if complete:
+        ranked_among = "every recommendation Meta returned"
+    elif reasons:
+        ranked_among = "only the recommendations that could be read on the first page Meta returned"
+    else:
+        ranked_among = "only the first page of recommendations Meta returned"
+    result = {
+        **base,
+        "items": items[:top_n],
+        "returned_count": min(len(items), top_n),
+        "available_count": len(items),
+        "complete": complete,
+        "ranked_among": ranked_among,
+    }
+    if reasons:
+        result["incomplete_reason"] = " ".join(reasons)
+        missing_signals.append(
+            f"recommendations: {' '.join(reasons)} top_recommendations ranks only the {len(items)} that were read."
+        )
+    if more_pages:
+        # The ranking is over the page read; a recommendation on a later page may have a larger gain.
+        missing_signals.append(
+            f"recommendations: Meta has more than the {len(items)} recommendations read (one page), so "
+            "top_recommendations ranks only those; a recommendation not read may have a larger estimated "
+            "score gain. Use get_recommendations to page through the rest."
+        )
+    return result
 
 
 def _require_level(level: str | None, allowed: tuple[str, ...]) -> str:
@@ -406,11 +458,15 @@ def _require_object_id(level: str, object_id: str | None) -> str:
 
 
 def _parse_date(value: str, *, field: str) -> date:
-    """Parse a YYYY-MM-DD date or raise a ValidationError."""
-    try:
-        return date.fromisoformat(value)
-    except ValueError as exc:
-        raise ValidationError(f"{field} must be a valid ISO date in YYYY-MM-DD format.") from exc
+    """Parse a YYYY-MM-DD date or raise a ValidationError that carries no trace of the value.
+
+    The error is raised outside the parser's exception handler (see insights_tools.parse_or_none), so the
+    parser's message, which holds the whole value, is neither the cause nor the context of the logged error.
+    """
+    parsed = insights_tools.parse_or_none(date.fromisoformat, value)
+    if parsed is None:
+        raise ValidationError(f"{field} must be a valid ISO date in YYYY-MM-DD format.")
+    return parsed
 
 
 def _explicit_window(since: str | None, until: str | None) -> tuple[date, date] | None:
@@ -1401,12 +1457,22 @@ def _entity_targets(
 async def _select_children(
     object_id: str, child_level: str, start: date, end: date, max_entities: int,
 ) -> tuple[list[dict[str, Any]], bool, str | None]:
+    """The children, whether more exist and why the selection is incomplete (see _select_children_read)."""
+    children, more, issue, _cut = await _select_children_read(object_id, child_level, start, end, max_entities)
+    return children, more, issue
+
+
+async def _select_children_read(
+    object_id: str, child_level: str, start: date, end: date, max_entities: int,
+) -> tuple[list[dict[str, Any]], bool, str | None, int]:
     """Pick the highest-spending children in the window with one lean, spend-sorted request.
 
     Lean because a sorted request that carried action fields failed at Meta on a large account. Returns the
-    children, whether more exist, and why the selection read was incomplete (None when it was read whole): a page
-    that could not be read, a row that could not be read or has no id (it may be a higher-spending child that
-    was not selected), or a child returned more than once (kept once).
+    children, whether more exist, why the selection read was incomplete (None when it was read whole), and how
+    many children the page held beyond max_entities. The page is checked whole before it is cut (see
+    _sorted_page): a page that could not be read, a row that could not be read or has no id (it may be a
+    higher-spending child that was not selected), a child returned more than once (kept once), or, when more
+    children exist, rows anywhere on the page out of spend order.
     """
     fields = [f"{child_level}_id", f"{child_level}_name", "spend"]
     params = insights_tools._insights_params(
@@ -1415,30 +1481,65 @@ async def _select_children(
     params["sort"] = ["spend_descending"]
     id_field, name_field = fields[0], fields[1]
     payload = await get_graph_api_client().get_insights(object_id, fields=fields, params=params)
-    page_rows, unreadable, page_bad = _page_rows(payload)
-    # One row per child over the whole window, so the child's id alone identifies a row.
-    identity = _RowIdentity((id_field,))
-    rows, repeated, unidentified = _new_rows(page_rows, identity, set())
-    issue = _stop_reason(
-        PAGE_UNREADABLE if page_bad else None, unreadable + unidentified, repeated=repeated, identity=identity,
-    )
+    page = _sorted_page(payload, id_field, max_entities)
     children = [
         {"object_id": str(row[id_field]), "name": row.get(name_field), "spend": _finite(row.get("spend"))}
-        for row in rows
+        for row in page.rows
     ]
-    # A page longer than the limit still has children beyond max_entities, which are not reported.
-    more = bool(extract_paging(payload).get("next")) or len(children) > max_entities
-    children = children[:max_entities]
-    if more and not _spend_order_confirmed([child["spend"] for child in children]):
-        # Which children are the highest-spending rests on Meta's order; without it, others may spend more.
-        issue = "; ".join(filter(None, [issue, SPEND_ORDER_UNCONFIRMED]))
-    return children, more or issue is not None, issue
+    issue = page.selection_issue
+    return children, page.more or issue is not None, issue, page.cut
 
 
 SPEND_ORDER_UNCONFIRMED = (
     "Meta's rows were not in spend order, or a spend could not be read, so the rows read cannot show which are "
     "the highest-spending"
 )
+
+
+class _SortedPage(NamedTuple):
+    """One spend-sorted page, checked whole and then cut to the cap (see _sorted_page)."""
+
+    rows: list[dict[str, Any]]
+    cut: int
+    more: bool
+    fault: str | None
+    contradicted: set[str]
+    order_confirmed: bool
+    selection_issue: str | None
+    unreadable: int
+    repeated: int
+    page_unreadable: bool
+
+
+def _sorted_page(payload: Any, id_field: str, cap: int) -> _SortedPage:
+    """The one place a spend-sorted page is checked and cut to a cap.
+
+    Every check runs on the whole page Meta returned, before anything is cut: rows that could not be read or
+    identified, rows returned twice and whether their copies disagree, and spend order over every identified
+    row (a row whose copies disagree has no known spend). Then the first cap rows are kept, in Meta's order, and
+    the rest are counted in cut. more is true when Meta reported a next page or rows were cut. selection_issue
+    joins the fault with SPEND_ORDER_UNCONFIRMED when rows exist beyond those kept and the order is not
+    confirmed: which rows are the highest-spending then rests on an order the page does not show.
+    """
+    page_rows, unreadable, page_bad = _page_rows(payload)
+    # One row per object over the whole window, so the object's id alone identifies a row.
+    identity = _RowIdentity((id_field,))
+    rows, repeated, unidentified, disputed = _split_rows(page_rows, identity, {})
+    contradicted = {key[0] for key in disputed}
+    spends = [None if str(row.get(id_field)) in contradicted else _finite(row.get("spend")) for row in rows]
+    order_confirmed = _spend_order_confirmed(spends)
+    fault = _stop_reason(
+        PAGE_UNREADABLE if page_bad else None, unreadable + unidentified, repeated=repeated, identity=identity,
+    )
+    cut = max(0, len(rows) - cap)
+    more = bool(extract_paging(payload).get("next")) or cut > 0
+    issue = fault
+    if (more or fault is not None) and not order_confirmed:
+        issue = "; ".join(filter(None, [fault, SPEND_ORDER_UNCONFIRMED]))
+    return _SortedPage(
+        rows[:cap], cut, more, fault, contradicted, order_confirmed, issue,
+        unreadable + unidentified, repeated, page_bad,
+    )
 
 
 def _spend_order_confirmed(spends: list[float | None]) -> bool:
@@ -1531,7 +1632,7 @@ async def _read_targets(
         entity_level = level
     else:
         entity_level = targets["child_level"]
-        children, more, selection_issue = await _select_children(
+        children, more, selection_issue, rows_cut = await _select_children_read(
             targets["object_id"], entity_level, start, end, targets["max_entities"],
         )
         ids = [child["object_id"] for child in children]
@@ -1544,6 +1645,8 @@ async def _read_targets(
             "children_selected": len(ids),
             "max_entities": targets["max_entities"],
             "more_children_exist": more,
+            # Rows Meta returned beyond max_entities: checked with the page, then not reported.
+            "rows_beyond_max_entities": rows_cut,
         }
         if selection_issue is not None:
             coverage["selection"]["incomplete_reason"] = selection_issue
@@ -2711,26 +2814,20 @@ async def _ranking_entity(
         return await _ranking_scope_rows(level, object_id, window)
 
     ad_payload, (scope_rows, scope_error, scope_has_results) = await asyncio.gather(read_ads(), read_scope())
-    lean_page_rows, lean_unreadable, lean_page_bad = _page_rows(ad_payload)
     # One row per ad over the window: an ad returned twice is examined once, and a row without its ad id (or that
     # is not an object) is an ad that was not examined. Either way the read is not all the highest-spending ads.
-    lean_identity = _RowIdentity(("ad_id",))
-    lean_rows, lean_repeated, lean_unidentified, lean_disputed = _split_rows(lean_page_rows, lean_identity, {})
-    # A page longer than the limit asked for still has ads beyond max_ads; they are not examined.
-    beyond_limit = len(lean_rows) > max_ads
-    lean_rows = lean_rows[:max_ads]
-    lean_issue = _stop_reason(
-        PAGE_UNREADABLE if lean_page_bad else None, lean_unreadable + lean_unidentified,
-        repeated=lean_repeated, identity=lean_identity,
-    )
+    # The page is checked whole (faults, repeats, spend order) before it is cut to max_ads (see _sorted_page).
+    lean_page = _sorted_page(ad_payload, "ad_id", max_ads)
+    lean_rows = lean_page.rows
+    lean_issue = lean_page.fault
     # An ad whose two rows disagree has no known spend or rankings: only who it is is kept.
-    lean_contradicted = {key[0] for key in lean_disputed}
+    lean_contradicted = lean_page.contradicted
     lean_rows = [
         {field: row[field] for field in ("ad_id", "ad_name", "campaign_id", "adset_id") if field in row}
         if str(row.get("ad_id")) in lean_contradicted else row
         for row in lean_rows
     ]
-    more_ads_exist = bool(extract_paging(ad_payload).get("next")) or lean_issue is not None or beyond_limit
+    more_ads_exist = lean_page.more or lean_issue is not None
     cost_ids = list(dict.fromkeys(
         str(row["ad_id"]) for row in lean_rows
         if row.get("ad_id") and any(_known_ranking(row.get(field)) for field in RANKING_FIELDS)
@@ -2751,10 +2848,9 @@ async def _ranking_entity(
     spend_unknown = sum(
         1 for row, spend in zip(rows, spends) if spend is None and str(row.get("ad_id")) not in lean_contradicted
     )
-    # Order can be confirmed only from known spends; a missing one is reported below, not read as zero.
-    order_confirmed = all(spend is not None for spend in spends) and all(
-        earlier >= later for earlier, later in zip(spends, spends[1:])  # type: ignore[operator]
-    )
+    # Order is judged on the whole page Meta returned, before the cut: a row cut off can disprove it. A missing
+    # spend leaves it unconfirmed and is reported below, never read as zero.
+    order_confirmed = lean_page.order_confirmed
 
     missing_signals: list[str] = []
     if lean_issue is not None:
@@ -2819,7 +2915,13 @@ async def _ranking_entity(
         )
     if not order_confirmed and all(spend is not None for spend in spends):
         missing_signals.append(
-            "Meta returned the ad rows not ordered by spend, so the examined ads may not be the highest-spending ones."
+            "Meta returned the ad rows not ordered by spend (judged on the whole page it returned, including rows "
+            "beyond max_ads), so the examined ads may not be the highest-spending ones."
+        )
+    if lean_page.cut:
+        missing_signals.append(
+            f"Meta returned {lean_page.cut} ad row(s) beyond max_ads ({max_ads}) on the page asked for; they were "
+            "checked with the page and not examined."
         )
 
     if cost_error is not None:
@@ -2985,6 +3087,7 @@ async def _ranking_entity(
             "request_fields": list(RANKING_LEAN_FIELDS),
             "meta_order_confirmed": order_confirmed,
             "more_ads_exist": more_ads_exist,
+            "rows_beyond_max_ads": lean_page.cut,
             "examined_spend": examined_spend,
             "scope_spend": scope_spend,
             "share_of_scope_spend": share,
@@ -3849,23 +3952,17 @@ async def _context_adset_rows(
         if isinstance(picked, BaseException):
             coverage.update({"status": "failed", "error": str(_public_error(picked).get("message"))})
         else:
-            picked_page_rows, picked_unreadable, picked_page_bad = _page_rows(picked)
             # A selection row that cannot be read (or has no ad set id) is an ad set that was not examined; an ad
-            # set returned twice is selected once. Either way the selection is not all the highest spenders.
-            picked_identity = _RowIdentity(("adset_id",))
-            picked_rows, picked_repeated, picked_unidentified = _new_rows(picked_page_rows, picked_identity, set())
-            picked_unreadable += picked_unidentified
-            all_ids = [str(row["adset_id"]) for row in picked_rows]
-            ids = all_ids[:CONTEXT_MAX_ADSETS]
-            selection_issue = _stop_reason(
-                PAGE_UNREADABLE if picked_page_bad else None, picked_unreadable,
-                repeated=picked_repeated, identity=picked_identity,
-            )
-            more = bool(extract_paging(picked).get("next")) or len(all_ids) > len(ids) or selection_issue is not None
-            picked_spends = [_finite(row.get("spend")) for row in picked_rows[:CONTEXT_MAX_ADSETS]]
-            if more and not _spend_order_confirmed(picked_spends):
-                # "Highest-spending" rests on Meta's spend order; without it other ad sets may spend more.
-                selection_issue = "; ".join(filter(None, [selection_issue, SPEND_ORDER_UNCONFIRMED]))
+            # set returned twice is selected once. Either way the selection is not all the highest spenders. The
+            # page is checked whole, spend order included, before it is cut to the cap (see _sorted_page).
+            picked_page = _sorted_page(picked, "adset_id", CONTEXT_MAX_ADSETS)
+            ids = [str(row["adset_id"]) for row in picked_page.rows]
+            picked_unreadable, picked_repeated = picked_page.unreadable, picked_page.repeated
+            picked_page_bad = picked_page.page_unreadable
+            selection_issue = picked_page.selection_issue
+            more = picked_page.more or selection_issue is not None
+            if picked_page.cut:
+                coverage["selection_rows_beyond_max_adsets"] = picked_page.cut
             if picked_unreadable:
                 coverage["selection_rows_unreadable"] = picked_unreadable
             if picked_repeated:
