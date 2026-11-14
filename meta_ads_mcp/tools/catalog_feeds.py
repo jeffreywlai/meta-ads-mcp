@@ -455,9 +455,11 @@ async def _collect_edge(
     read is not followed: either stops the read as incomplete, so a page Meta keeps
     returning is never counted twice. A page without a data list stops the read as
     incomplete (it may have held rows), and entries that are not objects are left out,
-    counted, and make the read incomplete (normalize.read_collection_page).
+    counted, and make the read incomplete (normalize.read_collection_page). Rows are kept
+    once per Graph id; copies of one id that disagree make the read incomplete and are left
+    out (_RowCopies).
     """
-    items: list[dict[str, Any]] = []
+    copies = _RowCopies(fields)
     after: str | None = None
     cursors_read: set[str | None] = {None}
     pages_read: set[str] = set()
@@ -467,10 +469,16 @@ async def _collect_edge(
         if stop_reasons is not None:
             stop_reasons.append(f"{edge} of {parent_id}: {reason}")
 
-    def finish(found: list[dict[str, Any]], complete: bool) -> tuple[list[dict[str, Any]], bool]:
+    def finish(complete: bool, cap: int | None = None) -> tuple[list[dict[str, Any]], bool]:
+        found = copies.rows()
+        if cap is not None:
+            found = found[:cap]
         if unreadable_entries:
             stopped(_unreadable_entries_reason(unreadable_entries))
-            return found, False
+            complete = False
+        if (conflict := copies.reason()) is not None:
+            stopped(conflict)
+            complete = False
         return found, complete
 
     for _ in range(max_pages):
@@ -481,7 +489,7 @@ async def _collect_edge(
         rows, skipped, page_unreadable = read_collection_page(payload)
         if page_unreadable:
             stopped("Meta's answer had no data list, so the page could not be read and the read stopped.")
-            return finish(items, False)
+            return finish(False)
         unreadable_entries += skipped
         if rows:
             fingerprint = json.dumps(rows, sort_keys=True, default=str)
@@ -490,31 +498,92 @@ async def _collect_edge(
                     "Meta returned the same page again; its rows were not counted a second time "
                     "and the read stopped, so later pages were not read."
                 )
-                return finish(items, False)
+                return finish(False)
             pages_read.add(fingerprint)
-        items.extend(rows)
+        for row in rows:
+            copies.add(row)
         paging = normalize_collection(payload)["paging"]
         has_next = bool(paging.get("next"))
-        if max_items is not None and len(items) >= max_items:
-            more = len(items) > max_items or has_next
+        found = len(copies.rows())
+        if max_items is not None and found >= max_items:
+            more = found > max_items or has_next
             if more:
                 stopped(f"stopped at the {max_items}-item cap; more items exist.")
-            return finish(items[:max_items], not more)
+            return finish(not more, cap=max_items)
         if not has_next:
-            return finish(items, True)
+            return finish(True)
         after = paging.get("after")
         if not after:
             stopped("Meta reported another page but gave no cursor to read it.")
-            return finish(items, False)
+            return finish(False)
         if after in cursors_read:
             stopped(
                 "Meta returned a cursor that was already read; the read stopped so no page is "
                 "counted twice, and later pages were not read."
             )
-            return finish(items, False)
+            return finish(False)
         cursors_read.add(after)
     stopped(f"stopped after {max_pages} pages; more pages exist.")
-    return finish(items, False)
+    return finish(False)
+
+
+def _requested_names(fields: list[str] | None) -> list[str] | None:
+    """The top-level field names a read asked for ("latest_upload{id}" is latest_upload)."""
+    if not fields:
+        return None
+    return list(dict.fromkeys(field.split("{", 1)[0].split(".", 1)[0].strip() for field in fields))
+
+
+class _RowCopies:
+    """The rows of one edge read, each Graph id kept once; copies of one id that disagree are set aside.
+
+    The rule, for every edge read with _collect_edge in this module and in catalogs.py: a
+    row's identity is its own Graph id (_row_id), and two rows with one id are copies only
+    when they are equal on the fields the read asked for (fields Meta adds are not
+    compared). Equal copies are kept once. Copies that differ make the read incomplete:
+    that id is listed in conflicting and left out of rows, so no consumer uses either copy.
+    A row without a readable id (a diagnostics group, an event_stats row: their SDK types
+    have no id) has no identity to compare, so the rule does not apply to it and it is kept.
+    """
+
+    def __init__(self, fields: list[str] | None) -> None:
+        self._compared = _requested_names(fields)
+        self._entries: list[tuple[str | None, dict[str, Any]]] = []
+        self._by_id: dict[str, dict[str, Any]] = {}
+        self.conflicting: set[str] = set()
+
+    def _view(self, row: dict[str, Any]) -> Any:
+        if self._compared is None:
+            return json.dumps(row, sort_keys=True, default=str)
+        return json.dumps({name: row.get(name) for name in self._compared}, sort_keys=True, default=str)
+
+    def add(self, row: dict[str, Any]) -> bool:
+        """Take one row; True when it adds something not read before."""
+        identity = _row_id(row)
+        if identity is None:
+            self._entries.append((None, row))
+            return True
+        first = self._by_id.get(identity)
+        if first is None:
+            self._by_id[identity] = row
+            self._entries.append((identity, row))
+            return True
+        if self._view(first) != self._view(row):
+            self.conflicting.add(identity)
+        return False
+
+    def rows(self) -> list[dict[str, Any]]:
+        return [row for identity, row in self._entries if identity is None or identity not in self.conflicting]
+
+    def reason(self) -> str | None:
+        """Why the read is not complete because of disagreeing copies, or None."""
+        if not self.conflicting:
+            return None
+        listed = ", ".join(sorted(self.conflicting)[:10])
+        return (
+            f"Meta returned copies of {len(self.conflicting)} id(s) that disagree on the fields read ({listed}), "
+            "so their values are not known and they are left out."
+        )
 
 
 def _rows_without_id(rows: list[dict[str, Any]]) -> int:

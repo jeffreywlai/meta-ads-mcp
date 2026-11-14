@@ -3892,3 +3892,52 @@ def test_an_upload_with_an_unreadable_id_does_not_claim_complete_errors(monkeypa
     [item] = run(catalog_feeds.list_product_feed_uploads("10"))["items"]
     assert item["errors_complete"] is False and "id" in item["errors_stop_reason"]
     assert [call for call in client.calls if call.get("edge") == "errors"] == []
+
+
+# round sixteen ---------------------------------------------------------------------------
+# V1: copies of one Graph id are one row only when they agree on the fields read.
+
+
+def test_feed_edge_keeps_equal_copies_once() -> None:
+    row = {"id": "20", "name": "Pixel"}
+    reasons: list[str] = []
+    rows, complete = run(catalog_feeds._collect_edge(
+        _RawEdgeClient({"data": [row, dict(row)], "paging": {"next": "n", "cursors": {"after": "a"}}},
+                       {"data": [dict(row), {"id": "21", "name": "Other"}]}),
+        "10", "adspixels", fields=["id", "name"], page_size=100, stop_reasons=reasons,
+    ))
+    assert rows == [row, {"id": "21", "name": "Other"}] and complete is True and reasons == []
+
+
+def test_feed_edge_sets_aside_disagreeing_copies() -> None:
+    reasons: list[str] = []
+    rows, complete = run(catalog_feeds._collect_edge(
+        _RawEdgeClient({"data": [{"id": "20", "source_type": "PIXEL"}, {"id": "20", "source_type": "APP"},
+                                 {"id": "21", "source_type": "PIXEL"}]}),
+        "10", "external_event_sources", fields=["id", "source_type"], page_size=100, stop_reasons=reasons,
+    ))
+    assert rows == [{"id": "21", "source_type": "PIXEL"}] and complete is False
+    assert "disagree" in reasons[0] and "20" in reasons[0]
+
+
+def test_disagreeing_copies_of_a_connected_source_do_not_settle_a_connection(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("10", "external_event_sources"): {"data": [
+        {"id": "20", "name": "A", "source_type": "PIXEL"}, {"id": "20", "name": "B", "source_type": "PIXEL"},
+    ]}}))
+    # Neither "already connected" nor "not connected": the request is sent and the gap stated.
+    result = run(catalog_feeds.connect_catalog_event_source("10", "20"))
+    assert "create_edge_object" in client.methods() and result["previous_complete"] is False
+
+
+def test_event_stat_rows_have_no_identity_and_are_all_counted(monkeypatch) -> None:
+    # ProductEventStat has no id (SDK 26.0.2): rows for one day, event and source, one per device,
+    # are separate rows and are summed, never treated as copies.
+    row = {"date_start": "2026-11-01", "event": "Purchase", "event_source": {"id": "20"},
+           "total_matched_content_ids": 5, "total_unmatched_content_ids": 0}
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"id": "20", "source_type": "PIXEL"}]},
+        ("10", "event_stats"): {"data": [{**row, "device_type": "mobile"}, {**row, "device_type": "desktop"}]},
+    }))
+    result = run(catalog_feeds.get_catalog_event_source_health("10"))
+    assert result["sources"][0]["matched_content_ids"] == 10
+    assert result["metrics"]["stats_complete"] is True
