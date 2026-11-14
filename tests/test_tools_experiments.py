@@ -664,6 +664,31 @@ def test_eligibility_validation(monkeypatch, kwargs) -> None:
         run(experiments.check_ab_test_eligibility(account_id="123", **kwargs))
 
 
+def test_eligibility_checks_up_to_its_own_per_call_limit(monkeypatch) -> None:
+    ids = [str(value) for value in range(1000, 1000 + experiments.MAX_ELIGIBILITY_ENTITIES)]
+    use(monkeypatch, FakeStudyClient(objects={key: _campaign(key) for key in ids}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="adset", entity_ids=ids))
+    assert result["metrics"]["entities_checked"] == experiments.MAX_ELIGIBILITY_ENTITIES
+
+
+def test_eligibility_entity_limit_is_this_tools_own_not_metas_cell_limit(monkeypatch) -> None:
+    """R25 C9: Meta allows 150 cells and 100 entities per cell, so more than 150 entities can form a
+    valid test. The per-call cap is this tool's own read limit, and the message says so."""
+    no_client(monkeypatch)
+    ids = [str(value) for value in range(1000, 1001 + experiments.MAX_ELIGIBILITY_ENTITIES)]
+    with pytest.raises(experiments.ValidationError) as error:
+        run(experiments.check_ab_test_eligibility(account_id="123", level="adset", entity_ids=ids))
+    message = str(error.value)
+    assert f"at most {experiments.MAX_ELIGIBILITY_ENTITIES} entities per call" in message
+    assert "batches" in message
+    assert "Meta" not in message and "cells" not in message
+    docstring = experiments.check_ab_test_eligibility.__doc__
+    assert f"at most {experiments.MAX_ELIGIBILITY_ENTITIES}" in docstring and "batches" in docstring
+    assert "+" not in docstring
+    rule = next(rule for rule in experiments.ELIGIBILITY_RULES if "150 cells" in rule["rule"])
+    assert "entity_ids" not in rule["applied_as"]
+
+
 @pytest.mark.parametrize("account_id", ["   ", "", "act_"])
 @pytest.mark.parametrize("tool", ["check_ab_test_eligibility", "create_ab_test", "create_lift_study"])
 def test_experiment_required_account_cannot_be_blank(monkeypatch, tool, account_id) -> None:
@@ -697,20 +722,53 @@ def _ab(**overrides):
 
 
 @pytest.mark.parametrize(("shares", "ok"), [
-    ((50, 40), False),
+    ((50, 40), True),
+    ((10, 10), True),
     ((50, 60), False),
+    ((50, 50.01), False),
     ((33.34, 33.33, 33.33), True),
     ((50, 50), True),
 ])
-def test_create_ab_test_shares_must_total_100(monkeypatch, shares, ok) -> None:
+def test_create_ab_test_shares_total_at_most_100(monkeypatch, shares, ok) -> None:
+    """Meta's Ad Study reference: each share at least 10, all shares together at most 100."""
     if ok:
         client = use(monkeypatch, FakeStudyClient())
         run(_ab(cells=_cells(*shares)))
         assert client.kinds() == ["create"]
+        assert [cell["treatment_percentage"] for cell in client.calls[0][3]["cells"]] == list(shares)
     else:
         no_client(monkeypatch)
-        with pytest.raises(experiments.ValidationError, match="100"):
+        with pytest.raises(experiments.ValidationError, match="at most 100"):
             run(_ab(cells=_cells(*shares)))
+
+
+def test_standard_split_test_can_use_less_than_the_whole_population(monkeypatch) -> None:
+    """R25 C3: a campaign or ad set split test may cover part of the population."""
+    cells = [
+        {"name": "A", "treatment_percentage": 40, "campaign_ids": ["10"]},
+        {"name": "B", "treatment_percentage": 40, "campaign_ids": ["11"]},
+    ]
+    client = use(monkeypatch, FakeStudyClient())
+    run(experiments.create_ab_test(
+        account_id="1", business_id="2", name="A small population test", cells=cells,
+        start_time="2027-01-01T00:00:00Z", end_time="2027-01-08T00:00:00Z",
+    ))
+    assert [cell["treatment_percentage"] for cell in client.calls[-1][-1]["cells"]] == [40, 40]
+    preview = run(experiments.create_ab_test(
+        account_id="1", business_id="2", name="A small population test", cells=cells,
+        start_time="2027-01-01T00:00:00Z", end_time="2027-01-08T00:00:00Z", dry_run=True,
+    ))
+    assert [cell["treatment_percentage"] for cell in preview["would_send"]["data"]["cells"]] == [40, 40]
+    assert preview["would_send"]["data"]["type"] == "SPLIT_TEST"
+
+
+@pytest.mark.parametrize("shares", [(50, 40), (40, 40, 10)])
+def test_creative_test_shares_still_total_exactly_100(monkeypatch, shares) -> None:
+    """Meta's split testing guide: a creative test's whole-number shares must sum to 100."""
+    no_client(monkeypatch)
+    with pytest.raises(experiments.ValidationError, match="must total 100") as error:
+        run(_ab(cells=_ad_cells(*shares), creative_test_lifetime_budget_percentage=50))
+    assert str(sum(shares)) not in str(error.value)
 
 
 def test_create_ab_test_rejects_entity_in_two_cells(monkeypatch) -> None:
@@ -839,6 +897,32 @@ def test_create_lift_study_posts_lift_payload(monkeypatch) -> None:
     assert result["created"] == {"id": "study_new"}
 
 
+def test_explicit_nonprimary_objective_is_not_promoted(monkeypatch) -> None:
+    """R25 C11: the single-objective default applies only when is_primary was left out."""
+    client = use(monkeypatch, FakeStudyClient())
+    run(_lift(objectives=[{"name": "Purchases", "is_primary": False,
+                           "customconversions": [{"id": "40"}]}]))
+    assert client.calls[-1][-1]["objectives"][0]["is_primary"] is False
+
+
+@pytest.mark.parametrize(("flags", "sent"), [
+    ((None,), [True]),
+    ((True,), [True]),
+    ((None, None), [None, None]),
+    ((False, None), [False, None]),
+])
+def test_objective_primary_default_only_fills_an_omitted_flag(monkeypatch, flags, sent) -> None:
+    client = use(monkeypatch, FakeStudyClient())
+    objectives = []
+    for index, flag in enumerate(flags):
+        objective = {"name": f"Objective {index}", "customconversions": [{"id": f"4{index}"}]}
+        if flag is not None:
+            objective["is_primary"] = flag
+        objectives.append(objective)
+    run(_lift(objectives=objectives))
+    assert [objective.get("is_primary") for objective in client.calls[-1][-1]["objectives"]] == sent
+
+
 def test_create_lift_study_uses_campaign_cells_when_given(monkeypatch) -> None:
     client = use(monkeypatch, FakeStudyClient())
     cells = [{"name": "A", "treatment_percentage": 45, "control_percentage": 5, "campaign_ids": ["c1"]},
@@ -921,6 +1005,15 @@ def test_update_ad_study_returns_previous_and_current(monkeypatch) -> None:
     assert result["previous"]["end_time"] == "2026-11-30T00:00:00+0000"
     assert result["previous"]["state"] == "running"
     assert result["current"] == {"name": "New name", "end_time": "2026-12-15T00:00:00+00:00"}
+
+
+def test_update_ad_study_empty_description_is_sent_to_clear_it(monkeypatch) -> None:
+    """An empty description is a value to send, not an omitted one."""
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": {**RUNNING_STUDY, "description": "Old"}}))
+    result = run(experiments.update_ad_study(study_id="study_1", description=""))
+    assert client.calls[-1] == ("update", "study_1", {"description": ""})
+    assert result["previous"]["description"] == "Old"
+    assert result["current"] == {"description": ""}
 
 
 def test_update_ad_study_rejects_start_change_after_start_without_writing(monkeypatch) -> None:
@@ -2269,13 +2362,15 @@ def test_misplaced_numeric_personal_value_is_not_quoted_by_percentage_error(capl
     ([{"name": "A", "treatment_percentage": 33.333, "campaign_ids": ["20"]},
       {"name": "B", "treatment_percentage": 50, "campaign_ids": ["21"]}], "at most two decimal places"),
     ([{"name": "A", "treatment_percentage": 47.5, "campaign_ids": ["20"]},
-      {"name": "B", "treatment_percentage": 50, "campaign_ids": ["21"]}], "must total 100; these cells do not"),
+      {"name": "B", "treatment_percentage": 60, "campaign_ids": ["21"]}],
+     "can total at most 100; these cells total more"),
 ])
 def test_ab_cell_errors_name_the_rule_not_the_numbers(monkeypatch, cells, match) -> None:
     no_client(monkeypatch)
     with pytest.raises(experiments.ValidationError, match=match) as error:
         run(_ab(cells=cells))
-    assert "33.333" not in str(error.value) and "97.5" not in str(error.value)
+    assert "33.333" not in str(error.value) and "107.5" not in str(error.value)
+    assert "47.5" not in str(error.value)
 
 
 @pytest.mark.parametrize(("cells", "match"), [

@@ -169,13 +169,23 @@ AUDIENCE_LABELS = frozenset({
 
 
 def _audience_labels(value: Any) -> list[str]:
+    """Validate a whole replacement set of labels; an empty list (or blank string) is the empty set.
+
+    The empty set is sent as [] so it clears the labels. A comma-separated string with only
+    separators, or a list holding a blank entry, is refused: a label was meant but none was given.
+    """
+    if isinstance(value, str) and not value.strip():
+        return []
     labels = coerce_csv_string_list(value)
     if (
         not isinstance(labels, list)
-        or not labels
+        or (not labels and isinstance(value, str))
         or any(not isinstance(label, str) or not label.strip() for label in labels)
     ):
-        raise ValidationError("audience_labels must be one or more nonblank labels, as a list or comma-separated string.")
+        raise ValidationError(
+            "audience_labels must be nonblank labels, as a list or comma-separated string; "
+            "an empty list clears the labels."
+        )
     normalized = list(dict.fromkeys(label.strip().upper() for label in labels))
     # Counted, never quoted: a misplaced name or email address can arrive here.
     unknown = sum(1 for label in normalized if label not in AUDIENCE_LABELS)
@@ -204,7 +214,8 @@ async def create_custom_audience(
     """Use this when the user wants to create a first-party or rule-based custom audience.
 
     is_value_based=true makes a value-based customer list (subtype CUSTOM) for value optimization.
-    audience_labels tags the audience, for example HIGH_VALUE_CUSTOMERS or QUALIFIED_LEADS.
+    audience_labels tags the audience, for example HIGH_VALUE_CUSTOMERS or QUALIFIED_LEADS; an empty
+    list is sent as an empty set.
     """
     payload: dict[str, Any] = {
         "name": name,
@@ -329,7 +340,7 @@ async def update_custom_audience(
     format create_custom_audience takes; for website audiences, retention is retention_seconds inside it.
     The prior rule is read first and returned in previous.
     audience_labels replaces the audience's labels (the values create_custom_audience takes, for example
-    HIGH_VALUE_CUSTOMERS); the prior labels are read first and returned in previous.
+    HIGH_VALUE_CUSTOMERS); an empty list clears them. The prior labels are read first and returned in previous.
     """
     payload: dict[str, Any] = {
         "name": OMIT,
@@ -418,7 +429,8 @@ _EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 # and returns "" when the normalized value does not have the published format.
 # An empty result is counted as invalid and sent blank; it is never hashed.
 # ST and ZIP also take the row's normalized COUNTRY, when the schema has one,
-# because their published format differs for the US and the UK.
+# because their published format differs for the US and the UK; PHONE takes it
+# because a national number without its calling code is valid only with COUNTRY.
 
 # ISO 3166-1 alpha-2 officially assigned codes (COUNTRY must be one of these).
 _ISO_COUNTRY_CODES = frozenset(
@@ -477,12 +489,21 @@ def _normalize_email(value: str) -> str:
     return candidate if _EMAIL_SHAPE.fullmatch(candidate) else ""
 
 
-def _normalize_phone(value: str) -> str:
-    """Remove symbols, letters and leading zeros; a phone number has 7 to 15 digits (E.164 allows 15)."""
+# Shortest phone number kept. Meta's normalization table asks for the calling code only when
+# the row has no COUNTRY, so with a usable COUNTRY a national number can be shorter (some
+# countries have six-digit numbers); without one the number must carry its calling code.
+MIN_PHONE_DIGITS = 7
+MIN_PHONE_DIGITS_WITH_COUNTRY = 4
+MAX_PHONE_DIGITS = 15  # E.164
+
+
+def _normalize_phone(value: str, country: str | None = None) -> str:
+    """Remove symbols, letters and leading zeros; 7 to 15 digits, or 4 to 15 when the row's COUNTRY is usable."""
     if _has_non_ascii_digit(value):
         return ""
     digits = re.sub(r"[^0-9]", "", value).lstrip("0")
-    return digits if 7 <= len(digits) <= 15 else ""
+    minimum = MIN_PHONE_DIGITS_WITH_COUNTRY if country else MIN_PHONE_DIGITS
+    return digits if minimum <= len(digits) <= MAX_PHONE_DIGITS else ""
 
 
 def _normalize_gender(value: str) -> str:
@@ -554,7 +575,7 @@ _AUDIENCE_KEY_NORMALIZERS = {
     "COUNTRY": _normalize_country,
 }
 # Keys whose published format depends on the row's COUNTRY.
-_COUNTRY_AWARE_KEYS = frozenset({"ST", "ZIP"})
+_COUNTRY_AWARE_KEYS = frozenset({"PHONE", "ST", "ZIP"})
 
 
 def _audience_schema(schema: Any) -> list[str]:
