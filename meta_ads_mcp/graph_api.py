@@ -290,6 +290,30 @@ def _outcome_left_open(response: httpx.Response) -> bool:
     return body.get("success") is True or (isinstance(error, dict) and error.get("is_transient") is True)
 
 
+def _refuse_acknowledgement_for_another_object(object_id: str, answer: Any, operation: str) -> None:
+    """Raise when Meta's answer to a write on one object names a different object.
+
+    An update or delete is sent to one object, and Meta's answer may name it (Meta's ad
+    reference shows id beside success). An answer that names a different object does not show
+    that this one was changed, so the outcome is unknown, never "done". An answer with no id,
+    such as {"success": true}, is returned as before; so is one whose id is this object by
+    value ("123", 123 and act_123 are one id).
+    """
+    from meta_ads_mcp.normalize import names_other_object  # normalize imports money, which imports this module
+
+    if names_other_object(object_id, answer):
+        raise MetaApiError(
+            message=(
+                "Meta's answer to the change named a different object than the one changed, so whether "
+                "the change was made is not known. Read the object before retrying."
+            ),
+            status_code=200,
+            details={"acknowledgement_for_another_object": True},
+            operation=operation,
+            mutation_outcome_unknown=True,
+        )
+
+
 def is_bare_answer_wrapper(payload: Any) -> bool:
     """Whether an answer has exactly the form request() gives a bare JSON boolean or array.
 
@@ -636,7 +660,9 @@ class GraphAPIClient:
         data: dict[str, Any],
     ) -> dict[str, Any]:
         """Send an object update."""
-        return await self.request("POST", _segment(object_id), data=data)
+        answer = await self.request("POST", _segment(object_id), data=data)
+        _refuse_acknowledgement_for_another_object(object_id, answer, f"POST /{object_id}")
+        return answer
 
     async def create_edge_object(
         self,
@@ -651,7 +677,9 @@ class GraphAPIClient:
 
     async def delete_object(self, object_id: str) -> dict[str, Any]:
         """Delete an object."""
-        return await self.request("DELETE", _segment(object_id))
+        answer = await self.request("DELETE", _segment(object_id))
+        _refuse_acknowledgement_for_another_object(object_id, answer, f"DELETE /{object_id}")
+        return answer
 
     async def get_insights(
         self,

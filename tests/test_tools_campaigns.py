@@ -19,7 +19,8 @@ class FakeCampaignClient:
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
         self.created_payload = {"parent_id": parent_id, "edge": edge, "data": data}
-        return {"id": "cmp_123"}
+        # A new ad set has its own id: it is never the id of the campaign it goes into.
+        return {"id": "set_123" if edge == "adsets" else "cmp_123"}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
         if object_id == "act_123":
@@ -234,7 +235,7 @@ def test_create_ad_set_supports_typed_bidding_and_validate_only(monkeypatch) -> 
     assert client.created_payload["data"]["execution_options"] == ["validate_only"]
     assert result["validation_only"] is True
     assert result["created"] is None
-    assert result["validation"] == {"id": "cmp_123"}
+    assert result["validation"] == {"id": "set_123"}
 
 
 def test_create_ad_set_encodes_zero_decimal_budget_and_bid(monkeypatch) -> None:
@@ -708,7 +709,7 @@ def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
         "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status",
         "end_time", "lifetime_budget", *params,
     ]
-    assert result["created"] == {"id": "cmp_123"}
+    assert result["created"] == {"id": "set_123"}
     assert result["target"] == {"account_id": "act_123", "campaign_id": "cmp_123"}
 
 
@@ -1398,7 +1399,7 @@ def test_create_ad_set_params_only_round_three_fields_call_is_unchanged(monkeypa
         "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status",
         "daily_budget", *params,
     ]
-    assert result["created"] == {"id": "cmp_123"}
+    assert result["created"] == {"id": "set_123"}
 
 
 def test_create_campaign_params_only_budget_schedule_call_is_unchanged(monkeypatch) -> None:
@@ -2347,7 +2348,7 @@ def test_create_ad_set_params_only_round_four_fields_call_is_unchanged(monkeypat
         "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status", "daily_budget",
         *ROUND_FOUR_ADSET_PARAMS,
     ]
-    assert result["created"] == {"id": "cmp_123"}
+    assert result["created"] == {"id": "set_123"}
 
 
 @pytest.mark.parametrize("key", list(ROUND_FOUR_CAMPAIGN_PARAMS))
@@ -2866,7 +2867,7 @@ def test_create_ad_set_params_only_phone_call_destination_call_is_unchanged(monk
     ))
     assert client.calls == [("get", "act_123", ["currency"]), ("create", "act_123", "adsets", _CALL_ADSET_SENT)]
     assert list(client.calls[1][3]) == list(_CALL_ADSET_SENT)
-    assert result["created"] == {"id": "cmp_123"}
+    assert result["created"] == {"id": "set_123"}
 
 
 @pytest.mark.parametrize("value", ["LEAD_FORM_MESSENGER", "LEAD_FROM_MESSENGER"])

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .money import ZERO_DECIMAL_CURRENCIES as ZERO_DECIMAL_CURRENCIES
@@ -177,3 +178,46 @@ def names_other_object(requested_id: Any, answer: Any, *, key: str = "id") -> bo
         return False
     asked, named = _plain_id(requested_id), _plain_id(answer.get(key))
     return asked is not None and named is not None and asked != named
+
+
+_GRAPH_ID_TEXT = re.compile(r"^(?:act_)?[0-9]+(?:_[0-9]+)*$")
+
+
+def graph_id_text(value: Any) -> str | None:
+    """A Graph object id read from Meta's answer, as text; None when the value is not an id.
+
+    Graph ids are digits, sometimes two runs of digits joined by an underscore (a Page post),
+    and an ad account's is act_ and digits. A whole number is read as the same id. True or
+    false, a negative or fractional number, a container, or text of any other form is not an
+    id and is never turned into one.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value >= 0 else None
+    if isinstance(value, str) and _GRAPH_ID_TEXT.match(value.strip()):
+        return value.strip()
+    return None
+
+
+def same_object_id(first: Any, second: Any) -> bool:
+    """Whether two ids are one object by value: "123", 123, " 123 " and act_123 are the same."""
+    left, right = graph_id_text(first), graph_id_text(second)
+    if left is None or right is None:
+        return False
+    return left.removeprefix("act_") == right.removeprefix("act_")
+
+
+def new_object_id(value: Any, *, known: Any = ()) -> str | None:
+    """The id of an object a create just made, or None when the value cannot be that id.
+
+    It cannot be when it is not an id (graph_id_text), or when it is an id the call already
+    knows as another object: the account, the parent, the source of a copy, an object created
+    earlier in the same call. A new object is none of those. known may hold None and values
+    that are not ids; they are ignored. Read live: every id Meta returned for the objects
+    created in the write tests was digits as text.
+    """
+    text = graph_id_text(value)
+    if text is None:
+        return None
+    return None if any(same_object_id(text, other) for other in known) else text

@@ -123,3 +123,39 @@ def test_names_other_object_reads_the_key_it_is_given() -> None:
 
     assert names_other_object("123", {"audience_id": "456"}, key="audience_id") is True
     assert names_other_object("123", {"audience_id": "123", "id": "456"}, key="audience_id") is False
+
+
+# Round thirty-four: one reader for "the id of an object a create just made".
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("123", "123"), (123, "123"), (" 123 ", "123"), ("act_123", "act_123"), ("111_222", "111_222"), ("0", "0"),
+    (True, None), (False, None), (-12, None), (1.5, None), (123.0, None), ("not_an_id", None), ("", None), (" ", None),
+    (None, None), (["123"], None), ({"id": "123"}, None), ("12a", None), ("act_", None), ("1__2", None), ("-12", None),
+])
+def test_graph_id_text_reads_only_an_id(value, expected) -> None:
+    from meta_ads_mcp.normalize import graph_id_text
+
+    assert graph_id_text(value) == expected
+
+
+@pytest.mark.parametrize(("first", "second", "expected"), [
+    ("123", "123", True), ("123", 123, True), (" 123 ", "123", True), ("act_123", "123", True), ("act_123", "act_123", True),
+    ("123", "456", False), ("123", None, False), (None, None, False), ("abc", "abc", False), ("111_222", "111_222", True),
+    ("111_222", "111", False),
+])
+def test_same_object_id_compares_by_value(first, second, expected) -> None:
+    from meta_ads_mcp.normalize import same_object_id
+
+    assert same_object_id(first, second) is expected
+
+
+@pytest.mark.parametrize(("value", "known", "expected"), [
+    ("123", (), "123"), ("123", ("456", None, "x", True), "123"), (123, ("456",), "123"),
+    ("123", ("123",), None), ("123", (123,), None), (" 123 ", ("act_123",), None), ("123", ("456", " 123 "), None),
+    (True, (), None), (-12, (), None), ("not_an_id", (), None), (None, (), None), ({"id": "1"}, (), None),
+])
+def test_new_object_id_is_an_id_the_call_does_not_already_know(value, known, expected) -> None:
+    from meta_ads_mcp.normalize import new_object_id
+
+    assert new_object_id(value, known=known) == expected
