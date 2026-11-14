@@ -100,3 +100,28 @@ def test_strict_currency_amount_refuses_true_and_false_and_keeps_numbers() -> No
             assert "not true or false" in str(error)
         else:
             raise AssertionError(f"{flag} was accepted as an amount")
+
+
+@pytest.mark.parametrize(
+    ("value", "kept"),
+    [(1798761600, 1798761600), ("1798761600", "1798761600"), ("2027-01-01T00:00:00Z", "2027-01-01T00:00:00Z")],
+)
+def test_schedule_time_keeps_text_and_whole_seconds_as_given(value, kept) -> None:
+    """Round twenty-five, C8 and A6: Meta's datetime fields take Unix seconds as a number."""
+    from pydantic import TypeAdapter
+
+    from meta_ads_mcp.tool_types import ScheduleTime
+
+    result = TypeAdapter(ScheduleTime).validate_python(value)
+    assert result == kept
+    assert type(result) is type(kept)
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, 1798761600.0, None, ["1798761600"]])
+def test_schedule_time_refuses_true_false_fractions_and_other_shapes(value) -> None:
+    from pydantic import TypeAdapter, ValidationError as PydanticValidationError
+
+    from meta_ads_mcp.tool_types import ScheduleTime
+
+    with pytest.raises(PydanticValidationError):
+        TypeAdapter(ScheduleTime).validate_python(value)

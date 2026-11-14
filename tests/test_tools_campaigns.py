@@ -3439,21 +3439,24 @@ def test_r25_update_adset_zero_minimum_target_reports_what_was_sent(monkeypatch)
     assert _r25_sent(client) == {"daily_min_spend_target": 0}
 
 
+_R25_STILL_REFUSED_AMOUNTS = [
+    ("daily_min_spend_target", -1, "daily_min_spend_target must be 0 or greater"),
+    ("lifetime_min_spend_target", -0.5, "lifetime_min_spend_target must be 0 or greater"),
+    ("daily_spend_cap", 0, "daily_spend_cap must be greater than 0"),
+    ("lifetime_spend_cap", 0, "lifetime_spend_cap must be greater than 0"),
+]
+
+
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
+    ("tool", "field", "value", "message"),
     [
-        ("daily_min_spend_target", -1, "daily_min_spend_target must be 0 or greater"),
-        ("lifetime_min_spend_target", -0.5, "lifetime_min_spend_target must be 0 or greater"),
-        ("daily_spend_cap", 0, "daily_spend_cap must be greater than 0"),
-        ("lifetime_spend_cap", 0, "lifetime_spend_cap must be greater than 0"),
-        ("bid_amount", 0, "bid_amount must be greater than 0"),
-        ("daily_budget", 0, "daily_budget must be greater than 0"),
+        *[("create_ad_set", *case) for case in _R25_STILL_REFUSED_AMOUNTS],
+        *[("update_adset", *case) for case in _R25_STILL_REFUSED_AMOUNTS],
+        ("create_ad_set", "bid_amount", 0, "bid_amount must be greater than 0"),
+        ("create_ad_set", "daily_budget", 0, "daily_budget must be greater than 0"),
     ],
 )
-@pytest.mark.parametrize("tool", ["create_ad_set", "update_adset"])
 def test_r25_other_amounts_stay_strictly_positive(monkeypatch, tool, field, value, message) -> None:
-    if tool == "update_adset" and field in {"bid_amount", "daily_budget"}:
-        pytest.skip("update_adset does not take budgets or bids")
     monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
     args = ADSET_BASE if tool == "create_ad_set" else {"adset_id": "20"}
     with pytest.raises(campaigns.ValidationError, match=message):
@@ -3619,3 +3622,15 @@ def test_r25_update_campaign_numeric_time_is_compared_with_what_meta_stored(monk
     result = asyncio.run(campaigns.update_campaign(campaign_id="20", start_time=_R25_START))
     assert result["current"]["start_time"] == _R25_START
     assert "warnings" not in result
+
+
+# Round twenty-five, beyond the findings: the clearing input of each whole-set or clearable
+# field on an update tool is sent, not refused or dropped as falsy.
+
+
+def test_r25_update_campaign_empty_adlabels_is_sent(monkeypatch) -> None:
+    client = BoundaryRecordingClient(stored={"adlabels": {"data": [{"id": "5", "name": "Old"}]}})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="20", adlabels=[]))
+    assert _r25_sent(client) == {"adlabels": []}
+    assert result["current"] == {"adlabels": []}
