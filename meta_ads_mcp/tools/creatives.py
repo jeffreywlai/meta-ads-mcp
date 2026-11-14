@@ -2173,13 +2173,28 @@ def _without_ad_code(spec: dict[str, Any]) -> dict[str, Any]:
     return {**spec, "branded_content": {**branded, **hidden}}
 
 
-def _boost_created_message(created: list[tuple[str, str]], failed_step: str, reason: str) -> str:
-    """Name every object already created so it can be found and removed."""
-    if not created:
+def _boost_created_message(
+    created: list[tuple[str, str]], failed_step: str, reason: str, *, unknown: bool = False
+) -> str:
+    """Name every object already created so it can be found and removed.
+
+    unknown: the failed step's request got no clear answer, so Meta may have created that
+    object too; the message never says it was not created.
+    """
+    if unknown:
+        head = (
+            f"Creating the {failed_step} got no clear answer, so Meta may have created it; look for it in the "
+            f"account before retrying: {reason}"
+        )
+    elif not created:
         return f"Creating the {failed_step} failed and nothing was created: {reason}"
+    else:
+        head = f"Creating the {failed_step} failed: {reason}"
+    if not created:
+        return f"{head} Nothing else was created."
     listed = "; ".join(f"{kind} {object_id} (PAUSED, remove with {_DELETE_TOOL[kind]})" for kind, object_id in created)
     return (
-        f"Creating the {failed_step} failed: {reason} Already created, all paused so nothing is spending: {listed}. "
+        f"{head} Already created, all paused so nothing is spending: {listed}. "
         "Delete them in reverse order (ad, creative, ad set, campaign) or reuse them."
     )
 
@@ -2355,18 +2370,20 @@ async def _boost_one_step(
         try:
             result = await client.create_edge_object(account_id, edge, data=data)
         except (MetaApiError, RateLimitError) as exc:
-            reason = exc.message
-            if getattr(exc, "mutation_outcome_unknown", False):
-                reason = f"{reason} Meta may still have created the {step}; check before retrying."
-            exc.message = _boost_created_message(created, step, reason)
+            exc.message = _boost_created_message(created, step, exc.message, unknown=_outcome_unknown(exc))
             raise
         except Exception as exc:
             if not created:
                 raise
-            raise MetaApiError(message=_boost_created_message(created, step, str(exc) or type(exc).__name__)) from exc
+            # The request may have reached Meta before this failed.
+            raise MetaApiError(
+                message=_boost_created_message(created, step, str(exc) or type(exc).__name__, unknown=True),
+                mutation_outcome_unknown=True,
+            ) from exc
         object_id = str(result.get("id") or "")
         if not object_id:
-            raise ValidationError(_boost_created_message(created, step, "Meta returned no id."))
+            # Meta accepted the request and named nothing, so an object may exist.
+            raise ValidationError(_boost_created_message(created, step, "Meta returned no id.", unknown=True))
         created.append((step, object_id))
         results[step] = result
         return object_id

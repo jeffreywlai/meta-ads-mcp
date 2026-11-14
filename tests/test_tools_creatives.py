@@ -970,6 +970,43 @@ def test_boost_one_step_failure_at_the_ad_names_all_three_objects(monkeypatch) -
         assert expected in message
 
 
+@pytest.mark.parametrize("fail_on", ["campaigns", "ads"])
+@pytest.mark.parametrize("kind", ["meta", "throttle"])
+def test_boost_one_step_step_with_an_unknown_outcome_never_says_it_was_not_created(monkeypatch, fail_on, kind) -> None:
+    """R19 A1: the failed step itself may have been created, first step included."""
+    from meta_ads_mcp.errors import MetaApiError, RateLimitError
+
+    error = (
+        MetaApiError(message="No clear answer.", status_code=200, mutation_outcome_unknown=True) if kind == "meta"
+        else RateLimitError("Application request limit reached", mutation_outcome_unknown=True)
+    )
+    client = FakeOneStepClient(fail_on=fail_on, error=error)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises((MetaApiError, RateLimitError)) as raised:
+        asyncio.run(creatives.boost_instagram_post(**ONE_STEP))
+    message = raised.value.message
+    step = "campaign" if fail_on == "campaigns" else "ad"
+    assert f"Creating the {step} got no clear answer, so Meta may have created it" in message
+    assert "nothing was created" not in message and f"Creating the {step} failed" not in message
+    assert raised.value.to_public_dict()["mutation_outcome_unknown"] is True
+    if fail_on == "campaigns":
+        assert message.endswith("Nothing else was created.")
+    else:
+        assert "campaign 1" in message and "creative 3" in message and "all paused" in message
+
+
+def test_boost_one_step_refused_first_step_still_says_nothing_was_created(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError, RateLimitError
+
+    for error in (MetaApiError(message="Invalid parameter", status_code=400, code=100),
+                  RateLimitError("Rate limited", retry_after_seconds=60)):
+        client = FakeOneStepClient(fail_on="campaigns", error=error)
+        monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+        with pytest.raises((MetaApiError, RateLimitError)) as raised:
+            asyncio.run(creatives.boost_instagram_post(**ONE_STEP))
+        assert raised.value.message.startswith("Creating the campaign failed and nothing was created: ")
+
+
 def test_boost_partnership_inputs_reach_the_creative(monkeypatch) -> None:
     client = FakeBoostClient()
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
