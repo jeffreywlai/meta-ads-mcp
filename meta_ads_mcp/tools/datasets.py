@@ -210,6 +210,15 @@ def _next_page(payload: dict[str, Any], seen_cursors: set[str]) -> tuple[bool, s
     return True, cursor, None
 
 
+def _stats_entry_identity(row: dict[str, Any]) -> str:
+    """What makes one stats entry distinct within an hour: every field Meta returned except count.
+
+    Derived from the keys the entry has, not from the aggregation name: (value) for groupings
+    such as event, (event, value) for groupings Meta reports once per event, such as match_keys.
+    """
+    return json.dumps({key: value for key, value in row.items() if key != "count"}, sort_keys=True, default=str)
+
+
 def _parse_day(value: str, name: str) -> date:
     """Parse a caller date, raising a value-free error outside the parser's handler.
 
@@ -348,6 +357,11 @@ async def get_dataset_stats(
     unreadable_counts = 0
     counted: dict[tuple[str, str], int] = {}
     conflicting_values: set[str] = set()
+    by_event: dict[str, dict[str, int]] = {}
+    # Entries with no count key at all: Meta returns some groupings (event_processing_results)
+    # as a list of events without counts. They are reported as such, not as unreadable counts.
+    uncounted_entries = 0
+    uncounted_events: set[str] = set()
     while True:
         if pages >= MAX_STATS_PAGES:
             stop_reason = f"Stopped after {pages} pages of hourly stats."
@@ -378,22 +392,34 @@ async def get_dataset_stats(
             rows = []
             hour = None if bucket.get("start_time") is None else str(bucket["start_time"])
             for row in bucket_rows:
+                if "count" not in row:
+                    uncounted_entries += 1
+                    if isinstance(row.get("event"), str):
+                        uncounted_events.add(row["event"])
+                    continue
                 count = to_int(row.get("count"))
                 if count is None:
                     unreadable_counts += 1
                     continue
                 value = str(row.get("value"))
+                row_event = row.get("event") if isinstance(row.get("event"), str) else None
                 if hour is not None:
-                    # One count per hour and value: a copy with the same count is counted once, and
-                    # copies with different counts leave that value's total unknown, not first-wins.
-                    seen = counted.get((hour, value))
+                    # An entry is one hour and every field except count (value, and event where the
+                    # grouping has one, as match_keys, had_pii and event_detection_method do). Only
+                    # an entry equal in all of them is a copy: an identical copy is counted once, and
+                    # a copy with a different count leaves that value's total unknown.
+                    identity = (hour, _stats_entry_identity(row))
+                    seen = counted.get(identity)
                     if seen is not None:
                         if seen != count:
                             conflicting_values.add(value)
                         continue
-                    counted[(hour, value)] = count
+                    counted[identity] = count
                 totals[value] = totals.get(value, 0) + count
-                rows.append({"value": value, "count": count})
+                if row_event is not None:
+                    split = by_event.setdefault(value, {})
+                    split[row_event] = split.get(row_event, 0) + count
+                rows.append({"value": value, "count": count, **({"event": row_event} if row_event is not None else {})})
             if bucket.get("start_time") is not None:
                 hours.append(str(bucket["start_time"]))
             if include_hourly:
@@ -404,6 +430,15 @@ async def get_dataset_stats(
             break
         if stop_reason is not None:
             break
+    counted_entries = len(counted) or bool(totals)
+    if uncounted_entries and counted_entries:
+        # Some entries carry counts and some do not: the totals may leave events out.
+        complete = False
+        mixed_reason = (
+            f"Meta returned {uncounted_entries} entr{'y' if uncounted_entries == 1 else 'ies'} without a count "
+            "alongside entries with counts; the totals leave them out."
+        )
+        stop_reason = f"{stop_reason} {mixed_reason}" if stop_reason else mixed_reason
     if unreadable_hours or unreadable_counts:
         complete = False
         unread = []
@@ -422,7 +457,12 @@ async def get_dataset_stats(
         stop_reason = f"{stop_reason} {conflict_reason}" if stop_reason else conflict_reason
 
     items = [
-        {"value": value, "count": count, **({"count_conflict": True} if value in conflicting_values else {})}
+        {
+            "value": value,
+            "count": count,
+            **({"by_event": dict(sorted(by_event[value].items()))} if value in by_event else {}),
+            **({"count_conflict": True} if value in conflicting_values else {}),
+        }
         for value, count in sorted(totals.items(), key=lambda pair: (-pair[1], pair[0]))
     ]
     summary: dict[str, Any] = {
@@ -438,6 +478,20 @@ async def get_dataset_stats(
         summary["unreadable_hours"] = unreadable_hours
     if unreadable_counts:
         summary["unreadable_counts"] = unreadable_counts
+    if by_event:
+        summary["by_event_note"] = (
+            "Meta reports this grouping once per event: count is the total across events, and by_event "
+            "splits it by event."
+        )
+    if uncounted_entries and not counted_entries:
+        summary["counts_returned"] = False
+        summary["entries_without_counts"] = uncounted_entries
+        summary["events_listed"] = sorted(uncounted_events)
+        summary["counts_note"] = (
+            f"Meta returned no counts for this grouping on this dataset: {uncounted_entries} hourly "
+            f"entr{'y' if uncounted_entries == 1 else 'ies'} naming {len(uncounted_events)} event(s) "
+            "(events_listed), with no count or value. There are no totals to show."
+        )
     if not complete:
         summary["stop_reason"] = stop_reason
         summary["note"] = (
