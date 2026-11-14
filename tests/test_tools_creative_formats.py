@@ -2896,3 +2896,294 @@ def test_a_login_in_a_url_is_refused_in_any_scheme_case(url) -> None:
         cf._require_url(url, "link_url")
     with pytest.raises(ValidationError):
         cf._display_link(url)
+
+
+# Round twenty-five (review R25a): inputs Meta documents that the builder refused or dropped.
+
+R25_BASE = {"account_id": "123", "name": "Creative", "page_id": "111"}
+R25_LINK = "https://shop.example.com/item"
+
+
+def _dry(monkeypatch, **arguments) -> dict[str, Any]:
+    _no_client(monkeypatch)
+    result = asyncio.run(cf.create_ad_creative_from_inputs(**R25_BASE, dry_run=True, **arguments))
+    assert result["sent"] is False
+    return result["would_send"]["data"]
+
+
+# A1: Meta's asset feed options guide: "Use an empty string with single space for blank description,
+# if you do not want to use the scraped text." Leaving descriptions out lets Meta scrape the link.
+
+
+@pytest.mark.parametrize("description_input", [
+    {"description": " "},
+    {"descriptions": [" "]},
+    {"descriptions": [" ", "Optional description"]},
+])
+@pytest.mark.parametrize("media", [{"image_hash": "image-a"}, {"video_id": "555", "image_hash": "thumbnail"}])
+def test_r25_a1_single_space_description_is_sent_on_text_variants(monkeypatch, description_input, media) -> None:
+    data = _dry(monkeypatch, primary_texts=["Body"], link_url=R25_LINK, **media, **description_input)
+    expected = description_input.get("descriptions", [description_input.get("description")])
+    assert data["asset_feed_spec"]["descriptions"] == [{"text": text} for text in expected]
+
+
+def test_r25_a1_single_space_description_is_sent_on_placement_customization(monkeypatch) -> None:
+    data = _dry(
+        monkeypatch, link_url=R25_LINK, description=" ",
+        placement_customizations=[
+            {"image_hash": "image-a", "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]},
+            {"image_hash": "image-b", "publisher_platforms": ["instagram"], "instagram_positions": ["story"]},
+        ],
+    )
+    assert data["asset_feed_spec"]["descriptions"] == [{"text": " "}]
+
+
+def test_r25_a1_single_space_description_is_sent_in_a_real_call(monkeypatch) -> None:
+    result, data = _create(
+        monkeypatch, page_id="111", image_hash="image-a", primary_texts=["Body"], link_url=R25_LINK, descriptions=[" "],
+    )
+    assert data["asset_feed_spec"]["descriptions"] == [{"text": " "}]
+    assert result["sent_spec"]["asset_feed_spec"]["descriptions"] == [{"text": " "}]
+
+
+@pytest.mark.parametrize(("arguments", "message"), [
+    ({"descriptions": ["  "]}, "descriptions must not contain blank texts"),
+    ({"descriptions": [""]}, "descriptions must not contain blank texts"),
+    ({"descriptions": [" ", " "]}, "repeat"),
+    ({"headlines": [" "]}, "headlines must not contain blank texts"),
+    ({"primary_texts": [" "]}, "primary_texts must not contain blank texts"),
+])
+def test_r25_a1_other_blank_texts_are_still_refused(monkeypatch, arguments, message) -> None:
+    _no_client(monkeypatch)
+    arguments = {"primary_texts": ["Body"], **arguments}
+    with pytest.raises(ValidationError, match=message):
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            **R25_BASE, image_hash="image-a", link_url=R25_LINK, dry_run=True, **arguments,
+        ))
+
+
+def test_r25_a1_single_space_description_is_refused_on_multi_media(monkeypatch) -> None:
+    # Meta documents the single-space blank description for an asset feed only, not a multi-media pool.
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="descriptions must not contain blank texts"):
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            **R25_BASE, link_url=R25_LINK, descriptions=[" "], dry_run=True,
+            multi_media=[{"image_hash": "image-a"}, {"image_hash": "image-b"}],
+        ))
+
+
+def test_r25_a1_single_space_description_on_a_single_image_is_unchanged(monkeypatch) -> None:
+    # Outside an asset feed the documentation says nothing about a single space, so it stays left out.
+    data = _dry(monkeypatch, image_hash="image-a", link_url=R25_LINK, description=" ")
+    assert "description" not in data["object_story_spec"]["link_data"]
+    assert "asset_feed_spec" not in data
+
+
+# A2: documented creative features the enhancement tool refused.
+
+
+@pytest.mark.parametrize("feature", ["text_generation", "site_extensions"])
+def test_r25_a2_documented_creative_feature_can_be_requested(monkeypatch, feature) -> None:
+    creative = {
+        "id": "20", "name": "Creative", "account_id": "123",
+        "object_story_spec": {"page_id": "111", "link_data": {"image_hash": "image-a", "link": R25_LINK, "message": "Body"}},
+    }
+    client = FakeClient(objects={"10": AD, "20": creative})
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={feature: "OPT_IN"}, dry_run=True))
+    sent = result["would_send"][0]["data"]
+    assert sent["degrees_of_freedom_spec"]["creative_features_spec"] == {feature: {"enroll_status": "OPT_IN"}}
+    assert result["proposed_features"] == {feature: "OPT_IN"}
+    assert [call[0] for call in client.calls] == ["get", "get", "get"]
+
+
+@pytest.mark.parametrize("feature", ["standard_enhancements", "image_template", "make_it_pop"])
+def test_r25_a2_retired_or_undocumented_feature_is_still_refused(monkeypatch, feature) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="not one of Meta's"):
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={feature: "OPT_IN"}))
+
+
+# A3: the profile-visit buttons, in the shapes Meta's profile visit ads guides show.
+
+
+def test_r25_a3_view_instagram_profile_single_image_matches_metas_example(monkeypatch) -> None:
+    link = "https://www.instagram.com/example"
+    data = _dry(
+        monkeypatch, instagram_account_id="40", image_hash="image-a", link_url=link, headline="Head", message="Body",
+        call_to_action_type="VIEW_INSTAGRAM_PROFILE",
+    )
+    assert data["object_story_spec"] == {
+        "page_id": "111",
+        "instagram_user_id": "40",
+        "link_data": {
+            "link": link,
+            "call_to_action": {"type": "VIEW_INSTAGRAM_PROFILE", "value": {"link": link}},
+            "image_hash": "image-a",
+            "message": "Body",
+            "name": "Head",
+        },
+    }
+
+
+def test_r25_a3_visit_profile_single_image_matches_metas_example(monkeypatch) -> None:
+    link = "https://www.facebook.com/example"
+    data = _dry(monkeypatch, image_hash="image-a", link_url=link, call_to_action_type="visit_profile")
+    assert data["object_story_spec"] == {
+        "page_id": "111",
+        "link_data": {
+            "link": link,
+            "call_to_action": {"type": "VISIT_PROFILE", "value": {"link": link}},
+            "image_hash": "image-a",
+        },
+    }
+
+
+@pytest.mark.parametrize(("cta", "link"), [
+    ("VIEW_INSTAGRAM_PROFILE", "https://www.instagram.com/example"),
+    ("VISIT_PROFILE", "https://www.facebook.com/example"),
+])
+def test_r25_a3_profile_visit_single_video(monkeypatch, cta, link) -> None:
+    data = _dry(
+        monkeypatch, instagram_account_id="40", video_id="555", image_hash="thumbnail", link_url=link,
+        call_to_action_type=cta,
+    )
+    assert data["object_story_spec"]["video_data"] == {
+        "video_id": "555", "image_hash": "thumbnail", "call_to_action": {"type": cta, "value": {"link": link}},
+    }
+
+
+def test_r25_a3_view_instagram_profile_on_an_existing_instagram_post_matches_metas_example(monkeypatch) -> None:
+    link = "https://www.instagram.com/example"
+    data = _dry(
+        monkeypatch, instagram_account_id="40", source_instagram_media_id="444", link_url=link,
+        call_to_action_type="VIEW_INSTAGRAM_PROFILE",
+    )
+    assert data == {
+        "name": "Creative",
+        "object_id": "111",
+        "source_instagram_media_id": "444",
+        "instagram_user_id": "40",
+        "call_to_action": {"type": "VIEW_INSTAGRAM_PROFILE", "value": {"link": link}},
+    }
+
+
+def test_r25_a3_profile_visit_works_in_a_real_call(monkeypatch) -> None:
+    link = "https://www.instagram.com/example"
+    _, data = _create(
+        monkeypatch, page_id="111", instagram_account_id="40", image_hash="image-a", link_url=link,
+        call_to_action_type="VIEW_INSTAGRAM_PROFILE",
+    )
+    assert data["object_story_spec"]["link_data"]["call_to_action"] == {
+        "type": "VIEW_INSTAGRAM_PROFILE", "value": {"link": link},
+    }
+
+
+def test_r25_a3_view_instagram_profile_needs_the_instagram_account(monkeypatch) -> None:
+    # Meta's Instagram profile visit guide: instagram_user_id is required; it is the profile the button opens.
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="VIEW_INSTAGRAM_PROFILE needs instagram_account_id"):
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            **R25_BASE, image_hash="image-a", link_url="https://www.instagram.com/example",
+            call_to_action_type="VIEW_INSTAGRAM_PROFILE", dry_run=True,
+        ))
+
+
+@pytest.mark.parametrize("cta", ["BUY_A_BOAT", "SEE_DETAILS", "VIEW_PROFILE"])
+def test_r25_a3_undocumented_or_unbuilt_call_to_action_is_still_refused(monkeypatch, cta) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="not one of Meta's call-to-action types"):
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            **R25_BASE, image_hash="image-a", link_url=R25_LINK, call_to_action_type=cta, dry_run=True,
+        ))
+
+
+# A4: a whole-number video id inside a card, placement entry or pool entry is the same id as its digits.
+
+
+@pytest.mark.parametrize("format_name", ["carousel", "instagram_carousel", "placements", "pool"])
+def test_r25_a4_numeric_nested_video_id_is_sent_as_digit_text(monkeypatch, format_name) -> None:
+    if format_name in {"carousel", "instagram_carousel"}:
+        arguments: dict[str, Any] = {"cards": [{"image_hash": "thumbnail", "video_id": 555}, {"image_hash": "image-b"}]}
+        if format_name == "instagram_carousel":
+            arguments.update(call_to_action_type="INSTAGRAM_MESSAGE", instagram_account_id="40")
+        else:
+            arguments["link_url"] = R25_LINK
+    elif format_name == "placements":
+        arguments = {"link_url": R25_LINK, "placement_customizations": [
+            {"video_id": 555, "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]},
+            {"video_id": "556", "publisher_platforms": ["instagram"], "instagram_positions": ["story"]},
+        ]}
+    else:
+        arguments = {"link_url": R25_LINK, "multi_media": [
+            {"image_hash": "image-a"}, {"video_id": 555, "thumbnail_url": "https://cdn.example.com/thumb.jpg"},
+        ]}
+    data = _dry(monkeypatch, **arguments)
+    if format_name in {"carousel", "instagram_carousel"}:
+        assert data["object_story_spec"]["link_data"]["child_attachments"][0]["video_id"] == "555"
+    elif format_name == "placements":
+        assert data["asset_feed_spec"]["videos"][0] == {"video_id": "555", "adlabels": [{"name": "placement_1"}]}
+    else:
+        assert data["media_sourcing_spec"]["videos"][0]["video_id"] == "555"
+        assert data["media_sourcing_spec"]["videos"][0]["original_video_id"] == "555"
+
+
+def test_r25_a4_numeric_main_pool_video_id_is_sent_as_digit_text(monkeypatch) -> None:
+    data = _dry(monkeypatch, link_url=R25_LINK, multi_media=[
+        {"video_id": 555, "thumbnail_hash": "thumb"}, {"image_hash": "image-a"},
+    ])
+    assert data["object_story_spec"]["video_data"]["video_id"] == "555"
+
+
+def test_r25_a4_numeric_and_text_forms_of_one_video_are_the_same_media(monkeypatch) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=r"multi_media\[1\] repeats the media"):
+        asyncio.run(cf.create_ad_creative_from_inputs(
+            **R25_BASE, link_url=R25_LINK, dry_run=True, multi_media=[
+                {"video_id": "555", "thumbnail_hash": "thumb"}, {"video_id": 555},
+            ],
+        ))
+
+
+def test_r25_mcp_boundary_keeps_a_blank_description_numeric_card_video_and_profile_button() -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    def call(arguments: dict[str, Any]) -> dict[str, Any]:
+        result = asyncio.run(mcp_server.call_tool(
+            "create_ad_creative_from_inputs", {**R25_BASE, "dry_run": True, **arguments},
+        ))
+        return result.structured_content["would_send"]["data"]
+
+    data = call({"image_hash": "h", "link_url": R25_LINK, "primary_texts": ["Body"], "descriptions": [" "]})
+    assert data["asset_feed_spec"]["descriptions"] == [{"text": " "}]
+    data = call({"link_url": R25_LINK, "cards": [{"image_hash": "a", "video_id": 555}, {"image_hash": "b"}]})
+    assert data["object_story_spec"]["link_data"]["child_attachments"][0]["video_id"] == "555"
+    data = call({
+        "instagram_account_id": "40", "image_hash": "h", "link_url": "https://www.instagram.com/example",
+        "call_to_action_type": "VIEW_INSTAGRAM_PROFILE",
+    })
+    assert data["object_story_spec"]["link_data"]["call_to_action"]["type"] == "VIEW_INSTAGRAM_PROFILE"
+
+
+@pytest.mark.parametrize("bad", [True, False, 5.5, -3, "abc", "55a", ["555"]])
+@pytest.mark.parametrize("site", ["card", "placement", "pool"])
+def test_r25_a4_a_nested_video_id_that_is_not_an_id_is_refused(monkeypatch, bad, site) -> None:
+    if site == "card":
+        arguments: dict[str, Any] = {"link_url": R25_LINK, "cards": [
+            {"image_hash": "thumbnail", "video_id": bad}, {"image_hash": "image-b"},
+        ]}
+        where = r"cards\[0\]"
+    elif site == "placement":
+        arguments = {"link_url": R25_LINK, "placement_customizations": [
+            {"video_id": bad, "publisher_platforms": ["facebook"], "facebook_positions": ["feed"]},
+            {"video_id": "556", "publisher_platforms": ["instagram"], "instagram_positions": ["story"]},
+        ]}
+        where = r"placement_customizations\[0\]"
+    else:
+        arguments = {"link_url": R25_LINK, "multi_media": [
+            {"image_hash": "image-a"}, {"video_id": bad, "thumbnail_url": "https://cdn.example.com/thumb.jpg"},
+        ]}
+        where = r"multi_media\[1\]"
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=where + " video_id must be a numeric Meta video id"):
+        asyncio.run(cf.create_ad_creative_from_inputs(**R25_BASE, dry_run=True, **arguments))
