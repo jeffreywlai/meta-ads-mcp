@@ -346,3 +346,87 @@ def test_zero_and_positive_occurrence_counts_give_the_same_rates_as_before(monke
     ))["sources"][0]
     assert source["window_match_rate"] == 0.75
     assert source["across_catalogs"]["all_catalogs_match_rate_range"] == {"low": 0.75, "high": 0.75}
+
+
+
+# Round thirty-four (review R34, FF1): ids in Meta's answers that cannot be right.
+
+
+@pytest.mark.parametrize("result", [{"id": True}, {"id": -12}, {"id": 1.5}, {"id": ["9"]}, {"id": {"id": "9"}}, {"id": "900"}, {"id": 900}, {"id": " 900 "}, {"id": "act_800"}, {"id": "800"}])
+def test_a_create_answer_whose_id_cannot_be_the_new_object_shows_nothing_as_created(result):
+    from meta_ads_mcp.schemas import creation_response
+
+    response = creation_response(action="create_thing", target={"account_id": "act_800", "parent_id": "900"}, result=result)
+    assert response["created"] is None and response["created_id_unresolved"] is True
+    assert response["unresolved_result"] == result and "may have been created" in response["warning"]
+
+
+@pytest.mark.parametrize("result", [{"id": "901"}, {"id": 901}, {"id": "thing_1"}, {"success": True}, {}, {"id": None}, {"id": ""}, {"handles": ["h"]}])
+def test_an_ordinary_create_answer_is_shown_as_created_as_before(result):
+    from meta_ads_mcp.schemas import creation_response
+
+    response = creation_response(action="create_thing", target={"account_id": "act_800", "parent_id": "900"}, result=result)
+    assert response["created"] == result and "created_id_unresolved" not in response and "warning" not in response
+
+
+def test_validation_only_create_answers_are_never_judged():
+    from meta_ads_mcp.schemas import creation_response
+
+    response = creation_response(action="create_thing", target={"account_id": "act_800"}, result={"id": True}, validate_only=True)
+    assert response["created"] is None and response["validation"] == {"id": True} and "warning" not in response
+
+
+def test_catalog_owner_is_not_taken_from_an_answer_about_another_catalog():
+    from meta_ads_mcp.errors import ValidationError
+    from meta_ads_mcp.tools import business_access
+
+    class Client:
+        def __init__(self, answer):
+            self.answer = answer
+
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return self.answer
+
+    with pytest.raises(ValidationError, match="named a different catalog"):
+        asyncio.run(business_access._catalog_business_id(Client({"id": "964999", "business": {"id": "964998"}}), "964000"))
+    for answer in ({"id": "964000", "business": {"id": "30"}}, {"id": 964000, "business": {"id": "30"}}, {"business": {"id": "30"}}):
+        assert asyncio.run(business_access._catalog_business_id(Client(answer), "964000")) == "30"
+
+
+@pytest.mark.parametrize("named", ["969999", None, "969001", 969001])
+def test_feed_rule_update_reads_its_own_rule_or_stops(named, monkeypatch):
+    from meta_ads_mcp.errors import MetaApiError
+
+    rule = {"attribute": "title", "rule_type": "mapping_rule", "params": {"map_from": "name"}}
+    if named is not None:
+        rule["id"] = named
+    writes = []
+
+    class Client:
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return deepcopy(rule)
+
+        async def update_object(self, object_id, *, data):
+            writes.append((object_id, data))
+            return {"success": True}
+
+    monkeypatch.setattr(catalog_feeds, "get_graph_api_client", lambda: Client())
+    call = catalog_feeds.update_feed_rule(rule_id="969001", params={"map_from": "name"})
+    if named == "969999":
+        with pytest.raises(MetaApiError, match="named a different rule"):
+            asyncio.run(call)
+    else:
+        result = asyncio.run(call)
+        assert result["current"]["unchanged"] is True and result["sent"] is False
+    assert writes == []
+
+
+def test_a_batch_error_naming_an_item_that_was_not_sent_confirms_no_item():
+    row = {"status": "finished", "errors_total_count": 1, "errors": [], "ids_of_invalid_requests": ["FOREIGN-SKU"]}
+    assert catalogs._batch_attribution(row)["complete"] is True
+    judged = catalogs._batch_attribution(row, {"QA-SKU"})
+    assert judged["complete"] is False and "did not send" in judged["reason"]
+    own = {"status": "finished", "errors_total_count": 1, "errors": [], "ids_of_invalid_requests": ["QA-SKU"]}
+    assert catalogs._batch_attribution(own, {"QA-SKU", "OTHER"})["complete"] is True
+    clean = {"status": "finished", "errors_total_count": 0, "errors": [], "ids_of_invalid_requests": []}
+    assert catalogs._batch_attribution(clean, {"QA-SKU"})["complete"] is True

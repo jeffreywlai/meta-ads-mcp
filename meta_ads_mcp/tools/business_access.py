@@ -15,7 +15,7 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
-from meta_ads_mcp.normalize import blank_to_none, collection_fault, read_collection_page
+from meta_ads_mcp.normalize import blank_to_none, collection_fault, names_other_object, read_collection_page
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.tool_types import GraphId, StringList
 
@@ -422,6 +422,12 @@ async def list_business_users(
 async def _catalog_business_id(client: Any, catalog_id: str) -> str:
     """Return the catalog's owning business id, read from the catalog."""
     catalog = await client.get_object(catalog_id, fields=["id", "business"])
+    if names_other_object(catalog_id, catalog):
+        # The owner decides which business's people are looked up, and so what is granted.
+        raise ValidationError(
+            "Meta's answer about this catalog named a different catalog, so its owning business is not "
+            "known; pass business_id."
+        )
     business = catalog.get("business") if isinstance(catalog, dict) else None
     business_id = business.get("id") if isinstance(business, dict) else None
     if not business_id:

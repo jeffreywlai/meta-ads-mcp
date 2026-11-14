@@ -1780,7 +1780,11 @@ def test_g7_submit_and_handle_paths_use_the_same_outcome_rules(monkeypatch, stat
     submitted = _run(catalogs.batch_update_catalog_products(
         catalog_id="123", items=[_batch_item("update", "target", name="New")],
     ))
-    assert submitted["items"][0]["outcome"] == expected
+    # R34 FF1: the submit path knows what it sent. An error that names only an item this batch
+    # did not send ("bad") cannot show that the item sent was applied.
+    names_unsent = "bad" in json.dumps(status)
+    on_submit = "outcome_unknown" if expected == "applied" and names_unsent else expected
+    assert submitted["items"][0]["outcome"] == on_submit
     _use(monkeypatch, _batch_client(status={"data": [status]}))
     read = _run(catalogs.batch_update_catalog_products(catalog_id="123", handle="h1"))
     named_failure = "target" in read["failed_retailer_ids"] or "bad" in read["failed_retailer_ids"]
@@ -1788,7 +1792,7 @@ def test_g7_submit_and_handle_paths_use_the_same_outcome_rules(monkeypatch, stat
         assert read["ok"] is True and read["outcome"] == "all_applied"
     else:
         assert read["ok"] is False
-    assert submitted["ok"] is (expected == "applied")
+    assert submitted["ok"] is (on_submit == "applied")
 
 
 def test_g7_handle_read_does_not_call_unknown_error_count_success(monkeypatch) -> None:

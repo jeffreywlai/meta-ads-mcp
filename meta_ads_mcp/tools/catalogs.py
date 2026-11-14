@@ -2296,8 +2296,12 @@ def _identified(entry: Any) -> str | None:
     return _retailer_id(entry.get("id")) if isinstance(entry, dict) else None
 
 
-def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
+def _batch_attribution(row: dict[str, Any], submitted: set[str] | None = None) -> dict[str, Any]:
     """Read a finished batch status once, with one set of rules for every caller.
+
+    submitted, when the caller knows it, is the set of retailer ids this batch sent. An error
+    or invalid request that names an id outside it is not about an item of this batch, so it
+    cannot show which sent item failed: the items not named are then not called applied.
 
     failed_ids are the items Meta names as failed (ids_of_invalid_requests, or an
     error entry carrying the item's id). complete is true only when every error
@@ -2349,6 +2353,11 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
         complete = False
         reason = (f"Meta reported {error_total} error(s) for the batch but named the item for only "
                   f"{len(named)}, so any item it did not name may be among them.")
+    foreign = sorted(failed_ids - submitted) if submitted is not None else []
+    if foreign and complete:
+        complete = False
+        reason = (f"Meta named {len(foreign)} item(s) as failed that this batch did not send, so its errors "
+                  "cannot be tied to the items sent; an item it did not name may be among them.")
     errors_by_id: dict[str, list[str]] = {}
     for entry in named:
         message = entry.get("message")
@@ -2376,6 +2385,7 @@ def _settle(
     unfinished_reason: str | None = None,
     unattributed_submission_errors: int = 0,
     unreadable_submission_entries: int = 0,
+    submitted: set[str] | None = None,
 ) -> None:
     """Set a sent item's outcome from the status of every handle of its batch.
 
@@ -2391,7 +2401,7 @@ def _settle(
     (unreadable_submission_entries).
     """
     rows = [rows] if isinstance(rows, dict) else list(rows)
-    attributions = [_batch_attribution(row) for row in rows]
+    attributions = [_batch_attribution(row, submitted) for row in rows]
     retailer_id = item["retailer_id"]
     failed_errors: list[str] = []
     named_failed = False
@@ -2939,10 +2949,11 @@ async def batch_update_catalog_products(
                             "note": ("Meta's finished batch listed warnings that name no item, so an item "
                                      "showing no warnings may still have one."),
                         }
+                    sent_ids = {sent["retailer_id"] for sent in to_send}
                     for item in to_send:
                         _settle(item, finished_rows, unfinished_reason=unfinished_reason,
                                 unattributed_submission_errors=len(unattributed),
-                                unreadable_submission_entries=unreadable_submission)
+                                unreadable_submission_entries=unreadable_submission, submitted=sent_ids)
                         if unreadable_handles and item["outcome"] == "applied":
                             item["outcome"] = "outcome_unknown"
                             item["reason"] = _unreadable_handles_reason(unreadable_handles, len(raw_handles))

@@ -28,6 +28,7 @@ from meta_ads_mcp.local_files import read_upload_file
 from meta_ads_mcp.normalize import (
     blank_to_none,
     collection_fault,
+    names_other_object,
     normalize_collection,
     read_collection_page,
     to_int,
@@ -1989,6 +1990,11 @@ async def update_feed_rule(
     _check_rule_params_shape(params)
     client = _client()
     rule = await client.get_object(rule_id, fields=RULE_FIELDS)
+    if names_other_object(rule_id, rule):
+        # The rule's type picks the checks and its params decide whether anything is sent.
+        raise MetaApiError(
+            message="Meta's answer about this rule named a different rule, so the rule was not read; nothing was sent.",
+        )
     rule_type = str(rule.get("rule_type") or "").strip().lower()
     notes: list[str] = []
     if rule_type in FEED_RULE_TYPES:
