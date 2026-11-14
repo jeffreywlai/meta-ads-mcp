@@ -2745,3 +2745,43 @@ def test_an_ad_whose_creative_is_not_an_object_is_refused_before_any_creative_re
         with pytest.raises(ValidationError, match=r"ad\.creative \(expected an object\)"):
             asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}, dry_run=dry_run))
     assert fake.writes == [("GET", "10"), ("GET", "10")]
+
+
+# Round fifteen (U1): a Partnership Ad code read from the old creative is a secret of the call, as a supplied
+# one is: once read it is added to the call's secrets and nothing returned or raised shows it.
+
+U1_READ_CODE = "".join(["Read", "Creator", "Code", "_", "q1w2"])
+
+
+class U1ReadCodeClient(S2CopyClient):
+    def __init__(self):
+        super().__init__("branded_content", {"instagram_boost_post_access_token": U1_READ_CODE, "ad_format": 1})
+
+    async def create_edge_object(self, parent_id, edge, *, data):
+        self.writes.append(("POST", parent_id, edge, data))
+        return {"id": "50", "diagnostic": "Accepted " + U1_READ_CODE}
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_enhancement_copy_never_returns_a_code_read_from_the_old_creative(monkeypatch, dry_run) -> None:
+    fake = U1ReadCodeClient()
+    _patch(monkeypatch, fake)
+    result = asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}, dry_run=dry_run))
+    assert U1_READ_CODE not in json.dumps(result)
+    if dry_run:
+        sent = result["would_send"][0]["data"]["branded_content"]
+        assert sent == {"instagram_boost_post_access_token": "<partnership_ad_code>", "ad_format": 1}
+    else:
+        # The real copy carries the code to Meta; only what is returned is cleaned.
+        assert fake.writes[0][3]["branded_content"]["instagram_boost_post_access_token"] == U1_READ_CODE
+
+
+def test_enhancement_error_never_shows_a_code_read_from_the_old_creative(monkeypatch) -> None:
+    class Refused(U1ReadCodeClient):
+        async def create_edge_object(self, parent_id, edge, *, data):
+            raise MetaApiError(message="Bad branded content " + U1_READ_CODE, code=100)
+
+    _patch(monkeypatch, Refused())
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert U1_READ_CODE not in json.dumps(raised.value.to_public_dict())
