@@ -3571,7 +3571,7 @@ def test_video_status_without_a_processing_status_says_so(monkeypatch) -> None:
         async def get_object(self, object_id, *, fields=None, params=None):
             return {"id": object_id}
 
-    status = asyncio.run(creatives._read_video_status(Client(), "55", creatives.NO_SECRETS))
+    status = asyncio.run(creatives._read_video_status(Client(), "55"))
     assert status["processing_status"] is None
     assert "did not include its processing status" in status["status_note"]
     assert "still processing" not in status["status_note"]
