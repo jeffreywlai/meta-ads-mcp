@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from .argument_privacy import server_media_type
 from .auth import build_app_access_token, build_appsecret_proof, resolve_access_token
 from .config import Settings, get_settings
 from .errors import (
@@ -228,17 +229,52 @@ def _with_stated_window(timing: RetryTiming, error: MetaApiError) -> RetryTiming
     return RetryTiming(delay_seconds=float(match.group(1)), server_retry_after_seconds=timing.server_retry_after_seconds)
 
 
+# Meta's "Rate Limiting" reference documents these usage header fields and text values.
+# A usage header is text the server chooses, so only these names, business ids, numbers
+# and these values are kept; anything else is withheld.
+_USAGE_FIELDS = frozenset({
+    "call_count", "total_time", "total_cputime", "acc_id_util_pct", "reset_time_duration",
+    "ads_api_access_tier", "type", "estimated_time_to_regain_access",
+})
+_USAGE_TEXT_VALUES = frozenset({
+    "development_access", "standard_access",
+    "ads_insights", "ads_management", "custom_audience", "instagram", "leadgen", "messenger", "pages",
+})
+USAGE_VALUE_WITHHELD = "(withheld)"
+_USAGE_NUMBER_TEXT = re.compile(r"[0-9]{1,20}(?:\.[0-9]{1,10})?")
+
+
+def _usage_value(value: Any, depth: int = 0) -> Any:
+    """One usage value with every part the server could have filled with free text withheld."""
+    if value is None or isinstance(value, bool) or (isinstance(value, (int, float)) and math.isfinite(value)):
+        return value
+    if isinstance(value, str):
+        return value if value in _USAGE_TEXT_VALUES or _USAGE_NUMBER_TEXT.fullmatch(value) else USAGE_VALUE_WITHHELD
+    if depth < 4 and isinstance(value, list):
+        return [_usage_value(item, depth + 1) for item in value[:50]]
+    if depth < 4 and isinstance(value, dict):
+        kept = {
+            key: _usage_value(item, depth + 1)
+            for key, item in list(value.items())[:50]
+            if isinstance(key, str) and (key in _USAGE_FIELDS or key.isdigit())
+        }
+        if len(kept) < len(value):
+            kept["withheld_fields"] = len(value) - len(kept)
+        return kept
+    return USAGE_VALUE_WITHHELD
+
+
 def _usage_headers(response: Any) -> dict[str, Any] | None:
-    """Return parsed Meta usage headers without exposing unrelated headers."""
+    """Return Meta's usage headers, keeping documented fields, ids, numbers and documented values only."""
     usage: dict[str, Any] = {}
     for name in USAGE_HEADER_NAMES:
         raw_value = _header_value(response.headers, name)
         if raw_value is None:
             continue
         try:
-            usage[name] = json.loads(raw_value)
-        except json.JSONDecodeError:
-            usage[name] = raw_value
+            usage[name] = _usage_value(json.loads(raw_value))
+        except (json.JSONDecodeError, RecursionError):
+            usage[name] = USAGE_VALUE_WITHHELD
     return usage or None
 
 
@@ -382,9 +418,10 @@ class GraphAPIClient:
             try:
                 payload = response.json()
             except ValueError:
+                # The body is not carried: it is text the server chose and can hold anything.
+                # The content type is reduced to a type/subtype pair or withheld.
                 payload = {
-                    "text_response": response.text,
-                    "content_type": response.headers.get("content-type"),
+                    "content_type": server_media_type(response.headers.get("content-type")),
                     "status_code": response.status_code,
                 }
                 if response.is_error:
@@ -423,11 +460,7 @@ class GraphAPIClient:
                 raise MetaApiError(
                     message="Meta's answer was not JSON, so it could not be read.",
                     status_code=response.status_code,
-                    details={
-                        "unreadable_answer": True,
-                        "content_type": response.headers.get("content-type"),
-                        "status_code": response.status_code,
-                    },
+                    details={"unreadable_answer": True, **payload},
                     operation=operation,
                     mutation_outcome_unknown=not safe_to_retry,
                 )

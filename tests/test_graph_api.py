@@ -1310,3 +1310,67 @@ def test_a_transport_failure_does_not_chain_the_http_library_message(monkeypatch
     assert error.value.__cause__ is None and error.value.__context__ is None
     rendered = "".join(traceback.format_exception(error.value))
     assert "Synthetic" not in rendered and "Synthetic" not in caplog.text
+
+
+# Round-fourteen review V3 (the class beyond the reproduction): a header value and a body
+# are text the server chooses. An error keeps only numbers, values from a fixed list, or
+# a fixed note in their place; Meta's JSON error fields are handled elsewhere.
+
+
+def _echo() -> str:
+    return "".join(["Synthetic", "Echo", "Value"])
+
+
+@pytest.mark.parametrize("status", [200, 400])
+@pytest.mark.parametrize(("content_type", "shown"), [
+    ("text/html; charset=utf-8", "text/html"),
+    (None, None),
+    (f"text/html {_echo()}", "(not a media type; withheld)"),
+])
+def test_an_unreadable_answer_keeps_only_a_media_type_and_never_the_body(monkeypatch, status, content_type, shown) -> None:
+    response = _TextResponse(status, f"<html>{_echo()}</html>", content_type=content_type or "")
+    if content_type is None:
+        response.headers.pop("content-type")
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([response])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.details["content_type"] == shown
+    assert error.value.details["status_code"] == status
+    assert "text_response" not in error.value.details
+    assert _echo() not in repr(error.value) and _echo() not in json.dumps(error.value.to_public_dict())
+
+
+def test_usage_headers_keep_documented_fields_ids_numbers_and_values_only(monkeypatch) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(
+            429,
+            {"error": {"message": "Too many calls", "code": 17}},
+            headers={
+                "X-App-Usage": f"not json {_echo()}",
+                "X-Ad-Account-Usage": json.dumps({
+                    "acc_id_util_pct": 9.67, "reset_time_duration": 100, "ads_api_access_tier": "standard_access",
+                    _echo(): 1,
+                }),
+                "X-Business-Use-Case-Usage": json.dumps({"66782684": [{
+                    "type": "ads_management", "call_count": 95, "estimated_time_to_regain_access": 0,
+                    "ads_api_access_tier": _echo(),
+                }]}),
+            },
+        )
+    ])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("GET", "act_1/campaigns"))
+    assert exc_info.value.usage == {
+        "x-app-usage": "(withheld)",
+        "x-ad-account-usage": {
+            "acc_id_util_pct": 9.67, "reset_time_duration": 100, "ads_api_access_tier": "standard_access",
+            "withheld_fields": 1,
+        },
+        "x-business-use-case-usage": {"66782684": [{
+            "type": "ads_management", "call_count": 95, "estimated_time_to_regain_access": 0,
+            "ads_api_access_tier": "(withheld)",
+        }]},
+    }
+    assert _echo() not in json.dumps(exc_info.value.to_public_dict())

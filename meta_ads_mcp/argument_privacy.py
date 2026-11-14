@@ -683,11 +683,14 @@ class LowLevelServerLogPrivacyFilter(logging.Filter):
 # * httpx logs one INFO record per response received, any status:
 #   'HTTP Request: %s %s "%s %d %s"' with the full URL as an argument. The URL is
 #   shown with scheme, host, port and path; a query, fragment or login is withheld.
+#   The reason phrase is the server's text and is replaced by the standard phrase
+#   for the status code; the HTTP version is kept only from a fixed list.
 # * httpcore logs DEBUG records per connection and request phase on five loggers.
-#   They hold the event name, the host, and on a failure the exception's repr; an
-#   exception about a header can quote the header's value, Authorization included.
-#   Each is rewritten to its event name, host, port and stream, and an exception's
-#   type only.
+#   They hold the event name, the host, on completion the server's status line and
+#   headers, and on a failure the exception's repr; an exception about a header can
+#   quote the header's value, Authorization included. Each is rewritten to its event
+#   name, the host, port and stream this client passed in (started records only),
+#   and an exception's type only.
 # * hpack (HTTP/2 header compression) logs DEBUG records with each request header,
 #   the :path pseudo-header that holds the query among them, and the encoded header
 #   block, from which Authorization can be decoded. Every argument that is not a
@@ -708,7 +711,54 @@ _QUERY_WITHHELD = f"(query {_HTTP_WITHHELD})"
 _ARGUMENT_WITHHELD = "<withheld>"
 _HTTPCORE_EVENT = re.compile(r"(?P<event>[a-z_0-9]+\.(?:started|complete|failed))(?:\s|$)")
 _HTTPCORE_SAFE_DETAIL = re.compile(r"\b(?P<key>host|port|server_hostname|stream_id)=(?P<value>'[A-Za-z0-9.\-:\[\]]*'|\d+)")
-_HTTPCORE_EXCEPTION = re.compile(r"\bexception=(?P<type>[A-Za-z_][A-Za-z0-9_.]*)\(")
+# httpcore formats a failure as exactly "<event>.failed exception=<repr>"; the type is
+# read only at that position, never from text later in the record.
+_HTTPCORE_FAILURE = re.compile(r"[a-z_0-9]+\.failed exception=(?P<type>[A-Za-z_][A-Za-z0-9_.]*)\(")
+_HTTP_METHOD = re.compile(r"[A-Z]{1,16}")
+_HTTP_VERSIONS = frozenset({"HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"})
+
+
+# --- Server-controlled transport values -------------------------------------------
+#
+# Rule: every part of a transport log record, or of a client error, that the remote
+# server controls is a number, a value from a fixed list, or withheld. A reason phrase,
+# a header value or an exception message is text the server chooses, and it can repeat
+# what was sent (a token, a creator's code). These two helpers are the shared point.
+
+
+def standard_reason_phrase(status: Any) -> str:
+    """The standard phrase for an HTTP status code (Python's http.HTTPStatus), or '' for any other.
+
+    Never the phrase the server sent: that text is the server's choice.
+    """
+    from http import HTTPStatus
+
+    if not isinstance(status, int) or isinstance(status, bool):
+        return ""
+    try:
+        return HTTPStatus(status).phrase
+    except ValueError:
+        return ""
+
+
+# type/subtype as RFC 9110 writes a media type token, lower case, short; parameters dropped.
+_MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+\-]{0,62}/[a-z0-9][a-z0-9!#$&^_.+\-]{0,62}")
+MEDIA_TYPE_WITHHELD = "(not a media type; withheld)"
+
+
+def server_media_type(value: Any) -> str | None:
+    """A Content-Type header reduced to its type/subtype, or a fixed note when it is not one.
+
+    None when the header is absent. Parameters such as charset are dropped; anything
+    that is not a short type/subtype token pair is withheld, since a header value is
+    text the server chooses.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return MEDIA_TYPE_WITHHELD
+    media_type = value.split(";", 1)[0].strip().lower()
+    return media_type if _MEDIA_TYPE.fullmatch(media_type) else MEDIA_TYPE_WITHHELD
 
 
 def url_without_query(url: Any) -> str:
@@ -752,8 +802,17 @@ class HttpxLogPrivacyFilter(logging.Filter):
     def _sanitize(record: logging.LogRecord) -> None:
         args = record.args
         if record.msg == HTTPX_REQUEST_TEMPLATE and isinstance(args, tuple) and len(args) == 5:
-            method, url, version, status, reason = args
-            record.args = (method, url_without_query(url), version, status, reason)
+            # The method and URL are this client's own; the version, status and reason phrase
+            # come from the server. The version is kept from a fixed list, the status as a
+            # number, and the reason phrase is replaced by the standard one for the status.
+            method, url, version, status, _reason = args
+            record.args = (
+                method if isinstance(method, str) and _HTTP_METHOD.fullmatch(method) else _ARGUMENT_WITHHELD,
+                url_without_query(url),
+                version if version in _HTTP_VERSIONS else _ARGUMENT_WITHHELD,
+                status if isinstance(status, int) and not isinstance(status, bool) else 0,
+                standard_reason_phrase(status),
+            )
         elif isinstance(record.msg, str) and isinstance(args, tuple) and args:
             # A record this release does not log: keep the code's own template, URLs
             # without their query, numbers, and nothing else.
@@ -786,12 +845,18 @@ class HttpcoreLogPrivacyFilter(logging.Filter):
         if found is None:
             _rewrite(record, f"HTTP connection record not recognised (details {_HTTP_WITHHELD})")
         else:
-            parts = [found["event"]]
-            parts += [f"{item['key']}={item['value']}" for item in _HTTPCORE_SAFE_DETAIL.finditer(message)]
-            failure = _HTTPCORE_EXCEPTION.search(message)
+            event = found["event"]
+            parts = [event]
+            if event.endswith(".started"):
+                # A started record holds only what this client passed in: the request's
+                # method, host, port, TLS server name and stream number.
+                parts += [f"{item['key']}={item['value']}" for item in _HTTPCORE_SAFE_DETAIL.finditer(message)]
+            failure = _HTTPCORE_FAILURE.match(message) if event.endswith(".failed") else None
             if failure is not None:
+                # The exception's type is the library's; its message can hold server text or a header.
                 parts.append(f"exception={failure['type']} (message {_HTTP_WITHHELD})")
-            elif message.strip() != found["event"]:
+            elif message.strip() != event:
+                # A complete record's return value holds the server's status line and headers.
                 parts.append(f"(other details {_HTTP_WITHHELD})")
             _rewrite(record, " ".join(parts))
         _strip_exception(record)

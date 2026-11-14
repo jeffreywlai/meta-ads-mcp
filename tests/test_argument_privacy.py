@@ -1452,6 +1452,87 @@ def test_an_httpcore_failure_keeps_its_event_and_exception_type_only():
     )
 
 
+# --- Round-fourteen review V3: text the server chooses stays out of transport records ---
+#
+# Rule: every part of a transport log record that the remote server controls is a
+# number, a value from a fixed list, or withheld. The reason phrase is the server's text.
+
+
+def test_upstream_secret_echo_in_http_reason_phrase_stays_out_of_info_log(monkeypatch, caplog):
+    """Reviewer reproduction (round fourteen, V3)."""
+    import httpx
+
+    from meta_ads_mcp.config import get_settings
+    from meta_ads_mcp.graph_api import GraphAPIClient
+    from meta_ads_mcp.tools import creatives
+
+    marker = "".join(["Synthetic", "CreatorCode", "R14", "x7y9"])
+
+    async def run():
+        # HTTPX itself emits the real INFO record; the mock replaces network I/O only.
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, json={"id": "50"}, extensions={"reason_phrase": ("Accepted " + marker).encode("ascii")}))
+        async with httpx.AsyncClient(transport=transport) as http:
+            monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda self, **kwargs: http)
+            client = GraphAPIClient(settings=get_settings())
+            monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+            return await creatives.create_ad_creative(
+                "10", "Review", params={"branded_content": {"instagram_boost_post_access_token": marker}})
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        result = asyncio.run(run())
+    assert result["created"]["id"] == "50"
+    assert marker not in caplog.text
+    _assert_not_logged(caplog, marker)
+    (line,) = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    assert line.endswith('"HTTP/1.1 200 OK"'), line  # the standard phrase, not the server's
+
+
+@pytest.mark.parametrize(("version", "status", "reason", "shown"), [
+    ("HTTP/1.1", 200, "Accepted SecretText", '"HTTP/1.1 200 OK"'),
+    ("HTTP/2", 503, "Busy SecretText", '"HTTP/2 503 Service Unavailable"'),
+    ("HTTP/1.1", 599, "SecretText", '"HTTP/1.1 599 "'),  # not a standard code: no phrase
+    ("SecretText/1.1", 200, "OK", '"<withheld> 200 OK"'),  # a version outside the fixed list
+])
+def test_the_request_line_keeps_only_numbers_and_fixed_values_from_the_server(version, status, reason, shown):
+    record = logging.LogRecord("httpx", logging.INFO, __file__, 1, argument_privacy.HTTPX_REQUEST_TEMPLATE,
+                               ("GET", "https://graph.facebook.com/v25.0/me", version, status, reason), None)
+    assert argument_privacy.HttpxLogPrivacyFilter().filter(record) is True
+    message = record.getMessage()
+    assert "SecretText" not in message
+    assert message == f"HTTP Request: GET https://graph.facebook.com/v25.0/me {shown}"
+
+
+def test_standard_reason_phrase_and_media_type_helpers():
+    from meta_ads_mcp.argument_privacy import MEDIA_TYPE_WITHHELD, server_media_type, standard_reason_phrase
+
+    assert standard_reason_phrase(404) == "Not Found" and standard_reason_phrase(599) == ""
+    assert standard_reason_phrase("200") == "" and standard_reason_phrase(True) == ""
+    assert server_media_type("text/html; charset=UTF-8") == "text/html"
+    assert server_media_type("application/vnd.api+json") == "application/vnd.api+json"
+    assert server_media_type(None) is None
+    for value in ("text/html SecretText", "SecretText", "a/b/c", "text/" + "x" * 80, 7):
+        assert server_media_type(value) == MEDIA_TYPE_WITHHELD
+
+
+@pytest.mark.parametrize("message", [
+    # A completed read's return value holds the server's status line and headers.
+    "receive_response_headers.complete return_value=(b'HTTP/1.1', 200, b'OK', "
+    "[(b'X-Echo', b\"host='SecretText' port=1 exception=SecretText(\")])",
+    # A failure's message is the server's or a header's text; only the leading type is read.
+    "receive_response_headers.failed exception=RemoteProtocolError(\"host='SecretText' exception=SecretText(\")",
+])
+def test_httpcore_detail_is_read_only_where_this_client_supplied_it(message):
+    record = logging.LogRecord("httpcore.http11", logging.DEBUG, __file__, 1, message, (), None)
+    argument_privacy.HttpcoreLogPrivacyFilter().filter(record)
+    rendered = record.getMessage()
+    assert "SecretText" not in rendered
+    assert "host=" not in rendered and "port=" not in rendered
+    assert rendered.startswith("receive_response_headers.")
+    if ".failed" in message:
+        assert "exception=RemoteProtocolError (message withheld" in rendered
+
+
 def test_hpack_records_keep_numbers_and_withhold_every_header():
     record = logging.LogRecord("hpack.hpack", logging.DEBUG, __file__, 1,
                                "Adding %s=%s to the header table, sensitive:%s, huffman:%s",
