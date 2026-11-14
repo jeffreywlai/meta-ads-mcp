@@ -460,7 +460,7 @@ async def test_ff1_boost_does_not_build_on_an_invalid_campaign_id(monkeypatch, b
                 account_id='962000', instagram_media_id='962010', instagram_account_id='962011',
                 page_id='962012', daily_budget=5, targeting={'geo_locations': {'countries': ['US']}})
     assert writes == ['campaigns'], writes
-    assert 'something that is not an id (not shown)' in str(raised.value)
+    assert 'something that is not an id where' in str(raised.value)
 
 
 @pytest.mark.parametrize('stage', ['adcreatives', 'ads'])
