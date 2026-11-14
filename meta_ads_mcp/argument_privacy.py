@@ -33,6 +33,14 @@ The HTTP client libraries the Graph client uses (httpx, httpcore, hpack) log eac
 request's URL, query included, and at DEBUG its headers. ``HttpxLogPrivacyFilter``,
 ``HttpcoreLogPrivacyFilter`` and ``HpackLogPrivacyFilter`` keep a request's query,
 body and Authorization header out of those records (see "HTTP client records").
+
+What is not kept out, on purpose: an object id. The id a caller passes in an id
+parameter (an account, catalog, campaign or user id) is the request's address and
+the only way to tell which object a failed call was about, so the Graph client
+names it in its own errors (``operation``, "Meta object or edge not found: ...")
+and tools name it in theirs, as on the main branch. An id parameter accepts digits
+only, so it cannot carry text, but it cannot tell an id from another number: put
+only Meta ids in id parameters.
 """
 
 from __future__ import annotations

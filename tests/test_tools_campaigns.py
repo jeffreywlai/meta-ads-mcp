@@ -1892,10 +1892,31 @@ def test_absolute_increase_up_to_eight_times_the_daily_budget_is_sent(monkeypatc
 def test_absolute_increase_past_eight_times_the_daily_budget_is_refused_before_any_call(monkeypatch, tool) -> None:
     monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
     base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
-    with pytest.raises(campaigns.ValidationError, match=r"budget_schedule_specs\[0\]\.budget_value 80\.01 .*at most 80"):
+    with pytest.raises(
+        campaigns.ValidationError, match=r"budget_schedule_specs\[0\]\.budget_value is more than 8 times daily_budget"
+    ) as caught:
         asyncio.run(getattr(campaigns, tool)(**base, daily_budget=10, budget_schedule_specs=[
             {**_GOOD_PERIOD, "budget_value": 80.01},
         ]))
+    # R15 W1: the message names the field, its position and the rule, and repeats no amount the caller sent.
+    assert "80.01" not in str(caught.value)
+    assert "major units" in str(caught.value)
+
+
+@pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])
+def test_schedule_cap_error_repeats_no_number_the_caller_sent(monkeypatch, tool) -> None:
+    """R15 W1: a number typed into the amount by mistake stays out of the error."""
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    base = CAMPAIGN_BASE if tool == "create_campaign" else ADSET_BASE
+    misplaced = int("202555" + "0198")
+    with pytest.raises(campaigns.ValidationError) as caught:
+        asyncio.run(getattr(campaigns, tool)(**base, daily_budget=1234.5, budget_schedule_specs=[
+            {**_GOOD_PERIOD, "budget_value": misplaced},
+        ]))
+    message = str(caught.value)
+    assert str(misplaced) not in message
+    assert "1234.5" not in message and "9876" not in message  # nor the daily budget, nor 8 times it
+    assert "budget_schedule_specs[0].budget_value" in message
 
 
 @pytest.mark.parametrize("tool", ["create_campaign", "create_ad_set"])

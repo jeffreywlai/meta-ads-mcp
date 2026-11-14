@@ -322,9 +322,10 @@ def check_budget_schedule_specs(
             # Compared as decimals, so 8 times 0.1 is exactly 0.8.
             largest = None if daily_budget is None else _MAX_SCHEDULED_BUDGET_MULTIPLE * Decimal(str(daily_budget))
             if largest is not None and Decimal(str(value)) > largest:
+                # No amount is repeated: a number typed here by mistake would reach the error and the log.
                 raise ValidationError(
-                    f"{label}.budget_value {value} is more than 8 times the daily budget {daily_budget}; "
-                    f"Meta allows an increase of at most {largest.normalize():f}. "
+                    f"{label}.budget_value is more than 8 times daily_budget, and Meta allows an increase of "
+                    "at most 8 times the daily budget. "
                     "budget_value is the increase in major units (20 means 20.00), not cents."
                 )
         else:
