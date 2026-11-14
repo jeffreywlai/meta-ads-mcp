@@ -749,7 +749,7 @@ def test_dataset_stats_unreadable_hour_is_disclosed_not_dropped(monkeypatch, bad
     assert "not in the totals" in summary["stop_reason"]
 
 
-@pytest.mark.parametrize("bad_row", [None, {"value": "Lead"}, {"value": "Lead", "count": "many"}])
+@pytest.mark.parametrize("bad_row", [None, {"value": "Lead", "count": None}, {"value": "Lead", "count": "many"}])
 def test_dataset_stats_row_without_a_count_is_disclosed_not_counted_as_zero(monkeypatch, bad_row) -> None:
     _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page([
         {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 4}, bad_row]},
@@ -864,9 +864,13 @@ def test_dataset_stats_identical_hour_value_copy_is_counted_once(monkeypatch) ->
 
 
 @pytest.mark.parametrize("same_page", [True, False])
-def test_dataset_stats_conflicting_hour_value_counts_are_uncertain(monkeypatch, same_page) -> None:
-    first = {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 4}, {"value": "Lead", "count": 1}]}
-    second = {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 9}]}
+@pytest.mark.parametrize("with_event", [False, True])
+def test_dataset_stats_conflicting_hour_value_counts_are_uncertain(monkeypatch, same_page, with_event) -> None:
+    """A true copy: same hour and every field but count equal (value, and event where entries carry one)."""
+    event = {"event": "Purchase"} if with_event else {}
+    first = {"start_time": "2026-11-01T00:00:00+0000",
+             "data": [{**event, "value": "PageView", "count": 4}, {**event, "value": "Lead", "count": 1}]}
+    second = {"start_time": "2026-11-01T00:00:00+0000", "data": [{**event, "value": "PageView", "count": 9}]}
     pages = [_stats_page([first, second])] if same_page else [_stats_page([first], next_after="c2"), _stats_page([second])]
     _use(monkeypatch, FakeDatasetClient(list_pages={"stats": pages}))
     _fixed_now(monkeypatch)
@@ -875,3 +879,96 @@ def test_dataset_stats_conflicting_hour_value_counts_are_uncertain(monkeypatch, 
     assert items["PageView"]["count_conflict"] is True and "count_conflict" not in items["Lead"]
     assert result["summary"]["complete"] is False
     assert "different counts for the same hour" in result["summary"]["stop_reason"]
+
+
+# --------- Live shapes of GET /{pixel_id}/stats (Graph API v26.0, read 2026-11-13): no false conflicts
+
+LIVE_HOURS = ["2026-11-01T00:00:00+0000", "2026-11-01T01:00:00+0000"]
+LIVE_EVENTS = ["PageView", "ViewContent", "AddToCart"]
+
+
+def _live_hour(aggregation: str, hour: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"aggregation": aggregation, "start_time": hour, "data": entries}
+
+
+def _per_event_entries(values: list[str], base: int) -> list[dict[str, Any]]:
+    """One entry per (event, value): the shape of match_keys, had_pii and event_detection_method."""
+    return [
+        {"count": base + index * 3 + position, "event": event, "value": value}
+        for index, value in enumerate(values)
+        for position, event in enumerate(LIVE_EVENTS)
+    ]
+
+
+LIVE_SHAPES = {
+    "event": lambda hour, base: [{"count": base + i, "value": event} for i, event in enumerate(LIVE_EVENTS)],
+    "match_keys": lambda hour, base: _per_event_entries(["em", "ph", "fn"], base),
+    "had_pii": lambda hour, base: _per_event_entries(["true", "false"], base),
+    "event_detection_method": lambda hour, base: _per_event_entries(["STANDARD"], base),
+}
+
+
+@pytest.mark.parametrize("aggregation", sorted(LIVE_SHAPES))
+@pytest.mark.parametrize("paged", [False, True])
+def test_dataset_stats_live_shapes_are_complete_and_summed(monkeypatch, aggregation, paged) -> None:
+    hours = [_live_hour(aggregation, hour, LIVE_SHAPES[aggregation](hour, 10 * (n + 1))) for n, hour in enumerate(LIVE_HOURS)]
+    pages = [_stats_page([hours[0]], next_after="c2"), _stats_page([hours[1]])] if paged else [_stats_page(hours)]
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": pages}))
+    _fixed_now(monkeypatch)
+    result = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW, aggregation=aggregation, include_hourly=True))
+    entries = [entry for hour in hours for entry in hour["data"]]
+    expected: dict[str, int] = {}
+    for entry in entries:
+        expected[entry["value"]] = expected.get(entry["value"], 0) + entry["count"]
+    summary = result["summary"]
+    assert summary["complete"] is True, summary
+    assert all("count_conflict" not in item for item in result["items"])
+    assert {item["value"]: item["count"] for item in result["items"]} == expected
+    assert summary["total_count"] == sum(entry["count"] for entry in entries)
+    if aggregation != "event":
+        for item in result["items"]:
+            split = {
+                event: sum(e["count"] for e in entries if e["value"] == item["value"] and e["event"] == event)
+                for event in LIVE_EVENTS
+            }
+            assert item["by_event"] == split and sum(item["by_event"].values()) == item["count"]
+        assert "by_event_note" in summary
+    else:
+        assert all("by_event" not in item for item in result["items"])
+    assert sum(len(hour["data"]) for hour in result["hourly"]) == len(entries)
+
+
+def test_dataset_stats_identical_per_event_copy_is_counted_once(monkeypatch) -> None:
+    hour = _live_hour("match_keys", LIVE_HOURS[0], _per_event_entries(["em"], 10))
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page([hour, json.loads(json.dumps(hour))])]}))
+    _fixed_now(monkeypatch)
+    result = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW, aggregation="match_keys"))
+    assert result["items"][0]["count"] == sum(entry["count"] for entry in hour["data"])
+    assert result["summary"]["complete"] is True
+
+
+def test_dataset_stats_grouping_without_counts_says_so_plainly(monkeypatch) -> None:
+    """event_processing_results entries carry only an event: no count and no value."""
+    hours = [
+        _live_hour("event_processing_results", hour, [{"event": event} for event in LIVE_EVENTS]) for hour in LIVE_HOURS
+    ]
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page(hours)]}))
+    _fixed_now(monkeypatch)
+    result = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW, aggregation="event_processing_results"))
+    summary = result["summary"]
+    assert result["items"] == [] and summary["total_count"] == 0
+    assert summary["complete"] is True
+    assert summary["counts_returned"] is False
+    assert summary["entries_without_counts"] == len(LIVE_EVENTS) * len(LIVE_HOURS)
+    assert summary["events_listed"] == sorted(LIVE_EVENTS)
+    assert "no counts for this grouping" in summary["counts_note"]
+    assert "unreadable_counts" not in summary
+
+
+def test_dataset_stats_entries_without_counts_beside_counted_ones_are_incomplete(monkeypatch) -> None:
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page([_live_hour("event", LIVE_HOURS[0], [
+        {"count": 4, "value": "PageView"}, {"value": "Lead"},
+    ])])]}))
+    _fixed_now(monkeypatch)
+    summary = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))["summary"]
+    assert summary["complete"] is False and "without a count" in summary["stop_reason"]
