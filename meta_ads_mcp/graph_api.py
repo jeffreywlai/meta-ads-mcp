@@ -278,6 +278,15 @@ def _usage_headers(response: Any) -> dict[str, Any] | None:
     return usage or None
 
 
+def _says_success(response: httpx.Response) -> bool:
+    """Whether a response's body is a JSON object holding success: true."""
+    try:
+        body = response.json()
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(body, dict) and body.get("success") is True
+
+
 def is_bare_answer_wrapper(payload: Any) -> bool:
     """Whether an answer has exactly the form request() gives a bare JSON boolean or array.
 
@@ -417,7 +426,11 @@ class GraphAPIClient:
             retry_timing = _retry_timing(response, attempt)
             delay = retry_timing.delay_seconds
             usage = _usage_headers(response)
-            if response.status_code == 404:
+            if response.status_code == 404 and not (
+                not safe_to_retry and _says_success(response)
+            ):
+                # A write answered 404 with success: true in its body is not proof that nothing
+                # was done; it falls through and is read as the contradiction it is.
                 raise NotFoundError(f"Meta object or edge not found: {endpoint}")
             if (
                 response.status_code in TRANSIENT_HTTP_STATUSES
@@ -508,11 +521,12 @@ class GraphAPIClient:
                     or response.status_code in TRANSIENT_HTTP_STATUSES
                 )
                 # A write's outcome is not known after a transient error, nor when the answer
-                # contradicts itself by carrying an error and success: true together.
+                # contradicts itself by carrying an error and success: true together. The
+                # contradiction is kept through every more specific error raised below.
+                contradictory = not safe_to_retry and payload.get("success") is True
                 error.mutation_outcome_unknown = (
-                    not safe_to_retry
-                    and (bool(error.is_transient) or payload.get("success") is True)
-                )
+                    not safe_to_retry and bool(error.is_transient)
+                ) or contradictory
                 if response.status_code == 429 or _is_rate_limit_error(error):
                     # The automatic wait for a safe read keeps its cap: can_automatically_wait.
                     retry_timing = _with_stated_window(retry_timing, error)
@@ -532,10 +546,13 @@ class GraphAPIClient:
                         usage=usage,
                         operation=operation,
                         # A throttling error object behind a success status on a write
-                        # contradicts itself; on an error status it is a plain refusal.
-                        mutation_outcome_unknown=not safe_to_retry and not response.is_error,
+                        # contradicts itself, as does one beside success: true; otherwise,
+                        # on an error status, it is a plain refusal.
+                        mutation_outcome_unknown=(
+                            (not safe_to_retry and not response.is_error) or contradictory
+                        ),
                     ) from error
-                if _is_unsupported_surface_error(error):
+                if _is_unsupported_surface_error(error) and not contradictory:
                     raise UnsupportedFeatureError(error.message) from error
                 if (
                     error.is_transient

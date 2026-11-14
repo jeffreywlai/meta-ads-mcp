@@ -11,7 +11,7 @@ import pytest
 
 from meta_ads_mcp.auth import build_appsecret_proof
 from meta_ads_mcp.config import Settings, reload_settings
-from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import (
     _CLIENT_POOL,
     GraphAPIClient,
@@ -1343,6 +1343,55 @@ def test_a_read_answer_holding_both_an_error_and_success_true_is_not_a_write_out
     with pytest.raises(MetaApiError) as error:
         asyncio.run(_client().request("GET", "123"))
     assert error.value.mutation_outcome_unknown is False
+
+
+_CONTRADICTIONS = [
+    (400, {"success": True, "error": {"code": 4, "message": "Too many calls"}}, RateLimitError),
+    (400, {"success": True, "error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, MetaApiError),
+    (404, {"success": True, "error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, MetaApiError),
+    (404, {"success": True}, MetaApiError),
+]
+
+
+@pytest.mark.parametrize(("status", "body", "error_type"), _CONTRADICTIONS)
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+def test_a_contradictory_write_answer_stays_unknown_through_every_specific_error(monkeypatch, status, body, error_type, method) -> None:
+    # R22 D1: the throttle, unsupported and not-found branches each dropped the contradiction.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(error_type) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert type(error.value) is error_type
+    assert error.value.mutation_outcome_unknown is True
+    assert error.value.to_public_dict()["retryable"] is False
+
+
+@pytest.mark.parametrize(("status", "body", "error_type"), [
+    (400, {"error": {"code": 4, "message": "Too many calls", "is_transient": True}}, RateLimitError),
+    (400, {"error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, UnsupportedFeatureError),
+    (404, {"error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, NotFoundError),
+    (404, {"success": False}, NotFoundError),
+    (404, {}, NotFoundError),
+])
+def test_the_ordinary_specific_errors_for_a_write_are_unchanged(monkeypatch, status, body, error_type) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(error_type) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert type(error.value) is error_type
+    assert getattr(error.value, "mutation_outcome_unknown", False) is False
+
+
+@pytest.mark.parametrize(("status", "body", "error_type"), [
+    (404, {"success": True}, NotFoundError),
+    (400, {"success": True, "error": {"code": 100, "message": "Unsupported get request."}}, UnsupportedFeatureError),
+])
+def test_a_read_keeps_its_specific_error_whatever_the_body_says(monkeypatch, status, body, error_type) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(error_type) as error:
+        asyncio.run(_client().request("GET", "123"))
+    assert type(error.value) is error_type
 
 
 class _TooDeepResponse(FakeResponse):
