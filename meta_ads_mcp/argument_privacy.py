@@ -14,8 +14,11 @@ Two measures, both applied before any tool code runs:
   tool is covered without registering anything.
 * ``PRIVATE_ARGUMENT_TOOLS`` names the tools whose arguments can carry personal
   data or secrets. For those, ``ToolParameterHelpMiddleware`` returns validation
-  errors that name parameters only and counts unknown parameters instead of
-  quoting them (a misplaced customer value can arrive as an argument name).
+  errors that name parameters only.
+* For every tool, ``ToolParameterHelpMiddleware`` counts unknown parameter names
+  instead of quoting them (a misplaced customer value can arrive as an argument
+  name), lists the accepted ones, and may name the one accepted parameter an
+  unknown name looks like a misspelling of (``misspelling_hint``).
 
 ``HandlerLogPrivacyFilter`` does the same for FastMCP's DEBUG record of each
 MCP tool call, which otherwise carries the tool name and every argument value.
@@ -913,6 +916,34 @@ def private_validation_message(
 
 def unknown_parameter_count(count: int) -> str:
     return f"{count} unknown parameter{'s' if count != 1 else ''}"
+
+
+# A fixed measure for "looks like a misspelling": difflib's similarity of the two
+# names, case ignored. 0.8 lets one wrong, missing or swapped letter through in a
+# name of five or more letters.
+_MISSPELLING_RATIO = 0.8
+
+
+def misspelling_hint(unknown: Iterable[str], accepted: Iterable[str]) -> str | None:
+    """The one accepted parameter an unknown name looks like a misspelling of, or None.
+
+    Only a name from the tool's own schema is returned, never the caller's spelling.
+    It is returned only when exactly one pair of an unknown name and an accepted name
+    is close, so the hint cannot be ambiguous.
+    """
+    import difflib
+
+    try:
+        accepted_names = [name for name in accepted if isinstance(name, str)]
+        pairs = [
+            name
+            for given in unknown if isinstance(given, str)
+            for name in accepted_names
+            if difflib.SequenceMatcher(None, given.casefold(), name.casefold()).ratio() >= _MISSPELLING_RATIO
+        ]
+    except Exception:
+        return None
+    return pairs[0] if len(pairs) == 1 else None
 
 
 # --- A tool's own error messages ----------------------------------------------------

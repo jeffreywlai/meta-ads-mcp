@@ -449,8 +449,11 @@ def test_historical_f10_argument_sets_are_supported_or_list_accepted_keywords(
             asyncio.run(mcp_server.call_tool(tool, call_arguments))
         schema = asyncio.run(mcp_server.get_tool(name)).parameters
         assert f"Accepted parameters: {', '.join(schema['properties'])}." in str(exc_info.value)
-        for rejected in set(arguments) - set(schema["properties"]):
-            assert rejected in str(exc_info.value)
+        rejected = set(arguments) - set(schema["properties"])
+        # Unknown names are counted, never repeated (round thirteen, U4).
+        assert f"{len(rejected)} unknown parameter{'s' if len(rejected) != 1 else ''} (names not repeated" in str(
+            exc_info.value
+        )
         assert not client_creations
 
 

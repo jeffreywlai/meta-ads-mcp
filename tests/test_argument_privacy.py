@@ -361,7 +361,8 @@ def test_other_tools_keep_naming_unknown_parameters_exactly():
         _call("list_adsets", {"account_id": "act_1", "not_a_parameter": True}, routed=False)
     accepted = ", ".join(_tools()["list_adsets"].parameters["properties"])
     assert str(info.value) == (
-        "Unknown parameters for list_adsets: not_a_parameter. "
+        "Unknown parameters for list_adsets: 1 unknown parameter (names not repeated because a value put in the "
+        "wrong place can arrive as a parameter name). "
         f"Accepted parameters: {accepted}. "
         "Inspect types and defaults with get_capabilities(tool_name='list_adsets')."
     )
@@ -577,12 +578,15 @@ def test_an_ordinary_target_keeps_naming_unknown_envelope_keys_exactly():
     with pytest.raises(ToolError) as info:
         _call_proxy({"name": "list_adsets", "arguments": {"account_id": "act_1"}, "bogus": 1})
     assert str(info.value) == (
-        "Unknown parameters for call_tool: bogus. Accepted parameters: name, arguments, tool_name. "
+        "Unknown parameters for call_tool: 1 unknown parameter (names not repeated because a value put in the "
+        "wrong place can arrive as a parameter name). Accepted parameters: name, arguments, tool_name. "
         "Inspect types and defaults with get_capabilities(tool_name='call_tool')."
     )
     with pytest.raises(ToolError) as info:
         _call_proxy({"tool_name": "list_adsets", "bogus": 1})
-    assert str(info.value).startswith("Unknown parameters for call_tool: bogus. ")
+    assert str(info.value).startswith(
+        "Unknown parameters for call_tool: 1 unknown parameter (names not repeated because a value put in the wrong "
+    )
 
 
 def test_a_wrong_type_target_beside_an_ordinary_one_is_treated_as_unclear():
@@ -1625,3 +1629,106 @@ def test_owned_tool_errors_are_built_without_caller_text(module_name):
                 ) == "ValidationError":
                     problems.append(f"{function.name}: ValidationError raised inside an except block")
     assert problems == [], problems
+
+
+# --- Round-thirteen review U4: an unknown argument name is never repeated, for any tool --
+#
+# Rule: an argument name the tool does not accept is never repeated; the error says how
+# many there were and lists the accepted names. ToolParameterHelpMiddleware applies it
+# to every tool, directly and through call_tool, so a new tool cannot be missed.
+
+
+def _lift_study_arguments() -> dict:
+    return {
+        "account_id": "10", "business_id": "30", "name": "Example",
+        "cells": [{"name": "Treatment", "treatment_percentage": 90, "control_percentage": 10}],
+        "objectives": [{"name": "Purchase", "is_primary": True,
+                        "adspixels": [{"id": "20", "event_names": ["Purchase"]}]}],
+        "start_time": "2080-01-01T00:00:00+00:00",
+        "end_time": "2080-01-08T00:00:00+00:00",
+    }
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+@pytest.mark.parametrize("name", ["create_lift_study", "get_dataset_stats"])
+def test_new_tools_do_not_repeat_misplaced_private_argument_names(caplog, routed, name):
+    """Reviewer reproduction (round thirteen, U4)."""
+    caplog.set_level(logging.DEBUG)
+    marker = "".join(["person", "-", "r13", "@", "example.invalid"])
+    if name == "create_lift_study":
+        args = _lift_study_arguments()
+    else:
+        args = {"dataset_id": "20", "since": "2026-11-01", "until": "2026-11-02"}
+    args[marker] = "extra"
+    with pytest.raises(ToolError) as error:
+        _call(name, args, routed)
+    assert marker not in str(error.value)
+    assert marker not in _rendered_chain(error.value)
+    _assert_not_logged(caplog, marker)
+    assert f"Unknown parameters for {name}: 1 unknown parameter (names not repeated" in str(error.value)
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+def test_every_tool_counts_unknown_argument_names_and_lists_accepted_ones(routed, caplog):
+    """The rule holds at the boundary for every registered tool, not only those on the private list."""
+    caplog.set_level(logging.DEBUG)
+    marker = "".join(["private.person", "@u4-every.invalid"])
+    for tool in _tools().values():
+        if tool.name in {"call_tool", "search_tools"}:
+            continue
+        arguments = {marker: "x", "".join(["second", "@u4.invalid"]): "y"}
+        name, sent = ("call_tool", {"name": tool.name, "arguments": arguments}) if routed else (tool.name, arguments)
+        try:
+            asyncio.run(mcp_server.call_tool(name, sent))
+        except Exception as error:  # read-only refusals and unknown-parameter refusals alike
+            rendered = _rendered_chain(error)
+        else:  # pragma: no cover - a tool that accepted unknown names would fail here
+            pytest.fail(f"{tool.name} accepted unknown argument names")
+        assert marker not in rendered and "second@" not in rendered, tool.name
+        if "Unknown parameters" in rendered:
+            assert f"Unknown parameters for {tool.name}: 2 unknown parameters (names not repeated" in rendered
+    _assert_not_logged(caplog, marker)
+
+
+def test_the_proxy_and_a_direct_call_give_the_same_refusal():
+    marker = "".join(["person", "@u4-same.invalid"])
+    arguments = {"dataset_id": "20", marker: "extra"}
+    with pytest.raises(ToolError) as direct:
+        _call("get_dataset_stats", dict(arguments), routed=False)
+    with pytest.raises(ToolError) as routed:
+        _call("get_dataset_stats", dict(arguments), routed=True)
+    assert str(direct.value) == str(routed.value)
+
+
+def test_every_tool_refuses_names_its_schema_does_not_declare():
+    """The boundary covers a tool only when its schema forbids other names; every tool's does."""
+    open_tools = [tool.name for tool in _tools().values() if tool.parameters.get("additionalProperties") is not False]
+    assert open_tools == []
+
+
+def test_a_close_misspelling_names_only_the_accepted_parameter(caplog):
+    caplog.set_level(logging.DEBUG)
+    misspelt = "".join(["datset", "_id"])
+    with pytest.raises(ToolError) as error:
+        _call("get_dataset_stats", {misspelt: "20"}, routed=False)
+    message = str(error.value)
+    assert "One of them looks like a misspelling of 'dataset_id'." in message
+    assert misspelt not in message
+    _assert_not_logged(caplog, misspelt)
+
+
+@pytest.mark.parametrize(("unknown", "accepted", "expected"), [
+    (["sincee"], ["since", "until"], "since"),
+    (["Account_ID"], ["account_id", "limit"], "account_id"),
+    # No hint when it would be ambiguous or far off.
+    (["sincee", "untill"], ["since", "until"], None),
+    (["dataset"], ["dataset_id", "datasets"], None),
+    (["".join(["person", "@example.invalid"])], ["since", "until"], None),
+    (["x"], [], None),
+])
+def test_the_misspelling_hint_returns_only_an_accepted_name(unknown, accepted, expected):
+    from meta_ads_mcp.argument_privacy import misspelling_hint
+
+    hint = misspelling_hint(unknown, accepted)
+    assert hint == expected
+    assert hint is None or hint in accepted

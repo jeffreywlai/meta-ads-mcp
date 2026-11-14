@@ -12,6 +12,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from meta_ads_mcp.argument_privacy import (
     PRIVATE_ARGUMENT_TOOLS,
+    misspelling_hint,
     private_validation_message,
     schema_parameter_names,
     unknown_parameter_count,
@@ -45,13 +46,39 @@ def unknown_tool_message() -> str:
     return READ_ONLY_UNKNOWN_TOOL_MESSAGE if get_settings().read_only else UNKNOWN_TOOL_MESSAGE
 
 
+def _unknown_parameters_message(
+    tool_name: str, unexpected: list[str], accepted: list[str], private: bool, proxy: bool,
+) -> str:
+    """The refusal of argument names a tool does not accept, for every tool.
+
+    The names given are counted, never repeated: a value put in the wrong place,
+    a customer's email or a password, can arrive as a parameter name. The accepted
+    names come from the tool's own schema, and so does the one misspelling hint.
+    """
+    if private and proxy:
+        reason = "the tool being called can receive personal data or secrets"
+    elif private:
+        reason = "this tool's arguments can hold personal data or secrets"
+    else:
+        reason = "a value put in the wrong place can arrive as a parameter name"
+    hint = misspelling_hint(unexpected, accepted)
+    return (
+        f"Unknown parameters for {tool_name}: {unknown_parameter_count(len(unexpected))} "
+        f"(names not repeated because {reason}). "
+        + (f"One of them looks like a misspelling of '{hint}'. " if hint else "")
+        + f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
+        f"Inspect types and defaults with get_capabilities(tool_name='{tool_name}')."
+    )
+
+
 class ToolParameterHelpMiddleware(Middleware):
     """Reject unknown keywords with the live schema before a tool executes.
 
-    For tools in PRIVATE_ARGUMENT_TOOLS, unknown parameters are counted rather
-    than named, and the framework's argument-validation error is replaced by one
-    that names parameters only: those arguments can hold personal data or
-    secrets, and a misplaced value can arrive as a parameter name.
+    For every tool, unknown parameters are counted rather than named: a
+    misplaced value can arrive as a parameter name. For tools in
+    PRIVATE_ARGUMENT_TOOLS, the framework's argument-validation error is also
+    replaced by one that names parameters only: those arguments can hold
+    personal data or secrets.
 
     The call_tool proxy's own envelope (name, arguments, tool_name) gets the
     same handling unless every target it names is a registered tool outside
@@ -124,21 +151,7 @@ class ToolParameterHelpMiddleware(Middleware):
             accepted = list(tool.parameters.get("properties", {}))
             unexpected = sorted(set(context.message.arguments or {}) - set(accepted))
             if unexpected:
-                reason = (
-                    "the tool being called can receive personal data or secrets"
-                    if proxy
-                    else "this tool's arguments can hold personal data or secrets"
-                )
-                described = (
-                    f"{unknown_parameter_count(len(unexpected))} (names not repeated because {reason})"
-                    if private
-                    else ", ".join(unexpected)
-                )
-                raise ToolError(
-                    f"Unknown parameters for {tool.name}: {described}. "
-                    f"Accepted parameters: {', '.join(accepted) or '(none)'}. "
-                    f"Inspect types and defaults with get_capabilities(tool_name='{tool.name}')."
-                )
+                raise ToolError(_unknown_parameters_message(tool.name, unexpected, accepted, private, proxy))
         if proxy and await self._names_an_unknown_target(context):
             # Refused before dispatch: the nested call's "Unknown tool" error
             # would repeat the target in the returned error and the log.
