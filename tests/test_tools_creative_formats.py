@@ -2785,3 +2785,22 @@ def test_enhancement_error_never_shows_a_code_read_from_the_old_creative(monkeyp
     with pytest.raises(MetaApiError) as raised:
         asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
     assert U1_READ_CODE not in json.dumps(raised.value.to_public_dict())
+
+
+# Round sixteen (V2 class): label copies that name one label id differently stop the copy; agreeing copies
+# are sent once.
+
+
+def test_enhancement_copy_refuses_label_copies_that_disagree(monkeypatch) -> None:
+    fake = S2CopyClient("adlabels", {"data": [{"id": "71", "name": "Spring"}, {"id": "71", "name": "Autumn"}]})
+    _patch(monkeypatch, fake)
+    with pytest.raises(ValidationError, match="label 71 more than once with different names"):
+        asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert fake.writes == []
+
+
+def test_enhancement_copy_sends_agreeing_label_copies_once(monkeypatch) -> None:
+    fake = S2CopyClient("adlabels", {"data": [{"id": "71", "name": "Spring"}, {"id": "71", "name": "Spring"}, {"id": "72"}]})
+    _patch(monkeypatch, fake)
+    asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert fake.writes[0][3]["adlabels"] == [{"id": "71"}, {"id": "72"}]

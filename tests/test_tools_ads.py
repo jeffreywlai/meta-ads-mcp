@@ -1048,3 +1048,30 @@ def test_update_ad_previous_labels_count_rows_that_could_not_be_read(monkeypatch
     result = asyncio.run(ads.update_ad(ad_id="ad_1", adlabels=[{"id": "9"}]))
     assert result["previous"] == {"adlabels": [{"id": "9", "name": "Old"}]}
     assert "1 of the labels Meta returned is not a label" in result["previous_incomplete"]["adlabels"]
+
+
+# Round sixteen (V2 class): image entries sharing a hash are copies of one image (Meta's AdImage reference:
+# the hash "uniquely identifies the image"). The first copy is shown; differing copies are named.
+
+
+def test_get_ad_image_names_hashes_whose_copies_differ(monkeypatch) -> None:
+    class Client(FakeAdsClient):
+        async def get_ad_images_by_hashes(self, account_id, *, hashes, fields=None):
+            return {"data": [
+                {"hash": "hash_123", "url": "https://cdn.example.com/a.png"},
+                {"hash": "hash_123", "url": "https://cdn.example.com/b.png"},
+                {"hash": "hash_456", "url": "https://cdn.example.com/c.png"},
+                {"hash": "hash_456", "url": "https://cdn.example.com/c.png"},
+            ]}
+
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: Client())
+    item = asyncio.run(ads.get_ad_image(ad_id="ad_123"))["item"]
+    assert [image["url"] for image in item["resolved_images"]] == ["https://cdn.example.com/a.png", "https://cdn.example.com/c.png"]
+    assert item["image_copies_differ"]["hashes"] == ["hash_123"]
+
+
+def test_get_ad_image_without_copies_is_unchanged(monkeypatch) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: FakeAdsClient())
+    item = asyncio.run(ads.get_ad_image(ad_id="ad_123"))["item"]
+    assert "image_copies_differ" not in item
+    assert [image["hash"] for image in item["resolved_images"]] == ["hash_123", "hash_456"]
