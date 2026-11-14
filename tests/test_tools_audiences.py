@@ -501,6 +501,44 @@ def test_audience_users_malformed_values_are_dropped_not_hashed(monkeypatch, key
     assert result["invalid_values"] == 1
 
 
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize(("phone", "sent"), [
+    ("911234", "911234"),
+    ("+298 91 12 34", "29891" "1234"),
+    ("0911234", "911234"),
+    ("1234", "1234"),
+])
+def test_short_national_phone_with_country_is_hashed(monkeypatch, tool, phone, sent) -> None:
+    """R25 C10: Meta's normalization table lets the calling code be left out when COUNTRY is given,
+    and some countries have six-digit numbers, so with COUNTRY four or more digits are kept."""
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(_users_tool(tool)(
+        audience_id="aud_1", schema=["PHONE", "COUNTRY"], rows=[[phone, "FO"]],
+    ))
+    assert client.requests[0]["data"]["payload"]["data"] == [[_sha(sent), _sha("fo")]]
+    assert result["invalid_values"] == 0
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize(("schema", "row", "invalid"), [
+    (["EMAIL", "PHONE"], ["valid@example.invalid", "911234"], 1),
+    (["EMAIL", "PHONE", "COUNTRY"], ["valid@example.invalid", "911234", ""], 2),
+    (["EMAIL", "PHONE", "COUNTRY"], ["valid@example.invalid", "911234", "zz"], 2),
+    (["EMAIL", "PHONE", "COUNTRY"], ["valid@example.invalid", "123", "fo"], 1),
+    (["EMAIL", "PHONE", "COUNTRY"], ["valid@example.invalid", "1234567890123456", "fo"], 1),
+])
+def test_short_phone_without_a_usable_country_is_still_dropped(monkeypatch, tool, schema, row, invalid) -> None:
+    """Without a COUNTRY Meta can use, the seven-digit minimum stays; the 15-digit maximum always does."""
+    client = FakeUsersClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(_users_tool(tool)(audience_id="aud_1", schema=schema, rows=[row]))
+    sent = client.requests[0]["data"]["payload"]["data"][0]
+    assert sent[0] == _sha("valid@example.invalid")
+    assert sent[1] == ""
+    assert result["invalid_values"] == invalid
+
+
 @pytest.mark.parametrize(
     ("schema", "row", "expected"),
     [
@@ -1388,7 +1426,8 @@ def test_create_custom_audience_named_values_through_the_mcp_boundary(monkeypatc
     ({"audience_labels": ["AT_RISK"], "params": {"audience_labels": ["AT_RISK"]}}, "audience_labels"),
     ({"audience_labels": ["NOT_A_LABEL"]}, "audience_labels has 1 value that is not a recognised label"),
     ({"audience_labels": [" "]}, "audience_labels"),
-    ({"audience_labels": []}, "audience_labels"),
+    ({"audience_labels": ["AT_RISK", ""]}, "audience_labels"),
+    ({"audience_labels": ","}, "audience_labels"),
     ({"is_value_based": True, "subtype": "WEBSITE"}, "CUSTOM"),
 ])
 def test_create_custom_audience_named_values_are_validated_before_any_request(monkeypatch, kwargs, match) -> None:
@@ -1481,8 +1520,9 @@ def test_update_custom_audience_labels_through_mcp_boundary(monkeypatch) -> None
     ({"audience_labels": ["NOT_A_LABEL"]}, "audience_labels has 1 value that is not a recognised label"),
     ({"audience_labels": ["APP_INSTALLERS", "AT_RISK", "x"]}, "audience_labels has 2 values that are not"),
     ({"audience_labels": [" "]}, "audience_labels"),
-    ({"audience_labels": []}, "audience_labels"),
-    ({"audience_labels": ""}, "audience_labels"),
+    ({"audience_labels": ["AT_RISK", ""]}, "audience_labels"),
+    ({"audience_labels": ","}, "audience_labels"),
+    ({"audience_labels": " , "}, "audience_labels"),
 ])
 def test_update_custom_audience_named_labels_are_validated_before_any_request(monkeypatch, kwargs, match) -> None:
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
@@ -1490,6 +1530,59 @@ def test_update_custom_audience_named_labels_are_validated_before_any_request(mo
         asyncio.run(audiences.update_custom_audience(audience_id="aud_1", **kwargs))
     if "params" in kwargs:
         assert "params" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("labels", [[], "", "  "])
+def test_update_custom_audience_empty_labels_clear_the_set(monkeypatch, labels) -> None:
+    """R25 C4: audience_labels replaces the whole set, so an empty set is sent to clear it."""
+    client = RecordingAudienceClient(previous={
+        "id": "aud_1", "name": "Buyers", "audience_labels": ["GENERAL_CUSTOMERS", "AT_RISK"],
+    })
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", audience_labels=labels))
+    assert client.calls == [
+        ("get", "aud_1", [*OLD_AUDIENCE_READ_FIELDS, "audience_labels"], None),
+        ("update", "aud_1", {"audience_labels": []}),
+    ]
+    assert result["previous"]["audience_labels"] == ["GENERAL_CUSTOMERS", "AT_RISK"]
+    assert result["current"] == {"audience_labels": []}
+
+
+def test_update_custom_audience_empty_description_is_sent_to_clear_it(monkeypatch) -> None:
+    client = RecordingAudienceClient(previous={"id": "aud_1", "description": "Old"})
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.update_custom_audience(audience_id="aud_1", description=""))
+    assert client.calls[-1] == ("update", "aud_1", {"description": ""})
+    assert result["previous"]["description"] == "Old"
+    assert result["current"] == {"description": ""}
+
+
+@pytest.mark.parametrize("labels", [[], ""])
+def test_create_custom_audience_empty_labels_are_sent(monkeypatch, labels) -> None:
+    client = CreateRecorder()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    asyncio.run(audiences.create_custom_audience(
+        account_id="1", name="Example", customer_file_source="USER_PROVIDED_ONLY", audience_labels=labels,
+    ))
+    assert client.calls[0][3]["audience_labels"] == []
+
+
+@pytest.mark.parametrize("tool", ["create_custom_audience", "update_custom_audience"])
+def test_empty_audience_labels_pass_the_mcp_boundary(monkeypatch, tool) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAudienceClient(previous={"id": "aud_1", "audience_labels": ["AT_RISK"]})
+    client.calls = []
+
+    async def create_edge_object(parent_id, edge, *, data, files=None):
+        client.calls.append(("create", parent_id, edge, dict(data)))
+        return {"id": "aud_created"}
+
+    client.create_edge_object = create_edge_object
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    args = {"account_id": "1", "name": "Example"} if tool.startswith("create") else {"audience_id": "aud_1"}
+    asyncio.run(mcp_server.call_tool(tool, {**args, "audience_labels": []}))
+    assert client.calls[-1][-1]["audience_labels"] == []
 
 
 def test_update_custom_audience_labels_failed_pre_read_writes_nothing(monkeypatch) -> None:
