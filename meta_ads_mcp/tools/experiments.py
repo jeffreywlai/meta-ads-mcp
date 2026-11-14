@@ -20,7 +20,13 @@ from meta_ads_mcp.errors import (
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
-from meta_ads_mcp.normalize import blank_to_none, collection_fault, normalize_collection, read_collection_page
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    collection_fault,
+    names_other_object,
+    normalize_collection,
+    read_collection_page,
+)
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import StrictCurrencyAmount, StringList, coerce_csv_string_list
@@ -683,6 +689,14 @@ async def _resolve_business_id(client: Any, account_id: str, business_id: str | 
     if business_id:
         return business_id
     account = await client.get_object(account_id, fields=["business"])
+    # An answer about a different account does not say which business owns this one. act_123
+    # and 123 are one account; an answer with no readable id is read as before.
+    if names_other_object(account_id, account):
+        raise ValidationError(
+            "Meta's answer to the read of this ad account was about a different ad account, so the business "
+            "that owns this account is not known and nothing was sent. Meta creates studies on a business "
+            "(POST /{business_id}/ad_studies); pass business_id."
+        )
     business = account.get("business")
     resolved = business.get("id") if isinstance(business, dict) else business
     if not resolved:
@@ -2037,6 +2051,17 @@ async def create_lift_study(
     )
 
 
+_OTHER_STUDY_UPDATE = (
+    "Meta's answer to the read of this study was about a different study, so whether this time change is "
+    "allowed is not known. Nothing was changed; read the study with get_ad_study and try again."
+)
+_OTHER_STUDY_CANCEL = (
+    "Meta's answer to the read of this study was about a different study, so whether to delete it (not yet "
+    "started) or end it early (running) is not known. Nothing was sent; read the study with get_ad_study "
+    "and try again."
+)
+
+
 def _previous_study(previous: dict[str, Any], state: str) -> dict[str, Any]:
     return {
         "name": previous.get("name"),
@@ -2137,6 +2162,12 @@ async def update_ad_study(
     read_fields = [*STUDY_WRITE_READ_FIELDS, *(key for key in readable_changes if key not in STUDY_WRITE_READ_FIELDS)]
     client = get_graph_api_client()
     previous = await client.get_object(study_id, fields=read_fields)
+    # The read decides whether a time change may be sent; a name or description change does not
+    # depend on it, and then it only supplies previous.
+    if (start is not None or end is not None or observation_end is not None) and names_other_object(
+        study_id, previous
+    ):
+        raise MetaApiError(message=_OTHER_STUDY_UPDATE)
     now = _now()
     state = _study_state(previous, now)
     previous_start = _parse_meta_time(previous.get("start_time"))
@@ -2193,6 +2224,10 @@ async def cancel_ad_study(study_id: str) -> dict[str, Any]:
         raise ValidationError("study_id is required.")
     client = get_graph_api_client()
     previous = await client.get_object(study_id, fields=STUDY_WRITE_READ_FIELDS)
+    # The read chooses between deleting the study and moving its end time; an answer about a
+    # different study cannot make that choice.
+    if names_other_object(study_id, previous):
+        raise MetaApiError(message=_OTHER_STUDY_CANCEL)
     now = _now()
     state = _study_state(previous, now)
     prior = _previous_study(previous, state)
