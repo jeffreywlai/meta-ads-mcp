@@ -909,21 +909,28 @@ async def _chunked_video_upload(
             account, data={"upload_phase": "finish", "upload_session_id": session_id, **meta_fields},
         )
         if not (isinstance(finished, dict) and finished.get("success") is True):
+            # The finish was sent. Only an explicit false says it was not made; an answer
+            # that says neither leaves the video's state unknown.
+            progress["unknown"] = not (isinstance(finished, dict) and finished.get("success") is False)
             raise _ChunkedUploadStopped("Meta did not confirm the finish (no success: true in its answer).")
         # Meta has finished the video; a change while the finish was in flight is reported
         # with the result, never as a failure.
         changed_after = _video_file_change(video)
     except _ChunkedUploadStopped as stop:
-        raise MetaApiError(message=stopped_message(str(stop))) from None
+        raise MetaApiError(
+            message=stopped_message(str(stop)), mutation_outcome_unknown=bool(progress.get("unknown")),
+        ) from None
     except ValidationError as exc:
         raise MetaApiError(message=stopped_message(str(exc))) from None
     except Exception as exc:
-        progress["unknown"] = _outcome_unknown(exc)
+        meta_error = isinstance(exc, (MetaApiError, RateLimitError))
+        # A failure in this server while the finish was in flight may have come after Meta took it.
+        progress["unknown"] = _outcome_unknown(exc) or (not meta_error and progress["phase"] == "finish")
         message = stopped_message(_failure_reason(exc))
-        if isinstance(exc, (MetaApiError, RateLimitError)):
+        if meta_error:
             exc.message = message
             raise
-        raise MetaApiError(message=message) from exc
+        raise MetaApiError(message=message, mutation_outcome_unknown=bool(progress["unknown"])) from exc
     return {
         "video_id": video_id or None,
         "finish": finished,
@@ -2688,7 +2695,11 @@ async def _boost_instagram_post(
     )
     creative_id = str(creative.get("id") or "")
     if not creative_id:
-        raise ValidationError("Meta did not return a creative id, so no ad was created.")
+        # Meta accepted the request and named nothing, so a creative may exist.
+        raise ValidationError(
+            "Meta accepted the creative request but did not return a creative id, so no ad was created. "
+            "A creative may have been created; look for it in the account before retrying."
+        )
     try:
         ad = await client.create_edge_object(
             resolved_account_id,

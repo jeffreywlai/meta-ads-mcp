@@ -448,6 +448,27 @@ class FakeBoostClient:
         return {"id": "ad_boost"}
 
 
+def test_boost_creative_accepted_without_an_id_says_a_creative_may_exist(monkeypatch) -> None:
+    """After review R20: Meta accepted the create and named nothing, so the creative may exist."""
+    from meta_ads_mcp.errors import ValidationError
+
+    class NoIdClient(FakeBoostClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            self.calls.append(("create", parent_id, edge, data))
+            return {}
+
+    client = NoIdClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(ValidationError) as raised:
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="123", adset_id="adset_1", instagram_media_id="media_1",
+            instagram_account_id="ig_1", page_id="page_1", name="Boost post",
+        ))
+    assert [call[2] for call in client.calls if call[0] == "create"] == ["adcreatives"]
+    assert "no ad was created" in str(raised.value)
+    assert "A creative may have been created; look for it in the account before retrying" in str(raised.value)
+
+
 def test_boost_instagram_post_creates_paused_ad(monkeypatch) -> None:
     client = FakeBoostClient()
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
@@ -1635,8 +1656,39 @@ def test_upload_ad_video_chunked_finish_without_success_is_not_reported_as_uploa
     _large_video(monkeypatch, tmp_path)
     client = ChunkedVideoClient(finish={"success": False})
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
-    with pytest.raises(MetaApiError, match="did not confirm"):
+    with pytest.raises(MetaApiError, match="did not confirm") as raised:
         asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    # An explicit false is a refusal: the session was not finished.
+    assert raised.value.mutation_outcome_unknown is False
+    assert "The session was not finished" in raised.value.message
+
+
+@pytest.mark.parametrize("finish", [{}, {"success": None}, {"success": "true"}, {"id": "7001"}])
+def test_upload_ad_video_chunked_finish_that_says_neither_leaves_the_outcome_unknown(monkeypatch, tmp_path, finish) -> None:
+    """R20 B1: the finish was sent, and its answer neither confirms nor refuses it."""
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(finish=finish)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="did not confirm") as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert raised.value.mutation_outcome_unknown is True
+    assert "may have been accepted" in raised.value.message
+    assert "list_ad_videos(video_ids=['7001'])" in raised.value.message
+    assert "The session was not finished" not in raised.value.message
+
+
+def test_upload_ad_video_chunked_finish_that_fails_in_this_server_leaves_the_outcome_unknown(monkeypatch, tmp_path) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+    client = ChunkedVideoClient(fail={("finish", 0): RuntimeError("late")})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+    assert raised.value.mutation_outcome_unknown is True
+    assert "may have been accepted" in raised.value.message
 
 
 def test_upload_ad_video_chunked_transfer_request_cap(monkeypatch, tmp_path) -> None:

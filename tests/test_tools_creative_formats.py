@@ -2838,3 +2838,4 @@ def test_a_creative_with_the_explicit_setting_is_still_read() -> None:
     answer = {"id": "20", "object_story_spec": {"whats_app_business_phone_number": "15550100"}}
     values, reason, error = asyncio.run(cf._read_explicit_story_settings(_OneAnswerClient(answer), "20"))
     assert (values, reason, error) == ({"whats_app_business_phone_number": "15550100"}, None, None)
+
