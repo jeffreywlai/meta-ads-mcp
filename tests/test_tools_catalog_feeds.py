@@ -149,15 +149,15 @@ EXPECTED_PIXEL_CANDIDATE_FIELDS = ["id", "name", "last_fired_time", "is_unavaila
 
 def test_list_product_feeds_lists_catalog_edge_with_paging(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "product_feeds"): {
+        ("900001", "product_feeds"): {
             "data": [{"id": "feed_1", "name": "Main"}],
             "paging": {"cursors": {"after": "c2"}, "next": "https://graph.facebook.com/next"},
         },
     }))
-    result = run(catalog_feeds.list_product_feeds(catalog_id="cat_1", limit=10, after="c1"))
+    result = run(catalog_feeds.list_product_feeds(catalog_id="900001", limit=10, after="c1"))
     call = client.calls[0]
     assert call["method"] == "list_objects"
-    assert (call["parent_id"], call["edge"]) == ("cat_1", "product_feeds")
+    assert (call["parent_id"], call["edge"]) == ("900001", "product_feeds")
     assert call["params"] == {"limit": 10, "after": "c1"}
     assert call["fields"] == [*EXPECTED_FEED_LIST_FIELDS, "supplementary_feeds"]
     assert result["items"] == [{"id": "feed_1", "name": "Main"}]
@@ -166,7 +166,7 @@ def test_list_product_feeds_lists_catalog_edge_with_paging(monkeypatch) -> None:
 
 def test_list_product_feeds_one_feed_returns_settings_schedule_and_latest_upload(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(objects={
-        "feed_1": {"id": "feed_1", "schedule": {"interval": "DAILY"}, "latest_upload": {"id": "up_1"}},
+        "feed_1": {"id": "feed_1", "schedule": {"interval": "DAILY"}, "latest_upload": {"id": "940001"}},
     }))
     result = run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
     call = client.calls[0]
@@ -175,11 +175,11 @@ def test_list_product_feeds_one_feed_returns_settings_schedule_and_latest_upload
     assert call["fields"] == [*EXPECTED_FEED_FIELDS, "supplementary_feeds"]
     assert "schedule" in call["fields"] and "update_schedule" in call["fields"]
     assert any(field.startswith("latest_upload{") for field in call["fields"])
-    assert result["item"]["latest_upload"] == {"id": "up_1"}
+    assert result["item"]["latest_upload"] == {"id": "940001"}
     assert result["summary"] == {"count": 1}
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"catalog_id": "cat_1", "feed_id": "feed_1"}, {"catalog_id": " "}, {"catalog_id": "cat_1", "limit": 0}])
+@pytest.mark.parametrize("kwargs", [{}, {"catalog_id": "900001", "feed_id": "feed_1"}, {"catalog_id": " "}, {"catalog_id": "900001", "limit": 0}])
 def test_list_product_feeds_requires_exactly_one_scope(monkeypatch, kwargs) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError):
@@ -187,9 +187,9 @@ def test_list_product_feeds_requires_exactly_one_scope(monkeypatch, kwargs) -> N
 
 
 def test_list_product_feeds_permission_error_is_not_swallowed(monkeypatch) -> None:
-    _use(monkeypatch, FakeCatalogFeedClient(errors={("cat_1", "product_feeds"): _permission_error()}))
+    _use(monkeypatch, FakeCatalogFeedClient(errors={("900001", "product_feeds"): _permission_error()}))
     with pytest.raises(MetaApiError, match="catalog_management"):
-        run(catalog_feeds.list_product_feeds(catalog_id="cat_1"))
+        run(catalog_feeds.list_product_feeds(catalog_id="900001"))
 
 
 # create_product_feed ----------------------------------------------------------------
@@ -198,13 +198,13 @@ def test_list_product_feeds_permission_error_is_not_swallowed(monkeypatch) -> No
 def test_create_product_feed_sends_name_schedule_and_options(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
     result = run(catalog_feeds.create_product_feed(
-        catalog_id="cat_1", name="Main feed", schedule=SCHEDULE,
+        catalog_id="900001", name="Main feed", schedule=SCHEDULE,
         update_schedule={"url": "http://example.com/prices.csv", "interval": "HOURLY"},
         file_name="feed.csv", default_currency="usd", country="us",
         delimiter="COMMA",
     ))
     call = client.calls[0]
-    assert (call["method"], call["parent_id"], call["edge"]) == ("create_edge_object", "cat_1", "product_feeds")
+    assert (call["method"], call["parent_id"], call["edge"]) == ("create_edge_object", "900001", "product_feeds")
     assert call["data"] == {
         "name": "Main feed",
         "schedule": {"url": "https://example.com/feed.csv", "interval": "DAILY", "hour": 22},
@@ -216,13 +216,13 @@ def test_create_product_feed_sends_name_schedule_and_options(monkeypatch) -> Non
     }
     assert result["ok"] is True
     assert result["action"] == "create_product_feed"
-    assert result["target"] == {"catalog_id": "cat_1"}
+    assert result["target"] == {"catalog_id": "900001"}
     assert result["created"] == {"id": "created_1"}
 
 
 def test_create_product_feed_without_schedule_sends_only_name(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
-    run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Manual feed"))
+    run(catalog_feeds.create_product_feed(catalog_id="900001", name="Manual feed"))
     assert client.calls[0]["data"] == {"name": "Manual feed"}
 
 
@@ -240,15 +240,15 @@ def test_create_product_feed_without_schedule_sends_only_name(monkeypatch) -> No
 def test_create_feed_schedule_validates_interval_and_url(monkeypatch, schedule) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError):
-        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", schedule=schedule))
+        run(catalog_feeds.create_product_feed(catalog_id="900001", name="Feed", schedule=schedule))
     with pytest.raises(ValidationError):
-        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", update_schedule=schedule))
+        run(catalog_feeds.create_product_feed(catalog_id="900001", name="Feed", update_schedule=schedule))
 
 
 def test_create_feed_schedule_accepts_documented_ftp_url(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
     run(catalog_feeds.create_product_feed(
-        catalog_id="cat_1", name="Feed",
+        catalog_id="900001", name="Feed",
         schedule={"url": "ftp://example.com/feed.csv", "interval": "weekly", "day_of_week": "monday"},
     ))
     assert client.calls[0]["data"]["schedule"] == {
@@ -259,7 +259,7 @@ def test_create_feed_schedule_accepts_documented_ftp_url(monkeypatch) -> None:
 def test_create_product_feed_response_never_echoes_schedule_password(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
     result = run(catalog_feeds.create_product_feed(
-        catalog_id="cat_1", name="Feed",
+        catalog_id="900001", name="Feed",
         schedule={**SCHEDULE, "username": "feeduser", "password": "s3cret-value"},
     ))
     assert client.calls[0]["data"]["schedule"]["password"] == "s3cret-value"
@@ -268,9 +268,9 @@ def test_create_product_feed_response_never_echoes_schedule_password(monkeypatch
 
 @pytest.mark.parametrize("kwargs", [
     {"catalog_id": " ", "name": "Feed"},
-    {"catalog_id": "cat_1", "name": " "},
-    {"catalog_id": "cat_1", "name": "Feed", "params": {"name": "other"}},
-    {"catalog_id": "cat_1", "name": "Feed", "params": {"schedule": {}}},
+    {"catalog_id": "900001", "name": " "},
+    {"catalog_id": "900001", "name": "Feed", "params": {"name": "other"}},
+    {"catalog_id": "900001", "name": "Feed", "params": {"schedule": {}}},
 ])
 def test_create_product_feed_rejects_bad_input_before_any_call(monkeypatch, kwargs) -> None:
     _no_client(monkeypatch)
@@ -436,13 +436,13 @@ def _upload_errors(_params):
 
 def test_feed_uploads_errors_ordered_by_rows_affected(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "start_time": "2026-11-01T00:00:00+0000", "end_time": "2026-11-01T00:05:00+0000", "error_count": 2, "warning_count": 2}},
-        edges={("up_1", "errors"): _upload_errors},
+        objects={"940001": {"id": "940001", "start_time": "2026-11-01T00:00:00+0000", "end_time": "2026-11-01T00:05:00+0000", "error_count": 2, "warning_count": 2}},
+        edges={("940001", "errors"): _upload_errors},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1"))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001"))
     assert [call["method"] for call in client.calls] == ["get_object", "list_objects"]
     assert client.calls[0]["fields"] == EXPECTED_UPLOAD_FIELDS
-    assert (client.calls[1]["parent_id"], client.calls[1]["edge"]) == ("up_1", "errors")
+    assert (client.calls[1]["parent_id"], client.calls[1]["edge"]) == ("940001", "errors")
     assert client.calls[1]["fields"] == EXPECTED_UPLOAD_ERROR_FIELDS
     item = result["item"]
     assert [error["id"] for error in item["errors"]] == ["e2", "e3", "e1", "e4"]
@@ -453,32 +453,32 @@ def test_feed_uploads_errors_ordered_by_rows_affected(monkeypatch) -> None:
 def test_list_product_feed_uploads_lists_feed_edge_and_fetches_errors_only_when_present(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
         ("feed_1", "uploads"): {"data": [
-            {"id": "up_2", "start_time": "2026-11-02T00:00:00+0000"},
-            {"id": "up_1", "end_time": "2026-11-01T00:05:00+0000", "error_count": 0, "warning_count": 0},
-            {"id": "up_0", "end_time": "2026-10-31T00:05:00+0000", "error_count": 1, "warning_count": 0},
+            {"id": "940002", "start_time": "2026-11-02T00:00:00+0000"},
+            {"id": "940001", "end_time": "2026-11-01T00:05:00+0000", "error_count": 0, "warning_count": 0},
+            {"id": "940000", "end_time": "2026-10-31T00:05:00+0000", "error_count": 1, "warning_count": 0},
         ]},
-        ("up_0", "errors"): _upload_errors,
-        ("up_2", "errors"): {"data": []},
+        ("940000", "errors"): _upload_errors,
+        ("940002", "errors"): {"data": []},
     }))
     result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", limit=3))
     first = client.calls[0]
     assert (first["parent_id"], first["edge"], first["params"]) == ("feed_1", "uploads", {"limit": 3})
     assert first["fields"] == EXPECTED_UPLOAD_FIELDS
     error_parents = [call["parent_id"] for call in client.calls if call.get("edge") == "errors"]
-    assert error_parents == ["up_2", "up_0"]
+    assert error_parents == ["940002", "940000"]
     items = {item["id"]: item for item in result["items"]}
-    assert items["up_2"]["status"] == "in_progress"
-    assert items["up_1"]["errors"] == []
-    assert items["up_0"]["errors"][0]["id"] == "e2"
+    assert items["940002"]["status"] == "in_progress"
+    assert items["940001"]["errors"] == []
+    assert items["940000"]["errors"][0]["id"] == "e2"
     assert result["summary"]["complete"] is True
 
 
 def test_list_product_feed_uploads_reports_truncated_error_list(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 500}},
-        edges={("up_1", "errors"): {"data": [{"id": "e1", "total_count": 1}], "paging": {"next": "https://next", "cursors": {"after": "x"}}}},
+        objects={"940001": {"id": "940001", "error_count": 500}},
+        edges={("940001", "errors"): {"data": [{"id": "e1", "total_count": 1}], "paging": {"next": "https://next", "cursors": {"after": "x"}}}},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1"))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001"))
     assert result["item"]["errors_complete"] is False
 
 
@@ -581,73 +581,73 @@ def test_delete_feed_rule_docstring_says_feed_and_products_unaffected() -> None:
 # event sources ---------------------------------------------------------------------------
 
 SOURCES = {"data": [
-    {"id": "px_1", "name": "Site pixel", "source_type": "PIXEL"},
-    {"id": "app_1", "name": "Shop app", "source_type": "APP"},
+    {"id": "920001", "name": "Site pixel", "source_type": "PIXEL"},
+    {"id": "930001", "name": "Shop app", "source_type": "APP"},
 ]}
 
 
 def test_list_catalog_event_sources_reads_external_event_sources_edge(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
-    result = run(catalog_feeds.list_catalog_event_sources(catalog_id="cat_1"))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): SOURCES}))
+    result = run(catalog_feeds.list_catalog_event_sources(catalog_id="900001"))
     call = client.calls[0]
-    assert (call["parent_id"], call["edge"], call["fields"]) == ("cat_1", "external_event_sources", EXPECTED_EVENT_SOURCE_FIELDS)
+    assert (call["parent_id"], call["edge"], call["fields"]) == ("900001", "external_event_sources", EXPECTED_EVENT_SOURCE_FIELDS)
     assert call["params"] == {"limit": 100}
-    assert [item["id"] for item in result["items"]] == ["px_1", "app_1"]
+    assert [item["id"] for item in result["items"]] == ["920001", "930001"]
 
 
 def test_list_catalog_event_sources_permission_error_is_not_swallowed(monkeypatch) -> None:
-    _use(monkeypatch, FakeCatalogFeedClient(errors={("cat_1", "external_event_sources"): _permission_error()}))
+    _use(monkeypatch, FakeCatalogFeedClient(errors={("900001", "external_event_sources"): _permission_error()}))
     with pytest.raises(MetaApiError):
-        run(catalog_feeds.list_catalog_event_sources(catalog_id="cat_1"))
+        run(catalog_feeds.list_catalog_event_sources(catalog_id="900001"))
 
 
 def test_list_event_source_catalogs_scans_business_catalogs(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1", "name": "A"}, {"id": "cat_2", "name": "B"}]},
-        ("cat_1", "external_event_sources"): SOURCES,
-        ("cat_2", "external_event_sources"): {"data": [{"id": "px_9"}]},
+        ("910001", "owned_product_catalogs"): {"data": [{"id": "900001", "name": "A"}, {"id": "900002", "name": "B"}]},
+        ("900001", "external_event_sources"): SOURCES,
+        ("900002", "external_event_sources"): {"data": [{"id": "920009"}]},
     }))
-    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001"))
     first = client.calls[0]
-    assert (first["parent_id"], first["edge"]) == ("biz_1", "owned_product_catalogs")
+    assert (first["parent_id"], first["edge"]) == ("910001", "owned_product_catalogs")
     assert first["fields"] == EXPECTED_CATALOG_SCAN_FIELDS
-    assert [item["id"] for item in result["items"]] == ["cat_1"]
+    assert [item["id"] for item in result["items"]] == ["900001"]
     assert result["summary"]["catalogs_scanned"] == 2
     assert result["summary"]["complete"] is True
-    assert result["summary"]["business_id"] == "biz_1"
+    assert result["summary"]["business_id"] == "910001"
     assert "derived" in result["summary"]["method"]
 
 
 def test_list_event_source_catalogs_uses_pixel_owner_business(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"px_1": {"id": "px_1", "owner_business": {"id": "biz_7", "name": "Biz"}}},
-        edges={("biz_7", "owned_product_catalogs"): {"data": []}},
+        objects={"920001": {"id": "920001", "owner_business": {"id": "910007", "name": "Biz"}}},
+        edges={("910007", "owned_product_catalogs"): {"data": []}},
     ))
-    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1"))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="920001"))
     assert client.calls[0]["method"] == "get_object"
     assert client.calls[0]["fields"] == ["id", "owner_business"]
-    assert client.calls[1]["parent_id"] == "biz_7"
+    assert client.calls[1]["parent_id"] == "910007"
     assert result["items"] == []
-    assert result["summary"]["business_id"] == "biz_7"
+    assert result["summary"]["business_id"] == "910007"
 
 
 def test_list_event_source_catalogs_without_owner_business_asks_for_business_id(monkeypatch) -> None:
-    _use(monkeypatch, FakeCatalogFeedClient(objects={"px_1": {"id": "px_1"}}))
+    _use(monkeypatch, FakeCatalogFeedClient(objects={"920001": {"id": "920001"}}))
     with pytest.raises(ValidationError, match="business_id"):
-        run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1"))
+        run(catalog_feeds.list_event_source_catalogs(event_source_id="920001"))
 
 
 def test_list_event_source_catalogs_reports_incomplete_scan(monkeypatch) -> None:
     def endless(params):
         page = int(params.get("after") or 0)
         return {
-            "data": [{"id": f"cat_{page}_{i}"} for i in range(params["limit"])],
+            "data": [{"id": f"{800000 + page * 1000 + i}"} for i in range(params["limit"])],
             "paging": {"next": "https://next", "cursors": {"after": str(page + 1)}},
         }
 
-    client = FakeCatalogFeedClient(edges={("biz_1", "owned_product_catalogs"): endless})
+    client = FakeCatalogFeedClient(edges={("910001", "owned_product_catalogs"): endless})
     _use(monkeypatch, client)
-    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001"))
     assert result["summary"]["complete"] is False
     assert result["summary"]["catalogs_scanned"] == 50
     assert "incomplete" in result["summary"]["note"]
@@ -656,11 +656,11 @@ def test_list_event_source_catalogs_reports_incomplete_scan(monkeypatch) -> None
 
 def test_list_event_source_catalogs_next_page_without_cursor_is_not_complete(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("biz_1", "owned_product_catalogs"): {
+        ("910001", "owned_product_catalogs"): {
             "data": [], "paging": {"next": "https://graph.invalid/?after=unextracted"},
         },
     }))
-    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001"))
     assert result["summary"]["complete"] is False
     assert any("no cursor" in reason for reason in result["summary"]["stop_reasons"])
     assert "no cursor" in result["summary"]["note"]
@@ -668,68 +668,68 @@ def test_list_event_source_catalogs_next_page_without_cursor_is_not_complete(mon
 
 def test_list_event_source_catalogs_catalog_sources_without_cursor_is_not_complete(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1"}]},
-        ("cat_1", "external_event_sources"): {
-            "data": [{"id": "px_9"}], "paging": {"next": "https://graph.invalid/next"},
+        ("910001", "owned_product_catalogs"): {"data": [{"id": "900001"}]},
+        ("900001", "external_event_sources"): {
+            "data": [{"id": "920009"}], "paging": {"next": "https://graph.invalid/next"},
         },
     }))
-    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001"))
     assert result["summary"]["complete"] is False
     assert result["summary"]["stop_reasons"] == [
-        "external_event_sources of cat_1: Meta reported another page but gave no cursor to read it.",
+        "external_event_sources of 900001: Meta reported another page but gave no cursor to read it.",
     ]
 
 
 def test_list_event_source_catalogs_permission_error_is_not_swallowed(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(
-        edges={("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1"}]}},
-        errors={("cat_1", "external_event_sources"): _permission_error()},
+        edges={("910001", "owned_product_catalogs"): {"data": [{"id": "900001"}]}},
+        errors={("900001", "external_event_sources"): _permission_error()},
     ))
     with pytest.raises(MetaApiError):
-        run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+        run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001"))
 
 
 def test_connect_catalog_event_source_reads_then_posts(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): {"data": [{"id": "app_1"}]}}))
-    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): {"data": [{"id": "930001"}]}}))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="900001", event_source_id="920001"))
     assert client.methods() == ["list_objects", "create_edge_object"]
     post = client.calls[1]
-    assert (post["parent_id"], post["edge"], post["data"]) == ("cat_1", "external_event_sources", {"external_event_sources": ["px_1"]})
+    assert (post["parent_id"], post["edge"], post["data"]) == ("900001", "external_event_sources", {"external_event_sources": ["920001"]})
     assert result["action"] == "connect_catalog_event_source"
-    assert result["previous"] == {"connected_event_source_ids": ["app_1"]}
-    assert result["current"] == {"connected_event_source_ids": ["app_1", "px_1"]}
+    assert result["previous"] == {"connected_event_source_ids": ["930001"]}
+    assert result["current"] == {"connected_event_source_ids": ["930001", "920001"]}
 
 
 def test_connect_already_connected_source_sends_no_write(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
-    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): SOURCES}))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="900001", event_source_id="920001"))
     assert client.methods() == ["list_objects"]
     assert result["ok"] is True
     assert result["current"]["already_connected"] is True
 
 
 def test_disconnect_catalog_event_source_reads_then_deletes_with_parameter(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
-    result = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): SOURCES}))
+    result = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="900001", event_source_id="920001"))
     assert client.methods() == ["list_objects", "delete_edge_object"]
     delete = client.calls[1]
-    assert (delete["parent_id"], delete["edge"], delete["data"]) == ("cat_1", "external_event_sources", {"external_event_sources": ["px_1"]})
-    assert result["previous"]["connected_event_source_ids"] == ["px_1", "app_1"]
-    assert result["previous"]["event_source"] == {"id": "px_1", "name": "Site pixel", "source_type": "PIXEL"}
-    assert result["current"] == {"connected_event_source_ids": ["app_1"]}
+    assert (delete["parent_id"], delete["edge"], delete["data"]) == ("900001", "external_event_sources", {"external_event_sources": ["920001"]})
+    assert result["previous"]["connected_event_source_ids"] == ["920001", "930001"]
+    assert result["previous"]["event_source"] == {"id": "920001", "name": "Site pixel", "source_type": "PIXEL"}
+    assert result["current"] == {"connected_event_source_ids": ["930001"]}
 
 
 def test_disconnect_source_not_connected_sends_no_delete(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): SOURCES}))
     with pytest.raises(ValidationError, match="not connected"):
-        run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_404"))
+        run(catalog_feeds.disconnect_catalog_event_source(catalog_id="900001", event_source_id="920404"))
     assert client.methods() == ["list_objects"]
 
 
 def test_connect_and_disconnect_report_complete_prior_list(monkeypatch) -> None:
-    _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): SOURCES}))
-    connected = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_2"))
-    disconnected = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+    _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): SOURCES}))
+    connected = run(catalog_feeds.connect_catalog_event_source(catalog_id="900001", event_source_id="920002"))
+    disconnected = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="900001", event_source_id="920001"))
     for result in (connected, disconnected):
         assert result["previous_complete"] is True
         assert result["missing_signals"] == []
@@ -739,14 +739,14 @@ def _capped_sources(params):
     """A connected-source list longer than the five pages the pre-read takes."""
     page = int(params.get("after") or 0)
     return {
-        "data": [{"id": f"px_{page}_{i}"} for i in range(params["limit"])],
+        "data": [{"id": f"{810000 + page * 1000 + i}"} for i in range(params["limit"])],
         "paging": {"next": "https://next", "cursors": {"after": str(page + 1)}},
     }
 
 
 def test_connect_with_capped_pre_read_marks_lists_partial(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): _capped_sources}))
-    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_new"))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): _capped_sources}))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="900001", event_source_id="920101"))
     assert client.methods() == ["list_objects"] * 5 + ["create_edge_object"]
     assert result["previous_complete"] is False
     assert len(result["previous"]["connected_event_source_ids"]) == 500
@@ -756,9 +756,9 @@ def test_connect_with_capped_pre_read_marks_lists_partial(monkeypatch) -> None:
 
 def test_connect_with_partial_pre_read_seen_source_is_already_connected(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}], "paging": {"next": "https://graph.invalid/next"}},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001"}], "paging": {"next": "https://graph.invalid/next"}},
     }))
-    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="900001", event_source_id="920001"))
     assert client.methods() == ["list_objects"]
     assert result["current"]["already_connected"] is True
     assert result["previous_complete"] is False
@@ -766,8 +766,8 @@ def test_connect_with_partial_pre_read_seen_source_is_already_connected(monkeypa
 
 
 def test_disconnect_with_partial_pre_read_sends_request_and_says_prior_state_unconfirmed(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("cat_1", "external_event_sources"): _capped_sources}))
-    result = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_beyond_cap"))
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("900001", "external_event_sources"): _capped_sources}))
+    result = run(catalog_feeds.disconnect_catalog_event_source(catalog_id="900001", event_source_id="px_beyond_cap"))
     assert client.methods() == ["list_objects"] * 5 + ["delete_edge_object"]
     assert client.calls[-1]["data"] == {"external_event_sources": ["px_beyond_cap"]}
     assert result["previous_complete"] is False
@@ -777,14 +777,14 @@ def test_disconnect_with_partial_pre_read_sends_request_and_says_prior_state_unc
 
 
 def test_disconnect_read_failure_sends_no_delete(monkeypatch) -> None:
-    client = _use(monkeypatch, FakeCatalogFeedClient(errors={("cat_1", "external_event_sources"): _permission_error()}))
+    client = _use(monkeypatch, FakeCatalogFeedClient(errors={("900001", "external_event_sources"): _permission_error()}))
     with pytest.raises(MetaApiError):
-        run(catalog_feeds.disconnect_catalog_event_source(catalog_id="cat_1", event_source_id="px_1"))
+        run(catalog_feeds.disconnect_catalog_event_source(catalog_id="900001", event_source_id="920001"))
     assert client.methods() == ["list_objects"]
 
 
 @pytest.mark.parametrize("tool", ["connect_catalog_event_source", "disconnect_catalog_event_source"])
-@pytest.mark.parametrize("kwargs", [{"catalog_id": " ", "event_source_id": "px_1"}, {"catalog_id": "cat_1", "event_source_id": ""}])
+@pytest.mark.parametrize("kwargs", [{"catalog_id": " ", "event_source_id": "920001"}, {"catalog_id": "900001", "event_source_id": ""}])
 def test_connect_and_disconnect_validate_ids_before_any_call(monkeypatch, tool, kwargs) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError):
@@ -806,7 +806,7 @@ def test_connect_and_disconnect_are_blocked_in_read_only(monkeypatch, name, rout
         components = mcp_server.local_provider._components.values()
         contracts = build_tool_contracts([c for c in components if getattr(c, "name", None)])
         assert contracts[name].effect == "write"
-        arguments = {"catalog_id": "cat_1", "event_source_id": "px_1"}
+        arguments = {"catalog_id": "900001", "event_source_id": "920001"}
         tool, payload = ("call_tool", {"name": name, "arguments": arguments}) if routed else (name, arguments)
         with pytest.raises(ToolError, match="META_READ_ONLY"):
             run(mcp_server.call_tool(tool, payload))
@@ -851,27 +851,27 @@ def _stat(day: str, source: str, event: str, matched: int, unmatched: int) -> di
 
 def test_event_source_health_includes_28_day_history_when_present_and_says_when_absent(monkeypatch) -> None:
     stats = {"data": [
-        _stat("2026-11-01", "px_1", "ViewContent", 90, 10),
-        _stat("2026-11-01", "px_1", "Purchase", 10, 0),
-        _stat("2026-11-02", "px_1", "ViewContent", 40, 60),
+        _stat("2026-11-01", "920001", "ViewContent", 90, 10),
+        _stat("2026-11-01", "920001", "Purchase", 10, 0),
+        _stat("2026-11-02", "920001", "ViewContent", 40, 60),
     ]}
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): SOURCES,
-        ("cat_1", "event_stats"): stats,
-        ("px_1", "da_checks"): {"data": [
+        ("900001", "external_event_sources"): SOURCES,
+        ("900001", "event_stats"): stats,
+        ("920001", "da_checks"): {"data": [
             {"key": "pixel_missing_dpa_event", "title": "Pixel is not sending DPA events", "result": "failed"},
             {"key": "pixel_decline", "title": "Decline", "result": "passed"},
         ]},
-        ("app_1", "da_checks"): {"data": []},
+        ("930001", "da_checks"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     stats_call = next(call for call in client.calls if call.get("edge") == "event_stats")
     assert stats_call["fields"] == EXPECTED_EVENT_STAT_FIELDS
     check_calls = [call for call in client.calls if call.get("edge") == "da_checks"]
     assert check_calls and all(call["fields"] == EXPECTED_DA_CHECK_FIELDS for call in check_calls)
     sources = {source["id"]: source for source in result["sources"]}
 
-    pixel = sources["px_1"]
+    pixel = sources["920001"]
     assert pixel["history_available"] is True
     assert pixel["match_rate_history"] == [
         {"date": "2026-11-01", "matched_content_ids": 100, "unmatched_content_ids": 10, "match_rate": 0.9091},
@@ -881,10 +881,10 @@ def test_event_source_health_includes_28_day_history_when_present_and_says_when_
     assert pixel["by_event"]["ViewContent"]["match_rate"] == round(130 / 200, 4)
     assert [check["key"] for check in pixel["failed_checks"]] == ["pixel_missing_dpa_event"]
 
-    app = sources["app_1"]
+    app = sources["930001"]
     assert app["history_available"] is False
     assert app["match_rate_history"] == []
-    assert any("app_1" in signal and "28" in signal for signal in result["missing_signals"])
+    assert any("930001" in signal and "28" in signal for signal in result["missing_signals"])
 
     finding_types = [finding["type"] for finding in result["findings"]]
     assert "failed_dynamic_ads_check" in finding_types
@@ -897,73 +897,73 @@ def test_event_source_health_includes_28_day_history_when_present_and_says_when_
 
 def test_event_source_health_no_connected_sources_is_a_finding(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": []},
-        ("cat_1", "event_stats"): {"data": []},
+        ("900001", "external_event_sources"): {"data": []},
+        ("900001", "event_stats"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     assert result["sources"] == []
     assert result["findings"][0]["type"] == "no_connected_event_sources"
 
 
 def test_event_source_health_skips_checks_for_unconfirmed_source_types(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "ds_1", "source_type": "OFFLINE"}]},
-        ("cat_1", "event_stats"): {"data": []},
+        ("900001", "external_event_sources"): {"data": [{"id": "980001", "source_type": "OFFLINE"}]},
+        ("900001", "event_stats"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     assert not any(call.get("edge") == "da_checks" for call in client.calls)
-    assert any("ds_1" in signal and "da_checks" in signal for signal in result["missing_signals"])
+    assert any("980001" in signal and "da_checks" in signal for signal in result["missing_signals"])
 
 
 @pytest.mark.parametrize("result_value", ["unavailable", None, "skipped"])
 def test_event_source_health_unevaluated_check_is_a_missing_signal_not_a_pass(monkeypatch, result_value) -> None:
     check = {"key": "pixel_missing_dpa_event", "result": result_value}
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 100, 0)]},
-        ("px_1", "da_checks"): {"data": [check]},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): {"data": [_stat("2026-11-01", "920001", "ViewContent", 100, 0)]},
+        ("920001", "da_checks"): {"data": [check]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     pixel = result["sources"][0]
     assert pixel["failed_checks"] == []
     assert pixel["unevaluated_checks"] == [check]
     assert any(
-        "pixel_missing_dpa_event" in signal and "px_1" in signal and "could not be evaluated" in signal
+        "pixel_missing_dpa_event" in signal and "920001" in signal and "could not be evaluated" in signal
         for signal in result["missing_signals"]
     )
 
 
 def test_event_source_health_empty_or_paged_checks_are_missing_signals(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [
-            {"id": "px_1", "source_type": "PIXEL"}, {"id": "px_2", "source_type": "PIXEL"},
+        ("900001", "external_event_sources"): {"data": [
+            {"id": "920001", "source_type": "PIXEL"}, {"id": "920002", "source_type": "PIXEL"},
         ]},
-        ("cat_1", "event_stats"): {"data": [
-            _stat("2026-11-01", "px_1", "ViewContent", 100, 0),
-            _stat("2026-11-01", "px_2", "ViewContent", 100, 0),
+        ("900001", "event_stats"): {"data": [
+            _stat("2026-11-01", "920001", "ViewContent", 100, 0),
+            _stat("2026-11-01", "920002", "ViewContent", 100, 0),
         ]},
-        ("px_1", "da_checks"): {"data": []},
-        ("px_2", "da_checks"): {
+        ("920001", "da_checks"): {"data": []},
+        ("920002", "da_checks"): {
             "data": [{"key": "pixel_missing_dpa_event", "result": "passed"}],
             "paging": {"next": "https://next", "cursors": {"after": "c2"}},
         },
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
-    assert "Meta returned no Dynamic Ads checks for source px_1." in result["missing_signals"]
-    assert "da_checks for source px_2 had more pages than were read." in result["missing_signals"]
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
+    assert "Meta returned no Dynamic Ads checks for source 920001." in result["missing_signals"]
+    assert "da_checks for source 920002 had more pages than were read." in result["missing_signals"]
 
 
 @pytest.mark.parametrize("omitted", ["total_matched_content_ids", "total_unmatched_content_ids"])
 def test_event_source_health_omitted_counter_is_unknown_not_zero(monkeypatch, omitted) -> None:
-    complete_row = _stat("2026-11-01", "px_1", "ViewContent", 100, 0)
-    partial_row = _stat("2026-11-02", "px_1", "ViewContent", 50, 50)
+    complete_row = _stat("2026-11-01", "920001", "ViewContent", 100, 0)
+    partial_row = _stat("2026-11-02", "920001", "ViewContent", 50, 50)
     del partial_row[omitted]
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): {"data": [complete_row, partial_row]},
-        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): {"data": [complete_row, partial_row]},
+        ("920001", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     pixel = result["sources"][0]
     assert pixel["window_match_rate"] is None
     if omitted == "total_matched_content_ids":
@@ -982,14 +982,14 @@ def test_event_source_health_omitted_counter_is_unknown_not_zero(monkeypatch, om
 
 
 def test_recommendations_omitted_counter_makes_totals_unknown(monkeypatch) -> None:
-    row = _stat("2026-11-01", "px_1", "ViewContent", 100, 0)
+    row = _stat("2026-11-01", "920001", "ViewContent", 100, 0)
     del row["total_unmatched_content_ids"]
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): {"data": [row]},
-        ("biz_1", "adspixels"): {"data": []},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): {"data": [row]},
+        ("910001", "adspixels"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001", business_id="910001"))
     assert result["metrics"]["matched_content_ids_28d"] == 100
     assert result["metrics"]["unmatched_content_ids_28d"] is None
     assert result["metrics"]["match_rate_28d"] is None
@@ -998,14 +998,14 @@ def test_recommendations_omitted_counter_makes_totals_unknown(monkeypatch) -> No
 
 def test_event_source_health_permission_error_is_not_swallowed(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(
-        edges={("cat_1", "external_event_sources"): SOURCES},
-        errors={("cat_1", "event_stats"): _permission_error()},
+        edges={("900001", "external_event_sources"): SOURCES},
+        errors={("900001", "event_stats"): _permission_error()},
     ))
     with pytest.raises(MetaApiError):
-        run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+        run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
 
 
-@pytest.mark.parametrize("kwargs", [{"catalog_id": " "}, {"catalog_id": "cat_1", "match_rate_threshold": 1.5}])
+@pytest.mark.parametrize("kwargs", [{"catalog_id": " "}, {"catalog_id": "900001", "match_rate_threshold": 1.5}])
 def test_event_source_health_validates_before_any_call(monkeypatch, kwargs) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError):
@@ -1017,28 +1017,28 @@ def test_event_source_health_validates_before_any_call(monkeypatch, kwargs) -> N
 
 def test_recommendations_rank_unconnected_pixels_with_evidence(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 1, 99)]},
-        ("biz_1", "adspixels"): {"data": [
-            {"id": "px_1", "name": "Connected"},
-            {"id": "px_2", "name": "Sends catalog events", "last_fired_time": "2026-11-11T10:00:00+0000"},
-            {"id": "px_3", "name": "Quiet", "last_fired_time": "2025-01-01T00:00:00+0000"},
-            {"id": "px_4", "name": "Gone", "is_unavailable": True},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): {"data": [_stat("2026-11-01", "920001", "ViewContent", 1, 99)]},
+        ("910001", "adspixels"): {"data": [
+            {"id": "920001", "name": "Connected"},
+            {"id": "920002", "name": "Sends catalog events", "last_fired_time": "2026-11-11T10:00:00+0000"},
+            {"id": "920003", "name": "Quiet", "last_fired_time": "2025-01-01T00:00:00+0000"},
+            {"id": "920004", "name": "Gone", "is_unavailable": True},
         ]},
-        ("px_2", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
-        ("px_3", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "failed"}]},
+        ("920002", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("920003", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "failed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001", business_id="910001"))
     pixel_call = next(call for call in client.calls if call.get("edge") == "adspixels")
-    assert pixel_call["parent_id"] == "biz_1"
+    assert pixel_call["parent_id"] == "910001"
     assert pixel_call["fields"] == EXPECTED_PIXEL_CANDIDATE_FIELDS
     checked = [call["parent_id"] for call in client.calls if call.get("edge") == "da_checks"]
-    assert checked == ["px_2", "px_3"]
+    assert checked == ["920002", "920003"]
     assert all(
         call["fields"] == EXPECTED_DA_CHECK_FIELDS for call in client.calls if call.get("edge") == "da_checks"
     )
     recommendations = result["recommendations"]
-    assert [item["event_source_id"] for item in recommendations] == ["px_2", "px_3"]
+    assert [item["event_source_id"] for item in recommendations] == ["920002", "920003"]
     assert recommendations[0]["strength"] == "strong"
     assert recommendations[0]["connection_status"] == "not_connected"
     assert recommendations[0]["evidence"]
@@ -1074,11 +1074,11 @@ def _stalled(rows, cursor: str = "repeat"):
 
 def test_recommendations_report_partial_stats_and_draw_no_coverage_conclusion(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): _endless([_stat("2026-11-01", "px_1", "ViewContent", 0, 1)]),
-        ("biz_1", "adspixels"): {"data": []},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): _endless([_stat("2026-11-01", "920001", "ViewContent", 0, 1)]),
+        ("910001", "adspixels"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001", business_id="910001"))
     metrics = result["metrics"]
     assert metrics["stats_complete"] is False
     assert metrics["sources_complete"] is True
@@ -1095,12 +1095,12 @@ def test_recommendations_report_partial_stats_and_draw_no_coverage_conclusion(mo
 
 def test_recommendations_partial_source_list_draws_no_unconnected_conclusion(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [], "paging": {"next": "https://graph.invalid/next"}},
-        ("cat_1", "event_stats"): {"data": []},
-        ("biz_1", "adspixels"): {"data": [{"id": "px_2", "name": "Maybe connected"}]},
-        ("px_2", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("900001", "external_event_sources"): {"data": [], "paging": {"next": "https://graph.invalid/next"}},
+        ("900001", "event_stats"): {"data": []},
+        ("910001", "adspixels"): {"data": [{"id": "920002", "name": "Maybe connected"}]},
+        ("920002", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001", business_id="910001"))
     assert result["metrics"]["sources_complete"] is False
     assert "no_connected_event_sources" not in [finding["type"] for finding in result["findings"]]
     assert any("whether any source is connected could not be determined" in s for s in result["missing_signals"])
@@ -1112,24 +1112,24 @@ def test_recommendations_partial_source_list_draws_no_unconnected_conclusion(mon
 
 def test_event_source_health_partial_scans_draw_no_absence_conclusions(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "ds_1", "source_type": "OFFLINE"}]},
-        ("cat_1", "event_stats"): _endless([_stat("2026-11-01", "px_9", "ViewContent", 1, 99)]),
+        ("900001", "external_event_sources"): {"data": [{"id": "980001", "source_type": "OFFLINE"}]},
+        ("900001", "event_stats"): _endless([_stat("2026-11-01", "920009", "ViewContent", 1, 99)]),
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     assert result["metrics"]["stats_complete"] is False
     finding_types = [finding["type"] for finding in result["findings"]]
     assert "no_event_stats" not in finding_types
     assert "low_match_rate" not in finding_types
-    assert any("ds_1" in signal and "unknown" in signal for signal in result["missing_signals"])
+    assert any("980001" in signal and "unknown" in signal for signal in result["missing_signals"])
     assert any("only partly read" in signal for signal in result["missing_signals"])
 
 
 def test_event_source_health_partial_empty_source_list_is_not_no_sources(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): _endless([]),
-        ("cat_1", "event_stats"): {"data": []},
+        ("900001", "external_event_sources"): _endless([]),
+        ("900001", "event_stats"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     assert result["metrics"]["sources_complete"] is False
     assert result["findings"] == []
     assert any("could not be determined" in signal for signal in result["missing_signals"])
@@ -1137,28 +1137,28 @@ def test_event_source_health_partial_empty_source_list_is_not_no_sources(monkeyp
 
 def test_recommendations_without_business_reads_catalog_business(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"cat_1": {"id": "cat_1", "business": {"id": "biz_9", "name": "Biz"}}},
+        objects={"900001": {"id": "900001", "business": {"id": "910009", "name": "Biz"}}},
         edges={
-            ("cat_1", "external_event_sources"): {"data": []},
-            ("cat_1", "event_stats"): {"data": []},
-            ("biz_9", "adspixels"): {"data": []},
+            ("900001", "external_event_sources"): {"data": []},
+            ("900001", "event_stats"): {"data": []},
+            ("910009", "adspixels"): {"data": []},
         },
     ))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001"))
     assert client.calls[0]["method"] == "get_object"
     assert client.calls[0]["fields"] == ["id", "business"]
-    assert result["scope"]["business_id"] == "biz_9"
+    assert result["scope"]["business_id"] == "910009"
     assert result["findings"][0]["type"] == "no_connected_event_sources"
     assert any("no pixel" in signal.lower() for signal in result["missing_signals"])
 
 
 def test_recommendations_permission_error_is_not_swallowed(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(
-        edges={("cat_1", "external_event_sources"): {"data": []}, ("cat_1", "event_stats"): {"data": []}},
-        errors={("biz_1", "adspixels"): _permission_error()},
+        edges={("900001", "external_event_sources"): {"data": []}, ("900001", "event_stats"): {"data": []}},
+        errors={("910001", "adspixels"): _permission_error()},
     ))
     with pytest.raises(MetaApiError):
-        run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+        run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001", business_id="910001"))
 
 
 def test_intent_guide_and_mutation_paths_cover_feed_and_event_source_tools(monkeypatch) -> None:
@@ -1187,8 +1187,8 @@ def test_graph_client_delete_edge_object_sends_delete_with_form_data(monkeypatch
 
     monkeypatch.setattr(GraphAPIClient, "request", fake_request)
     client = GraphAPIClient(reload_settings())
-    result = run(client.delete_edge_object("cat_1", "external_event_sources", data={"external_event_sources": ["px_1"]}))
-    assert sent == [("DELETE", "cat_1/external_event_sources", {"external_event_sources": ["px_1"]})]
+    result = run(client.delete_edge_object("900001", "external_event_sources", data={"external_event_sources": ["920001"]}))
+    assert sent == [("DELETE", "900001/external_event_sources", {"external_event_sources": ["920001"]})]
     assert result == {"success": True}
 
 
@@ -1203,7 +1203,7 @@ def test_create_product_feed_redacts_a_password_meta_echoes_back(monkeypatch) ->
     secret = "synthetic-feed-secret"
     result = run(
         catalog_feeds.create_product_feed(
-            "cat_1",
+            "900001",
             "Feed",
             schedule={"url": "https://example.invalid/feed.csv", "interval": "DAILY", "password": secret},
             update_schedule={"url": "https://example.invalid/delta.csv", "interval": "HOURLY", "password": secret},
@@ -1346,7 +1346,7 @@ def test_feed_credentials_are_never_returned_or_logged(monkeypatch, caplog) -> N
     client = _use(monkeypatch, EchoingClient(objects={"feed_1": {"id": "feed_1", "name": "Main"}}))
     schedule = {**SCHEDULE, "username": "feeduser", "password": secret}
     results = [
-        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", schedule=schedule, update_schedule=schedule)),
+        run(catalog_feeds.create_product_feed(catalog_id="900001", name="Feed", schedule=schedule, update_schedule=schedule)),
         run(catalog_feeds.update_product_feed(feed_id="feed_1", schedule=schedule)),
         run(catalog_feeds.create_product_feed_upload(
             feed_id="feed_1", url="https://example.com/feed.csv", username="feeduser", password=secret,
@@ -1371,10 +1371,10 @@ def test_feed_reads_mask_a_password_embedded_in_a_schedule_url(monkeypatch) -> N
     feed = {"id": "feed_1", "schedule": {"url": f"ftp://user:{secret}@example.com/feed.csv", "interval": "DAILY"}}
     _use(monkeypatch, FakeCatalogFeedClient(
         objects={"feed_1": feed},
-        edges={("cat_1", "product_feeds"): {"data": [feed]}},
+        edges={("900001", "product_feeds"): {"data": [feed]}},
     ))
     one = run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
-    many = run(catalog_feeds.list_product_feeds(catalog_id="cat_1"))
+    many = run(catalog_feeds.list_product_feeds(catalog_id="900001"))
     assert secret not in repr(one) and secret not in repr(many)
     assert one["item"]["schedule"]["url"] == "ftp://user:[redacted]@example.com/feed.csv"
 
@@ -1386,7 +1386,7 @@ def test_feed_reads_mask_a_password_embedded_in_a_schedule_url(monkeypatch) -> N
 def test_urls_with_embedded_credentials_are_rejected_without_echo(monkeypatch, url) -> None:
     _no_client(monkeypatch)
     calls = [
-        lambda: catalog_feeds.create_product_feed(catalog_id="cat_1", name="F", schedule={"url": url, "interval": "DAILY"}),
+        lambda: catalog_feeds.create_product_feed(catalog_id="900001", name="F", schedule={"url": url, "interval": "DAILY"}),
         lambda: catalog_feeds.update_product_feed(feed_id="feed_1", update_schedule={"url": url, "interval": "DAILY"}),
     ]
     if url.startswith("https"):
@@ -1406,7 +1406,7 @@ def test_a_csv_like_value_is_never_echoed_in_an_error(monkeypatch) -> None:
     _no_client(monkeypatch)
     calls = [
         lambda: catalog_feeds.create_product_feed_upload(feed_id="feed_1", url=CSV_RECORD),
-        lambda: catalog_feeds.create_product_feed(catalog_id="cat_1", name="F", schedule={"url": CSV_RECORD, "interval": "DAILY"}),
+        lambda: catalog_feeds.create_product_feed(catalog_id="900001", name="F", schedule={"url": CSV_RECORD, "interval": "DAILY"}),
         lambda: catalog_feeds.update_product_feed(feed_id="feed_1", schedule={"url": "https://e.com/f.csv", "interval": CSV_RECORD}),
         lambda: catalog_feeds.update_product_feed(
             feed_id="feed_1", schedule={"url": "https://e.com/f.csv", "interval": "WEEKLY", "day_of_week": CSV_RECORD},
@@ -1535,31 +1535,31 @@ def _stat_other(day: str, source: str, event: str, matched: int, unmatched: int,
 
 def test_event_source_health_can_be_scoped_to_one_source(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): SOURCES,
-        ("cat_1", "event_stats"): {"data": [
-            _stat_other("2026-11-01", "px_1", "ViewContent", 60, 40, 30),
-            _stat_other("2026-11-01", "app_1", "ViewContent", 5, 5, 0),
+        ("900001", "external_event_sources"): SOURCES,
+        ("900001", "event_stats"): {"data": [
+            _stat_other("2026-11-01", "920001", "ViewContent", 60, 40, 30),
+            _stat_other("2026-11-01", "930001", "ViewContent", 5, 5, 0),
         ]},
-        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("920001", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_1"))
-    assert [source["id"] for source in result["sources"]] == ["px_1"]
-    assert [call["parent_id"] for call in client.calls if call.get("edge") == "da_checks"] == ["px_1"]
-    assert result["scope"] == {"catalog_id": "cat_1", "event_source_id": "px_1"}
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001", event_source_id="920001"))
+    assert [source["id"] for source in result["sources"]] == ["920001"]
+    assert [call["parent_id"] for call in client.calls if call.get("edge") == "da_checks"] == ["920001"]
+    assert result["scope"] == {"catalog_id": "900001", "event_source_id": "920001"}
     assert result["metrics"]["connected_sources"] == 1
-    assert not any("app_1" in signal for signal in result["missing_signals"])
+    assert not any("930001" in signal for signal in result["missing_signals"])
 
 
 def test_event_source_health_reports_the_sources_rate_across_its_catalogs(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): {"data": [
-            _stat_other("2026-11-01", "px_1", "ViewContent", 50, 30, 20),
-            _stat_other("2026-11-02", "px_1", "Purchase", 10, 10, 10),
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): {"data": [
+            _stat_other("2026-11-01", "920001", "ViewContent", 50, 30, 20),
+            _stat_other("2026-11-02", "920001", "Purchase", 10, 10, 10),
         ]},
-        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("920001", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001", event_source_id="920001"))
     across = result["sources"][0]["across_catalogs"]
     assert across["this_catalog_match_rate"] == 0.6
     assert across["content_ids_matched_other_catalogs"] == 30
@@ -1572,14 +1572,14 @@ def test_event_source_health_reports_the_sources_rate_across_its_catalogs(monkey
 
 def test_event_source_health_across_catalog_rate_is_unknown_when_meta_omits_the_counter(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): {"data": [
-            _stat_other("2026-11-01", "px_1", "ViewContent", 50, 30, 20),
-            _stat_other("2026-11-02", "px_1", "ViewContent", 10, 10, None),
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): {"data": [
+            _stat_other("2026-11-01", "920001", "ViewContent", 50, 30, 20),
+            _stat_other("2026-11-02", "920001", "ViewContent", 10, 10, None),
         ]},
-        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("920001", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     across = result["sources"][0]["across_catalogs"]
     assert across["this_catalog_match_rate"] == 0.6
     assert across["content_ids_matched_other_catalogs"] is None
@@ -1589,11 +1589,11 @@ def test_event_source_health_across_catalog_rate_is_unknown_when_meta_omits_the_
 
 def test_event_source_health_across_catalog_rate_needs_a_finished_read(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): _endless([_stat_other("2026-11-01", "px_1", "ViewContent", 5, 5, 5)]),
-        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): _endless([_stat_other("2026-11-01", "920001", "ViewContent", 5, 5, 5)]),
+        ("920001", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001", event_source_id="920001"))
     across = result["sources"][0]["across_catalogs"]
     assert across["this_catalog_match_rate"] is None
     assert across["all_catalogs_match_rate_range"] is None
@@ -1602,39 +1602,39 @@ def test_event_source_health_across_catalog_rate_needs_a_finished_read(monkeypat
 
 def test_event_source_health_scope_to_unconnected_source_is_refused_after_a_full_read(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): SOURCES,
-        ("cat_1", "event_stats"): {"data": []},
+        ("900001", "external_event_sources"): SOURCES,
+        ("900001", "event_stats"): {"data": []},
     }))
     with pytest.raises(ValidationError, match="not connected"):
-        run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_404"))
+        run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001", event_source_id="920404"))
     assert not any(call.get("edge") == "da_checks" for call in client.calls)
 
 
 def test_event_source_health_scope_beyond_a_partial_source_list_is_reported_not_refused(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}], "paging": {"next": "https://graph.invalid/next"}},
-        ("cat_1", "event_stats"): {"data": [_stat_other("2026-11-01", "px_9", "ViewContent", 9, 1, 0)]},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001"}], "paging": {"next": "https://graph.invalid/next"}},
+        ("900001", "event_stats"): {"data": [_stat_other("2026-11-01", "920009", "ViewContent", 9, 1, 0)]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1", event_source_id="px_9"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001", event_source_id="920009"))
     [source] = result["sources"]
-    assert source["id"] == "px_9"
+    assert source["id"] == "920009"
     assert source["window_match_rate"] == 0.9
-    assert any("px_9" in signal and "not among" in signal for signal in result["missing_signals"])
+    assert any("920009" in signal and "not among" in signal for signal in result["missing_signals"])
 
 
 def test_event_source_health_unscoped_call_is_unchanged_apart_from_new_fields(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): SOURCES,
-        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 90, 10)]},
-        ("px_1", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
-        ("app_1", "da_checks"): {"data": [{"key": "x", "result": "passed"}]},
+        ("900001", "external_event_sources"): SOURCES,
+        ("900001", "event_stats"): {"data": [_stat("2026-11-01", "920001", "ViewContent", 90, 10)]},
+        ("920001", "da_checks"): {"data": [{"key": "pixel_missing_dpa_event", "result": "passed"}]},
+        ("930001", "da_checks"): {"data": [{"key": "x", "result": "passed"}]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     assert [(c["parent_id"], c["edge"]) for c in client.calls] == [
-        ("cat_1", "external_event_sources"), ("cat_1", "event_stats"), ("px_1", "da_checks"), ("app_1", "da_checks"),
+        ("900001", "external_event_sources"), ("900001", "event_stats"), ("920001", "da_checks"), ("930001", "da_checks"),
     ]
-    assert result["scope"] == {"catalog_id": "cat_1"}
-    assert [source["id"] for source in result["sources"]] == ["px_1", "app_1"]
+    assert result["scope"] == {"catalog_id": "900001"}
+    assert [source["id"] for source in result["sources"]] == ["920001", "930001"]
 
 
 # phase two: list_event_source_catalogs match rates ---------------------------------------------
@@ -1642,34 +1642,34 @@ def test_event_source_health_unscoped_call_is_unchanged_apart_from_new_fields(mo
 
 def _scan_edges() -> dict[tuple[str, str], Any]:
     return {
-        ("biz_1", "owned_product_catalogs"): {"data": [
-            {"id": "cat_1", "name": "A"}, {"id": "cat_2", "name": "B"}, {"id": "cat_3", "name": "C"},
+        ("910001", "owned_product_catalogs"): {"data": [
+            {"id": "900001", "name": "A"}, {"id": "900002", "name": "B"}, {"id": "900003", "name": "C"},
         ]},
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}]},
-        ("cat_2", "external_event_sources"): {"data": [{"id": "px_1"}, {"id": "px_2"}]},
-        ("cat_3", "external_event_sources"): {"data": [{"id": "px_2"}]},
-        ("cat_1", "event_stats"): {"data": [
-            _stat("2026-11-01", "px_1", "ViewContent", 40, 60),
-            _stat("2026-11-01", "px_1", "Purchase", 10, 0),
-            _stat("2026-11-01", "px_9", "ViewContent", 1000, 0),
+        ("900001", "external_event_sources"): {"data": [{"id": "920001"}]},
+        ("900002", "external_event_sources"): {"data": [{"id": "920001"}, {"id": "920002"}]},
+        ("900003", "external_event_sources"): {"data": [{"id": "920002"}]},
+        ("900001", "event_stats"): {"data": [
+            _stat("2026-11-01", "920001", "ViewContent", 40, 60),
+            _stat("2026-11-01", "920001", "Purchase", 10, 0),
+            _stat("2026-11-01", "920009", "ViewContent", 1000, 0),
         ]},
-        ("cat_2", "event_stats"): {"data": [
-            _stat("2026-11-01", "px_1", "ViewContent", 90, 10),
-            _stat("2026-11-01", "px_1", "Purchase", 0, 10),
+        ("900002", "event_stats"): {"data": [
+            _stat("2026-11-01", "920001", "ViewContent", 90, 10),
+            _stat("2026-11-01", "920001", "Purchase", 0, 10),
         ]},
     }
 
 
 def test_list_event_source_catalogs_without_match_rates_is_unchanged(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges()))
-    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001"))
     assert [(c["parent_id"], c["edge"]) for c in client.calls] == [
-        ("biz_1", "owned_product_catalogs"),
-        ("cat_1", "external_event_sources"),
-        ("cat_2", "external_event_sources"),
-        ("cat_3", "external_event_sources"),
+        ("910001", "owned_product_catalogs"),
+        ("900001", "external_event_sources"),
+        ("900002", "external_event_sources"),
+        ("900003", "external_event_sources"),
     ]
-    assert result["items"] == [{"id": "cat_1", "name": "A"}, {"id": "cat_2", "name": "B"}]
+    assert result["items"] == [{"id": "900001", "name": "A"}, {"id": "900002", "name": "B"}]
     assert set(result["summary"]) == {
         "count", "event_source_id", "business_id", "catalogs_scanned", "complete", "stop_reasons", "method", "note",
     }
@@ -1678,19 +1678,19 @@ def test_list_event_source_catalogs_without_match_rates_is_unchanged(monkeypatch
 def test_list_event_source_catalogs_match_rates_per_connected_catalog(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges()))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+        event_source_id="920001", business_id="910001", include_match_rates=True,
     ))
     stats_calls = [c for c in client.calls if c["edge"] == "event_stats"]
-    assert [c["parent_id"] for c in stats_calls] == ["cat_1", "cat_2"]
+    assert [c["parent_id"] for c in stats_calls] == ["900001", "900002"]
     assert all(c["fields"] == EXPECTED_EVENT_STAT_FIELDS for c in stats_calls)
     items = {item["id"]: item for item in result["items"]}
-    assert items["cat_1"]["match_rate"] == {
+    assert items["900001"]["match_rate"] == {
         "status": "computed", "match_rate": 0.4545, "matched_content_ids": 50, "unmatched_content_ids": 60,
         "event_stat_rows": 2, "events": ["Purchase", "ViewContent"], "stats_complete": True,
     }
-    assert items["cat_2"]["match_rate"]["match_rate"] == round(90 / 110, 4)
+    assert items["900002"]["match_rate"]["match_rate"] == round(90 / 110, 4)
     rates = result["summary"]["match_rates"]
-    assert rates["ranked_by_match_rate"] == ["cat_2", "cat_1"]
+    assert rates["ranked_by_match_rate"] == ["900002", "900001"]
     assert rates["ranking_covers_every_connected_catalog"] is True
     assert rates["catalogs_checked"] == 2 and rates["catalogs_with_rate"] == 2
     assert rates["catalogs_not_checked"] == []
@@ -1701,13 +1701,13 @@ def test_list_event_source_catalogs_match_rates_per_connected_catalog(monkeypatc
 def test_list_event_source_catalogs_match_rates_for_one_event(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges()))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True, event_name="purchase",
+        event_source_id="920001", business_id="910001", include_match_rates=True, event_name="purchase",
     ))
     items = {item["id"]: item for item in result["items"]}
-    assert items["cat_1"]["match_rate"]["match_rate"] == 1.0
-    assert items["cat_2"]["match_rate"]["match_rate"] == 0.0
+    assert items["900001"]["match_rate"]["match_rate"] == 1.0
+    assert items["900002"]["match_rate"]["match_rate"] == 0.0
     assert result["summary"]["match_rates"]["event_name"] == "Purchase"
-    assert result["summary"]["match_rates"]["ranked_by_match_rate"] == ["cat_1", "cat_2"]
+    assert result["summary"]["match_rates"]["ranked_by_match_rate"] == ["900001", "900002"]
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -1717,43 +1717,43 @@ def test_list_event_source_catalogs_match_rates_for_one_event(monkeypatch) -> No
 def test_list_event_source_catalogs_rejects_bad_match_rate_input_before_any_call(monkeypatch, kwargs) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError):
-        run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1", **kwargs))
+        run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001", **kwargs))
 
 
 def test_list_event_source_catalogs_match_rate_unknown_when_a_counter_is_omitted(monkeypatch) -> None:
-    row = _stat("2026-11-01", "px_1", "ViewContent", 40, 60)
+    row = _stat("2026-11-01", "920001", "ViewContent", 40, 60)
     del row["total_unmatched_content_ids"]
-    _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges() | {("cat_1", "event_stats"): {"data": [row]}}))
+    _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges() | {("900001", "event_stats"): {"data": [row]}}))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+        event_source_id="920001", business_id="910001", include_match_rates=True,
     ))
     first = result["items"][0]["match_rate"]
     assert first["status"] == "counters_missing"
     assert first["match_rate"] is None
     assert first["unmatched_content_ids"] is None
     rates = result["summary"]["match_rates"]
-    assert rates["ranked_by_match_rate"] == ["cat_2"]
+    assert rates["ranked_by_match_rate"] == ["900002"]
     assert rates["ranking_covers_every_connected_catalog"] is False
 
 
 def test_list_event_source_catalogs_match_rate_needs_a_finished_stats_read(monkeypatch) -> None:
-    edges = _scan_edges() | {("cat_1", "event_stats"): _endless([_stat("2026-11-01", "px_1", "ViewContent", 1, 1)])}
+    edges = _scan_edges() | {("900001", "event_stats"): _endless([_stat("2026-11-01", "920001", "ViewContent", 1, 1)])}
     _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+        event_source_id="920001", business_id="910001", include_match_rates=True,
     ))
     first = result["items"][0]["match_rate"]
     assert first["status"] == "partial_read"
     assert first["match_rate"] is None
     assert first["stats_complete"] is False
     assert first["partial_counts_from_pages_read"]["matched_content_ids"] > 0
-    assert "cat_1" not in result["summary"]["match_rates"]["ranked_by_match_rate"]
+    assert "900001" not in result["summary"]["match_rates"]["ranked_by_match_rate"]
 
 
 def test_list_event_source_catalogs_match_rate_no_events_is_not_zero(monkeypatch) -> None:
-    _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges() | {("cat_1", "event_stats"): {"data": []}}))
+    _use(monkeypatch, FakeCatalogFeedClient(edges=_scan_edges() | {("900001", "event_stats"): {"data": []}}))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+        event_source_id="920001", business_id="910001", include_match_rates=True,
     ))
     first = result["items"][0]["match_rate"]
     assert first["status"] == "no_events_in_window"
@@ -1761,30 +1761,30 @@ def test_list_event_source_catalogs_match_rate_no_events_is_not_zero(monkeypatch
 
 
 def test_list_event_source_catalogs_match_rates_are_capped_and_say_which_were_skipped(monkeypatch) -> None:
-    catalogs = [{"id": f"cat_{i}"} for i in range(12)]
-    edges: dict[tuple[str, str], Any] = {("biz_1", "owned_product_catalogs"): {"data": catalogs}}
+    catalogs = [{"id": f"{900000 + i}"} for i in range(12)]
+    edges: dict[tuple[str, str], Any] = {("910001", "owned_product_catalogs"): {"data": catalogs}}
     for catalog in catalogs:
-        edges[(catalog["id"], "external_event_sources")] = {"data": [{"id": "px_1"}]}
-        edges[(catalog["id"], "event_stats")] = {"data": [_stat("2026-11-01", "px_1", "ViewContent", 1, 1)]}
+        edges[(catalog["id"], "external_event_sources")] = {"data": [{"id": "920001"}]}
+        edges[(catalog["id"], "event_stats")] = {"data": [_stat("2026-11-01", "920001", "ViewContent", 1, 1)]}
     client = _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+        event_source_id="920001", business_id="910001", include_match_rates=True,
     ))
     assert len([c for c in client.calls if c["edge"] == "event_stats"]) == 10
     rates = result["summary"]["match_rates"]
     assert rates["catalogs_checked"] == 10
-    assert rates["catalogs_not_checked"] == ["cat_10", "cat_11"]
+    assert rates["catalogs_not_checked"] == ["900010", "900011"]
     assert rates["ranking_covers_every_connected_catalog"] is False
     assert result["items"][11]["match_rate"]["status"] == "not_checked"
 
 
 def test_list_event_source_catalogs_incomplete_scan_ranking_is_not_complete(monkeypatch) -> None:
     edges = _scan_edges() | {
-        ("biz_1", "owned_product_catalogs"): {"data": [{"id": "cat_1"}], "paging": {"next": "https://graph.invalid/next"}},
+        ("910001", "owned_product_catalogs"): {"data": [{"id": "900001"}], "paging": {"next": "https://graph.invalid/next"}},
     }
     _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+        event_source_id="920001", business_id="910001", include_match_rates=True,
     ))
     assert result["summary"]["complete"] is False
     assert result["summary"]["match_rates"]["ranking_covers_every_connected_catalog"] is False
@@ -1801,7 +1801,7 @@ class CredentialUrlClient(FakeCatalogFeedClient):
     """Meta-shaped responses that carry a URL with an embedded password in every place a URL can appear."""
 
     def __init__(self) -> None:
-        upload = {"id": "up_1", "url": CRED_URL, "end_time": "2026-11-01T00:00:00+0000", "error_count": 1}
+        upload = {"id": "940001", "url": CRED_URL, "end_time": "2026-11-01T00:00:00+0000", "error_count": 1}
         feed = {
             "id": "feed_1", "name": "Main",
             "schedule": {"url": CRED_URL, "interval": "DAILY"},
@@ -1809,11 +1809,11 @@ class CredentialUrlClient(FakeCatalogFeedClient):
             "latest_upload": dict(upload),
         }
         super().__init__(
-            objects={"feed_1": feed, "up_1": upload},
+            objects={"feed_1": feed, "940001": upload},
             edges={
-                ("cat_1", "product_feeds"): {"data": [feed]},
+                ("900001", "product_feeds"): {"data": [feed]},
                 ("feed_1", "uploads"): {"data": [upload]},
-                ("up_1", "errors"): {"data": [{"id": "e1", "description": f"Could not fetch {CRED_URL} today"}]},
+                ("940001", "errors"): {"data": [{"id": "e1", "description": f"Could not fetch {CRED_URL} today"}]},
             },
         )
 
@@ -1828,10 +1828,10 @@ def test_a_password_embedded_in_any_returned_url_is_masked(monkeypatch, tmp_path
     feed_file.write_bytes(b"id\n1\n")
     results = {
         "feed": run(catalog_feeds.list_product_feeds(feed_id="feed_1")),
-        "feeds": run(catalog_feeds.list_product_feeds(catalog_id="cat_1")),
-        "upload": run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1")),
+        "feeds": run(catalog_feeds.list_product_feeds(catalog_id="900001")),
+        "upload": run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001")),
         "uploads": run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1")),
-        "create": run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="F", schedule=SCHEDULE)),
+        "create": run(catalog_feeds.create_product_feed(catalog_id="900001", name="F", schedule=SCHEDULE)),
         "update": run(catalog_feeds.update_product_feed(feed_id="feed_1", schedule=SCHEDULE, update_schedule=SCHEDULE)),
         "delete": run(catalog_feeds.delete_product_feed(feed_id="feed_1")),
         "upload_url": run(catalog_feeds.create_product_feed_upload(feed_id="feed_1", url="https://e.com/f.csv")),
@@ -1916,19 +1916,19 @@ def test_wrongly_typed_secret_arguments_are_not_quoted_by_the_framework(monkeypa
 
 def test_recommendations_flag_paged_da_checks_and_do_not_guess(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": []},
-        ("cat_1", "event_stats"): {"data": []},
-        ("biz_1", "adspixels"): {"data": [{"id": "px_2", "name": "Paged"}]},
-        ("px_2", "da_checks"): {
+        ("900001", "external_event_sources"): {"data": []},
+        ("900001", "event_stats"): {"data": []},
+        ("910001", "adspixels"): {"data": [{"id": "920002", "name": "Paged"}]},
+        ("920002", "da_checks"): {
             "data": [{"key": "pixel_other_check", "result": "passed"}],
             "paging": {"next": "https://next", "cursors": {"after": "c2"}},
         },
     }))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001", business_id="910001"))
     [recommendation] = result["recommendations"]
     assert recommendation["strength"] == "unknown"
     assert "more pages" in recommendation["reason"]
-    assert "da_checks for pixel px_2 had more pages than were read." in result["missing_signals"]
+    assert "da_checks for pixel 920002 had more pages than were read." in result["missing_signals"]
 
 
 @pytest.mark.parametrize(
@@ -2160,15 +2160,15 @@ def test_g15_repeated_cursor_stops_the_read_after_counting_each_new_page_once(mo
         day = {None: "2026-11-01", "a": "2026-11-02"}.get(after, "2026-11-09")
         # The second page hands back the cursor that led to it.
         return {
-            "data": [_stat(day, "px_1", "ViewContent", 4, 1)],
+            "data": [_stat(day, "920001", "ViewContent", 4, 1)],
             "paging": {"next": "https://next", "cursors": {"after": "a"}},
         }
 
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "OFFLINE"}]},
-        ("cat_1", "event_stats"): pages,
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "OFFLINE"}]},
+        ("900001", "event_stats"): pages,
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     assert len(_stats_reads(client)) == 2
     source = result["sources"][0]
     assert source["matched_content_ids"] == 8
@@ -2179,10 +2179,10 @@ def test_g15_repeated_cursor_stops_the_read_after_counting_each_new_page_once(mo
 
 def test_g15_complete_stats_read_is_marked_complete(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "OFFLINE"}]},
-        ("cat_1", "event_stats"): {"data": [_stat("2026-11-01", "px_1", "ViewContent", 9, 1)]},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "OFFLINE"}]},
+        ("900001", "event_stats"): {"data": [_stat("2026-11-01", "920001", "ViewContent", 9, 1)]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     source = result["sources"][0]
     assert source["counts_complete"] is True
     assert source["window_match_rate"] == 0.9
@@ -2190,11 +2190,11 @@ def test_g15_complete_stats_read_is_marked_complete(monkeypatch) -> None:
 
 def test_g15_recommendations_never_total_a_stalled_stats_read(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1", "source_type": "PIXEL"}]},
-        ("cat_1", "event_stats"): _stalled([_stat("2026-11-01", "px_1", "ViewContent", 7, 3)]),
-        ("biz_1", "adspixels"): {"data": []},
+        ("900001", "external_event_sources"): {"data": [{"id": "920001", "source_type": "PIXEL"}]},
+        ("900001", "event_stats"): _stalled([_stat("2026-11-01", "920001", "ViewContent", 7, 3)]),
+        ("910001", "adspixels"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="cat_1", business_id="biz_1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations(catalog_id="900001", business_id="910001"))
     metrics = result["metrics"]
     assert len(_stats_reads(client)) <= 2
     assert metrics["matched_content_ids_28d"] is None
@@ -2206,27 +2206,27 @@ def test_g15_recommendations_never_total_a_stalled_stats_read(monkeypatch) -> No
 
 
 def test_g15_match_rate_per_catalog_from_a_stalled_read_is_partial(monkeypatch) -> None:
-    edges = _scan_edges() | {("cat_1", "event_stats"): _stalled([_stat("2026-11-01", "px_1", "ViewContent", 7, 3)])}
+    edges = _scan_edges() | {("900001", "event_stats"): _stalled([_stat("2026-11-01", "920001", "ViewContent", 7, 3)])}
     client = _use(monkeypatch, FakeCatalogFeedClient(edges=edges))
     result = run(catalog_feeds.list_event_source_catalogs(
-        event_source_id="px_1", business_id="biz_1", include_match_rates=True,
+        event_source_id="920001", business_id="910001", include_match_rates=True,
     ))
     first = result["items"][0]["match_rate"]
     assert first["status"] == "partial_read"
     assert first["partial_counts_from_pages_read"] == {"matched_content_ids": 7, "unmatched_content_ids": 3}
     assert "same page" in first["note"]
-    assert len([call for call in _stats_reads(client) if call["parent_id"] == "cat_1"]) <= 2
+    assert len([call for call in _stats_reads(client) if call["parent_id"] == "900001"]) <= 2
 
 
 def test_g15_repeated_catalog_page_is_scanned_once(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("biz_1", "owned_product_catalogs"): _stalled([{"id": "cat_1", "name": "A"}]),
-        ("cat_1", "external_event_sources"): {"data": [{"id": "px_1"}]},
+        ("910001", "owned_product_catalogs"): _stalled([{"id": "900001", "name": "A"}]),
+        ("900001", "external_event_sources"): {"data": [{"id": "920001"}]},
     }))
-    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="px_1", business_id="biz_1"))
+    result = run(catalog_feeds.list_event_source_catalogs(event_source_id="920001", business_id="910001"))
     assert result["summary"]["catalogs_scanned"] == 1
     assert result["summary"]["count"] == 1
-    assert [item["id"] for item in result["items"]] == ["cat_1"]
+    assert [item["id"] for item in result["items"]] == ["900001"]
     assert result["summary"]["complete"] is False
     assert any("same page" in reason for reason in result["summary"]["stop_reasons"])
     assert len([call for call in client.calls if call.get("edge") == "external_event_sources"]) == 1
@@ -2234,11 +2234,11 @@ def test_g15_repeated_catalog_page_is_scanned_once(monkeypatch) -> None:
 
 def test_g15_repeated_source_page_does_not_duplicate_connected_sources(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): _stalled([{"id": "px_1"}]),
+        ("900001", "external_event_sources"): _stalled([{"id": "920001"}]),
     }))
-    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="cat_1", event_source_id="px_2"))
-    assert result["previous"]["connected_event_source_ids"] == ["px_1"]
-    assert result["current"]["connected_event_source_ids"] == ["px_1", "px_2"]
+    result = run(catalog_feeds.connect_catalog_event_source(catalog_id="900001", event_source_id="920002"))
+    assert result["previous"]["connected_event_source_ids"] == ["920001"]
+    assert result["current"]["connected_event_source_ids"] == ["920001", "920002"]
     assert result["previous_complete"] is False
     assert any("same page" in gap for gap in result["missing_signals"])
     assert len([call for call in client.calls if call.get("edge") == "external_event_sources" and call["method"] == "list_objects"]) <= 2
@@ -2246,10 +2246,10 @@ def test_g15_repeated_source_page_does_not_duplicate_connected_sources(monkeypat
 
 def test_g15_repeated_empty_pages_stop_on_the_repeated_cursor(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("cat_1", "external_event_sources"): _stalled([]),
-        ("cat_1", "event_stats"): {"data": []},
+        ("900001", "external_event_sources"): _stalled([]),
+        ("900001", "event_stats"): {"data": []},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="cat_1"))
+    result = run(catalog_feeds.get_catalog_event_source_health(catalog_id="900001"))
     assert result["metrics"]["sources_complete"] is False
     assert result["findings"] == []
     assert len([call for call in client.calls if call.get("edge") == "external_event_sources"]) == 2
@@ -2257,10 +2257,10 @@ def test_g15_repeated_empty_pages_stop_on_the_repeated_cursor(monkeypatch) -> No
 
 
 @pytest.mark.parametrize(("tool", "arguments", "parent", "edge"), [
-    ("list_product_feeds", {"catalog_id": "cat_1"}, "cat_1", "product_feeds"),
+    ("list_product_feeds", {"catalog_id": "900001"}, "900001", "product_feeds"),
     ("list_product_feed_uploads", {"feed_id": "feed_1"}, "feed_1", "uploads"),
     ("list_feed_rules", {"feed_id": "feed_1"}, "feed_1", "rules"),
-    ("list_catalog_event_sources", {"catalog_id": "cat_1"}, "cat_1", "external_event_sources"),
+    ("list_catalog_event_sources", {"catalog_id": "900001"}, "900001", "external_event_sources"),
 ])
 def test_g15_list_page_that_hands_back_its_own_cursor_offers_no_next_cursor(monkeypatch, tool, arguments, parent, edge) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={(parent, edge): _stalled([{"id": "1"}], cursor="c1")}))
@@ -2280,7 +2280,7 @@ def test_g15_list_page_that_hands_back_its_own_cursor_offers_no_next_cursor(monk
 def test_create_product_feed_sends_named_feed_type_and_parsing_options(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
     run(catalog_feeds.create_product_feed(
-        catalog_id="cat_1", name="Hotels", feed_type="hotel", delimiter=",", encoding="utf-8",
+        catalog_id="900001", name="Hotels", feed_type="hotel", delimiter=",", encoding="utf-8",
         quoted_fields_mode="on", deletion_enabled=False,
     ))
     assert client.calls[0]["data"] == {
@@ -2299,7 +2299,7 @@ def test_create_product_feed_sends_named_feed_type_and_parsing_options(monkeypat
 ])
 def test_feed_delimiter_accepts_meta_names_and_characters(monkeypatch, given, sent) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
-    run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", delimiter=given))
+    run(catalog_feeds.create_product_feed(catalog_id="900001", name="Feed", delimiter=given))
     assert client.calls[0]["data"]["delimiter"] == sent
 
 
@@ -2310,14 +2310,14 @@ def test_feed_delimiter_accepts_meta_names_and_characters(monkeypatch, given, se
 ])
 def test_feed_encoding_accepts_meta_names_and_common_spellings(monkeypatch, given, sent) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
-    run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", encoding=given))
+    run(catalog_feeds.create_product_feed(catalog_id="900001", name="Feed", encoding=given))
     assert client.calls[0]["data"]["encoding"] == sent
 
 
 def test_create_product_feed_sends_a_supplementary_feed_with_its_override(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient())
     run(catalog_feeds.create_product_feed(
-        catalog_id="cat_1", name="French", ingestion_source_type="SUPPLEMENTARY_FEED",
+        catalog_id="900001", name="French", ingestion_source_type="SUPPLEMENTARY_FEED",
         primary_feed_ids="111, 222", override_type="language", override_value="fr_XX",
     ))
     assert client.calls[0]["data"] == {
@@ -2349,13 +2349,13 @@ def test_create_product_feed_sends_a_supplementary_feed_with_its_override(monkey
 def test_create_product_feed_rejects_invalid_named_options_before_any_call(monkeypatch, kwargs) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError):
-        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", **kwargs))
+        run(catalog_feeds.create_product_feed(catalog_id="900001", name="Feed", **kwargs))
 
 
 def test_create_product_feed_unsupported_option_error_lists_the_documented_values(monkeypatch) -> None:
     _no_client(monkeypatch)
     with pytest.raises(ValidationError, match="HOTEL") as caught:
-        run(catalog_feeds.create_product_feed(catalog_id="cat_1", name="Feed", feed_type="boats-and-planes"))
+        run(catalog_feeds.create_product_feed(catalog_id="900001", name="Feed", feed_type="boats-and-planes"))
     assert "boats-and-planes" not in str(caught.value)
 
 
@@ -2468,10 +2468,10 @@ class RefusingFieldClient(FakeCatalogFeedClient):
 def test_list_product_feeds_reads_supplementary_feeds_by_default(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
         objects={"feed_1": {"id": "feed_1", "supplementary_feeds": ["feed_9"]}},
-        edges={("cat_1", "product_feeds"): {"data": [{"id": "feed_1", "supplementary_feeds": ["feed_9"]}]}},
+        edges={("900001", "product_feeds"): {"data": [{"id": "feed_1", "supplementary_feeds": ["feed_9"]}]}},
     ))
     one = run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
-    many = run(catalog_feeds.list_product_feeds(catalog_id="cat_1"))
+    many = run(catalog_feeds.list_product_feeds(catalog_id="900001"))
     assert client.calls[0]["fields"] == [*EXPECTED_FEED_FIELDS, "supplementary_feeds"]
     assert client.calls[1]["fields"] == [*EXPECTED_FEED_LIST_FIELDS, "supplementary_feeds"]
     assert one["item"]["supplementary_feeds"] == ["feed_9"]
@@ -2484,11 +2484,11 @@ def test_list_product_feeds_retries_without_a_refused_field_and_names_it(monkeyp
     client = _use(monkeypatch, RefusingFieldClient(
         {"supplementary_feeds"},
         objects={"feed_1": {"id": "feed_1", "name": "Main"}},
-        edges={("cat_1", "product_feeds"): {"data": [{"id": "feed_1"}],
+        edges={("900001", "product_feeds"): {"data": [{"id": "feed_1"}],
                                              "paging": {"cursors": {"after": "c2"}, "next": "https://next"}}},
     ))
     one = run(catalog_feeds.list_product_feeds(feed_id="feed_1"))
-    many = run(catalog_feeds.list_product_feeds(catalog_id="cat_1", after="c1"))
+    many = run(catalog_feeds.list_product_feeds(catalog_id="900001", after="c1"))
     assert [call["fields"] for call in client.calls] == [
         [*EXPECTED_FEED_FIELDS, "supplementary_feeds"], EXPECTED_FEED_FIELDS,
         [*EXPECTED_FEED_LIST_FIELDS, "supplementary_feeds"], EXPECTED_FEED_LIST_FIELDS,
@@ -2539,10 +2539,10 @@ def _errors(start: int, count: int) -> list[dict[str, Any]]:
 
 def test_list_product_feed_uploads_without_new_options_is_unchanged(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 2}},
-        edges={("up_1", "errors"): _upload_errors},
+        objects={"940001": {"id": "940001", "error_count": 2}},
+        edges={("940001", "errors"): _upload_errors},
     ))
-    run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1"))
+    run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001"))
     assert client.calls[1]["fields"] == EXPECTED_UPLOAD_ERROR_FIELDS
     assert client.calls[1]["params"] == {"limit": 100}
     assert len(client.calls) == 2
@@ -2551,14 +2551,14 @@ def test_list_product_feed_uploads_without_new_options_is_unchanged(monkeypatch)
 def test_list_product_feed_uploads_include_samples_returns_one_short_sample_per_error(monkeypatch) -> None:
     long_id = "SKU-" + "x" * 300
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 2}},
-        edges={("up_1", "errors"): {"data": [
+        objects={"940001": {"id": "940001", "error_count": 2}},
+        edges={("940001", "errors"): {"data": [
             {"id": "e1", "total_count": 5, "samples": {"data": [{"id": "9", "row_number": 4, "retailer_id": "SKU-1"}]}},
             {"id": "e2", "total_count": 3, "samples": {"data": [{"id": "8", "row_number": 7, "retailer_id": long_id}]}},
             {"id": "e3", "total_count": 1},
         ]}},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", include_samples=True))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", include_samples=True))
     assert client.calls[1]["fields"] == EXPECTED_SAMPLED_ERROR_FIELDS
     errors = {error["id"]: error for error in result["item"]["errors"]}
     assert errors["e1"]["sample"] == {"id": "9", "row_number": 4, "retailer_id": "SKU-1"}
@@ -2584,10 +2584,10 @@ def test_list_product_feed_uploads_samples_refused_are_dropped_and_said(monkeypa
             return await super().list_objects(parent_id, edge, fields=fields, params=params)
 
     _use(monkeypatch, SampleRefusingClient(
-        objects={"up_1": {"id": "up_1", "error_count": 2}},
-        edges={("up_1", "errors"): _upload_errors},
+        objects={"940001": {"id": "940001", "error_count": 2}},
+        edges={("940001", "errors"): _upload_errors},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", include_samples=True))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", include_samples=True))
     assert calls == [EXPECTED_SAMPLED_ERROR_FIELDS, EXPECTED_UPLOAD_ERROR_FIELDS]
     item = result["item"]
     assert len(item["errors"]) == 4
@@ -2597,14 +2597,14 @@ def test_list_product_feed_uploads_samples_refused_are_dropped_and_said(monkeypa
 
 def test_list_product_feed_uploads_pages_errors_past_the_first_100(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 250}},
-        edges={("up_1", "errors"): _error_pages({
+        objects={"940001": {"id": "940001", "error_count": 250}},
+        edges={("940001", "errors"): _error_pages({
             None: {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
             "c1": {"data": _errors(100, 100), "paging": {"cursors": {"after": "c2"}, "next": "https://n2"}},
             "c2": {"data": _errors(200, 50)},
         })},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", error_limit=1000))
     error_calls = [call for call in client.calls if call.get("edge") == "errors"]
     assert [call["params"] for call in error_calls] == [
         {"limit": 100}, {"limit": 100, "after": "c1"}, {"limit": 100, "after": "c2"},
@@ -2618,13 +2618,13 @@ def test_list_product_feed_uploads_pages_errors_past_the_first_100(monkeypatch) 
 
 def test_list_product_feed_uploads_error_limit_stops_and_offers_a_cursor(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 250}},
-        edges={("up_1", "errors"): _error_pages({
+        objects={"940001": {"id": "940001", "error_count": 250}},
+        edges={("940001", "errors"): _error_pages({
             None: {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
             "c1": {"data": _errors(100, 50), "paging": {"cursors": {"after": "c2"}, "next": "https://n2"}},
         })},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=150))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", error_limit=150))
     error_calls = [call for call in client.calls if call.get("edge") == "errors"]
     # The second page asks only for the 50 errors still wanted.
     assert [call["params"] for call in error_calls] == [{"limit": 100}, {"limit": 50, "after": "c1"}]
@@ -2637,10 +2637,10 @@ def test_list_product_feed_uploads_error_limit_stops_and_offers_a_cursor(monkeyp
 
 def test_list_product_feed_uploads_error_after_continues_from_a_cursor(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 250}},
-        edges={("up_1", "errors"): _error_pages({"c2": {"data": _errors(200, 50)}})},
+        objects={"940001": {"id": "940001", "error_count": 250}},
+        edges={("940001", "errors"): _error_pages({"c2": {"data": _errors(200, 50)}})},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_after="c2"))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", error_after="c2"))
     assert client.calls[1]["params"] == {"limit": 100, "after": "c2"}
     assert result["item"]["errors_complete"] is True
     assert result["item"]["errors_from_start"] is False
@@ -2648,13 +2648,13 @@ def test_list_product_feed_uploads_error_after_continues_from_a_cursor(monkeypat
 
 def test_list_product_feed_uploads_repeated_error_cursor_stops_the_read(monkeypatch) -> None:
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 500}},
-        edges={("up_1", "errors"): _error_pages({
+        objects={"940001": {"id": "940001", "error_count": 500}},
+        edges={("940001", "errors"): _error_pages({
             None: {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
             "c1": {"data": _errors(100, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
         })},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", error_limit=1000))
     assert len([call for call in client.calls if call.get("edge") == "errors"]) == 2
     item = result["item"]
     assert len(item["errors"]) == 200
@@ -2665,10 +2665,10 @@ def test_list_product_feed_uploads_repeated_error_cursor_stops_the_read(monkeypa
 
 def test_list_product_feed_uploads_next_page_without_cursor_is_incomplete(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 500}},
-        edges={("up_1", "errors"): {"data": _errors(0, 100), "paging": {"next": "https://n1"}}},
+        objects={"940001": {"id": "940001", "error_count": 500}},
+        edges={("940001", "errors"): {"data": _errors(0, 100), "paging": {"next": "https://n1"}}},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", error_limit=1000))
     item = result["item"]
     assert item["errors_complete"] is False
     assert item["errors_next_after"] is None
@@ -2678,11 +2678,11 @@ def test_list_product_feed_uploads_next_page_without_cursor_is_incomplete(monkey
 def test_list_product_feed_uploads_same_page_again_is_not_counted_twice(monkeypatch) -> None:
     page = {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}}
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 500}},
-        edges={("up_1", "errors"): _error_pages({None: page, "c1": {**page, "paging": {
+        objects={"940001": {"id": "940001", "error_count": 500}},
+        edges={("940001", "errors"): _error_pages({None: page, "c1": {**page, "paging": {
             "cursors": {"after": "c2"}, "next": "https://n2"}}})},
     ))
-    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="up_1", error_limit=1000))
+    result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1", upload_id="940001", error_limit=1000))
     assert len([call for call in client.calls if call.get("edge") == "errors"]) == 2
     assert len(result["item"]["errors"]) == 100
     assert result["item"]["errors_complete"] is False
@@ -2694,11 +2694,11 @@ def test_list_product_feed_uploads_error_requests_are_capped(monkeypatch) -> Non
         return {"data": _errors(n * 100, 100), "paging": {"cursors": {"after": str(n + 1)}, "next": "https://n"}}
 
     client = _use(monkeypatch, FakeCatalogFeedClient(
-        objects={"up_1": {"id": "up_1", "error_count": 99999}},
-        edges={("up_1", "errors"): endless},
+        objects={"940001": {"id": "940001", "error_count": 99999}},
+        edges={("940001", "errors"): endless},
     ))
     result = run(catalog_feeds.list_product_feed_uploads(
-        feed_id="feed_1", upload_id="up_1", error_limit=catalog_feeds.MAX_UPLOAD_ERRORS,
+        feed_id="feed_1", upload_id="940001", error_limit=catalog_feeds.MAX_UPLOAD_ERRORS,
     ))
     error_calls = [call for call in client.calls if call.get("edge") == "errors"]
     assert len(error_calls) == catalog_feeds.MAX_UPLOAD_ERRORS // 100
@@ -2709,8 +2709,8 @@ def test_list_product_feed_uploads_error_requests_are_capped(monkeypatch) -> Non
 
 def test_list_product_feed_uploads_list_mode_offers_an_error_cursor(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("feed_1", "uploads"): {"data": [{"id": "up_1", "error_count": 300}]},
-        ("up_1", "errors"): {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
+        ("feed_1", "uploads"): {"data": [{"id": "940001", "error_count": 300}]},
+        ("940001", "errors"): {"data": _errors(0, 100), "paging": {"cursors": {"after": "c1"}, "next": "https://n1"}},
     }))
     result = run(catalog_feeds.list_product_feed_uploads(feed_id="feed_1"))
     item = result["items"][0]
@@ -2722,10 +2722,10 @@ def test_list_product_feed_uploads_list_mode_offers_an_error_cursor(monkeypatch)
 @pytest.mark.parametrize("kwargs", [
     {"error_after": "c1"},
     {"error_limit": 200},
-    {"upload_id": "up_1", "error_limit": 0},
-    {"upload_id": "up_1", "error_limit": 1001},
-    {"upload_id": "up_1", "error_limit": True},
-    {"upload_id": "up_1", "include_samples": "yes"},
+    {"upload_id": "940001", "error_limit": 0},
+    {"upload_id": "940001", "error_limit": 1001},
+    {"upload_id": "940001", "error_limit": True},
+    {"upload_id": "940001", "include_samples": "yes"},
 ])
 def test_list_product_feed_uploads_new_options_are_validated_before_any_call(monkeypatch, kwargs) -> None:
     _no_client(monkeypatch)
@@ -3668,10 +3668,10 @@ def test_upload_errors_with_unreadable_entries_are_not_complete(monkeypatch) -> 
 
 def test_upload_list_with_an_unreadable_entry_says_so(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("10", "uploads"): {"data": [{"id": "u1", "error_count": 0, "warning_count": 0}, None]},
+        ("10", "uploads"): {"data": [{"id": "974001", "error_count": 0, "warning_count": 0}, None]},
     }))
     result = run(catalog_feeds.list_product_feed_uploads("10"))
-    assert [item["id"] for item in result["items"]] == ["u1"]
+    assert [item["id"] for item in result["items"]] == ["974001"]
     assert result["summary"]["unreadable_entries"] == 1 and result["summary"]["complete"] is False
 
 
@@ -3687,10 +3687,10 @@ def test_disconnect_does_not_call_a_source_missing_when_a_listed_source_has_no_i
 
 def test_event_source_catalog_scan_with_an_unidentified_catalog_is_incomplete(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("b1", "owned_product_catalogs"): {"data": [{"name": "No id"}, {"id": "c2"}]},
-        ("c2", "external_event_sources"): {"data": [{"id": "s9"}]},
+        ("971001", "owned_product_catalogs"): {"data": [{"name": "No id"}, {"id": "973002"}]},
+        ("973002", "external_event_sources"): {"data": [{"id": "970009"}]},
     }))
-    result = run(catalog_feeds.list_event_source_catalogs("s1", business_id="b1"))
+    result = run(catalog_feeds.list_event_source_catalogs("970001", business_id="971001"))
     assert result["items"] == [] and result["summary"]["complete"] is False
 
 
@@ -3702,8 +3702,8 @@ def test_health_scoped_to_a_source_is_not_refused_when_a_source_has_no_id(monkey
 
 def test_unreadable_da_checks_are_reported_not_called_absent(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("10", "external_event_sources"): {"data": [{"id": "s1", "source_type": "PIXEL"}]},
-        ("s1", "da_checks"): {"data": [None, "x"]},
+        ("10", "external_event_sources"): {"data": [{"id": "970001", "source_type": "PIXEL"}]},
+        ("970001", "da_checks"): {"data": [None, "x"]},
     }))
     result = run(catalog_feeds.get_catalog_event_source_health("10"))
     notes = " ".join(result["missing_signals"])
@@ -3712,12 +3712,12 @@ def test_unreadable_da_checks_are_reported_not_called_absent(monkeypatch) -> Non
 
 def test_pixel_strength_is_unknown_when_its_checks_cannot_all_be_read(monkeypatch) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("b1", "adspixels"): {"data": [{"id": "p1"}, {"name": "No id"}]},
-        ("p1", "da_checks"): {"data": [None]},
+        ("971001", "adspixels"): {"data": [{"id": "972001"}, {"name": "No id"}]},
+        ("972001", "da_checks"): {"data": [None]},
     }))
-    result = run(catalog_feeds.get_catalog_event_source_recommendations("10", business_id="b1"))
+    result = run(catalog_feeds.get_catalog_event_source_recommendations("10", business_id="971001"))
     [recommendation] = result["recommendations"]
-    assert recommendation["event_source_id"] == "p1" and recommendation["strength"] == "unknown"
+    assert recommendation["event_source_id"] == "972001" and recommendation["strength"] == "unknown"
     assert any("without an id" in note or "had no id" in note for note in result["missing_signals"])
 
 
@@ -3809,17 +3809,86 @@ def test_attributed_rows_still_support_the_findings(monkeypatch) -> None:
 
 @pytest.mark.parametrize(("rows", "event_name"), [
     ([dict(_UNATTRIBUTED_ROW)], None),
-    ([{**_UNATTRIBUTED_ROW, "event_source": {"id": "s1"}, "event": None}], "Purchase"),
+    ([{**_UNATTRIBUTED_ROW, "event_source": {"id": "970001"}, "event": None}], "Purchase"),
 ])
 def test_match_rate_in_another_catalog_is_not_given_from_partly_attributed_rows(monkeypatch, rows, event_name) -> None:
     _use(monkeypatch, FakeCatalogFeedClient(edges={
-        ("b1", "owned_product_catalogs"): {"data": [{"id": "c1"}]},
-        ("c1", "external_event_sources"): {"data": [{"id": "s1"}]},
-        ("c1", "event_stats"): {"data": rows},
+        ("971001", "owned_product_catalogs"): {"data": [{"id": "973001"}]},
+        ("973001", "external_event_sources"): {"data": [{"id": "970001"}]},
+        ("973001", "event_stats"): {"data": rows},
     }))
     result = run(catalog_feeds.list_event_source_catalogs(
-        "s1", business_id="b1", include_match_rates=True, event_name=event_name,
+        "970001", business_id="971001", include_match_rates=True, event_name=event_name,
     ))
     rate = result["items"][0]["match_rate"]
     assert rate["status"] == "attribution_incomplete" and rate["match_rate"] is None
     assert rate["unattributed_event_stats"]["rows"] == 1
+
+
+# round fifteen ---------------------------------------------------------------------------
+# U2: one rule for a Graph id read from Meta; a row without one is unattributed, never matched.
+
+# Every id-like value worth pinning, with the identity the one rule gives it.
+GRAPH_ID_TABLE = [
+    ("20", "20"), (" 20 ", "20"), (20, "20"), (0, "0"), ("007", "007"),
+    (True, None), (False, None), (-1, None), (1.5, None), ("", None), ("   ", None),
+    ("unreadable-source", None), ("20a", None), ("-20", None), ("２０", None), (None, None), ([], None), ({}, None),
+]
+
+
+@pytest.mark.parametrize(("value", "identity"), GRAPH_ID_TABLE)
+def test_feed_ids_follow_the_one_graph_id_rule(value, identity) -> None:
+    from meta_ads_mcp.tools import business_access
+
+    assert business_access._row_identity(value) == identity
+    assert catalog_feeds._object_id(value) == (identity if not isinstance(value, dict) else None)
+    # A nested object's id follows the same rule.
+    assert catalog_feeds._object_id({"id": value}) == identity
+
+
+@pytest.mark.parametrize("bad_source", [True, {"id": False}, {"id": {}}, {"id": "   "}, "unreadable-source"])
+@pytest.mark.parametrize("tool", ["health", "recommendations", "catalog_rates"])
+def test_unreadable_source_identity_remains_unattributed(monkeypatch, bad_source, tool) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"id": "20", "source_type": "PIXEL"}]},
+        ("30", "owned_product_catalogs"): {"data": [{"id": "10", "name": "Example catalog"}]},
+        ("10", "event_stats"): {"data": [{"date_start": "2026-11-01", "event": "Purchase", "event_source": bad_source,
+                                          "total_matched_content_ids": 100, "total_unmatched_content_ids": 0}]},
+    }))
+    if tool == "health":
+        result = run(catalog_feeds.get_catalog_event_source_health("10"))
+        assert not any(f["type"] == "no_event_stats" for f in result["findings"])
+        assert result["sources"][0]["attribution_complete"] is False
+        assert result["metrics"]["unattributed_event_stats"]["rows"] == 1
+    elif tool == "recommendations":
+        result = run(catalog_feeds.get_catalog_event_source_recommendations("10", business_id="30"))
+        assert result["metrics"]["unattributed_event_stats"]["rows"] == 1
+        assert result["metrics"]["match_rate_28d"] is None
+    else:
+        result = run(catalog_feeds.list_event_source_catalogs("20", business_id="30", include_match_rates=True))
+        assert result["items"][0]["match_rate"]["status"] == "attribution_incomplete"
+
+
+@pytest.mark.parametrize("bad_id", [True, "pixel-20", {"id": "20"}, " "])
+def test_a_connected_source_with_an_unreadable_id_is_never_matched(monkeypatch, bad_id) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={
+        ("10", "external_event_sources"): {"data": [{"id": bad_id}]},
+    }))
+    # Not "already connected", and not "not connected": the request is sent and the gap stated.
+    result = run(catalog_feeds.connect_catalog_event_source("10", "20"))
+    assert "create_edge_object" in client.methods() and result["previous_complete"] is False
+    result = run(catalog_feeds.disconnect_catalog_event_source("10", "20"))
+    assert "delete_edge_object" in client.methods() and result["previous_complete"] is False
+
+
+def test_an_unreadable_owner_business_is_refused_not_guessed(monkeypatch) -> None:
+    _use(monkeypatch, FakeCatalogFeedClient(objects={"20": {"id": "20", "owner_business": {"id": True}}}))
+    with pytest.raises(ValidationError, match="no readable owner_business"):
+        run(catalog_feeds.list_event_source_catalogs("20"))
+
+
+def test_an_upload_with_an_unreadable_id_does_not_claim_complete_errors(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogFeedClient(edges={("10", "uploads"): {"data": [{"id": "up-1", "error_count": 3}]}}))
+    [item] = run(catalog_feeds.list_product_feed_uploads("10"))["items"]
+    assert item["errors_complete"] is False and "id" in item["errors_stop_reason"]
+    assert [call for call in client.calls if call.get("edge") == "errors"] == []
