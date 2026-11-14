@@ -1187,8 +1187,21 @@ async def delete_ad_image(
         )
     if not matches:
         raise ValidationError(f"No image with the given image_hash was found in {resolved_account}; nothing was deleted.")
+    # Meta's AdImage reference: the hash "uniquely identifies the image", so every match is a copy of one
+    # image, and the delete (by hash) is the same whichever copy is shown. Copies that differ are all
+    # shown rather than one chosen for previous.
     previous = matches[0]
+    copies = [match for index, match in enumerate(matches) if match not in matches[:index]]
     target = {"account_id": resolved_account, "image_hash": image_hash}
+    extra: dict[str, Any] = {}
+    if len(copies) > 1:
+        extra = {
+            "previous_copies": copies,
+            "previous_note": (
+                f"Meta listed {len(copies)} differing entries for this image hash; previous is the first, and "
+                "previous_copies lists them all. The delete is by hash, so it is the same for every copy."
+            ),
+        }
     if dry_run:
         return {
             "ok": True,
@@ -1197,6 +1210,7 @@ async def delete_ad_image(
             "sent": False,
             "target": target,
             "previous": previous,
+            **extra,
             "would_send": {"method": "DELETE", "path": f"{resolved_account}/adimages", "data": {"hash": image_hash}},
         }
     result = await client.delete_edge_object(resolved_account, "adimages", data={"hash": image_hash})
@@ -1206,6 +1220,7 @@ async def delete_ad_image(
         previous=previous,
         current={"hash": image_hash, "in_account_library": False},
     )
+    response.update(extra)
     response["result"] = result
     return response
 
@@ -1302,26 +1317,57 @@ def label_identity(label: Any) -> dict[str, str] | None:
     return None
 
 
+def _label_copies(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Readable label rows with copies of one label kept once, and the label ids whose copies disagree.
+
+    A copy without a name adds nothing and conflicts with nothing; the copy that carries the name is kept.
+    """
+    kept: dict[tuple[str, str], dict[str, Any]] = {}
+    conflicting: list[str] = []
+    for row in rows:
+        identity = label_identity(row)
+        key = next(iter(identity.items()))
+        if key not in kept:
+            kept[key] = row
+            continue
+        names = {str(copy.get("name")).strip() for copy in (kept[key], row) if isinstance(copy.get("name"), str)}
+        if len(names) > 1 and key[1] not in conflicting:
+            conflicting.append(key[1])
+        if not isinstance(kept[key].get("name"), str) and isinstance(row.get("name"), str):
+            kept[key] = row
+    return list(kept.values()), conflicting
+
+
 def read_label_set(raw: Any, *, more_pages: str) -> tuple[list[dict[str, Any]], str | None]:
     """Labels read from Meta (a list, or a page with data and paging), and why they are not the whole set.
 
     The reason is None only when every label was read: the page's data is a list, no further
     page is named (more_pages is the reason given when one is), and every row is a label that
     can be sent back (label_identity). Rows that cannot are counted, never dropped silently.
+
+    An AdLabel has one id and one name (SDK 26.0.2 AdLabel), so rows with one id are copies of one
+    label: copies that agree are kept once, and copies that name the label differently make the read
+    incomplete, since which label a name refers to is then not known.
     """
     if isinstance(raw, list):
         raw = {"data": raw}
     rows, unreadable_rows, page_unreadable = read_collection_page(raw)
     if page_unreadable:
         return [], "Meta returned the labels in a shape this server could not read"
-    labels = [row for row in rows if label_identity(row) is not None]
-    unreadable_rows += len(rows) - len(labels)
+    readable = [row for row in rows if label_identity(row) is not None]
+    unreadable_rows += len(rows) - len(readable)
+    labels, conflicting = _label_copies(readable)
     paging = raw.get("paging")
     if isinstance(paging, dict) and paging.get("next"):
         return labels, more_pages
+    if conflicting:
+        return labels, (
+            f"Meta listed label {conflicting[0]} more than once with different names, so which label each name "
+            "refers to is not known"
+        )
     if unreadable_rows:
         return labels, (
-            f"{unreadable_rows} of the {unreadable_rows + len(labels)} labels Meta returned "
+            f"{unreadable_rows} of the {unreadable_rows + len(readable)} labels Meta returned "
             f"{'is' if unreadable_rows == 1 else 'are'} not a label with an id or a name"
         )
     return labels, None
@@ -1981,16 +2027,28 @@ def _boost_settings(
     )
 
 
+def _graph_id_text(value: Any) -> str | None:
+    """An id read from Meta as text (Graph ids are text; a whole number is read as the same id), or None."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    return str(value).strip() or None
+
+
 async def _page_for_instagram_account(client: Any, instagram_account_id: str) -> tuple[str, dict[str, Any]]:
     """Find the one Page whose instagram_business_account is this Instagram account.
 
     Reads the token user's Pages (me/accounts, the Page field instagram_business_account),
     page by page with a request cap. Only a complete read with exactly one match is used.
+
+    A Page has one id and one linked Instagram account (SDK 26.0.2 Page: id string,
+    instagram_business_account a single IGUser), and me/accounts lists one node per Page with the
+    caller's roles as a tasks list on it, so two rows with one Page id are copies. Copies that agree
+    are one Page; a Page whose copies report different links, or a row whose id or link cannot be
+    read, makes the lookup incomplete, so no Page is inferred and page_id must be passed.
     """
-    matches: list[str] = []
+    links: dict[str, set[str | None]] = {}
     cursors: set[str] = set()
     params: dict[str, Any] = {"limit": BOOST_PAGE_LOOKUP_PAGE_SIZE}
-    pages_read = 0
     requests = 0
     complete = False
     stop_reason = f"the read stopped at this server's {BOOST_PAGE_LOOKUP_MAX_REQUESTS}-request limit"
@@ -2005,19 +2063,14 @@ async def _page_for_instagram_account(client: Any, instagram_account_id: str) ->
             break
         unreadable += unreadable_rows
         for page in rows:
+            page_id = _graph_id_text(page.get("id"))
             linked = page.get("instagram_business_account")
-            if linked is not None and not isinstance(linked, dict):
-                unreadable += 1
+            # Absent (the Page has no linked account) is a readable "no link"; a link object must carry an id.
+            link = _graph_id_text(linked.get("id")) if isinstance(linked, dict) else None
+            if page_id is None or (linked is not None and link is None):
+                unreadable += 1  # Which Page it is, or which account it links, is not known.
                 continue
-            linked_id = linked.get("id") if isinstance(linked, dict) else None
-            if linked_id is None or str(linked_id) != instagram_account_id:
-                pages_read += 1
-                continue
-            if not blank_to_none(str(page.get("id") or "")):
-                unreadable += 1  # The matching Page, but without its id.
-                continue
-            pages_read += 1
-            matches.append(str(page["id"]).strip())
+            links.setdefault(page_id, set()).add(link)
         paging = payload.get("paging")
         if not isinstance(paging, dict) or not paging.get("next"):
             complete = True
@@ -2038,7 +2091,15 @@ async def _page_for_instagram_account(client: Any, instagram_account_id: str) ->
             f"{unreadable} {'entry' if unreadable == 1 else 'entries'} in it could not be read, and any of them could "
             "be a Page linked to this Instagram account"
         )
-    matches = list(dict.fromkeys(matches))
+    matches = [page_id for page_id, seen in links.items() if instagram_account_id in seen]
+    conflicting = [page_id for page_id in matches if len(links[page_id]) > 1]
+    if complete and conflicting:
+        # Copies of one Page that disagree about its link: which account it links is not known.
+        complete = False
+        stop_reason = (
+            f"Meta listed Page {conflicting[0]} more than once with different Instagram accounts, so its link is not known"
+        )
+    pages_read = len(links)
     lookup = {"source": "me/accounts instagram_business_account", "pages_read": pages_read, "requests": requests, "complete": complete}
     if complete and len(matches) == 1:
         return matches[0], lookup

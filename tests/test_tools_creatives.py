@@ -3942,3 +3942,127 @@ def test_the_shared_exit_cleans_a_new_field_it_has_never_seen(monkeypatch) -> No
         creatives.current_call_secrets()
     with pytest.raises(RuntimeError):
         creatives.NO_SECRETS.add(codes=["x"])
+
+
+# Round sixteen (review R14, V2): a Page inferred from the lookup is used only when every row read for
+# that Page id agrees on its link, and exactly one Page id matches.
+
+
+@pytest.mark.parametrize("plan_only", [True, False], ids=["plan", "write"])
+def test_boost_page_lookup_rejects_conflicting_instagram_links(monkeypatch, plan_only) -> None:
+    class Client:
+        def __init__(self):
+            self.writes = []
+
+        async def get_object(self, object_id, **kwargs):
+            return {"id": object_id, "currency": "USD"}
+
+        async def list_objects(self, object_id, edge, **kwargs):
+            assert (object_id, edge) == ("me", "accounts")
+            return {"data": [
+                {"id": "40", "instagram_business_account": {"id": "30"}},
+                {"id": "40", "instagram_business_account": {"id": "31"}},
+            ]}
+
+        async def create_edge_object(self, object_id, edge, *, data, **kwargs):
+            self.writes.append((object_id, edge, deepcopy(data)))
+            return {"id": str(100 + len(self.writes))}
+
+    client = Client()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match="page_id is required") as raised:
+        asyncio.run(creatives.boost_instagram_post(
+            "10", instagram_media_id="20", instagram_account_id="30", daily_budget=2,
+            targeting={"geo_locations": {"countries": ["US"]}}, plan_only=plan_only))
+    assert "different Instagram accounts" in str(raised.value)
+    assert client.writes == []
+
+
+@pytest.mark.parametrize(
+    ("rows", "reason"),
+    [
+        # The matched Page listed again with no linked account: its copies disagree.
+        ([{"id": "777", "instagram_business_account": {"id": "666"}}, {"id": "777"}], "different Instagram accounts"),
+        # Equal copies spread over two answer pages, then a disagreeing third copy.
+        ([{"id": "777", "instagram_business_account": {"id": "666"}}, {"id": "777", "instagram_business_account": {"id": 666}},
+          {"id": "777", "instagram_business_account": {"id": "1"}}], "different Instagram accounts"),
+        # A link object without a readable id, on any Page.
+        ([{"id": "777", "instagram_business_account": {"id": "666"}}, {"id": "8", "instagram_business_account": {}}],
+         "1 entry in it could not be read"),
+        # A row whose Page id cannot be read.
+        ([{"id": "777", "instagram_business_account": {"id": "666"}}, {"id": True, "instagram_business_account": {"id": "2"}}],
+         "1 entry in it could not be read"),
+    ],
+)
+def test_boost_page_lookup_refuses_unknowable_links(monkeypatch, fixed_clock, rows, reason) -> None:
+    client = FakePageLookupClient({None: {"data": rows}})
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "page_id"}
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError, match=reason) as raised:
+        asyncio.run(creatives.boost_instagram_post(**arguments))
+    assert "could not be read completely" in str(raised.value)
+    assert not [call for call in client.calls if call[0] == "create"]
+
+
+def test_boost_page_lookup_accepts_agreeing_copies_and_ignores_other_pages_disagreeing(monkeypatch, fixed_clock) -> None:
+    pages = {
+        None: {"data": [{"id": "777", "instagram_business_account": {"id": "666"}},
+                        {"id": "5", "instagram_business_account": {"id": "1"}}],
+               "paging": {"cursors": {"after": "c1"}, "next": "https://graph.facebook.com/next"}},
+        # The same Page again on the next page (a list that shifted while it was read): an equal copy.
+        "c1": {"data": [{"id": "777", "instagram_business_account": {"id": "666"}},
+                        {"id": "5", "instagram_business_account": {"id": "2"}}]},
+    }
+    client = FakePageLookupClient(pages)
+    arguments = {key: value for key, value in ONE_STEP.items() if key != "page_id"}
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**arguments, objective="OUTCOME_AWARENESS"))
+    assert _created(client, "adsets")["promoted_object"] == {"page_id": "777"}
+    assert result["page_lookup"] == {"source": "me/accounts instagram_business_account", "pages_read": 2, "requests": 2, "complete": True}
+
+
+def test_boost_with_an_explicit_page_id_skips_the_lookup(monkeypatch, fixed_clock) -> None:
+    client = FakePageLookupClient({})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    asyncio.run(creatives.boost_instagram_post(**ONE_STEP))
+    assert not [call for call in client.calls if call[0] == "list"]
+
+
+# Label copies: one AdLabel id has one name.
+
+
+def test_label_copies_that_name_one_label_differently_refuse_a_removal(monkeypatch) -> None:
+    fake = R3LabelClient({"data": [{"id": "11", "name": "spring"}, {"id": "11", "name": "autumn"}, {"id": "12", "name": "x"}]})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    with pytest.raises(creatives.ValidationError, match="label 11 more than once with different names"):
+        asyncio.run(creatives.update_creative("10", adlabels=[{"name": "spring"}], adlabels_operation="remove"))
+    assert fake.writes == []
+
+
+def test_agreeing_label_copies_are_one_label(monkeypatch) -> None:
+    fake = R3LabelClient({"data": [{"id": "11", "name": "spring"}, {"id": "11"}, {"id": "11", "name": "spring"}, {"id": "12", "name": "x"}]})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.update_creative("10", adlabels=[{"name": "x"}], adlabels_operation="remove"))
+    assert fake.writes == [("update", "10", {"adlabels": [{"id": "11"}]})]
+    assert result["previous"]["adlabels"] == [{"id": "11", "name": "spring"}, {"id": "12", "name": "x"}]
+    assert result["adlabels_read_complete"] is True
+
+
+# Image copies: Meta's AdImage reference says the hash "uniquely identifies the image".
+
+
+def test_delete_ad_image_names_differing_copies_instead_of_choosing_one(monkeypatch) -> None:
+    client = FakeImageClient([{"hash": "h1", "name": "Hero"}, {"hash": "h1", "name": "Hero"}, {"hash": "h1", "name": "Other"}])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    for dry_run in (True, False):
+        result = asyncio.run(creatives.delete_ad_image(account_id="123", image_hash="h1", dry_run=dry_run))
+        assert result["previous"] == {"hash": "h1", "name": "Hero"}
+        assert result["previous_copies"] == [{"hash": "h1", "name": "Hero"}, {"hash": "h1", "name": "Other"}]
+        assert "2 differing entries" in result["previous_note"]
+
+
+def test_delete_ad_image_equal_copies_add_nothing(monkeypatch) -> None:
+    client = FakeImageClient([{"hash": "h1", "name": "Hero"}, {"hash": "h1", "name": "Hero"}])
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.delete_ad_image(account_id="123", image_hash="h1"))
+    assert "previous_copies" not in result and "previous_note" not in result
