@@ -100,6 +100,13 @@
       "what_changed": "When Meta answers a page of ad accounts that cannot be read in full, the result now says so: summary.complete is false and summary.incomplete_reason gives the reason. A page with no data list (data missing, null or not a list) returns no items and no paging cursor. A page with entries that are not objects returns the accounts that were read, without those entries, and Meta's paging. Before, a missing data list was returned as an ordinary empty last page, and a null data list or an entry that was not an object crashed the tool. A normal page, including an empty one, returns exactly what it did before, with no complete key.",
       "why_better": "An answer from Meta that could not be read is no longer shown as proof that the token can see no ad accounts, or no more of them, so a caller does not stop looking on an answer that said nothing.",
       "migration": "Nothing to change for a normal answer. A caller should treat summary.complete false with summary.incomplete_reason as a list that was not fully read: retry the call or report it."
+    },
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "When Meta answers a write (a POST or DELETE) with a success status and an explicit false (a bare false, or an object whose success field is false), the tool now raises a Meta API error saying Meta answered that the change was not made. Before, that answer was handed to the tool as a result, and write tools reported the change as made. Only the boolean false counts: an answer with no success field, or with success true, is returned exactly as before, and reads are not affected.",
+      "why_better": "A change Meta says it did not make is no longer reported as made.",
+      "migration": "Nothing to change for a normal answer. Treat the error like any other Meta error: read the object to see what it holds before retrying."
     }
   ]
 }

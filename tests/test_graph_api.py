@@ -1236,6 +1236,54 @@ def test_bool_and_list_answers_keep_their_existing_wrappers(monkeypatch) -> None
     assert asyncio.run(client.request("GET", "123")) == {"data": [{"id": "1"}]}
 
 
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+@pytest.mark.parametrize("body", [False, {"success": False}, {"success": False, "id": "9"}])
+def test_a_write_meta_answers_with_success_false_is_an_error(monkeypatch, method, body) -> None:
+    # R16 X2: before, every write tool reported such a change as made.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert "success: false" in error.value.message
+    assert error.value.details == {"negative_acknowledgement": True}
+    assert error.value.status_code == 200
+    assert error.value.operation == f"{method} /123"
+    assert error.value.mutation_outcome_unknown is False
+    assert not error.value.is_transient
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+@pytest.mark.parametrize("body", [
+    True, {"success": True}, {"id": "9"}, {"success": None}, {"success": 0}, {"success": "false"},
+    {"id": "9", "is_published": False}, {"data": [{"success": False}]}, {},
+])
+def test_a_write_answer_without_an_explicit_false_acknowledgement_is_returned_as_before(monkeypatch, method, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    answer = asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert answer == ({"success": True} if body is True else body)
+
+
+def test_a_read_answered_false_keeps_its_wrapper(monkeypatch) -> None:
+    # Only a write is refused: a read holds no acknowledgement of a change.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, False), FakeResponse(200, {"success": False})])
+    client = _client()
+    assert asyncio.run(client.request("GET", "123")) == {"success": False}
+    assert asyncio.run(client.request("GET", "123")) == {"success": False}
+
+
+@pytest.mark.parametrize(("payload", "expected"), [
+    ({"success": True}, True), ({"success": False}, True), ({"data": []}, True), ({"data": [{"id": "1"}]}, True),
+    ({"id": "1"}, False), ({}, False), ({"success": True, "id": "1"}, False), ({"data": [], "paging": {}}, False),
+    ({"success": "true"}, False), ({"data": None}, False), (None, False), ([], False),
+])
+def test_bare_answer_wrapper_is_recognised_only_in_its_exact_form(payload, expected) -> None:
+    from meta_ads_mcp.graph_api import is_bare_answer_wrapper
+
+    assert is_bare_answer_wrapper(payload) is expected
+
+
 class _TextResponse(FakeResponse):
     """A response whose body is not JSON."""
 

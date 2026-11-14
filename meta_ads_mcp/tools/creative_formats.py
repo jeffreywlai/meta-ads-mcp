@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, ValidationError
-from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
+from meta_ads_mcp.graph_api import get_graph_api_client, is_bare_answer_wrapper, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
@@ -1597,7 +1597,9 @@ async def _read_explicit_story_settings(
         read = await client.get_object(creative_id, fields=EXPLICIT_STORY_SPEC_READ)
     except Exception as exc:
         return {}, f"Meta's read of it failed ({type(exc).__name__})", exc
-    if not isinstance(read, dict):
+    if not isinstance(read, dict) or is_bare_answer_wrapper(read):
+        # A bare true, false or array is not a creative: its missing object_story_spec does
+        # not show the creative has none of these settings, so the copy must not go ahead.
         return {}, _EXPLICIT_UNREADABLE, None
     spec = read.get("object_story_spec")
     if spec is None:

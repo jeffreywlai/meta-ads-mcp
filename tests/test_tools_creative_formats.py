@@ -2804,3 +2804,37 @@ def test_enhancement_copy_sends_agreeing_label_copies_once(monkeypatch) -> None:
     _patch(monkeypatch, fake)
     asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
     assert fake.writes[0][3]["adlabels"] == [{"id": "71"}, {"id": "72"}]
+
+
+# Round eighteen (review R16, X1): an answer that is not a creative does not show a setting is absent.
+
+
+class _OneAnswerClient:
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        return self.answer
+
+
+@pytest.mark.parametrize("answer", [{"success": False}, {"success": True}, {"data": []}, {"data": [{"id": "20"}]}])
+def test_a_bare_answer_to_the_explicit_setting_read_is_not_read_as_no_setting(answer) -> None:
+    """The Graph client hands a bare true, false or array on in these forms."""
+    values, reason, error = asyncio.run(cf._read_explicit_story_settings(_OneAnswerClient(answer), "20"))
+    assert (values, reason, error) == ({}, cf._EXPLICIT_UNREADABLE, None)
+
+
+@pytest.mark.parametrize("answer", [
+    {"id": "20"},  # what Meta's live API answers for a creative without the setting (2026-11-13)
+    {"id": "20", "object_story_spec": None},
+    {"id": "20", "object_story_spec": {}},
+    {"object_story_spec": {"whats_app_business_phone_number": ""}},
+])
+def test_a_creative_without_the_explicit_setting_is_still_read_as_having_none(answer) -> None:
+    assert asyncio.run(cf._read_explicit_story_settings(_OneAnswerClient(answer), "20")) == ({}, None, None)
+
+
+def test_a_creative_with_the_explicit_setting_is_still_read() -> None:
+    answer = {"id": "20", "object_story_spec": {"whats_app_business_phone_number": "15550100"}}
+    values, reason, error = asyncio.run(cf._read_explicit_story_settings(_OneAnswerClient(answer), "20"))
+    assert (values, reason, error) == ({"whats_app_business_phone_number": "15550100"}, None, None)

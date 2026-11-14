@@ -278,6 +278,19 @@ def _usage_headers(response: Any) -> dict[str, Any] | None:
     return usage or None
 
 
+def is_bare_answer_wrapper(payload: Any) -> bool:
+    """Whether an answer has exactly the form request() gives a bare JSON boolean or array.
+
+    A bare true or false arrives as {"success": <boolean>} and a bare array as {"data": [...]},
+    with no other key. A list read can legitimately look like the second; a read of one object
+    cannot look like either, so a tool that reads an object and takes a missing field to mean
+    "not set" uses this to tell an object from an answer that was not one.
+    """
+    if not isinstance(payload, dict) or len(payload) != 1:
+        return False
+    return isinstance(payload.get("success"), bool) or isinstance(payload.get("data"), list)
+
+
 @dataclass(slots=True)
 class GraphAPIClient:
     """Thin async client around the Marketing API."""
@@ -526,6 +539,21 @@ class GraphAPIClient:
                     await asyncio.sleep(delay)
                     continue
                 raise error
+            if not safe_to_retry and payload.get("success") is False:
+                # Meta answered a write with a success status and an explicit false (a bare
+                # false, or success: false). That is its statement that the change was not
+                # made, so it is never handed back as an answer a tool would report as done.
+                # Only the boolean false counts: a missing, null or other value is not one.
+                raise MetaApiError(
+                    message=(
+                        "Meta answered that the change was not made (success: false). "
+                        "Read the object to see what it holds before retrying."
+                    ),
+                    status_code=response.status_code,
+                    details={"negative_acknowledgement": True},
+                    operation=operation,
+                    mutation_outcome_unknown=False,
+                )
             return payload
 
         raise AsyncJobError(f"Request retries exhausted for endpoint: {endpoint}")
