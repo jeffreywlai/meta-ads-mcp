@@ -113,12 +113,9 @@ def _catalog_recipient_kind(value: Any) -> str:
     """Return PERSON or AGENCY for the catalog access tools, accepting the other tools' kinds."""
     if str(value or "").strip().upper() == "PERSON":
         return "PERSON"
-    try:
-        kind = _user_kind(value)
-    except ValidationError:
-        raise ValidationError(
-            f"user_type is not recognised. Accepted values: PERSON, {_USER_TYPE_ACCEPTED}."
-        ) from None
+    kind = _known_kind(value)
+    if kind is None:
+        raise ValidationError(f"user_type is not recognised. Accepted values: PERSON, {_USER_TYPE_ACCEPTED}.")
     return "AGENCY" if kind == "AGENCY" else "PERSON"
 
 

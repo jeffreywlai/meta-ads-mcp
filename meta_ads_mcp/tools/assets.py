@@ -560,16 +560,26 @@ _INSTAGRAM_PRODUCT_TYPES = frozenset({"FEED", "REELS", "STORY", "AD"})
 _PRODUCT_TYPE_WORDS = {"REEL": "REELS", "STORIES": "STORY", "POST": "FEED", "POSTS": "FEED"}
 
 
+def _parse_caller_date(text: str) -> date | None:
+    """A caller's YYYY-MM-DD date, or None; the parser's error, which repeats the text, is discarded."""
+    try:
+        return date.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def _media_window(since: str | None, until: str | None) -> tuple[datetime | None, datetime | None] | None:
     """Turn inclusive UTC dates into [start, end) datetimes."""
     since_text, until_text = blank_to_none(since), blank_to_none(until)
     if since_text is None and until_text is None:
         return None
-    try:
-        start = datetime.combine(date.fromisoformat(since_text), time.min, UTC) if since_text else None
-        end = datetime.combine(date.fromisoformat(until_text), time.min, UTC) + timedelta(days=1) if until_text else None
-    except ValueError as exc:
-        raise ValidationError("since and until must be dates in YYYY-MM-DD format.") from exc
+    since_day = _parse_caller_date(since_text) if since_text else None
+    until_day = _parse_caller_date(until_text) if until_text else None
+    if (since_text and since_day is None) or (until_text and until_day is None):
+        # Raised here, outside the parser's handler: the parser's error repeats the text.
+        raise ValidationError("since and until must be dates in YYYY-MM-DD format.")
+    start = datetime.combine(since_day, time.min, UTC) if since_day else None
+    end = datetime.combine(until_day, time.min, UTC) + timedelta(days=1) if until_day else None
     if start is not None and end is not None and end <= start:
         raise ValidationError("until must be on or after since.")
     return start, end

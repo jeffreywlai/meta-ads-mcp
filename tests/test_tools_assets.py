@@ -1039,3 +1039,33 @@ def test_audience_adsets_targeting_without_audience_lists_is_readable(monkeypatc
     ))
     result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting"))
     assert result["summary"]["complete"] is True
+
+
+# R14 (review S4): a pasted date never reaches errors or logs ----------------------------------
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("field", ["since", "until"])
+def test_instagram_media_bad_date_never_logs_or_returns_private_input(caplog, routed, field) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    import meta_ads_mcp.server  # noqa: F401 -- register the complete real server
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    private = "".join(["Synthetic", "Private", "Value", "_", "x7y9"])
+    name, arguments = "list_instagram_media", {"instagram_account_id": "10", field: private}
+    if routed:
+        name, arguments = "call_tool", {"name": name, "arguments": arguments}
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(mcp_server.call_tool(name, arguments))
+    leaks = {"mcp_error": private in str(caught.value), "logs": private in caplog.text}
+    assert not any(leaks.values()), leaks
+
+
+def test_media_window_error_has_no_exception_chain() -> None:
+    with pytest.raises(ValidationError) as error:
+        assets._media_window("".join(["not", "-a-date"]), None)
+    assert error.value.__cause__ is None and error.value.__context__ is None

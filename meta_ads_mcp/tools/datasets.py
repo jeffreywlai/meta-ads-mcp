@@ -208,10 +208,19 @@ def _next_page(payload: dict[str, Any], seen_cursors: set[str]) -> tuple[bool, s
 
 
 def _parse_day(value: str, name: str) -> date:
+    """Parse a caller date, raising a value-free error outside the parser's handler.
+
+    The parser's error repeats the whole text, so it is discarded inside the handler and the
+    validation error is raised after it, with nothing of the text in its exception chain.
+    """
+    parsed: date | None = None
     try:
-        return date.fromisoformat(value.strip())
-    except (AttributeError, ValueError) as exc:
-        raise ValidationError(f"{name} must be a date in YYYY-MM-DD format.") from exc
+        parsed = date.fromisoformat(value.strip())
+    except (AttributeError, TypeError, ValueError):
+        parsed = None
+    if parsed is None:
+        raise ValidationError(f"{name} must be a date in YYYY-MM-DD format.")
+    return parsed
 
 
 def _resolve_stats_window(since: str | None, until: str | None, now: datetime) -> tuple[date, date]:

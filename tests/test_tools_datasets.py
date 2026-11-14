@@ -790,3 +790,33 @@ def test_dataset_quality_entries_that_are_not_objects_are_disclosed(monkeypatch,
     result = asyncio.run(datasets.get_dataset_quality(dataset_id="px1", channel=channel))
     assert result["metrics"]["events"] == 1
     assert any("1 " + channel + " event entry" in signal for signal in result["missing_signals"])
+
+
+# ------------------------------- R14 (review S4): a pasted date never reaches errors or logs
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "proxy"])
+@pytest.mark.parametrize("field", ["since", "until"])
+def test_dataset_stats_bad_date_never_logs_or_returns_private_input(caplog, routed, field) -> None:
+    import logging
+
+    from fastmcp.exceptions import ToolError
+
+    import meta_ads_mcp.server  # noqa: F401 -- register the complete real server
+    from meta_ads_mcp.coordinator import mcp_server
+
+    caplog.set_level(logging.DEBUG)
+    private = "".join(["Synthetic", "Private", "Value", "_", "x7y9"])
+    name, arguments = "get_dataset_stats", {"dataset_id": "10", field: private}
+    if routed:
+        name, arguments = "call_tool", {"name": name, "arguments": arguments}
+    with pytest.raises(ToolError) as caught:
+        asyncio.run(mcp_server.call_tool(name, arguments))
+    leaks = {"mcp_error": private in str(caught.value), "logs": private in caplog.text}
+    assert not any(leaks.values()), leaks
+
+
+def test_bad_date_error_has_no_exception_chain() -> None:
+    with pytest.raises(ValidationError) as error:
+        datasets._parse_day("".join(["not", "-a-date"]), "since")
+    assert error.value.__cause__ is None and error.value.__context__ is None

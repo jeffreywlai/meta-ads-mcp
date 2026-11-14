@@ -269,6 +269,32 @@ def _parse_meta_time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _parse_iso_text(text: str) -> datetime | None:
+    """Parse caller text as an ISO 8601 time, or return None.
+
+    The parser's own error repeats the whole text, so it is discarded here and the caller raises
+    a value-free error after this returns: nothing of the text stays in an exception chain that a
+    log could print.
+    """
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _unknown_keys_error(where: str, given: Any, accepted: Any) -> ValidationError:
+    """A value-free error for keys outside accepted: they are counted, never repeated.
+
+    A misplaced name, email address or token can arrive as a key, so only the number of
+    unknown keys and the accepted keys are named.
+    """
+    count = sum(1 for key in given if key not in accepted)
+    return ValidationError(
+        f"{where} has {count} unsupported key{'' if count == 1 else 's'} (not repeated here). "
+        f"Accepted keys: {', '.join(sorted(accepted))}."
+    )
+
+
 def _to_unix(value: Any, field_name: str) -> int:
     """Convert an ISO 8601 time with offset, or Unix seconds, to the integer Meta expects."""
     if isinstance(value, bool):
@@ -278,12 +304,11 @@ def _to_unix(value: Any, field_name: str) -> int:
     elif isinstance(value, str) and value.strip().isdigit():
         seconds = int(value.strip())
     elif isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.strip())
-        except ValueError as exc:
+        parsed = _parse_iso_text(value.strip())
+        if parsed is None:
             raise ValidationError(
                 f"{field_name} must be an ISO 8601 time with offset (2026-12-01T00:00:00Z) or Unix seconds."
-            ) from exc
+            )
         if parsed.tzinfo is None:
             raise ValidationError(
                 f"{field_name} needs a UTC offset or Z (for example 2026-12-01T00:00:00-05:00) "
@@ -360,12 +385,8 @@ def _percentage(value: Any, *, label: str, minimum: float = 0.0) -> float:
 def _check_cell_keys(cell: Any, index: int, accepted: frozenset[str]) -> dict[str, Any]:
     if not isinstance(cell, dict):
         raise ValidationError(f"cells[{index}] must be an object.")
-    unknown = sorted(set(cell) - accepted)
-    if unknown:
-        raise ValidationError(
-            f"cells[{index}] has unsupported keys: {', '.join(unknown)}. "
-            f"Accepted keys: {', '.join(sorted(accepted))}."
-        )
+    if set(cell) - accepted:
+        raise _unknown_keys_error(f"cells[{index}]", cell, accepted)
     name = cell.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ValidationError(f"cells[{index}].name is required.")
@@ -400,8 +421,9 @@ def _build_ab_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ids = _id_list(cell[key], label=f"cells[{index}].{key}")
             for entity_id in ids:
                 if entity_id in owners:
+                    # The id is not repeated: any text can arrive in an id list.
                     raise ValidationError(
-                        f"{entity_id} appears in cells[{owners[entity_id]}] and cells[{index}]; "
+                        f"The same id appears in cells[{owners[entity_id]}] and cells[{index}]; "
                         "each campaign or ad set can be in only one cell."
                     )
                 owners[entity_id] = index
@@ -448,7 +470,7 @@ def _build_creative_cells(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ad_id = ad_ids[0]
         if ad_id in owners:
             raise ValidationError(
-                f"{ad_id} appears in cells[{owners[ad_id]}] and cells[{index}]; each ad can be in only one cell."
+                f"The same ad id appears in cells[{owners[ad_id]}] and cells[{index}]; each ad can be in only one cell."
             )
         owners[ad_id] = index
         share = _percentage(
@@ -557,12 +579,8 @@ def _build_objectives(objectives: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for index, objective in enumerate(objectives):
         if not isinstance(objective, dict):
             raise ValidationError(f"objectives[{index}] must be an object.")
-        unknown = sorted(set(objective) - accepted)
-        if unknown:
-            raise ValidationError(
-                f"objectives[{index}] has unsupported keys: {', '.join(unknown)}. "
-                f"Accepted keys: {', '.join(sorted(accepted))}."
-            )
+        if set(objective) - accepted:
+            raise _unknown_keys_error(f"objectives[{index}]", objective, accepted)
         name = objective.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ValidationError(f"objectives[{index}].name is required.")
