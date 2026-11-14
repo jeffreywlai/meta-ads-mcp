@@ -16,6 +16,7 @@ from meta_ads_mcp.argument_privacy import (
     private_validation_message,
     schema_parameter_names,
     unknown_parameter_count,
+    validation_message,
 )
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.errors import MetaApiError, RateLimitError
@@ -75,10 +76,13 @@ class ToolParameterHelpMiddleware(Middleware):
     """Reject unknown keywords with the live schema before a tool executes.
 
     For every tool, unknown parameters are counted rather than named: a
-    misplaced value can arrive as a parameter name. For tools in
-    PRIVATE_ARGUMENT_TOOLS, the framework's argument-validation error is also
-    replaced by one that names parameters only: those arguments can hold
-    personal data or secrets.
+    misplaced value can arrive as a parameter name. The framework's
+    argument-validation error, which quotes the values sent, is replaced for
+    every tool: validation_message keeps each fault's location, type and
+    Pydantic's message unless the message repeats the input; for tools in
+    PRIVATE_ARGUMENT_TOOLS, private_validation_message is stricter and keeps
+    only Pydantic's built-in messages, since those arguments can hold personal
+    data or secrets.
 
     The call_tool proxy's own envelope (name, arguments, tool_name) gets the
     same handling unless every target it names is a registered tool outside
@@ -156,19 +160,18 @@ class ToolParameterHelpMiddleware(Middleware):
             # Refused before dispatch: the nested call's "Unknown tool" error
             # would repeat the target in the returned error and the log.
             raise ToolError(unknown_tool_message())
-        if not private:
+        if tool is None:
             return await call_next(context)
         failure: ToolError | None = None
         try:
             return await call_next(context)
         except (FastMCPValidationError, PydanticValidationError) as exc:
+            # FastMCP raises its own ValidationError with Pydantic's ValidationError as
+            # the cause; the input is read only to check a message does not repeat it.
             cause = exc if isinstance(exc, PydanticValidationError) else exc.__cause__
             errors = cause.errors(include_url=False) if isinstance(cause, PydanticValidationError) else None
-            failure = ToolError(
-                private_validation_message(
-                    tool.name, errors, schema_parameter_names(tool.parameters)
-                )
-            )
+            build = private_validation_message if private else validation_message
+            failure = ToolError(build(tool.name, errors, schema_parameter_names(tool.parameters)))
         # Raised outside the except block so the original error, which quotes
         # the values, is neither the cause nor the context of this one.
         raise failure
