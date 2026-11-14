@@ -146,17 +146,54 @@ def _page_fingerprint(items: list[Any]) -> str:
     return json.dumps(items, sort_keys=True, default=str)
 
 
-def _new_rows(items: list[Any], seen_ids: set[str]) -> list[Any]:
-    """Rows whose id has not been seen on an earlier page; rows without an id are kept."""
-    fresh: list[Any] = []
-    for item in items:
-        item_id = item.get("id") if isinstance(item, dict) else None
-        if item_id not in (None, ""):
-            if str(item_id) in seen_ids:
+class _RowsById:
+    """Every row read, grouped by id, so that no row wins because it came first.
+
+    The one place this module settles which row stands for an id (study scans, cells and
+    objectives). decides(row) gives the value a decision depends on: for a study scan its
+    state, for cells and objectives the whole row. Copies of one id that agree are one row
+    (an identical duplicate is known); copies that disagree make that id conflicting, and the
+    caller must treat it as unknown, never pick one. Rows without an id are kept as they came.
+    """
+
+    def __init__(self, decides: Any) -> None:
+        self.decides = decides
+        self.sequence: list[tuple[str | None, dict[str, Any]]] = []
+        self.by_id: dict[str, list[dict[str, Any]]] = {}
+
+    def add(self, rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            row_id = row.get("id")
+            if row_id in (None, ""):
+                self.sequence.append((None, row))
                 continue
-            seen_ids.add(str(item_id))
-        fresh.append(item)
-    return fresh
+            key = str(row_id)
+            if key not in self.by_id:
+                self.by_id[key] = []
+                self.sequence.append((key, row))
+            self.by_id[key].append(row)
+
+    def resolve(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """(the rows that stand, in the order first read; the ids whose copies disagree)."""
+        rows: list[dict[str, Any]] = []
+        conflicting: list[str] = []
+        for key, row in self.sequence:
+            if key is None:
+                rows.append(row)
+                continue
+            values = {_page_fingerprint([self.decides(copy)]) for copy in self.by_id[key]}
+            if len(values) > 1:
+                conflicting.append(key)
+            else:
+                rows.append(row)
+        return rows, conflicting
+
+
+def _conflicting_ids_reason(ids: list[str]) -> str:
+    return (
+        f"Meta returned {len(ids)} id(s) more than once with different values ({', '.join(ids)}); which copy "
+        "is right is unknown, so those rows were left out."
+    )
 # Creative tests (ad-level cells), from Meta's split testing guide: type SPLIT_TEST_V2, one ad per
 # cell, whole-number shares totalling 100, a creative_test_config budget, cooldown_start_time equal
 # to start_time and observation_end_time equal to end_time. The guide allows 2 to 7 cells; the Ad
@@ -720,24 +757,32 @@ async def _read_edge_pages(
     every row was an object. A page without a readable data list, a next link without a usable
     cursor, a repeated cursor, a page already read, or the page cap ends the read as incomplete
     with stop_reason saying why. Rows that are not objects are counted in unreadable_rows and also
-    leave the read incomplete. A repeated page is not added, and an id is kept only once.
+    leave the read incomplete. A repeated page is not added. Copies of one id that agree are kept
+    once; copies that disagree are left out and leave the read incomplete (_RowsById).
     """
-    items: list[Any] = []
+    collected = _RowsById(lambda row: row)
     params: dict[str, Any] = {"limit": page_size}
     seen_cursors: set[str] = set()
     seen_pages: set[str] = set()
-    seen_ids: set[str] = set()
     pages = 0
     unreadable = 0
 
     def finish(reason: str | None) -> dict[str, Any]:
-        reasons = [text for text in (reason, _non_object_rows_reason(unreadable) if unreadable else None) if text]
+        items, conflicting = collected.resolve()
+        reasons = [
+            text for text in (
+                reason,
+                _non_object_rows_reason(unreadable) if unreadable else None,
+                _conflicting_ids_reason(conflicting) if conflicting else None,
+            ) if text
+        ]
         return {
             "items": items,
             "pages_read": pages,
             "complete": not reasons,
             "stop_reason": " ".join(reasons) if reasons else None,
             "unreadable_rows": unreadable,
+            "conflicting_ids": conflicting,
         }
 
     while True:
@@ -752,7 +797,7 @@ async def _read_edge_pages(
                 return finish(REPEATED_PAGE_REASON)
             seen_pages.add(fingerprint)
         unreadable += bad_rows
-        items.extend(_new_rows(rows, seen_ids))
+        collected.add(rows)
         paging = extract_paging(payload)
         if not paging.get("next"):
             return finish(None)
@@ -933,6 +978,12 @@ def _to_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _only_cell(cells: list[dict[str, Any]], holds: Any) -> dict[str, Any] | None:
+    """The one cell that holds an ad object, or None when none or more than one does."""
+    holders = [cell for cell in cells if holds(cell)]
+    return holders[0] if len(holders) == 1 else None
+
+
 def _split_outcome(
     objective: dict[str, Any], cells: list[dict[str, Any]], cell_nodes_complete: bool = True,
 ) -> dict[str, Any] | None:
@@ -957,28 +1008,42 @@ def _split_outcome(
             # Creative tests: Meta's guide calls high_performer_ids the authoritative outcome.
             mapped = []
             for ad_id in high_performers:
-                cell = next((cell for cell in cells if str(ad_id) in cell.get("ad_ids", [])), None)
+                cell = _only_cell(cells, lambda cell, ad_id=ad_id: str(ad_id) in cell.get("ad_ids", []))
                 mapped.append({
                     "ad_id": str(ad_id),
                     "cell_id": cell["id"] if cell else None,
                     "cell_name": cell["name"] if cell else None,
                 })
             response["high_performer_cells"] = mapped
-            if not cell_nodes_complete and any(item["cell_id"] is None for item in mapped):
+            ambiguous = [
+                str(ad_id) for ad_id in high_performers
+                if sum(1 for cell in cells if str(ad_id) in cell.get("ad_ids", [])) > 1
+            ]
+            if ambiguous:
+                response["high_performer_ambiguous_ids"] = ambiguous
+                response["high_performer_mapping_note"] = (
+                    "Some high performers appear in more than one cell, so their cell is unknown."
+                )
+            elif not cell_nodes_complete and any(item["cell_id"] is None for item in mapped):
                 response["high_performer_mapping_note"] = (
                     "Some high performers were not found in the cells read, and not every cell could be read; "
                     "they may belong to a cell that was not read."
                 )
         if winner_id not in (None, ""):
             winner_id = str(winner_id)
-            cell = next((cell for cell in cells if winner_id in _cell_members(cell)), None)
+            holders = [cell for cell in cells if winner_id in _cell_members(cell)]
+            cell = holders[0] if len(holders) == 1 else None
             response["winner"] = {
                 "ad_object_id": winner_id,
                 "cell_id": cell["id"] if cell else None,
                 "cell_name": cell["name"] if cell else None,
                 "confidence": entry.get("winner_confidence"),
             }
-            if cell is None and not cell_nodes_complete:
+            if len(holders) > 1:
+                response["winner"]["cell_mapping_note"] = (
+                    f"The winner appears in {len(holders)} cells' memberships, so which cell won is unknown."
+                )
+            elif cell is None and not cell_nodes_complete:
                 response["winner"]["cell_mapping_note"] = (
                     "The winner was not found in the cells read, which are incomplete: not every cell could be "
                     "read, so it may belong to a cell that was not read."
@@ -1307,7 +1372,8 @@ async def get_ad_study(study_id: str, include_results: bool = False) -> dict[str
 
 
 UNCLASSIFIED_STUDIES_NOTE = (
-    "their start, end and cancel times could not be read, so whether they are scheduled or running is unknown"
+    "their start, end and cancel times could not be read, or two copies of the same study disagree, so "
+    "whether they are scheduled or running is unknown"
 )
 
 
@@ -1327,20 +1393,35 @@ async def _scan_active_studies(
     cursor, a page already read, the page cap, or reaching stop_at ends the scan with
     stop_reason saying why. A repeated page is not counted, and each study id is counted once.
 
-    A study whose state cannot be classified (a row that is not an object, or one without the
-    times that place it) is never dropped: unclassified counts them and lists the ids it can.
+    A study whose state cannot be classified (a row that is not an object, one without the
+    times that place it, or two copies of one id whose states disagree) is never dropped:
+    unclassified counts them and lists the ids it can.
     complete is true only when the pages were complete and every study was classified, so a
     count of active studies is never presented as complete when one could be missing from it.
     """
-    active: list[dict[str, Any]] = []
-    unclassified: list[str | None] = []
+    collected = _RowsById(lambda study: _study_state(study, now))
+    non_objects = 0
     pages = 0
     params: dict[str, Any] = {"limit": 100}
     seen_cursors: set[str] = set()
     seen_pages: set[str] = set()
-    seen_ids: set[str] = set()
+
+    def classify() -> tuple[list[dict[str, Any]], list[str | None]]:
+        studies, conflicting = collected.resolve()
+        active: list[dict[str, Any]] = []
+        unclassified: list[str | None] = [None] * non_objects
+        for study in studies:
+            state = _study_state(study, now)
+            if state in ACTIVE_STATES:
+                active.append({"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state})
+            elif state == "unknown":
+                study_id = study.get("id")
+                unclassified.append(None if study_id in (None, "") else str(study_id))
+        unclassified.extend(conflicting)
+        return active, unclassified
 
     def finish(pages_complete: bool, reason: str | None) -> dict[str, Any]:
+        active, unclassified = classify()
         return {
             "active": active,
             "unclassified": len(unclassified),
@@ -1362,14 +1443,8 @@ async def _scan_active_studies(
             if fingerprint in seen_pages:
                 return finish(False, REPEATED_PAGE_REASON)
             seen_pages.add(fingerprint)
-        unclassified.extend([None] * bad_rows)
-        for study in _new_rows(rows, seen_ids):
-            state = _study_state(study, now)
-            if state in ACTIVE_STATES:
-                active.append({"id": study.get("id"), "name": study.get("name"), "type": study.get("type"), "state": state})
-            elif state == "unknown":
-                study_id = study.get("id")
-                unclassified.append(None if study_id in (None, "") else str(study_id))
+        non_objects += bad_rows
+        collected.add(rows)
         paging = extract_paging(payload)
         if not paging.get("next"):
             return finish(True, None)
@@ -1378,7 +1453,7 @@ async def _scan_active_studies(
             reason = NO_CURSOR_REASON
         elif cursor in seen_cursors:
             reason = REPEATED_CURSOR_REASON
-        elif stop_at is not None and len(active) >= stop_at:
+        elif stop_at is not None and len(classify()[0]) >= stop_at:
             reason = f"Stopped once {stop_at} scheduled or running studies were found."
         elif pages >= max_pages:
             reason = f"Stopped at the {max_pages}-page read cap while Meta reported more pages."
