@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 import pytest
+from copy import deepcopy
 
 from meta_ads_mcp.errors import MetaApiError, NotFoundError, ValidationError
 from meta_ads_mcp.tools import catalogs
@@ -1798,7 +1799,7 @@ def test_g7_handle_read_does_not_call_unknown_error_count_success(monkeypatch) -
     assert result["ok"] is False, result
     assert result["outcome"] == "outcome_unknown"
     assert result["error_attribution"]["complete"] is False
-    assert "how many errors" in result["error_attribution"]["reason"]
+    assert "a usable count of the errors" in result["error_attribution"]["reason"]
 
 
 def test_g7_handle_read_unfinished_batch_is_processing(monkeypatch) -> None:
@@ -4008,3 +4009,70 @@ def test_retry_text_for_an_unfinished_batch_does_not_say_meta_is_processing_it()
         assert "has not been confirmed finished" in how
         assert "still processing" not in how
         assert "Do not resend yet" in how and "'h1'" in how
+
+
+
+# Round thirty (review R30, BB1): only a real count of errors can show a batch was applied.
+
+
+class _R30BatchClient:
+    def __init__(self, count):
+        self.count = count
+        self.writes = []
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        if edge == 'products':
+            return {'data': [{'id': '970001', 'retailer_id': 'QA-SKU', 'name': 'Before'}]}
+        assert edge == 'check_batch_request_status'
+        return {'data': [{'status': 'finished', 'errors_total_count': self.count,
+                          'errors': [], 'ids_of_invalid_requests': []}]}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.writes.append((parent_id, edge, deepcopy(data)))
+        return {'handles': ['QA-handle']}
+
+
+async def _r30_no_pause(_seconds):
+    return None
+
+
+@pytest.mark.parametrize('count', [-1, 0.5, False, '-0.25'],
+                         ids=['negative', 'fractional', 'boolean', 'negative-fraction-text'])
+@pytest.mark.parametrize('status_only', [False, True], ids=['submit-and-poll', 'handle-only'])
+def test_bb1_unreadable_error_count_cannot_verify_batch_success(monkeypatch, count, status_only):
+    client = _R30BatchClient(count)
+    monkeypatch.setattr(catalogs, 'get_graph_api_client', lambda: client)
+    monkeypatch.setattr(catalogs, '_pause', _r30_no_pause)
+    if status_only:
+        result = asyncio.run(catalogs.batch_update_catalog_products(
+            catalog_id='900001', handle='QA-handle'))
+        assert not client.writes
+        assert result['outcome'] == 'outcome_unknown', result
+    else:
+        result = asyncio.run(catalogs.batch_update_catalog_products(
+            catalog_id='900001',
+            items=[{'method': 'update', 'retailer_id': 'QA-SKU', 'name': 'After'}],
+            wait_seconds=2))
+        assert len(client.writes) == 1
+        assert result['items'][0]['outcome'] == 'outcome_unknown', result
+    assert result['ok'] is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (0, 0), (6, 6), ("6", 6), (" 6 ", 6), (6.0, 6),
+    (-1, None), (0.5, None), (True, None), (False, None), ("-0.25", None), ("six", None), (None, None),
+    (float("nan"), None), (float("inf"), None), ([], None),
+])
+def test_r30_batch_count_is_a_whole_number_of_zero_or_more(value, expected) -> None:
+    assert catalogs._batch_count(value) == expected
+
+
+@pytest.mark.parametrize("count", [0, "0", 0.0])
+def test_r30_a_real_zero_error_count_still_reports_the_item_applied(monkeypatch, count) -> None:
+    client = _R30BatchClient(count)
+    monkeypatch.setattr(catalogs, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(catalogs, "_pause", _r30_no_pause)
+    result = asyncio.run(catalogs.batch_update_catalog_products(
+        catalog_id="900001", items=[{"method": "update", "retailer_id": "QA-SKU", "name": "After"}], wait_seconds=2,
+    ))
+    assert result["ok"] is True and result["items"][0]["outcome"] == "applied"

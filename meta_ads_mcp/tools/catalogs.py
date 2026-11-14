@@ -2317,12 +2317,12 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
         listed = [listed]
     named = [entry for entry in listed if _identified(entry) is not None]
     unnamed = len(listed) - len(named)
-    error_total = to_int(row.get("errors_total_count"))
+    error_total = _batch_count(row.get("errors_total_count"))
     failed_ids = invalid | {_identified(entry) for entry in named}
     reason: str | None = None
     if error_total is None:
         complete = False
-        reason = ("Meta did not report how many errors the batch had"
+        reason = ("Meta did not report a usable count of the errors the batch had"
                   + (", and listed errors" if listed else "")
                   + ", so items it did not name cannot be called applied.")
     elif unreadable_invalid:
@@ -2450,6 +2450,24 @@ def _unreadable_handles_reason(unreadable: int, returned: int) -> str:
     )
 
 
+def _batch_count(value: Any) -> int | None:
+    """A count from a batch status answer: a whole number of zero or more, or None.
+
+    The count of errors decides whether items are reported as applied, so only a real count is
+    used: true or false, a fraction, a negative number or text that is not digits is read as
+    not reported, and the items are then not called applied.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value == value and value not in (float("inf"), float("-inf")) and value >= 0 and value == int(value) else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _retry_statement(outcomes: set[str], handles: list[str] | str | None) -> dict[str, Any]:
     if isinstance(handles, str):
         handles = [handles]
@@ -2530,8 +2548,8 @@ async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, 
             "status": row.get("status"),
             "complete": finished,
             "status_checks": 1,
-            "errors_total_count": to_int(row.get("errors_total_count")),
-            "warnings_total_count": to_int(row.get("warnings_total_count")),
+            "errors_total_count": _batch_count(row.get("errors_total_count")),
+            "warnings_total_count": _batch_count(row.get("warnings_total_count")),
         },
         "failed_retailer_ids": failed[:100],
         "errors": errors[:50],
@@ -2604,8 +2622,8 @@ def _batch_view(handles: list[str], tracks: dict[str, dict[str, Any]]) -> dict[s
             "status": row.get("status"),
             "complete": _is_finished(track["row"]),
             "status_checks": track["checks"],
-            "errors_total_count": to_int(row.get("errors_total_count")),
-            "warnings_total_count": to_int(row.get("warnings_total_count")),
+            "errors_total_count": _batch_count(row.get("errors_total_count")),
+            "warnings_total_count": _batch_count(row.get("warnings_total_count")),
         }
         if track["error"] is not None:
             entry["status_error"] = track["error"]
