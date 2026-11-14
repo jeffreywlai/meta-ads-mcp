@@ -849,3 +849,29 @@ def test_listings_with_readable_pages_are_still_complete(monkeypatch) -> None:
         asyncio.run(datasets.list_custom_conversions(account_id="1")),
     ):
         assert result["summary"]["complete"] is True and "incomplete_reason" not in result["summary"]
+
+
+# ----------------- R15 (review U3 sweep): one count per hour and value, never first-wins or doubled
+
+
+def test_dataset_stats_identical_hour_value_copy_is_counted_once(monkeypatch) -> None:
+    hour = {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 4}]}
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": [_stats_page([hour, dict(hour)])]}))
+    _fixed_now(monkeypatch)
+    result = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))
+    assert result["items"] == [{"value": "PageView", "count": 4}]
+    assert result["summary"]["complete"] is True
+
+
+@pytest.mark.parametrize("same_page", [True, False])
+def test_dataset_stats_conflicting_hour_value_counts_are_uncertain(monkeypatch, same_page) -> None:
+    first = {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 4}, {"value": "Lead", "count": 1}]}
+    second = {"start_time": "2026-11-01T00:00:00+0000", "data": [{"value": "PageView", "count": 9}]}
+    pages = [_stats_page([first, second])] if same_page else [_stats_page([first], next_after="c2"), _stats_page([second])]
+    _use(monkeypatch, FakeDatasetClient(list_pages={"stats": pages}))
+    _fixed_now(monkeypatch)
+    result = asyncio.run(datasets.get_dataset_stats(**STATS_WINDOW))
+    items = {item["value"]: item for item in result["items"]}
+    assert items["PageView"]["count_conflict"] is True and "count_conflict" not in items["Lead"]
+    assert result["summary"]["complete"] is False
+    assert "different counts for the same hour" in result["summary"]["stop_reason"]

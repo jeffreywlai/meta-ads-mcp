@@ -2089,3 +2089,20 @@ def test_access_lookup_reads_every_page_even_after_the_recipient_is_found(monkey
     _use(monkeypatch, client)
     preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
     assert preview["change"] == "no_change" and preview["current_access_read"]["requests"] == 2
+
+
+def test_partner_catalog_scan_checks_each_catalog_once_and_shows_no_first_copy_name(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeClient(edges={
+        (BUSINESS, "owned_product_catalogs"): _page([
+            {"id": "1", "name": "Shoes"}, {"id": "1", "name": "Hats"}, {"id": "2", "name": "Bags"}, {"id": "2", "name": "Bags"},
+        ]),
+        ("1", "agencies"): _page([{"id": "77"}]),
+        ("2", "agencies"): _page([{"id": "77"}]),
+    }))
+    result = run(business_access.list_user_assigned_catalogs(user_id="77", user_type="AGENCY", business_id=BUSINESS))
+    assert [call["parent_id"] for call in client.reads_of("agencies")] == ["1", "2"]
+    assert result["items"] == [
+        {"id": "1", "name": None, "access_type": "AGENCY", "name_conflict": True},
+        {"id": "2", "name": "Bags", "access_type": "AGENCY"},
+    ]
+    assert result["summary"]["catalogs_checked"] == 2

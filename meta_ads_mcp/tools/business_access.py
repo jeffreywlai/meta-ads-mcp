@@ -9,6 +9,7 @@ an email address.
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
@@ -654,11 +655,25 @@ async def list_user_assigned_catalogs(
     if unidentified_catalogs:
         gaps.append(f"{unidentified_catalogs} owned catalog row(s) had no readable id and could not be checked.")
     skipped = 0
+    # Each catalog is checked once. Copies of one catalog are one catalog; the name shown is
+    # Meta's only when every copy gives the same one, never the first copy's.
+    names: dict[str, set[str]] = {}
+    for catalog in catalogs:
+        catalog_key = _row_identity(catalog.get("id"))
+        if catalog_key is not None:
+            names.setdefault(catalog_key, set()).add(json.dumps(catalog.get("name"), default=str))
+    checked: set[str] = set()
     for catalog in catalogs:
         usable = _row_identity(catalog.get("id"))
         if usable is None:
             skipped += 1
             continue
+        if usable in checked:
+            skipped += 1
+            continue
+        checked.add(usable)
+        if len(names[usable]) > 1:
+            catalog = {**catalog, "name": None, "name_conflict": True}
         catalog_id = usable
         try:
             partners = await _scan(client, catalog_id, "agencies", fields=PARTNER_FIELDS, max_pages=3)
@@ -667,7 +682,10 @@ async def list_user_assigned_catalogs(
             continue
         requests += partners["requests"]
         if any(_is_row(row, user_id) for row in partners["rows"]):
-            items.append({**_project(catalog, OWNED_CATALOG_FIELDS), "access_type": "AGENCY"})
+            items.append({
+                **_project(catalog, OWNED_CATALOG_FIELDS), "access_type": "AGENCY",
+                **({"name_conflict": True} if catalog.get("name_conflict") else {}),
+            })
         elif not partners["complete"]:
             gaps.append(f"Catalog {catalog_id}: partner list not fully read ({partners['reason']}).")
         elif unidentified := _unidentified_rows(partners):
