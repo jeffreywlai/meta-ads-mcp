@@ -2839,3 +2839,24 @@ def test_a_creative_with_the_explicit_setting_is_still_read() -> None:
     values, reason, error = asyncio.run(cf._read_explicit_story_settings(_OneAnswerClient(answer), "20"))
     assert (values, reason, error) == ({"whats_app_business_phone_number": "15550100"}, None, None)
 
+
+
+# Round twenty-four (review R23, E1): a query or fragment may follow the host directly.
+
+
+@pytest.mark.parametrize("link", [
+    "https://shop.example.com?ref=fall", "https://shop.example.com#offers", "shop.example.com?ref=fall",
+    "example.com#top", "https://shop.example.com:8443?ref=fall", "https://shop.example.com/?ref=fall",
+    "https://shop.example.com/sale?ref=fall#offers", "https://example.com", "Example.com",
+])
+def test_display_link_accepts_a_query_or_fragment_with_or_without_a_path(link) -> None:
+    assert cf._display_link(link) == link
+
+
+@pytest.mark.parametrize("link", [
+    "Shop now", "ftp://example.com", "https://", "example", "https://example.com ?ref=x", "example.com?ref=a b",
+    "?ref=fall", "#offers", "https://?ref=fall",
+])
+def test_display_link_still_refuses_what_is_not_a_url_or_domain(link) -> None:
+    with pytest.raises(ValidationError, match="must be a URL or a domain"):
+        cf._display_link(link)

@@ -90,8 +90,10 @@ PARTNERSHIP_AD_FORMATS = {1: "both identities", 2: "first identity only", 3: "au
 
 _OBJECT_STORY_ID = re.compile(r"^[0-9]+_[0-9]+$")
 # A display link must be a URL or a bare domain (Meta: "The caption must be an actual URL").
+# After the host comes a path, or a query or fragment with no path before it (RFC 3986 allows
+# an empty path: https://example.com?ref=x).
 _DISPLAY_LINK = re.compile(
-    r"^(?:https?://)?(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?::[0-9]{1,5})?(?:/\S*)?$"
+    r"^(?:https?://)?(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?::[0-9]{1,5})?(?:[/?#]\S*)?$"
 )
 
 # Keys accepted inside cards, placement_customizations and multi_media entries.
