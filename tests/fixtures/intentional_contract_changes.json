@@ -93,6 +93,13 @@
       "what_changed": "When Meta answers a page of audiences without a readable data list (data missing, null or not a list), the tool now returns no items with summary.complete false, summary.next_after null and summary.incomplete_reason saying the page could not be read. Before, a missing data list was returned as an empty, complete list, a null data list crashed the tool, and a data value that was not a list was returned as the items. A normal page, including an empty data list, returns exactly what it did before.",
       "why_better": "A page that could not be read is no longer presented as proof that the account has no more audiences, so a caller does not stop paging, or conclude an audience does not exist, on an answer that said nothing.",
       "migration": "Nothing to change for a normal answer. A caller that pages until complete is true should also stop when next_after is null, and treat complete false with incomplete_reason as a list that was not fully read: retry the call or report it."
+    },
+    {
+      "tool": "list_ad_accounts",
+      "kind": "behaviour",
+      "what_changed": "When Meta answers a page of ad accounts that cannot be read in full, the result now says so: summary.complete is false and summary.incomplete_reason gives the reason. A page with no data list (data missing, null or not a list) returns no items and no paging cursor. A page with entries that are not objects returns the accounts that were read, without those entries, and Meta's paging. Before, a missing data list was returned as an ordinary empty last page, and a null data list or an entry that was not an object crashed the tool. A normal page, including an empty one, returns exactly what it did before, with no complete key.",
+      "why_better": "An answer from Meta that could not be read is no longer shown as proof that the token can see no ad accounts, or no more of them, so a caller does not stop looking on an answer that said nothing.",
+      "migration": "Nothing to change for a normal answer. A caller should treat summary.complete false with summary.incomplete_reason as a list that was not fully read: retry the call or report it."
     }
   ]
 }

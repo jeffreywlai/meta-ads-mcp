@@ -10,6 +10,7 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection
 from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list
+from meta_ads_mcp.tools.discovery import checked_collection
 
 ADS_ARCHIVE_FIELDS = [
     "id",
@@ -91,4 +92,6 @@ async def search_ads_archive(
         search_page_ids=page_ids,
         ad_active_status=status,
     )
-    return normalize_collection(payload)
+    # This search path is new on this branch: a page Meta could not answer in full says so.
+    # The search_terms-only path above keeps the result it had on master.
+    return checked_collection(payload)

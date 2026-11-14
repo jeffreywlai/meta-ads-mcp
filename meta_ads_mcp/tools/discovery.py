@@ -12,7 +12,9 @@ from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, resolve_account_currency
 from meta_ads_mcp.normalize import (
     blank_to_none,
+    collection_fault,
     normalize_collection,
+    read_collection_page,
 )
 from meta_ads_mcp.schemas import collection_response
 from meta_ads_mcp.tool_types import (
@@ -102,6 +104,32 @@ INSTAGRAM_ACCOUNT_FIELDS = [
     "profile_picture_url",
     "ig_id",
 ]
+
+
+def checked_collection(payload: Any) -> dict[str, Any]:
+    """Shape one Graph page like normalize_collection, saying so when it could not be read in full.
+
+    A page Meta answered normally comes back exactly as normalize_collection shapes it.
+    When collection_fault gives a reason (no data list, or entries that are not objects),
+    summary.complete is false and summary.incomplete_reason holds the reason: such a page
+    is never shown as an ordinary empty or last page. Entries that are not objects are
+    left out of items. A page with no data list has no items and no cursor, because
+    whether more pages follow is not known.
+    """
+    reason = collection_fault(payload)
+    if reason is None:
+        return normalize_collection(payload)
+    rows, _, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {"count": 0, "complete": False, "incomplete_reason": reason},
+        }
+    normalized = normalize_collection(payload)
+    normalized["items"] = rows
+    normalized["summary"].update({"count": len(rows), "complete": False, "incomplete_reason": reason})
+    return normalized
 
 
 def _resolve_account_id(account_id: str | None) -> str:
@@ -384,7 +412,7 @@ async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[st
     if after:
         params["after"] = after
     payload, read, error = await _read_account_list(client, params)
-    normalized = normalize_collection(payload)
+    normalized = checked_collection(payload)
     normalized["items"] = _normalize_monetary_fields(normalized["items"])
     read_set = set(read)
     for item in normalized["items"]:
