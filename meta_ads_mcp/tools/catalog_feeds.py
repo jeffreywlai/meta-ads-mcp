@@ -2050,7 +2050,9 @@ async def delete_feed_rule(rule_id: str) -> dict[str, Any]:
     try:
         result = await client.delete_object(rule_id)
     except MetaApiError as error:
-        if _is_retired_endpoint(error):
+        # RULE_DELETE_RETIRED says the rule was not deleted, so it is used only for a plain
+        # refusal; an answer that leaves the outcome unknown keeps its own error.
+        if _is_retired_endpoint(error) and not error.mutation_outcome_unknown:
             raise UnsupportedFeatureError(RULE_DELETE_RETIRED) from error
         raise
     return mutation_response(

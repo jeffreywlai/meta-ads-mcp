@@ -2242,6 +2242,7 @@ def _answer_unreadable(payload: Any) -> bool:
     return not isinstance(payload, dict) or "text_response" in payload
 
 
+_STATUS_OTHER_BATCH = "Meta's status answer was for a different batch than the one asked about."
 _STATUS_ENTRIES_DISAGREE = (
     "Meta's answer to the status check held entries for this handle that disagree, so whether the batch "
     "has finished, and with which errors, is not known; it was not checked again."
@@ -2280,7 +2281,14 @@ async def _check_batch(client, catalog_id: str, handle: str) -> tuple[dict[str, 
         catalog_id, "check_batch_request_status",
         params={"handle": handle, "load_ids_of_invalid_requests": True},
     )
-    return _batch_status_row(payload)
+    row, problem = _batch_status_row(payload)
+    # Meta's status entry names the batch it is about (read live: the handle asked for, as
+    # text). An entry that names a different batch says nothing about this one. An entry
+    # with no handle is read as before.
+    named = row.get("handle") if isinstance(row, dict) else None
+    if isinstance(named, str) and named.strip() and named.strip() != handle:
+        return None, _STATUS_OTHER_BATCH
+    return row, problem
 
 
 def _identified(entry: Any) -> str | None:

@@ -1547,13 +1547,21 @@ async def run_copy(
     result = await client.create_edge_object(source_id, "copies", data=data)
     raw_new_id = result.get(f"copied_{object_type}_id") if isinstance(result, dict) else None
     new_id = str(raw_new_id) if raw_new_id not in (None, "") else None
-    # A copy is a new object. An answer that names the source as its own copy does not say
-    # which object the copy is, so its id is treated as not returned: nothing later in this
-    # call (the rename) is sent to the source.
-    named_source = new_id is not None and new_id == str(source_id)
+    copied = result.get("ad_object_ids") if isinstance(result, dict) else None
+    # A copy is a new object. An answer that names, as the copy, an object this call already
+    # knows (the source, the campaign or ad set the copy goes into, or an original that the
+    # answer itself lists as copied from) does not say which object the copy is, so its id is
+    # treated as not returned: nothing later in this call (the rename) is sent to that object.
+    known_objects = {str(source_id)}
+    known_objects.update(str(data[key]) for key in ("campaign_id", "adset_id") if data.get(key) not in (None, ""))
+    if isinstance(copied, list):
+        known_objects.update(
+            str(item["source_id"]) for item in copied
+            if isinstance(item, dict) and item.get("source_id") not in (None, "")
+        )
+    named_source = new_id is not None and new_id in known_objects
     if named_source:
         new_id = None
-    copied = result.get("ad_object_ids") if isinstance(result, dict) else None
     response.update({
         "sent": True,
         "new_id": new_id,
@@ -1583,7 +1591,8 @@ async def run_copy(
         )
     if named_source:
         response["warning"] = (
-            "Meta's response named the source object as its own copy, so the new copy's id is not known; "
+            "Meta's response named an existing object (the source, its parent or a copied original) as the "
+            "new copy, so the new copy's id is not known; "
             "find the copy under its parent before acting on it or copying again."
         )
     elif new_id is None:

@@ -3678,7 +3678,7 @@ def test_cc1_duplicate_never_renames_the_source_returned_as_its_copy(monkeypatch
     if result is not None:
         assert result.get('rename', {}).get('applied') is not True
         assert result["new_id"] is None
-        assert "named the source object as its own copy" in result["warning"]
+        assert "named an existing object" in result["warning"]
         assert result["rename"]["reason"] == "The copy's id is unknown, so it was not renamed."
 
 
