@@ -863,7 +863,7 @@ async def get_entity_insights(
     fetch_all: bool = False,
     sort: str | None = None,
 ) -> dict[str, Any]:
-    """Return paginated insights with optional named scalar actions such as purchase. flatten_actions removes full action maps unless include_raw_actions=true. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values. Optional sort: one field, such as spend_descending or actions:link_click_ascending; a bare field such as spend is Meta's default ascending order and is sent and reported as spend_ascending."""
+    """Return paginated insights with optional named scalar actions such as purchase. flatten_actions removes full action maps unless include_raw_actions=true. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values. Optional sort, such as spend_descending; bare spend sorts ascending, sent as spend_ascending."""
     sort_key = _normalize_sort(sort)
     if sort_key is not None and fields is None:
         fields = list(SORTED_DEFAULT_INSIGHTS_FIELDS)
