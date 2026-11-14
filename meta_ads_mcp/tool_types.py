@@ -129,6 +129,20 @@ StrictCurrencyAmount: TypeAlias = Annotated[
     ),
 ]
 
+# A schedule time: ISO 8601 text, or whole Unix seconds as a number or as digit text.
+# Meta types these fields as datetime, which takes Unix seconds as a number. The value
+# is sent as given; the tool checks it (a UTC offset on text, a positive time). The
+# number is strict, so true, false and fractions are refused rather than read as seconds.
+ScheduleTime: TypeAlias = Annotated[
+    str | Annotated[int, Field(strict=True)],
+    Field(
+        description=(
+            "An ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00), "
+            "or whole Unix seconds as a number or as digit text."
+        )
+    ),
+]
+
 BidConstraints: TypeAlias = Annotated[
     dict[str, Any],
     Field(

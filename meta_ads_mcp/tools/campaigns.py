@@ -27,6 +27,7 @@ from meta_ads_mcp.tool_types import (
     BidConstraints,
     CurrencyAmount,
     GraphId,
+    ScheduleTime,
     StrictCurrencyAmount,
     StringList,
     coerce_csv_string_list,
@@ -588,8 +589,11 @@ def check_adset_round_four_fields(named: dict[str, Any], params: dict[str, Any] 
         if named[key] is not None:
             _nonempty_object(named[key], key)
     sequence = named["creative_sequence"]
-    if sequence is not None and (not isinstance(sequence, list) or not sequence or not all(map(_is_graph_id, sequence))):
-        raise ValidationError('creative_sequence must be a non-empty list of Meta ad ids, for example ["11", "12"].')
+    # An empty list is valid: Meta's Reservation guide says a zero-length creative_sequence means no sequencing.
+    if sequence is not None and (not isinstance(sequence, list) or not all(map(_is_graph_id, sequence))):
+        raise ValidationError(
+            'creative_sequence must be a list of Meta ad ids, for example ["11", "12"], or [] for no sequencing.'
+        )
     rotation = _check_ad_rotation(named[_ROTATION_PAIR[0]], named[_ROTATION_PAIR[1]], params)
     if rotation is not None:
         checked["time_based_ad_rotation_intervals"] = rotation
@@ -610,8 +614,8 @@ async def create_campaign(
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
     spend_cap: StrictCurrencyAmount | None = None,
-    start_time: str | None = None,
-    stop_time: str | None = None,
+    start_time: ScheduleTime | None = None,
+    stop_time: ScheduleTime | None = None,
     promoted_object: dict[str, Any] | None = None,
     special_ad_category_country: StringList | None = None,
     adlabels: list[dict[str, Any]] | None = None,
@@ -765,8 +769,8 @@ async def update_campaign(
     lifetime_budget: CurrencyAmount | None = None,
     params: dict[str, Any] | None = None,
     spend_cap: StrictCurrencyAmount | None = None,
-    start_time: str | None = None,
-    stop_time: str | None = None,
+    start_time: ScheduleTime | None = None,
+    stop_time: ScheduleTime | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Use this when the user already has a campaign id and wants to change core campaign settings. Budgets and spend_cap are in major units of the account currency (Meta's spend cap minimum is about 100 USD). start_time and stop_time take an ISO 8601 time with a UTC offset or Unix seconds; one given alone is checked against the stored other one. Meta takes a campaign's schedule from its ad sets and may not store these, so after the update they are read back into stored_schedule, and a time Meta did not store is listed under sent, not current, with a warning. adlabels (a list of {"name": ...} or {"id": ...}) replaces the campaign's whole label set, so include any label to keep; an empty list removes every label. The prior value of each named field is returned in previous. A named parameter and the same key inside params cannot both be given. daily_budget, lifetime_budget and spend_cap are refused inside params, where Meta would read them in minor units; use the named parameters."""
@@ -956,8 +960,8 @@ async def create_ad_set(
     daily_budget: CurrencyAmount | None = None,
     lifetime_budget: CurrencyAmount | None = None,
     promoted_object: dict[str, Any] | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
+    start_time: ScheduleTime | None = None,
+    end_time: ScheduleTime | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
     frequency_control_specs: list[dict[str, Any]] | None = None,
@@ -992,7 +996,7 @@ async def create_ad_set(
     max_budget_spend_percentage: WholeNumber | None = None,
     brand_safety_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE, or PHONE_CALL for call ads); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (on a quarter hour; ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER or ABSOLUTE, and budget_value: for MULTIPLIER a whole number sent unchanged (Meta's example: 140 means 140 percent), for ABSOLUTE the increase in major units of the account currency, at most 8 times the daily budget. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. existing_customer_budget_percentage, min_budget_spend_percentage and max_budget_spend_percentage are whole percentages from 0 to 100; daily_imps and lifetime_imps are impression counts for FIXED_CPM campaigns; multi_optimization_goal_weight is UNDEFINED, BALANCED, PREFER_INSTALL or PREFER_EVENT; tune_for_category is a special ad category such as HOUSING; is_incremental_attribution_enabled turns on incremental attribution; campaign_attribution is the app attribution type, for example SKAN or AEM; value_rule_set_id attaches a value rule set and sends value_rules_applied true with it; rf_prediction_id is a reach and frequency prediction id; creative_sequence lists ad ids in the order to show them; time_based_ad_rotation_id_blocks (lists of ad ids) and time_based_ad_rotation_intervals (at least two range start times, ISO 8601 with a UTC offset or Unix seconds; sent as Unix seconds) go together, one block per range, and are checked as a pair even when one of them is inside params (where start times must already be Unix seconds); placement_soft_opt_out and brand_safety_config are Meta's objects. start_time and end_time are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
+    """Create or validate an ad set with targeting, budget, bid strategy, and bid constraints. Budgets, bids, spend caps and minimum spend targets are in major units of the account currency; a minimum spend target of 0 removes it; daily caps and targets need a daily campaign budget, lifetime ones a lifetime campaign budget. destination_type says where ads send people (for example WEBSITE, MESSENGER, WHATSAPP, INSTAGRAM_DIRECT, ON_POST, INSTAGRAM_PROFILE, or PHONE_CALL for call ads); messaging and profile goals need it. frequency_control_specs, attribution_spec and adset_schedule are Meta's lists of objects; adset_schedule (day parting) needs a lifetime budget and the pacing_type parameter set to ["day_parting"]. is_dynamic_creative true makes a dynamic creative ad set (one ad, dynamic creative only). optimization_sub_event refines the goal, for example VIDEO_SOUND_ON. budget_schedule_specs schedules budget increases for busy periods (daily budgets only, at most 50 periods of at least 3 hours): each item has time_start and time_end (on a quarter hour; ISO 8601 with a UTC offset, or Unix seconds; sent as Unix seconds), budget_value_type MULTIPLIER or ABSOLUTE, and budget_value: for MULTIPLIER a whole number sent unchanged (Meta's example: 140 means 140 percent), for ABSOLUTE the increase in major units of the account currency, at most 8 times the daily budget. dsa_beneficiary and dsa_payor name who benefits from and who pays for ads shown in the EU. existing_customer_budget_percentage, min_budget_spend_percentage and max_budget_spend_percentage are whole percentages from 0 to 100; daily_imps and lifetime_imps are impression counts for FIXED_CPM campaigns; multi_optimization_goal_weight is UNDEFINED, BALANCED, PREFER_INSTALL or PREFER_EVENT; tune_for_category is a special ad category such as HOUSING; is_incremental_attribution_enabled turns on incremental attribution; campaign_attribution is the app attribution type, for example SKAN or AEM; value_rule_set_id attaches a value rule set and sends value_rules_applied true with it; rf_prediction_id is a reach and frequency prediction id; creative_sequence lists ad ids in the order to show them ([] means no sequencing); time_based_ad_rotation_id_blocks (lists of ad ids) and time_based_ad_rotation_intervals (at least two range start times, ISO 8601 with a UTC offset or Unix seconds; sent as Unix seconds) go together, one block per range, and are checked as a pair even when one of them is inside params (where start times must already be Unix seconds); placement_soft_opt_out and brand_safety_config are Meta's objects. start_time and end_time (ISO 8601 text, or whole Unix seconds as a number or digits; end_time 0 means no end) are sent as given; one without a UTC offset (2026-11-27T00:00:00) leaves Meta to choose the time zone, so the response adds warnings and, after a real create, stored_schedule with the times Meta stored. Give an offset, for example 2026-11-27T00:00:00-05:00. A named parameter and the same key inside params cannot both be given. Budgets, bids, spend caps and minimum spend targets are refused inside params, where Meta would read them in minor units; use the named parameters."""
     named_spend = {
         "daily_spend_cap": daily_spend_cap,
         "lifetime_spend_cap": lifetime_spend_cap,
@@ -1051,9 +1055,15 @@ async def create_ad_set(
         *named_spend.items(),
     ):
         if value is not None:
-            validate_positive_amount(value, field_name=field_name)
-    if bid_constraints and not bid_strategy:
-        raise ValidationError("bid_strategy is required when bid_constraints is provided.")
+            # Meta documents 0 as the way to remove a minimum spend target.
+            validate_positive_amount(value, field_name=field_name, allow_zero=field_name in _ADSET_MIN_SPEND_FIELDS)
+    # No local bid_strategy is needed with bid_constraints: an ad set takes its campaign's
+    # strategy. When neither has one, Meta's own error gets _NO_BID_STRATEGY_HINT below.
+    for field_name, value in (("start_time", start_time), ("end_time", end_time)):
+        # Text is sent as given (a time without a zone gets a warning); a number is
+        # whole Unix seconds, checked like every other schedule time; true and false are refused.
+        if isinstance(value, int):
+            _validate_adset_time(value, field_name)
     for field_name, value in named_other.items():
         if value is not None:
             _nonempty_object_list(value, field_name)
@@ -1094,8 +1104,9 @@ async def create_ad_set(
         "bid_strategy": bid_strategy or OMIT,
         "bid_constraints": bid_constraints or OMIT,
         "promoted_object": promoted_object or OMIT,
-        "start_time": start_time or OMIT,
-        "end_time": end_time or OMIT,
+        # Blank text is left out, as before; a number is sent as given, so end_time 0 (no end) is kept.
+        "start_time": OMIT if start_time is None or start_time == "" else start_time,
+        "end_time": OMIT if end_time is None or end_time == "" else end_time,
         "daily_budget": OMIT,
         "lifetime_budget": OMIT,
     }
@@ -1134,7 +1145,9 @@ async def create_ad_set(
     _encode_budget_field(payload, "lifetime_budget", lifetime_budget, currency=currency)
     for field_name, value in named_spend.items():
         if value is not None:
-            payload[field_name] = to_minor_units(value, currency, field_name=field_name)
+            payload[field_name] = to_minor_units(
+                value, currency, field_name=field_name, allow_zero=field_name in _ADSET_MIN_SPEND_FIELDS
+            )
     data = merge_graph_payload(payload, params)
     try:
         result = await client.create_edge_object(account_id, "adsets", data=data)
@@ -1217,6 +1230,10 @@ _ADSET_SPEND_FIELDS = (
     "daily_min_spend_target",
     "lifetime_min_spend_target",
 )
+# Meta's Advantage campaign budget guide (ad set-level controls): "To remove
+# daily_min_spend_target from an ad set, set it to 0", and the same for the lifetime
+# target. Zero is allowed for these two only; spend caps, budgets and bids stay positive.
+_ADSET_MIN_SPEND_FIELDS = ("daily_min_spend_target", "lifetime_min_spend_target")
 _ADSET_UNSUPPORTED_MONEY_PARAMS = {
     "budget_schedule_specs": (
         "budget_schedule_specs carries budget amounts in minor units and is not supported by update_adset."
@@ -1244,10 +1261,17 @@ def _time_without_zone(value: Any) -> bool:
     return parsed is not None and parsed.tzinfo is None
 
 
-def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
-    """Check an ad set schedule time; None when absent or end_time 0 (Meta's no-end-date value)."""
+def _validate_adset_time(value: str | int | None, field_name: str) -> datetime | None:
+    """Check an ad set schedule time; None when absent or end_time 0 (Meta's no-end-date value).
+
+    Whole Unix seconds may be a number or digit text; true and false are refused.
+    """
     if value is None:
         return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < 0:
+            raise ValidationError(f"{field_name} must be a positive Unix time.")
+        value = str(value)
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{field_name} must be {_ADSET_TIME_FORMAT}.")
     text = value.strip()
@@ -1269,7 +1293,7 @@ def _validate_adset_time(value: str | None, field_name: str) -> datetime | None:
     return parsed
 
 
-def validate_schedule_time(value: str | None, field_name: str) -> datetime | None:
+def validate_schedule_time(value: str | int | None, field_name: str) -> datetime | None:
     """Check a schedule time for another tool module: ISO 8601 with a UTC offset, or Unix seconds."""
     return _validate_adset_time(value, field_name)
 
@@ -1284,9 +1308,7 @@ def params_half_of_time_pair(named_half: Any, params: dict[str, Any] | None, key
     if named_half is None or not params or key not in params:
         return None
     value = params[key]
-    if isinstance(value, int) and not isinstance(value, bool):
-        value = str(value)
-    if not isinstance(value, str):
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
         raise ValidationError(f"{key} inside params must be {_ADSET_TIME_FORMAT}.")
     return _validate_adset_time(value, f"{key} inside params")
 
@@ -1304,8 +1326,8 @@ async def update_adset(
     adset_id: str,
     name: str | None = None,
     targeting: dict[str, Any] | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
+    start_time: ScheduleTime | None = None,
+    end_time: ScheduleTime | None = None,
     optimization_goal: str | None = None,
     billing_event: str | None = None,
     promoted_object: dict[str, Any] | None = None,
@@ -1318,7 +1340,7 @@ async def update_adset(
     lifetime_min_spend_target: StrictCurrencyAmount | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps, minimum spend targets or labels, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. Spend caps and minimum spend targets are refused inside params; use the named parameters. targeting replaces the whole spec. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad set's whole label set, so include any label to keep; an empty list removes every label. A changed field whose prior value Meta did not return is named in previous_unavailable."""
+    """Edit an ad set's name, targeting, schedule, optimization goal, billing event, promoted object, status, spend caps, minimum spend targets or labels, with before/after. Spend caps and minimum spend targets are in major units of the account currency (12.50 means 12.50, not cents); a minimum spend target of 0 removes it. start_time and end_time take an ISO 8601 time with a UTC offset or whole Unix seconds (a number or digits; end_time 0 means no end); Meta applies daily ones only under a daily campaign budget and lifetime ones under a lifetime campaign budget. status ARCHIVED stops delivery for good: an archived ad set cannot be restored to active from this server. Budgets and bids are rejected here: use update_adset_budget, update_adset_bid_amount or update_adset_bid_strategy. Spend caps and minimum spend targets are refused inside params; use the named parameters. targeting replaces the whole spec. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad set's whole label set, so include any label to keep; an empty list removes every label. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     adset_id = blank_to_none(adset_id)
     if adset_id is None:
         raise ValidationError("adset_id is required.")
@@ -1340,7 +1362,7 @@ async def update_adset(
     }
     spend = {key: value for key, value in spend.items() if value is not None}
     for field_name, value in spend.items():
-        validate_positive_amount(value, field_name=field_name)
+        validate_positive_amount(value, field_name=field_name, allow_zero=field_name in _ADSET_MIN_SPEND_FIELDS)
     if status is not None and status not in _UPDATABLE_ADSET_STATUSES:
         raise ValidationError(
             f"status must be one of {sorted(_UPDATABLE_ADSET_STATUSES)}; delete with delete_adset."
@@ -1386,7 +1408,9 @@ async def update_adset(
     previous = await client.get_object(adset_id, fields=["id", *read_fields, *bound_reads, *account_read])
     currency = await resolve_account_currency(client, previous.get("account_id")) if spend else None
     for field_name, value in spend.items():
-        payload[field_name] = to_minor_units(value, currency, field_name=field_name)
+        payload[field_name] = to_minor_units(
+            value, currency, field_name=field_name, allow_zero=field_name in _ADSET_MIN_SPEND_FIELDS
+        )
     previous_values = {key: previous[key] for key in read_fields if key in previous}
     for field_name in _ADSET_SPEND_FIELDS:
         if field_name in previous_values:
@@ -1455,8 +1479,8 @@ def build_copy_request(
     rename_prefix: str | None,
     rename_suffix: str | None,
     new_name: str | None,
-    start_time: str | None = None,
-    end_time: str | None = None,
+    start_time: ScheduleTime | None = None,
+    end_time: ScheduleTime | None = None,
     parent: tuple[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """Validate copy options and build the body for POST /{id}/copies."""
@@ -1599,8 +1623,8 @@ async def duplicate_campaign(
     rename_strategy: str | None = None,
     rename_prefix: str | None = None,
     rename_suffix: str | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
+    start_time: ScheduleTime | None = None,
+    end_time: ScheduleTime | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Copy a campaign with Meta's copy endpoint and return the new ids. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE. deep_copy also copies its ad sets and ads; Meta allows at most 3 ads in total for a deep copy made this way. start_time and end_time (deep copy only) set the copied ad sets' schedule. new_name renames the copy after it is made; rename_strategy (DEEP_RENAME, ONLY_TOP_LEVEL_RENAME, NO_RENAME), rename_prefix and rename_suffix control Meta's renaming, which by default appends " - Copy". dry_run returns the exact requests and sends nothing."""
@@ -1628,8 +1652,8 @@ async def duplicate_adset(
     rename_strategy: str | None = None,
     rename_prefix: str | None = None,
     rename_suffix: str | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
+    start_time: ScheduleTime | None = None,
+    end_time: ScheduleTime | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Copy an ad set with Meta's copy endpoint and return the new ids. The copy is PAUSED unless status_option is ACTIVE or INHERITED_FROM_SOURCE. campaign_id puts the copy under another campaign, whose settings such as budget it then follows; omitted, it stays in the original campaign. deep_copy also copies its ads; Meta allows at most 3 ads for a deep copy made this way. start_time and end_time (ISO 8601 with a UTC offset, or Unix seconds; end_time 0 means no end) override the copied schedule. new_name renames the copy after it is made; rename_strategy, rename_prefix and rename_suffix control Meta's renaming. dry_run returns the exact requests and sends nothing."""

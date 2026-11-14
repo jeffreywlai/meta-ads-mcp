@@ -170,6 +170,19 @@ def test_update_adset_bid_strategy_supports_bid_constraints(monkeypatch) -> None
     assert result["current"]["bid_constraints"] == {"roas_average_floor": 30000}
 
 
+def test_update_adset_bid_strategy_sends_empty_bid_constraints_to_remove_the_floor(monkeypatch) -> None:
+    """Meta's bid strategy guide removes roas_average_floor with bid_constraints={}; it is sent, not dropped."""
+    client = FakeExecutionClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        execution.update_adset_bid_strategy(
+            adset_id="adset_123", bid_strategy="LOWEST_COST_WITHOUT_CAP", bid_constraints={},
+        )
+    )
+    assert client.updated_payloads[0][1] == {"bid_strategy": "LOWEST_COST_WITHOUT_CAP", "bid_constraints": {}}
+    assert result["current"]["bid_constraints"] == {}
+
+
 @pytest.mark.parametrize(
     ("tool", "kwargs", "malformed_field"),
     [
