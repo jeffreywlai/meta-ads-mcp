@@ -113,12 +113,13 @@ class CallSecrets:
 
     Partnership Ad codes (shown as PARTNERSHIP_CODE_SHOWN) and a local file's path and names (shown
     as FILE_SHOWN) are removed by meta_ads_mcp.secret_scrub at any length, written plainly or encoded.
-    Two ways in, and every text from Meta or from an exception goes through one of them:
+    Every text from Meta or from an exception goes through one of these:
 
     - ``with secrets: ...`` around a tool's body: an error leaving the block is cleaned (message,
       fields, args and the errors chained behind it) before the MCP error or a traceback log is built.
     - failure_text(exc) and public_error(exc) for an error a tool catches and keeps in its result
       (a note, a warning, a failed list): the error is cleaned the same way, then its text is returned.
+    - value(answer) for Meta's answer to a request that carried a secret, before it goes into a result.
     """
 
     __slots__ = ("_scrubbers",)
@@ -158,6 +159,12 @@ class CallSecrets:
         for scrubber in self._scrubbers:
             text = scrubber.text(text)
         return text
+
+    def value(self, value: Any) -> Any:
+        """A copy of Meta's answer (any nested value) cleaned, for a result: Meta may repeat what it was sent."""
+        for scrubber in self._scrubbers:
+            value = scrubber.value(value)
+        return value
 
     def failure_text(self, exc: BaseException) -> str:
         """A caught error's text, cleaned, for a result: the only way such text goes into one."""
@@ -336,13 +343,13 @@ async def create_ad_creative(
         "degrees_of_freedom_spec": degrees_of_freedom_spec or OMIT,
     }
     # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
-    with CallSecrets.for_creative_inputs(object_story_spec, asset_feed_spec, degrees_of_freedom_spec, params):
+    with CallSecrets.for_creative_inputs(object_story_spec, asset_feed_spec, degrees_of_freedom_spec, params) as secrets:
         client = get_graph_api_client()
-        created = await client.create_edge_object(
+        created = secrets.value(await client.create_edge_object(
             normalize_account_id(account_id),
             "adcreatives",
             data=merge_graph_payload(payload, params),
-        )
+        ))
     return {
         "ok": True,
         "action": "create_ad_creative",
@@ -434,7 +441,7 @@ async def _preview_many(
                 for remaining in formats[position + 1:]
             )
             break
-        items.append({"ad_format": ad_format, "preview": preview})
+        items.append({"ad_format": ad_format, "preview": hidden.value(preview)})
     return {
         "items": items,
         "failed": failed,
@@ -483,6 +490,7 @@ async def preview_ad(
             creative=creative,
             ad_format=ad_format,
         )
+        result = hidden.value(result)
     return {"item": result, "summary": {"count": 1}}
 
 
@@ -893,7 +901,7 @@ async def _read_video_status(client: Any, video_id: str | None, secrets: CallSec
         )
     else:
         note = "Meta is still processing or reported a problem; check list_ad_videos(video_ids=...) before using it."
-    return {"processing_status": processing_status, "status": video.get("status"), "status_note": note}
+    return {"processing_status": processing_status, "status": secrets.value(video.get("status")), "status_note": note}
 
 
 @mcp_server.tool()
@@ -985,7 +993,7 @@ async def _upload_video_file(
         }
     client = get_graph_api_client()
     outcome = await _chunked_video_upload(client, account, video, meta_fields)
-    response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
+    response = creation_response(action="upload_ad_video", target=target, result={"finish": secrets.value(outcome["finish"])})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
     response.update(await _read_video_status(client, outcome["video_id"], secrets))
     # The last await is the status read: check the open file again after it, so a change
@@ -1051,7 +1059,7 @@ async def _upload_video_request(
     client = get_graph_api_client()
     uploaded = await client.create_edge_object(account, "advideos", data=data, files=files)
     video_id = str(uploaded.get("id") or uploaded.get("video_id") or "") or None
-    response = creation_response(action="upload_ad_video", target=target, result=uploaded)
+    response = creation_response(action="upload_ad_video", target=target, result=secrets.value(uploaded))
     response.update({"video_id": video_id, "upload": upload})
     response.update(await _read_video_status(client, video_id, secrets))
     return response
@@ -2452,8 +2460,19 @@ async def _boost_instagram_post(
     if resolved_page_id is None:
         adset = await client.get_object(ids["adset_id"], fields=["id", "promoted_object"])
         adset_promoted = adset.get("promoted_object")
-        if isinstance(adset_promoted, dict):
-            resolved_page_id = blank_to_none(str(adset_promoted.get("page_id") or ""))
+        read_page_id = adset_promoted.get("page_id") if isinstance(adset_promoted, dict) else None
+        # Absent, readable, or present in a shape that cannot be a Page id: only a readable id is used.
+        unreadable = (adset_promoted is not None and not isinstance(adset_promoted, dict)) or (
+            read_page_id is not None
+            and (isinstance(read_page_id, bool) or not isinstance(read_page_id, (str, int)))
+        )
+        if unreadable:
+            raise ValidationError(
+                "page_id is required: Meta returned the ad set's promoted_object in a shape this server could not "
+                "read, so its Page is not known. Nothing was created; pass page_id."
+            )
+        if read_page_id is not None:
+            resolved_page_id = blank_to_none(str(read_page_id))
         if resolved_page_id is None:
             raise ValidationError(
                 "page_id is required: Meta's Instagram post creative needs the Facebook Page id, "

@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 import json
+import re
 from copy import deepcopy
 
 import httpx
@@ -2305,7 +2306,9 @@ def test_x1_a_call_to_action_the_story_does_not_carry_stops_a_real_run(monkeypat
     with pytest.raises(ValidationError) as info:
         asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
     message = str(info.value)
-    assert "top-level call_to_action" in message
+    # A call_to_action that is not an object is refused by the one shape check, which says so.
+    expected = "call_to_action (expected an object)" if shape == "not_an_object" else "top-level call_to_action"
+    assert expected in message
     assert "Nothing was created or attached; ad 10 still uses creative 20" in message
     assert "https://example.com" not in message
     assert [call[0] for call in client.calls] == ["get", "get", "get"]
@@ -2584,7 +2587,7 @@ def test_p1_a_top_level_view_with_no_value_needs_only_the_type() -> None:
 UNREAD_COPY_LABELS = {
     "row-not-an-object": ([{"id": "71"}, None], "1 of the 2 labels"),
     "row-without-id-or-name": ([{"id": "71"}, {"created_time": "2026-01-01"}], "not a label with an id or a name"),
-    "page-without-data": ({"paging": {"cursors": {}}}, "shape this server could not read"),
+    "page-without-data": ({"paging": {"cursors": {}}}, "expected a list of labels, or a page of them with a data list"),
     "further-page": ({"data": [{"id": "71"}], "paging": {"next": "https://graph.facebook.com/next"}}, "further page"),
 }
 
@@ -2617,3 +2620,128 @@ def test_enhancement_copy_reads_labels_given_as_a_complete_page(monkeypatch) -> 
     posted = next(call[3] for call in client.calls if call[0] == "create")
     assert posted["adlabels"] == [{"id": "71"}, {"name": "Named"}]
     assert result["fields_not_copied"] == []
+
+
+# Round fourteen (review R12, S2): the copy is built only from state that was read and understood.
+# Absent (missing or null), present and readable, and present but not in the shape expected are three
+# cases; the third refuses a real run before any write and is reported by a dry run.
+
+
+class S2CopyClient:
+    def __init__(self, field, value):
+        self.field, self.value = field, value
+        self.writes = []
+
+    async def get_object(self, object_id, *, fields=None, **kwargs):
+        if object_id == "10":
+            return {"id": "10", "account_id": "20", "creative": {"id": "30"}}
+        if fields == cf.EXPLICIT_STORY_SPEC_READ:
+            return {"id": "30"}
+        return {
+            "id": "30", "name": "Example", "account_id": "20",
+            "object_story_spec": {"page_id": "40", "link_data": {"link": "https://example.test/", "image_hash": "abc"}},
+            self.field: self.value,
+        }
+
+    async def create_edge_object(self, parent_id, edge, *, data):
+        self.writes.append(("POST", parent_id, edge, data))
+        return {"id": "50"}
+
+    async def update_object(self, object_id, *, data):
+        self.writes.append(("POST", object_id, data))
+        return {"success": True}
+
+
+@pytest.mark.parametrize("raw_labels", [{}, False])
+def test_copy_refuses_a_present_unreadable_label_set(monkeypatch, raw_labels) -> None:
+    fake = S2CopyClient("adlabels", raw_labels)
+    _patch(monkeypatch, fake)
+    with pytest.raises(ValidationError):
+        asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert fake.writes == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("degrees_of_freedom_spec", "unreadable"),
+    ("degrees_of_freedom_spec", {"creative_features_spec": "unreadable"}),
+])
+def test_copy_refuses_unreadable_enhancement_settings(monkeypatch, field, value) -> None:
+    fake = S2CopyClient(field, value)
+    _patch(monkeypatch, fake)
+    with pytest.raises(ValidationError):
+        asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert fake.writes == []
+
+
+def test_every_field_the_copy_reads_has_one_expected_shape() -> None:
+    assert set(cf.ENHANCEMENT_FIELD_SHAPES) == set(cf.ENHANCEMENT_READ_FIELDS)
+    assert set(cf.ENHANCEMENT_AD_SHAPES) == {"id", "name", "account_id", "effective_status", "creative"}
+
+
+# A value of the wrong shape for each expected shape.
+_WRONG_FOR = {cf._OBJECT: ["x"], cf._LIST: "x", cf._TEXT: 5, cf._ID: {"a": 1}, cf._FLAG: "yes", cf._LABELS: {}}
+
+
+@pytest.mark.parametrize("field", sorted(cf.ENHANCEMENT_READ_FIELDS))
+def test_each_read_field_in_the_wrong_shape_refuses_a_real_run_and_is_reported_by_a_dry_run(monkeypatch, field) -> None:
+    wrong = _WRONG_FOR[cf.ENHANCEMENT_FIELD_SHAPES[field]]
+    fake = S2CopyClient(field, wrong)
+    _patch(monkeypatch, fake)
+    with pytest.raises(ValidationError, match="could not be read") as raised:
+        asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert f"{field} (" in str(raised.value) and "Nothing was created or attached" in str(raised.value)
+    assert fake.writes == []
+    result = asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}, dry_run=True))
+    assert field in result["settings_not_read"]
+    assert any("A real run would refuse" in note and f"{field} (" in note for note in result["notes"])
+    assert fake.writes == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "where"),
+    [
+        ("degrees_of_freedom_spec", {"creative_features_spec": {"image_touchups": "OPT_IN"}},
+         "degrees_of_freedom_spec.creative_features_spec.image_touchups"),
+        ("degrees_of_freedom_spec", {"creative_features_spec": {"text_optimizations": {"enroll_status": 1}}},
+         "degrees_of_freedom_spec.creative_features_spec.text_optimizations.enroll_status"),
+        ("object_story_spec", {"page_id": "40", "link_data": "https://example.test/"}, "object_story_spec.link_data"),
+    ],
+)
+def test_nested_places_the_copy_changes_must_be_readable(monkeypatch, field, value, where) -> None:
+    fake = S2CopyClient(field, value)
+    _patch(monkeypatch, fake)
+    with pytest.raises(ValidationError, match=re.escape(where)):
+        asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert fake.writes == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("adlabels", None), ("adlabels", []), ("adlabels", {"data": []}),
+        ("degrees_of_freedom_spec", None), ("degrees_of_freedom_spec", {}),
+        ("degrees_of_freedom_spec", {"creative_features_spec": None}),
+        ("degrees_of_freedom_spec", {"creative_features_spec": {}}),
+        ("enable_direct_install", False), ("url_tags", ""), ("format_transformation_spec", []),
+    ],
+)
+def test_absent_and_readable_empty_state_still_copies(monkeypatch, field, value) -> None:
+    fake = S2CopyClient(field, value)
+    _patch(monkeypatch, fake)
+    result = asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}))
+    assert [write[2] if len(write) == 4 else "attach" for write in fake.writes] == ["adcreatives", "attach"]
+    assert result["current"]["creative_features"] == {"image_touchups": "OPT_OUT"}
+
+
+def test_an_ad_whose_creative_is_not_an_object_is_refused_before_any_creative_read(monkeypatch) -> None:
+    class Client(S2CopyClient):
+        async def get_object(self, object_id, *, fields=None, **kwargs):
+            self.writes.append(("GET", object_id))
+            return {"id": "10", "account_id": "20", "creative": ["30"]}
+
+    fake = Client("adlabels", None)
+    _patch(monkeypatch, fake)
+    for dry_run in (False, True):
+        with pytest.raises(ValidationError, match=r"ad\.creative \(expected an object\)"):
+            asyncio.run(cf.update_ad_creative_enhancements("10", {"image_touchups": "OPT_OUT"}, dry_run=dry_run))
+    assert fake.writes == [("GET", "10"), ("GET", "10")]
