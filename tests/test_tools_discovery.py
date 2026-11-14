@@ -932,3 +932,65 @@ def test_list_ad_accounts_falls_back_to_the_old_request_when_readiness_fields_fa
     assert result["summary"]["readiness_fields"]["unavailable"] == [
         "business{id,name}", "disable_reason", "min_daily_budget", "funding_source",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Round-twelve review S5: a page Meta could not answer in full is not an ordinary page
+# ---------------------------------------------------------------------------
+
+
+class RawAccountsClient:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+
+    async def list_objects(self, *args, **kwargs):
+        return self.payload
+
+
+def test_changed_discovery_does_not_read_an_unreadable_page_as_empty(monkeypatch) -> None:
+    """Reviewer reproduction (round twelve, S5): {} was returned as an empty last page."""
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient({}))
+    result = asyncio.run(discovery.list_ad_accounts())
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["incomplete_reason"] == "Meta's answer had no list of results, so what it holds is not known."
+    assert result["items"] == [] and result["summary"]["count"] == 0
+    assert result["paging"] == {"before": None, "after": None, "next": None}
+    assert "readiness_fields" in result["summary"]
+
+
+@pytest.mark.parametrize("data", [None, "text", {"id": "act_1"}])
+def test_list_ad_accounts_data_that_is_not_a_list_is_unreadable(monkeypatch, data) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient({"data": data}))
+    result = asyncio.run(discovery.list_ad_accounts())
+    assert result["items"] == [] and result["summary"]["complete"] is False
+
+
+def test_list_ad_accounts_entry_that_is_not_an_object_marks_the_page_incomplete(monkeypatch) -> None:
+    payload = {"data": [dict(OLD_ACCOUNT_ROW), None], "paging": {"cursors": {"after": "A"}, "next": "https://next"}}
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient(payload))
+    result = asyncio.run(discovery.list_ad_accounts())
+    assert [item["id"] for item in result["items"]] == ["act_1"]
+    assert result["items"][0]["amount_spent"] == 1234.56
+    assert result["summary"]["count"] == 1 and result["summary"]["complete"] is False
+    assert result["summary"]["incomplete_reason"].startswith("1 entry in Meta's answer could not be read")
+    # The rows that were read are still a page Meta can continue from.
+    assert result["paging"]["after"] == "A"
+
+
+@pytest.mark.parametrize("paging", [{}, {"paging": {"cursors": {"after": "A"}, "next": "https://next"}}])
+def test_list_ad_accounts_ordinary_answer_is_exactly_as_before(monkeypatch, paging) -> None:
+    """A normal page, empty or not, gets no completeness keys it did not have before."""
+    for data in ([], [dict(OLD_ACCOUNT_ROW)]):
+        monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient({"data": data, **paging}))
+        result = asyncio.run(discovery.list_ad_accounts())
+        assert set(result) == {"items", "paging", "summary"}
+        assert set(result["summary"]) == {"count", "readiness_fields"}
+        assert result["summary"]["count"] == len(data)
+        assert result["paging"]["after"] == (paging and "A" or None)
+
+
+def test_checked_collection_matches_normalize_collection_for_a_readable_page() -> None:
+    from meta_ads_mcp.normalize import normalize_collection
+
+    for payload in ({"data": []}, {"data": [{"id": "1"}], "paging": {"cursors": {"before": "B", "after": "A"}, "next": "n"}}):
+        assert discovery.checked_collection(payload) == normalize_collection(payload)
