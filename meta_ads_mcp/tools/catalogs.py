@@ -2366,7 +2366,7 @@ def _retry_statement(outcomes: set[str], handles: list[str] | str | None) -> dic
                     "per handle, to read the outcome")
         return {
             "safe_now": False,
-            "how": (f"Do not resend yet: Meta accepted the batch and is still processing it. {read}, then "
+            "how": (f"Do not resend yet: Meta accepted the batch, but it has not been confirmed finished. {read}, then "
                     "resend only the items reported failed."),
             "why": _BATCH_RETRY_WHY,
         }

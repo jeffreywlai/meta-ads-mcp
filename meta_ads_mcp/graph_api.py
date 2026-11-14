@@ -430,7 +430,9 @@ class GraphAPIClient:
 
             try:
                 payload = response.json()
-            except ValueError:
+            except (ValueError, RecursionError):
+                # RecursionError: a body nested too deeply for the decoder is as unreadable
+                # as one that is not JSON, and is handled the same way.
                 # The body is not carried: it is text the server chose and can hold anything.
                 # The content type is reduced to a type/subtype pair or withheld.
                 payload = {
@@ -505,9 +507,11 @@ class GraphAPIClient:
                     error.is_transient
                     or response.status_code in TRANSIENT_HTTP_STATUSES
                 )
+                # A write's outcome is not known after a transient error, nor when the answer
+                # contradicts itself by carrying an error and success: true together.
                 error.mutation_outcome_unknown = (
                     not safe_to_retry
-                    and bool(error.is_transient)
+                    and (bool(error.is_transient) or payload.get("success") is True)
                 )
                 if response.status_code == 429 or _is_rate_limit_error(error):
                     # The automatic wait for a safe read keeps its cap: can_automatically_wait.

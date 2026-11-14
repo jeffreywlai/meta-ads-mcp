@@ -19,7 +19,7 @@ from pydantic import BeforeValidator
 
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_file
@@ -294,7 +294,12 @@ def _failure_reason(exc: BaseException) -> str:
 
 
 def _outcome_unknown(exc: BaseException) -> bool:
-    return bool(getattr(exc, "mutation_outcome_unknown", False))
+    """Whether a failed write may have been carried out.
+
+    True when the error says so, and for any failure that is not one of this server's own
+    error types: it may have happened after Meta took the request.
+    """
+    return bool(getattr(exc, "mutation_outcome_unknown", False)) or not isinstance(exc, MetaAdsError)
 
 
 def _with_context(exc: Exception, prefix: str) -> Exception:
@@ -306,7 +311,7 @@ def _with_context(exc: Exception, prefix: str) -> Exception:
     if isinstance(exc, (MetaApiError, RateLimitError)):
         exc.message = f"{prefix} {exc.message}"
         return exc
-    return MetaApiError(message=f"{prefix} {_failure_reason(exc)}")
+    return MetaApiError(message=f"{prefix} {_failure_reason(exc)}", mutation_outcome_unknown=_outcome_unknown(exc))
 
 
 # The field names a nested boost input can hold, so the only keys an error may name: a call to
@@ -2714,7 +2719,7 @@ async def _boost_instagram_post(
     except Exception as exc:
         if _outcome_unknown(exc):
             note = (
-                f"Creative {creative_id} was created; the ad may have been created too, because Meta's answer was lost. "
+                f"Creative {creative_id} was created; the ad may have been created too, because Meta gave no clear answer. "
                 f"Check the ads in ad set {ids['adset_id']} (list_ads) before retrying, and delete the creative with "
                 "delete_creative only if no ad uses it."
             )

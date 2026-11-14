@@ -3796,3 +3796,14 @@ def test_disagreeing_status_entries_after_a_submission_leave_items_unresolved(mo
     ))
     assert result["items"][0]["outcome"] == "processing"
     assert "disagree" in result["batch"]["status_error"] and result["ok"] is False
+
+
+# Round twenty-two (review R21, C3): the retry text claims no more than was confirmed.
+
+
+def test_retry_text_for_an_unfinished_batch_does_not_say_meta_is_processing_it() -> None:
+    for handles in ("h1", ["h1", "h2"]):
+        how = catalogs._retry_statement({"processing"}, handles)["how"]
+        assert "has not been confirmed finished" in how
+        assert "still processing" not in how
+        assert "Do not resend yet" in how and "'h1'" in how

@@ -469,6 +469,36 @@ def test_boost_creative_accepted_without_an_id_says_a_creative_may_exist(monkeyp
     assert "A creative may have been created; look for it in the account before retrying" in str(raised.value)
 
 
+def test_boost_ad_step_that_fails_in_this_server_leaves_the_ad_unknown(monkeypatch) -> None:
+    """R21 C2: a failure that is not one of this server's error types may have come after Meta took the request."""
+    from meta_ads_mcp.errors import MetaApiError
+
+    client = FakeBoostClient(fail_ad=RuntimeError("late"))
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="123", adset_id="adset_1", instagram_media_id="media_1",
+            instagram_account_id="ig_1", page_id="page_1", name="Boost post",
+        ))
+    assert raised.value.mutation_outcome_unknown is True
+    assert "the ad may have been created too" in raised.value.message
+    assert "but the ad was not" not in raised.value.message
+
+
+def test_boost_ad_step_meta_refused_still_says_the_ad_was_not_created(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    client = FakeBoostClient(fail_ad=MetaApiError(message="Invalid parameter", status_code=400, code=100))
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as raised:
+        asyncio.run(creatives.boost_instagram_post(
+            account_id="123", adset_id="adset_1", instagram_media_id="media_1",
+            instagram_account_id="ig_1", page_id="page_1", name="Boost post",
+        ))
+    assert raised.value.mutation_outcome_unknown is False
+    assert "was created but the ad was not" in raised.value.message
+
+
 def test_boost_instagram_post_creates_paused_ad(monkeypatch) -> None:
     client = FakeBoostClient()
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)

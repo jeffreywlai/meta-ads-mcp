@@ -1313,6 +1313,61 @@ def test_an_ordinary_throttle_of_a_write_is_still_a_refusal_that_can_be_retried(
     assert "mutation_outcome_unknown" not in public and "next_step" not in public
 
 
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+def test_a_write_answer_holding_both_an_error_and_success_true_leaves_the_outcome_unknown(monkeypatch, method) -> None:
+    # R21 C1: the answer contradicts itself, so it is not read as a plain refusal.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"success": True, "error": {"code": 100, "message": "Rejected"}})])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is True
+    assert error.value.to_public_dict()["retryable"] is False
+
+
+@pytest.mark.parametrize("status", [200, 400])
+@pytest.mark.parametrize("body", [
+    {"error": {"code": 100, "message": "Rejected"}},
+    {"success": False, "error": {"code": 100, "message": "Rejected"}},
+])
+def test_an_ordinary_error_answer_to_a_write_is_still_a_refusal(monkeypatch, status, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is False
+
+
+def test_a_read_answer_holding_both_an_error_and_success_true_is_not_a_write_outcome(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"success": True, "error": {"code": 100, "message": "Rejected"}})])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("GET", "123"))
+    assert error.value.mutation_outcome_unknown is False
+
+
+class _TooDeepResponse(FakeResponse):
+    """A response whose body the JSON decoder cannot get through."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(status_code, {})
+        self.headers = {**getattr(self, "headers", {}), "content-type": "application/json"}
+
+    def json(self):
+        raise RecursionError("maximum recursion depth exceeded")
+
+
+@pytest.mark.parametrize(("method", "unknown"), [("GET", False), ("POST", True), ("DELETE", True)])
+def test_a_body_nested_too_deeply_to_decode_is_an_unreadable_answer(monkeypatch, method, unknown) -> None:
+    # R21 C2: before, the decoder's RecursionError escaped the client as it was.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([_TooDeepResponse(200)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data=None if method == "GET" else {"name": "x"}))
+    assert "was not JSON" in error.value.message
+    assert error.value.details["unreadable_answer"] is True
+    assert error.value.mutation_outcome_unknown is unknown
+
+
 class _TextResponse(FakeResponse):
     """A response whose body is not JSON."""
 
