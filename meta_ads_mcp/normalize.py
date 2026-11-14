@@ -146,3 +146,34 @@ def normalize_collection(payload: dict[str, Any]) -> dict[str, Any]:
         "paging": extract_paging(payload),
         "summary": {"count": len(items)},
     }
+
+
+def _plain_id(value: Any) -> str | None:
+    """The digits of a Graph id given as text or a whole number, without an act_ prefix; else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value >= 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("act_"):
+        text = text[4:]
+    return text if text.isdigit() else None
+
+
+def names_other_object(requested_id: Any, answer: Any, *, key: str = "id") -> bool:
+    """True only when the answer carries a readable id under key that is a different object.
+
+    For a tool about to act on Meta's answer about one object (or on the id of an object it just
+    created): an answer that explicitly identifies another object is not about this one. The
+    comparison is by value, so "123", 123 and act_123 are the same id. It is never a mismatch
+    when the answer is not an object, has no id under key, or either id is not a plain id (an
+    alias such as me, a boolean, a container): a missing or unusual id is not evidence of
+    another object. Read live on 2026-11-14: accounts, campaigns, ad sets, ads, creatives,
+    audiences and a study each answered a read with the id asked for.
+    """
+    if not isinstance(answer, dict):
+        return False
+    asked, named = _plain_id(requested_id), _plain_id(answer.get(key))
+    return asked is not None and named is not None and asked != named

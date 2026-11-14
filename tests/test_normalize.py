@@ -96,3 +96,30 @@ def test_collection_fault_names_why_a_page_is_not_complete() -> None:
     assert "no list of results" in collection_fault({"data": None})
     assert collection_fault({"data": [None]}).startswith("1 entry ")
     assert collection_fault({"data": [{"id": "1"}, "x", 3]}).startswith("2 entries ")
+
+
+# Round thirty-three: the one comparison that says an answer is about a different object.
+
+
+@pytest.mark.parametrize(("requested", "answer", "expected"), [
+    ("123", {"id": "123"}, False), ("123", {"id": 123}, False), ("123", {"id": " 123 "}, False),
+    ("act_123", {"id": "act_123"}, False), ("act_123", {"id": "123"}, False), ("123", {"id": "act_123"}, False),
+    (123, {"id": "123"}, False),
+    ("123", {}, False), ("123", {"id": None}, False), ("123", {"id": ""}, False), ("123", {"name": "x"}, False),
+    ("me", {"id": "456"}, False), ("123", {"id": "me"}, False), ("123", {"id": True}, False),
+    ("123", {"id": ["456"]}, False), ("123", {"id": {"id": "456"}}, False), ("123", {"id": "12_34"}, False),
+    ("123", None, False), ("123", [{"id": "456"}], False), ("123", "456", False), (None, {"id": "456"}, False),
+    ("123", {"id": "456"}, True), ("123", {"id": 456}, True), ("act_123", {"id": "act_456"}, True),
+    ("act_123", {"id": "456"}, True), ("123", {"id": "0123"}, True),
+])
+def test_names_other_object_is_true_only_for_a_readable_different_id(requested, answer, expected) -> None:
+    from meta_ads_mcp.normalize import names_other_object
+
+    assert names_other_object(requested, answer) is expected
+
+
+def test_names_other_object_reads_the_key_it_is_given() -> None:
+    from meta_ads_mcp.normalize import names_other_object
+
+    assert names_other_object("123", {"audience_id": "456"}, key="audience_id") is True
+    assert names_other_object("123", {"audience_id": "123", "id": "456"}, key="audience_id") is False
