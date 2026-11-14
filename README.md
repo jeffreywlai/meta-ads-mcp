@@ -303,7 +303,9 @@ accept either JSON string lists or comma-separated strings.
 Budget and bid inputs use human-readable account-currency units. The server
 resolves currency from the owning Ad Account, converts values to Meta minor
 units exactly, and rejects precision the currency cannot represent (for
-example, fractional JPY). Campaign bidding strategy and Ad Set bid amounts are
+example, fractional JPY). The conversion follows the offset Meta documents for
+each currency: whole units for CLP, COP, CRC, HUF, IDR, ISK, JPY, KRW, PYG, TWD
+and VND, hundredths for every other currency. Campaign bidding strategy and Ad Set bid amounts are
 separate operations because Meta does not expose a campaign-level `bid_amount`.
 These units are also present in tool input schemas. `bid_constraints.roas_average_floor`
 is a raw integer scaled by 10,000 (`30000` means a 3.0 ROAS floor).
