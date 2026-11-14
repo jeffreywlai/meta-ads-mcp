@@ -3649,3 +3649,136 @@ def test_a_feed_with_an_unreadable_id_still_warns(monkeypatch) -> None:
         catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")], dry_run=True,
     ))
     assert "a product feed whose id could not be read" in result["items"][0]["feed_warning"]
+
+
+# round sixteen ---------------------------------------------------------------------------
+# V1: copies of one Graph id are one row only when they agree on the fields read.
+
+
+@pytest.mark.parametrize("split_pages", [False, True], ids=["same-page", "later-page"])
+def test_conflicting_catalog_product_copies_do_not_produce_exact_counts(monkeypatch, split_pages) -> None:
+    first = {"id": "20", "brand": "Alpha"}
+    second = {"id": "20", "brand": "Beta"}
+
+    class Client:
+        async def list_objects(self, parent_id, edge, **kwargs):
+            if split_pages and not kwargs["params"].get("after"):
+                return {"data": [first], "paging": {"next": "next-page", "cursors": {"after": "page-2"}}}
+            return {"data": [second, {"id": "21", "brand": "Gamma"}]} if split_pages else {"data": [first, second]}
+
+    monkeypatch.setattr(catalogs, "get_graph_api_client", Client)
+    result = _run(catalogs.list_catalog_attribute_values("10", "brand"))
+    assert result["coverage"]["complete"] is False
+    assert result["coverage"]["counts_are"] != "exact"
+    assert "disagree" in result["coverage"]["stop_reason"]
+    # Neither copy of product 20 is counted.
+    assert {entry["value"] for entry in result["values"]} <= {"Gamma"}
+
+
+def test_conflicting_product_identity_cannot_clear_batch_create_upsert(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeCatalogClient(edges={("10", "products"): {"data": [
+        {"id": "20", "retailer_id": "existing-a"}, {"id": "20", "retailer_id": "existing-b"},
+    ]}}))
+    item = {"method": "create", "retailer_id": "existing-b", "name": "Replacement",
+            "description": "Review product", "url": "https://example.com/item",
+            "image_url": "https://example.com/image.png", "brand": "Example",
+            "availability": "in stock", "condition": "new", "price": 2, "currency": "USD"}
+    result = _run(catalogs.batch_update_catalog_products(
+        "10", items=[{**item, "retailer_id": "existing-a"}, item], allow_upsert=True, wait_seconds=0,
+    ))
+    assert "create" not in client.kinds()
+    assert result["ok"] is False and result["sent"] is False and "disagree" in result["reason"]
+
+
+def test_equal_copies_of_one_id_are_one_row_and_complete() -> None:
+    row = {"id": "20", "retailer_id": "sku", "name": "Shoe"}
+    read = _run(catalogs._collect_edge(
+        _RawPages({"data": [row, dict(row)], "paging": {"next": "n", "cursors": {"after": "a"}}},
+                  {"data": [dict(row), {"id": "21", "retailer_id": "sku2", "name": "Hat"}]}),
+        "10", "products", fields=["id", "retailer_id", "name"], params={}, max_pages=5,
+    ))
+    assert read["rows"] == [row, {"id": "21", "retailer_id": "sku2", "name": "Hat"}]
+    assert read["complete"] is True and read["conflicting_ids"] == []
+
+
+def test_copies_are_compared_only_on_the_fields_read() -> None:
+    # Meta adding a field the read did not ask for does not make two copies disagree.
+    read = _run(catalogs._collect_edge(
+        _RawPages({"data": [{"id": "20", "name": "Shoe"}, {"id": "20", "name": "Shoe", "extra": 1}]}),
+        "10", "products", fields=["id", "name"], params={}, max_pages=1,
+    ))
+    assert read["complete"] is True and len(read["rows"]) == 1
+
+
+def test_rows_without_an_id_are_never_treated_as_copies() -> None:
+    # Diagnostics groups have no id (SDK ProductCatalogDiagnosticGroup): equal groups are both kept.
+    group = {"type": "IMAGE", "severity": "MUST_FIX", "number_of_affected_items": 2}
+    read = _run(catalogs._collect_edge(
+        _RawPages({"data": [group, dict(group)]}), "10", "diagnostics",
+        fields=["type", "severity", "number_of_affected_items"], params={}, max_pages=1,
+    ))
+    assert read["rows"] == [group, group] and read["complete"] is True
+
+
+def test_disagreeing_copies_of_a_connected_source_make_health_inconclusive(monkeypatch) -> None:
+    # The health read asks for id, name and source_type, so copies differing in name disagree.
+    _use(monkeypatch, FakeCatalogClient(
+        objects={"40": {"id": "40", "product_count": 5}},
+        edges={("40", "external_event_sources"): {"data": [{"id": "50", "name": "A"}, {"id": "50", "name": "B"}]}},
+    ))
+    result = _run(catalogs.get_catalog_dynamic_ads_health("40"))
+    assert result["status"] == "inconclusive"
+    assert result["metrics"]["event_source_count"] is None
+    assert any("disagree" in note for note in result["missing_signals"])
+
+
+def test_copies_differing_only_in_unread_fields_still_count_as_connected(monkeypatch) -> None:
+    # The DPA read asks for the source id alone, so copies differing elsewhere are one source.
+    _use(monkeypatch, FakeCatalogClient(edges={
+        ("30", "owned_product_catalogs"): {"data": [{"id": "40", "product_count": 5}]},
+        ("40", "product_sets"): {"data": [{"id": "41"}]},
+        ("40", "external_event_sources"): {"data": [{"id": "50", "name": "A"}, {"id": "50", "name": "B"}]},
+    }))
+    result = _run(catalogs.list_dpa_eligible_catalogs(business_id="30", pixel_id="50"))
+    [finding] = result["findings"]
+    assert finding["context_match"]["pixel"]["connected"] is True
+    assert finding["signals"]["event_source_count"] == 1
+
+
+# V5: every entry of one handle's status answer is read.
+
+
+@pytest.mark.parametrize("second", [None, {"status": "finished", "errors_total_count": 1,
+                                           "ids_of_invalid_requests": ["sku-b"], "errors": []}],
+                         ids=["unreadable-status", "conflicting-status"])
+def test_batch_status_does_not_call_first_copy_all_applied(monkeypatch, second) -> None:
+    _use(monkeypatch, _batch_client(status={"data": [{"status": "finished", "errors_total_count": 0, "errors": []}, second]}))
+    result = _run(catalogs.batch_update_catalog_products("123", handle="review-batch"))
+    assert result["outcome"] != "all_applied" and result["ok"] is False
+    assert result["batch"]["status_error"]
+
+
+def test_equal_status_entries_are_one_status(monkeypatch) -> None:
+    entry = {"status": "finished", "errors_total_count": 0, "errors": []}
+    _use(monkeypatch, _batch_client(status={"data": [entry, dict(entry)]}))
+    result = _run(catalogs.batch_update_catalog_products("123", handle="review-batch"))
+    assert result["outcome"] == "all_applied" and result["ok"] is True
+
+
+def test_a_single_status_entry_reads_as_before(monkeypatch) -> None:
+    _use(monkeypatch, _batch_client(status=_finished()))
+    result = _run(catalogs.batch_update_catalog_products("123", handle="h1"))
+    assert result["outcome"] == "all_applied" and result["ok"] is True
+
+
+def test_disagreeing_status_entries_after_a_submission_leave_items_unresolved(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "961101")], status={"data": [
+        {"status": "finished", "errors_total_count": 0},
+        {"status": "finished", "errors_total_count": 1, "ids_of_invalid_requests": ["SKU-1"]},
+    ]}))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", name="New")],
+    ))
+    assert result["items"][0]["outcome"] == "processing"
+    assert "disagree" in result["batch"]["status_error"] and result["ok"] is False

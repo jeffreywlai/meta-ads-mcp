@@ -45,6 +45,7 @@ from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 # from here.
 from meta_ads_mcp.tools.catalog_feeds import (
     _CheckedClient,
+    _RowCopies,
     _count_keys,
     _is_unreadable_answer_error,
     _is_unreadable_collection_error,
@@ -537,23 +538,31 @@ async def _collect_edge(
     summary total_count Meta returned on any page, or None. A page without a data list stops
     the read as incomplete (it may have held rows), and entries that are not objects are
     left out, counted in unreadable_entries, and make the read incomplete
-    (normalize.read_collection_page).
+    (normalize.read_collection_page). Rows are kept once per Graph id, and copies of one
+    id that disagree on the fields read make the read incomplete: they are left out of
+    rows and listed in conflicting_ids (catalog_feeds._RowCopies), so every consumer treats
+    that id as not known.
     """
-    rows: list[Any] = []
+    copies = _RowCopies(fields)
     unreadable_entries = 0
 
     def finish(read: dict[str, Any]) -> dict[str, Any]:
-        """Entries that are not objects leave the read incomplete, whatever else ended it."""
+        """Unreadable entries or disagreeing copies leave the read incomplete, whatever else ended it."""
+        read["rows"] = copies.rows()
         read["unreadable_entries"] = unreadable_entries
+        read["conflicting_ids"] = sorted(copies.conflicting)
+        reasons = [read["stop_reason"]]
         if unreadable_entries:
+            reasons.append(_unreadable_entries_reason(unreadable_entries))
+        if (conflict := copies.reason()) is not None:
+            reasons.append(conflict)
+        if unreadable_entries or conflict is not None:
             read["complete"] = False
-            read["stop_reason"] = " ".join(filter(None, (
-                read["stop_reason"], _unreadable_entries_reason(unreadable_entries),
-            )))
+            read["stop_reason"] = " ".join(filter(None, reasons))
         return read
 
+    rows: list[Any] = []  # filled from copies when the read ends (finish)
     seen_cursors: set[str] = set()
-    seen_ids: set[str] = set()
     seen_anonymous_pages: set[str] = set()
     cursor: str | None = None
     pages = 0
@@ -573,17 +582,8 @@ async def _collect_edge(
                            "summary_total": summary_total})
         unreadable_entries += skipped
         if data:
-            identities = [_row_identity(row) for row in data]
-            if all(identity is not None for identity in identities):
-                if all(identity in seen_ids for identity in identities):
-                    return finish({"rows": rows, "complete": False, "total_count": None, "pages": pages,
-                            "stop_reason": "Meta returned a page whose rows had all already been read.",
-                            "summary_total": summary_total})
-                for identity, row in zip(identities, data):
-                    if identity not in seen_ids:
-                        seen_ids.add(identity)
-                        rows.append(row)
-            else:
+            identified = all(_row_identity(row) is not None for row in data)
+            if not identified:
                 fingerprint = json.dumps(data, sort_keys=True, default=str)
                 if fingerprint in seen_anonymous_pages:
                     return finish({"rows": rows, "complete": False, "total_count": None, "pages": pages,
@@ -592,7 +592,13 @@ async def _collect_edge(
                                             "rows cannot be told, and the read stopped."),
                             "summary_total": summary_total})
                 seen_anonymous_pages.add(fingerprint)
-                rows.extend(data)
+            # Every row goes through the copy rule, on a mixed page too: a row with an id is
+            # compared with earlier copies of that id, one without is kept as it is.
+            added = [copies.add(row) for row in data]
+            if identified and not any(added):
+                return finish({"rows": rows, "complete": False, "total_count": None, "pages": pages,
+                        "stop_reason": "Meta returned a page whose rows had all already been read.",
+                        "summary_total": summary_total})
         total = (payload.get("summary") or {}).get("total_count")
         if summary_total is None:
             summary_total = to_int(total)
@@ -608,7 +614,7 @@ async def _collect_edge(
             reason = "Meta reported another page but returned no cursor to read it."
         elif cursor in seen_cursors:
             reason = "Meta returned a page cursor that had already been read."
-        elif max_items is not None and len(rows) >= max_items:
+        elif max_items is not None and len(copies.rows()) >= max_items:
             reason = f"Stopped at the {max_items}-row cap."
         elif pages >= max_pages:
             reason = f"Stopped after {pages} pages."
@@ -2138,29 +2144,40 @@ def _answer_unreadable(payload: Any) -> bool:
     return not isinstance(payload, dict) or "text_response" in payload
 
 
-def _batch_status_row(payload: Any) -> dict[str, Any] | None:
-    """The status row in Meta's answer to a status check, or None when it cannot be read.
+_STATUS_ENTRIES_DISAGREE = (
+    "Meta's answer to the status check held entries for this handle that disagree, so whether the batch "
+    "has finished, and with which errors, is not known; it was not checked again."
+)
 
-    The documented answer is a data list whose first entry is the batch's status; an object
-    without a data list is read as that entry itself. Anything else (not an object, one of
-    a non-JSON body's text_response object, or a data list with no object in front)
-    holds no status this tool can read.
+
+def _batch_status_row(payload: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """The batch's status in Meta's answer to a status check, and why not when it cannot be read.
+
+    The SDK types the answer for one handle as a data list of status objects; the ordinary
+    answer holds one (as the live batch test of 2026-11-13 returned). Every entry is read:
+    equal entries are one status; an entry that is not an object, or entries that disagree,
+    leave the status unknown, so no item is settled from it. An object without a data list
+    is read as that one entry. Anything else (not an object, a non-JSON body's
+    text_response object, an empty list) holds no status this tool can read.
     """
     if _answer_unreadable(payload):
-        return None
-    rows = payload.get("data")
-    if rows is None:
-        return payload
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-        return rows[0]
-    return None
+        return None, _STATUS_UNREADABLE
+    entries = payload.get("data")
+    if entries is None:
+        return payload, None
+    if not isinstance(entries, list) or not entries or not all(isinstance(entry, dict) for entry in entries):
+        return None, _STATUS_UNREADABLE
+    distinct = {json.dumps(entry, sort_keys=True, default=str) for entry in entries}
+    if len(distinct) > 1:
+        return None, _STATUS_ENTRIES_DISAGREE
+    return entries[0], None
 
 
 def _is_finished(row: dict[str, Any] | None) -> bool:
     return bool(row) and str(row.get("status") or "").strip().lower() == "finished"
 
 
-async def _check_batch(client, catalog_id: str, handle: str) -> dict[str, Any] | None:
+async def _check_batch(client, catalog_id: str, handle: str) -> tuple[dict[str, Any] | None, str | None]:
     payload = await client.list_objects(
         catalog_id, "check_batch_request_status",
         params={"handle": handle, "load_ids_of_invalid_requests": True},
@@ -2372,7 +2389,7 @@ def _retry_statement(outcomes: set[str], handles: list[str] | str | None) -> dic
 
 
 async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, Any]:
-    row = await _check_batch(client, catalog_id, handle)
+    row, problem = await _check_batch(client, catalog_id, handle)
     if row is None:
         return {
             "ok": False,
@@ -2380,7 +2397,7 @@ async def _batch_status_only(client, catalog_id: str, handle: str) -> dict[str, 
             "action": "batch_update_catalog_products",
             "target": {"catalog_id": catalog_id},
             "batch": {"handle": handle, "status": None, "complete": False, "status_checks": 1,
-                      "status_error": _STATUS_UNREADABLE},
+                      "status_error": problem},
             "note": ("Nothing is known about the batch's outcome from this answer. Call again with the same "
                      "handle to read it; do not resend the items until the batch is reported finished."),
         }
@@ -2453,7 +2470,7 @@ async def _poll_handles(
                 break
             requests += 1
             try:
-                row = await _check_batch(client, catalog_id, handle)
+                row, problem = await _check_batch(client, catalog_id, handle)
             except (MetaApiError, RateLimitError, UnsupportedFeatureError, NotFoundError) as error:
                 tracks[handle]["error"] = str(error)
                 continue
@@ -2468,7 +2485,7 @@ async def _poll_handles(
                 continue
             tracks[handle]["checks"] += 1
             if row is None:
-                tracks[handle]["error"] = _STATUS_UNREADABLE
+                tracks[handle]["error"] = problem
                 continue
             tracks[handle]["row"] = row
     if capped:
