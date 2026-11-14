@@ -749,3 +749,32 @@ async def test_an_ordinary_chunked_upload_reads_its_video_and_never_compares_the
     assert phases == ['start', 'transfer', 'finish'], phases
     assert result['video_id'] == '967001' and result['processing_status'] == 'ready', result
     assert result['upload']['upload_session_id'] == session_id, result
+
+
+# Found in the R34 sweep of the same family: the raw creative create and the raw study create showed
+# Meta's answer as the created object whatever id it gave.
+async def _raw_create(monkeypatch, tool, answer):
+    async with graph(monkeypatch, lambda request: httpx.Response(200, json=answer), creatives):
+        if tool == 'create_ad_creative':
+            return await creatives.create_ad_creative(account_id='973000', name='QA creative',
+                object_story_spec={'page_id': '973001', 'link_data': {'link': 'https://example.com'}})
+        return await creatives.setup_ab_test(owner_id='act_973000', name='QA study')
+
+
+@pytest.mark.parametrize('tool', ['create_ad_creative', 'setup_ab_test'])
+@pytest.mark.parametrize('returned_id', ['973000', 'act_973000', -12, 'not_an_id', True])
+@pytest.mark.asyncio
+async def test_a_raw_create_does_not_show_the_account_or_a_non_id_as_created(monkeypatch, tool, returned_id):
+    result = await _raw_create(monkeypatch, tool, {'id': returned_id})
+    assert result['ok'] is True and result['created'] is None and result['created_id_unresolved'] is True, result
+    assert result['unresolved_result'] == {'id': returned_id} and 'may have been created' in result['warning'], result
+
+
+@pytest.mark.parametrize('tool', ['create_ad_creative', 'setup_ab_test'])
+@pytest.mark.parametrize('answer', [{'id': '973009'}, {'id': 973009}, {'id': ' 973009 '}, {}],
+                         ids=['text', 'number', 'padded', 'absent'])
+@pytest.mark.asyncio
+async def test_an_ordinary_raw_create_answer_is_shown_as_before(monkeypatch, tool, answer):
+    """Control: a new id as text, a number or padded text, or no id at all, is shown exactly as before."""
+    result = await _raw_create(monkeypatch, tool, answer)
+    assert result == {'ok': True, 'action': tool, 'target': result['target'], 'created': answer}, result

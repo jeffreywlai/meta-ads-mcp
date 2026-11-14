@@ -1333,12 +1333,26 @@ async def setup_ab_test(
         "ad_studies",
         data=merge_graph_payload(payload, params),
     )
-    return {
+    response = {
         "ok": True,
         "action": "setup_ab_test",
         "target": {"owner_id": owner_id},
         "created": created,
     }
+    # A new study's id is an id and not its owner's (created_id); an answer that gives something else
+    # is not shown as the created study. An answer with no id is shown as before.
+    if not created_id_missing(created) and created_id(created, known=(owner_id,)) is None:
+        response.update({
+            "created": None,
+            "created_id_unresolved": True,
+            "unresolved_result": created,
+            "warning": (
+                "Meta accepted the request, but its answer did not give a usable id for the new study (it was not "
+                "an id, or it was the owner's id). The study may have been created; look for it before sending the "
+                "request again."
+            ),
+        })
+    return response
 
 
 _ADLABEL_OPERATIONS = ("set", "add", "remove")
