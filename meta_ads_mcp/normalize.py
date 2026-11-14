@@ -122,6 +122,22 @@ def read_collection_page(payload: Any) -> tuple[list[dict[str, Any]], int, bool]
     return rows, len(data) - len(rows), False
 
 
+def collection_fault(payload: Any) -> str | None:
+    """Why a collection page cannot be called complete, or None when every entry was read.
+
+    A page whose data list is missing, or that holds an entry that is not an object, may
+    hold rows that were not read. A tool that shapes such a page must say the result is
+    incomplete and give this reason; it must not report an empty or complete list.
+    """
+    _, unreadable_rows, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        return "Meta's answer had no list of results, so what it holds is not known."
+    if unreadable_rows:
+        entries = "1 entry" if unreadable_rows == 1 else f"{unreadable_rows} entries"
+        return f"{entries} in Meta's answer could not be read, so the list may be missing rows."
+    return None
+
+
 def normalize_collection(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize a collection response into the shared envelope."""
     items = payload.get("data", [])

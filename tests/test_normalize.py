@@ -85,3 +85,14 @@ def test_read_collection_page_only_reads_a_data_list() -> None:
     for unreadable in ({}, {"data": None}, {"data": {"id": "1"}}, {"data": "x"}, None, [], "text", 3):
         assert read_collection_page(unreadable) == ([], 0, True), unreadable
     assert pytest is not None
+
+
+def test_collection_fault_names_why_a_page_is_not_complete() -> None:
+    from meta_ads_mcp.normalize import collection_fault
+
+    assert collection_fault({"data": []}) is None
+    assert collection_fault({"data": [{"id": "1"}]}) is None
+    assert "no list of results" in collection_fault({})
+    assert "no list of results" in collection_fault({"data": None})
+    assert collection_fault({"data": [None]}).startswith("1 entry ")
+    assert collection_fault({"data": [{"id": "1"}, "x", 3]}).startswith("2 entries ")
