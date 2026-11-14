@@ -2452,7 +2452,9 @@ def _without(*keys):
         ({"end_time": "2026-11-20T00:00:00Z", "duration_days": 3}, "not both"),
         ({"end_time": "2026-11-14T00:00:00Z"}, "at least 24 hours"),
         ({"end_time": "2027-12-01T00:00:00Z"}, "at most 365 days"),
-        ({"end_time": "0"}, "positive Unix time"),
+        # end_time "0" with a daily budget is accepted (no end date; test_r25_b3_*); a lifetime budget still needs an end.
+        ({"daily_budget": None, "lifetime_budget": 10, "end_time": "0"}, "lifetime budget needs a real end_time"),
+        ({"start_time": "0"}, "positive Unix time"),
         ({"special_ad_categories": ["NONE", "HOUSING"]}, "NONE cannot be combined"),
         ({"special_ad_categories": ["someone@example.invalid"]}, "1 unknown value"),
         ({"buying_type": "RESERVED"}, "reach and frequency"),
@@ -4196,3 +4198,256 @@ def test_delete_ad_image_equal_copies_add_nothing(monkeypatch) -> None:
 ])
 def test_is_http_url_ignores_the_scheme_letter_case(value, expected) -> None:
     assert creatives.is_http_url(value) is expected
+
+
+# Round twenty-five (review R25b, B2, B3, B4): boost inputs Meta documents that the one-step
+# mode refused. Every change accepts more input; the requests for input already accepted
+# are pinned here first, written out in full.
+
+
+def test_r25_default_one_step_boost_sends_the_requests_it_sent_before(monkeypatch, fixed_clock) -> None:
+    client, result = _boost(monkeypatch)
+    assert client.calls == [
+        ("get", "act_123", ["currency"]),
+        ("create", "act_123", "campaigns", {
+            "name": "Instagram post 555 campaign", "objective": "OUTCOME_ENGAGEMENT", "status": "PAUSED",
+            "special_ad_categories": [], "is_adset_budget_sharing_enabled": False,
+        }),
+        ("create", "act_123", "adsets", {
+            "name": "Instagram post 555 ad set", "campaign_id": "1", "daily_budget": 1250, "billing_event": "IMPRESSIONS",
+            "optimization_goal": "POST_ENGAGEMENT", "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+            "targeting": {"geo_locations": {"countries": ["AU"]}}, "end_time": "2026-11-19T12:05:00+00:00",
+            "status": "PAUSED", "destination_type": "ON_POST",
+        }),
+        ("create", "act_123", "adcreatives", {
+            "name": "Instagram post 555 creative", "object_id": "777", "instagram_user_id": "666",
+            "source_instagram_media_id": "555",
+        }),
+        ("create", "act_123", "ads", {
+            "name": "Instagram post 555", "adset_id": "2", "creative": {"creative_id": "3"}, "status": "PAUSED",
+        }),
+    ]
+    assert result["defaults_applied"] == {
+        "objective": "OUTCOME_ENGAGEMENT", "destination_type": "ON_POST", "optimization_goal": "POST_ENGAGEMENT",
+        "billing_event": "IMPRESSIONS", "bid_strategy": "LOWEST_COST_WITHOUT_CAP", "special_ad_categories": [],
+        "buying_type": "AUCTION (Meta's default; not sent)", "is_adset_budget_sharing_enabled": False,
+        "start_time": "when Meta creates the ad set (no start_time sent)", "duration_days": 6,
+        "end_time": "2026-11-19T12:05:00+00:00", "status": "PAUSED for all four objects",
+        "names": "derived from 'Instagram post 555'",
+    }
+    assert result["schedule"] == {
+        "start_time": "when Meta creates the ad set (no start_time sent)",
+        "end_time": "2026-11-19T12:05:00+00:00",
+        "end_time_fixed_when_sent": True,
+        "safety_margin_seconds": 300,
+        "note": (
+            "end_time was computed immediately before the ad set request was sent: duration_days (6 days) plus a "
+            "300-second safety margin, counted from that moment, because Meta starts the ad set when it creates it, "
+            "after the request leaves. The run is longer than 6 days by at most the margin. end_time is the value sent."
+        ),
+    }
+
+
+def test_r25_default_one_step_plan_shows_the_requests_it_showed_before(monkeypatch, fixed_clock) -> None:
+    client, result = _boost(monkeypatch, plan_only=True)
+    assert client.calls == [("get", "act_123", ["currency"])]
+    adset_request = result["plan"]["requests"][1]
+    assert adset_request["data"] == {
+        "name": "Instagram post 555 ad set", "campaign_id": "<campaign id>", "daily_budget": 1250,
+        "billing_event": "IMPRESSIONS", "optimization_goal": "POST_ENGAGEMENT", "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+        "targeting": {"geo_locations": {"countries": ["AU"]}}, "end_time": "2026-11-19T12:05:00+00:00",
+        "status": "PAUSED", "destination_type": "ON_POST",
+    }
+    assert adset_request["end_time_note"] == result["plan"]["schedule"]["note"]
+    assert result["plan"]["schedule"]["end_time_fixed_when_sent"] is True
+
+
+def test_r25_default_existing_adset_boost_sends_the_requests_it_sent_before(monkeypatch) -> None:
+    client = FakeBoostClient(promoted_object={"page_id": "777"})
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    asyncio.run(creatives.boost_instagram_post(
+        account_id="123", adset_id="60", instagram_media_id="555", instagram_account_id="666",
+    ))
+    assert client.calls == [
+        ("get", "60", ["id", "promoted_object"]),
+        ("create", "act_123", "adcreatives", {
+            "name": "Instagram post 555 creative", "object_id": "777", "instagram_user_id": "666",
+            "source_instagram_media_id": "555",
+        }),
+        ("create", "act_123", "ads", {
+            "name": "Instagram post 555", "adset_id": "60", "creative": {"creative_id": "crt_boost"}, "status": "PAUSED",
+        }),
+    ]
+
+
+# B2: ad set reference, ODAX restrictions table (marketing-api/reference/ad-campaign.md, the
+# "API enum" rows for On Post, Traffic Website, Leads Website, App Promotion and Sales Website).
+R25_LEAD_PIXEL = {"pixel_id": "888", "custom_event_type": "LEAD"}
+R25_APP_EVENT = {**APP, "custom_event_type": "PURCHASE"}
+R25_DOCUMENTED_GOALS = [
+    ("OUTCOME_ENGAGEMENT", "ON_POST", "IMPRESSIONS", {}),
+    ("OUTCOME_TRAFFIC", "WEBSITE", "REACH", {"call_to_action": WEBSITE_CTA}),
+    *[("OUTCOME_LEADS", "WEBSITE", goal, {"call_to_action": WEBSITE_CTA, "promoted_object": R25_LEAD_PIXEL})
+      for goal in ("LANDING_PAGE_VIEWS", "LINK_CLICKS", "IMPRESSIONS", "REACH")],
+    *[("OUTCOME_SALES", "WEBSITE", goal, {"call_to_action": WEBSITE_CTA, "promoted_object": PIXEL})
+      for goal in ("VALUE", "LANDING_PAGE_VIEWS", "LINK_CLICKS", "IMPRESSIONS", "REACH")],
+    *[("OUTCOME_APP_PROMOTION", None, goal, {"promoted_object": R25_APP_EVENT, "call_to_action": APP_CTA})
+      for goal in ("APP_INSTALLS_AND_OFFSITE_CONVERSIONS", "VALUE")],
+]
+
+
+@pytest.mark.parametrize(("objective", "destination", "goal", "extras"), R25_DOCUMENTED_GOALS,
+                         ids=[f"{o}-{d}-{g}" for o, d, g, _ in R25_DOCUMENTED_GOALS])
+def test_r25_b2_documented_optimization_goals_reach_the_adset(monkeypatch, fixed_clock, objective, destination, goal, extras) -> None:
+    arguments = {"objective": objective, "destination_type": destination, "optimization_goal": goal, **extras}
+    _, plan = _boost(monkeypatch, plan_only=True, **arguments)
+    planned = plan["plan"]["requests"][1]["data"]
+    assert planned["optimization_goal"] == goal
+    client, result = _boost(monkeypatch, **arguments)
+    adset = _created(client, "adsets")
+    assert adset == planned | {"campaign_id": "1"}
+    assert adset["billing_event"] == "IMPRESSIONS"
+    assert adset.get("destination_type") == destination
+    if "promoted_object" in extras:
+        assert adset["promoted_object"] == extras["promoted_object"]
+    assert "optimization_goal" not in result["defaults_applied"]
+
+
+@pytest.mark.parametrize("objective", ["OUTCOME_LEADS", "OUTCOME_SALES"])
+def test_r25_b2_website_link_clicks_may_bill_on_link_clicks(monkeypatch, fixed_clock, objective) -> None:
+    """Billing events table: LINK_CLICKS optimization takes LINK_CLICKS or IMPRESSIONS billing."""
+    pixel = R25_LEAD_PIXEL if objective == "OUTCOME_LEADS" else PIXEL
+    client, _ = _boost(
+        monkeypatch, objective=objective, destination_type="WEBSITE", call_to_action=WEBSITE_CTA, promoted_object=pixel,
+        optimization_goal="LINK_CLICKS", billing_event="LINK_CLICKS",
+    )
+    assert _created(client, "adsets")["billing_event"] == "LINK_CLICKS"
+
+
+@pytest.mark.parametrize(("objective", "destination", "default"), [
+    ("OUTCOME_ENGAGEMENT", "ON_POST", "POST_ENGAGEMENT"),
+    ("OUTCOME_TRAFFIC", "WEBSITE", "LINK_CLICKS"),
+    ("OUTCOME_LEADS", "WEBSITE", "OFFSITE_CONVERSIONS"),
+    ("OUTCOME_SALES", "WEBSITE", "OFFSITE_CONVERSIONS"),
+    ("OUTCOME_APP_PROMOTION", None, "APP_INSTALLS"),
+])
+def test_r25_b2_route_defaults_are_unchanged(monkeypatch, fixed_clock, objective, destination, default) -> None:
+    extras = {
+        "OUTCOME_TRAFFIC": {"call_to_action": WEBSITE_CTA},
+        "OUTCOME_LEADS": {"call_to_action": WEBSITE_CTA, "promoted_object": R25_LEAD_PIXEL},
+        "OUTCOME_SALES": {"call_to_action": WEBSITE_CTA, "promoted_object": PIXEL},
+        "OUTCOME_APP_PROMOTION": {"call_to_action": APP_CTA, "promoted_object": APP},
+    }.get(objective, {})
+    client, result = _boost(monkeypatch, objective=objective, destination_type=destination, **extras)
+    assert _created(client, "adsets")["optimization_goal"] == default
+    assert result["defaults_applied"]["optimization_goal"] == default
+
+
+@pytest.mark.parametrize(("arguments", "message"), [
+    # App event and value goals optimize for an app event, which the promoted object must name.
+    ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": APP, "call_to_action": APP_CTA,
+      "optimization_goal": "APP_INSTALLS_AND_OFFSITE_CONVERSIONS"}, "custom_event_type"),
+    ({"objective": "OUTCOME_APP_PROMOTION", "promoted_object": APP, "call_to_action": APP_CTA,
+      "optimization_goal": "VALUE"}, "custom_event_type"),
+    # The website routes still need the pixel and its event, whatever the goal.
+    ({"objective": "OUTCOME_SALES", "destination_type": "WEBSITE", "call_to_action": WEBSITE_CTA,
+      "optimization_goal": "REACH"}, "pixel_id and custom_event_type"),
+    # Not in the SDK's optimization goal enum, so still refused.
+    ({"objective": "OUTCOME_SALES", "destination_type": "WEBSITE", "call_to_action": WEBSITE_CTA, "promoted_object": PIXEL,
+      "optimization_goal": "ONSITE_CONVERSIONS"}, "must be one of"),
+    # Goals the table does not list for the route stay refused.
+    ({"destination_type": "ON_VIDEO", "optimization_goal": "IMPRESSIONS"}, "must be one of THRUPLAY"),
+    ({"objective": "OUTCOME_TRAFFIC", "destination_type": "WEBSITE", "call_to_action": WEBSITE_CTA,
+      "optimization_goal": "VALUE"}, "must be one of"),
+    # Billing stays as the billing events table allows.
+    ({"optimization_goal": "IMPRESSIONS", "billing_event": "LINK_CLICKS"}, "must be IMPRESSIONS"),
+    ({"objective": "OUTCOME_SALES", "destination_type": "WEBSITE", "call_to_action": WEBSITE_CTA, "promoted_object": PIXEL,
+      "optimization_goal": "VALUE", "billing_event": "LINK_CLICKS"}, "must be IMPRESSIONS"),
+])
+def test_r25_b2_undocumented_goals_and_missing_events_are_still_refused(monkeypatch, fixed_clock, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+
+
+# B3: ad set reference, end_time: "When creating a set with a daily budget, specify end_time=0
+# to set the set to be ongoing and have no end date."
+
+
+@pytest.mark.parametrize("end_time", [0, "0", " 0 "])
+@pytest.mark.parametrize("budget", ["daily_budget", "campaign_daily_budget"])
+@pytest.mark.parametrize("plan_only", [True, False])
+def test_r25_b3_zero_end_time_means_no_end_on_a_daily_budget(monkeypatch, fixed_clock, end_time, budget, plan_only) -> None:
+    client, result = _boost(monkeypatch, **{"daily_budget": None, budget: 10}, end_time=end_time, plan_only=plan_only)
+    if plan_only:
+        adset = result["plan"]["requests"][1]["data"]
+        defaults, schedule = result["plan"]["defaults_applied"], result["plan"]["schedule"]
+        assert "no end date" in result["plan"]["requests"][1]["end_time_note"]
+        assert not [call for call in client.calls if call[0] == "create"]
+    else:
+        adset = _created(client, "adsets")
+        defaults, schedule = result["defaults_applied"], result["schedule"]
+    assert adset["end_time"] == 0 and type(adset["end_time"]) is int
+    assert "start_time" not in adset
+    assert "duration_days" not in defaults and "end_time" not in defaults
+    assert schedule["end_time"] == 0
+    assert schedule["end_time_fixed_when_sent"] is False
+    assert schedule["no_end_date"] is True
+    assert "no end date" in schedule["note"] and "until it is paused" in schedule["note"]
+    assert "safety_margin_seconds" not in schedule
+
+
+def test_r25_b3_zero_end_time_keeps_a_given_start(monkeypatch, fixed_clock) -> None:
+    client, result = _boost(monkeypatch, start_time="2026-12-01T09:00:00-05:00", end_time=0)
+    adset = _created(client, "adsets")
+    assert (adset["start_time"], adset["end_time"]) == ("2026-12-01T09:00:00-05:00", 0)
+    assert result["schedule"]["start_time"] == "2026-12-01T09:00:00-05:00"
+
+
+@pytest.mark.parametrize(("arguments", "message"), [
+    ({"daily_budget": None, "lifetime_budget": 50, "end_time": 0}, "lifetime budget needs a real end_time"),
+    ({"daily_budget": None, "campaign_lifetime_budget": 50, "end_time": "0"}, "lifetime budget needs a real end_time"),
+    ({"end_time": 0, "duration_days": 3}, "not both"),
+    ({"start_time": "0"}, "positive Unix time"),
+    ({"start_time": 0}, "positive Unix time"),
+    ({"end_time": -5}, "positive Unix time"),
+])
+def test_r25_b3_zero_is_no_end_only_for_a_daily_budget_end_time(monkeypatch, fixed_clock, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+
+
+# B4: "Use Posts as Instagram Ads" guide, Call to action, Click to Instagram:
+# {"type": "MESSAGE_PAGE", "value": {"app_destination": "INSTAGRAM_DIRECT"}}.
+R25_MESSAGE_PAGE_INSTAGRAM = {"type": "MESSAGE_PAGE", "value": {"app_destination": "INSTAGRAM_DIRECT"}}
+
+
+@pytest.mark.parametrize("objective", ["OUTCOME_TRAFFIC", "OUTCOME_ENGAGEMENT"])
+def test_r25_b4_message_page_to_instagram_direct_is_sent_as_given(monkeypatch, fixed_clock, objective) -> None:
+    _, plan = _boost(monkeypatch, objective=objective, destination_type="INSTAGRAM_DIRECT",
+                     call_to_action=deepcopy(R25_MESSAGE_PAGE_INSTAGRAM), plan_only=True)
+    assert plan["plan"]["requests"][2]["data"]["call_to_action"] == R25_MESSAGE_PAGE_INSTAGRAM
+    client, result = _boost(monkeypatch, objective=objective, destination_type="INSTAGRAM_DIRECT",
+                            call_to_action=deepcopy(R25_MESSAGE_PAGE_INSTAGRAM))
+    assert _created(client, "adcreatives")["call_to_action"] == R25_MESSAGE_PAGE_INSTAGRAM
+    adset = _created(client, "adsets")
+    assert (adset["destination_type"], adset["promoted_object"]) == ("INSTAGRAM_DIRECT", {"page_id": "777"})
+    assert "call_to_action" not in result["defaults_applied"]
+
+
+@pytest.mark.parametrize(("arguments", "message"), [
+    ({"destination_type": "MESSENGER", "call_to_action": R25_MESSAGE_PAGE_INSTAGRAM}, "needs destination_type INSTAGRAM_DIRECT"),
+    ({"destination_type": "WHATSAPP", "call_to_action": R25_MESSAGE_PAGE_INSTAGRAM}, "needs destination_type INSTAGRAM_DIRECT"),
+    ({"call_to_action": R25_MESSAGE_PAGE_INSTAGRAM}, "needs destination_type INSTAGRAM_DIRECT"),
+    ({"destination_type": "INSTAGRAM_DIRECT", "call_to_action": {"type": "MESSAGE_PAGE"}}, "needs destination_type MESSENGER"),
+    ({"destination_type": "INSTAGRAM_DIRECT", "call_to_action": {"type": "MESSAGE_PAGE", "value": {"app_destination": "MESSENGER"}}},
+     "needs destination_type MESSENGER"),
+    ({"destination_type": "INSTAGRAM_DIRECT", "call_to_action": {
+        "type": "MESSAGE_PAGE", "value": {"app_destination": "INSTAGRAM_DIRECT", "link": "https://www.instagram.com"}}},
+     "leave call_to_action.value out"),
+])
+def test_r25_b4_message_page_still_needs_the_destination_its_value_names(monkeypatch, fixed_clock, arguments, message) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(creatives.ValidationError, match=message):
+        asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))

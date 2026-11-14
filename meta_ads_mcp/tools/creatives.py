@@ -1588,9 +1588,13 @@ async def delete_creative(creative_id: str) -> dict[str, Any]:
 # - Click to Instagram and click to WhatsApp guides (ad-creative/messaging-ads):
 #   INSTAGRAM_DIRECT and WHATSAPP with CONVERSATIONS, billing IMPRESSIONS, promoted_object
 #   page_id, and the call to action each shows for an existing Instagram post.
-# - Use Posts as Instagram Ads guide: MESSAGE_PAGE with app_destination MESSENGER on a post.
+# - Use Posts as Instagram Ads guide: MESSAGE_PAGE with app_destination MESSENGER, or with
+#   app_destination INSTAGRAM_DIRECT ("Click to Instagram"), on a post.
 # - Call ads guide: PHONE_CALL with QUALITY_CALL, billing IMPRESSIONS, CALL_NOW with a tel: link.
 # - Ad set reference: INSTAGRAM_PROFILE with VISIT_INSTAGRAM_PROFILE, and WEBSITE.
+# - Ad set reference, ODAX restrictions table (the "API enum" rows): the further goals for
+#   On Post, Traffic Website, Leads Website, Sales Website and App Promotion.
+#   ONSITE_CONVERSIONS, also in that table, is not in the SDK's optimization goal enum.
 # Combinations those pages do not show (for example OUTCOME_SALES with a messaging
 # destination, where the guides and the mapping table disagree on the pixel) are not offered.
 def _route(goals: tuple[str, ...], *, promoted: str | None = None, cta: str | None = None) -> dict[str, Any]:
@@ -1601,7 +1605,7 @@ _ENGAGEMENT_MESSAGING_GOALS = ("CONVERSATIONS", "LINK_CLICKS")
 _TRAFFIC_MESSAGING_GOALS = ("CONVERSATIONS", "LINK_CLICKS", "REACH", "IMPRESSIONS")
 BOOST_OBJECTIVES: dict[str, dict[str | None, dict[str, Any]]] = {
     "OUTCOME_ENGAGEMENT": {
-        "ON_POST": _route(("POST_ENGAGEMENT", "REACH")),
+        "ON_POST": _route(("POST_ENGAGEMENT", "REACH", "IMPRESSIONS")),
         "ON_VIDEO": _route(("THRUPLAY", "TWO_SECOND_CONTINUOUS_VIDEO_VIEWS")),
         "INSTAGRAM_DIRECT": _route(_ENGAGEMENT_MESSAGING_GOALS, promoted="page", cta="message"),
         "WHATSAPP": _route(_ENGAGEMENT_MESSAGING_GOALS, promoted="page", cta="message"),
@@ -1612,26 +1616,39 @@ BOOST_OBJECTIVES: dict[str, dict[str | None, dict[str, Any]]] = {
     },
     "OUTCOME_TRAFFIC": {
         "INSTAGRAM_PROFILE": _route(("VISIT_INSTAGRAM_PROFILE",)),
-        "WEBSITE": _route(("LINK_CLICKS", "LANDING_PAGE_VIEWS", "IMPRESSIONS"), cta="website"),
+        "WEBSITE": _route(("LINK_CLICKS", "LANDING_PAGE_VIEWS", "IMPRESSIONS", "REACH"), cta="website"),
         "INSTAGRAM_DIRECT": _route(_TRAFFIC_MESSAGING_GOALS, promoted="page", cta="message"),
         "WHATSAPP": _route(_TRAFFIC_MESSAGING_GOALS, promoted="page", cta="message"),
         "MESSENGER": _route(_TRAFFIC_MESSAGING_GOALS, promoted="page", cta="message"),
         "PHONE_CALL": _route(("QUALITY_CALL", "LINK_CLICKS"), cta="call"),
     },
     "OUTCOME_SALES": {
-        "WEBSITE": _route(("OFFSITE_CONVERSIONS",), promoted="pixel", cta="website"),
+        "WEBSITE": _route(
+            ("OFFSITE_CONVERSIONS", "VALUE", "LANDING_PAGE_VIEWS", "LINK_CLICKS", "IMPRESSIONS", "REACH"),
+            promoted="pixel", cta="website",
+        ),
         "PHONE_CALL": _route(("QUALITY_CALL",), promoted="page", cta="call"),
     },
     "OUTCOME_LEADS": {
-        "WEBSITE": _route(("OFFSITE_CONVERSIONS",), promoted="pixel", cta="website"),
+        "WEBSITE": _route(
+            ("OFFSITE_CONVERSIONS", "LANDING_PAGE_VIEWS", "LINK_CLICKS", "IMPRESSIONS", "REACH"),
+            promoted="pixel", cta="website",
+        ),
         "ON_AD": _route(("LEAD_GENERATION", "QUALITY_LEAD"), promoted="page", cta="lead_form"),
         "WHATSAPP": _route(("CONVERSATIONS",), promoted="page", cta="message"),
         "PHONE_CALL": _route(("QUALITY_CALL",), promoted="page", cta="call"),
     },
     "OUTCOME_APP_PROMOTION": {
-        None: _route(("APP_INSTALLS", "LINK_CLICKS", "OFFSITE_CONVERSIONS"), promoted="app", cta="app"),
+        None: _route(
+            ("APP_INSTALLS", "LINK_CLICKS", "OFFSITE_CONVERSIONS", "APP_INSTALLS_AND_OFFSITE_CONVERSIONS", "VALUE"),
+            promoted="app", cta="app",
+        ),
     },
 }
+# App goals that optimize for an app event (VALUE: its purchase value), so the promoted object
+# names the event: promoted_object reference, "application_id, object_store_url, and
+# custom_event_type for mobile app events".
+_APP_EVENT_GOALS = ("OFFSITE_CONVERSIONS", "APP_INSTALLS_AND_OFFSITE_CONVERSIONS", "VALUE")
 # The call to action each messaging guide shows for an existing Instagram post.
 BOOST_MESSAGE_CALLS_TO_ACTION: dict[str, dict[str, Any]] = {
     "INSTAGRAM_DIRECT": {"type": "INSTAGRAM_MESSAGE", "value": {"link": "https://www.instagram.com"}},
@@ -1640,6 +1657,9 @@ BOOST_MESSAGE_CALLS_TO_ACTION: dict[str, dict[str, Any]] = {
 }
 # Call-to-action types tied to one destination; elsewhere they are refused.
 _DESTINATION_CALL_TO_ACTIONS = {"INSTAGRAM_MESSAGE": "INSTAGRAM_DIRECT", "WHATSAPP_MESSAGE": "WHATSAPP", "MESSAGE_PAGE": "MESSENGER", "CALL_NOW": "PHONE_CALL"}
+# Use Posts as Instagram Ads guide, "Click to Instagram": MESSAGE_PAGE whose value names
+# INSTAGRAM_DIRECT is the Instagram message button, sent as written there.
+BOOST_INSTAGRAM_MESSAGE_PAGE: dict[str, Any] = {"type": "MESSAGE_PAGE", "value": {"app_destination": "INSTAGRAM_DIRECT"}}
 # Lead ads guide: the call-to-action types an instant form accepts.
 BOOST_LEAD_FORM_CALL_TO_ACTIONS = ("APPLY_NOW", "DOWNLOAD", "GET_QUOTE", "LEARN_MORE", "SIGN_UP", "SUBSCRIBE")
 _TEL_LINK = re.compile(r"^tel:\+[0-9]{6,15}$")
@@ -1765,10 +1785,27 @@ def _boost_call_to_action(
     cta_type = _cta_type(call_to_action)
     value = _cta_value(call_to_action)
     tied = _DESTINATION_CALL_TO_ACTIONS.get(cta_type or "")
+    # MESSAGE_PAGE goes where its value.app_destination says: Instagram Direct for the guide's
+    # "Click to Instagram" form, otherwise Messenger.
+    instagram_message_page = (
+        cta_type == "MESSAGE_PAGE"
+        and value.get("app_destination") == BOOST_INSTAGRAM_MESSAGE_PAGE["value"]["app_destination"]
+    )
+    if instagram_message_page:
+        tied = "INSTAGRAM_DIRECT"
     if tied is not None and tied != destination:
-        raise ValidationError(f"call_to_action type {cta_type} needs destination_type {tied}.")
+        if instagram_message_page:
+            raise ValidationError(
+                "call_to_action type MESSAGE_PAGE with value.app_destination INSTAGRAM_DIRECT needs destination_type "
+                "INSTAGRAM_DIRECT."
+            )
+        hint = (
+            " (with value {\"app_destination\": \"INSTAGRAM_DIRECT\"} it needs destination_type INSTAGRAM_DIRECT)"
+            if cta_type == "MESSAGE_PAGE" else ""
+        )
+        raise ValidationError(f"call_to_action type {cta_type} needs destination_type {tied}{hint}.")
     if kind == "message":
-        expected = BOOST_MESSAGE_CALLS_TO_ACTION[destination]
+        expected = BOOST_INSTAGRAM_MESSAGE_PAGE if instagram_message_page else BOOST_MESSAGE_CALLS_TO_ACTION[destination]
         if call_to_action is None:
             return deepcopy(expected), True
         if value and value != expected["value"]:
@@ -1843,9 +1880,9 @@ def _boost_promoted_object(
             )
         if not is_http_url(store_url):
             raise ValidationError("promoted_object.object_store_url must be the app's http(s) store address.")
-        if goal == "OFFSITE_CONVERSIONS" and not blank_to_none(str(promoted_object.get("custom_event_type") or "")):
+        if goal in _APP_EVENT_GOALS and not blank_to_none(str(promoted_object.get("custom_event_type") or "")):
             raise ValidationError(
-                "optimization_goal OFFSITE_CONVERSIONS for an app needs promoted_object.custom_event_type, the app event "
+                f"optimization_goal {goal} for an app needs promoted_object.custom_event_type, the app event "
                 "to optimize for (Meta's ad set reference)."
             )
         _refuse_url_logins(promoted_object, "promoted_object")
@@ -1869,6 +1906,19 @@ def _boost_promoted_object(
             + " in one-step mode."
         )
     return None
+
+
+def _is_no_end(value: Any) -> bool:
+    """end_time 0 (or "0"): the ad set reference's value for an ongoing daily-budget ad set with no end date."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == 0
+    return isinstance(value, str) and value.strip().isdigit() and int(value.strip()) == 0
+
+
+# Ad set reference, end_time: "When creating a set with a daily budget, specify end_time=0".
+_DAILY_BUDGET_PARAMETERS = ("daily_budget", "campaign_daily_budget")
 
 
 def _boost_time(value: Any, field_name: str) -> tuple[Any, datetime]:
@@ -1917,6 +1967,7 @@ class _BoostSettings:
     end_sent: Any
     end_computed: bool
     days: int | None
+    no_end: bool
     targeting: dict[str, Any]
     given: set[str]
 
@@ -2008,7 +2059,17 @@ def _boost_settings(
     if end_time is not None and duration_days is not None:
         raise ValidationError("Give end_time or duration_days, not both.")
     days: int | None = None
-    if end_time is not None:
+    no_end = end_time is not None and _is_no_end(end_time)
+    end_at: datetime | None = None
+    if no_end:
+        if budget_parameter not in _DAILY_BUDGET_PARAMETERS:
+            raise ValidationError(
+                "end_time 0 means no end date, which Meta allows only with a daily budget; a lifetime budget needs a "
+                "real end_time."
+            )
+        # Sent as 0, the ad set reference's value; there is no run length to check.
+        end_sent = 0
+    elif end_time is not None:
         end_sent, end_at = _boost_time(end_time, "end_time")
     else:
         days = BOOST_DEFAULT_DURATION_DAYS if duration_days is None else duration_days
@@ -2021,11 +2082,11 @@ def _boost_settings(
         end_at = _ceil_second(start_at + timedelta(days=days)) if start_time is not None else _computed_boost_end(days)
         end_sent = end_at.isoformat()
     # Both checks compare the exact start (with its fraction of a second) and the exact end.
-    if end_at - start_at < BOOST_MIN_RUN:
+    if end_at is not None and end_at - start_at < BOOST_MIN_RUN:
         raise ValidationError("end_time must be at least 24 hours after the start (start_time, or now when it is omitted).")
     # A computed end is at most days (already checked) plus the rounding up and, without a
     # start_time, the safety margin above.
-    if end_time is not None and end_at - start_at > timedelta(days=BOOST_MAX_DURATION_DAYS):
+    if end_time is not None and end_at is not None and end_at - start_at > timedelta(days=BOOST_MAX_DURATION_DAYS):
         raise ValidationError(f"The ad set can run for at most {BOOST_MAX_DURATION_DAYS} days.")
     given = {
         name for name, value in (
@@ -2040,7 +2101,7 @@ def _boost_settings(
         bid_strategy=strategy, bid_amount=bid_amount, budget_parameter=budget_parameter, budget=budget,
         promoted_object=promoted, call_to_action=cta, call_to_action_built=built, special_ad_categories=categories,
         buying_type=resolved_buying_type, start_sent=start_sent, end_sent=end_sent, end_computed=end_time is None,
-        days=days, targeting=targeting, given=given,
+        days=days, no_end=no_end, targeting=targeting, given=given,
     )
 
 
@@ -2226,6 +2287,12 @@ def _boost_schedule(settings: _BoostSettings, end_sent: Any, *, fixed_when_sent:
         "end_time": end_sent,
         "end_time_fixed_when_sent": fixed_when_sent,
     }
+    if settings.no_end:
+        schedule["no_end_date"] = True
+        schedule["note"] = (
+            f"end_time 0 {'was' if sent else 'would be'} sent: Meta's value for an ongoing daily-budget ad set. The ad "
+            "set has no end date and runs until it is paused or given an end_time."
+        )
     if fixed_when_sent:
         margin = int(_boost_end_margin().total_seconds())
         days = f"{settings.days} day{'' if settings.days == 1 else 's'}"
@@ -2358,7 +2425,7 @@ async def _boost_one_step(
         "defaults_applied": defaults,
         "schedule": _boost_schedule(settings, end_sent, fixed_when_sent=end_fixed_when_sent, sent=False),
     }
-    if end_fixed_when_sent:
+    if end_fixed_when_sent or settings.no_end:
         plan["requests"][1]["end_time_note"] = plan["schedule"]["note"]
     if settings.budget_parameter == "daily_budget":
         plan["daily_budget"] = {"major_units": settings.budget, "sent_minor_units": budget_minor}
@@ -2481,7 +2548,7 @@ async def boost_instagram_post(
     special_ad_categories: StringList | None = None,
     buying_type: str | None = None,
 ) -> dict[str, Any]:
-    """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, with every default stated; plan_only returns the exact requests and creates nothing; if a later step fails the error names every object already created. One-step needs targeting and exactly one budget, never defaulted, in major units: daily_budget or lifetime_budget on the ad set, or campaign_daily_budget or campaign_lifetime_budget (bid_strategy then goes on the campaign). The run is duration_days (default 6) or end_time, from start_time or creation; times are ISO 8601 with a UTC offset or Unix seconds. objective and destination_type: OUTCOME_ENGAGEMENT (default; ON_POST, ON_VIDEO, INSTAGRAM_DIRECT, WHATSAPP, MESSENGER), OUTCOME_AWARENESS, OUTCOME_TRAFFIC (INSTAGRAM_PROFILE default, WEBSITE, the three messaging destinations, PHONE_CALL), OUTCOME_SALES (WEBSITE with promoted_object pixel_id and custom_event_type, or PHONE_CALL), OUTCOME_LEADS (WEBSITE with a pixel, ON_AD instant form, WHATSAPP, PHONE_CALL), OUTCOME_APP_PROMOTION (promoted_object application_id and object_store_url). Messaging destinations get their message button automatically; WEBSITE and app promotion need call_to_action value.link; ON_AD needs call_to_action value.lead_gen_form_id; PHONE_CALL needs CALL_NOW with a tel: link. optimization_goal, billing_event, bid_strategy (LOWEST_COST_WITHOUT_CAP default, LOWEST_COST_WITH_BID_CAP or COST_CAP with bid_amount), special_ad_categories and buying_type (AUCTION) are checked against Meta's documented combinations. Without page_id, the Page is found from the Instagram account when exactly one of your Pages lists it. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3; for a creator's post, partnership_ad_code instead of instagram_media_id. Check list_instagram_media boost_eligible first."""
+    """Boost an existing Instagram post, reel or story. With adset_id: creates a creative from it and a PAUSED ad in that ad set (page_id defaults to the ad set's promoted_object page; validate_only checks the ad with Meta). Without adset_id (one-step): creates a campaign, ad set, creative and ad, all PAUSED, with every default stated; plan_only returns the exact requests and creates nothing; if a later step fails the error names every object already created. One-step needs targeting and exactly one budget, never defaulted, in major units: daily_budget or lifetime_budget on the ad set, or campaign_daily_budget or campaign_lifetime_budget (bid_strategy then goes on the campaign). The run is duration_days (default 6) or end_time, from start_time or creation; times are ISO 8601 with a UTC offset or Unix seconds; end_time 0 with a daily budget (ad set or campaign) means no end date. objective and destination_type: OUTCOME_ENGAGEMENT (default; ON_POST, ON_VIDEO, INSTAGRAM_DIRECT, WHATSAPP, MESSENGER), OUTCOME_AWARENESS, OUTCOME_TRAFFIC (INSTAGRAM_PROFILE default, WEBSITE, the three messaging destinations, PHONE_CALL), OUTCOME_SALES (WEBSITE with promoted_object pixel_id and custom_event_type, or PHONE_CALL), OUTCOME_LEADS (WEBSITE with a pixel, ON_AD instant form, WHATSAPP, PHONE_CALL), OUTCOME_APP_PROMOTION (promoted_object application_id and object_store_url). Messaging destinations get their message button automatically (INSTAGRAM_DIRECT also takes MESSAGE_PAGE with value app_destination INSTAGRAM_DIRECT); WEBSITE and app promotion need call_to_action value.link; ON_AD needs call_to_action value.lead_gen_form_id; PHONE_CALL needs CALL_NOW with a tel: link. optimization_goal, billing_event, bid_strategy (LOWEST_COST_WITHOUT_CAP default, LOWEST_COST_WITH_BID_CAP or COST_CAP with bid_amount), special_ad_categories and buying_type (AUCTION) are checked against Meta's documented combinations. Without page_id, the Page is found from the Instagram account when exactly one of your Pages lists it. Partnership Ad: sponsor_page_id and/or sponsor_instagram_account_id, optional partnership_ad_format 1, 2 or 3; for a creator's post, partnership_ad_code instead of instagram_media_id. Check list_instagram_media boost_eligible first."""
     return await _boost_instagram_post(
             account_id=account_id,
             instagram_media_id=instagram_media_id,
