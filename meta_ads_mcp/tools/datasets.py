@@ -346,6 +346,8 @@ async def get_dataset_stats(
     # totals would otherwise silently leave out.
     unreadable_hours = 0
     unreadable_counts = 0
+    counted: dict[tuple[str, str], int] = {}
+    conflicting_values: set[str] = set()
     while True:
         if pages >= MAX_STATS_PAGES:
             stop_reason = f"Stopped after {pages} pages of hourly stats."
@@ -374,12 +376,22 @@ async def get_dataset_stats(
                 continue
             unreadable_counts += bad_rows
             rows = []
+            hour = None if bucket.get("start_time") is None else str(bucket["start_time"])
             for row in bucket_rows:
                 count = to_int(row.get("count"))
                 if count is None:
                     unreadable_counts += 1
                     continue
                 value = str(row.get("value"))
+                if hour is not None:
+                    # One count per hour and value: a copy with the same count is counted once, and
+                    # copies with different counts leave that value's total unknown, not first-wins.
+                    seen = counted.get((hour, value))
+                    if seen is not None:
+                        if seen != count:
+                            conflicting_values.add(value)
+                        continue
+                    counted[(hour, value)] = count
                 totals[value] = totals.get(value, 0) + count
                 rows.append({"value": value, "count": count})
             if bucket.get("start_time") is not None:
@@ -401,9 +413,16 @@ async def get_dataset_stats(
             unread.append(f"{unreadable_counts} row(s) without a readable count")
         unread_reason = f"Meta returned {' and '.join(unread)}; the events in them are not in the totals."
         stop_reason = f"{stop_reason} {unread_reason}" if stop_reason else unread_reason
+    if conflicting_values:
+        complete = False
+        conflict_reason = (
+            f"Meta returned different counts for the same hour and value for {len(conflicting_values)} value(s); "
+            "their totals are uncertain (count_conflict on those items)."
+        )
+        stop_reason = f"{stop_reason} {conflict_reason}" if stop_reason else conflict_reason
 
     items = [
-        {"value": value, "count": count}
+        {"value": value, "count": count, **({"count_conflict": True} if value in conflicting_values else {})}
         for value, count in sorted(totals.items(), key=lambda pair: (-pair[1], pair[0]))
     ]
     summary: dict[str, Any] = {

@@ -313,13 +313,15 @@ def test_catalog_assigned_users_one_person_check(monkeypatch) -> None:
     pages = {
         None: _page([{"id": "1", "name": "A", "tasks": ["ADVERTISE"]}], "p2", more=True),
         "p2": _page([{"id": PERSON, "name": PERSON_NAME, "tasks": ["MANAGE"]}], "p3", more=True),
+        "p3": _page([{"id": "3", "name": "C", "tasks": ["ADVERTISE"]}]),
     }
     client = _use(monkeypatch, FakeClient(edges={(CATALOG, "assigned_users"): lambda p: pages[p.get("after")]}))
     result = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON))
     assert result["access_status"] == "HAS_DIRECT_ACCESS"
     assert result["item"]["tasks"] == ["MANAGE"]
     assert "MANAGE" in result["item"]["can"]
-    assert len(client.calls) == 2
+    # The lookup reads to the end: a later row for the same person could disagree (R15 U3).
+    assert len(client.calls) == 3
 
 
 def test_catalog_assigned_users_one_person_absent_from_complete_list(monkeypatch) -> None:
@@ -1765,8 +1767,8 @@ def test_repeated_cursor_before_the_recipient_is_found_refuses(monkeypatch, kind
     assert client.writes() == []
 
 
-def test_recipient_found_on_a_page_whose_cursor_repeats_is_still_known(monkeypatch) -> None:
-    """The rows of a page Meta answered are kept; only the repeated cursor is not followed."""
+def test_recipient_found_on_a_page_whose_cursor_repeats_is_unknown(monkeypatch) -> None:
+    """The repeated cursor is not followed, so later rows for the same person were not read (R15 U3)."""
     pages = {
         None: _page([{"id": "1", "tasks": ["ADVERTISE"]}], "p2", more=True),
         "p2": _page([{"id": PERSON, "tasks": ["ADVERTISE"]}], "p2", more=True),
@@ -1775,7 +1777,9 @@ def test_recipient_found_on_a_page_whose_cursor_repeats_is_still_known(monkeypat
     client.edges[(CATALOG, "assigned_users")] = lambda p: pages[p.get("after")]
     _use(monkeypatch, client)
     preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
-    assert preview["change"] == "no_change" and preview["current_access_read"]["complete"] is True
+    assert preview["change"] == "unknown" and preview["would_be_refused"] is True
+    assert preview["previous"]["has_direct_access"] is True
+    assert "another row for this recipient" in preview["current_access_read"]["incomplete_reason"]
 
 
 @pytest.mark.parametrize("payload", UNREADABLE_PAGES)
@@ -1946,3 +1950,159 @@ def test_id_search_that_found_its_row_is_settled_despite_unreadable_ids(monkeypa
     result = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, user_type="AGENCY", user_id="30"))
     assert [item["id"] for item in result["items"]] == ["30"]
     assert result["summary"]["complete"] is True
+
+
+# R15 (review U3): every row read for one recipient must agree before their access is known --------
+
+
+class AmbiguousAccessClient:
+    """Reviewer reproduction client: two rows for recipient 20, who is also the caller."""
+
+    def __init__(self, second_tasks):
+        self.second_tasks = second_tasks
+        self.writes = []
+        self.identity_reads = 0
+
+    async def list_objects(self, parent_id, edge, **kwargs):
+        if edge == "business_users":
+            return {"data": [{"id": "20", "business": {"id": "30"}}]}
+        assert edge == "assigned_users"
+        if self.writes:
+            return {"data": [{"id": "20", "tasks": ["ADVERTISE", "MANAGE_AR"]}]}
+        return {"data": [{"id": "20", "tasks": ["ADVERTISE"]}, {"id": "20", "tasks": self.second_tasks}]}
+
+    async def get_object(self, object_id, **kwargs):
+        self.identity_reads += 1
+        assert object_id == "me"
+        return {"id": "20"}
+
+    async def create_edge_object(self, parent_id, edge, *, data, **kwargs):
+        self.writes.append({"parent_id": parent_id, "edge": edge, "data": data})
+        return {"success": True}
+
+
+@pytest.mark.parametrize("second_tasks", [None, ["ADVERTISE", "MANAGE"]],
+                         ids=["unreadable-second-copy", "contradictory-second-copy"])
+def test_ambiguous_catalog_assignment_refuses_write(monkeypatch, second_tasks) -> None:
+    fake = AmbiguousAccessClient(second_tasks)
+    monkeypatch.setattr(business_access, "get_graph_api_client", lambda: fake)
+    refused = False
+    result = None
+    try:
+        result = run(business_access.set_catalog_access("10", "20", ["ADVERTISE", "MANAGE_AR"], business_id="30"))
+    except ValidationError:
+        refused = True
+    assert fake.writes == [], {"writes": fake.writes, "identity_reads": fake.identity_reads, "result": result}
+    assert refused
+
+
+DISAGREEING_COPIES = [
+    pytest.param(["ADVERTISE", "MANAGE"], "different", id="different-tasks"),
+    pytest.param(None, "without its", id="null-tasks"),
+    pytest.param("MANAGE", "cannot read", id="tasks-not-a-list"),
+    pytest.param(["ADVERTISE", "OWNER"], "does not recognise", id="unknown-task"),
+]
+
+
+@pytest.mark.parametrize(("second", "reason"), DISAGREEING_COPIES)
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+@pytest.mark.parametrize("same_page", [True, False])
+def test_disagreeing_rows_for_one_recipient_make_access_unknown(monkeypatch, second, reason, kind, same_page) -> None:
+    edge, key = ("assigned_users", "tasks") if kind == "PERSON" else ("agencies", "permitted_tasks")
+    recipient = PERSON if kind == "PERSON" else PARTNER
+    business = {"business_id": BUSINESS} if kind == "PERSON" else {}
+    first = {"id": recipient, key: ["ADVERTISE"]}
+    copy = {"id": recipient, key: second}
+    if same_page:
+        pages = {None: _page([first, {"id": "1", key: ["ADVERTISE"]}, copy])}
+    else:
+        pages = {None: _page([first], "p2", more=True), "p2": _page([{"id": "1", key: ["ADVERTISE"]}, copy])}
+    client = _use(monkeypatch, FakeClient(
+        objects={"me": {"id": "100"}},
+        edges={
+            (CATALOG, edge): lambda p: pages[p.get("after")],
+            ("me", "business_users"): {"data": [{"id": CALLER, "business": {"id": OTHER_BUSINESS}}]},
+        },
+    ))
+    preview = run(business_access.preview_catalog_access_change(
+        CATALOG, recipient, ["ADVERTISE", "AA_ANALYZE"], user_type=kind, **business,
+    ))
+    assert preview["change"] == "unknown" and preview["would_be_refused"] is True and preview["would_send"] is None
+    assert preview["previous"]["tasks"] is None and preview["previous"]["has_direct_access"] is True
+    assert preview["current_access_read"]["complete"] is False
+    assert reason in preview["current_access_read"]["incomplete_reason"]
+    for dry_run in (True, False):
+        with pytest.raises(ValidationError, match="could not be read completely"):
+            run(business_access.set_catalog_access(
+                CATALOG, recipient, ["ADVERTISE", "AA_ANALYZE"], user_type=kind, dry_run=dry_run, **business,
+            ))
+    assert client.writes() == []
+    if kind == "PERSON":
+        check = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, business_id=BUSINESS, user_id=PERSON))
+        assert check["access_status"] == "UNKNOWN" and check["summary"]["complete"] is False
+    else:
+        check = run(business_access.list_catalog_partners(catalog_id=CATALOG, partner_id=PARTNER))
+        assert check["share_status"] == "UNKNOWN" and check["summary"]["complete"] is False
+
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+def test_identical_duplicate_rows_for_one_recipient_are_known(monkeypatch, kind) -> None:
+    edge, key = ("assigned_users", "tasks") if kind == "PERSON" else ("agencies", "permitted_tasks")
+    recipient = PERSON if kind == "PERSON" else PARTNER
+    business = {"business_id": BUSINESS} if kind == "PERSON" else {}
+    _use(monkeypatch, FakeClient(edges={(CATALOG, edge): _page([
+        {"id": recipient, key: ["MANAGE", "ADVERTISE"]}, {"id": f" {recipient} ", key: ["advertise", "MANAGE", "MANAGE"]},
+    ])}))
+    preview = run(business_access.preview_catalog_access_change(
+        CATALOG, recipient, ["ADVERTISE", "MANAGE"], user_type=kind, **business,
+    ))
+    assert preview["change"] == "no_change"
+    assert preview["previous"]["tasks"] == ["ADVERTISE", "MANAGE"]
+    assert preview["current_access_read"]["complete"] is True
+
+
+def test_disagreeing_copy_after_a_write_leaves_it_unverified(monkeypatch) -> None:
+    client = _access_client(["ADVERTISE"])
+    original = client.create_edge_object
+
+    async def create(parent_id, edge_name, *, data, files=None):
+        result = await original(parent_id, edge_name, data=data, files=files)
+        client.edges[(CATALOG, "assigned_users")] = _page([
+            {"id": PERSON, "tasks": data["tasks"]}, {"id": PERSON, "tasks": ["ADVERTISE"]},
+        ])
+        return result
+
+    client.create_edge_object = create
+    _use(monkeypatch, client)
+    result = run(business_access.set_catalog_access(CATALOG, PERSON, ["ADVERTISE", "MANAGE"], business_id=BUSINESS))
+    assert result["sent"] is True and result["verified"] is False
+    assert "different tasks" in result["warnings"][-1]
+
+
+def test_access_lookup_reads_every_page_even_after_the_recipient_is_found(monkeypatch) -> None:
+    pages = {
+        None: _page([{"id": PERSON, "tasks": ["ADVERTISE"]}], "p2", more=True),
+        "p2": _page([{"id": "1", "tasks": ["ADVERTISE"]}]),
+    }
+    client = _access_client(["ADVERTISE"])
+    client.edges[(CATALOG, "assigned_users")] = lambda p: pages[p.get("after")]
+    _use(monkeypatch, client)
+    preview = run(business_access.preview_catalog_access_change(CATALOG, PERSON, ["ADVERTISE"], business_id=BUSINESS))
+    assert preview["change"] == "no_change" and preview["current_access_read"]["requests"] == 2
+
+
+def test_partner_catalog_scan_checks_each_catalog_once_and_shows_no_first_copy_name(monkeypatch) -> None:
+    client = _use(monkeypatch, FakeClient(edges={
+        (BUSINESS, "owned_product_catalogs"): _page([
+            {"id": "1", "name": "Shoes"}, {"id": "1", "name": "Hats"}, {"id": "2", "name": "Bags"}, {"id": "2", "name": "Bags"},
+        ]),
+        ("1", "agencies"): _page([{"id": "77"}]),
+        ("2", "agencies"): _page([{"id": "77"}]),
+    }))
+    result = run(business_access.list_user_assigned_catalogs(user_id="77", user_type="AGENCY", business_id=BUSINESS))
+    assert [call["parent_id"] for call in client.reads_of("agencies")] == ["1", "2"]
+    assert result["items"] == [
+        {"id": "1", "name": None, "access_type": "AGENCY", "name_conflict": True},
+        {"id": "2", "name": "Bags", "access_type": "AGENCY"},
+    ]
+    assert result["summary"]["catalogs_checked"] == 2

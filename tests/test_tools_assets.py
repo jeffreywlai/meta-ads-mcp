@@ -1128,3 +1128,66 @@ def test_video_title_that_is_not_text_cannot_be_judged(monkeypatch) -> None:
     summary = asyncio.run(assets.list_ad_videos(account_id="1", title_contains="launch"))["summary"]
     assert summary["count"] == 1 and summary["unjudged_rows"] == 1
     assert summary["complete"] is False and "readable title" in summary["incomplete_reason"]
+
+
+# R15 (review U3 sweep): copies of one id are judged together, never first-wins ------------------
+
+
+def test_creative_ad_copies_that_disagree_are_not_a_match(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("act_123", "ads"): [_paged([
+        _ad("a1", "crt_1"), _ad("a1", "crt_2"), _ad("a2", "crt_1"), _ad("a2", "crt_1"),
+    ])]}))
+    result = asyncio.run(assets.list_creative_ads(creative_id="crt_1", account_id="123"))
+    assert [item["id"] for item in result["items"]] == ["a2"], "an identical copy counts once"
+    assert result["summary"]["ads_without_creative_id"] == 1 and result["summary"]["complete"] is False
+
+
+def test_instagram_media_copies_that_disagree_cannot_be_judged(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("ig_1", "media"): [_paged([
+        _media("m1", True), _media("m1", False, "NOT_ALLOWED"),
+    ])]}))
+    result = asyncio.run(assets.list_instagram_media(instagram_account_id="ig_1"))
+    assert result["items"] == []
+    assert result["summary"]["unjudged_rows"] == 1 and result["summary"]["complete"] is False
+
+
+@pytest.mark.parametrize("second", [
+    _adset("s1", excluded=["aud_1"]),
+    _adset("s1"),
+    {"id": "s1", "targeting": None},
+])
+def test_audience_adset_copies_that_disagree_on_targeting_are_unknown(monkeypatch, second) -> None:
+    _patch(monkeypatch, FakeAssetsClient(
+        objects={"aud_1": {"id": "aud_1", "account_id": "123"}},
+        pages={("act_123", "adsets"): [_paged([_adset("s1", included=["aud_1"]), second])]},
+    ))
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="targeting"))
+    assert result["items"] == []
+    assert result["summary"]["targeting_scan"]["adsets_with_unreadable_targeting"] == 1
+    assert result["summary"]["complete"] is False
+
+
+def test_audience_ad_copies_naming_different_ad_sets_are_not_placed(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(pages={("aud_1", "ads"): [_paged([
+        {"id": "a1", "adset_id": "s1"}, {"id": "a1", "adset_id": "s2"},
+        {"id": "a2", "adset_id": "s3"}, {"id": "a2", "adset_id": "s3"},
+    ])]}))
+    result = asyncio.run(assets.list_audience_adsets(audience_id="aud_1", source="ads"))
+    by_id = {item["id"]: item for item in result["items"]}
+    assert set(by_id) == {"s3"} and by_id["s3"]["ad_count"] == 1 and by_id["s3"]["ad_ids"] == ["a2"]
+    assert result["summary"]["ads_without_adset_id"] == 1 and result["summary"]["complete"] is False
+
+
+def test_audience_adset_values_read_differently_are_shown_as_unknown(monkeypatch) -> None:
+    _patch(monkeypatch, FakeAssetsClient(
+        objects={"aud_1": {"id": "aud_1", "account_id": "123"}},
+        pages={
+            ("aud_1", "ads"): [_paged([
+                {"id": "a1", "adset_id": "s1", "adset": {"id": "s1", "name": "Old name", "effective_status": "ACTIVE"}},
+            ])],
+            ("act_123", "adsets"): [_paged([{**_adset("s1", included=["aud_1"]), "name": "New name"}])],
+        },
+    ))
+    item = asyncio.run(assets.list_audience_adsets(audience_id="aud_1"))["items"][0]
+    assert item["name"] is None and item["conflicting_fields"] == ["name", "effective_status"]
+    assert item["found_by"] == ["ads", "targeting"]

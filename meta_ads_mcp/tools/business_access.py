@@ -9,6 +9,7 @@ an email address.
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import Any
 
 from meta_ads_mcp.coordinator import mcp_server
@@ -206,7 +207,6 @@ async def _scan(
     after: str | None = None,
     max_pages: int = MAX_SCAN_PAGES,
     page_size: int = SCAN_PAGE_SIZE,
-    stop_when: Any = None,
 ) -> dict[str, Any]:
     """Read an edge page by page, capped by pages, and say whether the end was reached.
 
@@ -258,10 +258,6 @@ async def _scan(
             break
         seen.add(new_cursor)
         cursor = new_cursor
-        if stop_when is not None and stop_when(page_rows):
-            reason = "stopped once the requested row was found; later pages were not read."
-            next_after = cursor
-            break
     reasons = [text for text in (reason, _non_object_rows_reason(unreadable) if unreadable else None) if text]
     return {
         "rows": rows,
@@ -470,44 +466,64 @@ def _task_meanings(tasks: list[str]) -> dict[str, str]:
 async def _find_assignment(
     client: Any, catalog_id: str, business_id: str, user_id: str,
 ) -> dict[str, Any]:
-    """Read the catalog's direct assignments until one user's row is found."""
+    """Read all of the catalog's direct assignments and look up one user's access."""
     scan = await _scan(
-        client, catalog_id, "assigned_users", fields=ASSIGNED_USER_FIELDS,
-        params={"business": business_id},
-        stop_when=lambda rows: any(_is_row(row, user_id) for row in rows),
+        client, catalog_id, "assigned_users", fields=ASSIGNED_USER_FIELDS, params={"business": business_id},
     )
-    row = next((row for row in scan["rows"] if _is_row(row, user_id)), None)
-    return _found(row, scan, ASSIGNED_USER_FIELDS, "tasks")
+    return _lookup_identity(scan, user_id, ASSIGNED_USER_FIELDS, "tasks")
 
 
-def _found(row: dict[str, Any] | None, scan: dict[str, Any], fields: list[str], task_field: str) -> dict[str, Any]:
-    """One recipient's row and whether their current access is fully known.
+def _lookup_identity(scan: dict[str, Any], wanted_id: str, fields: list[str], task_field: str) -> dict[str, Any]:
+    """One recipient's current tasks from a scan, and whether they are known.
 
-    Known means the row was found with readable tasks, or every page was read,
-    every row read had a usable id, and the row was not there. A row whose tasks
-    cannot be read is not known, and neither is an absence when some row could
-    be the recipient's but carries no readable id.
+    The one place a person's or partner's access is looked up by id: the assignment
+    lookup, the partner lookup, the one-person and one-partner checks, the read-back
+    after a write, and so every preview, write and self-access guard built on them.
+
+    Every row read for the id counts; none is preferred because it came first. The
+    answer is known only when:
+    - rows for the id were found, each with readable tasks, all holding the same task
+      set (compared as a set, so an identical duplicate is fine), and every page was
+      read, so no later row could disagree; or
+    - no row for the id was found, every page was read, and every row had a usable id.
+    Two rows for the id with different tasks, a row whose tasks cannot be read, pages
+    left unread, or rows without a usable id make the answer unknown, with the reason.
     """
-    tasks, problem = _tasks_state(row, task_field)
-    unidentified = 0 if row is not None else _unidentified_rows(scan)
-    known = (row is not None or (scan["complete"] and not unidentified)) and problem is None
-    if problem is not None:
-        reason = f"{problem}, so the current tasks are unknown"
-    elif row is None and scan["complete"] and unidentified:
+    matching = [row for row in scan["rows"] if _is_row(row, wanted_id)]
+    base = {"scanned": len(scan["rows"]), "requests": scan["requests"], "matching_rows": len(matching)}
+    if not matching:
+        unidentified = _unidentified_rows(scan)
+        known = scan["complete"] and not unidentified
+        if known:
+            reason = None
+        elif scan["complete"]:
+            reason = (
+                f"Meta returned {unidentified} row(s) without a readable id, so this server cannot tell whether "
+                "the recipient is among them"
+            )
+        else:
+            reason = scan["reason"]
+        return {**base, "row": None, "tasks": [] if known else None, "known": known, "reason": reason}
+    states = [_tasks_state(row, task_field) for row in matching]
+    problems = [problem for _, problem in states if problem is not None]
+    task_sets = {tuple(tasks) for tasks, problem in states if problem is None}
+    copies = f" (one of {len(matching)} rows Meta returned for this recipient)" if len(matching) > 1 else ""
+    if problems:
+        reason = f"{problems[0]}{copies}, so the current tasks are unknown"
+    elif len(task_sets) > 1:
         reason = (
-            f"Meta returned {unidentified} row(s) without a readable id, so this server cannot tell whether "
-            "the recipient is among them"
+            f"Meta returned {len(matching)} rows for this recipient with different {task_field}, so the current "
+            "tasks are unknown"
+        )
+    elif not scan["complete"]:
+        reason = (
+            f"Not every row was read ({scan['reason']}), so another row for this recipient could hold different "
+            f"{task_field}; the current tasks are unknown"
         )
     else:
-        reason = None if known else scan["reason"]
-    return {
-        "row": _project(row, fields) if row else None,
-        "tasks": tasks,
-        "known": known,
-        "scanned": len(scan["rows"]),
-        "requests": scan["requests"],
-        "reason": reason,
-    }
+        tasks = list(next(iter(task_sets)))
+        return {**base, "row": _project(matching[0], fields), "tasks": tasks, "known": True, "reason": None}
+    return {**base, "row": _project(matching[0], fields), "tasks": None, "known": False, "reason": reason}
 
 
 @mcp_server.tool()
@@ -639,11 +655,25 @@ async def list_user_assigned_catalogs(
     if unidentified_catalogs:
         gaps.append(f"{unidentified_catalogs} owned catalog row(s) had no readable id and could not be checked.")
     skipped = 0
+    # Each catalog is checked once. Copies of one catalog are one catalog; the name shown is
+    # Meta's only when every copy gives the same one, never the first copy's.
+    names: dict[str, set[str]] = {}
+    for catalog in catalogs:
+        catalog_key = _row_identity(catalog.get("id"))
+        if catalog_key is not None:
+            names.setdefault(catalog_key, set()).add(json.dumps(catalog.get("name"), default=str))
+    checked: set[str] = set()
     for catalog in catalogs:
         usable = _row_identity(catalog.get("id"))
         if usable is None:
             skipped += 1
             continue
+        if usable in checked:
+            skipped += 1
+            continue
+        checked.add(usable)
+        if len(names[usable]) > 1:
+            catalog = {**catalog, "name": None, "name_conflict": True}
         catalog_id = usable
         try:
             partners = await _scan(client, catalog_id, "agencies", fields=PARTNER_FIELDS, max_pages=3)
@@ -652,7 +682,10 @@ async def list_user_assigned_catalogs(
             continue
         requests += partners["requests"]
         if any(_is_row(row, user_id) for row in partners["rows"]):
-            items.append({**_project(catalog, OWNED_CATALOG_FIELDS), "access_type": "AGENCY"})
+            items.append({
+                **_project(catalog, OWNED_CATALOG_FIELDS), "access_type": "AGENCY",
+                **({"name_conflict": True} if catalog.get("name_conflict") else {}),
+            })
         elif not partners["complete"]:
             gaps.append(f"Catalog {catalog_id}: partner list not fully read ({partners['reason']}).")
         elif unidentified := _unidentified_rows(partners):
@@ -971,18 +1004,14 @@ def _partner_item(row: dict[str, Any], tasks_rejected: bool) -> dict[str, Any]:
 
 
 async def _find_partner(client: Any, catalog_id: str, partner_id: str) -> dict[str, Any]:
-    """Read the catalog's partner shares until one partner's row is found."""
+    """Read all of the catalog's partner shares and look up one partner's share."""
 
     async def read(fields: list[str]) -> dict[str, Any]:
-        return await _scan(
-            client, catalog_id, "agencies", fields=fields,
-            stop_when=lambda rows: any(_is_row(row, partner_id) for row in rows),
-        )
+        return await _scan(client, catalog_id, "agencies", fields=fields)
 
     scan, rejected = await _read_partners(read)
-    row = next((row for row in scan["rows"] if _is_row(row, partner_id)), None)
-    found = _found(row, scan, PARTNER_TASK_FIELDS, "permitted_tasks")
-    if rejected and row is not None:
+    found = _lookup_identity(scan, partner_id, PARTNER_TASK_FIELDS, "permitted_tasks")
+    if rejected and found["row"] is not None:
         found["reason"] = f"{PARTNER_TASKS_REJECTED_REASON}, so the current tasks are unknown"
     found["tasks_field_rejected"] = rejected
     return found

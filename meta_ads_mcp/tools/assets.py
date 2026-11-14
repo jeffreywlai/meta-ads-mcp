@@ -164,22 +164,62 @@ def _unreadable_page(reason: str) -> dict[str, Any]:
     }
 
 
+def _row_key(row: dict[str, Any]) -> str | None:
+    """A row's id as text, or None when it has no usable id."""
+    value = row.get("id")
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+        return None
+    return str(value).strip()
+
+
+def _groups_by_id(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Rows grouped by id in the order first read; a row without an id is its own group."""
+    groups: list[list[dict[str, Any]]] = []
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = _row_key(row)
+        if key is None:
+            groups.append([row])
+        elif key in by_key:
+            by_key[key].append(row)
+        else:
+            by_key[key] = [row]
+            groups.append(by_key[key])
+    return groups
+
+
 def _judge_rows(rows: list[dict[str, Any]], verdict: Any) -> tuple[list[dict[str, Any]], int]:
     """Split object rows by a filter into (kept, could_not_be_judged).
 
-    verdict returns True (keep), False (a definite non-match) or None when the row lacks what
-    the filter needs (a timestamp, a type, an eligibility answer). A row that cannot be judged is
-    never treated as a non-match: it is counted, and the caller reports the result incomplete.
+    The one place this module decides which rows a filter or match keeps. verdict returns a
+    true value to keep the row (the value can carry what the decision found, such as how an
+    ad set uses an audience), False for a definite non-match, or None when the row lacks what
+    the filter needs (a timestamp, a type, an eligibility answer). A row that cannot be judged
+    is never treated as a non-match: it is counted, and the caller reports the result incomplete.
+
+    Copies of one id are judged together, so no copy wins because it came first: copies whose
+    verdicts are equal count once, and copies whose verdicts differ make that id unjudged.
     """
     kept: list[dict[str, Any]] = []
     unjudged = 0
-    for row in rows:
-        decision = verdict(row)
-        if decision is None:
+    for group in _groups_by_id(rows):
+        decisions = [verdict(row) for row in group]
+        if any(decision is None for decision in decisions) or any(d != decisions[0] for d in decisions[1:]):
             unjudged += 1
-        elif decision:
-            kept.append(row)
+        elif decisions[0]:
+            kept.append(group[0])
     return kept, unjudged
+
+
+def _set_reported(entry: dict[str, Any], key: str, value: Any) -> None:
+    """Record a value read for an object; two different values for it leave it unknown, not last-wins."""
+    if value is None or key in entry.get("conflicting_fields", []):
+        return
+    if entry.get(key) is None:
+        entry[key] = value
+    elif entry[key] != value:
+        entry[key] = None
+        entry.setdefault("conflicting_fields", []).append(key)
 
 
 def _unjudged_reason(count: int, needs: str) -> str:
@@ -903,21 +943,22 @@ async def list_audience_adsets(
 
     if mode in {"both", "ads"}:
         scan = await _scan_edge(client, audience_id, "ads", fields=AUDIENCE_AD_FIELDS, params=_page_params(limit, after))
-        ads_without_adset = 0
-        for ad in scan["items"]:
+        def ad_adset_id(ad: dict[str, Any]) -> str | bool | None:
             nested = ad.get("adset") if isinstance(ad.get("adset"), dict) else {}
-            adset_id = str(ad.get("adset_id") or nested.get("id") or "")
-            if not adset_id:
-                ads_without_adset += 1
-                continue
-            entry = _audience_adset_entry(adsets, adset_id)
+            return str(ad.get("adset_id") or nested.get("id") or "") or None
+
+        # Every ad uses the audience; the verdict is its ad set id, so copies of one ad that name
+        # different ad sets (or none) cannot be placed and are counted with ads_without_adset.
+        placed, ads_without_adset = _judge_rows(scan["items"], ad_adset_id)
+        for ad in placed:
+            nested = ad.get("adset") if isinstance(ad.get("adset"), dict) else {}
+            entry = _audience_adset_entry(adsets, str(ad_adset_id(ad)))
             if "ads" not in entry["found_by"]:
                 entry["found_by"].append("ads")
             for key in ("name", "effective_status"):
-                if entry[key] is None and nested.get(key) is not None:
-                    entry[key] = nested[key]
-            if entry["campaign_id"] is None and ad.get("campaign_id"):
-                entry["campaign_id"] = str(ad["campaign_id"])
+                _set_reported(entry, key, nested.get(key))
+            if ad.get("campaign_id"):
+                _set_reported(entry, "campaign_id", str(ad["campaign_id"]))
             if ad.get("id"):
                 entry["ad_ids"].append(str(ad["id"]))
             entry["ad_count"] += 1
@@ -936,8 +977,8 @@ async def list_audience_adsets(
             ads_scan["unreadable_rows"] = scan["unreadable_rows"]
         if ads_without_adset:
             ads_scan["incomplete_reason"] = (
-                f"{ads_without_adset} ad(s) using the audience came back without a readable ad set id, so their "
-                "ad sets are not listed."
+                f"{ads_without_adset} ad(s) using the audience came back without a readable ad set id, or as copies "
+                "naming different ad sets, so their ad sets are not listed."
             )
     else:
         ads_scan = _skipped_scan("source=targeting")
@@ -983,13 +1024,15 @@ async def list_audience_adsets(
                     if audience_id in _audience_ids(targeting, key)
                 ]
 
-            def uses_audience(adset: dict[str, Any]) -> bool | None:
+            def uses_audience(adset: dict[str, Any]) -> tuple[str, ...] | bool | None:
                 # Ad sets whose targeting cannot be read could use the audience; so could a match without an id.
+                # The verdict carries how the audience is used, so copies of one ad set must agree on it.
                 if not _targeting_readable(adset.get("targeting")):
                     return None
-                if not audience_uses(adset):
+                uses = audience_uses(adset)
+                if not uses:
                     return False
-                return True if adset.get("id") else None
+                return tuple(uses) if adset.get("id") else None
 
             kept, unreadable_targeting = _judge_rows(scan["items"], uses_audience)
             matched = len(kept)
@@ -999,10 +1042,9 @@ async def list_audience_adsets(
                 entry["found_by"].append("targeting")
                 entry["targeting_use"] = uses
                 for key in ("name", "effective_status"):
-                    if adset.get(key) is not None:
-                        entry[key] = adset[key]
+                    _set_reported(entry, key, adset.get(key))
                 if adset.get("campaign_id"):
-                    entry["campaign_id"] = str(adset["campaign_id"])
+                    _set_reported(entry, "campaign_id", str(adset["campaign_id"]))
             targeting_scan = {
                 "ran": True,
                 "complete": scan["complete"] and not unreadable_targeting,
@@ -1038,7 +1080,8 @@ async def list_audience_adsets(
         "targeting_scan": targeting_scan,
         "derivation_note": (
             "found_by says which scan found each ad set; targeting_use says whether the audience is included or "
-            "excluded. An ad set can repeat across continuation calls, so merge by id."
+            "excluded. An ad set can repeat across continuation calls, so merge by id. conflicting_fields names "
+            "values Meta returned differently for the same ad set; they are shown as null."
         ),
     })
     return {"items": list(adsets.values()), "summary": summary}

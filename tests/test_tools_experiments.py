@@ -2121,3 +2121,110 @@ def test_list_ad_studies_definite_type_mismatch_keeps_the_page_complete(monkeypa
     result = run(experiments.list_ad_studies(account_id="123", study_type="LIFT"))
     assert [item["id"] for item in result["items"]] == ["s1"]
     assert result["summary"]["complete"] is True and result["summary"]["stop_reason"] is None
+
+
+# --- R15 (review U3 sweep): copies of one id that disagree are unknown, never first-wins ----------
+
+ENDED = ("2026-10-01T00:00:00+0000", "2026-10-15T00:00:00+0000")
+
+
+@pytest.mark.parametrize("same_page", [True, False])
+@pytest.mark.parametrize("where", ["entity", "account"])
+def test_study_copies_with_different_states_are_unclassified(monkeypatch, same_page, where) -> None:
+    edge = ("c1", "ad_studies") if where == "entity" else ("act_123", "impacting_ad_studies")
+    first, second = _study("s9", "SPLIT_TEST", *ENDED), _study("s9", "SPLIT_TEST", *RUNNING)
+    if same_page:
+        pages = {(*edge, None): {"data": [first, second]}}
+    else:
+        pages = {
+            (*edge, None): {"data": [first], "paging": {"next": "https://graph.invalid/n", "cursors": {"after": "p2"}}},
+            (*edge, "p2"): {"data": [second]},
+        }
+    use(monkeypatch, PagedStudyClient(pages, objects={"c1": _campaign("c1")}))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=["c1"]))
+    assert result["precheck_outcome"] == "inconclusive"
+    if where == "entity":
+        entity = result["entities"][0]
+        assert entity["unclassified_studies"] == 1 and entity["active_studies_complete"] is False
+        assert any("(s9)" in message and "disagree" in message for message in entity["unresolved"])
+    else:
+        assert result["account"]["unclassified_studies"] == 1 and result["account"]["count_complete"] is False
+
+
+def test_identical_study_copies_are_counted_once() -> None:
+    study = _study("s1", "LIFT", *RUNNING)
+    client = PagedStudyClient({("act_10", "impacting_ad_studies", None): {"data": [study, dict(study)]}})
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["active_studies"] == 1 and result["count_complete"] is True
+
+
+def test_study_copies_differing_only_in_name_agree_on_state() -> None:
+    client = PagedStudyClient({("act_10", "impacting_ad_studies", None): {"data": [
+        _study("s1", "LIFT", *RUNNING), {**_study("s1", "LIFT", *RUNNING), "name": "Renamed"},
+    ]}})
+    result = run(experiments._count_account_active_studies(client, "act_10", NOW))
+    assert result["active_studies"] == 1 and result["count_complete"] is True
+
+
+def test_get_ad_study_objective_copies_that_disagree_do_not_decide_the_winner(monkeypatch) -> None:
+    results = [json.dumps({"winner_ad_object_id": "as_1", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): SPLIT_CELLS, ("study_1", "objectives"): {"data": [
+            {"id": "obj_1", "is_primary": True, "results": results},
+            {"id": "obj_1", "is_primary": False, "results": results},
+        ]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    assert result["summary"]["objectives_complete"] is False
+    assert "obj_1" in result["summary"]["objectives_stop_reason"]
+    assert result["results"]["status"] == "unknown"
+
+
+def test_get_ad_study_cell_copies_that_disagree_leave_the_winner_unmapped(monkeypatch) -> None:
+    results = [json.dumps({"winner_ad_object_id": "as_1", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): {"data": [_cell("cell_a", "as_1"), _cell("cell_a", "as_9"), _cell("cell_b", "as_2")]},
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "is_primary": True, "results": results}]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1", include_results=True))
+    assert [cell["id"] for cell in result["cells"]] == ["cell_b"]
+    assert result["summary"]["cell_nodes_complete"] is False and "cell_a" in result["summary"]["cells_stop_reason"]
+    winner = result["results"]["winner"]
+    assert winner["cell_id"] is None and "not every cell could be read" in winner["cell_mapping_note"]
+
+
+def test_get_ad_study_identical_cell_copies_are_kept_once(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): {"data": [*SPLIT_CELLS["data"], SPLIT_CELLS["data"][0]]}},
+    ))
+    result = run(experiments.get_ad_study(study_id="study_1"))
+    assert [cell["id"] for cell in result["cells"]] == ["cell_a", "cell_b"]
+    assert result["summary"]["cell_nodes_complete"] is True
+
+
+def test_winner_in_two_cells_is_not_mapped_to_the_first(monkeypatch) -> None:
+    results = [json.dumps({"winner_ad_object_id": "as_1", "winner_confidence": 0.9})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": SPLIT_STUDY},
+        edges={("study_1", "cells"): {"data": [_cell("cell_a", "as_1"), _cell("cell_b", "as_1")]},
+               ("study_1", "objectives"): {"data": [{"id": "obj_1", "is_primary": True, "results": results}]}},
+    ))
+    winner = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]["winner"]
+    assert winner["cell_id"] is None and "2 cells" in winner["cell_mapping_note"]
+
+
+def test_high_performer_in_two_cells_is_not_mapped_to_the_first(monkeypatch) -> None:
+    results = [json.dumps({"winner_ad_object_id": None, "high_performer_ids": ["ad_1"]})]
+    use(monkeypatch, FakeStudyClient(
+        objects={"study_1": {**SPLIT_STUDY, "type": "SPLIT_TEST_V2"}},
+        edges={("study_1", "cells"): {"data": [
+            {"id": "cell_a", "name": "A", "treatment_percentage": 50, "ad_ids": ["ad_1"]},
+            {"id": "cell_b", "name": "B", "treatment_percentage": 50, "ad_ids": ["ad_1"]},
+        ]}, ("study_1", "objectives"): {"data": [{"id": "obj_1", "is_primary": True, "results": results}]}},
+    ))
+    outcome = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
+    assert outcome["high_performer_cells"] == [{"ad_id": "ad_1", "cell_id": None, "cell_name": None}]
+    assert outcome["high_performer_ambiguous_ids"] == ["ad_1"]
