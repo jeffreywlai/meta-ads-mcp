@@ -361,7 +361,17 @@ async def _get_ad_image(
                     "Image lookup returned an answer this server could not fully read; a complete image result could "
                     "not be obtained."
                 )
-            found = {image["hash"]: image for image in rows if image.get("hash")}
+            # Meta's AdImage reference: the hash "uniquely identifies the image", so rows with one hash
+            # are copies of one image. The first copy is shown; copies that differ are named, not chosen.
+            found: dict[str, dict[str, Any]] = {}
+            for image in rows:
+                image_hash = image.get("hash")
+                if not image_hash:
+                    continue
+                if image_hash not in found:
+                    found[image_hash] = image
+                elif image != found[image_hash]:
+                    images[(cache_account, image_hash, "copies_differ")] = True
             for image_hash in missing:
                 images[(cache_account, image_hash)] = found.get(image_hash)
         resolved_images = [
@@ -379,7 +389,11 @@ async def _get_ad_image(
                     image_hash=image.get("hash"),
                 )
 
-    return {
+    differing = (
+        [image_hash for image_hash in image_hashes if images.get((normalize_account_id(account_id), image_hash, "copies_differ"))]
+        if account_id and image_hashes else []
+    )
+    shown = {
         "item": {
             "ad_id": ad.get("id"),
             "ad_name": ad.get("name"),
@@ -403,6 +417,13 @@ async def _get_ad_image(
             "placement_note": "Rules describe configured image eligibility, not actual delivery. Unmatched labels and unknown positions are retained; no default image is guessed.",
         },
     }
+    if differing:
+        # Added only when it happens: the image shown for these hashes is Meta's first copy of several that differ.
+        shown["item"]["image_copies_differ"] = {
+            "hashes": differing,
+            "note": "Meta listed more than one differing entry for these image hashes; resolved_images shows the first of each.",
+        }
+    return shown
 
 
 @mcp_server.tool()
