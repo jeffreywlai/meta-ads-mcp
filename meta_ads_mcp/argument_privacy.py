@@ -25,6 +25,11 @@ the MCP request and notification types and logs the ones that fail, with the
 whole message and every value in it. ``SessionLogPrivacyFilter`` and
 ``LowLevelServerLogPrivacyFilter`` rewrite those records to keep the method,
 where the fault is and the error type (see "MCP transport records" below).
+
+The HTTP client libraries the Graph client uses (httpx, httpcore, hpack) log each
+request's URL, query included, and at DEBUG its headers. ``HttpxLogPrivacyFilter``,
+``HttpcoreLogPrivacyFilter`` and ``HpackLogPrivacyFilter`` keep a request's query,
+body and Authorization header out of those records (see "HTTP client records").
 """
 
 from __future__ import annotations
@@ -663,6 +668,172 @@ class LowLevelServerLogPrivacyFilter(logging.Filter):
         _strip_exception(record)
 
 
+# --- HTTP client records ------------------------------------------------------------
+#
+# The Graph client sends requests with HTTPX. Rule: no log record this process emits
+# carries a request's query string or body, or its Authorization header. Query strings
+# carry an access token or app secret proof on many calls, an OAuth code or app secret
+# on token calls, and a draft creative (with a creator's Partnership Ad code) on a
+# preview. What the installed libraries log (httpx 0.28, httpcore 1.0, hpack 4,
+# checked by test_the_http_client_filters_sit_where_the_libraries_log):
+#
+# * httpx logs one INFO record per response received, any status:
+#   'HTTP Request: %s %s "%s %d %s"' with the full URL as an argument. The URL is
+#   shown with scheme, host, port and path; a query, fragment or login is withheld.
+# * httpcore logs DEBUG records per connection and request phase on five loggers.
+#   They hold the event name, the host, and on a failure the exception's repr; an
+#   exception about a header can quote the header's value, Authorization included.
+#   Each is rewritten to its event name, host, port and stream, and an exception's
+#   type only.
+# * hpack (HTTP/2 header compression) logs DEBUG records with each request header,
+#   the :path pseudo-header that holds the query among them, and the encoded header
+#   block, from which Authorization can be decoded. Every argument that is not a
+#   number is withheld.
+# * h2 and h11 log nothing: httpcore gives h2 no logger.
+#
+# Request and response bodies appear in none of these records. Records are rewritten,
+# never dropped, so an operator still sees each request, its method, path and status.
+
+HTTPX_LOGGER = "httpx"
+HTTPCORE_LOGGERS = (
+    "httpcore.connection", "httpcore.http11", "httpcore.http2", "httpcore.proxy", "httpcore.socks",
+)
+HPACK_LOGGERS = ("hpack.hpack", "hpack.table")
+HTTPX_REQUEST_TEMPLATE = 'HTTP Request: %s %s "%s %d %s"'
+_HTTP_WITHHELD = "withheld so request contents stay out of logs"
+_QUERY_WITHHELD = f"(query {_HTTP_WITHHELD})"
+_ARGUMENT_WITHHELD = "<withheld>"
+_HTTPCORE_EVENT = re.compile(r"(?P<event>[a-z_0-9]+\.(?:started|complete|failed))(?:\s|$)")
+_HTTPCORE_SAFE_DETAIL = re.compile(r"\b(?P<key>host|port|server_hostname|stream_id)=(?P<value>'[A-Za-z0-9.\-:\[\]]*'|\d+)")
+_HTTPCORE_EXCEPTION = re.compile(r"\bexception=(?P<type>[A-Za-z_][A-Za-z0-9_.]*)\(")
+
+
+def url_without_query(url: Any) -> str:
+    """A URL as scheme, host, port and path; a query, fragment or login is withheld.
+
+    Paths and object ids are not secret and stay. Anything after the path, and a
+    user name or password before the host, can be, so it is never shown.
+    """
+    from urllib.parse import urlsplit
+
+    text = str(url)
+    try:
+        parts = urlsplit(text)
+        host = parts.netloc.rpartition("@")[2]
+        withheld = bool(parts.query or parts.fragment or "?" in text or "#" in text)
+    except ValueError:
+        return f"(URL {_HTTP_WITHHELD})"
+    shown = f"{parts.scheme}://{host}{parts.path}" if parts.scheme else f"{host}{parts.path}"
+    if "@" in parts.netloc:
+        shown += f" (login {_HTTP_WITHHELD})"
+    return f"{shown} {_QUERY_WITHHELD}" if withheld else shown
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, complex)
+
+
+class HttpxLogPrivacyFilter(logging.Filter):
+    """Show the URL of HTTPX's request record without its query, for every status."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._sanitize(record)
+            record.getMessage()
+        except Exception:
+            # Never raise from a filter: that would break every record of the logger.
+            _withhold_record(record, f"HTTP request record (details {_HTTP_WITHHELD})")
+        return True
+
+    @staticmethod
+    def _sanitize(record: logging.LogRecord) -> None:
+        args = record.args
+        if record.msg == HTTPX_REQUEST_TEMPLATE and isinstance(args, tuple) and len(args) == 5:
+            method, url, version, status, reason = args
+            record.args = (method, url_without_query(url), version, status, reason)
+        elif isinstance(record.msg, str) and isinstance(args, tuple) and args:
+            # A record this release does not log: keep the code's own template, URLs
+            # without their query, numbers, and nothing else.
+            record.args = tuple(
+                url_without_query(arg) if type(arg).__name__ == "URL"
+                else arg if _is_number(arg) else _ARGUMENT_WITHHELD
+                for arg in args
+            )
+        else:
+            # A message already formatted, or one that cannot be read: its text may hold anything.
+            _rewrite(record, f"HTTP client record not recognised (details {_HTTP_WITHHELD})")
+        _strip_exception(record)
+
+
+class HttpcoreLogPrivacyFilter(logging.Filter):
+    """Reduce httpcore's DEBUG trace records to the event, host, port and exception type."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._sanitize(record)
+            record.getMessage()
+        except Exception:
+            _withhold_record(record, f"HTTP connection record (details {_HTTP_WITHHELD})")
+        return True
+
+    @staticmethod
+    def _sanitize(record: logging.LogRecord) -> None:
+        message = record.msg if isinstance(record.msg, str) and not record.args else None
+        found = _HTTPCORE_EVENT.match(message) if message is not None else None
+        if found is None:
+            _rewrite(record, f"HTTP connection record not recognised (details {_HTTP_WITHHELD})")
+        else:
+            parts = [found["event"]]
+            parts += [f"{item['key']}={item['value']}" for item in _HTTPCORE_SAFE_DETAIL.finditer(message)]
+            failure = _HTTPCORE_EXCEPTION.search(message)
+            if failure is not None:
+                parts.append(f"exception={failure['type']} (message {_HTTP_WITHHELD})")
+            elif message.strip() != found["event"]:
+                parts.append(f"(other details {_HTTP_WITHHELD})")
+            _rewrite(record, " ".join(parts))
+        _strip_exception(record)
+
+
+class HpackLogPrivacyFilter(logging.Filter):
+    """Keep header names, values and encoded header blocks out of hpack's DEBUG records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._sanitize(record)
+            record.getMessage()
+        except Exception:
+            _withhold_record(record, f"HTTP/2 header record (details {_HTTP_WITHHELD})")
+        return True
+
+    @staticmethod
+    def _sanitize(record: logging.LogRecord) -> None:
+        args = record.args
+        if isinstance(record.msg, str) and isinstance(args, tuple):
+            record.args = tuple(arg if _is_number(arg) else _ARGUMENT_WITHHELD for arg in args)
+        else:
+            _rewrite(record, f"HTTP/2 header record (details {_HTTP_WITHHELD})")
+        _strip_exception(record)
+
+
+_HTTP_CLIENT_FILTERS: list[tuple[str, logging.Filter]] = []
+
+
+def _install_http_client_log_privacy() -> None:
+    """Put the HTTP client filters first on each logger those libraries create records on.
+
+    A filter on a logger sees only records created on that logger, not on its children,
+    so each logger is named. Installed once per process.
+    """
+    if _HTTP_CLIENT_FILTERS:
+        return
+    pairs: list[tuple[str, logging.Filter]] = [(HTTPX_LOGGER, HttpxLogPrivacyFilter())]
+    pairs += [(name, HttpcoreLogPrivacyFilter()) for name in HTTPCORE_LOGGERS]
+    pairs += [(name, HpackLogPrivacyFilter()) for name in HPACK_LOGGERS]
+    for name, log_filter in pairs:
+        logging.getLogger(name).filters.insert(0, log_filter)
+    _HTTP_CLIENT_FILTERS.extend(pairs)
+
+
 _TRANSPORT_TOOL_NAMES: list[Callable[[], Iterable[str]]] = []
 _TRANSPORT_FILTERS: list[logging.Filter] = []
 
@@ -689,6 +860,7 @@ def _install_transport_log_privacy(server: Any) -> None:
 
 def install_validation_log_privacy(server: Any) -> ValidationLogPrivacyFilter:
     """Attach the log filters for this server's tools once, and return the validation one."""
+    _install_http_client_log_privacy()
     if id(server) not in _HANDLER_INSTALLED:
         handler_filter = HandlerLogPrivacyFilter(lambda: _catalog_tool_names(server))
         logging.getLogger(FASTMCP_HANDLER_LOGGER).addFilter(handler_filter)

@@ -1274,3 +1274,39 @@ def test_an_error_status_with_a_body_that_is_not_json_is_unchanged(monkeypatch) 
         asyncio.run(_client().request("POST", "123", data={"name": "x"}))
     assert error.value.message == "Non-JSON error response from Meta API"
     assert error.value.to_public_dict()["mutation_outcome_unknown"] is False
+
+
+# Round-twelve review S1 (the class beyond the reproduction): an HTTP library's own
+# exception can quote a request header. h11 refuses a header value with a line break
+# and quotes it, so a malformed token reached the Authorization header text of an
+# exception chained to MetaApiError, which FastMCP prints when it logs the tool error.
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_a_transport_failure_does_not_chain_the_http_library_message(monkeypatch, caplog, method) -> None:
+    import logging
+    import traceback
+
+    import httpcore
+    import httpx
+
+    token = "".join(["Synthetic", "Broken", "Token", "\n"])
+    caplog.set_level(logging.DEBUG)
+    transport = httpx.AsyncHTTPTransport()
+    transport._pool = httpcore.AsyncConnectionPool(network_backend=httpcore.AsyncMockBackend([]))
+    http_client = httpx.AsyncClient(transport=transport)
+    client = _client(access_token=token)
+    monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda *a, **k: http_client)
+
+    async def scenario():
+        try:
+            await client.request(method, "act_10/adcreatives", params={"creative": "x"})
+        finally:
+            await http_client.aclose()
+
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(scenario())
+    assert error.value.details == {"exception_type": "LocalProtocolError"}
+    assert error.value.__cause__ is None and error.value.__context__ is None
+    rendered = "".join(traceback.format_exception(error.value))
+    assert "Synthetic" not in rendered and "Synthetic" not in caplog.text

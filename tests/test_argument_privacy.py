@@ -1230,10 +1230,20 @@ def _filters_and_records():
          _malformed_records(FASTMCP_SERVER_LOGGER, __file__, ["Invalid arguments for tool %r: %s"]), False),
         ("handler", HandlerLogPrivacyFilter(lambda: {"list_adsets"}),
          _malformed_records(FASTMCP_HANDLER_LOGGER, __file__, ["Handler called: call_tool %s with %s"]), False),
+        ("httpx", argument_privacy.HttpxLogPrivacyFilter(),
+         _malformed_records("httpx", __file__, [argument_privacy.HTTPX_REQUEST_TEMPLATE, "%s %s"]), True),
+        ("httpcore", argument_privacy.HttpcoreLogPrivacyFilter(),
+         _malformed_records("httpcore.http11", __file__, ["send_request_headers.failed exception=%s"]), True),
+        ("hpack", argument_privacy.HpackLogPrivacyFilter(),
+         _malformed_records("hpack.hpack", __file__, ["Adding %s=%s to the header table, sensitive:%s, huffman:%s"]),
+         True),
     ]
 
 
-@pytest.mark.parametrize("name", ["lowlevel", "session", "validation", "handler"])
+_ALL_FILTERS = ["lowlevel", "session", "validation", "handler", "httpx", "httpcore", "hpack"]
+
+
+@pytest.mark.parametrize("name", _ALL_FILTERS)
 def test_l5_every_log_filter_returns_normally_for_a_record_it_cannot_read(name):
     """A filter that raises breaks logging for the whole logger, so each one contains its own failure."""
     (_name, log_filter, records, formattable), = [item for item in _filters_and_records() if item[0] == name]
@@ -1244,7 +1254,7 @@ def test_l5_every_log_filter_returns_normally_for_a_record_it_cannot_read(name):
             record.getMessage()
 
 
-@pytest.mark.parametrize("name", ["lowlevel", "session", "validation", "handler"])
+@pytest.mark.parametrize("name", _ALL_FILTERS)
 def test_l5_a_filter_that_cannot_read_its_own_record_logs_a_fixed_message(name):
     (_name, log_filter, records, _formattable), = [item for item in _filters_and_records() if item[0] == name]
     unprintable = next(record for record in records if isinstance(record.msg, _Unprintable))
@@ -1266,3 +1276,241 @@ def test_l5_a_real_logger_with_the_filters_keeps_logging_after_a_bad_record(capl
     messages = [record.getMessage() for record in caplog.records if record.name == MCP_LOWLEVEL_LOGGER]
     assert "Request <request id that is text, withheld> cancelled - duplicate response suppressed" in messages
     assert "Processing request of type PingRequest" in messages
+
+
+# --- Round-twelve review S1: HTTP client records ------------------------------------
+#
+# Rule: no log record this process emits carries a request's query string or body, or
+# its Authorization header. httpx logs every response's request line with the full URL
+# at INFO; over HTTP/2, hpack logs each request header (the :path holds the query) and
+# the encoded header block (Authorization can be decoded from it) at DEBUG; httpcore
+# logs an exception's repr, which can quote a header. A preview sends its draft
+# creative in the query because Meta's generatepreviews edge is read-only (GET).
+
+
+def _creator_code() -> str:
+    return "".join(["Synthetic", "Creator", "Code", "_x7y9"])
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "call_tool_proxy"])
+def test_successful_draft_preview_does_not_log_partnership_code(monkeypatch, caplog, routed):
+    """Reviewer reproduction (round twelve, S1): HTTPX's INFO request line held the code."""
+    from dataclasses import replace
+
+    import httpx
+
+    from meta_ads_mcp.config import get_settings
+    from meta_ads_mcp.graph_api import GraphAPIClient
+    from meta_ads_mcp.tools import creatives
+
+    code = _creator_code()
+    caplog.set_level(logging.INFO)
+    received = []
+
+    def answer(request):
+        received.append(request)
+        return httpx.Response(200, json={"data": [{"body": "<div>preview</div>"}]})
+
+    client = GraphAPIClient(settings=replace(get_settings(), access_token="offline-only", app_secret=None, max_retries=0))
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda *a, **k: http_client)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    try:
+        result = _call("preview_ad", {
+            "account_id": "10", "creative": {
+                "object_id": "20", "instagram_branded_content": {"sponsor_id": "30"},
+                "branded_content": {"instagram_boost_post_access_token": code}}}, routed)
+    finally:
+        asyncio.run(http_client.aclose())
+    assert received and code in str(received[0].url)  # the code was sent, in the query
+    assert result.structured_content["summary"]["count"] == 1
+    assert code not in caplog.text
+    _assert_not_logged(caplog, code)
+    # The request is still logged, with its method, path and status.
+    (line,) = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    assert line.startswith("HTTP Request: GET https://graph.facebook.com/"), line
+    assert "/act_10/generatepreviews (query withheld" in line and line.endswith('"HTTP/1.1 200 OK"'), line
+
+
+def _h2_answer_frames() -> list[bytes]:
+    import hpack
+    import hyperframe.frame as frames
+
+    headers = hpack.Encoder().encode([(b":status", b"200"), (b"content-type", b"application/json")])
+    return [
+        frames.SettingsFrame().serialize(),
+        frames.HeadersFrame(stream_id=1, data=headers, flags=["END_HEADERS"]).serialize(),
+        frames.DataFrame(stream_id=1, data=b'{"data": []}', flags=["END_STREAM"]).serialize(),
+    ]
+
+
+def _http11_answer() -> list[bytes]:
+    return [b"HTTP/1.1 200 OK\r\n", b"Content-Type: application/json\r\n", b"Content-Length: 12\r\n", b"\r\n",
+            b'{"data": []}']
+
+
+@pytest.mark.parametrize("http2", [False, True], ids=["http1", "http2"])
+def test_no_http_client_record_carries_a_query_a_body_or_the_authorization_header(monkeypatch, caplog, http2):
+    """The real httpx, httpcore and hpack stack, at DEBUG, over an in-memory network."""
+    from dataclasses import replace
+
+    import httpcore
+    import httpx
+    from hpack.huffman import HuffmanEncoder
+    from hpack.huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
+
+    from meta_ads_mcp.config import get_settings
+    from meta_ads_mcp.graph_api import GraphAPIClient
+
+    token = "".join(["Synthetic", "Access", "Token", "_q1"])
+    code = _creator_code()
+    body = "".join(["Synthetic", "Body", "Value", "_b2"])
+    caplog.set_level(logging.DEBUG)
+    backend = httpcore.AsyncMockBackend(_h2_answer_frames() if http2 else _http11_answer(), http2=http2)
+    transport = httpx.AsyncHTTPTransport(http2=http2)
+    transport._pool = httpcore.AsyncConnectionPool(network_backend=backend, http1=not http2, http2=http2)
+    http_client = httpx.AsyncClient(transport=transport)
+    client = GraphAPIClient(settings=replace(get_settings(), access_token=token, app_secret=None, max_retries=0))
+    monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda *a, **k: http_client)
+
+    async def scenario():
+        try:
+            return await client.request("POST", "act_10/adcreatives", params={"creative": {"code": code}},
+                                        data={"name": body})
+        finally:
+            await http_client.aclose()
+
+    assert asyncio.run(scenario()) == {"data": []}
+    for secret in (token, code, body):
+        _assert_not_logged(caplog, secret)
+    # Huffman coding hides nothing: the encoded Authorization value must not be logged either.
+    encoded = HuffmanEncoder(REQUEST_CODES, REQUEST_CODES_LENGTH).encode(f"Bearer {token}".encode())
+    for record in caplog.records:
+        for value in record.args if isinstance(record.args, tuple) else ():
+            assert not (isinstance(value, bytes) and encoded in value), record.msg
+    names = {record.name for record in caplog.records}
+    assert "httpx" in names and any(name.startswith("httpcore.") for name in names)
+    assert ("hpack.hpack" in names) is http2
+    (line,) = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    assert "https://graph.facebook.com/" in line and "/act_10/adcreatives (query withheld" in line, line
+
+
+@pytest.mark.parametrize("status", [(200, "OK"), (400, "Bad Request"), (404, "Not Found"), (500, "Internal Server Error")])
+def test_the_httpx_request_line_keeps_method_path_and_status_for_every_status(status):
+    import httpx
+
+    url = httpx.URL("https://user:pass@graph.facebook.com/v25.0/act_10/generatepreviews",
+                    params={"creative": _creator_code(), "access_token": "x"})
+    record = logging.LogRecord("httpx", logging.INFO, __file__, 1, argument_privacy.HTTPX_REQUEST_TEMPLATE,
+                               ("GET", url, "HTTP/2", *status), None)
+    assert argument_privacy.HttpxLogPrivacyFilter().filter(record) is True
+    message = record.getMessage()
+    assert _creator_code() not in message and "pass" not in message and "access_token" not in message
+    assert message == (
+        "HTTP Request: GET https://graph.facebook.com/v25.0/act_10/generatepreviews (login withheld so request "
+        "contents stay out of logs) (query withheld so request contents stay out of logs) "
+        f'"HTTP/2 {status[0]} {status[1]}"'
+    )
+
+
+def test_a_url_without_a_query_is_shown_whole():
+    assert argument_privacy.url_without_query("https://graph.facebook.com/v25.0/me/adaccounts") == (
+        "https://graph.facebook.com/v25.0/me/adaccounts"
+    )
+
+
+def test_an_httpcore_failure_keeps_its_event_and_exception_type_only():
+    header = "".join(["Bearer ", "Synthetic", "Token", "\n"])
+    message = f"send_request_headers.failed exception=LocalProtocolError({('Illegal header value ' + repr(header))!r})"
+    record = logging.LogRecord("httpcore.http11", logging.DEBUG, __file__, 1, message, (), None)
+    assert argument_privacy.HttpcoreLogPrivacyFilter().filter(record) is True
+    assert record.getMessage() == (
+        "send_request_headers.failed exception=LocalProtocolError (message withheld so request contents stay out of logs)"
+    )
+    started = logging.LogRecord(
+        "httpcore.connection", logging.DEBUG, __file__, 1,
+        "connect_tcp.started host='graph.facebook.com' port=443 local_address=None timeout=5.0 socket_options=None",
+        (), None,
+    )
+    argument_privacy.HttpcoreLogPrivacyFilter().filter(started)
+    assert started.getMessage() == (
+        "connect_tcp.started host='graph.facebook.com' port=443 (other details withheld so request contents stay out of logs)"
+    )
+
+
+def test_hpack_records_keep_numbers_and_withhold_every_header():
+    record = logging.LogRecord("hpack.hpack", logging.DEBUG, __file__, 1,
+                               "Adding %s=%s to the header table, sensitive:%s, huffman:%s",
+                               (b":path", b"/v25.0/act_10?code=x", False, True), None)
+    argument_privacy.HpackLogPrivacyFilter().filter(record)
+    assert record.getMessage() == "Adding <withheld>=<withheld> to the header table, sensitive:False, huffman:True"
+
+
+def _logger_names_in(package) -> set[str]:
+    """Logger names a package's source creates records on, from its getLogger calls."""
+    root = Path(package.__file__).parent
+    names: set[str] = set()
+    for path in root.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for argument in re.findall(r"getLogger\(([^)]*)\)", source):
+            if argument.strip() == "__name__":
+                module = ".".join(path.relative_to(root.parent).with_suffix("").parts)
+                names.add(module.removesuffix(".__init__"))
+            else:
+                names.add(argument.strip().strip("\"'"))
+        # Nothing logs on the root logger directly.
+        assert not re.search(r"\blogging\.(?:debug|info|warning|error|exception|critical|log)\(", source), path
+    return names
+
+
+def test_the_http_client_filters_sit_where_the_libraries_log():
+    """If httpx, httpcore, hpack, h2 or h11 log something new, or somewhere new, this fails."""
+    import h2.config
+    import h11
+    import hpack
+    import httpcore
+    import httpcore._async.http2 as async_http2
+    import httpcore._sync.http2 as sync_http2
+    import httpx
+
+    filtered = {
+        argument_privacy.HTTPX_LOGGER: argument_privacy.HttpxLogPrivacyFilter,
+        **{name: argument_privacy.HttpcoreLogPrivacyFilter for name in argument_privacy.HTTPCORE_LOGGERS},
+        **{name: argument_privacy.HpackLogPrivacyFilter for name in argument_privacy.HPACK_LOGGERS},
+    }
+    # Each filter is first on its logger, so any other filter there sees a private record.
+    for name, kind in filtered.items():
+        assert isinstance(logging.getLogger(name).filters[0], kind), name
+
+    assert _logger_names_in(httpx) == {argument_privacy.HTTPX_LOGGER}
+    assert _logger_names_in(httpcore) == set(argument_privacy.HTTPCORE_LOGGERS)
+    assert _logger_names_in(hpack) == set(argument_privacy.HPACK_LOGGERS)
+    assert _logger_names_in(h11) == set()
+    assert _logger_names_in(h2) == set()
+    # h2 logs only through a logger it is given, and httpcore gives it none.
+    for connection in (async_http2.AsyncHTTP2Connection, sync_http2.HTTP2Connection):
+        assert isinstance(connection.CONFIG.logger, h2.config.DummyLogger)
+
+    # httpx's only records are the request line, with the URL as the second argument.
+    source = (Path(httpx.__file__).parent / "_client.py").read_text(encoding="utf-8")
+    calls = re.findall(r"logger\.(\w+)\(\n\s*('[^\n]*'),\n((?:\s+[\w.]+,\n){5})\s*\)", source)
+    assert len(calls) == 2 and len(re.findall(r"\blogger\.\w+\(", source)) == 2, calls
+    for level, template, arguments in calls:
+        assert level == "info" and template == repr(argument_privacy.HTTPX_REQUEST_TEMPLATE), template
+        assert [line.strip().rstrip(",") for line in arguments.strip().splitlines()] == [
+            "request.method", "request.url", "response.http_version", "response.status_code", "response.reason_phrase",
+        ]
+    for path in Path(httpx.__file__).parent.rglob("*.py"):
+        if path.name != "_client.py":
+            assert not re.search(r"\blogger\.\w+\(", path.read_text(encoding="utf-8")), path
+
+    # httpcore logs only from its Trace helper, one preformatted message with no arguments.
+    for path in Path(httpcore.__file__).parent.rglob("*.py"):
+        found = re.findall(r"\blogger\.(?:debug|info|warning|error|exception|critical|log)\(([^\n]*)",
+                           path.read_text(encoding="utf-8"))
+        assert found == (["message)", "message)"] if path.name == "_trace.py" else []), (path, found)
+
+    # hpack's records: templates whose header values are arguments (withheld) and numbers.
+    for path in Path(hpack.__file__).parent.rglob("*.py"):
+        for call in re.findall(r"\blog\.\w+\(\s*(\S[^\n]*)", path.read_text(encoding="utf-8")):
+            assert call.startswith('"'), (path, call)  # a template literal, never preformatted text

@@ -333,6 +333,7 @@ class GraphAPIClient:
         operation = f"{normalized_method} /{endpoint.lstrip('/')}"
         safe_to_retry = normalized_method in SAFE_RETRY_METHODS
         for attempt in range(retries):
+            failure: str | None = None
             try:
                 # HTTPX timeouts bound inactivity in each network phase. Also
                 # bound total elapsed time so a trickling response cannot hang.
@@ -346,17 +347,23 @@ class GraphAPIClient:
                         files=files,
                     )
             except (httpx.RequestError, TimeoutError) as exc:
+                failure = type(exc).__name__
+            if failure is not None:
                 delay = float(min(2**attempt, 60))
                 if safe_to_retry and attempt + 1 < retries:
                     await asyncio.sleep(delay)
                     continue
+                # Raised outside the handler, so the HTTP library's exception is not
+                # chained: its message can quote a request header (Authorization
+                # included) or the URL with its query, and a chained exception is
+                # printed wherever this error is logged.
                 raise MetaApiError(
                     message="Meta API request failed before a response was received.",
                     operation=operation,
                     is_transient=True,
                     mutation_outcome_unknown=not safe_to_retry,
-                    details={"exception_type": type(exc).__name__},
-                ) from exc
+                    details={"exception_type": failure},
+                )
 
             retry_timing = _retry_timing(response, attempt)
             delay = retry_timing.delay_seconds
