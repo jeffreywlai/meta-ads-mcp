@@ -20,7 +20,7 @@ class FakeCampaignClient:
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
         self.created_payload = {"parent_id": parent_id, "edge": edge, "data": data}
         # A new ad set has its own id: it is never the id of the campaign it goes into.
-        return {"id": "set_123" if edge == "adsets" else "cmp_123"}
+        return {"id": "100789" if edge == "adsets" else "100123"}
 
     async def get_object(self, object_id: str, *, fields=None, params=None):
         if object_id == "act_123":
@@ -64,7 +64,7 @@ def test_create_campaign_encodes_budget(monkeypatch) -> None:
             daily_budget=50.0,
         )
     )
-    assert result["created"]["id"] == "cmp_123"
+    assert result["created"]["id"] == "100123"
     assert client.created_payload["parent_id"] == "act_123"
     assert client.created_payload["data"]["daily_budget"] == 5000
 
@@ -122,7 +122,7 @@ def test_update_campaign_returns_previous_budget(monkeypatch) -> None:
     client = FakeCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(
-        campaigns.update_campaign(campaign_id="cmp_123", name="Updated", daily_budget=75.0)
+        campaigns.update_campaign(campaign_id="100123", name="Updated", daily_budget=75.0)
     )
     assert result["previous"]["daily_budget"] == 50.0
     assert client.updated_payload["data"]["daily_budget"] == 7500
@@ -137,7 +137,7 @@ def test_update_campaign_rejects_noop_update(monkeypatch) -> None:
         lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
     )
     with pytest.raises(campaigns.ValidationError):
-        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123"))
+        asyncio.run(campaigns.update_campaign(campaign_id="100123"))
 
 
 def test_update_campaign_rejects_both_budgets(monkeypatch) -> None:
@@ -145,7 +145,7 @@ def test_update_campaign_rejects_both_budgets(monkeypatch) -> None:
     with pytest.raises(campaigns.ValidationError):
         asyncio.run(
             campaigns.update_campaign(
-                campaign_id="cmp_123",
+                campaign_id="100123",
                 daily_budget=10.0,
                 lifetime_budget=20.0,
             )
@@ -162,13 +162,13 @@ def test_update_campaign_rejects_nonpositive_budget_before_client_lookup(
     )
     with pytest.raises(campaigns.ValidationError, match="daily_budget"):
         asyncio.run(
-            campaigns.update_campaign(campaign_id="cmp_123", daily_budget=-1)
+            campaigns.update_campaign(campaign_id="100123", daily_budget=-1)
         )
 
 
 def test_delete_campaign_returns_success(monkeypatch) -> None:
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: FakeCampaignClient())
-    result = asyncio.run(campaigns.delete_campaign(campaign_id="cmp_123"))
+    result = asyncio.run(campaigns.delete_campaign(campaign_id="100123"))
     assert result["result"]["success"] is True
 
 
@@ -178,7 +178,7 @@ def test_create_ad_set_rejects_both_budgets(monkeypatch) -> None:
         asyncio.run(
             campaigns.create_ad_set(
                 account_id="123",
-                campaign_id="cmp_123",
+                campaign_id="100123",
                 name="Bad Ad Set",
                 billing_event="IMPRESSIONS",
                 optimization_goal="OFFSITE_CONVERSIONS",
@@ -202,7 +202,7 @@ def test_create_ad_set_rejects_removed_v26_placement_before_api(monkeypatch) -> 
         asyncio.run(
             campaigns.create_ad_set(
                 account_id="123",
-                campaign_id="cmp_123",
+                campaign_id="100123",
                 name="Removed placement",
                 billing_event="IMPRESSIONS",
                 optimization_goal="OFFSITE_CONVERSIONS",
@@ -220,7 +220,7 @@ def test_create_ad_set_supports_typed_bidding_and_validate_only(monkeypatch) -> 
     result = asyncio.run(
         campaigns.create_ad_set(
             account_id="123",
-            campaign_id="cmp_123",
+            campaign_id="100123",
             name="Target ROAS",
             billing_event="IMPRESSIONS",
             optimization_goal="VALUE",
@@ -235,7 +235,7 @@ def test_create_ad_set_supports_typed_bidding_and_validate_only(monkeypatch) -> 
     assert client.created_payload["data"]["execution_options"] == ["validate_only"]
     assert result["validation_only"] is True
     assert result["created"] is None
-    assert result["validation"] == {"id": "set_123"}
+    assert result["validation"] == {"id": "100789"}
 
 
 def test_create_ad_set_encodes_zero_decimal_budget_and_bid(monkeypatch) -> None:
@@ -244,7 +244,7 @@ def test_create_ad_set_encodes_zero_decimal_budget_and_bid(monkeypatch) -> None:
     asyncio.run(
         campaigns.create_ad_set(
             account_id="123",
-            campaign_id="cmp_123",
+            campaign_id="100123",
             name="JPY Ad Set",
             billing_event="IMPRESSIONS",
             optimization_goal="OFFSITE_CONVERSIONS",
@@ -274,7 +274,7 @@ def test_create_ad_set_rejects_invalid_money_before_client_lookup(
         asyncio.run(
             campaigns.create_ad_set(
                 account_id="123",
-                campaign_id="cmp_123",
+                campaign_id="100123",
                 name="Invalid Ad Set",
                 billing_event="IMPRESSIONS",
                 optimization_goal="OFFSITE_CONVERSIONS",
@@ -294,7 +294,7 @@ def test_create_ad_set_rejects_params_overriding_typed_fields(monkeypatch) -> No
         asyncio.run(
             campaigns.create_ad_set(
                 account_id="123",
-                campaign_id="cmp_123",
+                campaign_id="100123",
                 name="Safe name",
                 billing_event="IMPRESSIONS",
                 optimization_goal="VALUE",
@@ -334,7 +334,7 @@ def test_campaign_params_cannot_supply_omitted_typed_or_control_fields(
     with pytest.raises(campaigns.ValidationError, match="daily_budget"):
         asyncio.run(
             campaigns.update_campaign(
-                campaign_id="cmp_123",
+                campaign_id="100123",
                 params={"daily_budget": 25},
             )
         )
@@ -342,7 +342,7 @@ def test_campaign_params_cannot_supply_omitted_typed_or_control_fields(
         asyncio.run(
             campaigns.create_ad_set(
                 account_id="123",
-                campaign_id="cmp_123",
+                campaign_id="100123",
                 name="Ad set",
                 billing_event="IMPRESSIONS",
                 optimization_goal="VALUE",
@@ -359,7 +359,7 @@ def test_create_ad_set_bid_constraints_without_a_local_strategy_are_sent(monkeyp
     asyncio.run(
         campaigns.create_ad_set(
             account_id="123",
-            campaign_id="cmp_123",
+            campaign_id="100123",
             name="Campaign strategy",
             billing_event="IMPRESSIONS",
             optimization_goal="VALUE",
@@ -375,7 +375,7 @@ def test_update_campaign_encodes_zero_decimal_budget_without_cents(monkeypatch) 
     client = FakeZeroDecimalCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(
-        campaigns.update_campaign(campaign_id="cmp_123", daily_budget=7500.0)
+        campaigns.update_campaign(campaign_id="100123", daily_budget=7500.0)
     )
     assert result["previous"]["daily_budget"] == 5000.0
     assert result["current"]["daily_budget"] == 7500.0
@@ -394,7 +394,7 @@ def test_update_campaign_decodes_previous_money_before_mutating(monkeypatch) -> 
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     with pytest.raises(campaigns.ValidationError, match="daily_budget"):
         asyncio.run(
-            campaigns.update_campaign(campaign_id="cmp_123", daily_budget=75.0)
+            campaigns.update_campaign(campaign_id="100123", daily_budget=75.0)
         )
     assert client.updated_payload is None
 
@@ -635,7 +635,7 @@ def test_create_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
             "daily_budget": 5000,
             **params,
         }),
-        ("get", "cmp_123", ["start_time", "stop_time"]),
+        ("get", "100123", ["start_time", "stop_time"]),
     ]
     assert list(client.calls[1][3]) == [
         "name", "objective", "status", "special_ad_categories", "daily_budget", *params,
@@ -643,7 +643,7 @@ def test_create_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
     added = {key: result.pop(key) for key in ("stored_schedule", "warnings")}
     assert result == {
         "ok": True, "action": "create_campaign", "target": {"account_id": "act_123"},
-        "validation_only": False, "created": {"id": "cmp_123"},
+        "validation_only": False, "created": {"id": "100123"},
     }
     assert added["stored_schedule"] == {"start_time": None, "stop_time": None}
 
@@ -664,7 +664,7 @@ def test_create_campaign_params_only_call_without_a_schedule_is_unchanged(monkey
     ]
     assert result == {
         "ok": True, "action": "create_campaign", "target": {"account_id": "act_123"},
-        "validation_only": False, "created": {"id": "cmp_123"},
+        "validation_only": False, "created": {"id": "100123"},
     }
 
 
@@ -687,14 +687,14 @@ def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
     }
     targeting = {"geo_locations": {"countries": ["DE"]}}
     result = asyncio.run(campaigns.create_ad_set(
-        account_id="act_123", campaign_id="cmp_123", name="Old style set",
+        account_id="act_123", campaign_id="100123", name="Old style set",
         billing_event="IMPRESSIONS", optimization_goal="REACH", targeting=targeting,
         lifetime_budget=500.0, end_time="2026-12-31T00:00:00-0500", params=dict(params),
     ))
     assert client.calls == [
         ("get", "act_123", ["currency"]),
         ("create", "act_123", "adsets", {
-            "campaign_id": "cmp_123",
+            "campaign_id": "100123",
             "name": "Old style set",
             "billing_event": "IMPRESSIONS",
             "optimization_goal": "REACH",
@@ -709,8 +709,8 @@ def test_create_ad_set_params_only_call_is_unchanged(monkeypatch) -> None:
         "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status",
         "end_time", "lifetime_budget", *params,
     ]
-    assert result["created"] == {"id": "set_123"}
-    assert result["target"] == {"account_id": "act_123", "campaign_id": "cmp_123"}
+    assert result["created"] == {"id": "100789"}
+    assert result["target"] == {"account_id": "act_123", "campaign_id": "100123"}
 
 
 def _no_client():
@@ -719,7 +719,7 @@ def _no_client():
 
 CAMPAIGN_BASE = {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES"}
 ADSET_BASE = {
-    "account_id": "123", "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS",
+    "account_id": "123", "campaign_id": "100123", "name": "S", "billing_event": "IMPRESSIONS",
     "optimization_goal": "REACH", "targeting": {"geo_locations": {"countries": ["DE"]}},
 }
 
@@ -843,7 +843,7 @@ def test_create_ad_set_named_parameters_are_sent(monkeypatch) -> None:
     assert client.calls == [
         ("get", "act_123", ["currency"]),
         ("create", "act_123", "adsets", {
-            "campaign_id": "cmp_123",
+            "campaign_id": "100123",
             "name": "S",
             "billing_event": "IMPRESSIONS",
             "optimization_goal": "REACH",
@@ -1378,14 +1378,14 @@ def test_create_ad_set_params_only_round_three_fields_call_is_unchanged(monkeypa
     }
     targeting = {"geo_locations": {"countries": ["DE"]}}
     result = asyncio.run(campaigns.create_ad_set(
-        account_id="act_123", campaign_id="cmp_123", name="Old style set",
+        account_id="act_123", campaign_id="100123", name="Old style set",
         billing_event="IMPRESSIONS", optimization_goal="CONVERSATIONS", targeting=targeting,
         daily_budget=20.0, params=dict(params),
     ))
     assert client.calls == [
         ("get", "act_123", ["currency"]),
         ("create", "act_123", "adsets", {
-            "campaign_id": "cmp_123",
+            "campaign_id": "100123",
             "name": "Old style set",
             "billing_event": "IMPRESSIONS",
             "optimization_goal": "CONVERSATIONS",
@@ -1399,7 +1399,7 @@ def test_create_ad_set_params_only_round_three_fields_call_is_unchanged(monkeypa
         "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status",
         "daily_budget", *params,
     ]
-    assert result["created"] == {"id": "set_123"}
+    assert result["created"] == {"id": "100789"}
 
 
 def test_create_campaign_params_only_budget_schedule_call_is_unchanged(monkeypatch) -> None:
@@ -1416,7 +1416,7 @@ def test_create_campaign_params_only_budget_schedule_call_is_unchanged(monkeypat
             "special_ad_categories": [], "daily_budget": 5000, **params,
         }),
     ]
-    assert result["created"] == {"id": "cmp_123"}
+    assert result["created"] == {"id": "100123"}
 
 
 def test_update_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
@@ -1434,19 +1434,19 @@ def test_update_campaign_params_only_call_is_unchanged(monkeypatch) -> None:
         "stop_time": "2026-12-31T00:00:00-0500",
         "adlabels": [{"name": "Q4"}],
     }
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", name="Renamed", params=dict(params)))
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", name="Renamed", params=dict(params)))
     assert client.calls == [
-        ("get", "cmp_123", ["id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget"]),
+        ("get", "100123", ["id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget"]),
         ("get", "act_123", ["currency"]),
-        ("update", "cmp_123", {"name": "Renamed", **params}),
-        ("get", "cmp_123", ["start_time", "stop_time"]),
+        ("update", "100123", {"name": "Renamed", **params}),
+        ("get", "100123", ["start_time", "stop_time"]),
     ]
     assert list(client.calls[2][2]) == ["name", *params]
     warnings = result.pop("warnings")
     assert result == {
         "ok": True,
         "action": "update_campaign",
-        "target": {"campaign_id": "cmp_123"},
+        "target": {"campaign_id": "100123"},
         "previous": {
             "name": "Old name", "status": "PAUSED", "objective": "OUTCOME_SALES",
             "daily_budget": 50.0, "lifetime_budget": None,
@@ -1509,7 +1509,7 @@ def test_create_ad_set_round_three_named_parameters_are_sent(monkeypatch) -> Non
     assert client.calls == [
         ("get", "act_123", ["currency"]),
         ("create", "act_123", "adsets", {
-            "campaign_id": "cmp_123",
+            "campaign_id": "100123",
             "name": "S",
             "billing_event": "IMPRESSIONS",
             "optimization_goal": "REACH",
@@ -1703,20 +1703,20 @@ def test_update_campaign_named_fields_read_first_and_return_previous(monkeypatch
     client = StoredCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(campaigns.update_campaign(
-        campaign_id="cmp_123", spend_cap=750.5, start_time="2026-12-05T00:00:00Z",
+        campaign_id="100123", spend_cap=750.5, start_time="2026-12-05T00:00:00Z",
         stop_time="2027-01-15T00:00:00-05:00", adlabels=[{"name": "Holiday"}],
     ))
     assert client.calls == [
-        ("get", "cmp_123", [
+        ("get", "100123", [
             "id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget",
             "spend_cap", "start_time", "stop_time", "adlabels",
         ]),
         ("get", "act_123", ["currency"]),
-        ("update", "cmp_123", {
+        ("update", "100123", {
             "spend_cap": 75050, "start_time": "2026-12-05T00:00:00Z",
             "stop_time": "2027-01-15T00:00:00-05:00", "adlabels": [{"name": "Holiday"}],
         }),
-        ("get", "cmp_123", ["start_time", "stop_time"]),
+        ("get", "100123", ["start_time", "stop_time"]),
     ]
     assert result["previous"] == {
         "name": "Old name", "status": "PAUSED", "objective": "OUTCOME_SALES",
@@ -1735,8 +1735,8 @@ def test_update_campaign_named_fields_read_first_and_return_previous(monkeypatch
 def test_update_campaign_spend_cap_alone_is_a_change(monkeypatch) -> None:
     client = StoredCampaignClient(extra={})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", spend_cap=100))
-    assert client.calls[-1] == ("update", "cmp_123", {"spend_cap": 10000})
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", spend_cap=100))
+    assert client.calls[-1] == ("update", "100123", {"spend_cap": 10000})
     assert result["previous"]["spend_cap"] is None
     assert result["previous_unavailable"] == {"spend_cap": "Meta returned no value for it; it may not have been set."}
 
@@ -1746,7 +1746,7 @@ def test_update_campaign_labels_on_an_unread_page_are_flagged(monkeypatch) -> No
         "data": [{"id": "1", "name": "A"}], "paging": {"next": "https://graph.example/next"},
     }})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", adlabels=[{"id": "2"}]))
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", adlabels=[{"id": "2"}]))
     assert result["previous"]["adlabels"] == [{"id": "1", "name": "A"}]
     assert "first page only" in result["previous_incomplete"]["adlabels"]
 
@@ -1754,7 +1754,7 @@ def test_update_campaign_labels_on_an_unread_page_are_flagged(monkeypatch) -> No
 def test_update_campaign_unreadable_previous_labels_are_named(monkeypatch) -> None:
     client = StoredCampaignClient(extra={"adlabels": "unexpected"})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", adlabels=[{"id": "2"}]))
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", adlabels=[{"id": "2"}]))
     assert result["previous"]["adlabels"] is None
     assert "could not read" in result["previous_incomplete"]["adlabels"]
 
@@ -1763,9 +1763,9 @@ def test_update_campaign_one_sided_start_is_checked_against_stored_stop(monkeypa
     client = StoredCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     with pytest.raises(campaigns.ValidationError, match="stored stop_time"):
-        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", start_time="2027-01-02T00:00:00Z"))
+        asyncio.run(campaigns.update_campaign(campaign_id="100123", start_time="2027-01-02T00:00:00Z"))
     assert client.calls == [
-        ("get", "cmp_123", [
+        ("get", "100123", [
             "id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget",
             "start_time", "stop_time",
         ]),
@@ -1776,7 +1776,7 @@ def test_update_campaign_one_sided_stop_is_checked_against_stored_start(monkeypa
     client = StoredCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     with pytest.raises(campaigns.ValidationError, match="stored start_time"):
-        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", stop_time="2026-11-30T00:00:00Z"))
+        asyncio.run(campaigns.update_campaign(campaign_id="100123", stop_time="2026-11-30T00:00:00Z"))
     assert not [call for call in client.calls if call[0] == "update"]
 
 
@@ -1790,7 +1790,7 @@ def test_update_campaign_failed_read_writes_nothing(monkeypatch) -> None:
     client = GoneClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     with pytest.raises(MetaApiError):
-        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", spend_cap=200))
+        asyncio.run(campaigns.update_campaign(campaign_id="100123", spend_cap=200))
     assert client.calls == []
 
 
@@ -1807,7 +1807,7 @@ def test_update_campaign_named_parameter_and_same_params_key_together_raise(monk
     monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
     (key, _value), = named.items()
     with pytest.raises(campaigns.ValidationError, match=rf"{key} was given both as a named parameter and inside params"):
-        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", **named, params={key: params_value}))
+        asyncio.run(campaigns.update_campaign(campaign_id="100123", **named, params={key: params_value}))
 
 
 @pytest.mark.parametrize(
@@ -1825,7 +1825,7 @@ def test_update_campaign_named_parameter_and_same_params_key_together_raise(monk
 def test_update_campaign_named_parameter_errors_make_no_call(monkeypatch, arguments, message) -> None:
     monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
     with pytest.raises(campaigns.ValidationError, match=message):
-        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", **arguments))
+        asyncio.run(campaigns.update_campaign(campaign_id="100123", **arguments))
 
 
 @pytest.mark.parametrize("value", [True, False])
@@ -2028,14 +2028,14 @@ def test_budget_increase_times_on_a_quarter_hour_in_any_offset_are_accepted(offs
 # a params value would reach Meta unconverted and be read as minor units.
 
 _CREATE_ADSET_ARGS = {
-    "account_id": "123", "campaign_id": "cmp_123", "name": "Ad set", "billing_event": "IMPRESSIONS",
+    "account_id": "123", "campaign_id": "100123", "name": "Ad set", "billing_event": "IMPRESSIONS",
     "optimization_goal": "REACH", "targeting": {"geo_locations": {"countries": ["US"]}},
 }
 _ADSET_SPEND_KEYS = ("daily_spend_cap", "lifetime_spend_cap", "daily_min_spend_target", "lifetime_min_spend_target")
 _MONEY_IN_PARAMS_CASES = [
     *[("create_campaign", {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES"}, key)
       for key in ("daily_budget", "lifetime_budget", "spend_cap")],
-    *[("update_campaign", {"campaign_id": "cmp_123"}, key) for key in ("daily_budget", "lifetime_budget", "spend_cap")],
+    *[("update_campaign", {"campaign_id": "100123"}, key) for key in ("daily_budget", "lifetime_budget", "spend_cap")],
     *[("create_ad_set", _CREATE_ADSET_ARGS, key)
       for key in ("bid_amount", "daily_budget", "lifetime_budget", *_ADSET_SPEND_KEYS)],
     *[("update_adset", {"adset_id": "adset_1"}, key) for key in _ADSET_SPEND_KEYS],
@@ -2059,7 +2059,7 @@ def test_money_field_inside_params_is_refused_before_any_call(monkeypatch, tool,
     ("tool", "arguments"),
     [
         ("create_campaign", {"account_id": "123", "name": "C", "objective": "OUTCOME_SALES", "spend_cap": 250}),
-        ("update_campaign", {"campaign_id": "cmp_123", "spend_cap": 250}),
+        ("update_campaign", {"campaign_id": "100123", "spend_cap": 250}),
         ("create_ad_set", {**_CREATE_ADSET_ARGS, "daily_spend_cap": 90}),
     ],
 )
@@ -2084,14 +2084,14 @@ def test_money_field_nested_inside_params_is_not_refused(monkeypatch) -> None:
 
 ZONELESS_ADSET_ARGS = {
     "account_id": "act_123",
-    "campaign_id": "cmp_123",
+    "campaign_id": "100123",
     "name": "Black Friday",
     "billing_event": "IMPRESSIONS",
     "optimization_goal": "REACH",
     "targeting": {"geo_locations": {"countries": ["US"]}},
 }
 ZONELESS_ADSET_CREATE = {
-    "campaign_id": "cmp_123",
+    "campaign_id": "100123",
     "name": "Black Friday",
     "billing_event": "IMPRESSIONS",
     "optimization_goal": "REACH",
@@ -2121,13 +2121,13 @@ def test_create_ad_set_zoneless_start_time_request_is_unchanged(monkeypatch) -> 
 
 
 class ScheduleReadClient(RecordingCampaignClient):
-    """Records calls; the create returns adset_new, whose stored schedule is read back as configured."""
+    """Records calls; the create returns 100456, whose stored schedule is read back as configured."""
 
     def __init__(self, *, stored=None, read_error: BaseException | None = None, created=None) -> None:
         super().__init__()
-        self.stored = {"id": "adset_new"} if stored is None else stored
+        self.stored = {"id": "100456"} if stored is None else stored
         self.read_error = read_error
-        self.created = {"id": "adset_new"} if created is None else created
+        self.created = {"id": "100456"} if created is None else created
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
         self.calls.append(("create", parent_id, edge, dict(data)))
@@ -2145,16 +2145,16 @@ class ScheduleReadClient(RecordingCampaignClient):
 OLD_STYLE_ADSET_RESPONSE = {
     "ok": True,
     "action": "create_ad_set",
-    "target": {"account_id": "act_123", "campaign_id": "cmp_123"},
+    "target": {"account_id": "act_123", "campaign_id": "100123"},
     "validation_only": False,
-    "created": {"id": "adset_new"},
+    "created": {"id": "100456"},
 }
 
 
 def test_create_ad_set_old_style_zoneless_response_keeps_every_field(monkeypatch) -> None:
     """Every field an old-style call's response had is still there with the same value; two fields are added."""
     client = ScheduleReadClient(stored={
-        "id": "adset_new", "start_time": "2026-11-27T00:00:00-0800", "end_time": "2026-11-30T00:00:00-0800",
+        "id": "100456", "start_time": "2026-11-27T00:00:00-0800", "end_time": "2026-11-30T00:00:00-0800",
     })
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(campaigns.create_ad_set(
@@ -2166,7 +2166,7 @@ def test_create_ad_set_old_style_zoneless_response_keeps_every_field(monkeypatch
         ("create", "act_123", "adsets", {
             **ZONELESS_ADSET_CREATE, "start_time": "2026-11-27T00:00:00", "end_time": "2026-11-30T00:00:00",
         }),
-        ("get", "adset_new", ["start_time", "end_time"]),
+        ("get", "100456", ["start_time", "end_time"]),
     ]
     assert result["stored_schedule"] == {
         "start_time": "2026-11-27T00:00:00-0800", "end_time": "2026-11-30T00:00:00-0800",
@@ -2179,7 +2179,7 @@ def test_create_ad_set_old_style_zoneless_response_keeps_every_field(monkeypatch
 
 
 def test_create_ad_set_warning_names_only_the_zoneless_time(monkeypatch) -> None:
-    client = ScheduleReadClient(stored={"id": "adset_new", "start_time": "2026-11-27T00:00:00-0500"})
+    client = ScheduleReadClient(stored={"id": "100456", "start_time": "2026-11-27T00:00:00-0500"})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(campaigns.create_ad_set(
         **ZONELESS_ADSET_ARGS, start_time="2026-11-27T00:00:00-05:00", end_time="2026-11-30",
@@ -2189,7 +2189,7 @@ def test_create_ad_set_warning_names_only_the_zoneless_time(monkeypatch) -> None
     assert "start_time" not in warning
     assert "Meta chose how to read it." in warning
     assert result["stored_schedule"] == {"start_time": "2026-11-27T00:00:00-0500", "end_time": None}
-    assert client.calls[-1] == ("get", "adset_new", ["start_time", "end_time"])
+    assert client.calls[-1] == ("get", "100456", ["start_time", "end_time"])
 
 
 @pytest.mark.parametrize(
@@ -2210,7 +2210,7 @@ def test_create_ad_set_failed_read_back_still_reports_the_create(monkeypatch, cl
     assert warning.startswith("start_time was given without a time zone")
     assert "could not be read" in warning
     assert "get_adset" in warning
-    assert client.calls[-1] == ("get", "adset_new", ["start_time", "end_time"])
+    assert client.calls[-1] == ("get", "100456", ["start_time", "end_time"])
 
 
 def test_create_ad_set_without_created_id_skips_the_read_back(monkeypatch) -> None:
@@ -2326,7 +2326,7 @@ def test_create_campaign_params_only_round_four_fields_call_is_unchanged(monkeyp
     ]
     assert result == {
         "ok": True, "action": "create_campaign", "target": {"account_id": "act_123"},
-        "validation_only": False, "created": {"id": "cmp_123"},
+        "validation_only": False, "created": {"id": "100123"},
     }
 
 
@@ -2339,7 +2339,7 @@ def test_create_ad_set_params_only_round_four_fields_call_is_unchanged(monkeypat
     assert client.calls == [
         ("get", "act_123", ["currency"]),
         ("create", "act_123", "adsets", {
-            "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
+            "campaign_id": "100123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
             "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED", "daily_budget": 2000,
             **ROUND_FOUR_ADSET_PARAMS,
         }),
@@ -2348,7 +2348,7 @@ def test_create_ad_set_params_only_round_four_fields_call_is_unchanged(monkeypat
         "campaign_id", "name", "billing_event", "optimization_goal", "targeting", "status", "daily_budget",
         *ROUND_FOUR_ADSET_PARAMS,
     ]
-    assert result["created"] == {"id": "set_123"}
+    assert result["created"] == {"id": "100789"}
 
 
 @pytest.mark.parametrize("key", list(ROUND_FOUR_CAMPAIGN_PARAMS))
@@ -2437,7 +2437,7 @@ def test_create_ad_set_round_four_named_parameters_are_sent(monkeypatch) -> None
     ))
     assert client.calls == [
         ("create", "act_123", "adsets", {
-            "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
+            "campaign_id": "100123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
             "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED",
             "existing_customer_budget_percentage": 20,
             "multi_optimization_goal_weight": "PREFER_EVENT",
@@ -2724,7 +2724,7 @@ def test_create_ad_set_params_only_rotation_pair_is_sent_unchecked_and_unchanged
     asyncio.run(campaigns.create_ad_set(**ADSET_BASE, params=dict(params)))
     assert client.calls == [
         ("create", "act_123", "adsets", {
-            "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
+            "campaign_id": "100123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "REACH",
             "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED", **params,
         }),
     ]
@@ -2808,16 +2808,16 @@ def test_update_campaign_mixed_schedule_pair_is_compared_with_the_params_bound_n
     client = StoredCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     asyncio.run(campaigns.update_campaign(
-        campaign_id="cmp_123", start_time="2027-01-05T00:00:00Z", params={"stop_time": "2027-02-01T00:00:00Z"},
+        campaign_id="100123", start_time="2027-01-05T00:00:00Z", params={"stop_time": "2027-02-01T00:00:00Z"},
     ))
     assert client.calls == [
-        ("get", "cmp_123", [
+        ("get", "100123", [
             "id", "account_id", "name", "status", "objective", "daily_budget", "lifetime_budget", "start_time",
         ]),
         ("get", "act_123", ["currency"]),
-        ("update", "cmp_123", {"start_time": "2027-01-05T00:00:00Z", "stop_time": "2027-02-01T00:00:00Z"}),
+        ("update", "100123", {"start_time": "2027-01-05T00:00:00Z", "stop_time": "2027-02-01T00:00:00Z"}),
         # The schedule read-back after the write (declared change).
-        ("get", "cmp_123", ["start_time", "stop_time"]),
+        ("get", "100123", ["start_time", "stop_time"]),
     ]
 
 
@@ -2837,7 +2837,7 @@ def test_update_campaign_mixed_schedule_pair_errors_make_no_call(monkeypatch, ar
     client = StoredCampaignClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     with pytest.raises(campaigns.ValidationError, match=message):
-        asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", **arguments))
+        asyncio.run(campaigns.update_campaign(campaign_id="100123", **arguments))
     assert client.calls == []
 
 
@@ -2845,7 +2845,7 @@ def test_update_campaign_mixed_schedule_pair_errors_make_no_call(monkeypatch, ar
 
 _CALL_ADSET = {**ADSET_BASE, "optimization_goal": "QUALITY_CALL"}
 _CALL_ADSET_SENT = {
-    "campaign_id": "cmp_123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "QUALITY_CALL",
+    "campaign_id": "100123", "name": "S", "billing_event": "IMPRESSIONS", "optimization_goal": "QUALITY_CALL",
     "targeting": {"geo_locations": {"countries": ["DE"]}}, "status": "PAUSED", "daily_budget": 2000,
     "destination_type": "PHONE_CALL",
 }
@@ -2867,7 +2867,7 @@ def test_create_ad_set_params_only_phone_call_destination_call_is_unchanged(monk
     ))
     assert client.calls == [("get", "act_123", ["currency"]), ("create", "act_123", "adsets", _CALL_ADSET_SENT)]
     assert list(client.calls[1][3]) == list(_CALL_ADSET_SENT)
-    assert result["created"] == {"id": "set_123"}
+    assert result["created"] == {"id": "100789"}
 
 
 @pytest.mark.parametrize("value", ["LEAD_FORM_MESSENGER", "LEAD_FROM_MESSENGER"])
@@ -3052,7 +3052,7 @@ def test_create_campaign_with_a_campaign_budget_sends_exactly_what_it_sent_befor
     ]
     assert result == {
         "ok": True, "action": "create_campaign", "target": {"account_id": "act_123"},
-        "validation_only": False, "created": {"id": "cmp_123"},
+        "validation_only": False, "created": {"id": "100123"},
     }
 
 
@@ -3195,8 +3195,8 @@ def test_create_campaign_reads_back_a_schedule_meta_did_not_store(monkeypatch, a
     result = asyncio.run(campaigns.create_campaign(**CAMPAIGN_BASE, daily_budget=5, **arguments))
     create = next(call for call in client.calls if call[0] == "create")
     assert create[3]["start_time"] == "2026-12-05T00:00:00-05:00"
-    assert client.calls[-1] == ("get", "cmp_123", ["start_time", "stop_time"])
-    assert result["created"] == {"id": "cmp_123"}
+    assert client.calls[-1] == ("get", "100123", ["start_time", "stop_time"])
+    assert result["created"] == {"id": "100123"}
     assert result["stored_schedule"] == {"start_time": None, "stop_time": None}
     (warning,) = result["warnings"]
     assert warning.startswith("start_time and stop_time: Meta accepted the request but did not store these times")
@@ -3224,7 +3224,7 @@ def test_create_campaign_failed_schedule_read_back_is_still_a_success(monkeypatc
     client = ScheduleReadbackClient(fail_readback=True)
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(campaigns.create_campaign(**CAMPAIGN_BASE, stop_time="2026-12-25T00:00:00-05:00"))
-    assert result["ok"] is True and result["created"] == {"id": "cmp_123"}
+    assert result["ok"] is True and result["created"] == {"id": "100123"}
     assert "stored_schedule" not in result
     (warning,) = result["warnings"]
     assert "could not be read" in warning and "stop_time" in warning
@@ -3258,9 +3258,9 @@ def test_create_campaign_without_a_schedule_makes_no_read_back(monkeypatch) -> N
 def test_update_campaign_does_not_report_unstored_times_as_current(monkeypatch, arguments) -> None:
     client = ScheduleReadbackClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", name="Renamed", **arguments))
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", name="Renamed", **arguments))
     assert [call[0] for call in client.calls][-2:] == ["update", "get"]
-    assert client.calls[-1] == ("get", "cmp_123", ["start_time", "stop_time"])
+    assert client.calls[-1] == ("get", "100123", ["start_time", "stop_time"])
     assert result["current"] == {"name": "Renamed"}
     assert result["sent"] == {"start_time": "2026-12-08T00:00:00-05:00", "stop_time": "2026-12-28T00:00:00-05:00"}
     assert result["stored_schedule"] == {"start_time": None, "stop_time": None}
@@ -3272,7 +3272,7 @@ def test_update_campaign_stored_time_stays_in_current(monkeypatch) -> None:
     client = ScheduleReadbackClient(stored={"start_time": "2026-12-08T05:00:00+0000", "stop_time": None})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(campaigns.update_campaign(
-        campaign_id="cmp_123", start_time="2026-12-08T00:00:00-05:00", stop_time="2026-12-28T00:00:00-05:00",
+        campaign_id="100123", start_time="2026-12-08T00:00:00-05:00", stop_time="2026-12-28T00:00:00-05:00",
     ))
     assert result["current"] == {"start_time": "2026-12-08T00:00:00-05:00"}
     assert result["sent"] == {"stop_time": "2026-12-28T00:00:00-05:00"}
@@ -3284,10 +3284,10 @@ def test_update_campaign_failed_schedule_read_back_is_still_a_success(monkeypatc
     client = ScheduleReadbackClient(fail_readback=True)
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(campaigns.update_campaign(
-        campaign_id="cmp_123", params={"stop_time": "2026-12-28T00:00:00-05:00"},
+        campaign_id="100123", params={"stop_time": "2026-12-28T00:00:00-05:00"},
     ))
     assert result["ok"] is True
-    assert ("update", "cmp_123", {"stop_time": "2026-12-28T00:00:00-05:00"}) in client.calls
+    assert ("update", "100123", {"stop_time": "2026-12-28T00:00:00-05:00"}) in client.calls
     assert result["current"] == {}
     assert result["sent"] == {"stop_time": "2026-12-28T00:00:00-05:00"}
     assert "stored_schedule" not in result
@@ -3298,7 +3298,7 @@ def test_update_campaign_failed_schedule_read_back_is_still_a_success(monkeypatc
 def test_update_campaign_without_a_schedule_makes_no_read_back(monkeypatch) -> None:
     client = ScheduleReadbackClient()
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", params={"adlabels": [{"name": "Q4"}]}))
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", params={"adlabels": [{"name": "Q4"}]}))
     assert [call[0] for call in client.calls] == ["get", "get", "update"]
     assert set(result) == {"ok", "action", "target", "previous", "current"}
     assert result["current"] == {"adlabels": [{"name": "Q4"}]}
@@ -3316,8 +3316,8 @@ def test_update_campaign_time_that_cannot_be_compared_is_not_claimed_stored(monk
     # compared with what Meta holds, so it must not be shown as the campaign's current value.
     client = ScheduleReadbackClient(stored={"start_time": "2026-12-01T00:00:00-0500", "stop_time": None})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", name="Renamed", params={"start_time": sent_time}))
-    assert ("update", "cmp_123", {"name": "Renamed", "start_time": sent_time}) in client.calls
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", name="Renamed", params={"start_time": sent_time}))
+    assert ("update", "100123", {"name": "Renamed", "start_time": sent_time}) in client.calls
     assert result["current"] == {"name": "Renamed"}
     assert result["sent"] == {"start_time": sent_time}
     assert result["stored_schedule"]["start_time"] == "2026-12-01T00:00:00-0500"
@@ -3364,10 +3364,10 @@ def test_campaign_schedule_report_keeps_the_two_reasons_apart() -> None:
 def test_update_campaign_previous_labels_count_rows_that_could_not_be_read(monkeypatch, stored, shown, note) -> None:
     client = StoredCampaignClient(extra={"adlabels": stored})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
-    result = asyncio.run(campaigns.update_campaign(campaign_id="cmp_123", adlabels=[{"id": "2"}]))
+    result = asyncio.run(campaigns.update_campaign(campaign_id="100123", adlabels=[{"id": "2"}]))
     assert result["previous"]["adlabels"] == shown
     assert note in result["previous_incomplete"]["adlabels"]
-    assert client.calls[-1] == ("update", "cmp_123", {"adlabels": [{"id": "2"}]})
+    assert client.calls[-1] == ("update", "100123", {"adlabels": [{"id": "2"}]})
 
 
 def test_read_adlabels_both_notes_when_a_page_is_partial_and_has_unread_rows() -> None:
