@@ -1083,3 +1083,101 @@ def test_get_ad_image_without_copies_is_unchanged(monkeypatch) -> None:
     item = asyncio.run(ads.get_ad_image(ad_id="ad_123"))["item"]
     assert "image_copies_differ" not in item
     assert [image["hash"] for image in item["resolved_images"]] == ["hash_123", "hash_456"]
+
+
+# Round twenty-five, A5: Meta's ad references (POST /act_{id}/ads and POST /{ad_id}) type
+# tracking_specs as Object. One object is accepted at the MCP boundary and sent as given.
+
+_R25_TRACKING_SPEC = {"action.type": "offsite_conversion", "fb_pixel": ["70"]}
+
+
+class _R25UpdateAdClient(FakeUpdateAdClient):
+    async def update_object(self, object_id: str, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+
+@pytest.mark.parametrize("spec", [_R25_TRACKING_SPEC, [_R25_TRACKING_SPEC]])
+@pytest.mark.parametrize("tool", ["create_ad", "update_ad"])
+def test_r25_tracking_specs_object_or_list_is_sent_as_given(monkeypatch, tool, spec) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAdsClient() if tool == "create_ad" else _R25UpdateAdClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    args = {**AD_BASE, "creative_id": "crt_123"} if tool == "create_ad" else {"ad_id": "10"}
+    asyncio.run(mcp_server.call_tool(tool, {**args, "tracking_specs": spec}))
+    writes = [call for call in client.calls if call[0] in {"create", "update"}]
+    assert len(writes) == 1
+    assert writes[0][-1]["tracking_specs"] == spec
+
+
+@pytest.mark.parametrize("bad", ["offsite_conversion", 5, ["offsite_conversion"]])
+@pytest.mark.parametrize("tool", ["create_ad", "update_ad"])
+def test_r25_tracking_specs_that_are_not_objects_are_still_refused_at_the_mcp_boundary(monkeypatch, tool, bad) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAdsClient() if tool == "create_ad" else _R25UpdateAdClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    args = {**AD_BASE, "creative_id": "crt_123"} if tool == "create_ad" else {"ad_id": "10"}
+    with pytest.raises((ToolError, MCPValidationError)):
+        asyncio.run(mcp_server.call_tool(tool, {**args, "tracking_specs": bad}))
+    assert client.calls == []
+
+
+# Round twenty-five, A6: Meta types ad_schedule_start_time and ad_schedule_end_time as datetime,
+# which takes whole Unix seconds as a number; the number is sent as given.
+
+
+@pytest.mark.parametrize("through_mcp", [False, True])
+@pytest.mark.parametrize(
+    "times",
+    [
+        {"ad_schedule_start_time": 1796083200},
+        {"ad_schedule_end_time": 1796169600},
+        {"ad_schedule_start_time": 1796083200, "ad_schedule_end_time": 1796169600},
+    ],
+)
+def test_r25_numeric_ad_schedule_times_are_sent_as_given(monkeypatch, times, through_mcp) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    args = {**AD_BASE, "creative_id": "crt_123", **times}
+    asyncio.run(mcp_server.call_tool("create_ad", args) if through_mcp else ads.create_ad(**args))
+    sent = client.calls[-1][3]
+    assert {key: sent[key] for key in times} == times
+    assert all(type(sent[key]) is int for key in times)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"ad_schedule_start_time": 0}, "positive"),
+        ({"ad_schedule_end_time": 0}, "positive"),
+        ({"ad_schedule_end_time": -1}, "positive"),
+        ({"ad_schedule_start_time": 1796169600, "ad_schedule_end_time": 1796083200},
+         "ad_schedule_end_time must be after ad_schedule_start_time"),
+        ({"ad_schedule_start_time": 1796169600, "params": {"ad_schedule_end_time": "1796083200"}},
+         "ad_schedule_end_time must be after ad_schedule_start_time"),
+        ({"ad_schedule_start_time": True}, "ad_schedule_start_time must be"),
+    ],
+)
+def test_r25_numeric_ad_schedule_times_keep_the_existing_rules(monkeypatch, arguments, message) -> None:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
+    with pytest.raises(ads.ValidationError, match=message):
+        asyncio.run(ads.create_ad(**AD_BASE, creative_id="crt_123", **arguments))
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5])
+def test_r25_ad_schedule_time_refuses_true_false_and_fractions_at_the_mcp_boundary(monkeypatch, value) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = RecordingAdsClient()
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    with pytest.raises((ToolError, MCPValidationError)):
+        asyncio.run(mcp_server.call_tool(
+            "create_ad", {**AD_BASE, "creative_id": "crt_123", "ad_schedule_start_time": value},
+        ))
+    assert client.calls == []

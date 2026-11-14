@@ -30,7 +30,13 @@ from meta_ads_mcp.tools.campaigns import (
     validate_adlabels,
     validate_schedule_time,
 )
-from meta_ads_mcp.tool_types import CurrencyAmount, GraphId, StrictStringList, coerce_strict_csv_string_list
+from meta_ads_mcp.tool_types import (
+    CurrencyAmount,
+    GraphId,
+    ScheduleTime,
+    StrictStringList,
+    coerce_strict_csv_string_list,
+)
 from meta_ads_mcp.tools.creatives import SecretArguments, keeps_call_secrets
 
 AD_IMAGE_FIELDS = [
@@ -180,18 +186,18 @@ async def create_ad(
     creative: dict[str, Any] | None = None,
     status: str = "PAUSED",
     bid_amount: CurrencyAmount | None = None,
-    tracking_specs: list[dict[str, Any]] | None = None,
+    tracking_specs: dict[str, Any] | list[dict[str, Any]] | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
     conversion_domain: str | None = None,
     adlabels: list[dict[str, Any]] | None = None,
     creative_spec: dict[str, Any] | None = None,
-    ad_schedule_start_time: str | None = None,
-    ad_schedule_end_time: str | None = None,
+    ad_schedule_start_time: ScheduleTime | None = None,
+    ad_schedule_end_time: ScheduleTime | None = None,
     display_sequence: WholeNumber | None = None,
     engagement_audience: bool | None = None,
 ) -> dict[str, Any]:
-    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or Unix seconds); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. display_sequence is the ad's position in its campaign's sequence (a whole number from 0); engagement_audience true makes an audience of people who engage with this ad. A named parameter and the same key inside params cannot both be given. bid_amount is refused inside params, where Meta would read it in minor units; use the named bid_amount."""
+    """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. tracking_specs is one tracking spec object or a list of them, sent as given. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or whole Unix seconds as a number or digits); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. display_sequence is the ad's position in its campaign's sequence (a whole number from 0); engagement_audience true makes an audience of people who engage with this ad. A named parameter and the same key inside params cannot both be given. bid_amount is refused inside params, where Meta would read it in minor units; use the named bid_amount."""
     schedule_times = {"ad_schedule_start_time": ad_schedule_start_time, "ad_schedule_end_time": ad_schedule_end_time}
     named_later = {"display_sequence": display_sequence, "engagement_audience": engagement_audience}
     reject_named_and_params(
@@ -277,7 +283,7 @@ async def _create_ad(
     creative: dict[str, Any],
     status: str,
     bid_amount: float | None,
-    tracking_specs: list[dict[str, Any]] | None,
+    tracking_specs: dict[str, Any] | list[dict[str, Any]] | None,
     conversion_domain: str | None,
     adlabels: list[dict[str, Any]] | None,
     validate_only: bool,
@@ -465,13 +471,13 @@ async def update_ad(
     ad_id: str,
     name: str | None = None,
     creative_id: str | None = None,
-    tracking_specs: list[dict[str, Any]] | None = None,
+    tracking_specs: dict[str, Any] | list[dict[str, Any]] | None = None,
     status: str | None = None,
     validate_only: bool = False,
     params: dict[str, Any] | None = None,
     adlabels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Edit an ad's name, creative, tracking specs, status (ACTIVE, PAUSED or ARCHIVED) or labels, with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad's whole label set, so include any label to keep; an empty list removes every label. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
+    """Edit an ad's name, creative, tracking specs, status (ACTIVE, PAUSED or ARCHIVED) or labels, with before/after. ARCHIVED stops delivery for good: an archived ad cannot be restored to active from this server. tracking_specs (one object or a list of them) is sent as given. adlabels (a list of {"name": ...} or {"id": ...}) replaces the ad's whole label set, so include any label to keep; an empty list removes every label. Use validate_only to have Meta check the change without applying it. A changed field whose prior value Meta did not return is named in previous_unavailable."""
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
         raise ValidationError("ad_id is required.")

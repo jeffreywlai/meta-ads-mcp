@@ -124,3 +124,29 @@ def test_currencies_meta_documents_at_offset_100_are_accepted(currency) -> None:
     assert to_minor_units(12.34, currency) == 1234
     with pytest.raises(ValidationError, match="too many decimal places"):
         to_minor_units(12.345, currency)
+
+
+# Round twenty-five, C2: zero is a value of its own only where a caller asks for it, such as an
+# ad set's minimum spend targets (Meta: "To remove daily_min_spend_target ... set it to 0").
+
+
+def test_zero_is_accepted_only_when_the_field_allows_it() -> None:
+    from meta_ads_mcp.money import validate_positive_amount
+
+    assert to_minor_units(0, "USD", field_name="daily_min_spend_target", allow_zero=True) == 0
+    assert to_minor_units(0.0, "JPY", field_name="daily_min_spend_target", allow_zero=True) == 0
+    validate_positive_amount(0, field_name="daily_min_spend_target", allow_zero=True)
+    with pytest.raises(ValidationError, match="bid_amount must be greater than 0"):
+        to_minor_units(0, "USD", field_name="bid_amount")
+    with pytest.raises(ValidationError, match="bid_amount must be greater than 0"):
+        validate_positive_amount(0, field_name="bid_amount")
+
+
+@pytest.mark.parametrize("value", [-1, -0.01])
+def test_a_negative_amount_is_refused_even_where_zero_is_allowed(value) -> None:
+    from meta_ads_mcp.money import validate_positive_amount
+
+    with pytest.raises(ValidationError, match="daily_min_spend_target must be 0 or greater"):
+        to_minor_units(value, "USD", field_name="daily_min_spend_target", allow_zero=True)
+    with pytest.raises(ValidationError, match="daily_min_spend_target must be 0 or greater"):
+        validate_positive_amount(value, field_name="daily_min_spend_target", allow_zero=True)

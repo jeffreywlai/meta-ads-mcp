@@ -136,12 +136,16 @@ def to_minor_units(
     currency: str | None,
     *,
     field_name: str = "amount",
+    allow_zero: bool = False,
 ) -> int:
-    """Encode a human currency value exactly, rejecting unsupported precision."""
+    """Encode a human currency value exactly, rejecting unsupported precision.
+
+    allow_zero is for the few fields where Meta documents 0 as a value of its own,
+    such as an ad set's minimum spend targets, where 0 removes the target.
+    """
     decimal_places = currency_decimal_places(currency)
     numeric = _decimal_value(value, field_name=field_name)
-    if numeric <= 0:
-        raise ValidationError(f"{field_name} must be greater than 0.")
+    _check_sign(numeric, field_name=field_name, allow_zero=allow_zero)
     scaled = numeric * (Decimal(10) ** decimal_places)
     if scaled != scaled.to_integral_value():
         raise ValidationError(
@@ -151,11 +155,17 @@ def to_minor_units(
     return int(scaled)
 
 
-def validate_positive_amount(value: Any, *, field_name: str) -> None:
-    """Fail fast before any API lookup when a write amount is not positive."""
-    numeric = _decimal_value(value, field_name=field_name)
-    if numeric <= 0:
+def _check_sign(numeric: Decimal, *, field_name: str, allow_zero: bool) -> None:
+    if allow_zero and numeric < 0:
+        raise ValidationError(f"{field_name} must be 0 or greater.")
+    if not allow_zero and numeric <= 0:
         raise ValidationError(f"{field_name} must be greater than 0.")
+
+
+def validate_positive_amount(value: Any, *, field_name: str, allow_zero: bool = False) -> None:
+    """Fail fast before any API lookup when a write amount is not positive (or, with allow_zero, negative)."""
+    numeric = _decimal_value(value, field_name=field_name)
+    _check_sign(numeric, field_name=field_name, allow_zero=allow_zero)
 
 
 def from_minor_units(

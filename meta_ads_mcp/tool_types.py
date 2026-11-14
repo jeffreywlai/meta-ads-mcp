@@ -129,6 +129,27 @@ StrictCurrencyAmount: TypeAlias = Annotated[
     ),
 ]
 
+def _refuse_true_false_time(value: Any) -> Any:
+    """Refuse true or false where a time is expected; MCP would otherwise read true as 1."""
+    if isinstance(value, bool):
+        raise ValueError("a time must be text or whole Unix seconds, not true or false")
+    return value
+
+
+# A schedule time: ISO 8601 text, or whole Unix seconds as a number or as digit text.
+# Meta types these fields as datetime, which takes Unix seconds as a number. The value
+# is sent as given; the tool checks it (a UTC offset on text, a positive time).
+ScheduleTime: TypeAlias = Annotated[
+    str | Annotated[int, Field(strict=True)],
+    BeforeValidator(_refuse_true_false_time),
+    Field(
+        description=(
+            "An ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00), "
+            "or whole Unix seconds as a number or as digit text."
+        )
+    ),
+]
+
 BidConstraints: TypeAlias = Annotated[
     dict[str, Any],
     Field(

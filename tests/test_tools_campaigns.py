@@ -351,24 +351,23 @@ def test_campaign_params_cannot_supply_omitted_typed_or_control_fields(
         )
 
 
-def test_create_ad_set_requires_strategy_for_bid_constraints(monkeypatch) -> None:
-    monkeypatch.setattr(
-        campaigns,
-        "get_graph_api_client",
-        lambda: (_ for _ in ()).throw(AssertionError("client should not be created")),
-    )
-    with pytest.raises(campaigns.ValidationError, match="bid_strategy is required"):
-        asyncio.run(
-            campaigns.create_ad_set(
-                account_id="123",
-                campaign_id="cmp_123",
-                name="Missing strategy",
-                billing_event="IMPRESSIONS",
-                optimization_goal="VALUE",
-                targeting={"geo_locations": {"countries": ["US"]}},
-                bid_constraints={"roas_average_floor": 30000},
-            )
+def test_create_ad_set_bid_constraints_without_a_local_strategy_are_sent(monkeypatch) -> None:
+    """Round twenty-five, C7: the ad set takes its campaign's bid strategy, so none is needed here."""
+    client = FakeCampaignClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(
+        campaigns.create_ad_set(
+            account_id="123",
+            campaign_id="cmp_123",
+            name="Campaign strategy",
+            billing_event="IMPRESSIONS",
+            optimization_goal="VALUE",
+            targeting={"geo_locations": {"countries": ["US"]}},
+            bid_constraints={"roas_average_floor": 30000},
         )
+    )
+    assert client.created_payload["data"]["bid_constraints"] == {"roas_average_floor": 30000}
+    assert "bid_strategy" not in client.created_payload["data"]
 
 
 def test_update_campaign_encodes_zero_decimal_budget_without_cents(monkeypatch) -> None:
@@ -875,7 +874,8 @@ def test_create_ad_set_spend_cap_zero_decimal_currency(monkeypatch) -> None:
     ("arguments", "message"),
     [
         ({"daily_spend_cap": -1}, "daily_spend_cap must be greater than 0"),
-        ({"lifetime_min_spend_target": 0}, "lifetime_min_spend_target must be greater than 0"),
+        ({"lifetime_min_spend_target": -1}, "lifetime_min_spend_target must be 0 or greater"),
+        ({"daily_spend_cap": 0}, "daily_spend_cap must be greater than 0"),
         ({"frequency_control_specs": []}, "frequency_control_specs must not be empty"),
         ({"attribution_spec": ["CLICK"]}, "attribution_spec"),
         ({"adset_schedule": [1]}, "adset_schedule"),
@@ -1249,7 +1249,7 @@ def test_update_adset_rejects_too_many_decimals_before_writing(monkeypatch) -> N
     ("arguments", "message"),
     [
         ({"daily_spend_cap": 0}, "daily_spend_cap must be greater than 0"),
-        ({"lifetime_min_spend_target": -5}, "lifetime_min_spend_target must be greater than 0"),
+        ({"lifetime_min_spend_target": -5}, "lifetime_min_spend_target must be 0 or greater"),
         ({"daily_spend_cap": float("nan")}, "daily_spend_cap"),
         ({"params": {"daily_spend_cap": 9000}}, "named daily_spend_cap parameter"),
         ({"params": {"lifetime_spend_cap": 9000}}, "named lifetime_spend_cap parameter"),
@@ -2506,8 +2506,7 @@ _ROTATION_TIMES = [1796101200, 1796706000]
         ({"rf_prediction_id": "12a"}, "rf_prediction_id must be a Meta id"),
         ({"placement_soft_opt_out": {}}, "placement_soft_opt_out must be a non-empty object"),
         ({"brand_safety_config": []}, "brand_safety_config must be a non-empty object"),
-        ({"creative_sequence": []}, "creative_sequence must be a non-empty list of Meta ad ids"),
-        ({"creative_sequence": ["11", "ad_12"]}, "creative_sequence must be a non-empty list of Meta ad ids"),
+        ({"creative_sequence": ["11", "ad_12"]}, "creative_sequence must be a list of Meta ad ids"),
         ({"time_based_ad_rotation_id_blocks": [["11"], []], "time_based_ad_rotation_intervals": _ROTATION_TIMES},
          "time_based_ad_rotation_id_blocks must be a non-empty list of non-empty lists of Meta ad ids"),
         ({"time_based_ad_rotation_id_blocks": [["11"], ["x"]], "time_based_ad_rotation_intervals": _ROTATION_TIMES},
@@ -3398,3 +3397,225 @@ def test_duplicate_with_every_copied_object_read_has_no_note(monkeypatch) -> Non
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
     result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111"))
     assert "copied_objects_note" not in result
+
+
+# Round twenty-five. Each check here was stricter than Meta, so a valid call was refused.
+
+
+def _r25_sent(client: BoundaryRecordingClient) -> dict:
+    writes = [call for call in client.calls if call[0] in {"create", "update"}]
+    assert len(writes) == 1, client.calls
+    return writes[0][-1]
+
+
+# C2: Meta's Advantage campaign budget guide, ad set-level controls: "To remove
+# daily_min_spend_target from an ad set, set it to 0"; the same for lifetime_min_spend_target.
+
+
+@pytest.mark.parametrize("field", ["daily_min_spend_target", "lifetime_min_spend_target"])
+@pytest.mark.parametrize("tool", ["create_ad_set", "update_adset"])
+@pytest.mark.parametrize("through_mcp", [False, True])
+def test_r25_zero_minimum_spend_target_is_sent(monkeypatch, field, tool, through_mcp) -> None:
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    args = {**(_G12_ADSET_ARGS if tool == "create_ad_set" else {"adset_id": "20"}), field: 0}
+    if through_mcp:
+        asyncio.run(mcp_server.call_tool(tool, args))
+    else:
+        asyncio.run(getattr(campaigns, tool)(**args))
+    sent = _r25_sent(client)
+    assert sent[field] == 0
+    assert type(sent[field]) is int
+
+
+def test_r25_update_adset_zero_minimum_target_reports_what_was_sent(monkeypatch) -> None:
+    client = BoundaryRecordingClient(stored={"daily_min_spend_target": "500"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(adset_id="20", daily_min_spend_target=0))
+    assert result["previous"]["daily_min_spend_target"] == 5.0
+    assert result["current"]["daily_min_spend_target"] == 0
+    assert _r25_sent(client) == {"daily_min_spend_target": 0}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("daily_min_spend_target", -1, "daily_min_spend_target must be 0 or greater"),
+        ("lifetime_min_spend_target", -0.5, "lifetime_min_spend_target must be 0 or greater"),
+        ("daily_spend_cap", 0, "daily_spend_cap must be greater than 0"),
+        ("lifetime_spend_cap", 0, "lifetime_spend_cap must be greater than 0"),
+        ("bid_amount", 0, "bid_amount must be greater than 0"),
+        ("daily_budget", 0, "daily_budget must be greater than 0"),
+    ],
+)
+@pytest.mark.parametrize("tool", ["create_ad_set", "update_adset"])
+def test_r25_other_amounts_stay_strictly_positive(monkeypatch, tool, field, value, message) -> None:
+    if tool == "update_adset" and field in {"bid_amount", "daily_budget"}:
+        pytest.skip("update_adset does not take budgets or bids")
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    args = ADSET_BASE if tool == "create_ad_set" else {"adset_id": "20"}
+    with pytest.raises(campaigns.ValidationError, match=message):
+        asyncio.run(getattr(campaigns, tool)(**args, **{field: value}))
+
+
+# C5: Meta's Reservation guide: "If creative_sequence array length is zero, then you're using no sequencing."
+
+
+def test_r25_empty_creative_sequence_means_no_sequencing(monkeypatch) -> None:
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(**_G12_ADSET_ARGS, creative_sequence=[]))
+    assert _r25_sent(client)["creative_sequence"] == []
+
+
+@pytest.mark.parametrize("sequence", [["11", "ad_12"], "11", [11]])
+def test_r25_a_creative_sequence_with_entries_is_still_checked(monkeypatch, sequence) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    with pytest.raises(campaigns.ValidationError, match="creative_sequence must be a list of Meta ad ids"):
+        asyncio.run(campaigns.create_ad_set(**ADSET_BASE, creative_sequence=sequence))
+
+
+# C7: Meta's Advantage campaign budget guide sets LOWEST_COST_WITH_MIN_ROAS on the campaign, then
+# creates the ad set with bid_constraints and no bid_strategy: "All ad sets share the same bid
+# strategy defined at the ad campaign level."
+
+
+def test_r25_bid_constraints_follow_the_campaign_bid_strategy(monkeypatch) -> None:
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.create_ad_set(
+        **{**_G12_ADSET_ARGS, "optimization_goal": "VALUE"},
+        promoted_object={"pixel_id": "40", "custom_event_type": "PURCHASE"},
+        bid_constraints={"roas_average_floor": 10000},
+    ))
+    sent = _r25_sent(client)
+    assert sent["bid_constraints"] == {"roas_average_floor": 10000}
+    assert "bid_strategy" not in sent
+
+
+def test_r25_bid_constraints_with_no_strategy_at_either_level_get_metas_error_and_the_hint(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    class NoStrategyClient(BoundaryRecordingClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            self.calls.append(("create", parent_id, edge, dict(data)))
+            raise MetaApiError(message="Bid amount required", status_code=400, code=100, subcode=2490487)
+
+    client = NoStrategyClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError) as info:
+        asyncio.run(campaigns.create_ad_set(**_G12_ADSET_ARGS, bid_constraints={"roas_average_floor": 10000}))
+    assert "No bid strategy was sent with this ad set" in info.value.message
+    assert info.value.subcode == 2490487
+
+
+# C8 and A6: Meta's ad set and copies references type start_time and end_time as datetime and
+# say "UTC UNIX timestamp"; whole Unix seconds as a number are accepted and forwarded as given.
+
+_R25_TIME_TOOLS = {
+    "create_campaign": ({"account_id": "10", "name": "C", "objective": "OUTCOME_TRAFFIC"}, "start_time", "stop_time"),
+    "update_campaign": ({"campaign_id": "20"}, "start_time", "stop_time"),
+    "create_ad_set": (_G12_ADSET_ARGS, "start_time", "end_time"),
+    "update_adset": ({"adset_id": "20"}, "start_time", "end_time"),
+    "duplicate_campaign": ({"campaign_id": "20", "deep_copy": True}, "start_time", "end_time"),
+    "duplicate_adset": ({"adset_id": "20"}, "start_time", "end_time"),
+}
+_R25_START = 1_798_761_600  # 2027-01-01T00:00:00Z
+_R25_END = 1_799_366_400  # 2027-01-08T00:00:00Z
+
+
+def _r25_time_call(monkeypatch, tool: str, times: dict, *, through_mcp: bool) -> dict:
+    """Run one schedule call and return the data sent (or, for a copy, the dry run's request data)."""
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    args = {**_R25_TIME_TOOLS[tool][0], **times}
+    if tool.startswith("duplicate"):
+        args["dry_run"] = True
+    if through_mcp:
+        result = asyncio.run(mcp_server.call_tool(tool, args)).structured_content
+    else:
+        result = asyncio.run(getattr(campaigns, tool)(**args))
+    if tool.startswith("duplicate"):
+        assert client.calls == []
+        return result["requests"][0]["data"]
+    return _r25_sent(client)
+
+
+@pytest.mark.parametrize("through_mcp", [False, True])
+@pytest.mark.parametrize("tool", list(_R25_TIME_TOOLS))
+def test_r25_whole_unix_seconds_are_accepted_and_sent_as_given(monkeypatch, tool, through_mcp) -> None:
+    _, start_key, end_key = _R25_TIME_TOOLS[tool]
+    times = {start_key: _R25_START, end_key: _R25_END}
+    sent = _r25_time_call(monkeypatch, tool, times, through_mcp=through_mcp)
+    assert {key: sent[key] for key in times} == times
+    assert all(type(sent[key]) is int for key in times)
+
+
+@pytest.mark.parametrize("tool", ["update_adset", "duplicate_adset", "duplicate_campaign", "create_ad_set"])
+def test_r25_end_time_zero_as_a_number_means_no_end_and_is_sent(monkeypatch, tool) -> None:
+    sent = _r25_time_call(monkeypatch, tool, {"start_time": _R25_START, "end_time": 0}, through_mcp=True)
+    assert sent["end_time"] == 0
+    assert sent["start_time"] == _R25_START
+
+
+@pytest.mark.parametrize("tool", list(_R25_TIME_TOOLS))
+@pytest.mark.parametrize(("which", "value"), [("start", 0), ("start", -5), ("end", -5)])
+def test_r25_numeric_times_keep_the_positive_rule(monkeypatch, tool, which, value) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    base, start_key, end_key = _R25_TIME_TOOLS[tool]
+    args = {**base, (start_key if which == "start" else end_key): value}
+    with pytest.raises(campaigns.ValidationError, match="positive"):
+        asyncio.run(getattr(campaigns, tool)(**args))
+
+
+@pytest.mark.parametrize("tool", ["create_campaign", "update_campaign", "update_adset", "duplicate_adset", "duplicate_campaign"])
+def test_r25_numeric_times_keep_the_end_after_start_rule(monkeypatch, tool) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    base, start_key, end_key = _R25_TIME_TOOLS[tool]
+    with pytest.raises(campaigns.ValidationError, match="after start_time"):
+        asyncio.run(getattr(campaigns, tool)(**base, **{start_key: _R25_END, end_key: _R25_START}))
+
+
+@pytest.mark.parametrize("value", [True, False])
+@pytest.mark.parametrize("tool", list(_R25_TIME_TOOLS))
+def test_r25_true_or_false_is_not_a_time(monkeypatch, tool, value) -> None:
+    from fastmcp.exceptions import ToolError, ValidationError as MCPValidationError
+    from meta_ads_mcp.coordinator import mcp_server
+
+    client = BoundaryRecordingClient()
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    base, start_key, _ = _R25_TIME_TOOLS[tool]
+    mcp_args = {**base, start_key: value, **({"dry_run": True} if tool.startswith("duplicate") else {})}
+    with pytest.raises((ToolError, MCPValidationError)):
+        asyncio.run(mcp_server.call_tool(tool, mcp_args))
+    with pytest.raises(campaigns.ValidationError, match="start_time must be"):
+        asyncio.run(getattr(campaigns, tool)(**base, **{start_key: value}))
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("tool", ["update_adset", "update_campaign", "create_campaign"])
+def test_r25_iso_text_still_needs_a_utc_offset(monkeypatch, tool) -> None:
+    monkeypatch.setattr(campaigns, "get_graph_api_client", _no_client)
+    base, start_key, _ = _R25_TIME_TOOLS[tool]
+    with pytest.raises(campaigns.ValidationError, match="UTC offset"):
+        asyncio.run(getattr(campaigns, tool)(**base, **{start_key: "2027-01-01T00:00:00"}))
+
+
+def test_r25_update_adset_numeric_start_is_checked_against_the_stored_end(monkeypatch) -> None:
+    client = BoundaryRecordingClient(stored={"end_time": "2027-01-01T00:00:00+0000"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.ValidationError, match="stored end_time"):
+        asyncio.run(campaigns.update_adset(adset_id="20", start_time=_R25_END))
+    assert all(call[0] != "update" for call in client.calls)
+
+
+def test_r25_update_campaign_numeric_time_is_compared_with_what_meta_stored(monkeypatch) -> None:
+    client = BoundaryRecordingClient(stored={"start_time": "2027-01-01T00:00:00+0000"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="20", start_time=_R25_START))
+    assert result["current"]["start_time"] == _R25_START
+    assert "warnings" not in result
