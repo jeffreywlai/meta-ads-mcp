@@ -2614,11 +2614,24 @@ async def get_catalog_event_source_recommendations(
             checks_paged = bool(checks_page["paging"].get("next"))
             if checks_paged:
                 missing.append(f"da_checks for pixel {pixel_id} had more pages than were read.")
-            dpa_check = next((c for c in checks if c.get("key") == "pixel_missing_dpa_event"), None)
+            dpa_checks = [c for c in checks if c.get("key") == "pixel_missing_dpa_event"]
+            dpa_check = dpa_checks[0] if dpa_checks else None
             result = str((dpa_check or {}).get("result") or "").lower()
-            if dpa_check is not None:
+            verdicts = {str(c.get("result") or "").lower() for c in dpa_checks} & {"passed", "failed"}
+            if len(verdicts) > 1:
+                # The same check says both passed and failed: neither is taken, and both are shown.
+                # One entry, or entries that agree, are read as before.
+                evidence.extend(dpa_checks)
+                strength = "unknown"
+                reason = (
+                    "Meta returned the check pixel_missing_dpa_event more than once with opposite results "
+                    "(passed and failed), so the result is unknown."
+                )
+            elif dpa_check is not None:
                 evidence.append(dpa_check)
-            if result == "passed":
+            if len(verdicts) > 1:
+                pass
+            elif result == "passed":
                 strength = "strong"
                 reason = "Meta's check pixel_missing_dpa_event passed: the pixel already sends catalog events."
             elif result == "failed":

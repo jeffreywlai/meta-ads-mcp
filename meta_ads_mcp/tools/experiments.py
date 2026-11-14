@@ -1003,9 +1003,28 @@ def _split_outcome(
     A winner or high performer not found in the cells read is said to be unmapped because the
     cells read are incomplete whenever they are: not every cell, or not every membership page.
     """
-    for entry in objective["parsed_results"]:
-        if not isinstance(entry, dict) or not SPLIT_RESULT_KEYS & set(entry):
-            continue
+    recognised = [
+        entry for entry in objective["parsed_results"]
+        if isinstance(entry, dict) and SPLIT_RESULT_KEYS & set(entry)
+    ]
+    winners = sorted({
+        str(entry["winner_ad_object_id"]) for entry in recognised
+        if entry.get("winner_ad_object_id") not in (None, "")
+    })
+    if len(winners) > 1:
+        # The objective's results name different winners, with nothing here to tell them apart:
+        # none is taken. One result, or results naming the same winner, are read as before.
+        return {
+            "objective_id": objective.get("id"),
+            "is_primary": objective.get("is_primary"),
+            "winner": None,
+            "conflicting_winner_ids": winners,
+            "winner_conflict_note": (
+                "Meta's results for this objective name more than one winner, so no winner is named here; "
+                "see conflicting_winner_ids and check the study in Meta."
+            ),
+        }
+    for entry in recognised:
         winner_id = entry.get("winner_ad_object_id")
         response: dict[str, Any] = {
             "objective_id": objective.get("id"),
@@ -1138,6 +1157,8 @@ def _split_results(
     response.update({key: value for key, value in outcome.items() if key not in {"objective_id", "is_primary"}})
     if outcome["winner"] is not None:
         response["message"] = "Meta reported a winning cell."
+    elif outcome.get("conflicting_winner_ids"):
+        response["message"] = "Meta's results name more than one winner, so no winner is named."
     else:
         response["message"] = (
             "Meta reported no single winner. For creative tests Meta's authoritative "
