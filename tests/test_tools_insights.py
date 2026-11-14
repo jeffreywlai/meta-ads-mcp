@@ -2365,7 +2365,13 @@ def test_get_entity_insights_sort_without_fields_uses_a_lean_field_list(monkeypa
     assert "lean" in result["summary"]["sort_fields_note"]
 
 
-@pytest.mark.parametrize("value", ["spend", "spend descending", "_descending", "spend_descending,reach_ascending", " "])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "spend descending", "_descending", "_ascending", "descending", "ascending", "spend_",
+        "actions:", "spend_descending,reach_ascending", "spend,reach", "", " ", 7,
+    ],
+)
 def test_get_entity_insights_rejects_a_malformed_sort_before_any_call(monkeypatch, value) -> None:
     client = RecordingInsightsClient()
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
@@ -2381,6 +2387,42 @@ def test_get_entity_insights_sort_accepts_action_sort_keys(monkeypatch) -> None:
         level="ad", object_id="act_123", sort="actions:link_click_descending", fields=["ad_id", "actions"],
     ))
     assert client.calls[0]["params"]["sort"] == ["actions:link_click_descending"]
+
+
+@pytest.mark.parametrize(
+    ("value", "sent"),
+    [
+        ("spend", "spend_ascending"),
+        ("actions:link_click", "actions:link_click_ascending"),
+        (" cost_per_action_type:offsite_conversion.fb_pixel_purchase ",
+         "cost_per_action_type:offsite_conversion.fb_pixel_purchase_ascending"),
+    ],
+)
+def test_get_entity_insights_bare_sort_is_sent_with_metas_default_ascending_direction(monkeypatch, value, sent) -> None:
+    """Insights reference: the _ascending/_descending suffix is optional and ascending is the default.
+
+    A bare field is sent with _ascending written out, so the request and summary.sort both name the direction.
+    """
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(insights.get_entity_insights(
+        level="account", object_id="123", fields=["spend"], sort=value,
+    ))
+
+    assert client.calls[0]["params"]["sort"] == [sent]
+    assert result["summary"]["sort"] == sent
+
+
+def test_get_entity_insights_bare_sort_without_fields_still_uses_the_lean_field_list(monkeypatch) -> None:
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", sort="spend"))
+
+    assert client.calls[0]["fields"] == insights.SORTED_DEFAULT_INSIGHTS_FIELDS
+    assert client.calls[0]["params"]["sort"] == ["spend_ascending"]
+    assert "lean" in result["summary"]["sort_fields_note"]
 
 
 # Round fourteen (R12 S4): a date the caller typed never reaches a logged exception chain.

@@ -66,6 +66,9 @@ SORTED_DEFAULT_INSIGHTS_FIELDS = [
     field for field in DEFAULT_INSIGHTS_FIELDS if field not in ("actions", "action_values")
 ]
 SORT_PATTERN = re.compile(r"^[A-Za-z0-9_.:]*[A-Za-z0-9]_(ascending|descending)$")
+# Meta's Insights reference makes the _ascending/_descending suffix optional, with ascending the default.
+BARE_SORT_PATTERN = re.compile(r"^[A-Za-z0-9_.:]*[A-Za-z0-9]$")
+SORT_DIRECTIONS = ("ascending", "descending")
 
 ASYNC_ID_FIELDS_BY_LEVEL = {
     "account": ["account_id", "account_name"],
@@ -494,16 +497,27 @@ def _insights_params(
 
 
 def _normalize_sort(sort: str | None) -> str | None:
-    """Validate Meta's one-element insights sort, <field>_ascending or <field>_descending, before any call."""
+    """Validate Meta's one-element insights sort before any call and return it with its direction written out.
+
+    Meta accepts <field>_ascending, <field>_descending, or a bare <field>, which it sorts ascending. A bare
+    field is returned as <field>_ascending, so the request and the reported sort both name the direction.
+    """
     if sort is None:
         return None
     value = sort.strip() if isinstance(sort, str) else sort
-    if not isinstance(value, str) or not SORT_PATTERN.match(value):
-        raise ValidationError(
-            "sort must be one field and a direction joined by an underscore, such as spend_descending, "
-            "impressions_ascending or actions:link_click_descending. Meta accepts one sort key per request."
-        )
-    return value
+    if isinstance(value, str) and SORT_PATTERN.match(value):
+        return value
+    if (
+        isinstance(value, str)
+        and BARE_SORT_PATTERN.match(value)
+        and value.rpartition("_")[2] not in SORT_DIRECTIONS
+    ):
+        return f"{value}_ascending"
+    raise ValidationError(
+        "sort must be one field, optionally followed by _ascending or _descending, such as spend, "
+        "spend_descending or actions:link_click_descending. Without a direction Meta sorts ascending. "
+        "Meta accepts one sort key per request."
+    )
 
 
 def _normalize_reporting_object_id(level: str, object_id: str) -> str:
@@ -849,7 +863,7 @@ async def get_entity_insights(
     fetch_all: bool = False,
     sort: str | None = None,
 ) -> dict[str, Any]:
-    """Return paginated insights with optional named scalar actions such as purchase. flatten_actions removes full action maps unless include_raw_actions=true. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values. Optional sort, such as spend_descending."""
+    """Return paginated insights with optional named scalar actions such as purchase. flatten_actions removes full action maps unless include_raw_actions=true. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values. Optional sort: one field, such as spend_descending or actions:link_click_ascending; a bare field such as spend is Meta's default ascending order and is sent and reported as spend_ascending."""
     sort_key = _normalize_sort(sort)
     if sort_key is not None and fields is None:
         fields = list(SORTED_DEFAULT_INSIGHTS_FIELDS)

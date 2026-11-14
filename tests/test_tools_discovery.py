@@ -285,6 +285,99 @@ def test_destination_projection_preserves_explicit_creative_selection(monkeypatc
     assert "https://shop.example/asset" in result["item"]["destination_urls"]
 
 
+CREATIVE_SUMMARY_SELECTION = (
+    "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+    "effective_instagram_media_id,object_story_spec}"
+)
+
+
+class RecordingAdClient:
+    """Records the fields of every get_object request exactly as the tool sends them."""
+
+    def __init__(self) -> None:
+        self.fields: list[list[str]] = []
+
+    async def get_object(self, object_id, *, fields):
+        self.fields.append(list(fields))
+        return {"id": object_id, "creative": {"id": "cr1", "image_hash": "hash1"}}
+
+
+@pytest.mark.parametrize(
+    ("fields", "sent"),
+    [
+        # Requests captured at e2cddee, before explicit creative selections were kept.
+        (None, ["id", "account_id", "name", "status", "effective_status", "campaign_id", "adset_id",
+                "bid_amount", CREATIVE_SUMMARY_SELECTION]),
+        (["id", "creative"], ["id", CREATIVE_SUMMARY_SELECTION]),
+        (["id", "name"], ["id", "name", CREATIVE_SUMMARY_SELECTION]),
+        ("id,destination_urls", [
+            "id",
+            "creative{link_url,object_url,object_store_url,template_url,link_deep_link_url,object_story_spec,"
+            "asset_feed_spec{link_urls},call_to_action,id,name,title,body,object_story_id,"
+            "effective_object_story_id,effective_instagram_media_id}",
+        ]),
+    ],
+)
+def test_creative_summary_without_an_explicit_creative_selection_is_unchanged(monkeypatch, fields, sent) -> None:
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    asyncio.run(discovery.get_ad("ad1", include_creative_summary=True, fields=fields))
+
+    assert client.fields == [sent]
+
+
+def test_creative_summary_keeps_the_callers_explicit_creative_fields(monkeypatch) -> None:
+    """Ad.creative is an AdCreative, whose image_hash is a readable field (Ad Creative reference)."""
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.get_ad(
+        "ad1", fields=["id", "creative{image_hash}"], include_creative_summary=True,
+    ))
+
+    assert client.fields == [[
+        "id",
+        "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+        "effective_instagram_media_id,object_story_spec,image_hash}",
+    ]]
+    assert result["item"]["creative"]["image_hash"] == "hash1"
+
+
+def test_creative_summary_merges_nested_and_overlapping_creative_selections(monkeypatch) -> None:
+    """Nested selections survive; a narrower selection of a summary field widens to the whole field."""
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    asyncio.run(discovery.get_ad(
+        "ad1",
+        fields="id,creative{name,asset_feed_spec{images,bodies},object_story_spec{link_data}},creative{url_tags}",
+        include_creative_summary=True,
+    ))
+
+    assert client.fields == [[
+        "id",
+        "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+        "effective_instagram_media_id,object_story_spec,asset_feed_spec{images,bodies},url_tags}",
+    ]]
+
+
+def test_creative_summary_and_destination_urls_keep_explicit_creative_fields(monkeypatch) -> None:
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    asyncio.run(discovery.get_ad(
+        "ad1", fields="id,creative{image_hash},destination_urls", include_creative_summary=True,
+    ))
+
+    assert client.fields == [[
+        "id",
+        "creative{link_url,object_url,object_store_url,template_url,link_deep_link_url,object_story_spec,"
+        "asset_feed_spec{link_urls},call_to_action,id,name,title,body,object_story_id,"
+        "effective_object_story_id,effective_instagram_media_id,image_hash}",
+    ]]
+
+
 @pytest.mark.parametrize("tool_name", ["list_ads", "get_ad"])
 @pytest.mark.parametrize("cta_path", [
     ("call_to_action",),

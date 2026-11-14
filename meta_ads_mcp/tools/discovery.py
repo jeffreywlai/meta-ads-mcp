@@ -83,6 +83,11 @@ MONETARY_FIELDS = {
     "daily_budget", "lifetime_budget", "amount_spent", "balance", "bid_amount",
 }
 
+CREATIVE_SUMMARY_FIELDS = [
+    "id", "name", "title", "body", "object_story_id", "effective_object_story_id",
+    "effective_instagram_media_id", "object_story_spec",
+]
+
 DESTINATION_CREATIVE_FIELDS = [
     "link_url", "object_url", "object_store_url", "template_url", "link_deep_link_url",
     "object_story_spec", "asset_feed_spec{link_urls}", "call_to_action",
@@ -208,15 +213,9 @@ def _field_name(field: str) -> str:
     return re.split(r"[.{]", field, maxsplit=1)[0].strip()
 
 
-def _ad_graph_fields(selected_fields: list[str]) -> list[str]:
-    """Replace the local destination_urls projection with creative URL sources."""
-    if "destination_urls" not in selected_fields:
-        return list(selected_fields)
-    graph_fields = [
-        field for field in selected_fields
-        if field != "destination_urls" and _field_name(field) != "creative"
-    ]
-    creative_fields = list(DESTINATION_CREATIVE_FIELDS)
+def _merged_creative_selection(base_fields: list[str], selected_fields: list[str]) -> str:
+    """Return one creative{...} selection holding base_fields and every explicit creative sub-selection."""
+    creative_fields = list(base_fields)
     for field in selected_fields:
         if _field_name(field) != "creative" or "{" not in field:
             continue
@@ -229,7 +228,18 @@ def _ad_graph_fields(selected_fields: list[str]) -> list[str]:
                 creative_fields.append(selection)
             elif creative_fields[position] != selection:
                 creative_fields[position] = name
-    graph_fields.append("creative{" + ",".join(creative_fields) + "}")
+    return "creative{" + ",".join(creative_fields) + "}"
+
+
+def _ad_graph_fields(selected_fields: list[str]) -> list[str]:
+    """Replace the local destination_urls projection with creative URL sources."""
+    if "destination_urls" not in selected_fields:
+        return list(selected_fields)
+    graph_fields = [
+        field for field in selected_fields
+        if field != "destination_urls" and _field_name(field) != "creative"
+    ]
+    graph_fields.append(_merged_creative_selection(DESTINATION_CREATIVE_FIELDS, selected_fields))
     return graph_fields
 
 
@@ -667,16 +677,14 @@ async def get_ad(
     include_creative_summary: bool = False,
     fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """Inspect one ad with selectable fields, optionally including a creative summary. fields may include destination_urls for configured creative links (no redirect/catalog resolution or url_tags expansion). Bid amounts use major units of the account currency."""
+    """Inspect one ad with selectable fields, optionally including a creative summary. include_creative_summary adds the summary fields to the creative selection and keeps any creative fields named in fields, such as creative{image_hash}. fields may include destination_urls for configured creative links (no redirect/catalog resolution or url_tags expansion). Bid amounts use major units of the account currency."""
     client = get_graph_api_client()
     selected_fields = normalize_field_list(fields) or None
     requested_fields = list(selected_fields or AD_FIELDS)
     if include_creative_summary:
+        creative_selection = _merged_creative_selection(CREATIVE_SUMMARY_FIELDS, requested_fields)
         requested_fields = [field for field in requested_fields if _field_name(field) != "creative"]
-        requested_fields.append(
-            "creative{id,name,title,body,object_story_id,effective_object_story_id,"
-            "effective_instagram_media_id,object_story_spec}"
-        )
+        requested_fields.append(creative_selection)
     ad = await client.get_object(ad_id, fields=_entity_read_fields(_ad_graph_fields(requested_fields), AD_FIELDS))
     item = (await _hydrate_and_normalize_monetary_fields(
         client, [ad], selected_fields=selected_fields,
