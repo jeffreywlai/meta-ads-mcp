@@ -1258,8 +1258,9 @@ def _metric_reference(field_names: Any) -> dict[str, Any]:
             "(meta_ads_mcp/context/insights_metrics.md) and derived metrics (meta_ads_mcp/diagnostics.py)"
         ),
         "sort_syntax": (
-            "Meta's Insights sort parameter takes one value: a field name with _ascending or _descending, "
-            "or actions:<action_type>_ascending for action lists. Meta does not publish which fields it accepts."
+            "Meta's Insights sort parameter takes one value: a field name, optionally followed by _ascending or "
+            "_descending (ascending when left out), or actions:<action_type> in the same way for action lists. "
+            "Meta does not publish which fields it accepts."
         ),
         "filter_operators": list(INSIGHTS_FILTER_OPERATORS),
         "filter_syntax": (
