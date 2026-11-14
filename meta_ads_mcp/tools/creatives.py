@@ -22,7 +22,7 @@ from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
 from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.secret_scrub import ANYWHERE, scrub_exception
+from meta_ads_mcp.secret_scrub import ANYWHERE, SecretScrubber, scrub_exception
 from meta_ads_mcp.tool_types import (
     AccountId,
     FieldList,
@@ -99,21 +99,49 @@ def partnership_codes(*raw_inputs: Any) -> list[str]:
     return list(dict.fromkeys(codes))
 
 
-class PartnershipCodesHidden:
-    """Keeps the Partnership Ad codes found in raw creative inputs out of every error a block raises.
+FILE_SHOWN = "<file>"
 
-    Used as ``with PartnershipCodesHidden(spec, params): ...`` around a tool's whole body: an error
-    leaving the block has each code removed (meta_ads_mcp.secret_scrub, at any length, written plainly
-    or encoded) from its message, fields and the errors chained behind it, before the MCP error or a
-    traceback log is built from it. scrub() does the same for an error a tool catches and keeps.
+
+def local_file_forms(file_path: str, *names: str) -> tuple[str, ...]:
+    """Every form of a local file a message can repeat: the path as given, trimmed and expanded, and its names."""
+    text = file_path if isinstance(file_path, str) else ""
+    return (text, text.strip(), str(Path(text.strip()).expanduser()) if text.strip() else "", *names)
+
+
+class CallSecrets:
+    """The secrets and private file names known in one call, and the one place their text is removed.
+
+    Partnership Ad codes (shown as PARTNERSHIP_CODE_SHOWN) and a local file's path and names (shown
+    as FILE_SHOWN) are removed by meta_ads_mcp.secret_scrub at any length, written plainly or encoded.
+    Two ways in, and every text from Meta or from an exception goes through one of them:
+
+    - ``with secrets: ...`` around a tool's body: an error leaving the block is cleaned (message,
+      fields, args and the errors chained behind it) before the MCP error or a traceback log is built.
+    - failure_text(exc) and public_error(exc) for an error a tool catches and keeps in its result
+      (a note, a warning, a failed list): the error is cleaned the same way, then its text is returned.
     """
 
-    __slots__ = ("codes",)
+    __slots__ = ("_scrubbers",)
 
-    def __init__(self, *raw_inputs: Any) -> None:
-        self.codes = partnership_codes(*raw_inputs)
+    def __init__(self, *, codes: Any = (), files: Any = ()) -> None:
+        self._scrubbers = [
+            scrubber for scrubber in (
+                SecretScrubber(codes, policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN),
+                SecretScrubber(files, policy=ANYWHERE, shown=FILE_SHOWN),
+            ) if scrubber
+        ]
 
-    def __enter__(self) -> PartnershipCodesHidden:
+    @classmethod
+    def for_creative_inputs(cls, *raw_inputs: Any) -> CallSecrets:
+        """The Partnership Ad codes found in raw creative inputs (partnership_codes)."""
+        return cls(codes=partnership_codes(*raw_inputs))
+
+    @classmethod
+    def for_local_file(cls, file_path: str, *names: str) -> CallSecrets:
+        """A local file's path, as given and resolved, and the names it was opened and sent under."""
+        return cls(files=local_file_forms(file_path, *names))
+
+    def __enter__(self) -> CallSecrets:
         return self
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, traceback: Any) -> bool:
@@ -122,8 +150,30 @@ class PartnershipCodesHidden:
         return False
 
     def scrub(self, exc: BaseException) -> None:
-        if self.codes:
-            scrub_exception(exc, self.codes, policy=ANYWHERE, shown=PARTNERSHIP_CODE_SHOWN)
+        """Clean a raised error and every error behind it, in place."""
+        for scrubber in self._scrubbers:
+            scrubber.exception(exc)
+
+    def text(self, text: str) -> str:
+        for scrubber in self._scrubbers:
+            text = scrubber.text(text)
+        return text
+
+    def failure_text(self, exc: BaseException) -> str:
+        """A caught error's text, cleaned, for a result: the only way such text goes into one."""
+        self.scrub(exc)
+        return _failure_reason(exc)
+
+    def public_error(self, exc: BaseException) -> dict[str, Any]:
+        """A caught error's public fields (to_public_dict when it has one), cleaned, for a result."""
+        self.scrub(exc)
+        public = getattr(exc, "to_public_dict", None)
+        return public() if callable(public) else {"type": type(exc).__name__}
+
+
+# A call that knows no secret: its caught error text still goes through the same helper.
+NO_SECRETS = CallSecrets()
+
 
 
 def _failure_reason(exc: BaseException) -> str:
@@ -286,7 +336,7 @@ async def create_ad_creative(
         "degrees_of_freedom_spec": degrees_of_freedom_spec or OMIT,
     }
     # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
-    with PartnershipCodesHidden(object_story_spec, asset_feed_spec, degrees_of_freedom_spec, params):
+    with CallSecrets.for_creative_inputs(object_story_spec, asset_feed_spec, degrees_of_freedom_spec, params):
         client = get_graph_api_client()
         created = await client.create_edge_object(
             normalize_account_id(account_id),
@@ -349,12 +399,12 @@ async def _preview_many(
     creative_id: str | None,
     creative: dict[str, Any] | None,
     formats: list[str],
-    hidden: PartnershipCodesHidden,
+    hidden: CallSecrets,
 ) -> dict[str, Any]:
     """Request one preview per format, keeping the formats Meta refused.
 
-    A refused format's error is kept as text in the result, so the creative's Partnership Ad
-    codes are removed from it first (hidden).
+    A refused format's error is kept as text in the result, so it goes through
+    hidden.failure_text, which removes the creative's Partnership Ad codes first.
     """
     client = get_graph_api_client()
     items: list[dict[str, Any]] = []
@@ -369,17 +419,16 @@ async def _preview_many(
                 ad_format=ad_format,
             )
         except MetaApiError as exc:
-            hidden.scrub(exc)
-            failed.append({"ad_format": ad_format, "error": exc.message, "code": exc.code})
+            failed.append({"ad_format": ad_format, "error": hidden.failure_text(exc), "code": exc.code})
             continue
         except UnsupportedFeatureError as exc:
-            hidden.scrub(exc)
-            failed.append({"ad_format": ad_format, "error": str(exc), "code": None})
+            failed.append({"ad_format": ad_format, "error": hidden.failure_text(exc), "code": None})
             continue
         except RateLimitError as exc:
-            hidden.scrub(exc)
             # Keep the previews already rendered; stop asking while Meta is throttling.
-            failed.append({"ad_format": ad_format, "error": exc.message, "code": exc.code, "rate_limited": True})
+            failed.append({
+                "ad_format": ad_format, "error": hidden.failure_text(exc), "code": exc.code, "rate_limited": True,
+            })
             failed.extend(
                 {"ad_format": remaining, "error": "Not requested: Meta rate-limited an earlier format in this call.", "code": None}
                 for remaining in formats[position + 1:]
@@ -415,7 +464,7 @@ async def preview_ad(
     if (creative_id or creative) and not account_id and not ad_id:
         raise ValidationError("account_id is required when previewing from creative_id or creative.")
     # A Partnership Ad code in the draft creative never reaches an error, a log or a failed format's text.
-    with PartnershipCodesHidden(creative) as hidden:
+    with CallSecrets.for_creative_inputs(creative) as hidden:
         if ad_formats is not None:
             formats = _preview_formats(ad_formats, ad_format)
             return await _preview_many(
@@ -475,15 +524,6 @@ def _legacy_image_file_name(file_path: str, resolved_name: str) -> str:
     return name
 
 
-def _scrub_local_file(exc: BaseException, file_path: str, *names: str) -> None:
-    """Remove a local file's path and names (image or video) from an error and every error behind it.
-
-    meta_ads_mcp.secret_scrub finds each one wherever it occurs, written plainly or encoded.
-    """
-    paths = (file_path, file_path.strip(), str(Path(file_path.strip()).expanduser()), *names)
-    scrub_exception(exc, paths, policy=ANYWHERE, shown=FILE_SHOWN)
-
-
 @mcp_server.tool()
 async def upload_creative_asset(
     account_id: str,
@@ -509,7 +549,7 @@ async def upload_creative_asset(
         except Exception as exc:
             # A file name can itself be private: no error or log line names the file or its
             # path, even when Meta's own error text repeats it.
-            _scrub_local_file(exc, file_path, image_file.name, file_name)
+            CallSecrets.for_local_file(file_path, image_file.name, file_name).scrub(exc)
             raise
     else:
         result = await client.upload_ad_image(
@@ -576,7 +616,6 @@ class _OpenVideo:
     sent_name: str
 
 
-FILE_SHOWN = "<file>"
 _FILE_CHANGED = (
     "The local file changed while it was being uploaded (its size or modification time is not what it was "
     "when it was opened), so the bytes sent may not be the whole file."
@@ -820,8 +859,12 @@ def _chunked_plan(account: str, video: _OpenVideo, meta_fields: dict[str, Any]) 
     }
 
 
-async def _read_video_status(client: Any, video_id: str | None) -> dict[str, Any]:
-    """Read processing status after an upload; a failed read never hides the video id."""
+async def _read_video_status(client: Any, video_id: str | None, secrets: CallSecrets) -> dict[str, Any]:
+    """Read processing status after an upload; a failed read never hides the video id.
+
+    A failed read's text is kept in status_note, so it goes through secrets.failure_text, which
+    removes the local file's path and names first, as for an error that escapes.
+    """
     if video_id is None:
         return {
             "processing_status": None,
@@ -835,7 +878,7 @@ async def _read_video_status(client: Any, video_id: str | None) -> dict[str, Any
             "processing_status": None,
             "status": None,
             "status_note": (
-                f"The upload succeeded (video {video_id}) but its status could not be read: {_failure_reason(exc)} "
+                f"The upload succeeded (video {video_id}) but its status could not be read: {secrets.failure_text(exc)} "
                 "Check list_ad_videos(video_ids=...) before using it."
             ),
         }
@@ -888,18 +931,17 @@ async def upload_ad_video(
     if url:
         return await _upload_video_request(
             resolved_account, target, data={"file_url": url, **meta_fields}, files=None,
-            shown={"file_url": url, **meta_fields}, upload={"mode": "url"}, dry_run=dry_run,
+            shown={"file_url": url, **meta_fields}, upload={"mode": "url"}, dry_run=dry_run, secrets=NO_SECRETS,
         )
     # Only from the operator's upload folder: a path from the model must not be able
     # to send some other file on this machine to Meta.
     video = _open_upload_video(path_text)
+    # A file name can itself be private: no error, log line or note names the file, even when
+    # Meta's own error text repeats it.
+    secrets = CallSecrets.for_local_file(path_text, video.name, video.sent_name)
     try:
-        return await _upload_video_file(resolved_account, target, video, meta_fields, dry_run=dry_run)
-    except Exception as exc:
-        # A file name can itself be private: no error or log line names the file, even
-        # when Meta's own error text repeats it.
-        _scrub_local_file(exc, path_text, video.name, video.sent_name)
-        raise
+        with secrets:
+            return await _upload_video_file(resolved_account, target, video, meta_fields, dry_run=dry_run, secrets=secrets)
     finally:
         os.close(video.descriptor)
 
@@ -911,6 +953,7 @@ async def _upload_video_file(
     meta_fields: dict[str, Any],
     *,
     dry_run: bool,
+    secrets: CallSecrets,
 ) -> dict[str, Any]:
     """Upload an opened local video in one request or in chunks; the caller closes it."""
     if video.size <= MAX_DIRECT_VIDEO_BYTES:
@@ -926,6 +969,7 @@ async def _upload_video_file(
         response = await _upload_video_request(
             account, target, data=dict(meta_fields), files={"source": (video.sent_name, content)},
             shown={"source": source, **meta_fields}, upload={"mode": "direct", **source}, dry_run=dry_run,
+            secrets=secrets,
         )
         if not dry_run:
             _note_change_after_send(response, _video_file_change(video))
@@ -943,7 +987,7 @@ async def _upload_video_file(
     outcome = await _chunked_video_upload(client, account, video, meta_fields)
     response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
-    response.update(await _read_video_status(client, outcome["video_id"]))
+    response.update(await _read_video_status(client, outcome["video_id"], secrets))
     # The last await is the status read: check the open file again after it, so a change
     # while it was in flight is reported (as the direct path does). A change already seen
     # right after the finish still counts if this later check cannot be made.
@@ -992,6 +1036,7 @@ async def _upload_video_request(
     shown: dict[str, Any],
     upload: dict[str, Any],
     dry_run: bool,
+    secrets: CallSecrets,
 ) -> dict[str, Any]:
     """One-request upload (URL or a small file), then a status read."""
     if dry_run:
@@ -1008,7 +1053,7 @@ async def _upload_video_request(
     video_id = str(uploaded.get("id") or uploaded.get("video_id") or "") or None
     response = creation_response(action="upload_ad_video", target=target, result=uploaded)
     response.update({"video_id": video_id, "upload": upload})
-    response.update(await _read_video_status(client, video_id))
+    response.update(await _read_video_status(client, video_id, secrets))
     return response
 
 
@@ -1333,7 +1378,7 @@ async def update_creative(
     if not payload and operation not in {"add", "remove"}:
         raise ValidationError("At least one field must be provided for update_creative.")
     # A Partnership Ad code in the raw spec never reaches an error or a log, even when Meta repeats it.
-    with PartnershipCodesHidden(object_story_spec, asset_feed_spec, params):
+    with CallSecrets.for_creative_inputs(object_story_spec, asset_feed_spec, params):
         client = get_graph_api_client()
         if labels is not None and operation is not None:
             return await _update_creative_labels(client, creative_id, payload, labels, operation)

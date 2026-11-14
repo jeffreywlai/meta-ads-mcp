@@ -1434,11 +1434,15 @@ def _holds_value(value: Any) -> bool:
 
 _LABELS_ON_MORE_PAGES = "Meta named a further page of labels, which this read does not follow"
 
+# object_story_spec parts that hold the creative's own story (SDK 26.0.2 AdCreativeObjectStorySpec).
+# A creative with one of them is not promoting an existing post.
+INLINE_STORY_KEYS = ("link_data", "video_data", "photo_data", "template_data", "text_data")
+
 
 def _copy_value(field: str, value: Any) -> Any:
     """The value to send for a copied field: ad labels go back by id (or name), as Meta's create takes them.
 
-    The labels are sent as the copy's whole set, so _copied_labels_problem must be checked first:
+    The labels are sent as the copy's whole set, so _unreadable_fields must be checked first:
     a label that was not read would be missing from the copy.
     """
     if field == "adlabels":
@@ -1447,11 +1451,108 @@ def _copy_value(field: str, value: Any) -> Any:
     return value
 
 
-def _copied_labels_problem(creative: dict[str, Any]) -> str | None:
-    """Why the old creative's labels could not all be read for the copy (None when they were, or it has none)."""
-    if not _holds_value(creative.get("adlabels")):
-        return None
-    return read_label_set(creative["adlabels"], more_pages=_LABELS_ON_MORE_PAGES)[1]
+# The shape each field the enhancement copy reads must have when it is present. A field is in one of
+# three cases: absent (the key is missing, or null), present and readable (the shape below; an empty
+# object, empty list, empty text or false is a readable "no setting"), or present but not in the shape
+# expected. Only the first two are copied from: the third refuses a real run before any write, and a
+# dry run names it in settings_not_read. Types are from SDK 26.0.2's AdCreative and Ad field types.
+_OBJECT = "an object"
+_LIST = "a list"
+_TEXT = "text"
+_ID = "an id (text or a whole number)"
+_FLAG = "true or false"
+_LABELS = "a list of labels, or a page of them with a data list"
+_SHAPE_TESTS = {
+    _OBJECT: lambda value: isinstance(value, dict),
+    _LIST: lambda value: isinstance(value, list),
+    _TEXT: lambda value: isinstance(value, str),
+    # Graph ids come as text; a whole number is read as the same id.
+    _ID: lambda value: isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool)),
+    _FLAG: lambda value: isinstance(value, bool),
+    # An empty object is not a readable label page: it has no data list, so labels may have been there.
+    _LABELS: lambda value: isinstance(value, list) or (isinstance(value, dict) and isinstance(value.get("data"), list)),
+}
+ENHANCEMENT_AD_SHAPES: dict[str, str] = {
+    "id": _ID, "name": _TEXT, "account_id": _ID, "effective_status": _TEXT, "creative": _OBJECT,
+}
+ENHANCEMENT_FIELD_SHAPES: dict[str, str] = {
+    "id": _ID, "name": _TEXT, "account_id": _ID, "degrees_of_freedom_spec": _OBJECT,
+    "object_story_spec": _OBJECT, "asset_feed_spec": _OBJECT, "object_story_id": _ID,
+    "source_instagram_media_id": _ID, "instagram_user_id": _ID, "object_id": _ID, "url_tags": _TEXT,
+    "call_to_action": _OBJECT, "facebook_branded_content": _OBJECT, "instagram_branded_content": _OBJECT,
+    "product_set_id": _ID, "media_sourcing_spec": _OBJECT, "branded_content": _OBJECT,
+    "creative_sourcing_spec": _OBJECT, "ad_disclaimer_spec": _OBJECT, "adlabels": _LABELS,
+    "applink_treatment": _TEXT, "authorization_category": _TEXT, "branded_content_sponsor_page_id": _ID,
+    "bundle_folder_id": _ID, "categorization_criteria": _TEXT, "category_media_source": _TEXT,
+    "contextual_multi_ads": _OBJECT, "destination_set_id": _ID, "destination_spec": _OBJECT,
+    "dynamic_ad_voice": _TEXT, "enable_direct_install": _FLAG, "enable_launch_instant_app": _FLAG,
+    "existing_post_title": _TEXT, "format_transformation_spec": _LIST, "generative_asset_spec": _OBJECT,
+    "image_crops": _OBJECT, "interactive_components_spec": _OBJECT, "link_og_id": _ID,
+    "marketing_message_structured_spec": _OBJECT, "omnichannel_link_spec": _OBJECT, "page_welcome_message": _TEXT,
+    "place_page_set_id": _ID, "platform_customizations": _OBJECT, "playable_asset_id": _ID,
+    "portrait_customizations": _OBJECT, "product_suggestion_settings": _OBJECT, "recommender_settings": _OBJECT,
+    "regional_regulation_disclaimer_spec": _OBJECT, "source_facebook_post_id": _ID, "template_url": _TEXT,
+    "template_url_spec": _OBJECT, "use_page_actor_override": _FLAG, "wamo_whatsapp_identity_spec": _OBJECT,
+    "collaborative_ads_lsb_image_bank_id": _ID, "link_destination_display_url": _TEXT,
+    "messenger_sponsored_message": _TEXT, "product_data": _LIST,
+}
+# Places inside a read field that the copy reads to change or compare (a "*" stands for every key there).
+ENHANCEMENT_NESTED_SHAPES: dict[tuple[str, ...], str] = {
+    ("degrees_of_freedom_spec", "creative_features_spec"): _OBJECT,
+    ("degrees_of_freedom_spec", "creative_features_spec", "*"): _OBJECT,
+    ("degrees_of_freedom_spec", "creative_features_spec", "*", "enroll_status"): _TEXT,
+    **{("object_story_spec", key): _OBJECT for key in INLINE_STORY_KEYS},
+}
+
+
+def _nested_values(value: Any, path: tuple[str, ...], where: str) -> list[tuple[str, Any]]:
+    """The present (not missing, not null) values at path inside value, with where each one sits."""
+    if not path:
+        return [] if value is None else [(where, value)]
+    if not isinstance(value, dict):
+        return []  # The level above is checked on its own.
+    key, rest = path[0], path[1:]
+    keys = list(value) if key == "*" else [key]
+    found: list[tuple[str, Any]] = []
+    for name in keys:
+        if name in value:
+            found.extend(_nested_values(value[name], rest, f"{where}.{name}"))
+    return found
+
+
+def _unreadable_fields(ad: dict[str, Any], creative: dict[str, Any]) -> dict[str, str]:
+    """Every read field present but not in the shape expected, with why: the one check the copy is built behind.
+
+    A key the copy reads that has no expected shape here is itself reported, so a field added to the
+    read without a shape can never be copied unchecked.
+    """
+    problems: dict[str, str] = {}
+    for source, values, shapes in (("ad", ad, ENHANCEMENT_AD_SHAPES), ("creative", creative, ENHANCEMENT_FIELD_SHAPES)):
+        for field, value in values.items():
+            shape = shapes.get(field)
+            if value is None:
+                continue
+            if shape is None:
+                if source == "creative" and field in ENHANCEMENT_READ_FIELDS:
+                    problems[field] = "this server has no expected shape for it"
+                continue
+            if not _SHAPE_TESTS[shape](value):
+                problems[field if source == "creative" else f"ad.{field}"] = f"expected {shape}"
+    for path, shape in ENHANCEMENT_NESTED_SHAPES.items():
+        if path[0] in problems:
+            continue
+        for where, value in _nested_values(creative.get(path[0]), path[1:], path[0]):
+            if not _SHAPE_TESTS[shape](value) and where not in problems:
+                problems[where] = f"expected {shape}"
+    if "adlabels" in creative and creative["adlabels"] is not None and "adlabels" not in problems:
+        reason = read_label_set(creative["adlabels"], more_pages=_LABELS_ON_MORE_PAGES)[1]
+        if reason:
+            problems["adlabels"] = reason
+    return problems
+
+
+def _shape_problem_text(problems: dict[str, str]) -> str:
+    return "; ".join(f"{field} ({reason})" for field, reason in sorted(problems.items()))
 
 
 def _raise_step_failure(exc: Exception, *, definite: str, unknown: str) -> None:
@@ -1554,9 +1655,6 @@ def _refuse_unread_settings(
     raise ValidationError(message)
 
 
-# object_story_spec parts that hold the creative's own story (SDK 26.0.2 AdCreativeObjectStorySpec).
-# A creative with one of them is not promoting an existing post.
-INLINE_STORY_KEYS = ("link_data", "video_data", "photo_data", "template_data", "text_data")
 
 # Image pairs Meta returns on read but accepts only one of on create; the first (the library
 # image's hash) is kept and the second left out. video_data: Meta's live answer (2026-11-13,
@@ -1772,6 +1870,13 @@ async def _update_enhancements(
         raise ValidationError("name must be at most 100 characters.")
     client = get_graph_api_client()
     ad = await client.get_object(ad_id, fields=["id", "name", "account_id", "effective_status", "creative{id}"])
+    ad_unreadable = _unreadable_fields(ad, {})
+    if ad_unreadable:
+        # Without a readable ad there is no creative to copy, so a dry run cannot go on either.
+        raise ValidationError(
+            f"Meta returned the ad's {_shape_problem_text(ad_unreadable)}, so the creative to copy is not known. "
+            f"Nothing was created or attached; ad {ad_id} was not changed."
+        )
     creative_ref = ad.get("creative")
     old_creative_id = str(creative_ref.get("id") or "") if isinstance(creative_ref, dict) else str(creative_ref or "")
     if not old_creative_id:
@@ -1789,6 +1894,8 @@ async def _update_enhancements(
                 f"settings. Meta's error: {exc.message}"
             )
         raise
+    # The one shape check: a field present but not in the shape expected is never copied from or rebuilt.
+    unreadable = _unreadable_fields({}, creative)
     branded = creative.get("branded_content") if isinstance(creative.get("branded_content"), dict) else {}
     codes.extend(branded.get(key) for key in _AD_CODE_FIELDS)
     account_id = account_id or blank_to_none(str(creative.get("account_id") or ""))
@@ -1873,12 +1980,11 @@ async def _update_enhancements(
         f"{', '.join(not_read)} could not be read: {explicit_problem}. Meta returns it only when asked for by name, "
         "so a copy made without it could lose it. A real run would refuse and change nothing."
     ) if not_read else None
-    # The copy carries the old creative's labels as its whole set, so every label must have been read.
-    labels_problem = _copied_labels_problem(creative)
-    labels_note = (
-        f"adlabels could not all be read: {labels_problem}. The copy would carry only the labels read and lose the "
-        "rest. A real run would refuse and change nothing."
-    ) if labels_problem else None
+    # The copy carries or rebuilds these fields, so each must have been read in the shape expected.
+    unreadable_note = (
+        f"These settings of the old creative could not be read: {_shape_problem_text(unreadable)}. A copy built "
+        "without them could lose them. A real run would refuse and change nothing."
+    ) if unreadable else None
     if dry_run:
         return {
             "ok": True,
@@ -1895,12 +2001,18 @@ async def _update_enhancements(
             "fields_not_copied": not_copied,
             "derived_fields_left_out": derived,
             "settings_that_cannot_be_copied": [*lost_settings, *(["call_to_action"] if call_to_action_lost else [])],
-            "settings_not_read": [*not_read, *(["adlabels"] if labels_problem else [])],
+            "settings_not_read": [*not_read, *sorted(unreadable)],
             "notes": [
                 copy_note, review_note,
-                *(note for note in (lost_note, call_to_action_note, not_read_note, labels_note) if note),
+                *(note for note in (unreadable_note, lost_note, call_to_action_note, not_read_note) if note),
             ],
         }
+    if unreadable:
+        raise ValidationError(
+            f"Settings of creative {old_creative_id} could not be read: {_shape_problem_text(unreadable)}. The copy "
+            f"this change needs could lose them. Nothing was created or attached; ad {ad_id} still uses creative "
+            f"{old_creative_id}."
+        )
     if lost_settings:
         raise ValidationError(
             f"Creative {old_creative_id} has {', '.join(lost_settings)}, which Meta does not accept when a creative "
@@ -1914,12 +2026,6 @@ async def _update_enhancements(
         )
     if not_read:
         _refuse_unread_settings(explicit_error, not_read, explicit_problem, ad_id=ad_id, creative_id=old_creative_id)
-    if labels_problem:
-        raise ValidationError(
-            f"The labels of creative {old_creative_id} could not all be read: {labels_problem}. The copy this change "
-            f"needs would lose the labels not read. Nothing was created or attached; ad {ad_id} still uses creative "
-            f"{old_creative_id}."
-        )
     # A name the caller typed is free text, so the error points at it rather than repeating it.
     shown_name = "with the name given in this call" if new_name else f"named {payload['name']!r}"
     try:
