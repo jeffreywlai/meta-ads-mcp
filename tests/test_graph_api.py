@@ -1284,6 +1284,35 @@ def test_bare_answer_wrapper_is_recognised_only_in_its_exact_form(payload, expec
     assert is_bare_answer_wrapper(payload) is expected
 
 
+_THROTTLE = {"error": {"code": 4, "message": "Application request limit reached", "is_transient": True}}
+
+
+def test_a_throttling_error_behind_a_success_status_on_a_write_leaves_the_outcome_unknown(monkeypatch) -> None:
+    # R18 Z1: the wrapper kept none of this, so a tool said the request was refused.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, _THROTTLE)])
+    with pytest.raises(RateLimitError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is True
+    public = error.value.to_public_dict()
+    assert public["retryable"] is False and public["mutation_outcome_unknown"] is True
+    assert "before retrying" in public["next_step"]
+
+
+@pytest.mark.parametrize("status", [400, 429])
+def test_an_ordinary_throttle_of_a_write_is_still_a_refusal_that_can_be_retried(monkeypatch, status) -> None:
+    # Meta's throttling errors can carry is_transient: true; on an error status that is a
+    # refusal, as the live edit-limit error was (retried after the wait, and accepted).
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, _THROTTLE)])
+    with pytest.raises(RateLimitError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is False
+    public = error.value.to_public_dict()
+    assert public["retryable"] is True
+    assert "mutation_outcome_unknown" not in public and "next_step" not in public
+
+
 class _TextResponse(FakeResponse):
     """A response whose body is not JSON."""
 

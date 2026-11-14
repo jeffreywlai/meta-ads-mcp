@@ -1557,17 +1557,27 @@ async def run_copy(
     if new_id is None:
         rename["reason"] = "The copy's id is unknown, so it was not renamed."
     else:
+        unknown = False
         try:
             await client.update_object(new_id, data={"name": new_name})
         except MetaAdsError as exc:
             # A caught error kept in the result goes through the one helper that cleans such text;
             # a copy call holds no secret of its own.
+            unknown = getattr(exc, "mutation_outcome_unknown", False) is True
             rename["error"] = NO_SECRETS.public_error(exc)
         except Exception as exc:  # The copy exists; keep its id in the answer whatever the rename did.
+            # The request may have reached Meta before this failed, so the name is not known.
+            unknown = True
             rename["error"] = {"type": type(exc).__name__}
         else:
             rename["applied"] = True
-        if not rename["applied"]:
+        if unknown:
+            rename["outcome_unknown"] = True
+            rename["next_step"] = (
+                f"The copy {new_id} exists, but whether it was renamed is not known; read its name, and "
+                f"rename it with update_{object_type} if it still has Meta's default name."
+            )
+        elif not rename["applied"]:
             rename["next_step"] = (
                 f"The copy {new_id} exists with Meta's default name; rename it with update_{object_type}."
             )

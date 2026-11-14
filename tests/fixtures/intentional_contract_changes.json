@@ -107,6 +107,13 @@
       "what_changed": "When Meta answers a write (a POST or DELETE) with a success status and an explicit false (a bare false, or an object whose success field is false), the tool now raises a Meta API error saying Meta answered that the change was not made. Before, that answer was handed to the tool as a result, and write tools reported the change as made. Only the boolean false counts: an answer with no success field, or with success true, is returned exactly as before, and reads are not affected.",
       "why_better": "A change Meta says it did not make is no longer reported as made.",
       "migration": "Nothing to change for a normal answer. Treat the error like any other Meta error: read the object to see what it holds before retrying."
+    },
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "When Meta answers a write (a POST or DELETE) with a success status whose body is a throttling error, the rate-limit error the tool raises now says the outcome is not known: retryable is false, and mutation_outcome_unknown true and next_step are added. Before, it said retryable true, as for an ordinary throttle. A throttling error on an error status (the ordinary case) is unchanged: retryable true, with no added field.",
+      "why_better": "A success status with an error body contradicts itself, so the change may have been made; the caller is told to check before retrying instead of being told a retry is safe.",
+      "migration": "Nothing to change for an ordinary throttle. When a rate-limit error carries mutation_outcome_unknown true, read the object before retrying."
     }
   ]
 }

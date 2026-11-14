@@ -757,6 +757,7 @@ def _sanitized_upload_error(
             else None,
             code=_safe_int(exc.code),
             subcode=_safe_int(exc.subcode),
+            mutation_outcome_unknown=exc.mutation_outcome_unknown is True,
         )
     if isinstance(exc, MetaApiError):
         retry_after = exc.retry_after_seconds

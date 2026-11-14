@@ -60,6 +60,10 @@ class RateLimitError(MetaAdsError):
     subcode: int | None = None
     usage: dict[str, Any] | None = None
     operation: str | None = None
+    # True only when a write's throttling error came behind a success status: the answer
+    # contradicts itself, so the change may have been made. An ordinary throttle (an error
+    # status) is Meta's refusal, and this stays False.
+    mutation_outcome_unknown: bool = False
 
     def __str__(self) -> str:
         return self.message
@@ -69,8 +73,11 @@ class RateLimitError(MetaAdsError):
         payload: dict[str, Any] = {
             "type": "rate_limit",
             "message": self.message,
-            "retryable": True,
+            "retryable": not self.mutation_outcome_unknown,
         }
+        if self.mutation_outcome_unknown:
+            payload["mutation_outcome_unknown"] = True
+            payload["next_step"] = "Verify the target object's current state before retrying this mutation."
         for key, value in (
             ("retry_after_seconds", self.retry_after_seconds),
             ("code", self.code),

@@ -527,6 +527,9 @@ class GraphAPIClient:
                         subcode=error.subcode,
                         usage=usage,
                         operation=operation,
+                        # A throttling error object behind a success status on a write
+                        # contradicts itself; on an error status it is a plain refusal.
+                        mutation_outcome_unknown=not safe_to_retry and not response.is_error,
                     ) from error
                 if _is_unsupported_surface_error(error):
                     raise UnsupportedFeatureError(error.message) from error

@@ -1012,6 +1012,37 @@ def test_duplicate_rename_failure_still_returns_the_new_id(monkeypatch) -> None:
     assert "222" in result["rename"]["next_step"]
 
 
+@pytest.mark.parametrize("failure", ["unreadable answer", "throttle behind a success status", "crash"])
+def test_duplicate_rename_with_an_unknown_outcome_does_not_claim_the_default_name(monkeypatch, failure) -> None:
+    """R18 Z2: the rename may have been made, so the copy's name is not stated."""
+    from meta_ads_mcp.errors import MetaApiError, RateLimitError
+
+    error = {
+        "unreadable answer": MetaApiError(message="not JSON", status_code=200, mutation_outcome_unknown=True),
+        "throttle behind a success status": RateLimitError("limit", mutation_outcome_unknown=True),
+        "crash": RuntimeError("late"),
+    }[failure]
+    client = CopyClient(rename_error=error)
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="Black Friday 2"))
+    rename = result["rename"]
+    assert result["new_id"] == "222"
+    assert rename["applied"] is False and rename["outcome_unknown"] is True
+    assert "not known" in rename["next_step"] and "read its name" in rename["next_step"]
+    assert "exists with Meta's default name" not in rename["next_step"]
+    assert "222" in rename["next_step"] and "update_campaign" in rename["next_step"]
+
+
+def test_duplicate_rename_meta_refused_still_says_the_copy_has_the_default_name(monkeypatch) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    client = CopyClient(rename_error=MetaApiError(message="Invalid parameter", status_code=400, code=100))
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    rename = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="Black Friday 2"))["rename"]
+    assert "outcome_unknown" not in rename
+    assert "exists with Meta's default name" in rename["next_step"]
+
+
 def test_duplicate_without_a_new_id_in_the_response_says_so_and_does_not_rename(monkeypatch) -> None:
     client = CopyClient(result={"success": True})
     monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
