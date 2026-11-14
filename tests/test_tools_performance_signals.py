@@ -4663,3 +4663,161 @@ def test_sweep_top_recommendations_from_one_page_say_so(monkeypatch) -> None:
     top = result["top_recommendations"]
     assert top["complete"] is False and top["ranked_among"].startswith("only the first page")
     assert any("ranks only those" in signal for signal in result["missing_signals"])
+
+
+# ---------------------------------------------------------------------------
+# Round fourteen (R12 S7): every check on a sorted page runs on the whole page Meta returned, before the cut
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["ranking", "children", "briefing"])
+def test_spend_order_uses_the_entire_returned_page_before_truncating(monkeypatch, path) -> None:
+    """Reviewer reproduction: [spend 1, spend 1000] cut to one row was called confirmed highest first."""
+    cap = performance_signals.CONTEXT_MAX_ADSETS if path == "briefing" else 1
+    level = "adset" if path == "briefing" else "ad"
+    id_key = level + "_id"
+    picked = [{id_key: str(100 + index), "spend": "1", "impressions": "100"} for index in range(cap)]
+    picked.append({id_key: "9999", "spend": "1000", "impressions": "100"})
+
+    class Client:
+        async def get_insights(self, object_id, *, fields, params):
+            if params.get("sort"):
+                return {"data": picked}
+            if params.get("level") in {"campaign", "account"}:
+                return {"data": [{"spend": str(1000 + cap), "impressions": "1000", "clicks": "10"}]}
+            if path == "briefing":
+                return {"data": [{"adset_id": row["adset_id"], "campaign_id": "10",
+                                  "spend": "1", "impressions": "100", "clicks": "1"} for row in picked[:cap]]}
+            return {"data": []}
+
+    monkeypatch.setattr(performance_signals, "get_graph_api_client", Client)
+    start, end = date(2026, 11, 1), date(2026, 11, 7)
+    if path == "ranking":
+        result = asyncio.run(performance_signals.get_auction_ranking_report("campaign", "10", max_ads=1))
+        assert result["examined"]["meta_order_confirmed"] is False, result["examined"]
+        assert result["examined"]["rows_beyond_max_ads"] == 1
+        assert any("beyond max_ads" in signal for signal in result["missing_signals"])
+    elif path == "children":
+        children, more, issue = asyncio.run(performance_signals._select_children("10", "ad", start, end, 1))
+        assert more is True and issue is not None, (children, more, issue)
+        assert performance_signals.SPEND_ORDER_UNCONFIRMED in issue
+    else:
+        _, _, coverage = asyncio.run(performance_signals._context_adset_rows("act_10", start, end, None))
+        assert coverage.get("selection_incomplete_reason") is not None, coverage
+        assert coverage["selection_rows_beyond_max_adsets"] == 1
+
+
+def test_s7_sorted_page_checks_the_whole_page_then_counts_the_cut() -> None:
+    page = {"data": [{"ad_id": "1", "spend": "50"}, {"ad_id": "2", "spend": "40"}, None,
+                     {"ad_id": "1", "spend": "55"}, {"ad_id": "3", "spend": "60"}]}
+    checked = performance_signals._sorted_page(page, "ad_id", 1)
+    assert [row["ad_id"] for row in checked.rows] == ["1"]
+    assert checked.cut == 2 and checked.more is True
+    # The repeat, the unreadable entry and the rise to 60 all sit after the cut, and all are still found.
+    assert checked.unreadable == 1 and checked.repeated == 1 and checked.contradicted == {"1"}
+    assert checked.order_confirmed is False
+    assert performance_signals.SPEND_ORDER_UNCONFIRMED in checked.selection_issue
+
+
+def test_s7_control_an_ordered_page_within_the_cap_is_confirmed_and_whole() -> None:
+    page = {"data": [{"ad_id": "1", "spend": "50"}, {"ad_id": "2", "spend": "40"}]}
+    checked = performance_signals._sorted_page(page, "ad_id", 5)
+    assert checked.cut == 0 and checked.more is False and checked.order_confirmed is True
+    assert checked.fault is None and checked.selection_issue is None
+
+
+def test_s7_control_an_ordered_page_beyond_the_cap_is_confirmed_and_counts_the_cut() -> None:
+    page = {"data": [{"ad_id": "1", "spend": "50"}, {"ad_id": "2", "spend": "40"}, {"ad_id": "3", "spend": "40"}]}
+    checked = performance_signals._sorted_page(page, "ad_id", 2)
+    assert checked.cut == 1 and checked.more is True and checked.order_confirmed is True
+    assert checked.selection_issue is None
+
+
+def test_s7_trend_selection_reports_the_rows_beyond_max_entities(monkeypatch) -> None:
+    rows = [{"campaign_id": str(index), "campaign_name": "A", "spend": str(10 - index)} for index in range(3)]
+
+    def handler(object_id, fields, params):
+        if "sort" in params:
+            return {"data": rows}
+        return {"data": [dict(day, campaign_id="0") for day in DAY_ROWS]}
+
+    _patch(monkeypatch, RecordingClient(insights_handler=handler))
+    result = asyncio.run(performance_signals.get_performance_trend(
+        "account", "act_10", child_level="campaign", max_entities=1, since="2026-11-01", until="2026-11-03",
+        metrics=["spend"],
+    ))
+    assert result["coverage"]["selection"]["rows_beyond_max_entities"] == 2
+    assert result["coverage"]["selection"]["more_children_exist"] is True
+
+
+# ---------------------------------------------------------------------------
+# Round fourteen (R12 S4): a date the caller typed never reaches a logged exception chain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("tool", "arguments"), [
+    ("get_performance_trend", {"level": "campaign", "object_id": "10", "until": "2026-11-01"}),
+    ("get_performance_trend", {"level": "campaign", "object_id": "10", "since": "2026-11-01"}),
+    ("detect_performance_anomalies", {"level": "campaign", "object_id": "10"}),
+    ("get_advertiser_context", {"account_id": "act_10", "until": "2026-11-01"}),
+])
+def test_s4_a_date_parse_failure_leaves_no_private_text_in_the_error_or_log(monkeypatch, caplog, tool, arguments):
+    private = "".join(["Synthetic", "Private", "Value", "_", "x7y9"])
+    field = {"get_performance_trend": "until" if "since" in arguments else "since",
+             "detect_performance_anomalies": "end_date", "get_advertiser_context": "since"}[tool]
+    monkeypatch.setattr(performance_signals, "get_graph_api_client", lambda: pytest.fail("refuse before any read"))
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as raised:
+        asyncio.run(mcp_server.call_tool(tool, {**arguments, field: private}))
+    assert private not in str(raised.value)
+    assert private not in caplog.text
+
+
+def test_s4_parse_date_error_has_no_cause_or_context() -> None:
+    private = "".join(["Synthetic", "Private", "Value"])
+    with pytest.raises(ValidationError) as raised:
+        performance_signals._parse_date(private, field="since")
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+# ---------------------------------------------------------------------------
+# Round fourteen (R12 S5): recommendations read strictly before any completeness claim
+# ---------------------------------------------------------------------------
+
+
+def _score_with_recommendations(monkeypatch, payload) -> dict[str, Any]:
+    _patch(monkeypatch, RecordingClient(
+        objects={"act_10": {"id": "act_10", "name": "Example", "currency": "USD", "opportunity_score": 80}},
+        recommendations_payload=payload,
+    ))
+    return asyncio.run(performance_signals.get_opportunity_score("10", include_history=False))
+
+
+def test_opportunity_score_does_not_inherit_false_completeness_from_legacy_reader(monkeypatch) -> None:
+    """Reviewer reproduction: {} from Meta gave no recommendations, complete=true, 'every recommendation'."""
+    result = _score_with_recommendations(monkeypatch, {})
+    top = result["top_recommendations"]
+    assert top["complete"] is False, result
+    assert top["items"] is None and top["ranked_among"] is None and top["incomplete_reason"]
+    assert any(signal.startswith("recommendations: not known") for signal in result["missing_signals"])
+
+
+@pytest.mark.parametrize("payload", [
+    {"data": [*REC_PAYLOAD["data"], None]},
+    {"data": [{"recommendations": [*REC_PAYLOAD["data"][0]["recommendations"], "x"]}]},
+])
+def test_s5_recommendations_with_an_unreadable_entry_rank_only_what_was_read(monkeypatch, payload) -> None:
+    result = _score_with_recommendations(monkeypatch, payload)
+    top = result["top_recommendations"]
+    assert top["complete"] is False and top["incomplete_reason"]
+    assert top["ranked_among"].startswith("only the recommendations that could be read")
+    assert top["available_count"] == 3
+    assert "every recommendation" not in json.dumps(top)
+
+
+def test_s5_control_a_whole_page_ranks_every_recommendation(monkeypatch) -> None:
+    result = _score_with_recommendations(monkeypatch, REC_PAYLOAD)
+    top = result["top_recommendations"]
+    assert top["complete"] is True and top["ranked_among"] == "every recommendation Meta returned"
+    assert [item["estimated_score_gain"] for item in top["items"]] == [12.0, 3.0, None]
+    assert "incomplete_reason" not in top

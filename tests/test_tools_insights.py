@@ -2381,3 +2381,41 @@ def test_get_entity_insights_sort_accepts_action_sort_keys(monkeypatch) -> None:
         level="ad", object_id="act_123", sort="actions:link_click_descending", fields=["ad_id", "actions"],
     ))
     assert client.calls[0]["params"]["sort"] == ["actions:link_click_descending"]
+
+
+# Round fourteen (R12 S4): a date the caller typed never reaches a logged exception chain.
+
+
+def test_s4_insights_date_error_carries_no_chained_parser_exception() -> None:
+    private = "".join(["Synthetic", "Private", "Value"])
+    with pytest.raises(insights.ValidationError) as raised:
+        insights._build_date_params(date_preset=None, since=private, until="2026-11-01", default_date_preset="last_7d")
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert private not in str(raised.value)
+
+
+def test_s4_insights_tool_date_error_does_not_log_the_value(caplog) -> None:
+    import logging
+
+    private = "".join(["Synthetic", "Private", "Value", "_", "insights"])
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as raised:
+        asyncio.run(mcp_server.call_tool("get_entity_insights", {
+            "level": "campaign", "object_id": "10", "since": private, "until": "2026-11-01",
+        }))
+    assert private not in str(raised.value)
+    assert private not in caplog.text
+
+
+def test_s4_parse_or_none_ends_the_parser_failure_inside_it() -> None:
+    from datetime import date
+
+    assert insights.parse_or_none(date.fromisoformat, "2026-11-01") == date(2026, 11, 1)
+    assert insights.parse_or_none(date.fromisoformat, "not a date") is None
+    assert insights.parse_or_none(date.fromisoformat, None) is None
+
+    def lookup(_text: str) -> str:
+        return {}["missing"]
+
+    with pytest.raises(KeyError):
+        insights.parse_or_none(lookup, "a")  # only the named errors are absorbed
