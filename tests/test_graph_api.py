@@ -1417,40 +1417,22 @@ def test_a_transient_unsupported_or_not_found_answer_to_a_read_is_unchanged(monk
         asyncio.run(_client().request("GET", "123"))
 
 
-@pytest.mark.parametrize("body", [{"id": "972999"}, {"id": "972999", "success": True}, {"id": 972999}])
-@pytest.mark.parametrize("write", ["update", "delete"])
-def test_a_write_acknowledgement_that_names_another_object_leaves_the_outcome_unknown(monkeypatch, body, write) -> None:
-    # R34 FF1: such an answer was reported as the change being made.
-    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
-    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
-    client = _client()
-    call = client.update_object("972000", data={"name": "x"}) if write == "update" else client.delete_object("972000")
-    with pytest.raises(MetaApiError) as error:
-        asyncio.run(call)
-    assert error.value.mutation_outcome_unknown is True
-    assert error.value.details == {"acknowledgement_for_another_object": True}
-    assert error.value.to_public_dict()["retryable"] is False
-
-
 @pytest.mark.parametrize("body", [
-    {"success": True}, {"id": "972000"}, {"id": "972000", "success": True}, {"id": 972000}, {"id": " 972000 "},
-    {"id": None, "success": True}, {"id": "me"}, {},
+    {"success": True}, {"id": "972000"}, {"id": "972000", "success": True}, {"id": "972999"}, {"id": "972999", "success": True}, {},
 ])
 @pytest.mark.parametrize("write", ["update", "delete"])
-def test_an_ordinary_write_acknowledgement_is_returned_as_before(monkeypatch, body, write) -> None:
+def test_a_write_acknowledgement_is_returned_whatever_id_it_carries(monkeypatch, body, write) -> None:
+    """The client does not judge the id in an update's or a delete's acknowledgement.
+
+    A rule that did (round thirty-four) was taken out in round thirty-six: what Meta's ordinary
+    acknowledgement carries for eleven kinds of write has not been observed live, and a wrong
+    guess would report every such ordinary write as "outcome unknown".
+    """
     monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
     FakeAsyncClient.responses = deque([FakeResponse(200, body)])
     client = _client()
     call = client.update_object("972000", data={"name": "x"}) if write == "update" else client.delete_object("972000")
     assert asyncio.run(call) == body
-
-
-def test_an_account_write_acknowledged_with_the_account_in_either_form_is_returned(monkeypatch) -> None:
-    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
-    FakeAsyncClient.responses = deque([FakeResponse(200, {"id": "123"}), FakeResponse(200, {"id": "act_123"})])
-    client = _client()
-    assert asyncio.run(client.update_object("act_123", data={"name": "x"})) == {"id": "123"}
-    assert asyncio.run(client.update_object("123", data={"name": "x"})) == {"id": "act_123"}
 
 
 class _TooDeepResponse(FakeResponse):
