@@ -336,6 +336,7 @@ def test_graph_client_accepts_csv_fields_for_direct_callers(
             "method": "GET",
             "endpoint": "crt_123",
             "params": {"fields": "id,name,url_tags"},
+            "single_object": True,
         }
     ]
 
@@ -1437,6 +1438,34 @@ def test_a_body_nested_too_deeply_to_decode_is_an_unreadable_answer(monkeypatch,
     assert "was not JSON" in error.value.message
     assert error.value.details["unreadable_answer"] is True
     assert error.value.mutation_outcome_unknown is unknown
+
+
+@pytest.mark.parametrize("body", [True, False, [], [{"id": "1"}]])
+def test_a_read_of_one_object_answered_with_a_bare_boolean_or_array_is_unreadable(monkeypatch, body) -> None:
+    # R27 H1: wrapped as {"success": ...} or {"data": [...]}, it looked like an object with no
+    # fields, so a tool that reads before it writes took every field for absent and wrote.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().get_object("123", fields=["id", "name"]))
+    assert error.value.details == {"unreadable_answer": True, "json_type": type(body).__name__}
+    assert error.value.mutation_outcome_unknown is False
+    assert error.value.operation == "GET /123"
+
+
+@pytest.mark.parametrize("body", [{"id": "123"}, {}, {"data": []}, {"success": True}, {"id": "123", "name": None}])
+def test_a_read_of_one_object_answered_with_any_json_object_is_returned_as_before(monkeypatch, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    assert asyncio.run(_client().get_object("123", fields=["id"])) == body
+
+
+def test_list_reads_and_writes_keep_the_wrappers_for_a_bare_array_or_boolean(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, [{"id": "1"}]), FakeResponse(200, True)])
+    client = _client()
+    assert asyncio.run(client.list_objects("123", "ads")) == {"data": [{"id": "1"}]}
+    assert asyncio.run(client.update_object("123", data={"name": "x"})) == {"success": True}
 
 
 class _TextResponse(FakeResponse):

@@ -135,6 +135,13 @@
       "what_changed": "With include_creative_summary=true, creative fields the caller names in fields (for example creative{image_hash}) are now merged into the creative selection instead of being replaced by the summary fields, so the request asks for and the result returns those fields as well. A call without an explicit creative{...} selection sends exactly the request it sent before.",
       "why_better": "The option no longer silently drops creative fields the caller asked for.",
       "migration": "None. A caller who relied on the summary alone can leave the creative{...} selection out of fields."
+    },
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "When Meta answers the read of one object with a success status and a bare true, false or array where an object belongs, the tool now raises a Meta API error saying the answer could not be read. Before, that answer was handed to the tool as an object with no fields: a tool that reads an object before changing it went on to write and reported every previous value as absent, and a read reported the object as found with nothing set. Any JSON object, including an empty one, is returned exactly as before; list reads and writes are not affected.",
+      "why_better": "An answer that is not the object asked for is no longer read as an object with nothing set, so no tool writes on a before-state it never read.",
+      "migration": "Nothing to change for a normal answer. Treat the error like any other failed read."
     }
   ]
 }

@@ -363,8 +363,15 @@ class GraphAPIClient:
         files: dict[str, Any] | None = None,
         base_url: str | None = None,
         use_auth_header: bool = True,
+        single_object: bool = False,
     ) -> dict[str, Any]:
-        """Make a Graph API request with basic retries."""
+        """Make a Graph API request with basic retries.
+
+        single_object: the request reads one object (get_object). A success answer that is a
+        bare true, false or array is then not an object, and is refused as unreadable rather
+        than wrapped: wrapped, it would look like an object with no fields, and a tool would
+        take "field absent" for "not set".
+        """
         _validate_endpoint(endpoint)
         _reject_method_override(params, "params")
         _reject_method_override(data, "data")
@@ -497,6 +504,13 @@ class GraphAPIClient:
                     mutation_outcome_unknown=not safe_to_retry,
                 )
 
+            if single_object and isinstance(payload, (bool, list)) and not response.is_error:
+                raise MetaApiError(
+                    message="Meta's answer was not a JSON object, so it could not be read.",
+                    status_code=response.status_code,
+                    details={"unreadable_answer": True, "json_type": type(payload).__name__},
+                    operation=operation,
+                )
             if isinstance(payload, bool):
                 payload = {"success": payload}
             elif isinstance(payload, list):
@@ -599,7 +613,7 @@ class GraphAPIClient:
         query = dict(params or {})
         if serialized_fields := _serialize_fields(fields):
             query["fields"] = serialized_fields
-        return await self.request("GET", _segment(object_id), params=query)
+        return await self.request("GET", _segment(object_id), params=query, single_object=True)
 
     async def list_objects(
         self,
