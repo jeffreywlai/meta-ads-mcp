@@ -3203,3 +3203,136 @@ def test_enhancements_do_not_attach_the_existing_creative_returned_as_the_copy(m
     with pytest.raises(ValidationError, match="named the ad's existing creative as the new copy"):
         asyncio.run(cf.update_ad_creative_enhancements(ad_id="10", features={"image_touchups": "OPT_OUT"}))
     assert [call[0] for call in client.calls] == ["get", "get", "get", "create"]
+
+
+# Round thirty-three (review R33, EE3): none of the enhancement copy's three reads is used when it
+# names a different object than the one asked for; the second and third are asked for by the
+# creative id the ad read returned.
+
+R33_MISSING = "<missing>"
+R33_FEATURES = {"image_touchups": "OPT_OUT"}
+
+
+class R33EnhancementClient(FakeClient):
+    """Ad 953200 uses creative 953201; each read answers with the id configured for it."""
+
+    def __init__(self, *, ad="953200", creative="953201", explicit="953201", created: Any = "953202") -> None:
+        super().__init__()
+        self.answered = {"ad": ad, "creative": creative, "explicit": explicit}
+        self.created = created
+
+    @staticmethod
+    def _with_id(answer: dict[str, Any], answered: Any) -> dict[str, Any]:
+        return answer if isinstance(answered, str) and answered == R33_MISSING else {"id": answered, **answer}
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        if object_id == "953200":
+            return self._with_id({"account_id": "953000", "creative": {"id": "953201"}}, self.answered["ad"])
+        if fields == cf.EXPLICIT_STORY_SPEC_READ:
+            # Another creative's answer carries a setting this one does not have.
+            other = self.answered["explicit"] == "953299"
+            story = {"object_story_spec": {"whats_app_business_phone_number": "15555550199"}} if other else {}
+            return self._with_id(story, self.answered["explicit"])
+        return self._with_id({
+            "account_id": "953000",
+            "object_story_spec": {"page_id": "953210", "link_data": {"link": "https://example.com/r33"}},
+        }, self.answered["creative"])
+
+    async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, data))
+        return self._with_id({}, self.created)
+
+
+def _r33_writes(client: FakeClient) -> list[tuple]:
+    return [call for call in client.calls if call[0] in ("create", "update")]
+
+
+@pytest.mark.parametrize(("wrong_read", "message"), [
+    ("ad", "Meta's read of ad 953200 answered about a different ad (953299)"),
+    ("creative", "Meta's read of creative 953201 answered about a different creative (953299)"),
+    ("explicit", "Meta's read of it answered about a different creative (953299)"),
+])
+def test_ee3_enhancements_do_not_copy_settings_from_another_object(monkeypatch, wrong_read, message) -> None:
+    client = R33EnhancementClient(**{wrong_read: "953299"})
+    _patch(monkeypatch, client)
+    with pytest.raises(ValidationError) as raised:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="953200", features=R33_FEATURES))
+    assert _r33_writes(client) == []
+    assert message in str(raised.value)
+    assert "Nothing was created or attached" in str(raised.value)
+
+
+@pytest.mark.parametrize("wrong_read", ["ad", "creative"])
+def test_ee3_enhancement_dry_run_does_not_show_a_copy_of_another_object(monkeypatch, wrong_read) -> None:
+    client = R33EnhancementClient(**{wrong_read: 953299})
+    _patch(monkeypatch, client)
+    with pytest.raises(ValidationError, match="answered about a different"):
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="953200", features=R33_FEATURES, dry_run=True))
+    assert _r33_writes(client) == []
+
+
+def test_ee3_enhancement_dry_run_names_explicit_settings_from_another_creative_as_not_read(monkeypatch) -> None:
+    client = R33EnhancementClient(explicit="953299")
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="953200", features=R33_FEATURES, dry_run=True))
+    assert _r33_writes(client) == []
+    assert result["settings_not_read"] == ["object_story_spec.whats_app_business_phone_number"]
+    assert "15555550199" not in json.dumps(result["would_send"])
+    assert any("different creative (953299)" in note for note in result["notes"])
+
+
+@pytest.mark.parametrize("read", ["ad", "creative", "explicit"])
+@pytest.mark.parametrize("form", ["text", "whole number", "spaced text", "missing"])
+def test_ee3_enhancements_control_ordinary_reads_as_before(monkeypatch, read, form) -> None:
+    """Control: each read answering with the id asked for (text, whole number, spaced) or with no id."""
+    asked = "953200" if read == "ad" else "953201"
+    answered = {"text": asked, "whole number": int(asked), "spaced text": f" {asked} ", "missing": R33_MISSING}[form]
+    client = R33EnhancementClient(**{read: answered})
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="953200", features=R33_FEATURES))
+    writes = _r33_writes(client)
+    assert [write[0] for write in writes] == ["create", "update"]
+    assert writes[0][3]["object_story_spec"] == {"page_id": "953210", "link_data": {"link": "https://example.com/r33"}}
+    assert writes[1] == ("update", "953200", {"creative": {"creative_id": "953202"}})
+    assert result["current"]["creative_id"] == "953202"
+
+
+@pytest.mark.parametrize(("created", "message"), [
+    (True, "returned something that is not an id"),
+    ({"id": "953202"}, "returned something that is not an id"),
+    (["953202"], "returned something that is not an id"),
+    (953201, "named the ad's existing creative as the new copy"),
+    (" 953201 ", "named the ad's existing creative as the new copy"),
+    ("953200", "named ad 953200 as the new copy"),
+])
+def test_ee2_enhancements_attach_only_a_new_creative_id(monkeypatch, created, message) -> None:
+    client = R33EnhancementClient(created=created)
+    _patch(monkeypatch, client)
+    with pytest.raises(ValidationError, match=message) as raised:
+        asyncio.run(cf.update_ad_creative_enhancements(ad_id="953200", features=R33_FEATURES))
+    assert [write[0] for write in _r33_writes(client)] == ["create"]
+    assert "A replacement creative may have been created" in str(raised.value)
+
+
+@pytest.mark.parametrize("created", [953202, " 953202 "])
+def test_ee2_enhancements_control_new_creative_id_forms_as_before(monkeypatch, created) -> None:
+    client = R33EnhancementClient(created=created)
+    _patch(monkeypatch, client)
+    result = asyncio.run(cf.update_ad_creative_enhancements(ad_id="953200", features=R33_FEATURES))
+    assert _r33_writes(client)[-1] == ("update", "953200", {"creative": {"creative_id": "953202"}})
+    assert result["current"]["creative_id"] == "953202"
+
+
+@pytest.mark.parametrize(("created", "shown"), [(True, None), ({"id": "999"}, None), (999, "999"), ("999", "999")])
+def test_ee2_create_from_inputs_shows_only_an_id_as_the_new_creative(monkeypatch, created, shown) -> None:
+    class Client(FakeClient):
+        async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
+            self.calls.append(("create", parent_id, edge, data))
+            return {"id": created}
+
+    _patch(monkeypatch, Client())
+    result = asyncio.run(cf.create_ad_creative_from_inputs(
+        account_id="123", name="Creative", page_id="111", link_url="https://example.com", image_hash="h1",
+    ))
+    assert result["creative_id"] == shown

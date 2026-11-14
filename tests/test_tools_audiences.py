@@ -1635,3 +1635,85 @@ def test_audience_label_error_counts_every_unrecognised_value_without_quoting_an
     message = str(error.value)
     assert "2 values that are not" in message
     assert "jordan" not in message.casefold()
+
+
+# Round thirty-three (review R33, EE4): an upload batch acknowledged for a different audience is not
+# counted as accepted, and no further batch is sent.
+
+R33_MISSING = "<missing>"
+R33_EMAILS = ["qa-r33-one@example.com", "qa-r33-two@example.com"]
+
+
+class R33AnsweringUsersClient(FakeUsersClient):
+    """Answers batch n (from 1) with the audience_id answers[n - 1] (left out for R33_MISSING)."""
+
+    def __init__(self, answers: list) -> None:
+        super().__init__()
+        self.answers = answers
+
+    def _record(self, method: str, parent_id: str, edge: str, data: dict) -> dict:
+        answer = super()._record(method, parent_id, edge, data)
+        answered = self.answers[len(self.requests) - 1]
+        if isinstance(answered, str) and answered == R33_MISSING:
+            answer.pop("audience_id")
+        else:
+            answer["audience_id"] = answered
+        return answer
+
+
+def _r33_upload(monkeypatch, tool: str, answers: list, emails: list[str]):
+    client = R33AnsweringUsersClient(answers)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+    return client, (lambda: asyncio.run(_users_tool(tool)(
+        audience_id="954001", schema=["EMAIL"], rows=[[email] for email in emails],
+    )))
+
+
+def _r33_assert_no_values(text: str) -> None:
+    for email in R33_EMAILS:
+        assert email not in text and _sha(email) not in text
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+def test_ee4_upload_does_not_claim_success_from_another_audience(monkeypatch, tool) -> None:
+    client, run = _r33_upload(monkeypatch, tool, ["954099"], R33_EMAILS[:1])
+    with pytest.raises(audiences.MetaApiError) as raised:
+        run()
+    assert len(client.requests) == 1
+    error = raised.value
+    assert error.mutation_outcome_unknown is True
+    message = str(error)
+    assert f"{tool} stopped on batch 1 of 1 in session" in message
+    assert "0 earlier batches with 0 rows were accepted by Meta" in message
+    assert "named a different audience (954099) than 954001" in message
+    assert "whether this batch was accepted is not known" in message
+    _r33_assert_no_values(message)
+    _r33_assert_no_values(json.dumps(error.to_public_dict()))
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize("wrong_batch", [1, 2])
+def test_ee4_upload_sends_no_batch_after_another_audiences_acknowledgement(monkeypatch, tool, wrong_batch) -> None:
+    answers = ["954001", "954001"]
+    answers[wrong_batch - 1] = 954099
+    client, run = _r33_upload(monkeypatch, tool, answers, R33_EMAILS)
+    with pytest.raises(audiences.MetaApiError) as raised:
+        run()
+    assert len(client.requests) == wrong_batch
+    message = str(raised.value)
+    accepted = "1 earlier batch with 1 row was accepted" if wrong_batch == 2 else "0 earlier batches with 0 rows were accepted"
+    assert f"batch {wrong_batch} of 2" in message and accepted in message
+    _r33_assert_no_values(message)
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize("answered", ["954001", 954001, " 954001 ", R33_MISSING])
+def test_ee4_upload_control_ordinary_acknowledgements_as_before(monkeypatch, tool, answered) -> None:
+    """Control: the audience asked for, as text, a whole number or spaced text, or no audience_id at all."""
+    client, run = _r33_upload(monkeypatch, tool, [answered, answered], R33_EMAILS)
+    result = run()
+    assert len(client.requests) == 2
+    assert result["ok"] is True
+    assert result["meta"]["num_received"] == 2
+    assert [batch["rows_sent"] for batch in result["batches"]] == [1, 1]

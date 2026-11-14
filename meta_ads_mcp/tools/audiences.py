@@ -21,7 +21,13 @@ from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
-from meta_ads_mcp.normalize import blank_to_none, collection_fault, normalize_collection, read_collection_page
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    collection_fault,
+    names_other_object,
+    normalize_collection,
+    read_collection_page,
+)
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list
 
@@ -744,6 +750,48 @@ def _safe_int(value: Any) -> int | None:
     return value if _is_count(value) else None
 
 
+def _upload_progress(
+    action: str, verb: str, *, batch_seq: int, total_batches: int, rows_accepted: int, session_id: int
+) -> str:
+    """Where an upload stopped and what Meta accepted before it: structured facts only, never a value."""
+    accepted = batch_seq - 1
+    return (
+        f"{action} {verb} on batch {batch_seq} of {total_batches} in session {session_id}; "
+        f"{accepted} earlier batch{'es' if accepted != 1 else ''} with {rows_accepted} "
+        f"row{'s' if rows_accepted != 1 else ''} {'were' if accepted != 1 else 'was'} accepted by Meta. "
+        "Meta closes an unfinished session automatically after 90 minutes."
+    )
+
+
+def _other_audience_error(
+    *,
+    action: str,
+    audience_id: str,
+    answered_id: Any,
+    batch_seq: int,
+    total_batches: int,
+    rows_accepted: int,
+    session_id: int,
+) -> MetaApiError:
+    """A batch whose answer named a different audience: its acceptance is unknown, and no batch follows.
+
+    The message holds the upload's progress and the two audience ids (diagnostic context the tool
+    already shows), never an uploaded value or hash.
+    """
+    progress = _upload_progress(
+        action, "stopped", batch_seq=batch_seq, total_batches=total_batches, rows_accepted=rows_accepted,
+        session_id=session_id,
+    )
+    return MetaApiError(
+        message=(
+            f"{progress} Meta's answer to batch {batch_seq} named a different audience ({str(answered_id).strip()}) "
+            f"than {audience_id}, so whether this batch was accepted is not known, and no further batch was sent. "
+            "Check the audience with get_audience before uploading again."
+        ),
+        mutation_outcome_unknown=True,
+    )
+
+
 def _sanitized_upload_error(
     exc: Exception,
     *,
@@ -761,12 +809,9 @@ def _sanitized_upload_error(
     them all. They are withheld; only Meta's numeric code and subcode, the HTTP
     status, whether a retry is safe, and the upload progress are kept.
     """
-    accepted = batch_seq - 1
-    progress = (
-        f"{action} failed on batch {batch_seq} of {total_batches} in session {session_id}; "
-        f"{accepted} earlier batch{'es' if accepted != 1 else ''} with {rows_accepted} "
-        f"row{'s' if rows_accepted != 1 else ''} {'were' if accepted != 1 else 'was'} accepted by Meta. "
-        "Meta closes an unfinished session automatically after 90 minutes."
+    progress = _upload_progress(
+        action, "failed", batch_seq=batch_seq, total_batches=total_batches, rows_accepted=rows_accepted,
+        session_id=session_id,
     )
     withheld = "Meta's error text is withheld because it can quote uploaded customer values."
     if isinstance(exc, RateLimitError):
@@ -910,6 +955,17 @@ async def _send_audience_users(
             # Raised outside the except block so the original error, which can
             # echo uploaded values, is not chained as __context__.
             raise failure
+        if names_other_object(audience_id, result, key="audience_id"):
+            # An acknowledgement for another audience does not say this batch was accepted.
+            raise _other_audience_error(
+                action=action,
+                audience_id=audience_id,
+                answered_id=result.get("audience_id"),
+                batch_seq=batch_seq,
+                total_batches=len(batches),
+                rows_accepted=rows_accepted,
+                session_id=session_id,
+            )
         counts = {
             key: result.get(key) if _is_count(result.get(key)) else None
             for key in ("num_received", "num_invalid_entries")
