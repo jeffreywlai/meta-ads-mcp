@@ -212,9 +212,11 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "delete_feed_rule": {"rule_id": "rule_123"},
     "update_feed_rule": {"rule_id": "123", "params": {"type": "to_lower"}},
     "list_catalog_event_sources": {"catalog_id": "cat_123"},
-    "list_event_source_catalogs": {"event_source_id": "external_event_sources_123"},
+    # business_id is given: this fake answers every unknown field with placeholder text, which is
+    # not a Graph id, so the owner business it would otherwise read cannot be read.
+    "list_event_source_catalogs": {"event_source_id": "external_event_sources_123", "business_id": "123"},
     "get_catalog_event_source_health": {"catalog_id": "cat_123"},
-    "get_catalog_event_source_recommendations": {"catalog_id": "cat_123"},
+    "get_catalog_event_source_recommendations": {"catalog_id": "cat_123", "business_id": "123"},
     "connect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "px_123"},
     "disconnect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "external_event_sources_123"},
     "list_pages": {"source": "ad_account", "account_id": "123"},

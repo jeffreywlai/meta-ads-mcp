@@ -36,6 +36,8 @@ from meta_ads_mcp.normalize import (
     to_int,
 )
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
+# The one rule for a Graph id read from Meta, shared with the catalog access tools.
+from meta_ads_mcp.tools.business_access import _row_identity as graph_id
 from meta_ads_mcp.tool_types import FieldList, GraphId, normalize_field_list
 # The feed tools' masking: a URL password in a result or in a raised error's text
 # is replaced, keeping user, host and path, and a password or token the caller supplied
@@ -483,11 +485,26 @@ def _masked(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
 
 
 def _row_identity(row: Any) -> str | None:
-    """Return a row's Meta id, or None when the row carries none."""
-    if not isinstance(row, dict):
-        return None
-    value = row.get("id")
-    if value is None or isinstance(value, (bool, dict, list)):
+    """A row's Graph id, or None when it cannot be read.
+
+    The id goes through business_access._row_identity, the codebase's one rule for a Graph
+    id read from Meta: a non-negative whole number that is not true or false, or text that
+    is ASCII digits once surrounding spaces are removed. Every Graph id this module reads
+    from a row (catalogs, products, product sets, event sources, Pages, businesses) goes
+    through here; a row without one is counted as unidentified, never matched.
+    """
+    return graph_id(row.get("id")) if isinstance(row, dict) else None
+
+
+def _retailer_id(value: Any) -> str | None:
+    """An item's retailer id (the advertiser's own SKU, not a Graph id), or None when it cannot be read.
+
+    A retailer id is any text the advertiser chose, so its rule is: text that is not blank
+    once surrounding spaces are removed, or a whole number that is not true or false. Used
+    for every SKU read back from Meta: products in the catalog, batch submission and status
+    entries, warnings and invalid-request ids.
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
     text = str(value).strip()
     return text or None
@@ -608,7 +625,7 @@ async def _business_scope(client, business_id: str | None, account_id: str | Non
     normalized_account = normalize_account_id(account_id or "")
     account = await client.get_object(normalized_account, fields=["business"])
     business = account.get("business") or {}
-    owner_id = str(business.get("id") or "").strip() if isinstance(business, dict) else ""
+    owner_id = _row_identity(business) or ""
     if not owner_id:
         raise ValidationError(
             f"Ad account {normalized_account} is not owned by a business, so it has no business product "
@@ -723,7 +740,7 @@ async def _catalog_dpa_signals(
     A catalog Meta reports with no products is blocked whatever else is true, so
     its supporting edges are not read.
     """
-    catalog_id = str(catalog.get("id"))
+    catalog_id = _row_identity(catalog)
     signals: dict[str, Any] = {
         "product_count": to_int(catalog.get("product_count")),
         "is_catalog_segment": catalog.get("is_catalog_segment"),
@@ -1028,7 +1045,7 @@ async def list_dpa_eligible_catalogs(
     for catalog in catalogs:
         collected = await _catalog_dpa_signals(client, catalog, ad_domain=ad_domain, pixel_id=pixel_id)
         if page_read is not None:
-            catalog_key = str(catalog.get("id"))
+            catalog_key = _row_identity(catalog)
             if page_read["ids"] is None:
                 linked = None
             elif catalog_key in page_read["ids"]:
@@ -1040,16 +1057,16 @@ async def list_dpa_eligible_catalogs(
             collected["signals"], collected["unavailable"], collected["partial"], ad_format=normalized_format,
         )
         for entry in collected["unavailable"]:
-            missing_signals.append(f"{catalog.get('id')}: {entry['signal']} could not be read ({entry['error']}).")
+            missing_signals.append(f"{_row_identity(catalog)}: {entry['signal']} could not be read ({entry['error']}).")
         for entry in collected["partial"]:
             missing_signals.append(
-                f"{catalog.get('id')}: {entry['signal']} was only partly read "
+                f"{_row_identity(catalog)}: {entry['signal']} was only partly read "
                 f"({entry['rows_read']} row(s) read). {entry['reason']}"
             )
         for entry in collected.get("context_errors", []):
-            missing_signals.append(f"{catalog.get('id')}: {entry['signal']} could not be read ({entry['error']}).")
+            missing_signals.append(f"{_row_identity(catalog)}: {entry['signal']} could not be read ({entry['error']}).")
         finding = {
-            "catalog_id": str(catalog.get("id")),
+            "catalog_id": _row_identity(catalog),
             "name": catalog.get("name"),
             "vertical": catalog.get("vertical"),
             "assessment": assessment,
@@ -1150,7 +1167,7 @@ async def list_dpa_eligible_catalogs(
         rules["page_id"] = ("Matches when the catalog is among the product catalogs Meta lists for the Page "
                             "(GET /{page_id}/product_catalogs, documented as the catalogs the Page owns).")
         if page_read is not None and page_read["ids"]:
-            evaluated = {str(catalog.get("id")) for catalog in catalogs}
+            evaluated = {_row_identity(catalog) for catalog in catalogs}
             outside = sorted(page_read["ids"] - evaluated)
             if outside:
                 extra_basis["page_catalogs_not_evaluated"] = outside[:20]
@@ -1326,8 +1343,13 @@ async def get_catalog_dynamic_ads_health(
     product_set: dict[str, Any] | None = None
     if product_set_id:
         product_set = await client.get_object(product_set_id, fields=[*PRODUCT_SET_FIELDS, "product_catalog"])
-        owner = (product_set.get("product_catalog") or {}).get("id")
-        if owner and str(owner) != catalog_id:
+        owner = _row_identity(product_set.get("product_catalog"))
+        if owner is None:
+            missing.append(
+                f"The catalog product set {product_set_id} belongs to could not be read, so that it is in "
+                f"catalog {catalog_id} is not confirmed."
+            )
+        elif owner != (graph_id(catalog_id) or catalog_id):
             raise ValidationError(f"Product set {product_set_id} belongs to catalog {owner}, not {catalog_id}.")
         used.append("product_set.product_count")
 
@@ -2000,12 +2022,12 @@ async def _read_batch_products(client, catalog_id: str, entries: list[dict[str, 
     for row in read["rows"]:
         if not isinstance(row, dict):
             continue
-        retailer_id = row.get("retailer_id")
-        if not isinstance(retailer_id, (str, int)) or isinstance(retailer_id, bool) or not str(retailer_id).strip():
+        retailer_id = _retailer_id(row.get("retailer_id"))
+        if retailer_id is None:
             unidentified += 1
             continue
-        if str(retailer_id) in wanted:
-            found[str(retailer_id)] = row
+        if retailer_id in wanted:
+            found[retailer_id] = row
     complete, stop_reason = read["complete"], read["stop_reason"]
     if unidentified:
         complete = False
@@ -2042,13 +2064,15 @@ def _previous_for(
 
 def _feed_warning(entry: dict[str, Any], product: dict[str, Any]) -> str | None:
     feed = product.get(_FEED_FIELD)
-    feed_id = feed.get("id") if isinstance(feed, dict) else feed
-    if not feed_id:
+    if feed is None or feed in ("", {}, []):
         return None
+    # Meta reported a feed; one whose id cannot be read is still a feed, named without its id.
+    feed_id = _row_identity(feed) if isinstance(feed, dict) else graph_id(feed)
+    linked = f"product feed {feed_id}" if feed_id is not None else "a product feed whose id could not be read"
     if entry["method"] == "delete":
-        return (f"This product is linked to product feed {feed_id}. The feed's next fetch or upload may add it "
+        return (f"This product is linked to {linked}. The feed's next fetch or upload may add it "
                 "back unless it is removed from the feed too.")
-    return (f"This product is linked to product feed {feed_id}. The feed's next fetch or upload may overwrite "
+    return (f"This product is linked to {linked}. The feed's next fetch or upload may overwrite "
             "this change unless the feed is changed too.")
 
 
@@ -2099,8 +2123,8 @@ def _messages(entries: Any, generic: str = _NO_MESSAGE_ERROR) -> list[str]:
 def _by_id(entries: Any) -> dict[str, list[str]]:
     grouped: dict[str, list[str]] = {}
     for entry in _entry_list(entries):
-        if isinstance(entry, dict) and entry.get("id") is not None:
-            grouped.setdefault(str(entry["id"]), []).append(_entry_text(entry, _NO_MESSAGE_WARNING))
+        if (identity := _identified(entry)) is not None:
+            grouped.setdefault(identity, []).append(_entry_text(entry, _NO_MESSAGE_WARNING))
     return grouped
 
 
@@ -2144,8 +2168,9 @@ async def _check_batch(client, catalog_id: str, handle: str) -> dict[str, Any] |
     return _batch_status_row(payload)
 
 
-# A batch error entry names its item by the request's id (the retailer id).
-_identified = _row_identity
+def _identified(entry: Any) -> str | None:
+    """The item a batch error or warning entry names: the request's id, which is the retailer id."""
+    return _retailer_id(entry.get("id")) if isinstance(entry, dict) else None
 
 
 def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
@@ -2167,7 +2192,7 @@ def _batch_attribution(row: dict[str, Any]) -> dict[str, Any]:
     for value in raw_invalid:
         # Meta documents these as the requests' ids; a single id given without a list is
         # read as one id, never character by character.
-        text = str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+        text = _retailer_id(value)
         if text:
             invalid.add(text)
         else:
@@ -2553,7 +2578,7 @@ async def batch_update_catalog_products(
             "warnings": [],
         }
         if product is not None:
-            item["product_id"] = str(product.get("id")) if product.get("id") is not None else None
+            item["product_id"] = _row_identity(product)
         if entry["method"] == "create" and product is not None:
             item["outcome"] = "skipped_already_exists"
             item["reason"] = "A product with this retailer_id is already in the catalog; use method update to change it."
@@ -2664,8 +2689,7 @@ async def batch_update_catalog_products(
                     if not isinstance(entry, dict):
                         unreadable_entries += 1
                         continue
-                    raw_id = entry.get("retailer_id")
-                    entry_id = str(raw_id).strip() if raw_id is not None else ""
+                    entry_id = _retailer_id(entry.get("retailer_id")) or ""
                     if entry_id in sent_ids:
                         flagged.setdefault(entry_id, []).append(entry)
                     else:

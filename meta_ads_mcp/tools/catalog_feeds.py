@@ -33,6 +33,8 @@ from meta_ads_mcp.normalize import (
     to_int,
 )
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
+# The one rule for a Graph id read from Meta, shared with the catalog access tools.
+from meta_ads_mcp.tools.business_access import _row_identity as graph_id
 from meta_ads_mcp.secret_scrub import (  # noqa: F401 - the length thresholds stay importable from here
     ANYWHERE,
     ERROR,
@@ -517,17 +519,30 @@ async def _collect_edge(
 
 def _rows_without_id(rows: list[dict[str, Any]]) -> int:
     """How many rows carry no readable id, so cannot be told apart from the one being looked for."""
-    return sum(1 for row in rows if _object_id(row.get("id")) is None)
+    return sum(1 for row in rows if _row_id(row) is None)
+
+
+def _row_id(row: Any) -> str | None:
+    """A row's own Graph id, or None when it cannot be read.
+
+    A row's id is a bare id under business_access._row_identity's rule; an object in its
+    place is not one (unlike a field naming another object, which _object_id reads).
+    """
+    return graph_id(row.get("id")) if isinstance(row, dict) else None
 
 
 def _object_id(value: Any) -> str | None:
-    """Read an id from a nested Graph object or a bare id string."""
-    if isinstance(value, dict):
-        candidate = value.get("id")
-        return str(candidate) if candidate not in (None, "") else None
-    if isinstance(value, (str, int)) and str(value).strip():
-        return str(value).strip()
-    return None
+    """The Graph id of a field naming another object ({"id": ...}) or a bare id, or None when it cannot be read.
+
+    Used for fields that name another object (a stats row's event_source, a source's
+    owner_business, a catalog's business); a row's own id (event sources, pixels, catalogs,
+    uploads) is read with _row_id. Both go through business_access._row_identity,
+    the codebase's one rule for a Graph id: a non-negative whole number that is not true or
+    false, or text that is ASCII digits once surrounding spaces are removed. Anything else
+    (true, a word, blank text, an object inside the id) is no readable identity: callers count such
+    a row as unattributed or unreadable, never drop it silently and never match it.
+    """
+    return graph_id(value.get("id")) if isinstance(value, dict) else graph_id(value)
 
 
 def _validate_http_url(
@@ -1174,7 +1189,7 @@ async def _upload_with_errors(
     are no errors to read. An upload with neither an id nor those zero counts gets
     errors_complete=false with the reason, never an empty list called complete.
     """
-    upload_id = _object_id(upload.get("id")) or requested_id
+    upload_id = _row_id(upload) or requested_id
     item = {**upload, "status": _upload_status(upload)}
     error_count = to_int(upload.get("error_count"))
     warning_count = to_int(upload.get("warning_count"))
@@ -2106,7 +2121,7 @@ async def list_event_source_catalogs(
     matches: list[dict[str, Any]] = []
     sources_complete = True
     for catalog in catalogs:
-        catalog_id = _object_id(catalog.get("id"))
+        catalog_id = _row_id(catalog)
         if catalog_id is None:
             # A catalog Meta listed without an id cannot be checked, so it may be connected.
             sources_complete = False
@@ -2114,7 +2129,7 @@ async def list_event_source_catalogs(
             continue
         sources, complete = await _connected_sources(client, catalog_id, stop_reasons)
         sources_complete = sources_complete and complete
-        if any(_object_id(source.get("id")) == event_source_id for source in sources):
+        if any(_row_id(source) == event_source_id for source in sources):
             matches.append(catalog)
         elif _rows_without_id(sources):
             sources_complete = False
@@ -2145,7 +2160,7 @@ async def list_event_source_catalogs(
     items: list[dict[str, Any]] = []
     not_checked: list[str] = []
     for index, catalog in enumerate(matches):
-        catalog_id = _object_id(catalog.get("id"))
+        catalog_id = _row_id(catalog)
         if index < MAX_MATCH_RATE_CATALOGS and catalog_id is not None:
             rate = await _source_rate_in_catalog(client, catalog_id, event_source_id, event_name)
         else:
@@ -2165,7 +2180,7 @@ async def list_event_source_catalogs(
         "catalogs_not_checked": not_checked,
         "max_catalogs_checked": MAX_MATCH_RATE_CATALOGS,
         "max_event_stats_pages_per_catalog": MATCH_RATE_STATS_PAGES,
-        "ranked_by_match_rate": [item["id"] for item in ranked],
+        "ranked_by_match_rate": [_row_id(item) for item in ranked],
         "ranking_covers_every_connected_catalog": complete and len(computed) == len(items),
         "method": "derived: for each connected catalog, this source's rows in the catalog's event_stats "
         "(last 28 days) are summed. A rate is given only when that read finished and Meta reported both "
@@ -2200,7 +2215,7 @@ async def get_catalog_event_source_health(
     reports: list[dict[str, Any]] = []
     sources = inputs["sources"]
     if scope_id is not None:
-        sources = [source for source in sources if _object_id(source.get("id")) == scope_id]
+        sources = [source for source in sources if _row_id(source) == scope_id]
         if not sources and inputs["sources_complete"] and not _rows_without_id(inputs["sources"]):
             raise ValidationError(
                 f"Event source {scope_id} is not connected to catalog {catalog_id}; "
@@ -2215,7 +2230,7 @@ async def get_catalog_event_source_health(
                 + "), so its name and type are unknown."
             )
     for source in sources:
-        source_id = _object_id(source.get("id"))
+        source_id = _row_id(source)
         if source_id is None:
             missing.append("Meta listed a connected source without an id, so it could not be reported on.")
             continue
@@ -2403,7 +2418,7 @@ async def get_catalog_event_source_recommendations(
                 "The catalog has no readable business; pass business_id to choose whose pixels to consider."
             )
     inputs = await _catalog_signal_inputs(client, catalog_id)
-    connected_ids = {_object_id(source.get("id")) for source in inputs["sources"]} - {None}
+    connected_ids = {_row_id(source) for source in inputs["sources"]} - {None}
     findings: list[dict[str, Any]] = []
     missing: list[str] = []
     matched = _known_sum(stat["matched_content_ids"] for stat in inputs["stats"].values())
@@ -2493,15 +2508,15 @@ async def get_catalog_event_source_recommendations(
         missing.append(
             f"{_rows_without_id(pixels)} pixel(s) Meta listed had no id, so they could not be considered."
         )
-        pixels = [pixel for pixel in pixels if _object_id(pixel.get("id")) is not None]
+        pixels = [pixel for pixel in pixels if _row_id(pixel) is not None]
     candidates = [
         pixel for pixel in pixels
-        if _object_id(pixel.get("id")) not in connected_ids and not pixel.get("is_unavailable")
+        if _row_id(pixel) not in connected_ids and not pixel.get("is_unavailable")
     ]
     excluded = [
-        {"event_source_id": _object_id(pixel.get("id")), "reason": "Meta marks this pixel unavailable."}
+        {"event_source_id": _row_id(pixel), "reason": "Meta marks this pixel unavailable."}
         for pixel in pixels
-        if _object_id(pixel.get("id")) not in connected_ids and pixel.get("is_unavailable")
+        if _row_id(pixel) not in connected_ids and pixel.get("is_unavailable")
     ]
     if not pixels:
         missing.append(f"No pixels were returned for business {business_id}, so there are no candidates to recommend.")
@@ -2513,7 +2528,7 @@ async def get_catalog_event_source_recommendations(
     connection_status = "not_connected" if sources_complete else "unknown"
     recommendations: list[dict[str, Any]] = []
     for index, pixel in enumerate(candidates):
-        pixel_id = _object_id(pixel.get("id"))
+        pixel_id = _row_id(pixel)
         evidence: list[dict[str, Any]] = [{"last_fired_time": pixel.get("last_fired_time")}]
         strength = "unchecked"
         reason = (
@@ -2607,7 +2622,7 @@ async def _connection_state(
     """Read the connected sources; when the read stops early, say so in plain words."""
     reasons: list[str] = []
     sources, complete = await _connected_sources(client, catalog_id, reasons)
-    ids = [source_id for source in sources if (source_id := _object_id(source.get("id")))]
+    ids = [source_id for source in sources if (source_id := _row_id(source))]
     if len(ids) < len(sources):
         # The source asked about may be the one Meta listed without an id.
         complete = False
@@ -2673,7 +2688,7 @@ async def disconnect_catalog_event_source(
     event_source_id = _require_id(event_source_id, "event_source_id")
     client = _client()
     sources, before, complete, gaps = await _connection_state(client, catalog_id)
-    source = next((s for s in sources if _object_id(s.get("id")) == event_source_id), None)
+    source = next((s for s in sources if _row_id(s) == event_source_id), None)
     if source is None and complete:
         raise ValidationError(
             # The ids are not repeated: event_source_id is not checked as an id before this point.
