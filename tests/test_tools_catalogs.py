@@ -1847,6 +1847,192 @@ def test_batch_products_sdk_only_field_previous_is_read(monkeypatch) -> None:
     assert "previous_unavailable" not in result["items"][0]
 
 
+# round twenty-five: documented batch fields and images, the empty product set filter --------------
+
+
+@pytest.mark.parametrize("fields", [
+    {"user_rating": 4.5, "rating_count": 100},
+    {"vendor_id": "seller-123"},
+    {"inventory": 0},
+    {"product_tags": ["summer", "trending"]},
+], ids=["ratings", "vendor", "inventory-alias-zero", "product-tags-alias"])
+def test_r25_documented_product_item_fields_reach_batch(monkeypatch, fields) -> None:
+    """items_batch PRODUCT_ITEM table: rating_count, user_rating, vendor_id; inventory and product_tags aliases."""
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "961101", inventory=7)]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", fields=fields)], dry_run=True, wait_seconds=0,
+    ))
+    assert result["request"]["data"]["requests"][0]["data"] == {"id": "SKU-1", **fields}
+    item = result["items"][0]
+    assert item["outcome"] == "would_send"
+    assert item["changes"] == fields
+    if "inventory" in fields:
+        assert item["previous"] == {"inventory": 7}
+        assert "previous_unavailable" not in item
+    else:
+        assert item["previous"] == {}
+        assert item["previous_unavailable"] == list(fields)
+
+
+@pytest.mark.parametrize(("fields", "match"), [
+    ({"inventory": 0, "quantity_to_sell_on_facebook": 0}, "same Meta field"),
+    ({"product_tags": ["a"], "internal_label": ["a"]}, "same Meta field"),
+    ({"not_a_field": "x"}, r"items\[0\]\.fields has 1 key"),
+    ({"price": "10 USD"}, r"price \(use price\)"),
+    ({"sale_price": "10 USD"}, r"sale_price \(use sale_price\)"),
+    ({"image_link": "https://shop.example/a.png"}, r"image_link \(use image_url\)"),
+])
+def test_r25_batch_fields_still_refused(monkeypatch, fields, match) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=match):
+        _run(catalogs.batch_update_catalog_products(
+            catalog_id="123", items=[_batch_item("update", "SKU-1", fields=fields)], dry_run=True,
+        ))
+
+
+_R25_IMAGES = [
+    {"url": "https://shop.example/front.jpg", "tag": ["front"]},
+    {"url": "https://shop.example/back.jpg", "tag": ["back"]},
+]
+
+
+def test_r25_structured_images_reach_a_batch_update_with_previous_images(monkeypatch) -> None:
+    """items_batch: image is an array of up to 21 objects with url and optional tag."""
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing(
+        "SKU-1", "961101", image_url="https://shop.example/old.jpg",
+        additional_image_urls=["https://shop.example/old2.jpg"],
+    )]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[_batch_item("update", "SKU-1", fields={"image": _R25_IMAGES})],
+        dry_run=True, wait_seconds=0,
+    ))
+    assert result["request"]["data"]["requests"][0]["data"] == {"id": "SKU-1", "image": _R25_IMAGES}
+    item = result["items"][0]
+    assert item["changes"] == {"image": _R25_IMAGES}
+    assert item["previous"] == {"image": {
+        "image_url": "https://shop.example/old.jpg", "additional_image_urls": ["https://shop.example/old2.jpg"],
+    }}
+    assert "previous_unavailable" not in item
+    read_fields = client.calls[0][1]["fields"]
+    assert "image_url" in read_fields and "additional_image_urls" in read_fields
+
+
+def test_r25_structured_images_satisfy_a_batch_create(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([]))
+    item = _full_create("SKU-1", fields={"image": _R25_IMAGES})
+    item.pop("image_url")
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", items=[item], dry_run=True, wait_seconds=0,
+    ))
+    sent = result["request"]["data"]["requests"][0]
+    assert sent["method"] == "CREATE"
+    assert sent["data"]["image"] == _R25_IMAGES
+    assert "image_link" not in sent["data"]
+    # Without any image a create is still refused.
+    item.pop("fields")
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="missing image_url"):
+        _run(catalogs.batch_update_catalog_products(catalog_id="123", items=[item], dry_run=True))
+
+
+def test_r25_named_primary_image_keeps_additional_images(monkeypatch) -> None:
+    """items_batch ignores additional_image_link when image is sent, so the primary goes as image_link."""
+    _no_pause(monkeypatch)
+    client = _use(monkeypatch, _batch_client([_existing(
+        "SKU-1", "961101", image_url="https://shop.example/old.jpg",
+        additional_image_urls=["https://shop.example/old2.jpg"],
+    )]))
+    additional = ["https://shop.example/back.jpg"]
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", dry_run=True, wait_seconds=0,
+        items=[_batch_item("update", "SKU-1", image_url="https://shop.example/front.jpg",
+                           fields={"additional_image_link": additional})],
+    ))
+    assert result["request"]["data"]["requests"][0]["data"] == {
+        "id": "SKU-1", "image_link": "https://shop.example/front.jpg", "additional_image_link": additional,
+    }
+    item = result["items"][0]
+    assert item["changes"] == {"image_url": "https://shop.example/front.jpg", "additional_image_link": additional}
+    assert item["previous"] == {
+        "image_url": "https://shop.example/old.jpg", "additional_image_link": ["https://shop.example/old2.jpg"],
+    }
+    assert "previous_unavailable" not in item
+    read_fields = client.calls[0][1]["fields"]
+    assert "image_url" in read_fields and "additional_image_urls" in read_fields
+
+
+def test_r25_named_primary_image_alone_is_sent_as_before(monkeypatch) -> None:
+    _no_pause(monkeypatch)
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "961101", image_url="https://shop.example/old.jpg")]))
+    result = _run(catalogs.batch_update_catalog_products(
+        catalog_id="123", dry_run=True, wait_seconds=0,
+        items=[_batch_item("update", "SKU-1", image_url="https://shop.example/front.jpg")],
+    ))
+    assert result["request"]["data"]["requests"][0]["data"] == {
+        "id": "SKU-1", "image": [{"url": "https://shop.example/front.jpg"}],
+    }
+    assert result["items"][0]["previous"] == {"image_url": "https://shop.example/old.jpg"}
+
+
+@pytest.mark.parametrize(("item", "match"), [
+    (_batch_item("update", "S1", image_url="https://shop.example/a.jpg", fields={"image": _R25_IMAGES}),
+     "either as image_url or as fields.image"),
+    (_batch_item("update", "S1", fields={"image": _R25_IMAGES,
+                                         "additional_image_link": ["https://shop.example/c.jpg"]}),
+     "ignores additional_image_link"),
+    (_batch_item("update", "S1", fields={"image": "https://shop.example/a.jpg"}), r"fields\.image must be a list"),
+    (_batch_item("update", "S1", fields={"image": []}), r"fields\.image must be a list"),
+    (_batch_item("update", "S1", fields={"image": ["https://shop.example/a.jpg"]}), r"fields\.image\[0\]"),
+    (_batch_item("update", "S1", fields={"image": [{"tag": ["front"]}]}), r"fields\.image\[0\]\.url"),
+    (_batch_item("update", "S1", fields={"image": [{"url": " "}]}), r"fields\.image\[0\]\.url"),
+])
+def test_r25_malformed_or_conflicting_images_are_refused(monkeypatch, item, match) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match=match):
+        _run(catalogs.batch_update_catalog_products(catalog_id="123", items=[item], dry_run=True))
+
+
+def test_r25_empty_filter_creates_a_set_of_every_product(monkeypatch) -> None:
+    """product_sets reference: an empty filter parameter value and {} both mean every item."""
+    client = _use(monkeypatch, FakeCatalogClient())
+    _run(catalogs.create_product_set(catalog_id="900001", name="All products", filter=""))
+    assert client.calls[0][1]["data"]["filter"] == {}
+
+
+@pytest.mark.parametrize("value", ["nope", "[]", "3", '"text"', "null"])
+def test_r25_create_product_set_still_refuses_a_filter_that_is_not_an_object(monkeypatch, value) -> None:
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="filter must be a JSON object"):
+        _run(catalogs.create_product_set(catalog_id="900001", name="X", filter=value))
+
+
+def test_r25_empty_filter_is_not_relaxed_for_reads_or_updates(monkeypatch) -> None:
+    """Meta documents the empty value only for creating a product set."""
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="filter must be a JSON object"):
+        _run(catalogs.update_product_set(product_set_id="950001", filter=""))
+    with pytest.raises(ValidationError, match="filter must be a JSON object"):
+        _run(catalogs.list_catalog_products(catalog_id="900001", filter=""))
+
+
+def test_r25_filter_builder_accepts_documented_i_not_contains(monkeypatch) -> None:
+    """Product set filter operators: i_not_contains (catalog guides; i_* operators are accepted)."""
+    client = _use(monkeypatch, FakeCatalogClient())
+    result = _run(catalogs.build_product_set_filter(
+        "900001", [{"field": "product_type", "operator": "i_not_contains", "value": "shirt"}],
+    ))
+    assert result["filter"] == {"product_type": {"i_not_contains": "shirt"}}
+    assert client.calls[0][1]["params"]["filter"] == {"product_type": {"i_not_contains": "shirt"}}
+    _no_client(monkeypatch)
+    with pytest.raises(ValidationError, match="must be a string for i_not_contains"):
+        _run(catalogs.build_product_set_filter(
+            "900001", [{"field": "product_type", "operator": "i_not_contains", "value": 3}],
+        ))
+
+
 # --------------------------------------------- list_catalog_products extensions
 
 
@@ -2329,6 +2515,17 @@ _LOGIN_INPUTS = [
                       "fields": {"applink": {"ios_url": "app://x", "web_url": _LOGIN_URL}}}], dry_run=True)),
     ("batch.create", lambda: catalogs.batch_update_catalog_products(
         "10", items=[_full_create("sku", url=_LOGIN_URL)], dry_run=True)),
+    ("batch.structured_image", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku", "fields": {"image": [
+            {"url": "https://shop.example/a.png", "tag": ["front"]}, {"url": _LOGIN_URL, "tag": ["back"]},
+        ]}}], dry_run=True)),
+    ("batch.structured_image_tag", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku", "fields": {"image": [
+            {"url": "https://shop.example/a.png", "tag": [f"see {_LOGIN_URL}"]},
+        ]}}], dry_run=True)),
+    ("batch.image_link_with_additional", lambda: catalogs.batch_update_catalog_products(
+        "10", items=[{"method": "update", "retailer_id": "sku", "image_url": _LOGIN_URL,
+                      "fields": {"additional_image_link": ["https://shop.example/a.png"]}}], dry_run=True)),
     ("create_catalog.params", lambda: catalogs.create_catalog(
         "1", "Shop", params={"default_image_url": _LOGIN_URL})),
     ("update_catalog.params", lambda: catalogs.update_catalog(

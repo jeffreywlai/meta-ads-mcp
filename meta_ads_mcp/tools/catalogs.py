@@ -173,14 +173,16 @@ DIAGNOSTIC_DETAIL_TEXT_LIMIT = 160
 EVENT_SOURCE_FIELDS = ["id", "name", "source_type"]
 
 # Operators named in Meta's product set filter documentation. starts_with is
-# documented as available only for the category field.
+# documented as available only for the category field. i_not_contains is listed for the
+# same product_sets filter in Meta's hotel, flight, destination, vehicle and home listing
+# catalog guides, and the product_sets reference says i_* operators can still be used.
 FILTER_OPERATORS = (
-    "eq", "neq", "contains", "not_contains", "i_contains", "is_any", "is_not_any",
+    "eq", "neq", "contains", "not_contains", "i_contains", "i_not_contains", "is_any", "is_not_any",
     "lt", "lte", "gt", "gte", "starts_with",
 )
 _LIST_OPERATORS = {"is_any", "is_not_any"}
 _NUMERIC_OPERATORS = {"lt", "lte", "gt", "gte"}
-_STRING_OPERATORS = {"contains", "not_contains", "i_contains", "starts_with"}
+_STRING_OPERATORS = {"contains", "not_contains", "i_contains", "i_not_contains", "starts_with"}
 
 _DPA_MAX_CATALOGS = 100
 _DPA_PAGE_SIZE = 50
@@ -292,10 +294,19 @@ def _single(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _parse_filter(value: dict[str, Any] | str | None, *, name: str = "filter") -> dict[str, Any] | None:
-    """Accept a filter object or its JSON text; Meta expects a JSON object."""
+def _parse_filter(
+    value: dict[str, Any] | str | None, *, name: str = "filter", empty_means_all: bool = False,
+) -> dict[str, Any] | None:
+    """Accept a filter object or its JSON text; Meta expects a JSON object.
+
+    With empty_means_all, empty (or blank) text is the empty filter {}: Meta's product_sets
+    reference says an empty filter parameter value and {} both create a set of every item.
+    Only creating a product set is documented that way, so only create_product_set passes it.
+    """
     if value is None:
         return None
+    if empty_means_all and isinstance(value, str) and not value.strip():
+        return {}
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -1799,16 +1810,22 @@ _BATCH_NAMED_FIELDS = {
     "price": "price", "sale_price": "sale_price",
 }
 # Request fields a caller must set through the item's named key, not through fields.
+# image is the exception: Meta's items_batch reference documents it as an array of up to
+# 21 objects with url and optional tag, which the one-string image_url cannot carry, so a
+# structured image is accepted in fields (_batch_images).
 _FIELDS_WITH_NAMED_KEY = {
-    **{batch: key for key, batch in _BATCH_NAMED_FIELDS.items()},
+    **{batch: key for key, batch in _BATCH_NAMED_FIELDS.items() if batch != "image"},
     "id": "retailer_id", "image_link": "image_url", "currency": "currency",
 }
 # The guide's CREATE requirement for PRODUCT_ITEM: availability, brand, condition,
-# description, id, image, link, price, title.
+# description, id, image, link, price, title. image_url is met by fields.image too.
 _BATCH_CREATE_REQUIRED = ("name", "description", "url", "image_url", "brand", "availability",
                           "condition", "price", "currency")
-# Further PRODUCT_ITEM fields listed in the "send product updates" guide, passed
-# through `fields` unchanged. Fields with a named key above are not repeated here.
+# Further PRODUCT_ITEM fields listed in Meta's items_batch reference (Supported Fields,
+# item_type=PRODUCT_ITEM), passed through `fields` unchanged. Fields with a named key
+# above are not repeated here, and image is handled apart (_batch_images). inventory and
+# product_tags are the older names Meta still accepts for quantity_to_sell_on_facebook
+# and internal_label.
 BATCH_EXTRA_FIELDS = frozenset({
     "rich_text_description", "mobile_link", "additional_image_link", "video",
     "quantity_to_sell_on_facebook", "sale_price_effective_date", "color", "size", "material",
@@ -1818,7 +1835,15 @@ BATCH_EXTRA_FIELDS = frozenset({
     "custom_label_2", "custom_label_3", "custom_label_4", "custom_number_0", "custom_number_1",
     "custom_number_2", "custom_number_3", "custom_number_4", "internal_label", "shipping",
     "shipping_weight", "applink", "disabled_capabilities", "importer_address", "importer_name",
+    "rating_count", "user_rating", "vendor_id", "inventory", "product_tags",
 })
+# Older field name -> current name of the same PRODUCT_ITEM field (items_batch reference:
+# "previously called product_tags", "replacing the inventory field"). An item gives one.
+_BATCH_FIELD_ALIASES = {"inventory": "quantity_to_sell_on_facebook", "product_tags": "internal_label"}
+# What a structured fields.image replaces, read before the write for its previous value:
+# Meta's items_batch reference says image_link and additional_image_link are ignored when
+# image is given, so the array stands for the main image and the additional images.
+_BATCH_IMAGE_READ_FIELDS = ("image_url", "additional_image_urls")
 # Batch request field -> readable product item field, for showing previous values.
 _BATCH_READ_FIELD = {
     "title": "name", "description": "description", "link": "url", "image": "image_url",
@@ -1833,6 +1858,8 @@ _BATCH_READ_FIELD = {
     "custom_label_2": "custom_label_2", "custom_label_3": "custom_label_3",
     "custom_label_4": "custom_label_4", "importer_address": "importer_address",
     "importer_name": "importer_name",
+    # A named image_url sent with additional images goes as image_link (_batch_entry).
+    "image_link": "image_url", "inventory": "inventory",
 }
 # Batch fields whose readable product item field rests on SDK 26.0.2 alone
 # (PRODUCT_SDK_READABLE_UPDATE_FIELDS); Meta refusing to read them leaves only
@@ -1858,6 +1885,7 @@ def _known_keys() -> frozenset[str]:
         "partner_integration", *PRODUCT_DETAIL_FIELDS, *PRODUCT_READABLE_UPDATE_FIELDS,
         *PRODUCT_SDK_READABLE_UPDATE_FIELDS, *PRODUCT_SET_FIELDS, *FILTER_OPERATORS, "and", "or",
         "field", "operator", "value", *_BATCH_ITEM_KEYS, *_BATCH_NAMED_FIELDS.values(), *BATCH_EXTRA_FIELDS,
+        "image_link", "tag",
     })
 
 
@@ -1883,6 +1911,28 @@ def _batch_price(value: Any, currency: str, label: str) -> str:
     whole, cents = divmod(minor, 100)
     amount = str(whole) if cents == 0 else f"{whole}.{cents:02d}"
     return f"{amount} {currency}"
+
+
+def _batch_images(value: Any, label: str) -> list[Any]:
+    """Check a structured fields.image and return it unchanged, tags and all.
+
+    Meta's items_batch reference: image is a JSON array of records, each with url (the
+    image's URL) and an optional tag (a JSON array of strings). Each record needs a url;
+    everything else in it is sent as given for Meta to judge. Logins inside a URL were
+    already refused for the whole item.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValidationError(
+            f"{label}.fields.image must be a list of image objects, each with url and optionally tag "
+            "(a list of strings), as Meta's batch documentation describes."
+        )
+    for position, image in enumerate(value):
+        if not isinstance(image, dict):
+            raise ValidationError(f"{label}.fields.image[{position}] must be an object with url and optionally tag.")
+        url = image.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValidationError(f"{label}.fields.image[{position}].url must be a nonblank string (the image URL).")
+    return value
 
 
 def _batch_entry(index: int, item: Any) -> dict[str, Any]:
@@ -1922,19 +1972,37 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
     if named_here:
         listed = ", ".join(f"{key} (use {_FIELDS_WITH_NAMED_KEY[key]})" for key in named_here)
         raise ValidationError(f"{label}.fields: use the item's named key instead for {listed}.")
-    unknown_fields = [key for key in extra if key not in BATCH_EXTRA_FIELDS]
+    unknown_fields = [key for key in extra if key not in BATCH_EXTRA_FIELDS and key != "image"]
     if unknown_fields:
         raise ValidationError(
             f"{label}.fields has {_count_keys(len(unknown_fields), 'key')} that Meta's batch documentation does "
             f"not list as a PRODUCT_ITEM field (not repeated here). Accepted fields: "
-            f"{', '.join(sorted(BATCH_EXTRA_FIELDS))}."
+            f"{', '.join(sorted({*BATCH_EXTRA_FIELDS, 'image'}))}."
         )
-    if method == "create":
-        missing = [key for key in _BATCH_CREATE_REQUIRED if values.get(key) in (None, "")]
-        if missing:
+    for alias, current in _BATCH_FIELD_ALIASES.items():
+        if alias in extra and current in extra:
             raise ValidationError(
-                f"{label}: a create is missing {', '.join(missing)} (Meta requires these for a new product)."
+                f"{label}.fields: {alias} and {current} name the same Meta field ({alias} is its older name); "
+                "send one of them."
             )
+    images: list[Any] | None = None
+    if "image" in extra:
+        images = _batch_images(extra["image"], label)
+        if "image_url" in values:
+            raise ValidationError(f"{label}: give the image either as image_url or as fields.image, not both.")
+        if "additional_image_link" in extra:
+            raise ValidationError(
+                f"{label}.fields: Meta ignores additional_image_link when image is sent; list every image in "
+                "fields.image instead."
+            )
+    if method == "create":
+        missing = [
+            key for key in _BATCH_CREATE_REQUIRED
+            if values.get(key) in (None, "") and not (key == "image_url" and images is not None)
+        ]
+        if missing:
+            listed = ", ".join("image_url (or fields.image)" if key == "image_url" else key for key in missing)
+            raise ValidationError(f"{label}: a create is missing {listed} (Meta requires these for a new product).")
     if not values and not extra:
         raise ValidationError(f"{label}: an update needs at least one field to change.")
     data: dict[str, Any] = {"id": retailer_id}
@@ -1951,7 +2019,13 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
                 raise ValidationError(f"{label}.{key} needs currency in the same item.")
             data[batch_field] = _batch_price(value, currency, f"{label}.{key}")
         elif key == "image_url":
-            data[batch_field] = [{"url": _require(value, f"{label}.image_url")}]
+            primary = _require(value, f"{label}.image_url")
+            if "additional_image_link" in extra:
+                # Meta ignores additional_image_link whenever image is given, and its migration
+                # guide maps image_url to image_link ("same value, different field name").
+                data["image_link"] = primary
+            else:
+                data[batch_field] = [{"url": primary}]
         else:
             if key == "availability":
                 _choice(value, PRODUCT_AVAILABILITY, f"{label}.availability")
@@ -1967,18 +2041,27 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
         data[key] = value
         changes[key] = value
     return {"method": method, "retailer_id": retailer_id,
-            "request": {"method": BATCH_METHODS[method], "data": data}, "changes": changes}
+            "request": {"method": BATCH_METHODS[method], "data": data}, "changes": changes,
+            "image_from_fields": images is not None}
+
+
+def _reads_for(entry: dict[str, Any], batch_field: str) -> tuple[str, ...]:
+    """The product item fields read before the write to show batch_field's previous value."""
+    if batch_field == "image" and entry.get("image_from_fields"):
+        return _BATCH_IMAGE_READ_FIELDS
+    read = _BATCH_READ_FIELD.get(batch_field)
+    return (read,) if read else ()
 
 
 def _batch_read_fields(entries: list[dict[str, Any]], *, with_feed: bool, with_sdk_only: bool = True) -> list[str]:
     fields = list(_BATCH_BASE_READ_FIELDS)
     for entry in entries:
         for key in entry["request"]["data"]:
-            read = _BATCH_READ_FIELD.get(key)
             if not with_sdk_only and key in _BATCH_SDK_READ_FIELD:
                 continue
-            if read and read not in fields:
-                fields.append(read)
+            for read in _reads_for(entry, key):
+                if read not in fields:
+                    fields.append(read)
     if with_feed:
         fields.append(_FEED_FIELD)
     return fields
@@ -2053,16 +2136,25 @@ def _previous_for(
         return {key: value for key, value in product.items() if key != _FEED_FIELD}, []
     previous: dict[str, Any] = {}
     unavailable: list[str] = []
+    # Keyed as the caller wrote them: a named key's batch field goes back to its name (image_link,
+    # sent for a named image_url with additional images, too), a structured image stays image.
     named = {batch: key for key, batch in _BATCH_NAMED_FIELDS.items()}
+    named["image_link"] = "image_url"
+    if entry.get("image_from_fields"):
+        named.pop("image")
     for batch_field in entry["request"]["data"]:
         if batch_field == "id":
             continue
         key = named.get(batch_field, batch_field)
-        read = _BATCH_READ_FIELD.get(batch_field)
-        if read is None or read in refused:
+        reads = _reads_for(entry, batch_field)
+        if not reads or any(read in refused for read in reads):
             unavailable.append(key)
             continue
-        previous[key] = product.get(read)
+        if len(reads) > 1:
+            # A structured image stands for the main image and the additional images together.
+            previous[key] = {read: product.get(read) for read in reads}
+            continue
+        previous[key] = product.get(reads[0])
         if batch_field in {"price", "sale_price"}:
             previous["currency"] = product.get("currency")
     return previous, unavailable
@@ -2549,7 +2641,7 @@ async def batch_update_catalog_products(
     wait_seconds: int = 10,
     handle: str | None = None,
 ) -> dict[str, Any]:
-    """Create, update or delete up to 50 catalog products by retailer_id (SKU) in one call. Item: method (create, update, delete), retailer_id, then name, description, url, image_url, brand, availability, condition, price, sale_price, currency (major units) or fields. Reads products first and skips creates of existing SKUs and deletes of missing ones, so resending is safe. Meta applies batches in the background: each item is reported applied, failed, processing or unknown, with a feed warning where relevant. handle alone reads an earlier batch. dry_run writes nothing. Created products are not held in staging."""
+    """Create, update or delete up to 50 catalog products by retailer_id (SKU) in one call. Item: method (create, update, delete), retailer_id, then name, description, url, image_url, brand, availability, condition, price, sale_price, currency (major units) or fields (other documented product fields; fields.image, a list of {url, tag}, gives several or tagged images in place of image_url). image_url with fields.additional_image_link is sent as image_link so the additional images are kept. Reads products first and skips creates of existing SKUs and deletes of missing ones, so resending is safe. Meta applies batches in the background: each item is reported applied, failed, processing or unknown, with a feed warning where relevant. handle alone reads an earlier batch. dry_run writes nothing. Created products are not held in staging."""
     if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 0 <= wait_seconds <= _BATCH_MAX_WAIT:
         raise ValidationError(f"wait_seconds must be a whole number from 0 to {_BATCH_MAX_WAIT}.")
     handle = blank_to_none(handle) if isinstance(handle, str) else None
@@ -3091,10 +3183,10 @@ async def create_product_set(
     params: dict[str, Any] | None = None,
     retailer_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a product set in a product catalog from a Meta filter object ({} means every product). Build and test the filter first with build_product_set_filter. retailer_id is your own id for the set."""
+    """Create a product set in a product catalog from a Meta filter object ({} or an empty string means every product). Build and test the filter first with build_product_set_filter. retailer_id is your own id for the set."""
     catalog_id = _require(catalog_id, "catalog_id")
     name = _require(name, "name")
-    parsed_filter = _parse_filter(filter)
+    parsed_filter = _parse_filter(filter, empty_means_all=True)
     typed: dict[str, Any] = {"name": name, "filter": parsed_filter}
     if retailer_id is not None:
         # Meta's product_sets edge reference: retailer_id, "External product set retailer id" (string).
