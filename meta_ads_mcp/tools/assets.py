@@ -113,6 +113,22 @@ def _require_id(value: str | None, name: str) -> str:
     return normalized
 
 
+def _with_eligibility_flag(field: str) -> str:
+    """Add eligible_to_boost to an explicit boost_eligibility_info{...} selection that lacks it.
+
+    The eligibility filter and the boostable flag read that part; a selection naming other
+    parts only (the reason, say) would leave every post looking ineligible or unknown.
+    """
+    name, brace, rest = field.partition("{")
+    if name.strip() != "boost_eligibility_info" or not brace:
+        return field
+    inner = rest.rsplit("}", 1)[0]
+    parts = normalize_field_list(inner) or []
+    if any(part.split("{", 1)[0].strip() == "eligible_to_boost" for part in parts):
+        return field
+    return name.strip() + "{" + ",".join(["eligible_to_boost", *parts]) + "}"
+
+
 def _requests_field(fields: list[str], name: str) -> bool:
     """Whether a field list already asks for a field, with or without a sub-selection."""
     return any(field.split("{", 1)[0].split(".", 1)[0].strip() == name for field in fields)
@@ -774,6 +790,8 @@ async def list_instagram_media(
     requested_fields = list(normalize_field_list(fields) or INSTAGRAM_MEDIA_FIELDS)
     if not _requests_field(requested_fields, "boost_eligibility_info"):
         requested_fields.append(BOOST_ELIGIBILITY_FIELD)
+    else:
+        requested_fields = [_with_eligibility_flag(field) for field in requested_fields]
     for needed, active in (("timestamp", window), ("media_type", type_filter), ("media_product_type", product_filter)):
         if active is not None and not _requests_field(requested_fields, needed):
             requested_fields.append(needed)

@@ -2136,3 +2136,66 @@ def test_search_overflow_names_the_limit_parameter_not_its_value(monkeypatch) ->
     _use(monkeypatch, FakeClient(edges={("me", "businesses"): _page([{"id": str(n), "name": "Acme"} for n in range(1, 4)])}))
     result = run(business_access.list_businesses(name_contains="acme", limit=2))
     assert "only the first `limit` of them" in result["summary"]["incomplete_reason"]
+
+
+# Round twenty-seven (review R26, G2): a removal is confirmed only when the recipient is no longer listed.
+
+@pytest.mark.parametrize("kind", ["PERSON", "AGENCY"])
+def test_g2_access_removal_requires_assignment_absence(monkeypatch, kind):
+    from meta_ads_mcp.tools import business_access
+
+    class AccessClient:
+        removed = False
+
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": "50"}
+
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            if edge == "business_users":
+                return {"data": []}
+            task_key = "permitted_tasks" if edge == "agencies" else "tasks"
+            return {"data": [{"id": "40", task_key: [] if self.removed else ["ADVERTISE"]}]}
+
+        async def delete_edge_object(self, parent_id, edge, *, data):
+            self.removed = True
+            return {"success": True}
+
+    client = AccessClient()
+    monkeypatch.setattr(business_access, "get_graph_api_client", lambda: client)
+    kwargs = {} if kind == "AGENCY" else {"business_id": "30"}
+    result = asyncio.run(business_access.set_catalog_access(
+        catalog_id="10", user_id="40", tasks=[], user_type=kind,
+        allow_self_removal=True, **kwargs,
+    ))
+    # Meta says deletion succeeded, yet the next read still lists the assignment.
+    # The tool correctly reports that row as direct access, but must not certify
+    # that the requested removal was fully verified.
+    assert result["current"]["has_direct_access"] is True
+    assert result["verified"] is False
+    assert result["ok"] is False
+
+
+def test_r26_an_ordinary_removal_with_no_row_left_is_still_verified(monkeypatch) -> None:
+    from meta_ads_mcp.tools import business_access
+
+    class AccessClient:
+        removed = False
+
+        async def get_object(self, object_id, *, fields=None, params=None):
+            return {"id": "50"}
+
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            if edge == "business_users" or self.removed:
+                return {"data": []}
+            return {"data": [{"id": "40", "tasks": ["ADVERTISE"]}]}
+
+        async def delete_edge_object(self, parent_id, edge, *, data):
+            self.removed = True
+            return {"success": True}
+
+    monkeypatch.setattr(business_access, "get_graph_api_client", lambda: AccessClient())
+    result = asyncio.run(business_access.set_catalog_access(
+        catalog_id="10", user_id="40", tasks=[], user_type="PERSON", allow_self_removal=True, business_id="30",
+    ))
+    assert result["verified"] is True and result["ok"] is True
+    assert result["current"]["has_direct_access"] is False

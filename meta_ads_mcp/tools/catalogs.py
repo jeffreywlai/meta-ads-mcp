@@ -1858,8 +1858,11 @@ _BATCH_READ_FIELD = {
     "custom_label_2": "custom_label_2", "custom_label_3": "custom_label_3",
     "custom_label_4": "custom_label_4", "importer_address": "importer_address",
     "importer_name": "importer_name",
-    # A named image_url sent with additional images goes as image_link (_batch_entry).
-    "image_link": "image_url", "inventory": "inventory",
+    # A named image_url goes as image_link (_batch_entry).
+    "image_link": "image_url",
+    # Live (2026-11-14): a batch that sent inventory 7 stored quantity_to_sell_on_facebook 7; the
+    # readable field named inventory is a different number and did not change.
+    "inventory": "quantity_to_sell_on_facebook", "quantity_to_sell_on_facebook": "quantity_to_sell_on_facebook",
 }
 # Batch fields whose readable product item field rests on SDK 26.0.2 alone
 # (PRODUCT_SDK_READABLE_UPDATE_FIELDS); Meta refusing to read them leaves only
@@ -2019,13 +2022,11 @@ def _batch_entry(index: int, item: Any) -> dict[str, Any]:
                 raise ValidationError(f"{label}.{key} needs currency in the same item.")
             data[batch_field] = _batch_price(value, currency, f"{label}.{key}")
         elif key == "image_url":
-            primary = _require(value, f"{label}.image_url")
-            if "additional_image_link" in extra:
-                # Meta ignores additional_image_link whenever image is given, and its migration
-                # guide maps image_url to image_link ("same value, different field name").
-                data["image_link"] = primary
-            else:
-                data[batch_field] = [{"url": primary}]
+            # Sent as image_link, never as image: [{url}]. Meta's migration guide maps image_url
+            # to image_link ("same value, different field name"), and an image array stands for
+            # every image of the product: live (2026-11-14), an update that sent image: [{url}]
+            # removed the product's additional images.
+            data["image_link"] = _require(value, f"{label}.image_url")
         else:
             if key == "availability":
                 _choice(value, PRODUCT_AVAILABILITY, f"{label}.availability")
@@ -2641,7 +2642,7 @@ async def batch_update_catalog_products(
     wait_seconds: int = 10,
     handle: str | None = None,
 ) -> dict[str, Any]:
-    """Create, update or delete up to 50 catalog products by retailer_id (SKU) in one call. Item: method (create, update, delete), retailer_id, then name, description, url, image_url, brand, availability, condition, price, sale_price, currency (major units) or fields (other documented product fields; fields.image, a list of {url, tag}, gives several or tagged images in place of image_url). image_url with fields.additional_image_link is sent as image_link so the additional images are kept. Reads products first and skips creates of existing SKUs and deletes of missing ones, so resending is safe. Meta applies batches in the background: each item is reported applied, failed, processing or unknown, with a feed warning where relevant. handle alone reads an earlier batch. dry_run writes nothing. Created products are not held in staging."""
+    """Create, update or delete up to 50 catalog products by retailer_id (SKU) in one call. Item: method (create, update, delete), retailer_id, then name, description, url, image_url, brand, availability, condition, price, sale_price, currency (major units) or fields (other documented product fields; fields.image, a list of {url, tag}, gives several or tagged images in place of image_url). image_url changes the main image only and keeps any additional images. Reads products first and skips creates of existing SKUs and deletes of missing ones, so resending is safe. Meta applies batches in the background: each item is reported applied, failed, processing or unknown, with a feed warning where relevant. handle alone reads an earlier batch. dry_run writes nothing. Created products are not held in staging."""
     if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or not 0 <= wait_seconds <= _BATCH_MAX_WAIT:
         raise ValidationError(f"wait_seconds must be a whole number from 0 to {_BATCH_MAX_WAIT}.")
     handle = blank_to_none(handle) if isinstance(handle, str) else None

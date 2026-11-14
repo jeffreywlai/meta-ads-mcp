@@ -1191,3 +1191,42 @@ def test_audience_adset_values_read_differently_are_shown_as_unknown(monkeypatch
     item = asyncio.run(assets.list_audience_adsets(audience_id="aud_1"))["items"][0]
     assert item["name"] is None and item["conflicting_fields"] == ["name", "effective_status"]
     assert item["found_by"] == ["ads", "targeting"]
+
+
+# Round twenty-seven (review R26, G1): an explicit eligibility sub-selection keeps the part the filter reads.
+
+@pytest.mark.parametrize("boost_only", [True, False])
+@pytest.mark.parametrize("source", ["media", "stories"])
+def test_g1_instagram_selection_keeps_eligibility_dependency(monkeypatch, boost_only, source):
+    from meta_ads_mcp.tools import assets
+
+    class MediaClient:
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            eligibility = {}
+            # A valid Graph sub-selection returns just the selected members.
+            selected = ",".join(fields or [])
+            if "boost_eligibility_info" in fields or "eligible_to_boost" in selected:
+                eligibility["eligible_to_boost"] = True
+            return {"data": [{"id": "20", "boost_eligibility_info": eligibility}]}
+
+    monkeypatch.setattr(assets, "get_graph_api_client", lambda: MediaClient())
+    result = asyncio.run(assets.list_instagram_media(
+        "30", boost_eligible_only=boost_only, source=source,
+        fields=["id", "boost_eligibility_info{boost_ineligible_reason}"],
+    ))
+    assert len(result["items"]) == 1
+    assert result["items"][0]["boost_eligible"] is True
+    assert result["summary"]["complete"] is True
+
+
+@pytest.mark.parametrize(("field", "expected"), [
+    ("boost_eligibility_info{boost_ineligible_reason}", "boost_eligibility_info{eligible_to_boost,boost_ineligible_reason}"),
+    ("boost_eligibility_info{eligible_to_boost}", "boost_eligibility_info{eligible_to_boost}"),
+    ("boost_eligibility_info", "boost_eligibility_info"),
+    ("caption", "caption"),
+    ("owner{id}", "owner{id}"),
+])
+def test_r26_eligibility_flag_is_added_only_to_an_explicit_selection_that_lacks_it(field, expected) -> None:
+    from meta_ads_mcp.tools import assets
+
+    assert assets._with_eligibility_flag(field) == expected

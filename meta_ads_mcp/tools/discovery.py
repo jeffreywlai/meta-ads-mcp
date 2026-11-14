@@ -213,6 +213,43 @@ def _field_name(field: str) -> str:
     return re.split(r"[.{]", field, maxsplit=1)[0].strip()
 
 
+# The parts of object_story_spec that Meta returns when the field is read whole (the SDK's
+# AdCreativeObjectStorySpec fields). Read live on 2026-11-14: for 100 creatives, naming these
+# parts returned the same story as the bare field. Meta's reference says one more part,
+# whats_app_business_phone_number, is returned only when asked for by name, so "the whole
+# field" does not cover a part the caller names beyond these.
+_STORY_SPEC_DEFAULT_PARTS = (
+    "instagram_user_id", "link_data", "page_id", "photo_data", "product_data", "template_data",
+    "text_data", "video_data",
+)
+
+
+def _sub_selections(selection: str) -> list[str]:
+    """The fields inside a selection's braces; none when it has no braces."""
+    if "{" not in selection:
+        return []
+    return normalize_field_list(selection.partition("{")[2].rsplit("}", 1)[0]) or []
+
+
+def _whole_field_with(name: str, *selections: str) -> str:
+    """A selection that reads a structured field whole and also what the selections name in it.
+
+    For most fields the bare name does that. For object_story_spec it is the default parts
+    plus any other part a selection names, since a part outside the defaults is returned
+    only when named.
+    """
+    if name != "object_story_spec":
+        return name
+    extra: list[str] = []
+    for selection in selections:
+        for part in _sub_selections(selection):
+            if _field_name(part) not in _STORY_SPEC_DEFAULT_PARTS and part not in extra:
+                extra.append(part)
+    if not extra:
+        return name
+    return name + "{" + ",".join((*_STORY_SPEC_DEFAULT_PARTS, *extra)) + "}"
+
+
 def _merged_creative_selection(base_fields: list[str], selected_fields: list[str]) -> str:
     """Return one creative{...} selection holding base_fields and every explicit creative sub-selection."""
     creative_fields = list(base_fields)
@@ -220,14 +257,15 @@ def _merged_creative_selection(base_fields: list[str], selected_fields: list[str
         if _field_name(field) != "creative" or "{" not in field:
             continue
         # Keep explicitly requested creative details. If two selections for one
-        # structured field differ, fetch that whole field rather than dropping either.
-        for selection in normalize_field_list(field.partition("{")[2].rsplit("}", 1)[0]) or []:
+        # structured field differ, fetch that whole field (and any part of it that is
+        # returned only when named) rather than dropping either.
+        for selection in _sub_selections(field):
             name = _field_name(selection)
             position = next((i for i, value in enumerate(creative_fields) if _field_name(value) == name), None)
             if position is None:
                 creative_fields.append(selection)
             elif creative_fields[position] != selection:
-                creative_fields[position] = name
+                creative_fields[position] = _whole_field_with(name, creative_fields[position], selection)
     return "creative{" + ",".join(creative_fields) + "}"
 
 

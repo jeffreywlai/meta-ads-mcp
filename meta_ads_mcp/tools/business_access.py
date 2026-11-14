@@ -1271,12 +1271,16 @@ async def set_catalog_access(
         return response
     after_tasks = after["tasks"] or []
     response["current"] = {"tasks": after_tasks, "has_direct_access": after["row"] is not None, "can": _task_meanings(after_tasks)}
-    response["verified"] = after_tasks == plan["proposed"]["tasks"]
+    still_listed = after["row"] is not None and not plan["proposed"]["has_direct_access"]
+    response["verified"] = after_tasks == plan["proposed"]["tasks"] and not still_listed
     if not response["verified"]:
         response["ok"] = False
-        response["warnings"] = [
-            *plan["warnings"],
-            f"Meta reports tasks {after_tasks or 'none'} after the change, not the requested "
-            f"{plan['proposed']['tasks'] or 'none'}; the change did not fully take effect.",
-        ]
+        problem = (
+            "Meta still lists the recipient on this catalog after the removal, with no tasks; the removal "
+            "is not confirmed."
+            if still_listed and after_tasks == plan["proposed"]["tasks"]
+            else f"Meta reports tasks {after_tasks or 'none'} after the change, not the requested "
+                 f"{plan['proposed']['tasks'] or 'none'}; the change did not fully take effect."
+        )
+        response["warnings"] = [*plan["warnings"], problem]
     return response

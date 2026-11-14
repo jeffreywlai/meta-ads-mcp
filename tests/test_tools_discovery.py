@@ -1087,3 +1087,97 @@ def test_checked_collection_matches_normalize_collection_for_a_readable_page() -
 
     for payload in ({"data": []}, {"data": [{"id": "1"}], "paging": {"cursors": {"before": "B", "after": "A"}, "next": "n"}}):
         assert discovery.checked_collection(payload) == normalize_collection(payload)
+
+
+# Round twenty-seven (review R26, G1): a part of a creative that Meta returns only when it is named
+# is kept when the tool also reads the field whole.
+
+def _r26_parts(text):
+    from meta_ads_mcp.tool_types import coerce_csv_string_list as split
+
+    return split(text)
+
+
+class _ExplicitStoryClient:
+    def __init__(self):
+        self.calls = []
+        self.phone = "+" + "1650555" + "1234"
+
+    def _creative(self, fields):
+        selected = list(fields or [])
+        creative_selection = next((f for f in selected if f.startswith("creative{")), None)
+        if creative_selection:
+            selected = _r26_parts(creative_selection[len("creative{"):-1])
+        full = {"page_id": "30", "link_data": {"link": "https://shop.example/item"}}
+        # A bare parent returns default content, without the explicit-only setting.
+        spec = __import__("copy").deepcopy(full) if "object_story_spec" in selected else {}
+        for field in selected:
+            if field.startswith("object_story_spec{"):
+                nested = _r26_parts(field[len("object_story_spec{"):-1])
+                for name in nested:
+                    if name == "whats_app_business_phone_number":
+                        spec[name] = self.phone
+                    elif name in full:
+                        spec[name] = __import__("copy").deepcopy(full[name])
+        return {"id": "20", "object_story_spec": spec}
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append((object_id, __import__("copy").deepcopy(fields)))
+        creative = self._creative(fields)
+        return creative if object_id == "20" else {"id": object_id, "creative": creative}
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        self.calls.append((parent_id, __import__("copy").deepcopy(fields)))
+        return {"data": [{"id": "10", "creative": self._creative(fields)}]}
+
+
+@pytest.mark.parametrize("summary,destinations", [(True, False), (False, True), (True, True)])
+def test_g1_get_ad_preserves_explicit_only_story_field(monkeypatch, summary, destinations):
+    client = _ExplicitStoryClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+    fields = ["id", "creative{object_story_spec{whats_app_business_phone_number}}"]
+    if destinations:
+        fields.append("destination_urls")
+    result = asyncio.run(discovery.get_ad("10", include_creative_summary=summary, fields=fields))
+    story = result["item"]["creative"]["object_story_spec"]
+    assert story.get("whats_app_business_phone_number") == client.phone, client.calls
+    assert story.get("page_id") == "30"
+    assert story.get("link_data", {}).get("link") == "https://shop.example/item"
+
+
+def test_g1_list_ads_preserves_explicit_only_story_field_with_destinations(monkeypatch):
+    client = _ExplicitStoryClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+    fields = ["id", "creative{object_story_spec{whats_app_business_phone_number}}", "destination_urls"]
+    result = asyncio.run(discovery.list_ads("1", fields=fields))
+    story = result["items"][0]["creative"]["object_story_spec"]
+    assert story.get("whats_app_business_phone_number") == client.phone, client.calls
+
+
+def test_r26_whole_story_selection_names_the_default_parts_and_the_part_asked_for() -> None:
+    merged = discovery._merged_creative_selection(
+        discovery.CREATIVE_SUMMARY_FIELDS, ["id", "creative{object_story_spec{whats_app_business_phone_number}}"],
+    )
+    assert (
+        "object_story_spec{instagram_user_id,link_data,page_id,photo_data,product_data,template_data,"
+        "text_data,video_data,whats_app_business_phone_number}"
+    ) in merged
+
+
+@pytest.mark.parametrize("selection", [
+    "creative{object_story_spec{link_data}}", "creative{object_story_spec{link_data{link},page_id}}",
+    "creative{object_story_spec}",
+])
+def test_r26_a_selection_inside_the_default_parts_still_reads_the_field_whole(selection) -> None:
+    merged = discovery._merged_creative_selection(discovery.CREATIVE_SUMMARY_FIELDS, ["id", selection])
+    assert merged.endswith(",object_story_spec}") and "object_story_spec{" not in merged
+
+
+def test_r26_a_field_without_parts_returned_only_by_name_is_merged_as_before() -> None:
+    merged = discovery._merged_creative_selection(
+        discovery.DESTINATION_CREATIVE_FIELDS, ["creative{asset_feed_spec{bodies},image_hash}"],
+    )
+    assert merged == (
+        "creative{link_url,object_url,object_store_url,template_url,link_deep_link_url,object_story_spec,"
+        "asset_feed_spec,call_to_action,image_hash}"
+    )

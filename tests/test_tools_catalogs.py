@@ -1393,7 +1393,7 @@ def test_batch_products_dry_run_sends_nothing(monkeypatch) -> None:
     assert request["data"]["requests"] == [
         {"method": "CREATE", "data": {
             "id": "SKU-1", "title": "Shoe", "description": "Running shoe", "link": "https://shop.example/s",
-            "image": [{"url": "https://shop.example/s.png"}], "brand": "Acme", "availability": "in stock",
+            "image_link": "https://shop.example/s.png", "brand": "Acme", "availability": "in stock",
             "condition": "new", "price": "12.50 USD",
         }},
         {"method": "UPDATE", "data": {"id": "SKU-2", "price": "9.99 USD"}},
@@ -1859,7 +1859,9 @@ def test_batch_products_sdk_only_field_previous_is_read(monkeypatch) -> None:
 def test_r25_documented_product_item_fields_reach_batch(monkeypatch, fields) -> None:
     """items_batch PRODUCT_ITEM table: rating_count, user_rating, vendor_id; inventory and product_tags aliases."""
     _no_pause(monkeypatch)
-    _use(monkeypatch, _batch_client([_existing("SKU-1", "961101", inventory=7)]))
+    # Live, 2026-11-14: inventory writes quantity_to_sell_on_facebook; the readable field named
+    # inventory is another number (100 here), so the previous value is read from the former.
+    _use(monkeypatch, _batch_client([_existing("SKU-1", "961101", inventory=100, quantity_to_sell_on_facebook=7)]))
     result = _run(catalogs.batch_update_catalog_products(
         catalog_id="123", items=[_batch_item("update", "SKU-1", fields=fields)], dry_run=True, wait_seconds=0,
     ))
@@ -1964,7 +1966,9 @@ def test_r25_named_primary_image_keeps_additional_images(monkeypatch) -> None:
     assert "image_url" in read_fields and "additional_image_urls" in read_fields
 
 
-def test_r25_named_primary_image_alone_is_sent_as_before(monkeypatch) -> None:
+def test_named_primary_image_alone_is_sent_as_image_link_so_other_images_are_kept(monkeypatch) -> None:
+    """Live, 2026-11-14: an update that sent image: [{url}] removed the product's additional images;
+    the same update sent as image_link kept them."""
     _no_pause(monkeypatch)
     _use(monkeypatch, _batch_client([_existing("SKU-1", "961101", image_url="https://shop.example/old.jpg")]))
     result = _run(catalogs.batch_update_catalog_products(
@@ -1972,7 +1976,7 @@ def test_r25_named_primary_image_alone_is_sent_as_before(monkeypatch) -> None:
         items=[_batch_item("update", "SKU-1", image_url="https://shop.example/front.jpg")],
     ))
     assert result["request"]["data"]["requests"][0]["data"] == {
-        "id": "SKU-1", "image": [{"url": "https://shop.example/front.jpg"}],
+        "id": "SKU-1", "image_link": "https://shop.example/front.jpg",
     }
     assert result["items"][0]["previous"] == {"image_url": "https://shop.example/old.jpg"}
 
