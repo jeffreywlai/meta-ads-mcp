@@ -504,7 +504,7 @@ def test_eligibility_unknown_study_read_is_not_a_pass(monkeypatch) -> None:
     assert result["precheck_outcome"] == "inconclusive"
     assert result["eligible_by_local_precheck"] is None
     assert result["entities"][0]["active_studies"] is None
-    assert any("Could not read the studies containing c1" in s for s in result["missing_signals"])
+    assert any("Could not read the studies containing the campaign at entity_ids entry 1" in s for s in result["missing_signals"])
     assert any(f["severity"] == "unresolved" for f in result["findings"])
 
 
@@ -649,7 +649,7 @@ def test_eligibility_reports_incomplete_entity_study_read(monkeypatch, paging) -
     entity = result["entities"][0]
     assert entity["active_studies"] == []
     assert entity["active_studies_complete"] is False
-    assert any("studies containing c1" in signal for signal in result["missing_signals"])
+    assert any("studies containing the campaign at entity_ids entry 1" in signal for signal in result["missing_signals"])
     assert result["precheck_outcome"] == "inconclusive"
 
 
@@ -856,7 +856,7 @@ def test_lift_cell_allocations_cannot_exceed_population(monkeypatch) -> None:
     no_client(monkeypatch)
     cells = [{"name": "A", "treatment_percentage": 90, "control_percentage": 10, "campaign_ids": ["c1"]},
              {"name": "B", "treatment_percentage": 90, "control_percentage": 10, "campaign_ids": ["c2"]}]
-    with pytest.raises(experiments.ValidationError, match="total 200"):
+    with pytest.raises(experiments.ValidationError, match="these cells total more"):
         run(_lift(cells=cells))
 
 
@@ -1758,7 +1758,7 @@ def test_unclassified_study_on_the_entity_edge_makes_membership_inconclusive(mon
     assert entity["active_studies"] == [] and entity["active_studies_complete"] is False
     assert entity["unclassified_studies"] == 1
     assert any("scheduled or running is unknown" in message for message in entity["unresolved"])
-    assert any("studies containing c1" in signal or "containing c1" in signal for signal in result["missing_signals"])
+    assert any("containing the campaign at entity_ids entry 1" in signal for signal in result["missing_signals"])
     assert result["precheck_outcome"] == "inconclusive"
     assert result["eligible_by_local_precheck"] is None
     # The account edge read nothing unknown, so its own count stays complete.
@@ -2228,3 +2228,273 @@ def test_high_performer_in_two_cells_is_not_mapped_to_the_first(monkeypatch) -> 
     outcome = run(experiments.get_ad_study(study_id="study_1", include_results=True))["results"]
     assert outcome["high_performer_cells"] == [{"ad_id": "ad_1", "cell_id": None, "cell_name": None}]
     assert outcome["high_performer_ambiguous_ids"] == ["ad_1"]
+
+
+# --- R16 (review V4): no message repeats a value the caller supplied, of any type -----------------
+#
+# Rule: an error, warning or note names the field, its position and what is accepted; it never
+# repeats a value the caller supplied (text, numbers, dates, booleans, ids the caller typed).
+# It may show ids and names Meta returned, values from a fixed list of accepted options, the
+# tool's own limits, positions and counts. Ids: a caller-typed id is never repeated in a message,
+# even after Meta answered for it; it stays in the structured fields (target, scope, entity_id,
+# request paths). An id read from Meta's answer (a parent, a row, a study) may be named.
+
+
+@pytest.mark.parametrize("tool_name", ["create_ab_test", "create_lift_study"])
+@pytest.mark.parametrize("routed", [False, True], ids=["direct-mcp", "proxy-mcp"])
+def test_misplaced_numeric_personal_value_is_not_quoted_by_percentage_error(caplog, tool_name, routed) -> None:
+    from fastmcp.exceptions import ToolError
+
+    caplog.set_level(logging.DEBUG)
+    # Fictional NANP number, assembled at runtime, standing for a personal number in the wrong field.
+    private_value = int("202555" + "0198")
+    arguments = {
+        "account_id": "10", "name": "Review",
+        "cells": [{"name": "A", "treatment_percentage": private_value, "campaign_ids": ["20"]},
+                  {"name": "B", "treatment_percentage": 50, "campaign_ids": ["21"]}],
+        "start_time": "2027-01-01T00:00:00Z", "end_time": "2027-01-08T00:00:00Z",
+    }
+    if tool_name == "create_lift_study":
+        arguments["cells"] = [{"name": "A", "treatment_percentage": private_value, "control_percentage": 10}]
+        arguments["objectives"] = [{"name": "Purchases", "type": "CONVERSIONS", "is_primary": True,
+                                    "adspixels": [{"id": "30", "event_names": ["Purchase"]}]}]
+    with pytest.raises(ToolError) as caught:
+        _routed_call(tool_name, arguments, routed)
+    assert str(private_value) not in str(caught.value)
+    assert str(private_value) not in caplog.text
+    assert "cells[0].treatment_percentage must be" in str(caught.value)
+
+
+@pytest.mark.parametrize(("cells", "match"), [
+    ([{"name": "A", "treatment_percentage": 33.333, "campaign_ids": ["20"]},
+      {"name": "B", "treatment_percentage": 50, "campaign_ids": ["21"]}], "at most two decimal places"),
+    ([{"name": "A", "treatment_percentage": 47.5, "campaign_ids": ["20"]},
+      {"name": "B", "treatment_percentage": 50, "campaign_ids": ["21"]}], "must total 100; these cells do not"),
+])
+def test_ab_cell_errors_name_the_rule_not_the_numbers(monkeypatch, cells, match) -> None:
+    no_client(monkeypatch)
+    with pytest.raises(experiments.ValidationError, match=match) as error:
+        run(_ab(cells=cells))
+    assert "33.333" not in str(error.value) and "97.5" not in str(error.value)
+
+
+@pytest.mark.parametrize(("cells", "match"), [
+    ([{"name": "A", "treatment_percentage": 60, "control_percentage": 50}], "cannot exceed 100"),
+    ([{"name": "A", "treatment_percentage": 60, "control_percentage": 30}], "must equal 100"),
+])
+def test_lift_cell_errors_name_the_rule_not_the_numbers(monkeypatch, cells, match) -> None:
+    no_client(monkeypatch)
+    args = {**_lift_args(), "cells": cells}
+    with pytest.raises(experiments.ValidationError, match=match) as error:
+        run(experiments.create_lift_study(**args))
+    assert "110" not in str(error.value) and "90" not in str(error.value)
+
+
+def test_study_time_errors_do_not_repeat_the_times(monkeypatch) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"study_1": SCHEDULED_STUDY}))
+    with pytest.raises(experiments.ValidationError, match="end_time would not be after its start_time") as error:
+        run(experiments.update_ad_study(study_id="study_1", end_time="2026-11-20T00:00:00Z"))
+    assert "2026-11-20" not in str(error.value) and "2026-12-01" not in str(error.value)
+    assert client.kinds() == ["get"]
+
+
+def test_eligibility_messages_name_entities_by_position_not_by_typed_id(monkeypatch) -> None:
+    typed = "".join(["2025", "550198"])
+    use(monkeypatch, FakeStudyClient(
+        objects={typed: _campaign(typed, account="999")},
+        errors={(typed, "ad_studies"): MetaApiError(message="(#100) Unsupported", code=100)},
+    ))
+    result = run(experiments.check_ab_test_eligibility(account_id="123", level="campaign", entity_ids=[typed]))
+    messages = [finding["message"] for finding in result["findings"]] + result["missing_signals"]
+    assert messages and not any(typed in message for message in messages)
+    assert any("campaign at entity_ids entry 1" in message for message in messages)
+    assert any("belongs to ad account 999" in message for message in messages), "Meta's own value is still shown"
+    assert result["entities"][0]["entity_id"] == typed, "the structured field keeps the id"
+
+
+# Every message f-string (one whose literal text has a space) in these modules may interpolate only
+# constants, counts from len(), plural endings, and the expressions audited below for each function.
+# Each audited expression is a position, a count, a fixed option, the tool's own limit, a reason built
+# from those, or a value or id read from Meta's answer. Adding an interpolation of anything else (a
+# parameter, a caller-typed id, a number the caller sent) fails this test until it is audited here.
+_MESSAGE_GUARD_MODULES = ["business_access", "experiments", "datasets", "assets", "audiences"]
+_AUDITED_INTERPOLATIONS: dict[str, dict[str, set[str]]] = {
+    "assets": {
+        "_media_filter": {"', '.join(sorted(allowed))", "name"},  # name: the parameter's own name
+        "_require_id": {"name"},
+        "_scan_note": {"examined", "noun", "rows_note", "scan.get('read_error')", "scan['pages_read']",
+                       "scan['pages_read'] + 1", "unreadable"},
+        "_unjudged_reason": {"count", "needs"},
+        "_validate_limit": {"maximum"},
+        "get_field_reference": {"normalized_level"},  # one of campaign, adset, ad
+        "list_audience_adsets": {"ads_without_adset", "unreadable_targeting"},
+        "list_creative_ads": {"without_creative_id"},
+    },
+    "audiences": {
+        "_audience_labels": {"unknown"},
+        "_audience_schema": {"', '.join(unsupported)"},  # positions
+        "_hash_rows": {"key", "row_number"},  # key: a supported schema key
+        "_parse_customer_csv": {"', '.join(missing)", "lines_read + 1"},  # missing: supported schema keys
+        "_sanitized_upload_error": {"accepted", "action", "batch_seq", "progress", "rows_accepted", "session_id",
+                                    "total_batches", "type(exc).__name__", "withheld"},
+    },
+    "business_access": {
+        "_lookup_identity": {"copies", "problems[0]", "scan['reason']", "task_field", "unidentified"},
+        "_non_object_rows_reason": {"count"},
+        "_normalize_tasks": {"accepted", "unknown"},
+        "_numeric_id": {"name"},
+        "_partner_error": {"error.message"},
+        "_partner_item": {"reason"},
+        "_plan_access_change": {"found['reason']", "task", "what"},
+        "_plan_partner_change": {"found['reason']", "task", "what"},
+        "_scan": {"max_pages"},
+        "_search_response": {"' or '.join(text_fields)", "needs", "scan['reason']", "text_fields[0]", "unsearchable"},
+        "_tasks_state": {"field", "unknown"},
+        "list_catalog_assigned_users": {"found['reason']", "problem"},
+        "list_catalog_partners": {"found['reason']"},
+        # catalog_id and unreadable are ids from Meta's owned_product_catalogs answer.
+        "list_user_assigned_catalogs": {"', '.join(unreadable)", "catalog_id", "owned['reason']",
+                                        "partners['reason']", "unidentified", "unidentified_catalogs"},
+        # after_tasks and the proposed tasks are task names from the fixed list.
+        "set_catalog_access": {"after['reason']", "after_tasks or 'none'", "detail",
+                               "plan['proposed']['tasks'] or 'none'"},
+    },
+    "datasets": {
+        "_offline_quality_response": {"event['composite_score']", "name"},  # Meta's event name and score
+        "_parse_day": {"name"},
+        "_quality_rows": {"bad", "key"},
+        "_required_id": {"name"},
+        "get_dataset_quality": {"event['emq_score']", "event['event_coverage_goal_percentage']",
+                                "event['event_coverage_percentage']", "name"},
+        "get_dataset_stats": {"' and '.join(unread)", "conflict_reason", "mixed_reason", "pages", "stop_reason",
+                              "uncounted_entries", "unread_reason", "unreadable_counts", "unreadable_hours"},
+    },
+    "experiments": {
+        "_build_ab_cells": {"index", "owners[entity_id]"},  # positions
+        "_build_creative_cells": {"index", "owners[ad_id]"},
+        "_build_lift_cells": {"index"},
+        "_build_objectives": {"index", "key"},  # key: a documented objective source key
+        # subject names a parent by the id Meta returned on the ad; the rest is Meta's answer.
+        "_check_account_and_status": {"' for ' + subject if subject else ''", "'The ' + subject + ' has ' if subject else ''",
+                                      "'The ' + subject if subject else 'It'", "entity_account", "status"},
+        "_check_ad_parents": {"id_field", "noun", "parent_id", "read_error", "subject"},
+        "_check_cell_keys": {"index"},
+        "_conflicting_ids_reason": {"', '.join(ids)"},  # study, cell or objective ids from Meta
+        "_id_list": {"label"},
+        "_listing_page": {"needs", "unjudged"},
+        "_non_object_rows_reason": {"count"},
+        "_note_studies": {"', '.join((str(study['id']) for study in active))",
+                          "_unclassified_message(scan, f'containing {subject}')", "error", "lead",
+                          "scan['pages_read']", "scan['stop_reason']", "subject"},
+        "_percentage": {"label", "lower", "minimum"},  # minimum: this tool's own lower limit
+        "_read_cell_breakdowns": {"exc"},
+        "_read_edge_pages": {"max_pages"},
+        "_scan_active_studies": {"max_pages", "stop_at"},
+        "_split_results": {"basis", "deciding.get('id')"},
+        "_to_unix": {"field_name"},
+        "_unclassified_message": {"', '.join(ids)", "named", "scan['unclassified']", "where"},
+        "_unknown_keys_error": {"', '.join(sorted(accepted))", "count", "where"},
+        "cancel_ad_study": {"state", "stored_end.isoformat()"},  # the end time Meta holds
+        "check_ab_test_eligibility": {"' '.join(gaps)", "100 // MIN_SPLIT_TREATMENT_PERCENTAGE",
+                                      "account_check['active_studies']", "account_check['pages_read']",
+                                      "account_check['stop_reason']", "account_check['unclassified_note']",
+                                      "exc", "position", "where"},
+        "get_ad_study": {"exc", "objectives_read['stop_reason']", "state", "study.get('results_first_available_date')"},
+        "list_ad_studies": {"bad_rows"},
+        "update_ad_study": {"state"},
+    },
+}
+
+
+def _message_interpolations(module_name: str) -> dict[str, set[str]]:
+    import importlib
+    from pathlib import Path
+
+    module = importlib.import_module(f"meta_ads_mcp.tools.{module_name}")
+    return _message_interpolations_in(Path(module.__file__).read_text(encoding="utf-8"))
+
+
+def _message_interpolations_in(source: str) -> dict[str, set[str]]:
+    import ast
+
+    def constant(expr) -> bool:
+        if isinstance(expr, ast.Constant):
+            return True
+        if isinstance(expr, ast.Name):
+            return expr.id.lstrip("_").isupper()
+        if isinstance(expr, ast.Subscript):
+            return constant(expr.value)
+        if isinstance(expr, ast.Call):
+            name = getattr(expr.func, "id", None) or getattr(expr.func, "attr", None)
+            if name == "len":
+                return True
+            if name in {"sorted", "list", "join"}:
+                return all(constant(arg) for arg in expr.args)
+        if isinstance(expr, ast.IfExp):
+            return constant(expr.body) and constant(expr.orelse)
+        return False
+
+    tree = ast.parse(source)
+    found: dict[str, set[str]] = {}
+    for function in [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        for node in ast.walk(function):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            literal = "".join(
+                part.value for part in node.values if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
+            if " " not in literal:
+                continue  # a key, a Graph path or a sort value, not a message
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue) and not constant(part.value):
+                    found.setdefault(function.name, set()).add(ast.unparse(part.value))
+    return found
+
+
+@pytest.mark.parametrize("module_name", _MESSAGE_GUARD_MODULES)
+def test_messages_interpolate_only_audited_values(module_name) -> None:
+    found = _message_interpolations(module_name)
+    audited = _AUDITED_INTERPOLATIONS[module_name]
+    unaudited = {
+        f"{function}: {expression}"
+        for function, expressions in found.items() for expression in expressions
+        if expression not in audited.get(function, set())
+    }
+    assert not unaudited, sorted(unaudited)
+    stale = {
+        f"{function}: {expression}"
+        for function, expressions in audited.items() for expression in expressions
+        if expression not in found.get(function, set())
+    }
+    assert not stale, f"audited interpolations no longer in the code: {sorted(stale)}"
+
+
+@pytest.mark.parametrize("module_name", _MESSAGE_GUARD_MODULES)
+def test_validation_errors_are_never_raised_inside_an_except_block(module_name) -> None:
+    import ast
+    import importlib
+    from pathlib import Path
+
+    module = importlib.import_module(f"meta_ads_mcp.tools.{module_name}")
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    problems = [
+        f"line {node.lineno}"
+        for handler in ast.walk(tree) if isinstance(handler, ast.ExceptHandler)
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+        and getattr(node.exc.func, "id", None) == "ValidationError"
+    ]
+    assert problems == [], problems
+
+
+def test_message_guard_catches_an_interpolated_parameter() -> None:
+    """The guard itself must be able to fail: the reported line, and a typed id in a warning."""
+    source = (
+        'def _percentage(value, *, label):\n'
+        '    raise ValidationError(f"{label} must be at most 100; got {value}.")\n'
+        'def _plan(user_id, warnings):\n'
+        '    warnings.append(f"MANAGE gives user {user_id} full control.")\n'
+        '    path = f"{user_id}/assigned_users"\n'
+        '    raise ValidationError(f"limit must be at most {MAX_LIMIT}; {len(warnings)} given.")\n'
+    )
+    assert _message_interpolations_in(source) == {"_percentage": {"label", "value"}, "_plan": {"user_id"}}
