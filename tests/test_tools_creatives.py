@@ -4451,3 +4451,319 @@ def test_r25_b4_message_page_still_needs_the_destination_its_value_names(monkeyp
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("No client should be created"))
     with pytest.raises(creatives.ValidationError, match=message):
         asyncio.run(creatives.boost_instagram_post(**{**ONE_STEP, **arguments}))
+
+
+# Round thirty-three (review R33, EE2): the ids a boost's creates return are read as ids, and a new
+# object's id is never an id the call already knows as a different object.
+
+R33_ONE_STEP = {
+    "account_id": "951000", "instagram_media_id": "951010", "instagram_account_id": "951011",
+    "page_id": "951012", "daily_budget": 5, "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+R33_NORMAL_IDS = {"campaigns": "951001", "adsets": "951002", "adcreatives": "951003", "ads": "951004"}
+R33_STEPS = ["campaigns", "adsets", "adcreatives", "ads"]
+R33_MISSING = "<missing>"
+
+
+class R33OneStepClient(FakeOneStepClient):
+    """Answers each create with the id given for its edge (no id at all for R33_MISSING)."""
+
+    def __init__(self, ids: dict) -> None:
+        super().__init__()
+        self.ids = ids
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, data))
+        value = self.ids[edge]
+        return {} if isinstance(value, str) and value == R33_MISSING else {"id": value}
+
+
+def _r33_one_step_client(monkeypatch, ids: dict) -> R33OneStepClient:
+    client = R33OneStepClient(ids)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    return client
+
+
+def _r33_creates(client) -> list[str]:
+    return [call[2] for call in client.calls if call[0] == "create"]
+
+
+@pytest.mark.parametrize(("step", "reused"), [
+    ("adsets", "951001"), ("adcreatives", "951001"), ("adcreatives", "951002"),
+    ("ads", "951001"), ("ads", "951002"), ("ads", "951003"),
+    # By value: a whole number, or text with spaces, is the same id.
+    ("adsets", 951001), ("ads", " 951003 "),
+])
+def test_ee2_one_step_boost_stops_on_an_id_already_known_as_a_different_object(monkeypatch, step, reused) -> None:
+    client = _r33_one_step_client(monkeypatch, {**R33_NORMAL_IDS, step: reused})
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.boost_instagram_post(**R33_ONE_STEP))
+    # Nothing is created after the step whose answer named a known object.
+    assert _r33_creates(client) == R33_STEPS[:R33_STEPS.index(step) + 1]
+    message = str(raised.value)
+    assert "so Meta may have created it" in message
+    assert f"{str(reused).strip()}, created earlier in this call" in message
+    # Every object already created is listed, paused, with how to remove it.
+    for edge, kind in (("campaigns", "campaign"), ("adsets", "ad set"), ("adcreatives", "creative")):
+        if R33_STEPS.index(edge) < R33_STEPS.index(step):
+            assert f"{kind} {R33_NORMAL_IDS[edge]} (PAUSED" in message
+
+
+@pytest.mark.parametrize("bad_id", [True, False, {"unexpected": "id"}, ["951999"], 951001.5])
+def test_ee2_one_step_boost_does_not_use_a_non_id_as_a_new_campaign(monkeypatch, bad_id) -> None:
+    client = _r33_one_step_client(monkeypatch, {**R33_NORMAL_IDS, "campaigns": bad_id})
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.boost_instagram_post(**R33_ONE_STEP))
+    assert _r33_creates(client) == ["campaigns"]
+    message = str(raised.value)
+    assert "not an id" in message and "so Meta may have created it" in message
+    assert "unexpected" not in message and "951999" not in message and "True" not in message
+
+
+def test_ee2_one_step_boost_final_ad_with_a_non_id_is_not_reported_as_created(monkeypatch) -> None:
+    _r33_one_step_client(monkeypatch, {**R33_NORMAL_IDS, "ads": {"id": "951004"}})
+    with pytest.raises(creatives.ValidationError, match="Creating the ad got no clear answer") as raised:
+        asyncio.run(creatives.boost_instagram_post(**R33_ONE_STEP))
+    assert "campaign 951001 (PAUSED" in str(raised.value) and "creative 951003 (PAUSED" in str(raised.value)
+
+
+@pytest.mark.parametrize("form", ["text", "whole number", "spaced text"])
+def test_ee2_one_step_boost_control_new_ids_are_accepted_as_before(monkeypatch, form) -> None:
+    """Control: new ids as digit text or whole numbers are used as before; spaces around an id are not sent."""
+    ids = {
+        "text": R33_NORMAL_IDS,
+        "whole number": {edge: int(value) for edge, value in R33_NORMAL_IDS.items()},
+        "spaced text": {edge: f" {value} " for edge, value in R33_NORMAL_IDS.items()},
+    }[form]
+    client = _r33_one_step_client(monkeypatch, ids)
+    result = asyncio.run(creatives.boost_instagram_post(**R33_ONE_STEP))
+    creates = [call[3] for call in client.calls if call[0] == "create"]
+    assert _r33_creates(client) == R33_STEPS
+    assert creates[1]["campaign_id"] == "951001"
+    assert creates[3]["adset_id"] == "951002" and creates[3]["creative"] == {"creative_id": "951003"}
+    assert result["ok"] is True
+    assert (result["campaign_id"], result["adset_id"], result["creative_id"], result["ad_id"]) == (
+        "951001", "951002", "951003", "951004",
+    )
+
+
+def test_ee2_one_step_boost_control_a_missing_id_stops_as_before(monkeypatch) -> None:
+    client = _r33_one_step_client(monkeypatch, {**R33_NORMAL_IDS, "adsets": R33_MISSING})
+    with pytest.raises(creatives.ValidationError, match="Meta returned no id"):
+        asyncio.run(creatives.boost_instagram_post(**R33_ONE_STEP))
+    assert _r33_creates(client) == ["campaigns", "adsets"]
+
+
+R33_EXISTING = {
+    "account_id": "952000", "adset_id": "952001", "instagram_media_id": "952010",
+    "instagram_account_id": "952011", "page_id": "952012",
+}
+
+
+class R33ExistingClient:
+    def __init__(self, creative_id, ad_id) -> None:
+        self.calls: list[tuple] = []
+        self.answers = {"adcreatives": creative_id, "ads": ad_id}
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append((edge, data))
+        value = self.answers[edge]
+        return {} if isinstance(value, str) and value == R33_MISSING else {"id": value}
+
+
+def _r33_existing(monkeypatch, creative_id, ad_id) -> R33ExistingClient:
+    client = R33ExistingClient(creative_id, ad_id)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    return client
+
+
+@pytest.mark.parametrize("creative_id", ["952001", 952001, True, {"id": "952002"}, ["952002"]])
+def test_ee2_existing_adset_boost_does_not_build_an_ad_on_an_unusable_creative_id(monkeypatch, creative_id) -> None:
+    client = _r33_existing(monkeypatch, creative_id, "952003")
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.boost_instagram_post(**R33_EXISTING))
+    assert [edge for edge, _ in client.calls] == ["adcreatives"]
+    message = str(raised.value)
+    assert "no ad was created" in message and "A creative may have been created" in message
+    names_the_adset = not isinstance(creative_id, (bool, dict, list))
+    assert ("ad set 952001, given in this call" in message) is names_the_adset
+
+
+@pytest.mark.parametrize("ad_id", ["952002", " 952002 ", 952002, "952001", True, {"id": "952003"}])
+def test_ee2_existing_adset_boost_does_not_report_an_unidentified_ad_as_created(monkeypatch, ad_id) -> None:
+    client = _r33_existing(monkeypatch, "952002", ad_id)
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.boost_instagram_post(**R33_EXISTING))
+    assert [edge for edge, _ in client.calls] == ["adcreatives", "ads"]
+    message = str(raised.value)
+    assert "Creative 952002 was created" in message and "the ad's id is not known" in message
+    assert "Check the ads in ad set 952001 (list_ads) before retrying" in message
+
+
+@pytest.mark.parametrize(("ad_id", "shown"), [("952003", "952003"), (952003, "952003"), (R33_MISSING, None)])
+def test_ee2_existing_adset_boost_control_ordinary_ad_ids_as_before(monkeypatch, ad_id, shown) -> None:
+    """Control: a new ad id as text or a whole number is reported; an answer with no id keeps ad_id None as before."""
+    client = _r33_existing(monkeypatch, "952002", ad_id)
+    result = asyncio.run(creatives.boost_instagram_post(**R33_EXISTING))
+    assert result["ok"] is True and result["creative_id"] == "952002" and result["ad_id"] == shown
+    assert client.calls[1] == ("ads", {
+        "name": "Instagram post 952010", "adset_id": "952001", "creative": {"creative_id": "952002"}, "status": "PAUSED",
+    })
+
+
+@pytest.mark.parametrize(("answer", "video_id"), [
+    ({"id": True}, None), ({"id": {"id": "777"}}, None), ({"id": 777}, "777"), ({"video_id": "777"}, "777"),
+])
+def test_ee2_video_upload_reads_the_returned_video_id_as_an_id(monkeypatch, answer, video_id) -> None:
+    class Client(FakeVideoClient):
+        async def create_edge_object(self, parent_id, edge, *, data, files=None):
+            self.calls.append(("create", parent_id, edge, dict(data), files))
+            return answer
+
+    client = Client()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video(account_id="123", video_url="https://cdn.example.com/v.mp4"))
+    assert result["video_id"] == video_id
+    assert [call[1] for call in client.calls if call[0] == "get"] == ([video_id] if video_id else [])
+
+
+@pytest.mark.parametrize(("session", "sent"), [(True, None), ({"id": "5001"}, None), (5001, "5001"), ("5001", "5001")])
+def test_ee2_chunked_upload_sends_only_a_session_id_read_as_an_id(monkeypatch, tmp_path, session, sent) -> None:
+    from meta_ads_mcp.errors import MetaApiError
+
+    _large_video(monkeypatch, tmp_path)
+
+    class Client(ChunkedVideoClient):
+        async def post_ad_video_upload_phase(self, account_id, *, data, files=None):
+            answer = await super().post_ad_video_upload_phase(account_id, data=data, files=files)
+            return {**answer, "upload_session_id": session} if data["upload_phase"] == "start" else answer
+
+    client = Client()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    if sent is None:
+        with pytest.raises(MetaApiError, match="did not return an upload session"):
+            asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+        assert [call[0] for call in client.calls] == ["start"]
+    else:
+        result = asyncio.run(creatives.upload_ad_video("123", file_path="film.mp4"))
+        assert {call[2]["upload_session_id"] for call in client.calls if call[0] in ("transfer", "finish")} == {sent}
+        assert result["upload"]["upload_session_id"] == sent
+
+
+# Round thirty-three (review R33, EE3): a read that names a different object does not decide a write.
+
+
+class R33AdsetPageClient(FakeBoostClient):
+    def __init__(self, answered_id) -> None:
+        super().__init__(promoted_object={"page_id": "953398"})
+        self.answered_id = answered_id
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        answer = {"promoted_object": self.promoted_object}
+        if self.answered_id != R33_MISSING:
+            answer["id"] = self.answered_id
+        return answer
+
+
+R33_EXISTING_NO_PAGE = {
+    "account_id": "953000", "adset_id": "953300", "instagram_media_id": "953320", "instagram_account_id": "953321",
+}
+
+
+def test_ee3_existing_boost_does_not_infer_a_page_from_another_adset(monkeypatch) -> None:
+    client = R33AdsetPageClient("953399")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.boost_instagram_post(**R33_EXISTING_NO_PAGE))
+    assert [call[0] for call in client.calls] == ["get"]
+    message = str(raised.value)
+    assert "page_id is required" in message and "different ad set (953399)" in message
+    assert "Nothing was created; pass page_id" in message
+
+
+@pytest.mark.parametrize("answered_id", ["953300", 953300, " 953300 ", R33_MISSING])
+def test_ee3_existing_boost_control_page_is_read_as_before(monkeypatch, answered_id) -> None:
+    """Control: the ad set answering with its own id (text, whole number, spaced) or with no id gives its Page."""
+    client = R33AdsetPageClient(answered_id)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.boost_instagram_post(**R33_EXISTING_NO_PAGE))
+    assert result["target"]["page_id"] == "953398"
+    assert client.calls[1][3]["object_id"] == "953398"
+
+
+class R33LabelClient(R3LabelClient):
+    def __init__(self, adlabels, answered_id) -> None:
+        super().__init__(adlabels)
+        self.answered_id = answered_id
+
+    async def get_object(self, *args, **kwargs):
+        answer = {"name": "Old", "adlabels": self.adlabels}
+        if self.answered_id != R33_MISSING:
+            answer["id"] = self.answered_id
+        return answer
+
+
+R33_LABELS = {"data": [{"id": "953101", "name": "remove"}, {"id": "953102", "name": "foreign-only"}]}
+
+
+def test_ee3_label_removal_does_not_replace_labels_from_another_creative(monkeypatch) -> None:
+    fake = R33LabelClient(R33_LABELS, "953199")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    with pytest.raises(creatives.ValidationError) as raised:
+        asyncio.run(creatives.update_creative("953100", adlabels=[{"id": "953101"}], adlabels_operation="remove"))
+    assert fake.writes == []
+    assert "different creative (953199)" in str(raised.value) and "Nothing was changed" in str(raised.value)
+
+
+def test_ee3_label_add_does_not_claim_a_label_set_from_another_creative(monkeypatch) -> None:
+    fake = R33LabelClient(R33_LABELS, "953199")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.update_creative("953100", adlabels=[{"name": "new"}], adlabels_operation="add"))
+    # The add itself does not depend on the read; the full resulting set is not claimed from it.
+    assert fake.writes == [("create", "953100", "adlabels", {"adlabels": [{"name": "new"}]})]
+    assert result["current"]["adlabels"] is None
+    assert result["adlabels_read_complete"] is False
+    assert result["previous"]["adlabels"] == []
+    assert "different creative (953199)" in result["adlabels_note"]
+
+
+@pytest.mark.parametrize("answered_id", ["953100", 953100, " 953100 ", R33_MISSING])
+def test_ee3_label_removal_control_ordinary_reads_as_before(monkeypatch, answered_id) -> None:
+    """Control: the creative answering with its own id (text, whole number, spaced) or with no id."""
+    fake = R33LabelClient(R33_LABELS, answered_id)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: fake)
+    result = asyncio.run(creatives.update_creative("953100", adlabels=[{"id": "953101"}], adlabels_operation="remove"))
+    assert fake.writes == [("update", "953100", {"adlabels": [{"id": "953102"}]})]
+    assert result["adlabels_read_complete"] is True
+
+
+class R33VideoClient(FakeVideoClient):
+    def __init__(self, answered_id) -> None:
+        super().__init__(status={"video_status": "ready"})
+        self.answered_id = answered_id
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, fields))
+        answer = {"status": self.status}
+        if self.answered_id != R33_MISSING:
+            answer["id"] = self.answered_id
+        return answer
+
+
+def test_ee3_video_status_from_another_video_is_not_reported(monkeypatch) -> None:
+    client = R33VideoClient("778")
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video(account_id="123", video_url="https://cdn.example.com/v.mp4"))
+    assert result["video_id"] == "777"
+    assert result["processing_status"] is None and result["status"] is None
+    assert "different video (778)" in result["status_note"]
+
+
+@pytest.mark.parametrize("answered_id", ["777", 777, R33_MISSING])
+def test_ee3_video_status_control_ordinary_reads_as_before(monkeypatch, answered_id) -> None:
+    client = R33VideoClient(answered_id)
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    result = asyncio.run(creatives.upload_ad_video(account_id="123", video_url="https://cdn.example.com/v.mp4"))
+    assert result["processing_status"] == "ready"
+    assert result["status_note"] == "Video is ready to use."

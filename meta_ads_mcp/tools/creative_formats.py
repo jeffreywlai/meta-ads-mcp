@@ -18,14 +18,17 @@ from urllib.parse import urlsplit
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, is_bare_answer_wrapper, normalize_account_id
-from meta_ads_mcp.normalize import blank_to_none
+from meta_ads_mcp.normalize import blank_to_none, names_other_object
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
 from meta_ads_mcp.tools.creatives import (
     PARTNERSHIP_CODE_FIELDS,
     PARTNERSHIP_CODE_SHOWN,
     SecretArguments,
+    created_id,
+    created_id_missing,
     current_call_secrets,
+    is_known_id,
     keeps_call_secrets,
     label_identity,
     read_label_set,
@@ -1345,7 +1348,8 @@ async def _create_from_inputs(
         )
     response = creation_response(action="create_ad_creative_from_inputs", target=target, result=created)
     response.update({
-        "creative_id": str(created.get("id") or "") or None,
+        # Read as an id: something that is not an id is not shown as the new creative's id.
+        "creative_id": created_id(created),
         "format": creative_format,
         "sent_spec": shown,
         "notes": notes,
@@ -1644,6 +1648,11 @@ def _step_failure(exc: Exception, *, definite: str, unknown: str) -> Exception:
 _EXPLICIT_UNREADABLE = "Meta returned it in a shape this server could not read"
 
 
+def _shown_id(answer: dict[str, Any]) -> str:
+    """The id an answer names, for a message (names_other_object found it readable)."""
+    return str(answer.get("id")).strip()
+
+
 async def _read_explicit_story_settings(
     client: Any, creative_id: str
 ) -> tuple[dict[str, str], str | None, Exception | None]:
@@ -1661,6 +1670,9 @@ async def _read_explicit_story_settings(
         # A bare true, false or array is not a creative: its missing object_story_spec does
         # not show the creative has none of these settings, so the copy must not go ahead.
         return {}, _EXPLICIT_UNREADABLE, None
+    if names_other_object(creative_id, read):
+        # Settings of another creative are not this creative's: the copy must not go ahead on them.
+        return {}, f"Meta's read of it answered about a different creative ({_shown_id(read)})", None
     spec = read.get("object_story_spec")
     if spec is None:
         return {}, None, None
@@ -1927,6 +1939,12 @@ async def _update_enhancements(ad_id: str, features: dict[str, str], name: str |
             f"Meta returned the ad's {_shape_problem_text(ad_unreadable)}, so the creative to copy is not known. "
             f"Nothing was created or attached; ad {ad_id} was not changed."
         )
+    if names_other_object(ad_id, ad):
+        # An answer about another ad does not say which creative this ad uses.
+        raise ValidationError(
+            f"Meta's read of ad {ad_id} answered about a different ad ({_shown_id(ad)}), so the creative to copy is "
+            f"not known. Nothing was created or attached; ad {ad_id} was not changed."
+        )
     creative_ref = ad.get("creative")
     old_creative_id = str(creative_ref.get("id") or "") if isinstance(creative_ref, dict) else str(creative_ref or "")
     if not old_creative_id:
@@ -1944,6 +1962,13 @@ async def _update_enhancements(ad_id: str, features: dict[str, str], name: str |
                 f"settings. Meta's error: {exc.message}"
             )
         raise
+    if names_other_object(old_creative_id, creative):
+        # Another creative's settings are not this creative's: a copy built from them would change the ad.
+        raise ValidationError(
+            f"Meta's read of creative {old_creative_id} answered about a different creative ({_shown_id(creative)}), "
+            f"so the settings to copy are not known. Nothing was created or attached; ad {ad_id} still uses creative "
+            f"{old_creative_id}."
+        )
     # The one shape check: a field present but not in the shape expected is never copied from or rebuilt.
     unreadable = _unreadable_fields({}, creative)
     branded = creative.get("branded_content") if isinstance(creative.get("branded_content"), dict) else {}
@@ -2093,19 +2118,28 @@ async def _update_enhancements(ad_id: str, features: dict[str, str], name: str |
                 "creative in the account before retrying, so a second copy is not made"
             ),
         )
-    new_creative_id = str(created.get("id") or "")
-    if not new_creative_id:
-        # Meta accepted the request and named nothing, so a replacement creative may exist.
+    new_creative_id = created_id(created)
+    if new_creative_id is None:
+        # Meta accepted the request and named nothing usable, so a replacement creative may exist.
+        returned = "did not return a creative id" if created_id_missing(created) else (
+            "returned something that is not an id (not shown) as the creative id"
+        )
         raise ValidationError(
-            "Meta accepted the creative request but did not return a creative id, so the ad was not changed. "
+            f"Meta accepted the creative request but {returned}, so the ad was not changed. "
             "A replacement creative may have been created; look for it in the account before retrying."
         )
-    if new_creative_id == str(old_creative_id):
+    if is_known_id(old_creative_id, new_creative_id):
         # A copy is a new creative. Attaching the ad's own creative would change nothing and be
         # reported as the change asked for.
         raise ValidationError(
             "Meta's answer named the ad's existing creative as the new copy, so the ad was not changed. "
             "A replacement creative may have been created; look for it in the account before retrying."
+        )
+    if is_known_id(ad_id, new_creative_id):
+        # The ad is not a creative: nothing is attached on that answer.
+        raise ValidationError(
+            f"Meta's answer named ad {ad_id} as the new copy, so the copy's id is not known and the ad was not "
+            "changed. A replacement creative may have been created; look for it in the account before retrying."
         )
     try:
         await client.update_object(ad_id, data={"creative": {"creative_id": new_creative_id}})
