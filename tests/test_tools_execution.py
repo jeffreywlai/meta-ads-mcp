@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import execution
 
 
@@ -295,3 +296,65 @@ def test_set_status_docstring_says_archiving_cannot_be_undone_here(tool, id_name
     assert "ARCHIVED" in doc
     assert "cannot be restored to active from this server" in doc
     assert "+" not in doc
+
+
+# Round thirty-three (review R33, EE3): the object read supplies the account whose currency
+# prices the amount written. An answer naming a different object must not decide that amount.
+class _NamedReadClient(FakeExecutionClient):
+    def __init__(self, named) -> None:
+        super().__init__()
+        self.named = named
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        payload = await super().get_object(object_id, fields=fields, params=params)
+        if object_id.startswith("act_") or self.named == "same":
+            return payload
+        if self.named is None:
+            payload.pop("id")
+        else:
+            payload["id"] = self.named
+        return payload
+
+
+_MONEY_WRITES = [
+    (execution.update_campaign_budget, {"campaign_id": "970000", "daily_budget": 60}, {"daily_budget": 6000}),
+    (execution.update_adset_budget, {"adset_id": "970000", "lifetime_budget": 160}, {"lifetime_budget": 16000}),
+    (execution.update_adset_bid_amount, {"adset_id": "970000", "bid_amount": 2.5}, {"bid_amount": 250}),
+    (
+        execution.update_adset_bid_strategy,
+        {"adset_id": "970000", "bid_strategy": "COST_CAP", "bid_amount": 2.5},
+        {"bid_strategy": "COST_CAP", "bid_amount": 250},
+    ),
+]
+_MONEY_IDS = ["campaign-budget", "adset-budget", "bid-amount", "bid-strategy-with-amount"]
+
+
+@pytest.mark.parametrize(("tool", "kwargs", "sent"), _MONEY_WRITES, ids=_MONEY_IDS)
+def test_ee3_money_write_stops_when_the_read_names_another_object(monkeypatch, tool, kwargs, sent) -> None:
+    client = _NamedReadClient("970999")
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="different object.*nothing was changed"):
+        asyncio.run(tool(**kwargs))
+    assert client.updated_payloads == []
+
+
+@pytest.mark.parametrize("named", ["same", 970000, None], ids=["same-text", "same-number", "no-id"])
+@pytest.mark.parametrize(("tool", "kwargs", "sent"), _MONEY_WRITES, ids=_MONEY_IDS)
+def test_money_write_reads_an_ordinary_answer_as_before(monkeypatch, tool, kwargs, sent, named) -> None:
+    client = _NamedReadClient(named)
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    asyncio.run(tool(**kwargs))
+    assert client.updated_payloads == [("970000", sent)]
+
+
+@pytest.mark.parametrize(("tool", "kwargs"), [
+    (execution.set_campaign_status, {"campaign_id": "970000", "status": "PAUSED"}),
+    (execution.update_campaign_bid_strategy, {"campaign_id": "970000", "bid_strategy": "COST_CAP"}),
+    (execution.update_adset_bid_strategy, {"adset_id": "970000", "bid_strategy": "COST_CAP"}),
+], ids=["status", "campaign-bid-strategy", "adset-bid-strategy-without-amount"])
+def test_display_only_read_naming_another_object_is_left_as_before(monkeypatch, tool, kwargs) -> None:
+    """Accepted class: the write does not depend on the read, which only supplies previous."""
+    client = _NamedReadClient("970999")
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    asyncio.run(tool(**kwargs))
+    assert len(client.updated_payloads) == 1

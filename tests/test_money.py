@@ -82,6 +82,30 @@ def test_resolve_account_currency_fails_when_meta_omits_it() -> None:
         asyncio.run(resolve_account_currency(FakeClient(), "123"))
 
 
+@pytest.mark.parametrize("named", ["act_999", "999", 999])
+def test_resolve_account_currency_refuses_an_answer_about_another_account(named) -> None:
+    """Round thirty-three (R33 EE3): another account's currency must never price this account's money."""
+    class FakeClient:
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            return {"id": named, "currency": "JPY"}
+
+    with pytest.raises(ValidationError, match="Could not resolve currency.*different ad account"):
+        asyncio.run(resolve_account_currency(FakeClient(), "123"))
+
+
+@pytest.mark.parametrize("requested", ["123", "act_123", " act_123 "])
+@pytest.mark.parametrize("named", ["act_123", "123", 123, " act_123 ", None, "me"], ids=[
+    "act-text", "bare-text", "number", "padded", "absent", "alias",
+])
+def test_resolve_account_currency_reads_an_answer_about_the_same_account_as_before(requested, named) -> None:
+    """Control: act_123 and 123 are one account, and a missing or unusual id is not another account."""
+    class FakeClient:
+        async def get_object(self, object_id: str, *, fields=None, params=None):
+            return {"currency": "jpy"} if named is None else {"id": named, "currency": "jpy"}
+
+    assert asyncio.run(resolve_account_currency(FakeClient(), requested)) == "JPY"
+
+
 # Meta's own table, "Currencies" page of the Marketing API documentation, read 2026-11-13:
 # an offset of 100 means amounts are sent in hundredths of the unit, an offset of 1 means
 # they are sent in whole units.

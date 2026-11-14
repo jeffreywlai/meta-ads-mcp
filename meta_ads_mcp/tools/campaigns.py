@@ -21,7 +21,7 @@ from meta_ads_mcp.money import (
     to_minor_units,
     validate_positive_amount,
 )
-from meta_ads_mcp.normalize import blank_to_none, read_collection_page
+from meta_ads_mcp.normalize import _plain_id, blank_to_none, names_other_object, read_collection_page
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import (
     BidConstraints,
@@ -428,7 +428,25 @@ async def _read_campaign_schedule(client: Any, campaign_id: Any) -> dict[str, An
         stored = await client.get_object(str(campaign_id), fields=list(_CAMPAIGN_SCHEDULE_FIELDS))
     except Exception:  # A failed read-back must not turn a successful write into an error.
         return None
+    # An answer about a different campaign does not say what this one holds: not read back.
+    if names_other_object(campaign_id, stored):
+        return None
     return stored if isinstance(stored, dict) else None
+
+
+def refuse_read_about_other_object(requested_id: Any, answer: Any, *, read: str, needed_for: str) -> None:
+    """Stop before a write that depends on a read whose answer names a different object.
+
+    Only an explicit, readable, different id stops the write (names_other_object): the same id
+    as text or a number, act_123 for 123, or an answer with no id passes unchanged.
+    """
+    if names_other_object(requested_id, answer):
+        raise MetaApiError(
+            message=(
+                f"Meta's answer to the read of {read} {requested_id} was about a different object "
+                f"({answer.get('id')}), so it was not used for {needed_for} and nothing was changed."
+            )
+        )
 
 
 def _campaign_schedule_report(sent: dict[str, Any], stored: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
@@ -836,6 +854,13 @@ async def update_campaign(
             *extra_reads,
         ],
     )
+    # The read decides the write when it supplies the currency for an amount to send or the
+    # stored other bound; when it only supplies previous, it is shown as read.
+    if other_bound or any(value is not None for value in (daily_budget, lifetime_budget, spend_cap)):
+        refuse_read_about_other_object(
+            campaign_id, previous, read="campaign",
+            needed_for="its account currency or stored schedule",
+        )
     stored = _stored_adset_time(previous.get(other_bound)) if other_bound else None
     if stored is not None and other_bound == "stop_time" and new_start is not None and new_start >= stored:
         raise ValidationError(
@@ -1205,6 +1230,9 @@ async def _add_zoneless_time_warning(
                 stored = await client.get_object(str(new_id), fields=["start_time", "end_time"])
             except Exception:  # The create succeeded; a failed read-back must not turn it into an error.
                 stored = None
+            # An answer about a different ad set does not say what the new one holds: not read back.
+            if names_other_object(new_id, stored):
+                stored = None
         if isinstance(stored, dict):
             response["stored_schedule"] = {"start_time": stored.get("start_time"), "end_time": stored.get("end_time")}
             warning += " stored_schedule shows the times Meta stored; check they are what you meant."
@@ -1406,6 +1434,13 @@ async def update_adset(
     account_read = ["account_id"] if spend else []
     client = get_graph_api_client()
     previous = await client.get_object(adset_id, fields=["id", *read_fields, *bound_reads, *account_read])
+    # The read decides the write when it supplies the account currency or the stored other bound;
+    # when it only supplies previous, it is shown as read.
+    if spend or other_bound:
+        refuse_read_about_other_object(
+            adset_id, previous, read="ad set",
+            needed_for="its account currency or stored schedule",
+        )
     currency = await resolve_account_currency(client, previous.get("account_id")) if spend else None
     for field_name, value in spend.items():
         payload[field_name] = to_minor_units(
@@ -1518,6 +1553,46 @@ def build_copy_request(
     return data
 
 
+# Meta's copies references (ad-campaign-group/copies, ad-campaign/copies) list each copied object as
+# {ad_object_type, source_id, copied_id}, with types campaign, ad_set, ad and unique_adcreative.
+_COPY_OBJECT_TYPES = ("campaign", "ad_set", "ad", "unique_adcreative")
+_COPY_ANSWER_TYPES = {"campaign": "campaign", "adset": "ad_set", "ad": "ad"}
+
+
+def _same_id(first: Any, second: Any) -> bool:
+    """True only when both are readable ids of the same object, normalised as names_other_object does."""
+    plain = _plain_id(first)
+    return plain is not None and plain == _plain_id(second)
+
+
+def _copy_list_contradicts(new_id: str, copied: Any, *, source_id: str, own_type: str) -> bool:
+    """True when a readable row of the copied-objects list contradicts new_id as the copy of source_id.
+
+    Two contradictions count: a row of another known type whose copy is new_id, and a row of
+    this type for source_id whose copy is a different id. Only explicit rows are compared: a
+    missing list, a row that is not an object, an unknown or missing type, or a missing or
+    unusual id is not a contradiction.
+    """
+    if not isinstance(copied, list):
+        return False
+    for item in copied:
+        if not isinstance(item, dict):
+            continue
+        raw_type = item.get("ad_object_type")
+        row_type = raw_type.strip().lower() if isinstance(raw_type, str) else None
+        if row_type not in _COPY_OBJECT_TYPES:
+            continue
+        if row_type != own_type and _same_id(new_id, item.get("copied_id")):
+            return True
+        if (
+            row_type == own_type
+            and _same_id(source_id, item.get("source_id"))
+            and names_other_object(new_id, {"id": item.get("copied_id")})
+        ):
+            return True
+    return False
+
+
 async def run_copy(
     client_factory: Any,
     *,
@@ -1562,6 +1637,14 @@ async def run_copy(
     named_source = new_id is not None and new_id in known_objects
     if named_source:
         new_id = None
+    # The answer's own list of copied objects can also contradict the copy id: it lists that id as
+    # the copy of another type of object, or lists a different copy of the source. Either way the
+    # answer does not say which object is the copy, so its id is treated as not returned.
+    contradicted = new_id is not None and _copy_list_contradicts(
+        new_id, copied, source_id=source_id, own_type=_COPY_ANSWER_TYPES[object_type]
+    )
+    if contradicted:
+        new_id = None
     response.update({
         "sent": True,
         "new_id": new_id,
@@ -1594,6 +1677,12 @@ async def run_copy(
             "Meta's response named an existing object (the source, its parent or a copied original) as the "
             "new copy, so the new copy's id is not known; "
             "find the copy under its parent before acting on it or copying again."
+        )
+    elif contradicted:
+        response["warning"] = (
+            "Meta's response disagrees with itself about which object is the copy: its list of copied objects "
+            "names the returned id as a different object, or names a different copy of the source. The new "
+            "copy's id is not known; find the copy under its parent before acting on it or copying again."
         )
     elif new_id is None:
         response["warning"] = (

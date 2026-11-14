@@ -3688,3 +3688,239 @@ def test_r31_a_copy_with_its_own_id_is_still_renamed(monkeypatch) -> None:
     result = asyncio.run(campaigns.duplicate_campaign(campaign_id="111", new_name="Black Friday 2"))
     assert result["new_id"] == "222" and result["rename"] == {"requested": "Black Friday 2", "applied": True}
     assert "warning" not in result
+
+
+# Round thirty-three (review R33, EE3): a read whose answer names a different object must not
+# decide a write, and must not be shown as what Meta stored after one. The reviewer's cases go
+# through the real Graph client and decoder; the controls show the ordinary answer (the same id as
+# text, as a number, or no id at all) behaves exactly as before.
+from contextlib import asynccontextmanager as _r33_asynccontextmanager  # noqa: E402
+from urllib.parse import parse_qs as _r33_parse_qs  # noqa: E402
+
+import httpx as _r33_httpx  # noqa: E402
+
+from meta_ads_mcp.config import get_settings as _r33_get_settings  # noqa: E402
+from meta_ads_mcp.errors import MetaAdsError as _R33MetaAdsError  # noqa: E402
+from meta_ads_mcp.graph_api import GraphAPIClient as _R33GraphAPIClient  # noqa: E402
+
+
+@_r33_asynccontextmanager
+async def _r33_real_graph(monkeypatch, handler):
+    async with _r33_httpx.AsyncClient(transport=_r33_httpx.MockTransport(handler)) as http:
+        client = _R33GraphAPIClient(_r33_get_settings())
+        monkeypatch.setattr(_R33GraphAPIClient, "_get_shared_client", lambda self, **kwargs: http)
+        monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+        yield client
+
+
+@pytest.mark.asyncio
+async def test_ee3_adset_spend_cap_does_not_use_another_adsets_currency_context(monkeypatch) -> None:
+    writes = []
+
+    def handler(request):
+        if request.method == "GET":
+            if request.url.path.endswith("/953800"):
+                return _r33_httpx.Response(200, json={"id": "953899", "account_id": "953898"})
+            return _r33_httpx.Response(200, json={"id": "act_953898", "currency": "JPY"})
+        writes.append((request.url.path, _r33_parse_qs(request.content.decode())))
+        return _r33_httpx.Response(200, json={"success": True})
+
+    async with _r33_real_graph(monkeypatch, handler):
+        with pytest.raises(_R33MetaAdsError, match="different object"):
+            await campaigns.update_adset(adset_id="953800", daily_spend_cap=500)
+    assert not writes, writes
+
+
+@pytest.mark.parametrize("mode", ["create", "update"])
+@pytest.mark.asyncio
+async def test_ee3_campaign_schedule_is_not_verified_from_a_different_campaign(monkeypatch, mode) -> None:
+    writes = []
+    sent_time = "2027-01-01T00:00:00+0000"
+
+    def handler(request):
+        if request.method == "GET":
+            return _r33_httpx.Response(200, json={"id": "953599" if writes else "953500", "start_time": sent_time})
+        writes.append((request.url.path, _r33_parse_qs(request.content.decode())))
+        return _r33_httpx.Response(200, json={"id": "953501"} if mode == "create" else {"success": True})
+
+    async with _r33_real_graph(monkeypatch, handler):
+        if mode == "create":
+            result = await campaigns.create_campaign(
+                account_id="953000", name="QA schedule", objective="OUTCOME_TRAFFIC", start_time=sent_time)
+        else:
+            result = await campaigns.update_campaign(campaign_id="953500", start_time=sent_time)
+    assert len(writes) == 1
+    assert "stored_schedule" not in result, result
+    assert "could not be read back" in result["warnings"][0], result
+    if mode == "create":
+        assert result["created"]["id"] == "953501"
+    else:
+        # A time not known to be stored is shown under sent, not as the campaign's current value.
+        assert result["sent"] == {"start_time": sent_time} and "start_time" not in result["current"], result
+
+
+@pytest.mark.asyncio
+async def test_ee3_adset_schedule_is_not_verified_from_a_different_adset(monkeypatch) -> None:
+    writes = []
+
+    def handler(request):
+        if request.method == "GET":
+            if request.url.path.endswith("/act_953000"):
+                return _r33_httpx.Response(200, json={"id": "act_953000", "currency": "USD"})
+            return _r33_httpx.Response(200, json={"id": "953699", "start_time": "2027-01-01T00:00:00+0000"})
+        writes.append((request.url.path, _r33_parse_qs(request.content.decode())))
+        return _r33_httpx.Response(200, json={"id": "953601"})
+
+    async with _r33_real_graph(monkeypatch, handler):
+        result = await campaigns.create_ad_set(
+            account_id="953000", campaign_id="953600", name="QA schedule",
+            billing_event="IMPRESSIONS", optimization_goal="REACH",
+            daily_budget=5, start_time="2027-01-01T00:00:00",
+            targeting={"geo_locations": {"countries": ["US"]}},
+        )
+    assert len(writes) == 1
+    assert "stored_schedule" not in result, result
+    assert "could not be read back" in result["warnings"][0], result
+    assert result["created"]["id"] == "953601"
+
+
+class _R33ReadAnswer:
+    """A fake whose object reads answer with a chosen id ("same", another id, or None for no id).
+
+    Account reads always answer as the account asked for, with USD.
+    """
+
+    def __init__(self, named, *, extra=None):
+        self.named = named
+        self.extra = extra or {}
+        self.calls = []
+
+    def _answer(self, object_id, body):
+        if self.named == "same":
+            return {"id": object_id, **body}
+        if self.named is None:
+            return body
+        return {"id": self.named, **body}
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("read", object_id, list(fields or [])))
+        if object_id.startswith("act_"):
+            return {"id": object_id, "currency": "USD"}
+        body = {"account_id": "123", "daily_budget": "5000", **self.extra}
+        return self._answer(object_id, {key: value for key, value in body.items() if key in (fields or body)})
+
+    async def create_edge_object(self, parent_id, edge, *, data, files=None):
+        self.calls.append(("create", parent_id, edge, dict(data)))
+        return {"id": "960001"}
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return {"success": True}
+
+    def writes(self):
+        return [call for call in self.calls if call[0] in {"create", "update"}]
+
+
+_R33_ORDINARY_IDS = ["same-text", "same-number", "no-id"]
+
+
+@pytest.mark.parametrize("call", [
+    {"daily_spend_cap": 500},
+    {"start_time": "2027-01-10T00:00:00+00:00"},
+], ids=["spend-cap", "one-sided-schedule"])
+def test_update_adset_stops_when_its_deciding_read_names_another_adset(monkeypatch, call) -> None:
+    client = _R33ReadAnswer("960999", extra={"end_time": "2027-02-01T00:00:00+0000"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.MetaApiError, match="different object.*nothing was changed"):
+        asyncio.run(campaigns.update_adset(adset_id="960000", **call))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("named", ["same", 960000, None], ids=_R33_ORDINARY_IDS)
+def test_update_adset_reads_an_ordinary_answer_as_before(monkeypatch, named) -> None:
+    client = _R33ReadAnswer(named, extra={"end_time": "2027-02-01T00:00:00+0000"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_adset(
+        adset_id="960000", daily_spend_cap=500, start_time="2027-01-10T00:00:00+00:00"))
+    assert client.writes()[-1] == ("update", "960000", {
+        "start_time": "2027-01-10T00:00:00+00:00", "daily_spend_cap": 50000})
+    assert result["money_units"] == "major units of the ad account currency (USD)"
+
+
+def test_update_adset_display_only_read_naming_another_adset_is_left_as_before(monkeypatch) -> None:
+    """Accepted class: a read that only supplies previous is not compared; the write does not depend on it."""
+    client = _R33ReadAnswer("960999", extra={"name": "Other"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.update_adset(adset_id="960000", name="New"))
+    assert client.writes() == [("update", "960000", {"name": "New"})]
+
+
+@pytest.mark.parametrize("call", [
+    {"daily_budget": 50},
+    {"spend_cap": 150},
+    {"start_time": "2027-01-10T00:00:00+00:00"},
+], ids=["budget", "spend-cap", "one-sided-schedule"])
+def test_update_campaign_stops_when_its_deciding_read_names_another_campaign(monkeypatch, call) -> None:
+    client = _R33ReadAnswer("960999", extra={"stop_time": "2027-02-01T00:00:00+0000"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    with pytest.raises(campaigns.MetaApiError, match="different object.*nothing was changed"):
+        asyncio.run(campaigns.update_campaign(campaign_id="960000", **call))
+    assert client.writes() == []
+
+
+@pytest.mark.parametrize("named", ["same", 960000, None], ids=_R33_ORDINARY_IDS)
+def test_update_campaign_reads_an_ordinary_answer_as_before(monkeypatch, named) -> None:
+    client = _R33ReadAnswer(named, extra={"stop_time": "2027-02-01T00:00:00+0000"})
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.update_campaign(campaign_id="960000", daily_budget=50))
+    assert client.writes()[-1] == ("update", "960000", {"daily_budget": 5000})
+    assert result["previous"]["daily_budget"] == 50.0
+
+
+def test_update_campaign_display_only_read_naming_another_campaign_is_left_as_before(monkeypatch) -> None:
+    """Accepted class: a name change does not depend on the read, which only supplies previous."""
+    client = _R33ReadAnswer("960999")
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    asyncio.run(campaigns.update_campaign(campaign_id="960000", name="New"))
+    assert client.writes() == [("update", "960000", {"name": "New"})]
+
+
+class _R33ScheduleReadBack(_R33ReadAnswer):
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("read", object_id, list(fields or [])))
+        if object_id.startswith("act_"):
+            return {"id": object_id, "currency": "USD"}
+        body = {"account_id": "123", "start_time": "2027-01-01T00:00:00+0000", "stop_time": None, "end_time": None}
+        return self._answer(object_id, {key: body.get(key) for key in (fields or body) if key != "id"})
+
+
+@pytest.mark.parametrize("named", ["same", 960001, None], ids=_R33_ORDINARY_IDS)
+def test_campaign_schedule_read_back_of_the_same_campaign_is_shown_as_before(monkeypatch, named) -> None:
+    client = _R33ScheduleReadBack(named)
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    created = asyncio.run(campaigns.create_campaign(
+        account_id="123", name="QA", objective="OUTCOME_TRAFFIC", start_time="2027-01-01T00:00:00+00:00"))
+    assert created["stored_schedule"] == {"start_time": "2027-01-01T00:00:00+0000", "stop_time": None}
+    assert "warnings" not in created
+
+
+@pytest.mark.parametrize("named", ["same", 960000, None], ids=_R33_ORDINARY_IDS)
+def test_campaign_update_schedule_read_back_of_the_same_campaign_is_shown_as_before(monkeypatch, named) -> None:
+    client = _R33ScheduleReadBack(named)
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    updated = asyncio.run(campaigns.update_campaign(campaign_id="960000", start_time="2027-01-01T00:00:00+00:00"))
+    assert updated["stored_schedule"] == {"start_time": "2027-01-01T00:00:00+0000", "stop_time": None}
+    assert updated["current"]["start_time"] == "2027-01-01T00:00:00+00:00" and "warnings" not in updated
+
+
+@pytest.mark.parametrize("named", ["same", 960001, None], ids=_R33_ORDINARY_IDS)
+def test_adset_schedule_read_back_of_the_same_adset_is_shown_as_before(monkeypatch, named) -> None:
+    client = _R33ScheduleReadBack(named)
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    result = asyncio.run(campaigns.create_ad_set(
+        account_id="123", campaign_id="960002", name="QA", billing_event="IMPRESSIONS",
+        optimization_goal="REACH", daily_budget=5, start_time="2027-01-01T00:00:00",
+        targeting={"geo_locations": {"countries": ["US"]}},
+    ))
+    assert result["stored_schedule"] == {"start_time": "2027-01-01T00:00:00+0000", "end_time": None}
+    assert "stored_schedule shows the times Meta stored" in result["warnings"][0]

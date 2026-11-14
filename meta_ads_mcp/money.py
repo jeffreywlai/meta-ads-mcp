@@ -188,8 +188,19 @@ async def resolve_account_currency(client: ObjectReader, account_id: str | None)
         raise ValidationError(
             "Could not derive the owning ad account needed for monetary conversion."
         )
+    # Imported here: normalize imports this module, so a module-level import would be circular.
+    from meta_ads_mcp.normalize import names_other_object
+
     normalized_account_id = normalize_account_id(str(account_id).strip())
     account = await client.get_object(normalized_account_id, fields=["currency"])
+    # An answer that names a different account is not this account's currency, and every
+    # amount converted with it would be sent at the wrong scale. act_123 and 123 are one
+    # account; an answer without a readable id is read as before.
+    if names_other_object(normalized_account_id, account):
+        raise ValidationError(
+            f"Could not resolve currency for ad account {normalized_account_id}: Meta's answer was about a "
+            "different ad account, so its currency was not used."
+        )
     try:
         return normalize_currency(account.get("currency"))
     except ValidationError as exc:

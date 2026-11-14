@@ -1,6 +1,7 @@
-"""Round thirty-two (review R32, DD1 to DD3): values in Meta's answer to a write that name the wrong thing.
+"""Rounds thirty-two and thirty-three (R32 DD1 to DD3, R33 EE1): values in Meta's answer to a write that name the wrong thing.
 
-A copy answer that names an object this call already knows is not renamed; a batch status that
+A copy answer that names an object this call already knows, or whose own list of copied objects
+contradicts the copy id, is not renamed; a batch status that
 names another batch does not confirm this one; an uncertain delete is not logged as not deleted.
 Ordinary answers are read exactly as before (controls at the end).
 """
@@ -67,6 +68,100 @@ def test_dd1_copy_never_renames_an_original_child(monkeypatch, kind, child_type)
     assert not [c for c in client.calls if c[0] == 'rename' and c[1] == original_child], result
     if result is not None:
         assert result.get('rename', {}).get('applied') is not True, result
+
+
+# Round thirty-three (review R33, EE1): the answer's own list of copied objects contradicts the
+# top-level copy id. Meta's copies references name the types campaign, ad_set, ad and unique_adcreative.
+_OWN_TYPE = {'campaign': 'campaign', 'adset': 'ad_set', 'ad': 'ad'}
+_CHILD_TYPE = {'campaign': 'ad_set', 'adset': 'ad', 'ad': 'unique_adcreative'}
+
+
+async def _copy_with_answer(monkeypatch, kind, answer):
+    client = _OrdinaryCopy(answer)
+    monkeypatch.setattr(campaigns, 'get_graph_api_client', lambda: client)
+    monkeypatch.setattr(ads, 'get_graph_api_client', lambda: client)
+    if kind == 'campaign':
+        result = await campaigns.duplicate_campaign(campaign_id='950001', deep_copy=True, new_name='QA copy')
+    elif kind == 'adset':
+        result = await campaigns.duplicate_adset(adset_id='950001', deep_copy=True, new_name='QA copy')
+    else:
+        result = await ads.duplicate_ad(ad_id='950001', new_name='QA copy')
+    return client, result
+
+
+@pytest.mark.parametrize('kind,child_kind', [('campaign', 'ad_set'), ('adset', 'ad'), ('ad', 'unique_adcreative')])
+@pytest.mark.parametrize('mapping_case', ['wrong_type', 'different_copy_for_source'])
+@pytest.mark.asyncio
+async def test_ee1_copy_does_not_rename_an_explicitly_identified_different_object(monkeypatch, kind, child_kind, mapping_case):
+    mapping = (
+        {'ad_object_type': child_kind, 'source_id': '950004', 'copied_id': '950003'}
+        if mapping_case == 'wrong_type' else
+        {'ad_object_type': _OWN_TYPE[kind], 'source_id': '950001', 'copied_id': '950002'}
+    )
+    client, result = await _copy_with_answer(
+        monkeypatch, kind, {f'copied_{kind}_id': '950003', 'ad_object_ids': [mapping]})
+    assert not [c for c in client.calls if c[0] == 'rename'], result
+    assert result['new_id'] is None and result['new_ids'] == {f'{kind}_id': None}, result
+    assert result['rename']['applied'] is False, result
+    assert 'disagrees with itself' in result['warning'], result
+
+
+@pytest.mark.parametrize('kind', ['campaign', 'adset', 'ad'])
+@pytest.mark.parametrize('rows', [
+    [],
+    None,
+    ['not-a-row', 7],
+    [{'ad_object_type': 'something_new', 'source_id': '950004', 'copied_id': '950003'}],
+    [{'source_id': '950001', 'copied_id': '950002'}],
+    [{'ad_object_type': None, 'source_id': '950004', 'copied_id': '950003'}],
+    [{'ad_object_type': 'OWN', 'source_id': '950001', 'copied_id': '950003'}],
+    [{'ad_object_type': 'OWN', 'source_id': 950001, 'copied_id': 950003}],
+    [{'ad_object_type': ' OWN ', 'source_id': ' 950001 ', 'copied_id': ' 950003 '}],
+    [{'ad_object_type': 'OWN', 'source_id': '950001'}],
+    [{'ad_object_type': 'OWN', 'source_id': '950001', 'copied_id': None}],
+    [{'ad_object_type': 'OWN', 'source_id': '950001', 'copied_id': 'pending'}],
+    [{'ad_object_type': 'OWN', 'source_id': None, 'copied_id': '950002'}],
+    [{'ad_object_type': 'CHILD', 'source_id': '950004', 'copied_id': '950005'}],
+    [{'ad_object_type': 'CHILD', 'source_id': '950004'}],
+], ids=[
+    'empty', 'absent', 'unreadable-rows', 'unknown-type', 'no-type', 'null-type', 'own-row',
+    'own-row-numbers', 'own-row-padded', 'own-row-no-copy', 'own-row-null-copy', 'own-row-unusual-copy',
+    'own-row-no-source', 'child-row', 'child-row-no-copy',
+])
+@pytest.mark.asyncio
+async def test_a_copy_list_that_does_not_contradict_the_copy_id_still_renames(monkeypatch, kind, rows):
+    """Control: a missing mapping, an unreadable row or an unknown type is not a contradiction."""
+    def fill(row):
+        if not isinstance(row, dict) or not isinstance(row.get('ad_object_type'), str):
+            return row
+        named = row['ad_object_type'].replace('OWN', _OWN_TYPE[kind]).replace('CHILD', _CHILD_TYPE[kind])
+        return {**row, 'ad_object_type': named}
+
+    answer = {f'copied_{kind}_id': '950003'}
+    if rows is not None:
+        answer['ad_object_ids'] = [fill(row) for row in rows]
+    client, result = await _copy_with_answer(monkeypatch, kind, answer)
+    assert client.calls[-1] == ('rename', '950003', {'name': 'QA copy'}), result
+    assert result['new_id'] == '950003' and result['rename']['applied'] is True, result
+    assert 'warning' not in result, result
+
+
+@pytest.mark.parametrize('top_level', ['950003', 950003], ids=['text', 'number'])
+@pytest.mark.asyncio
+async def test_copy_ids_in_another_form_are_compared_by_value(monkeypatch, top_level):
+    """Control: the same copy id as a number is not a different copy; the same child id as a number still is."""
+    ordinary = {'copied_campaign_id': top_level, 'ad_object_ids': [
+        {'ad_object_type': 'campaign', 'source_id': 950001, 'copied_id': 950003},
+        {'ad_object_type': 'ad_set', 'source_id': '950004', 'copied_id': '950005'},
+    ]}
+    client, result = await _copy_with_answer(monkeypatch, 'campaign', ordinary)
+    assert client.calls[-1] == ('rename', '950003', {'name': 'QA copy'}), result
+    assert result['rename']['applied'] is True and 'warning' not in result, result
+    contradicted = {'copied_campaign_id': top_level, 'ad_object_ids': [
+        {'ad_object_type': 'ad_set', 'source_id': '950004', 'copied_id': 950003},
+    ]}
+    client, result = await _copy_with_answer(monkeypatch, 'campaign', contradicted)
+    assert not [c for c in client.calls if c[0] == 'rename'] and result['new_id'] is None, result
 
 
 class WrongBatchHandle:

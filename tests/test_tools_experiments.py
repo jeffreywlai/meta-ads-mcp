@@ -2593,3 +2593,168 @@ def test_message_guard_catches_an_interpolated_parameter() -> None:
         '    raise ValidationError(f"limit must be at most {MAX_LIMIT}; {len(warnings)} given.")\n'
     )
     assert _message_interpolations_in(source) == {"_percentage": {"label", "value"}, "_plan": {"user_id"}}
+
+
+# --- round thirty-three (review R33, EE3): reads naming a different object ---------------
+# The account read that infers the owning business, and the study read that decides between
+# DELETE and moving the end time, must not act on an answer about a different object. The
+# reviewer's cases go through the real Graph client; the controls show ordinary answers (the
+# same id as text, as a number, with or without act_, or no id) behave as before.
+
+
+@pytest.fixture
+def r33_real_graph(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    import httpx
+
+    from meta_ads_mcp.config import get_settings
+    from meta_ads_mcp.graph_api import GraphAPIClient
+
+    @asynccontextmanager
+    async def real_graph(handler):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = GraphAPIClient(get_settings())
+            monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda self, **kwargs: http)
+            monkeypatch.setattr(experiments, "get_graph_api_client", lambda: client)
+            yield client
+
+    return real_graph
+
+
+@pytest.mark.parametrize("kind", ["split", "lift"])
+@pytest.mark.asyncio
+async def test_ee3_study_creation_does_not_use_another_accounts_owning_business(monkeypatch, r33_real_graph, kind):
+    import httpx
+
+    writes = []
+    monkeypatch.setattr(experiments, "_now", lambda: datetime(2026, 11, 14, tzinfo=timezone.utc))
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "act_953999", "business": {"id": "953798"}})
+        writes.append(request.url.path)
+        return httpx.Response(200, json={"id": "953799"})
+
+    async with r33_real_graph(handler):
+        common = dict(account_id="953000", name="QA study",
+                      start_time="2027-01-01T00:00:00Z", end_time="2027-01-08T00:00:00Z")
+        with pytest.raises(experiments.ValidationError, match="different ad account.*business_id"):
+            if kind == "split":
+                await experiments.create_ab_test(**common, cells=[
+                    {"name": "A", "treatment_percentage": 50, "campaign_ids": ["953701"]},
+                    {"name": "B", "treatment_percentage": 50, "campaign_ids": ["953702"]},
+                ])
+            else:
+                await experiments.create_lift_study(
+                    **common,
+                    cells=[{"name": "test", "treatment_percentage": 80, "control_percentage": 20}],
+                    objectives=[{"name": "purchases", "adspixels": [{"id": "953721", "event_names": ["Purchase"]}]}],
+                )
+    assert not writes, writes
+
+
+@pytest.mark.asyncio
+async def test_ee3_cancel_does_not_choose_delete_using_another_studys_schedule(monkeypatch, r33_real_graph):
+    import httpx
+
+    writes = []
+    monkeypatch.setattr(experiments, "_now", lambda: datetime(2026, 11, 14, tzinfo=timezone.utc))
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={
+                "id": "953499", "start_time": "2027-01-01T00:00:00+0000", "end_time": "2027-01-08T00:00:00+0000",
+            })
+        writes.append((request.method, request.url.path))
+        return httpx.Response(200, json={"success": True})
+
+    async with r33_real_graph(handler):
+        with pytest.raises(MetaApiError, match="different study.*Nothing was sent"):
+            await experiments.cancel_ad_study(study_id="953400")
+    assert not writes, writes
+
+
+@pytest.mark.parametrize("tool", ["ab", "lift", "ab-dry-run"])
+def test_owning_business_from_an_answer_about_another_account_is_not_used(monkeypatch, tool) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={
+        "act_123": {"id": "act_999", "business": {"id": "biz_77"}},
+    }))
+    with pytest.raises(experiments.ValidationError, match="different ad account.*pass business_id"):
+        if tool == "lift":
+            run(_lift(business_id=None))
+        else:
+            run(_ab(business_id=None, dry_run=tool == "ab-dry-run"))
+    assert "create" not in client.kinds()
+
+
+@pytest.mark.parametrize("named", ["act_123", "123", 123, " act_123 ", None, "me"], ids=[
+    "act-text", "bare-text", "number", "padded", "no-id", "alias",
+])
+@pytest.mark.parametrize("tool", ["ab", "lift"])
+def test_owning_business_from_an_answer_about_the_same_account_is_used_as_before(monkeypatch, tool, named) -> None:
+    answer = {"business": {"id": "biz_77"}}
+    if named is not None:
+        answer["id"] = named
+    client = use(monkeypatch, FakeStudyClient(objects={"act_123": answer}))
+    run(_lift(business_id=None) if tool == "lift" else _ab(business_id=None))
+    assert client.calls[-1][:3] == ("create", "biz_77", "ad_studies")
+
+
+def test_a_given_business_id_needs_no_account_read(monkeypatch) -> None:
+    """Control: with business_id the account is not read, so no answer can be compared."""
+    client = use(monkeypatch, FakeStudyClient(objects={"act_123": {"id": "act_999"}}))
+    run(_ab(business_id="biz_1"))
+    assert client.kinds() == ["create"]
+
+
+SCHEDULED_STUDY = {**RUNNING_STUDY, "id": "770001", "start_time": "2026-12-01T00:00:00+0000",
+                   "end_time": "2026-12-20T00:00:00+0000"}
+
+
+@pytest.mark.parametrize("study", [SCHEDULED_STUDY, {**RUNNING_STUDY, "id": "770001"}], ids=["scheduled", "running"])
+def test_cancel_stops_when_the_study_read_names_another_study(monkeypatch, study) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"770000": study}))
+    with pytest.raises(MetaApiError, match="different study.*Nothing was sent"):
+        run(experiments.cancel_ad_study(study_id="770000"))
+    assert client.kinds() == ["get"]
+
+
+@pytest.mark.parametrize("named", ["770000", 770000, None], ids=["same-text", "same-number", "no-id"])
+def test_cancel_reads_an_ordinary_study_answer_as_before(monkeypatch, named) -> None:
+    study = {key: value for key, value in SCHEDULED_STUDY.items() if key != "id"}
+    if named is not None:
+        study["id"] = named
+    client = use(monkeypatch, FakeStudyClient(objects={"770000": study}))
+    result = run(experiments.cancel_ad_study(study_id="770000"))
+    assert client.kinds() == ["get", "delete"]
+    assert result["current"]["operation"] == "delete"
+
+
+@pytest.mark.parametrize("change", [
+    {"end_time": FUTURE_END},
+    {"start_time": "2026-12-02T00:00:00+00:00"},
+    {"params": {"observation_end_time": "2026-12-20T00:00:00+00:00"}},
+], ids=["end-time", "start-time", "observation-end-time"])
+def test_update_ad_study_stops_when_its_deciding_read_names_another_study(monkeypatch, change) -> None:
+    client = use(monkeypatch, FakeStudyClient(objects={"770000": {**SCHEDULED_STUDY, "id": "770001"}}))
+    with pytest.raises(MetaApiError, match="different study.*Nothing was changed"):
+        run(experiments.update_ad_study(study_id="770000", **change))
+    assert client.kinds() == ["get"]
+
+
+@pytest.mark.parametrize("named", ["770000", 770000, None], ids=["same-text", "same-number", "no-id"])
+def test_update_ad_study_reads_an_ordinary_study_answer_as_before(monkeypatch, named) -> None:
+    study = {key: value for key, value in SCHEDULED_STUDY.items() if key != "id"}
+    if named is not None:
+        study["id"] = named
+    client = use(monkeypatch, FakeStudyClient(objects={"770000": study}))
+    run(experiments.update_ad_study(study_id="770000", end_time=FUTURE_END))
+    assert client.calls[-1] == ("update", "770000", {"end_time": FUTURE_END_TS})
+
+
+def test_update_ad_study_name_change_with_a_read_naming_another_study_is_left_as_before(monkeypatch) -> None:
+    """Accepted class: a name change does not depend on the read, which only supplies previous."""
+    client = use(monkeypatch, FakeStudyClient(objects={"770000": {**SCHEDULED_STUDY, "id": "770001"}}))
+    run(experiments.update_ad_study(study_id="770000", name="New"))
+    assert client.calls[-1] == ("update", "770000", {"name": "New"})
