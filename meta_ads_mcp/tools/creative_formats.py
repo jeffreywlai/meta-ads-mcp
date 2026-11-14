@@ -33,7 +33,11 @@ from meta_ads_mcp.tools.creatives import (
 from meta_ads_mcp.url_secrets import refuse_url_credentials
 
 # AdCreativeLinkDataCallToAction.type values from Meta's reference page, plus
-# INSTAGRAM_MESSAGE, which Meta's click-to-Instagram examples use.
+# INSTAGRAM_MESSAGE, which Meta's click-to-Instagram examples use, and the two profile visit
+# buttons from Meta's profile visit ads guides (VIEW_INSTAGRAM_PROFILE for an Instagram profile,
+# VISIT_PROFILE for a Facebook Page), which also appear in the call_to_action type list of
+# Meta's adcreatives reference. That reference lists further types that no guide shows on a
+# creative request; they are not added.
 CALL_TO_ACTION_TYPES = frozenset({
     "OPEN_LINK", "LIKE_PAGE", "SHOP_NOW", "PLAY_GAME", "INSTALL_APP", "USE_APP", "CALL", "CALL_ME",
     "VIDEO_CALL", "INSTALL_MOBILE_APP", "USE_MOBILE_APP", "MOBILE_DOWNLOAD", "BOOK_TRAVEL", "LISTEN_MUSIC",
@@ -52,8 +56,10 @@ CALL_TO_ACTION_TYPES = frozenset({
     "BOOK_A_CONSULTATION", "GET_A_QUOTE", "BUY_VIA_MESSAGE", "ASK_FOR_MORE_INFO", "CHAT_WITH_US",
     "VIEW_PRODUCT", "VIEW_CHANNEL", "GET_IN_TOUCH", "ASK_A_QUESTION", "START_A_CHAT", "CHAT_NOW",
     "ASK_US", "WATCH_LIVE_VIDEO", "JOIN_LIVE_VIDEO", "SHOP_WITH_AI", "TRY_ON_WITH_AI", "WATCH_NOW",
-    "STREAM_NOW", "BUY_ACTIVITY_TICKETS", "INSTAGRAM_MESSAGE",
+    "STREAM_NOW", "BUY_ACTIVITY_TICKETS", "INSTAGRAM_MESSAGE", "VIEW_INSTAGRAM_PROFILE", "VISIT_PROFILE",
 })
+# Meta's Instagram profile visit guide: object_story_spec needs instagram_user_id, the profile opened.
+INSTAGRAM_PROFILE_CALL_TO_ACTION = "VIEW_INSTAGRAM_PROFILE"
 
 # Click-to-message CTAs and the app_destination Meta's guides pair with each.
 MESSAGING_DESTINATIONS = {
@@ -73,6 +79,9 @@ DEFAULT_CALL_TO_ACTION = "LEARN_MORE"
 MAX_TEXT_VARIANTS = 5
 MAX_BODY_CHARS = 1024
 MAX_TITLE_CHARS = 255
+# Meta's asset feed options guide: "Use an empty string with single space for blank description, if you
+# do not want to use the scraped text." Leaving descriptions out lets Meta scrape one from the link.
+BLANK_DESCRIPTION = " "
 MIN_CARDS = 2
 MAX_CARDS = 10
 MIN_PLACEMENT_ASSETS = 2
@@ -111,6 +120,24 @@ _KNOWN_ENTRY_KEYS = CARD_KEYS | _MULTI_MEDIA_KEYS | _PLACEMENT_KEYS
 
 def _text(value: Any) -> str | None:
     return blank_to_none(value) if isinstance(value, str) else None
+
+
+def _nested_video_id(entry: dict[str, Any], where: str) -> str | None:
+    """A video_id inside a card, placement entry or pool entry, as digit text.
+
+    A whole number is the same id as its digits (SDK 26.0.2 types video_id as a string and its
+    type check accepts a number for one), so 555 is sent as "555". True and false are not ids;
+    they, and anything else that is not digits, are refused rather than left out.
+    """
+    value = entry.get("video_id")
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    elif value is not None and not isinstance(value, str):
+        raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
+    video_id = _text(value)
+    if video_id is not None and not video_id.isdigit():
+        raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
+    return video_id
 
 
 def _unknown_keys(entry: dict[str, Any], allowed: frozenset[str], where: str) -> None:
@@ -175,13 +202,20 @@ def _display_link(value: Any) -> str | None:
     return text
 
 
-def _variants(values: list[str] | None, name: str, max_chars: int) -> list[str] | None:
+def _variants(
+    values: list[str] | None, name: str, max_chars: int, *, keep_blank_description: bool = False
+) -> list[str] | None:
+    """Clean a list of texts. With keep_blank_description, a text of exactly one space is kept as it is:
+    Meta's asset feed guide documents it as a blank description that stops Meta scraping one."""
     if values is None:
         return None
     values = coerce_csv_string_list(values)
     if not isinstance(values, list) or not values:
         raise ValidationError(f"{name} must list 1 to {MAX_TEXT_VARIANTS} texts.")
-    cleaned = [value.strip() if isinstance(value, str) else "" for value in values]
+    cleaned = [
+        (value if keep_blank_description and value == BLANK_DESCRIPTION else value.strip()) if isinstance(value, str) else ""
+        for value in values
+    ]
     if any(not value for value in cleaned):
         raise ValidationError(f"{name} must not contain blank texts.")
     if len(cleaned) > MAX_TEXT_VARIANTS:
@@ -514,10 +548,8 @@ def _card_media(card: dict[str, Any], where: str) -> dict[str, str]:
     if not media:
         raise ValidationError(f"{where} needs image_hash or image_url; Meta requires an image on every card, including video cards.")
     shown = _link_data_image(media)
-    video_id = _text(card.get("video_id"))
+    video_id = _nested_video_id(card, where)
     if video_id is not None:
-        if not video_id.isdigit():
-            raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
         shown["video_id"] = video_id
     return shown
 
@@ -573,10 +605,14 @@ def _build_messaging_carousel(inputs: _Inputs, page_id: str) -> tuple[dict[str, 
 
 
 def _asset_feed_texts(inputs: _Inputs) -> dict[str, Any]:
+    """bodies, titles and descriptions of an asset feed. A description of exactly one space is sent as it
+    is (BLANK_DESCRIPTION), as Meta's asset feed guide documents for a blank description."""
     feed: dict[str, Any] = {}
     bodies = inputs.primary_texts or ([inputs.message] if inputs.message else None)
     titles = inputs.headlines or ([inputs.headline] if inputs.headline else None)
-    descriptions = inputs.descriptions or ([inputs.description] if inputs.description else None)
+    descriptions = inputs.descriptions or (
+        [inputs.description] if inputs.description else [BLANK_DESCRIPTION] if inputs.blank_description else None
+    )
     if bodies:
         feed["bodies"] = [{"text": text} for text in bodies]
     if titles:
@@ -660,7 +696,8 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
         if not isinstance(entry, dict):
             raise ValidationError(f"{where} must be an object.")
         _unknown_keys(entry, allowed_keys, where)
-        image_hash, image_url, video_id = (_text(entry.get(key)) for key in ("image_hash", "image_url", "video_id"))
+        image_hash, image_url = (_text(entry.get(key)) for key in ("image_hash", "image_url"))
+        video_id = _nested_video_id(entry, where)
         if sum(1 for value in (image_hash, image_url, video_id) if value) != 1:
             raise ValidationError(f"{where} needs exactly one of image_hash, image_url or video_id.")
         if image_url:
@@ -683,8 +720,6 @@ def _build_placement_customization(inputs: _Inputs) -> tuple[dict[str, Any], lis
             image_ref = {"url": image_url} if image_url else {"hash": image_hash}
             assets.append({**image_ref, "adlabels": [{"name": label}]})
         else:
-            if not video_id.isdigit():
-                raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
             assets.append({"video_id": video_id, "adlabels": [{"name": label}]})
         platforms_raw = entry.get("publisher_platforms")
         position_keys = [key for key in PLACEMENT_POSITION_FIELDS.values() if entry.get(key) is not None]
@@ -925,6 +960,11 @@ def _build_multi_media(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
         raise ValidationError("Click-to-message is not built for multi_media; use a single image or video.")
     if not inputs.link_url:
         raise ValidationError("link_url is required for multi_media.")
+    if inputs.descriptions and BLANK_DESCRIPTION in inputs.descriptions:
+        raise ValidationError(
+            "descriptions must not contain blank texts for multi_media: Meta documents a description of one space "
+            "(a blank description) for text variants and placement_customizations, not for an asset pool."
+        )
     entries = inputs.multi_media
     if not isinstance(entries, list) or not MIN_POOL_ASSETS <= len(entries) <= MAX_POOL_ASSETS:
         raise ValidationError(
@@ -940,9 +980,10 @@ def _build_multi_media(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
         if not isinstance(entry, dict):
             raise ValidationError(f"{where} must be an object.")
         _unknown_keys(entry, _MULTI_MEDIA_KEYS, where)
-        image_hash, image_url, video_id, thumb_url, thumb_hash = (
-            _text(entry.get(key)) for key in ("image_hash", "image_url", "video_id", "thumbnail_url", "thumbnail_hash")
+        image_hash, image_url, thumb_url, thumb_hash = (
+            _text(entry.get(key)) for key in ("image_hash", "image_url", "thumbnail_url", "thumbnail_hash")
         )
+        video_id = _nested_video_id(entry, where)
         if sum(1 for value in (image_hash, image_url, video_id) if value) != 1:
             raise ValidationError(f"{where} needs exactly one of image_hash, image_url or video_id.")
         media = image_hash or image_url or video_id
@@ -959,8 +1000,6 @@ def _build_multi_media(inputs: _Inputs) -> tuple[dict[str, Any], list[str]]:
             if index == 0:
                 primary = {"image_url": image_url} if image_url else {"image_hash": image_hash}
             continue
-        if not video_id.isdigit():
-            raise ValidationError(f"{where} video_id must be a numeric Meta video id.")
         if thumb_url and thumb_hash:
             raise ValidationError(f"{where}: give thumbnail_url or thumbnail_hash, not both.")
         if thumb_hash and index != 0:
@@ -1039,6 +1078,8 @@ _BUILDERS = {
 # with sponsor ids beside it).
 _PARTNERSHIP_POST_FORMATS = {"instagram_post", "partnership_ad_code", "facebook_partnership_post", "facebook_partnership_ad_code"}
 _PARTNERSHIP_NEW_MEDIA_FORMATS = {"single_image", "single_video"}
+# Formats whose documented request has no instagram_user_id (instagram_account_id is not sent).
+_FACEBOOK_PARTNERSHIP_FORMATS = {"facebook_partnership_post", "facebook_partnership_ad_code"}
 
 
 def _check_product_extensions(inputs: _Inputs, creative_format: str, partnership: bool) -> None:
@@ -1079,6 +1120,15 @@ def build_creative_spec(inputs: _Inputs) -> tuple[str, dict[str, Any], list[str]
                 "partnership_ad_format is documented for boosting an existing post or ad code, not for a Partnership "
                 "Ad from new media."
             )
+    if (
+        inputs.call_to_action_type == INSTAGRAM_PROFILE_CALL_TO_ACTION
+        and not inputs.instagram_account_id
+        and creative_format not in _FACEBOOK_PARTNERSHIP_FORMATS
+    ):
+        raise ValidationError(
+            "VIEW_INSTAGRAM_PROFILE needs instagram_account_id: Meta's Instagram profile visit guide requires "
+            "instagram_user_id, the Instagram profile the button opens."
+        )
     if inputs.lead_gen_form_id and creative_format not in {"single_image", "single_video"}:
         raise ValidationError("lead_gen_form_id is built for a single image or single video creative only.")
     if inputs.display_link and not inputs.link_url and creative_format not in _PARTNERSHIP_POST_FORMATS | {"page_post"}:
@@ -1168,7 +1218,7 @@ async def create_ad_creative_from_inputs(
     display_link: str | None = None,
     product_extensions_product_set_id: GraphId | None = None,
 ) -> dict[str, Any]:
-    """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image or video; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash, image_url or video_id with publisher_platforms and positions; all images or all videos; at most one entry without platforms), multi_media asset pool (2 to 10 entries, images and videos may mix, each image_hash, image_url or video_id with optional thumbnail_url; the first is the main media; Meta mixes them with the text variants), catalog carousel (product_set_id with link_url; texts may use tags like {{product.name}}), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on a single image; MESSAGE_PAGE or INSTAGRAM_MESSAGE on a video; INSTAGRAM_MESSAGE on a carousel, every card opening the same chat; WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on an existing Instagram post), instant form (lead_gen_form_id) and Partnership Ads: sponsor ids on an Instagram post, on a Facebook post (object_story_id, sponsor_page_id required) or on a new single image or video; or an ad code (partnership_ad_code for Instagram, facebook_partnership_ad_code for Facebook). display_link is the address shown on the ad (Meta's caption) and needs link_url. product_extensions_product_set_id shows products from that product set below a single image or video link ad. dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
+    """Build a creative from named inputs instead of Meta's raw spec, and reject combinations Meta does not document before sending. Formats: single image (image_hash or image_url), single video (video_id plus a thumbnail), carousel (cards, 2 to 10, each with image and optional video_id, link, headline, description, call_to_action_type), text variants (up to 5 each of primary_texts, headlines, descriptions with one image or video; pass them as JSON arrays, since a plain string is split at commas), placement_customizations (2 to 10 entries, each image_hash, image_url or video_id with publisher_platforms and positions; all images or all videos; at most one entry without platforms), multi_media asset pool (2 to 10 entries, images and videos may mix, each image_hash, image_url or video_id with optional thumbnail_url; the first is the main media; Meta mixes them with the text variants), catalog carousel (product_set_id with link_url; texts may use tags like {{product.name}}), existing Page post (object_story_id), existing Instagram post (source_instagram_media_id), click-to-message (call_to_action_type WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on a single image; MESSAGE_PAGE or INSTAGRAM_MESSAGE on a video; INSTAGRAM_MESSAGE on a carousel, every card opening the same chat; WHATSAPP_MESSAGE, MESSAGE_PAGE or INSTAGRAM_MESSAGE on an existing Instagram post), instant form (lead_gen_form_id) and Partnership Ads: sponsor ids on an Instagram post, on a Facebook post (object_story_id, sponsor_page_id required) or on a new single image or video; or an ad code (partnership_ad_code for Instagram, facebook_partnership_ad_code for Facebook). display_link is the address shown on the ad (Meta's caption) and needs link_url. On text variants and placement_customizations a description of exactly one space is sent as Meta's blank description, so Meta does not fill one in from the link. Profile visit buttons: call_to_action_type VIEW_INSTAGRAM_PROFILE (needs instagram_account_id) or VISIT_PROFILE, with link_url set to the profile. product_extensions_product_set_id shows products from that product set below a single image or video link ad. dry_run returns the assembled spec and sends nothing. Attach the creative with create_ad or update_ad_creative."""
     return await _create_from_inputs(**dict(locals()))
 
 
@@ -1246,7 +1296,9 @@ async def _create_from_inputs(
         description=_text(description),
         primary_texts=_variants(primary_texts, "primary_texts", MAX_BODY_CHARS),
         headlines=_variants(headlines, "headlines", MAX_TITLE_CHARS),
-        descriptions=_variants(descriptions, "descriptions", MAX_TITLE_CHARS),
+        descriptions=_variants(descriptions, "descriptions", MAX_TITLE_CHARS, keep_blank_description=True),
+        # Only an asset feed (text variants, placement_customizations) sends it; elsewhere it is left out as before.
+        blank_description=description == BLANK_DESCRIPTION,
         cards=cards,
         placement_customizations=placement_customizations,
         object_story_id=_text(object_story_id),
@@ -1310,6 +1362,9 @@ ADVANTAGE_CREATIVE_FEATURES = frozenset({
     "image_text_translation", "image_touchups", "image_uncrop", "inline_comment", "media_type_automation",
     "pac_relaxation", "product_extensions", "reveal_details_over_time", "text_optimizations",
     "text_translation", "translate_voiceover", "video_auto_crop", "video_filtering", "video_uncrop",
+    # Meta's Generative AI Features guide (text_generation, linked from the page above) and its Add Site
+    # Links guide (site_extensions, with the links in creative_sourcing_spec, which the copy carries).
+    "text_generation", "site_extensions",
 })
 ENROLL_STATUSES = frozenset({"OPT_IN", "OPT_OUT"})
 
