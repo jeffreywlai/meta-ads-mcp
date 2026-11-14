@@ -24,7 +24,14 @@ from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import LocalUpload, open_upload_file, read_upload_file
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
-from meta_ads_mcp.normalize import _plain_id, blank_to_none, names_other_object, normalize_collection, read_collection_page
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    names_other_object,
+    new_object_id,
+    normalize_collection,
+    read_collection_page,
+    same_object_id,
+)
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.secret_scrub import ANYWHERE, SecretScrubber, distinct_key
 from meta_ads_mcp.tool_types import (
@@ -463,12 +470,26 @@ async def create_ad_creative(
         "adcreatives",
         data=merge_graph_payload(payload, params),
     )
-    return {
+    response = {
         "ok": True,
         "action": "create_ad_creative",
         "target": {"account_id": normalize_account_id(account_id)},
         "created": created,
     }
+    # A new creative's id is an id and not the account's (created_id); an answer that gives something
+    # else is not shown as the created creative. An answer with no id is shown as before.
+    if not created_id_missing(created) and created_id(created, known=(normalize_account_id(account_id),)) is None:
+        response.update({
+            "created": None,
+            "created_id_unresolved": True,
+            "unresolved_result": created,
+            "warning": (
+                "Meta accepted the request, but its answer did not give a usable id for the new creative (it was "
+                "not an id, or it was the account's id). The creative may have been created; look for it before "
+                "sending the request again."
+            ),
+        })
+    return response
 
 
 @mcp_server.tool()
@@ -838,9 +859,16 @@ async def _chunked_video_upload(
         if wrapped is exc:
             raise
         raise wrapped from exc
-    # Read as ids (text, or a whole number): something that is not an id is never turned into text and sent.
+    # The session id is read as text (or a whole number); something else is never turned into text
+    # and sent. It names an upload session, not a Graph object, so it is compared with nothing.
     session_id = (_graph_id_text(started.get("upload_session_id")) if isinstance(started, dict) else None) or ""
-    video_id = (_graph_id_text(started.get("video_id")) if isinstance(started, dict) else None) or ""
+    # The new video's id (new_object_id): something that is not an id, or the account's own id, is
+    # not the new video, so no status is read for it.
+    named_video = started.get("video_id") if isinstance(started, dict) else None
+    video_id = new_object_id(named_video, known=(account,)) or ""
+    video_unusable = not video_id and named_video is not None and not (
+        isinstance(named_video, str) and not named_video.strip()
+    )
     if not session_id:
         raise MetaApiError(message="Meta did not return an upload session for the chunked upload; nothing was transferred.")
     progress = {"phase": "transfer", "confirmed": 0, "requests": 0}
@@ -848,7 +876,7 @@ async def _chunked_video_upload(
     def stopped_message(reason: str) -> str:
         message = (
             f"The chunked upload stopped during the {progress['phase']} step: upload session {session_id}, "
-            f"video {video_id or 'not returned'}. Meta confirmed {progress['confirmed']} of {video.size} bytes "
+            f"video {video_id or ('not known' if video_unusable else 'not returned')}. Meta confirmed {progress['confirmed']} of {video.size} bytes "
             f"({progress['requests']} transfer requests sent)."
         )
         if progress["phase"] == "finish":
@@ -944,6 +972,7 @@ async def _chunked_video_upload(
         raise MetaApiError(message=message, mutation_outcome_unknown=bool(progress["unknown"])) from exc
     return {
         "video_id": video_id or None,
+        "video_id_unusable": video_unusable,
         "finish": finished,
         "changed_after_send": changed_after,
         "upload": {
@@ -983,12 +1012,24 @@ def _chunked_plan(account: str, video: _OpenVideo, meta_fields: dict[str, Any]) 
     }
 
 
-async def _read_video_status(client: Any, video_id: str | None) -> dict[str, Any]:
+async def _read_video_status(client: Any, video_id: str | None, *, unusable: bool = False) -> dict[str, Any]:
     """Read processing status after an upload; a failed read never hides the video id.
 
     A failed read's text is kept in status_note, so it goes through the call's failure_text, which
-    removes the local file's path and names first, as for an error that escapes.
+    removes the local file's path and names first, as for an error that escapes. unusable: Meta's
+    answer named something as the video's id that cannot be the new video (not an id, or the
+    account's id), so nothing is read and the note says the video may exist.
     """
+    if video_id is None and unusable:
+        return {
+            "processing_status": None,
+            "status": None,
+            "status_note": (
+                "Meta accepted the upload, but what its answer gave as the video's id is not a usable video id "
+                "(something that is not an id, or the account's own id), so the new video's id and status are not "
+                "known. The video may have been uploaded; check list_ad_videos before uploading again."
+            ),
+        }
     if video_id is None:
         return {
             "processing_status": None,
@@ -1122,7 +1163,7 @@ async def _upload_video_file(
     outcome = await _chunked_video_upload(client, account, video, meta_fields)
     response = creation_response(action="upload_ad_video", target=target, result={"finish": outcome["finish"]})
     response.update({"video_id": outcome["video_id"], "upload": outcome["upload"]})
-    response.update(await _read_video_status(client, outcome["video_id"]))
+    response.update(await _read_video_status(client, outcome["video_id"], unusable=outcome["video_id_unusable"]))
     # The last await is the status read: check the open file again after it, so a change
     # while it was in flight is reported (as the direct path does). A change already seen
     # right after the finish still counts if this later check cannot be made.
@@ -1184,13 +1225,16 @@ async def _upload_video_request(
         }
     client = get_graph_api_client()
     uploaded = await client.create_edge_object(account, "advideos", data=data, files=files)
-    # Read as an id (text, or a whole number); something that is not an id is never read as one.
-    video_id = created_id(uploaded) or (
-        _graph_id_text(uploaded.get("video_id")) if isinstance(uploaded, dict) else None
-    )
+    # The new video's id, under id or, when id is absent, video_id (new_object_id): something that is
+    # not an id, or the account's own id, is not the new video, so no status is read for it.
+    answer = uploaded if isinstance(uploaded, dict) else {}
+    id_key = "id" if not created_id_missing(answer) else "video_id"
+    named = answer.get(id_key)
+    video_id = new_object_id(named, known=(account,))
+    unusable = video_id is None and named is not None and not (isinstance(named, str) and not named.strip())
     response = creation_response(action="upload_ad_video", target=target, result=uploaded)
     response.update({"video_id": video_id, "upload": upload})
-    response.update(await _read_video_status(client, video_id))
+    response.update(await _read_video_status(client, video_id, unusable=unusable))
     return response
 
 
@@ -1289,12 +1333,26 @@ async def setup_ab_test(
         "ad_studies",
         data=merge_graph_payload(payload, params),
     )
-    return {
+    response = {
         "ok": True,
         "action": "setup_ab_test",
         "target": {"owner_id": owner_id},
         "created": created,
     }
+    # A new study's id is an id and not its owner's (created_id); an answer that gives something else
+    # is not shown as the created study. An answer with no id is shown as before.
+    if not created_id_missing(created) and created_id(created, known=(owner_id,)) is None:
+        response.update({
+            "created": None,
+            "created_id_unresolved": True,
+            "unresolved_result": created,
+            "warning": (
+                "Meta accepted the request, but its answer did not give a usable id for the new study (it was not "
+                "an id, or it was the owner's id). The study may have been created; look for it before sending the "
+                "request again."
+            ),
+        })
+    return response
 
 
 _ADLABEL_OPERATIONS = ("set", "add", "remove")
@@ -2135,13 +2193,16 @@ def _graph_id_text(value: Any) -> str | None:
     return str(value).strip() or None
 
 
-def created_id(answer: Any) -> str | None:
-    """The id a create returned: text, or a whole number read as the same id (_graph_id_text).
+def created_id(answer: Any, *, known: Any = ()) -> str | None:
+    """The id of the object a create just made (new_object_id), or None when the answer cannot give it.
 
-    None when the answer names no id, and for anything that is not an id (true or false, a
-    number with a fraction, an object, a list): such a value is never turned into text and used.
+    None when the answer names no id; for anything that is not an id (true or false, a fraction,
+    a negative number, text that is not digits, an object, a list), which is never turned into
+    text and used; and for an id in known, an object the call already knows as something else.
+    Read live: the creatives, ads, campaigns, ad sets and videos Meta created answered with their
+    new id as digits, which is always read.
     """
-    return _graph_id_text(answer.get("id")) if isinstance(answer, dict) else None
+    return new_object_id(answer.get("id"), known=known) if isinstance(answer, dict) else None
 
 
 def created_id_missing(answer: Any) -> bool:
@@ -2157,21 +2218,15 @@ def created_id_problem(answer: Any) -> str:
     return "Meta's answer held something that is not an id where the new object's id belongs (not shown)."
 
 
-def is_known_id(known: Any, returned: str) -> bool:
-    """Whether an id a create returned is an id this call already knows as another object.
+def known_object_named(answer: Any, known: Iterable[tuple[str, Any]]) -> tuple[str, str] | None:
+    """Which object the call already knows a create's answer named as its new object: (kind, id), or None.
 
-    The same text, or two plain ids that are one id by value: names_other_object, which reads
-    "123", 123 and act_123 as one id, finds no difference between them. names_other_object alone
-    cannot say this, since it also answers "no difference" when an id cannot be compared; an id
-    that is not a plain id (an alias, or text that is not digits) is the same only as the same text.
+    known lists (kind, id) pairs, such as ("account", "act_1"). Compared by value
+    (same_object_id), so "123", 123, " 123 " and act_123 are one object. Used to say which
+    object it was after created_id found no usable id.
     """
-    known_text = _graph_id_text(known)
-    if known_text is None:
-        return False
-    if known_text == returned:
-        return True
-    readable = _plain_id(known_text) is not None and _plain_id(returned) is not None
-    return readable and not names_other_object(known_text, {"id": returned})
+    value = answer.get("id") if isinstance(answer, dict) else None
+    return next(((kind, str(known_id)) for kind, known_id in known if same_object_id(known_id, value)), None)
 
 
 async def _page_for_instagram_account(client: Any, instagram_account_id: str) -> tuple[str, dict[str, Any]]:
@@ -2384,8 +2439,13 @@ async def _boost_one_step(
     creative_for: Any,
     settings: _BoostSettings,
     plan_only: bool,
+    input_objects: tuple[tuple[str, Any], ...] = (),
 ) -> dict[str, Any]:
-    """Create campaign, ad set, creative and ad, all paused, or return the plan."""
+    """Create campaign, ad set, creative and ad, all paused, or return the plan.
+
+    input_objects lists (kind, id) for the objects the call names; with the Page (given or
+    found), none of them can be an object this call creates.
+    """
     client = client_factory()
     currency = await resolve_account_currency(client, account_id)
     budget_minor = to_minor_units(settings.budget, currency, field_name=settings.budget_parameter)
@@ -2511,6 +2571,7 @@ async def _boost_one_step(
         }
     created: list[tuple[str, str]] = []
     results: dict[str, Any] = {}
+    known_inputs = [*input_objects, ("Page", page_id)]
 
     async def create(step: str, edge: str, data: dict[str, Any]) -> str:
         try:
@@ -2526,20 +2587,28 @@ async def _boost_one_step(
                 message=_boost_created_message(created, step, str(exc) or type(exc).__name__, unknown=True),
                 mutation_outcome_unknown=True,
             ) from exc
-        object_id = created_id(result)
+        # A new object is none of the objects this call names or infers (the account, the post, the
+        # Instagram account, the Page, any sponsor) and none it already created: an answer naming one
+        # of those, or something that is not an id, does not say which object the request made, so
+        # nothing later is built on it.
+        object_id = created_id(result, known=[known_id for _, known_id in (*known_inputs, *created)])
         if object_id is None:
             # Meta accepted the request and named nothing usable, so an object may exist.
-            raise ValidationError(_boost_created_message(created, step, created_id_problem(result), unknown=True))
-        # A new object is not one this call already created: an answer naming one of those does
-        # not say which object the request made, so nothing later is built on it.
-        known = next(((kind, known_id) for kind, known_id in created if is_known_id(known_id, object_id)), None)
-        if known is not None:
-            raise ValidationError(_boost_created_message(
-                created, step,
-                f"Meta's answer gave the {known[0]} {known[1]}, created earlier in this call, as the new {step}'s id, "
-                f"so the new {step}'s id is not known.",
-                unknown=True,
-            ))
+            earlier = known_object_named(result, created)
+            given = known_object_named(result, known_inputs)
+            if earlier is not None:
+                reason = (
+                    f"Meta's answer gave the {earlier[0]} {earlier[1]}, created earlier in this call, as the new "
+                    f"{step}'s id, so the new {step}'s id is not known."
+                )
+            elif given is not None:
+                reason = (
+                    f"Meta's answer gave the {given[0]} {given[1]}, already known in this call, as the new "
+                    f"{step}'s id, so the new {step}'s id is not known."
+                )
+            else:
+                reason = created_id_problem(result)
+            raise ValidationError(_boost_created_message(created, step, reason, unknown=True))
         created.append((step, object_id))
         results[step] = result
         return object_id
@@ -2740,6 +2809,15 @@ async def _boost_instagram_post(
     resolved_account_id = normalize_account_id(ids["account_id"])
     ad_name = blank_to_none(name) or (f"Instagram post {media_id}" if media_id else "Partnership ad")
     resolved_page_id = blank_to_none(page_id)
+    # The objects this call names. A create's answer that gives one of them (or the Page, the ad set
+    # or an object created earlier in the call) as its new object's id does not identify the new object.
+    input_objects = (
+        ("account", resolved_account_id),
+        ("Instagram post", media_id),
+        ("Instagram account", ids["instagram_account_id"]),
+        ("sponsor Page", blank_to_none(sponsor_page_id)),
+        ("sponsor Instagram account", blank_to_none(sponsor_instagram_account_id)),
+    )
 
     def creative_for(page: str | None, cta: dict[str, Any] | None = call_to_action) -> tuple[dict[str, Any], dict[str, str]]:
         return _boost_creative_spec(
@@ -2782,6 +2860,7 @@ async def _boost_instagram_post(
             creative_for=creative_for,
             settings=settings,
             plan_only=plan_only,
+            input_objects=input_objects,
         )
     client = get_graph_api_client()
     if resolved_page_id is None:
@@ -2848,22 +2927,26 @@ async def _boost_instagram_post(
         "adcreatives",
         data={"name": f"{ad_name} creative", **creative_spec},
     )
-    creative_id = created_id(creative)
+    # Neither the ad set, the Page nor any object this call names is the new creative: no ad is built on
+    # an answer that gives one of them, or something that is not an id, as the creative's id.
+    known_objects = [*input_objects, ("ad set", ids["adset_id"]), ("Page", resolved_page_id)]
+    creative_id = created_id(creative, known=[known_id for _, known_id in known_objects])
     if creative_id is None:
         # Meta accepted the request and named nothing usable, so a creative may exist.
+        named = known_object_named(creative, known_objects)
+        if named is not None and named[0] == "ad set":
+            raise ValidationError(
+                f"Meta accepted the creative request but its answer gave ad set {ids['adset_id']}, given in this "
+                "call, as the new creative's id, so the creative's id is not known and no ad was created. A "
+                "creative may have been created; look for it in the account before retrying."
+            )
         returned = "did not return a creative id" if created_id_missing(creative) else (
-            "returned something that is not an id (not shown) as the creative id"
+            f"its answer gave the {named[0]} {named[1]}, already known in this call, as the new creative's id"
+            if named is not None else "returned something that is not an id (not shown) as the creative id"
         )
         raise ValidationError(
             f"Meta accepted the creative request but {returned}, so no ad was created. "
             "A creative may have been created; look for it in the account before retrying."
-        )
-    if is_known_id(ids["adset_id"], creative_id):
-        # The ad set given in this call is not the new creative: no ad is built on that answer.
-        raise ValidationError(
-            f"Meta accepted the creative request but its answer gave ad set {ids['adset_id']}, given in this call, as "
-            "the new creative's id, so the creative's id is not known and no ad was created. A creative may have been "
-            "created; look for it in the account before retrying."
         )
     try:
         ad = await client.create_edge_object(
@@ -2892,17 +2975,15 @@ async def _boost_instagram_post(
         if wrapped is exc:
             raise
         raise wrapped from exc
-    ad_id = created_id(ad)
+    known_objects = [("creative", creative_id), *known_objects]
+    ad_id = created_id(ad, known=[known_id for _, known_id in known_objects])
     # An answer that names no ad id keeps the result it always had (ad_id None). One that names
     # something that is not an id, or an object this call already knows, does not identify the ad.
-    known = next(
-        (f"{kind} {known_id}" for kind, known_id in (("creative", creative_id), ("ad set", ids["adset_id"]))
-         if ad_id is not None and is_known_id(known_id, ad_id)),
-        None,
-    )
-    if known is not None or (ad_id is None and not created_id_missing(ad)):
+    if ad_id is None and not created_id_missing(ad):
+        named = known_object_named(ad, known_objects)
         reason = (
-            f"its answer gave the {known}, already known in this call, as the new ad's id" if known is not None
+            f"its answer gave the {named[0]} {named[1]}, already known in this call, as the new ad's id"
+            if named is not None
             else "its answer held something that is not an id (not shown) where the new ad's id belongs"
         )
         raise ValidationError(

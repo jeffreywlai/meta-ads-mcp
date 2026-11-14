@@ -21,7 +21,14 @@ from meta_ads_mcp.money import (
     to_minor_units,
     validate_positive_amount,
 )
-from meta_ads_mcp.normalize import _plain_id, blank_to_none, names_other_object, read_collection_page
+from meta_ads_mcp.normalize import (
+    blank_to_none,
+    graph_id_text,
+    names_other_object,
+    new_object_id,
+    read_collection_page,
+    same_object_id,
+)
 from meta_ads_mcp.schemas import creation_response, mutation_response
 from meta_ads_mcp.tool_types import (
     BidConstraints,
@@ -771,7 +778,10 @@ async def create_campaign(
         }
     sent_schedule = {key: data[key] for key in _CAMPAIGN_SCHEDULE_FIELDS if key in data}
     if sent_schedule and not validate_only:
-        new_id = result.get("id") if isinstance(result, dict) else None
+        # Only the new campaign's own id is read back: a value that is not an id, or the account's
+        # id, would read some other object's times as this campaign's (new_object_id). Unresolved,
+        # nothing is read and the warning says the times could not be read back.
+        new_id = new_object_id(result.get("id"), known=(account_id,)) if isinstance(result, dict) else None
         stored = await _read_campaign_schedule(client, new_id)
         response.update(_campaign_schedule_report(sent_schedule, stored)[0])
     return response
@@ -1189,7 +1199,9 @@ async def create_ad_set(
     )
     zoneless = [key for key, value in (("start_time", start_time), ("end_time", end_time)) if _time_without_zone(value)]
     if zoneless:
-        await _add_zoneless_time_warning(response, client, zoneless, result, validate_only=validate_only)
+        await _add_zoneless_time_warning(
+            response, client, zoneless, result, validate_only=validate_only, known=(account_id, campaign_id)
+        )
     return response
 
 
@@ -1210,11 +1222,14 @@ async def _add_zoneless_time_warning(
     result: Any,
     *,
     validate_only: bool,
+    known: tuple[Any, ...] = (),
 ) -> None:
     """Warn that a schedule time had no time zone and, after a real create, show what Meta stored.
 
     The ad set already exists here, so nothing in this function may raise: a
-    failed read-back only changes the warning's wording.
+    failed read-back only changes the warning's wording. Only the new ad set's own id is read
+    back (new_object_id): a value that is not an id, or an id in known (the account, the
+    campaign), is not read, and the warning says the time could not be read back.
     """
     names = " and ".join(zoneless)
     verb, pronoun = ("was", "it") if len(zoneless) == 1 else ("were", "them")
@@ -1223,11 +1238,11 @@ async def _add_zoneless_time_warning(
         "To be unambiguous, include a UTC offset, for example 2026-11-27T00:00:00-05:00."
     )
     if not validate_only:
-        new_id = result.get("id") if isinstance(result, dict) else None
+        new_id = new_object_id(result.get("id"), known=known) if isinstance(result, dict) else None
         stored = None
-        if new_id not in (None, ""):
+        if new_id is not None:
             try:
-                stored = await client.get_object(str(new_id), fields=["start_time", "end_time"])
+                stored = await client.get_object(new_id, fields=["start_time", "end_time"])
             except Exception:  # The create succeeded; a failed read-back must not turn it into an error.
                 stored = None
             # An answer about a different ad set does not say what the new one holds: not read back.
@@ -1559,12 +1574,6 @@ _COPY_OBJECT_TYPES = ("campaign", "ad_set", "ad", "unique_adcreative")
 _COPY_ANSWER_TYPES = {"campaign": "campaign", "adset": "ad_set", "ad": "ad"}
 
 
-def _same_id(first: Any, second: Any) -> bool:
-    """True only when both are readable ids of the same object, normalised as names_other_object does."""
-    plain = _plain_id(first)
-    return plain is not None and plain == _plain_id(second)
-
-
 def _copy_list_contradicts(new_id: str, copied: Any, *, source_id: str, own_type: str) -> bool:
     """True when a readable row of the copied-objects list contradicts new_id as the copy of source_id.
 
@@ -1582,11 +1591,11 @@ def _copy_list_contradicts(new_id: str, copied: Any, *, source_id: str, own_type
         row_type = raw_type.strip().lower() if isinstance(raw_type, str) else None
         if row_type not in _COPY_OBJECT_TYPES:
             continue
-        if row_type != own_type and _same_id(new_id, item.get("copied_id")):
+        if row_type != own_type and same_object_id(new_id, item.get("copied_id")):
             return True
         if (
             row_type == own_type
-            and _same_id(source_id, item.get("source_id"))
+            and same_object_id(source_id, item.get("source_id"))
             and names_other_object(new_id, {"id": item.get("copied_id")})
         ):
             return True
@@ -1621,22 +1630,20 @@ async def run_copy(
     client = client_factory()
     result = await client.create_edge_object(source_id, "copies", data=data)
     raw_new_id = result.get(f"copied_{object_type}_id") if isinstance(result, dict) else None
-    new_id = str(raw_new_id) if raw_new_id not in (None, "") else None
     copied = result.get("ad_object_ids") if isinstance(result, dict) else None
     # A copy is a new object. An answer that names, as the copy, an object this call already
     # knows (the source, the campaign or ad set the copy goes into, or an original that the
     # answer itself lists as copied from) does not say which object the copy is, so its id is
     # treated as not returned: nothing later in this call (the rename) is sent to that object.
-    known_objects = {str(source_id)}
-    known_objects.update(str(data[key]) for key in ("campaign_id", "adset_id") if data.get(key) not in (None, ""))
+    # Ids are compared by value (new_object_id), so " 123 ", 123 and "123" are one object. A value
+    # that is not an id (true, a negative number, text that is not digits) is not the copy's id either.
+    known_objects = [source_id, data.get("campaign_id"), data.get("adset_id")]
     if isinstance(copied, list):
-        known_objects.update(
-            str(item["source_id"]) for item in copied
-            if isinstance(item, dict) and item.get("source_id") not in (None, "")
-        )
-    named_source = new_id is not None and new_id in known_objects
-    if named_source:
-        new_id = None
+        known_objects.extend(item.get("source_id") for item in copied if isinstance(item, dict))
+    returned = raw_new_id not in (None, "") and not (isinstance(raw_new_id, str) and not raw_new_id.strip())
+    not_an_id = returned and graph_id_text(raw_new_id) is None
+    new_id = new_object_id(raw_new_id, known=known_objects) if returned else None
+    named_source = returned and not not_an_id and new_id is None
     # The answer's own list of copied objects can also contradict the copy id: it lists that id as
     # the copy of another type of object, or lists a different copy of the source. Either way the
     # answer does not say which object is the copy, so its id is treated as not returned.
@@ -1672,7 +1679,12 @@ async def run_copy(
         response["copied_objects_note"] = (
             "Meta listed the copied objects in a shape this server could not read; copied_objects is empty."
         )
-    if named_source:
+    if not_an_id:
+        response["warning"] = (
+            "Meta's response gave something that is not an id as the new copy's id, so the new copy's id is not "
+            "known; find the copy under its parent before acting on it or copying again."
+        )
+    elif named_source:
         response["warning"] = (
             "Meta's response named an existing object (the source, its parent or a copied original) as the "
             "new copy, so the new copy's id is not known; "

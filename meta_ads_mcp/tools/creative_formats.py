@@ -28,8 +28,8 @@ from meta_ads_mcp.tools.creatives import (
     created_id,
     created_id_missing,
     current_call_secrets,
-    is_known_id,
     keeps_call_secrets,
+    known_object_named,
     label_identity,
     read_label_set,
 )
@@ -1347,14 +1347,38 @@ async def _create_from_inputs(
             ),
         )
     response = creation_response(action="create_ad_creative_from_inputs", target=target, result=created)
+    # The new creative's id is an id and none of the objects this call names (the account, the Page,
+    # the Instagram account, a video, post, form, sponsor or product set). creation_response already
+    # withholds created for a value that is not an id or the account's id; a creative's id is digits,
+    # and the call names more objects than target shows, so the same is done here for those too.
+    known = [resolved_account, *(getattr(inputs, field) for field in _BUILDER_INPUT_OBJECTS)]
+    creative_id = created_id(created, known=known)
+    if creative_id is None and not created_id_missing(created) and not response.get("created_id_unresolved"):
+        response.update({
+            "created": None,
+            "created_id_unresolved": True,
+            "unresolved_result": created,
+            "warning": (
+                "Meta accepted the request, but its answer did not give a usable id for the new creative (it was "
+                "not an id, or it was the id of an object this call names). The creative may have been created; "
+                "look for it before sending the request again."
+            ),
+        })
     response.update({
-        # Read as an id: something that is not an id is not shown as the new creative's id.
-        "creative_id": created_id(created),
+        "creative_id": creative_id,
         "format": creative_format,
         "sent_spec": shown,
         "notes": notes,
     })
     return response
+
+
+# The inputs of create_ad_creative_from_inputs that name an existing object.
+_BUILDER_INPUT_OBJECTS = (
+    "page_id", "instagram_account_id", "video_id", "object_story_id", "source_instagram_media_id",
+    "lead_gen_form_id", "sponsor_page_id", "sponsor_instagram_account_id", "product_set_id",
+    "product_extensions_product_set_id",
+)
 
 
 # update_ad_creative_enhancements
@@ -1907,6 +1931,32 @@ async def update_ad_creative_enhancements(
     return await _update_enhancements(ad_id, features, name, dry_run)
 
 
+def _objects_named_by_copy(account: str, creative: dict[str, Any], copied: dict[str, Any]) -> list[tuple[str, Any]]:
+    """The objects the copied creative names, as (kind, id): none of them can be the new copy.
+
+    Values that are not ids are listed too and simply never match (same_object_id).
+    """
+    spec = creative.get("object_story_spec") if isinstance(creative.get("object_story_spec"), dict) else {}
+    facebook = creative.get("facebook_branded_content") if isinstance(creative.get("facebook_branded_content"), dict) else {}
+    instagram = creative.get("instagram_branded_content") if isinstance(creative.get("instagram_branded_content"), dict) else {}
+    copied_spec = copied.get("object_story_spec") if isinstance(copied.get("object_story_spec"), dict) else {}
+    return [
+        ("account", account),
+        ("account", creative.get("account_id")),
+        ("Page", spec.get("page_id")),
+        ("Page", copied_spec.get("page_id")),
+        ("Page", creative.get("object_id")),
+        ("Instagram account", spec.get("instagram_user_id")),
+        ("Instagram account", spec.get("instagram_actor_id")),
+        ("Instagram account", creative.get("instagram_user_id")),
+        ("Instagram post", creative.get("source_instagram_media_id")),
+        ("post", creative.get("object_story_id")),
+        ("sponsor Page", facebook.get("sponsor_page_id")),
+        ("sponsor Instagram account", instagram.get("sponsor_id")),
+        ("product set", creative.get("product_set_id")),
+    ]
+
+
 async def _update_enhancements(ad_id: str, features: dict[str, str], name: str | None, dry_run: bool) -> dict[str, Any]:
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
@@ -2118,28 +2168,28 @@ async def _update_enhancements(ad_id: str, features: dict[str, str], name: str |
                 "creative in the account before retrying, so a second copy is not made"
             ),
         )
-    new_creative_id = created_id(created)
+    # A copy is a new creative: it is an id, and none of the objects known from the ad and the copied
+    # creative (the ad's own creative, the ad, the account, the Page, the Instagram account and the other
+    # objects the copy names). Attaching any of those would change the ad to something not asked for.
+    known_objects = [("creative", old_creative_id), ("ad", ad_id), *_objects_named_by_copy(resolved_account, creative, copied)]
+    new_creative_id = created_id(created, known=[known_id for _, known_id in known_objects])
     if new_creative_id is None:
         # Meta accepted the request and named nothing usable, so a replacement creative may exist.
-        returned = "did not return a creative id" if created_id_missing(created) else (
-            "returned something that is not an id (not shown) as the creative id"
-        )
+        named = None if created_id_missing(created) else known_object_named(created, known_objects)
+        if named is not None and named[0] == "creative":
+            reason = "Meta's answer named the ad's existing creative as the new copy, so the ad was not changed."
+        elif named is not None:
+            reason = (
+                f"Meta's answer named {named[0]} {named[1]} as the new copy, so the copy's id is not known and the ad "
+                "was not changed."
+            )
+        else:
+            returned = "did not return a creative id" if created_id_missing(created) else (
+                "returned something that is not an id (not shown) as the creative id"
+            )
+            reason = f"Meta accepted the creative request but {returned}, so the ad was not changed."
         raise ValidationError(
-            f"Meta accepted the creative request but {returned}, so the ad was not changed. "
-            "A replacement creative may have been created; look for it in the account before retrying."
-        )
-    if is_known_id(old_creative_id, new_creative_id):
-        # A copy is a new creative. Attaching the ad's own creative would change nothing and be
-        # reported as the change asked for.
-        raise ValidationError(
-            "Meta's answer named the ad's existing creative as the new copy, so the ad was not changed. "
-            "A replacement creative may have been created; look for it in the account before retrying."
-        )
-    if is_known_id(ad_id, new_creative_id):
-        # The ad is not a creative: nothing is attached on that answer.
-        raise ValidationError(
-            f"Meta's answer named ad {ad_id} as the new copy, so the copy's id is not known and the ad was not "
-            "changed. A replacement creative may have been created; look for it in the account before retrying."
+            f"{reason} A replacement creative may have been created; look for it in the account before retrying."
         )
     try:
         await client.update_object(ad_id, data={"creative": {"creative_id": new_creative_id}})

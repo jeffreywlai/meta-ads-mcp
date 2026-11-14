@@ -23,7 +23,7 @@ class FakeCreativeClient:
         return {"data": [{"id": "crt_1", "name": "Creative One"}]}
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
-        return {"id": "crt_created", "payload": data}
+        return {"id": "200001", "payload": data}
 
     async def preview_ad(self, **kwargs):
         return {"data": [{"body": "<html>preview</html>"}], "request": kwargs}
@@ -442,10 +442,10 @@ class FakeBoostClient:
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
         self.calls.append(("create", parent_id, edge, data))
         if edge == "adcreatives":
-            return {"id": "crt_boost"}
+            return {"id": "200002"}
         if self.fail_ad is not None:
             raise self.fail_ad
-        return {"id": "ad_boost"}
+        return {"id": "200003"}
 
 
 def test_boost_creative_accepted_without_an_id_says_a_creative_may_exist(monkeypatch) -> None:
@@ -522,11 +522,11 @@ def test_boost_instagram_post_creates_paused_ad(monkeypatch) -> None:
     assert ad_call[3] == {
         "name": "Boost post",
         "adset_id": "adset_1",
-        "creative": {"creative_id": "crt_boost"},
+        "creative": {"creative_id": "200002"},
         "status": "PAUSED",
     }
-    assert result["creative_id"] == "crt_boost"
-    assert result["ad_id"] == "ad_boost"
+    assert result["creative_id"] == "200002"
+    assert result["ad_id"] == "200003"
     assert result["status"] == "PAUSED"
     assert result["validation_only"] is False
     assert result["action"] == "boost_instagram_post"
@@ -577,7 +577,7 @@ def test_boost_instagram_post_ad_failure_names_the_created_creative(monkeypatch)
 
     client = FakeBoostClient(fail_ad=MetaApiError(message="Invalid ad set", status_code=400, code=100))
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
-    with pytest.raises(MetaApiError, match="crt_boost"):
+    with pytest.raises(MetaApiError, match="200002"):
         asyncio.run(creatives.boost_instagram_post(
             account_id="123", adset_id="adset_1", instagram_media_id="media_1",
             instagram_account_id="ig_1", page_id="page_1",
@@ -4275,7 +4275,7 @@ def test_r25_default_existing_adset_boost_sends_the_requests_it_sent_before(monk
             "source_instagram_media_id": "555",
         }),
         ("create", "act_123", "ads", {
-            "name": "Instagram post 555", "adset_id": "60", "creative": {"creative_id": "crt_boost"}, "status": "PAUSED",
+            "name": "Instagram post 555", "adset_id": "60", "creative": {"creative_id": "200002"}, "status": "PAUSED",
         }),
     ]
 

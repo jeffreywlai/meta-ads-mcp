@@ -470,7 +470,9 @@ class UniversalFakeClient:
         return payload
 
     async def create_edge_object(self, parent_id: str, edge: str, *, data, files=None):
-        return {"id": f"{edge}_created", "parent_id": parent_id, "payload": data, "files": files}
+        # A new object's id is digits, and each create in one call makes a different object.
+        self.creates = getattr(self, "creates", 0) + 1
+        return {"id": str(990000 + self.creates), "parent_id": parent_id, "payload": data, "files": files}
 
     async def update_object(self, object_id: str, *, data):
         return {"success": True, "id": object_id, "payload": data}
