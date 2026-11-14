@@ -11,7 +11,7 @@ from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, ValidationError
 from meta_ads_mcp.field_reference import FIELD_REFERENCE, SDK_SOURCE
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
+from meta_ads_mcp.normalize import blank_to_none, collection_fault, normalize_collection, read_collection_page
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.tool_types import (
     FieldList,
@@ -152,23 +152,70 @@ PAGE_UNREADABLE_REASON = (
 )
 
 
-def _unreadable_page() -> dict[str, Any]:
+def _unreadable_page(reason: str) -> dict[str, Any]:
     """The listing envelope for a page without a readable data list: not empty, not complete."""
     return {
         "items": [],
         "paging": {"before": None, "after": None, "next": None},
         "summary": {
             "count": 0, "complete": False, "truncated": False, "next_after": None,
-            "page_unreadable": True, "incomplete_reason": PAGE_UNREADABLE_REASON,
+            "page_unreadable": True, "incomplete_reason": reason,
         },
     }
 
 
-def _listing_page(payload: Any) -> dict[str, Any]:
-    """One listing page as Meta returned it; a page without a readable data list is never complete."""
-    if read_collection_page(payload)[2]:
-        return _unreadable_page()
-    return _with_page_summary(normalize_collection(payload))
+def _judge_rows(rows: list[dict[str, Any]], verdict: Any) -> tuple[list[dict[str, Any]], int]:
+    """Split object rows by a filter into (kept, could_not_be_judged).
+
+    verdict returns True (keep), False (a definite non-match) or None when the row lacks what
+    the filter needs (a timestamp, a type, an eligibility answer). A row that cannot be judged is
+    never treated as a non-match: it is counted, and the caller reports the result incomplete.
+    """
+    kept: list[dict[str, Any]] = []
+    unjudged = 0
+    for row in rows:
+        decision = verdict(row)
+        if decision is None:
+            unjudged += 1
+        elif decision:
+            kept.append(row)
+    return kept, unjudged
+
+
+def _unjudged_reason(count: int, needs: str) -> str:
+    return (
+        f"{count} row(s) on this page lacked {needs}, so whether they match the filter is unknown; "
+        "they are left out."
+    )
+
+
+def _listing_page(payload: Any, *, verdict: Any = None, needs: str = "") -> dict[str, Any]:
+    """Shape one listing page; the one place a page in this module is called complete or not.
+
+    The page is complete only when collection_fault finds nothing wrong with it (a data list
+    whose entries are all objects), Meta reported no next page, and, when a filter is given,
+    every object row could be judged. Otherwise summary.complete is false and
+    summary.incomplete_reason says why. Without a filter, rows are shown as Meta returned them;
+    with one, rows that are not objects cannot be judged and are left out (the fault names them).
+    """
+    fault = collection_fault(payload)
+    rows, _, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        return _unreadable_page(fault or PAGE_UNREADABLE_REASON)
+    normalized = normalize_collection(payload)
+    unjudged = 0
+    if verdict is not None:
+        normalized["items"], unjudged = _judge_rows(rows, verdict)
+    normalized["summary"] = {"count": len(normalized["items"])}
+    _with_page_summary(normalized)
+    reasons = [fault] if fault else []
+    if unjudged:
+        normalized["summary"]["unjudged_rows"] = unjudged
+        reasons.append(_unjudged_reason(unjudged, needs))
+    if reasons:
+        normalized["summary"]["complete"] = False
+        normalized["summary"]["incomplete_reason"] = " ".join(reasons)
+    return normalized
 
 
 async def _scan_edge(
@@ -445,13 +492,27 @@ async def list_ad_videos(
             fields=scan_fields, params=_page_params(limit, after),
         )
         needle = title_filter.casefold()
+
+        def title_verdict(video: dict[str, Any]) -> bool | None:
+            title = video.get("title")
+            if title is None:
+                # Meta leaves out the title of an untitled video; no title cannot contain the text.
+                return False
+            return needle in title.casefold() if isinstance(title, str) else None
+
+        kept, unjudged = _judge_rows(scan["items"], title_verdict)
         matched = [
             _with_processing_status(
                 {key: value for key, value in video.items() if not (title_added and key == "title")}
             )
-            for video in scan["items"]
-            if isinstance(video, dict) and needle in str(video.get("title") or "").casefold()
+            for video in kept
         ]
+        title_summary: dict[str, Any] = {}
+        if unjudged:
+            title_summary = {
+                "unjudged_rows": unjudged,
+                "incomplete_reason": _unjudged_reason(unjudged, "a readable title"),
+            }
         return {
             "items": matched,
             "summary": {
@@ -461,7 +522,8 @@ async def list_ad_videos(
                 "scanned_count": len(scan["items"]),
                 "unreadable_rows": scan["unreadable_rows"],
                 "pages_read": scan["pages_read"],
-                "complete": scan["complete"],
+                **title_summary,
+                "complete": scan["complete"] and not unjudged,
                 "scan_capped": scan["scan_capped"],
                 "next_after": scan["next_after"],
                 "scan_note": _scan_note(scan, "videos"),
@@ -505,15 +567,15 @@ async def list_creative_ads(
     scan = await _scan_edge(client, resolved_account_id, "ads", fields=CREATIVE_AD_FIELDS, params=params)
     matched: list[dict[str, Any]] = []
     # An ad whose creative id cannot be read could be using this creative.
-    without_creative_id = 0
-    for ad in scan["items"]:
+    def uses_creative(ad: dict[str, Any]) -> bool | None:
         creative = ad.get("creative") if isinstance(ad.get("creative"), dict) else {}
         ad_creative_id = creative.get("id")
         if isinstance(ad_creative_id, bool) or not isinstance(ad_creative_id, (str, int)) or not str(ad_creative_id).strip():
-            without_creative_id += 1
-            continue
-        if str(ad_creative_id).strip() != creative_id:
-            continue
+            return None
+        return str(ad_creative_id).strip() == creative_id
+
+    kept, without_creative_id = _judge_rows(scan["items"], uses_creative)
+    for ad in kept:
         item = {key: value for key, value in ad.items() if key != "creative"}
         item["creative_id"] = creative_id
         matched.append(item)
@@ -598,25 +660,48 @@ def _media_filter(values: Any, name: str, allowed: frozenset[str]) -> set[str] |
     return normalized
 
 
+def _readable_text(value: Any) -> str | None:
+    return value.strip().upper() if isinstance(value, str) and value.strip() else None
+
+
+def _media_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+
+
 def _media_matches(
     media: dict[str, Any],
     window: tuple[datetime | None, datetime | None] | None,
     type_filter: set[str] | None,
     product_filter: set[str] | None,
-) -> bool:
-    if type_filter is not None and str(media.get("media_type") or "").upper() not in type_filter:
-        return False
-    if product_filter is not None and str(media.get("media_product_type") or "").upper() not in product_filter:
-        return False
+) -> bool | None:
+    """True or False for a media item, or None when a field a filter needs cannot be read."""
+    unknown = False
+    if type_filter is not None:
+        media_type = _readable_text(media.get("media_type"))
+        if media_type is None:
+            unknown = True
+        elif media_type not in type_filter:
+            return False
+    if product_filter is not None:
+        product = _readable_text(media.get("media_product_type"))
+        if product is None:
+            unknown = True
+        elif product not in product_filter:
+            return False
     if window is not None:
-        try:
-            created = datetime.strptime(str(media.get("timestamp") or ""), "%Y-%m-%dT%H:%M:%S%z")
-        except ValueError:
-            return False
-        start, end = window
-        if (start is not None and created < start) or (end is not None and created >= end):
-            return False
-    return True
+        created = _media_timestamp(media.get("timestamp"))
+        if created is None:
+            unknown = True
+        else:
+            start, end = window
+            if (start is not None and created < start) or (end is not None and created >= end):
+                return False
+    return None if unknown else True
 
 
 @mcp_server.tool()
@@ -664,39 +749,47 @@ async def list_instagram_media(
         fields=requested_fields,
         params=params,
     )
-    scanned, unreadable_rows, page_unreadable = read_collection_page(payload)
-    if page_unreadable:
-        normalized = _unreadable_page()
-        normalized["summary"].update({"source": edge, "boost_eligible_only": boost_eligible_only, "scanned_count": 0})
-        return normalized
-    normalized = normalize_collection(payload)
-    items: list[dict[str, Any]] = []
+    scanned, unreadable_rows, _ = read_collection_page(payload)
     excluded_ineligible = 0
     unknown = 0
     excluded_by_filters = 0
-    for media in scanned:
-        if not _media_matches(media, window, type_filter, product_filter):
+    filter_unreadable = 0
+
+    def verdict(media: dict[str, Any]) -> bool | None:
+        nonlocal excluded_ineligible, unknown, excluded_by_filters, filter_unreadable
+        matches = _media_matches(media, window, type_filter, product_filter)
+        if matches is False:
             excluded_by_filters += 1
-            continue
-        eligible, reason = _boost_eligibility(media)
+            return False
+        eligible, _ = _boost_eligibility(media)
         if eligible is None:
             unknown += 1
         elif eligible is False:
             excluded_ineligible += 1
+        if matches is None:
+            filter_unreadable += 1
+            return None
         if boost_eligible_only and eligible is not True:
-            continue
-        items.append({**media, "boost_eligible": eligible, "boost_ineligible_reason": reason})
-    normalized["items"] = items
-    normalized["summary"] = {"count": len(items)}
-    _with_page_summary(normalized)
+            # Without an eligibility answer the item cannot be judged; an ineligible one is a non-match.
+            return None if eligible is None else False
+        return True
+
+    normalized = _listing_page(
+        payload, verdict=verdict,
+        needs="a readable timestamp, media type or product type for the filters, or a boost eligibility answer",
+    )
+    if normalized["summary"].get("page_unreadable"):
+        normalized["summary"].update({"source": edge, "boost_eligible_only": boost_eligible_only, "scanned_count": 0})
+        return normalized
+    normalized["items"] = [
+        {**media, "boost_eligible": eligible, "boost_ineligible_reason": reason}
+        for media in normalized["items"]
+        for eligible, reason in [_boost_eligibility(media)]
+    ]
     if unreadable_rows:
-        # They could be eligible items or matches; they are left out and the page is not complete.
-        normalized["summary"]["complete"] = False
         normalized["summary"]["unreadable_rows"] = unreadable_rows
-        normalized["summary"]["incomplete_reason"] = (
-            f"Meta returned {unreadable_rows} item(s) that are not objects on this page; they could not be "
-            "read or filtered and are left out."
-        )
+    if filter_unreadable:
+        normalized["summary"]["filter_fields_unreadable"] = filter_unreadable
     normalized["summary"].update({
         "source": edge,
         "boost_eligible_only": boost_eligible_only,
@@ -706,7 +799,7 @@ async def list_instagram_media(
         "ineligible_count": excluded_ineligible,
         "eligibility_note": (
             "boost_eligible is null when Meta returned no boost_eligibility_info for the item; "
-            "such items are left out when boost_eligible_only is true."
+            "such items are left out when boost_eligible_only is true, and the page is then not complete."
         ),
     })
     if window is not None or type_filter is not None or product_filter is not None:
@@ -883,25 +976,25 @@ async def list_audience_adsets(
             summary["targeting_next_after"] = None
         else:
             account_edge = normalize_account_id(resolved_account)
-            matched = 0
-            # Ad sets whose targeting cannot be read could use the audience; so could a match without an id.
-            unreadable_targeting = 0
-            for adset in scan["items"]:
+            def audience_uses(adset: dict[str, Any]) -> list[str]:
                 targeting = adset.get("targeting")
-                if not _targeting_readable(targeting):
-                    unreadable_targeting += 1
-                    continue
-                uses = []
-                if audience_id in _audience_ids(targeting, "custom_audiences"):
-                    uses.append("included")
-                if audience_id in _audience_ids(targeting, "excluded_custom_audiences"):
-                    uses.append("excluded")
-                if not uses:
-                    continue
-                if not adset.get("id"):
-                    unreadable_targeting += 1
-                    continue
-                matched += 1
+                return [
+                    use for use, key in (("included", "custom_audiences"), ("excluded", "excluded_custom_audiences"))
+                    if audience_id in _audience_ids(targeting, key)
+                ]
+
+            def uses_audience(adset: dict[str, Any]) -> bool | None:
+                # Ad sets whose targeting cannot be read could use the audience; so could a match without an id.
+                if not _targeting_readable(adset.get("targeting")):
+                    return None
+                if not audience_uses(adset):
+                    return False
+                return True if adset.get("id") else None
+
+            kept, unreadable_targeting = _judge_rows(scan["items"], uses_audience)
+            matched = len(kept)
+            for adset in kept:
+                uses = audience_uses(adset)
                 entry = _audience_adset_entry(adsets, str(adset["id"]))
                 entry["found_by"].append("targeting")
                 entry["targeting_use"] = uses

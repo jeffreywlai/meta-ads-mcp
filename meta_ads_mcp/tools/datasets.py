@@ -18,7 +18,9 @@ from typing import Any
 from meta_ads_mcp.coordinator import mcp_server
 from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page, to_float, to_int
+from meta_ads_mcp.normalize import (
+    blank_to_none, collection_fault, normalize_collection, read_collection_page, to_float, to_int,
+)
 from meta_ads_mcp.schemas import analysis_response
 from meta_ads_mcp.tool_types import FieldList, normalize_field_list
 
@@ -149,29 +151,30 @@ def _page_params(limit: int, after: str | None) -> dict[str, Any]:
     return params
 
 
-PAGE_UNREADABLE_REASON = (
-    "Meta returned a page without a readable data list, so the rows on it, and whether more pages "
-    "follow, are unknown."
-)
-
-
 def _listing_page(payload: Any) -> dict[str, Any]:
     """One listing page as Meta returned it, with list_audiences-style completeness keys.
 
-    A page without a readable data list is not an empty, complete list: it is reported as
-    not complete with the reason.
+    The one place a listing page in this module is called complete or not: complete only when
+    collection_fault finds nothing wrong (a data list whose entries are all objects) and Meta
+    reported no next page. Otherwise summary.incomplete_reason carries the reason. A page
+    without a readable data list returns no items and no cursor.
     """
-    _, _, page_unreadable = read_collection_page(payload)
-    if page_unreadable:
+    fault = collection_fault(payload)
+    if read_collection_page(payload)[2]:
         return {
             "items": [],
             "paging": {"before": None, "after": None, "next": None},
             "summary": {
                 "count": 0, "complete": False, "truncated": False, "next_after": None,
-                "page_unreadable": True, "incomplete_reason": PAGE_UNREADABLE_REASON,
+                "page_unreadable": True, "incomplete_reason": fault,
             },
         }
-    return _page_summary(normalize_collection(payload))
+    normalized = _page_summary(normalize_collection(payload))
+    if fault:
+        # Rows are shown as Meta returned them; one that is not an object could not be read.
+        normalized["summary"]["complete"] = False
+        normalized["summary"]["incomplete_reason"] = fault
+    return normalized
 
 
 def _page_summary(normalized: dict[str, Any]) -> dict[str, Any]:

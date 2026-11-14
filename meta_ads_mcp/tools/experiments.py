@@ -20,7 +20,7 @@ from meta_ads_mcp.errors import (
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.money import resolve_account_currency, to_minor_units, validate_positive_amount
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
+from meta_ads_mcp.normalize import blank_to_none, collection_fault, normalize_collection, read_collection_page
 from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import analysis_response, creation_response, mutation_response
 from meta_ads_mcp.tool_types import StrictCurrencyAmount, StringList, coerce_csv_string_list
@@ -645,6 +645,55 @@ async def _resolve_business_id(client: Any, account_id: str, business_id: str | 
     return str(resolved)
 
 
+def _listing_page(payload: Any, *, verdict: Any = None, needs: str = "") -> dict[str, Any]:
+    """Shape one listing page; the one place a study page is called complete or not.
+
+    complete is true only when collection_fault finds nothing wrong with the page (a data list
+    whose entries are all objects), Meta reported no next page, and, with a filter, every object
+    row could be judged. verdict returns True, False, or None when a row lacks the field the
+    filter needs; such a row is counted, never treated as a non-match. Without a filter, rows are
+    shown as Meta returned them; with one, rows that are not objects are left out (the fault
+    names them). When incomplete, stop_reason says why.
+    """
+    fault = collection_fault(payload)
+    rows, _, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {
+                "count": 0, "complete": False, "truncated": False, "next_after": None,
+                "stop_reason": fault, "page_unreadable": True,
+            },
+        }
+    normalized = normalize_collection(payload)
+    unjudged = 0
+    removed = 0
+    if verdict is not None:
+        kept = []
+        for row in rows:
+            decision = verdict(row)
+            if decision is None:
+                unjudged += 1
+            elif decision:
+                kept.append(row)
+        removed = len(rows) - len(kept) - unjudged
+        normalized["items"] = kept
+    normalized["summary"] = {"count": len(normalized["items"]), **_paged_summary(normalized)}
+    reasons = [text for text in (normalized["summary"]["stop_reason"], fault) if text]
+    if unjudged:
+        normalized["summary"]["unjudged_rows"] = unjudged
+        reasons.append(
+            f"{unjudged} row(s) on this page lacked {needs}, so whether they match the filter is unknown; "
+            "they are left out."
+        )
+    if fault or unjudged:
+        normalized["summary"]["complete"] = False
+    normalized["summary"]["stop_reason"] = " ".join(reasons) if reasons else None
+    normalized["summary"]["removed_by_filter"] = removed
+    return normalized
+
+
 def _paged_summary(normalized: dict[str, Any]) -> dict[str, Any]:
     has_more = bool(normalized["paging"].get("next"))
     next_after = normalized["paging"].get("after") if has_more else None
@@ -760,28 +809,26 @@ async def list_ad_studies(
     if blank_to_none(after):
         params["after"] = after.strip()
     payload = await get_graph_api_client().list_objects(parent, edge, fields=STUDY_LIST_FIELDS, params=params)
-    _, bad_rows, page_unreadable = read_collection_page(payload)
-    if page_unreadable:
-        # Not an empty list: the studies on this page, and whether more follow, are unknown.
-        return {
-            "items": [],
-            "paging": {"before": None, "after": None, "next": None},
-            "summary": {
-                "count": 0, "complete": False, "truncated": False, "next_after": None,
-                "stop_reason": PAGE_UNREADABLE_REASON, "page_unreadable": True, "source_edge": edge,
-            },
-        }
-    normalized = normalize_collection(payload)
+    _, bad_rows, _ = read_collection_page(payload)
+
+    def has_type(study: dict[str, Any]) -> bool | None:
+        study_type = study.get("type")
+        if not isinstance(study_type, str) or not study_type.strip():
+            return None
+        return study_type.strip().upper() == type_filter
+
+    normalized = _listing_page(
+        payload, verdict=None if type_filter is None else has_type, needs="a readable study type",
+    )
+    removed = normalized["summary"].pop("removed_by_filter", 0)
+    normalized["summary"]["source_edge"] = edge
+    if normalized["summary"].get("page_unreadable"):
+        return normalized
     now = _now()
     # Rows that are not objects are shown as Meta returned them, without a derived state.
-    items = [{**item, "state": _study_state(item, now)} if isinstance(item, dict) else item for item in normalized["items"]]
-    removed = 0
-    if type_filter is not None:
-        kept = [item for item in items if isinstance(item, dict) and str(item.get("type") or "").upper() == type_filter]
-        removed = len(items) - len(kept)
-        items = kept
-    normalized["items"] = items
-    normalized["summary"] = {"count": len(items), **_paged_summary(normalized), "source_edge": edge}
+    normalized["items"] = [
+        {**item, "state": _study_state(item, now)} if isinstance(item, dict) else item for item in normalized["items"]
+    ]
     if type_filter is not None:
         normalized["summary"]["study_type_filter"] = {
             "study_type": type_filter,
@@ -794,6 +841,8 @@ async def list_ad_studies(
                 f"{bad_rows} row(s) on this page are not objects, so their type is unknown; they were left out "
                 "and may be studies of this type."
             )
+        if normalized["summary"].get("unjudged_rows"):
+            normalized["summary"]["study_type_filter"]["unjudged_rows"] = normalized["summary"]["unjudged_rows"]
     return normalized
 
 

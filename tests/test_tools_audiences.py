@@ -10,6 +10,7 @@ import re
 
 import pytest
 
+from meta_ads_mcp.normalize import collection_fault
 from meta_ads_mcp.tools import audiences
 
 
@@ -100,7 +101,26 @@ def test_list_audiences_unreadable_page_is_not_an_empty_complete_list(monkeypatc
     summary = result["summary"]
     assert summary["count"] == 0 and summary["complete"] is False
     assert summary["truncated"] is False and summary["next_after"] is None
-    assert "readable data list" in summary["incomplete_reason"]
+    assert summary["incomplete_reason"] == collection_fault(payload)
+
+
+@pytest.mark.parametrize("more", [False, True])
+def test_list_audiences_entry_that_is_not_an_object_leaves_the_page_incomplete(monkeypatch, more) -> None:
+    """R14 (review S5): a page holding an entry that cannot be read is not complete."""
+    payload = {"data": [{"id": "aud_1"}, None]}
+    if more:
+        payload["paging"] = {"next": "https://graph.facebook.com/next", "cursors": {"after": "c2"}}
+
+    class PartlyUnreadableClient(FakeAudienceClient):
+        async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+            return payload
+
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: PartlyUnreadableClient())
+    result = asyncio.run(audiences.list_audiences(account_id="123"))
+    assert result["items"] == [{"id": "aud_1"}, None], "rows are still shown as Meta returned them"
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["incomplete_reason"] == collection_fault(payload)
+    assert summary["next_after"] == ("c2" if more else None) and summary["truncated"] is more
 
 
 def test_get_audience_returns_detailed_single_object(monkeypatch) -> None:

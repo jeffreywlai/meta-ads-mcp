@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import pytest
 
 from meta_ads_mcp.errors import MetaApiError, NotFoundError
+from meta_ads_mcp.normalize import collection_fault
 from meta_ads_mcp.tools import experiments
 
 NOW = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
@@ -1945,7 +1946,7 @@ def test_list_ad_studies_unreadable_page_is_not_complete(monkeypatch, payload) -
     result = run(experiments.list_ad_studies(account_id="123"))
     assert result["items"] == []
     assert result["summary"]["complete"] is False and result["summary"]["next_after"] is None
-    assert "readable data list" in result["summary"]["stop_reason"]
+    assert result["summary"]["stop_reason"] == collection_fault(payload)
 
 
 def test_list_ad_studies_shows_rows_that_are_not_objects_without_failing(monkeypatch) -> None:
@@ -2082,3 +2083,41 @@ def test_bad_study_time_error_has_no_exception_chain(monkeypatch) -> None:
     with pytest.raises(experiments.ValidationError) as error:
         run(experiments.create_lift_study(**args))
     assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+# --- R14 (review S5): an entry or a type that cannot be read never yields a complete list ---------
+
+
+@pytest.mark.parametrize("study_type", [None, "LIFT"])
+def test_list_ad_studies_with_an_entry_that_is_not_an_object_is_incomplete(monkeypatch, study_type) -> None:
+    payload = {"data": [_study("s1", "LIFT", *RUNNING), None]}
+    use(monkeypatch, FakeStudyClient(edges={("act_123", "impacting_ad_studies"): payload}))
+    result = run(experiments.list_ad_studies(account_id="123", study_type=study_type))
+    assert result["items"][0]["id"] == "s1"
+    assert result["summary"]["complete"] is False
+    assert collection_fault(payload) in result["summary"]["stop_reason"]
+
+
+@pytest.mark.parametrize("row", [
+    {"id": "20", "name": "No type"}, {"id": "20", "type": None}, {"id": "20", "type": 5}, {"id": "20", "type": " "},
+])
+def test_list_ad_studies_row_without_a_type_is_not_a_definite_nonmatch(monkeypatch, row) -> None:
+    use(monkeypatch, FakeStudyClient(edges={
+        ("act_123", "impacting_ad_studies"): {"data": [row, _study("s2", "SPLIT_TEST", *RUNNING)]},
+    }))
+    result = run(experiments.list_ad_studies(account_id="123", study_type="LIFT"))
+    assert result["items"] == []
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["unjudged_rows"] == 1
+    assert summary["study_type_filter"]["removed_on_this_page"] == 1
+    assert summary["study_type_filter"]["unjudged_rows"] == 1
+    assert "readable study type" in summary["stop_reason"]
+
+
+def test_list_ad_studies_definite_type_mismatch_keeps_the_page_complete(monkeypatch) -> None:
+    use(monkeypatch, FakeStudyClient(edges={
+        ("act_123", "impacting_ad_studies"): {"data": [_study("s1", "lift", *RUNNING), _study("s2", "SPLIT_TEST", *RUNNING)]},
+    }))
+    result = run(experiments.list_ad_studies(account_id="123", study_type="LIFT"))
+    assert [item["id"] for item in result["items"]] == ["s1"]
+    assert result["summary"]["complete"] is True and result["summary"]["stop_reason"] is None

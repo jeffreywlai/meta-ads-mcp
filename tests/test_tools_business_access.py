@@ -12,6 +12,7 @@ from fastmcp.exceptions import ToolError
 
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.errors import MetaApiError, ValidationError
+from meta_ads_mcp.normalize import collection_fault
 from meta_ads_mcp.tools import business_access
 
 PERSON_NAME = "Jordan Example"
@@ -1868,7 +1869,7 @@ def test_plain_listings_do_not_call_an_unreadable_page_complete(monkeypatch, pay
     for result in results:
         assert result["items"] == []
         assert result["summary"]["complete"] is False, result
-        assert "readable data list" in result["summary"]["incomplete_reason"]
+        assert result["summary"]["incomplete_reason"] == collection_fault(payload)
     assert "notes" not in results[0], "an unreadable page is not 'Meta returned no businesses'"
 
 
@@ -1895,7 +1896,7 @@ def test_plain_listing_counts_rows_that_are_not_objects(monkeypatch) -> None:
     result = run(business_access.list_business_users(business_id=BUSINESS))
     assert [item["id"] for item in result["items"]] == ["1"]
     assert result["summary"]["unreadable_rows"] == 2 and result["summary"]["complete"] is False
-    assert "not objects" in result["summary"]["incomplete_reason"]
+    assert "2 entries in Meta's answer could not be read" in result["summary"]["incomplete_reason"]
 
 
 @pytest.mark.parametrize("payload", UNREADABLE_PAGES)
@@ -1910,3 +1911,38 @@ def test_partner_catalog_scan_with_unreadable_pages_is_incomplete(monkeypatch, p
     partner = run(business_access.list_user_assigned_catalogs(user_id="77", user_type="AGENCY", business_id=BUSINESS))
     assert partner["items"] == [] and partner["summary"]["complete"] is False
     assert "Catalog 1" in partner["summary"]["incomplete_reason"]
+
+
+# R14 (review S5): a row whose searched field cannot be read is not a definite non-match ---------
+
+
+@pytest.mark.parametrize("row", [{"id": "2"}, {"id": "2", "name": None}, {"id": "2", "name": 5}])
+def test_name_search_row_without_a_readable_name_is_not_a_definite_nonmatch(monkeypatch, row) -> None:
+    _use(monkeypatch, FakeClient(edges={
+        ("me", "businesses"): _page([{"id": "1", "name": "Other"}, row]),
+        (BUSINESS, "business_users"): _page([{"id": "1", "name": "Other"}, row]),
+    }))
+    for result in (
+        run(business_access.list_businesses(name_contains="acme")),
+        run(business_access.list_business_users(business_id=BUSINESS, search="acme")),
+    ):
+        assert result["items"] == []
+        assert result["summary"]["complete"] is False
+        assert "without a readable name" in result["summary"]["incomplete_reason"]
+
+
+def test_person_search_without_an_email_is_still_judged_by_name(monkeypatch) -> None:
+    """A person's business email is optional in Meta's answer; the name decides a text search."""
+    _use(monkeypatch, FakeClient(edges={(BUSINESS, "business_users"): _page([
+        {"id": "1", "name": "Jordan Example"}, {"id": "2", "name": "Other", "email": "acme@example.com"},
+    ])}))
+    result = run(business_access.list_business_users(business_id=BUSINESS, search="acme"))
+    assert [item["id"] for item in result["items"]] == ["2"]
+    assert result["summary"]["complete"] is True
+
+
+def test_id_search_that_found_its_row_is_settled_despite_unreadable_ids(monkeypatch) -> None:
+    _use(monkeypatch, FakeClient(edges={(CATALOG, "agencies"): _page([{"id": "30"}, {"id": "odd"}])}))
+    result = run(business_access.list_catalog_assigned_users(catalog_id=CATALOG, user_type="AGENCY", user_id="30"))
+    assert [item["id"] for item in result["items"]] == ["30"]
+    assert result["summary"]["complete"] is True

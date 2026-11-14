@@ -21,7 +21,7 @@ from meta_ads_mcp.errors import MetaApiError, RateLimitError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.graph_payload import OMIT, merge_graph_payload
 from meta_ads_mcp.local_files import read_upload_file
-from meta_ads_mcp.normalize import blank_to_none, normalize_collection, read_collection_page
+from meta_ads_mcp.normalize import blank_to_none, collection_fault, normalize_collection, read_collection_page
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list
 
@@ -109,30 +109,33 @@ async def list_audiences(
         fields=fields or AUDIENCE_SUMMARY_FIELDS,
         params=params,
     )
+    return _audience_page(payload)
+
+
+def _audience_page(payload: Any) -> dict[str, Any]:
+    """Shape one page of audiences; the one place this module calls a page complete or not.
+
+    complete is true only when collection_fault finds nothing wrong with the page (a data list
+    whose entries are all objects) and Meta reported no next page; otherwise
+    summary.incomplete_reason carries the reason. A page without a readable data list returns no
+    items and no cursor. A normal page, empty or not, is shaped exactly as before.
+    """
+    fault = collection_fault(payload)
     if read_collection_page(payload)[2]:
-        # A page without a readable data list is not an empty list: the audiences on it,
-        # and whether more pages follow, are unknown.
         return {
             "items": [],
             "paging": {"before": None, "after": None, "next": None},
-            "summary": {
-                "count": 0,
-                "complete": False,
-                "truncated": False,
-                "next_after": None,
-                "incomplete_reason": (
-                    "Meta returned a page without a readable data list, so the audiences on it, and whether "
-                    "more pages follow, are unknown."
-                ),
-            },
+            "summary": {"count": 0, "complete": False, "truncated": False, "next_after": None, "incomplete_reason": fault},
         }
     normalized = normalize_collection(payload)
     has_more = bool(normalized["paging"].get("next"))
     normalized["summary"].update({
-        "complete": not has_more,
+        "complete": not has_more and fault is None,
         "truncated": has_more,
         "next_after": normalized["paging"].get("after") if has_more else None,
     })
+    if fault:
+        normalized["summary"]["incomplete_reason"] = fault
     return normalized
 
 
