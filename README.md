@@ -452,21 +452,23 @@ are never included in public error payloads.
 
 ### Optional settings
 
-- **Analysis only:** set `META_READ_ONLY=true` in the launch environment and restart. Tools that change anything are hidden from search and refused. The default is writable.
-- **Local file uploads:** set `META_UPLOAD_DIR` to one folder you choose. The tools that upload a local file read only from that folder, and refuse every local file until it is set.
-- **Large responses:** an oversized result is saved as a local file and replaced by an `export_id`; read it with `read_overflow_artifact`. `META_EXPORT_DIR` and the three `META_EXPORT_*` limits above are optional.
+- **Analysis only.** Set `META_READ_ONLY=true` and restart. Every tool that changes something is hidden and refused. The default is writable.
+- **Uploading local files.** Set `META_UPLOAD_DIR` to one folder. The upload tools read files from that folder and nowhere else. Until it is set, they refuse every local file.
+- **Large responses.** A result too big to return is saved to a local file and you get an `export_id` instead. Read it with `read_overflow_artifact`. The `META_EXPORT_*` settings above control where it is kept and for how long.
 
-### Operating reference
+### How the tools behave
 
-How the tools behave in detail is in [docs/reference.md](docs/reference.md):
+The details are in [docs/reference.md](docs/reference.md):
 
-- [SDK schema audit](docs/reference.md#sdk-schema-audit) and [version 26 options](docs/reference.md#version-26-options)
-- [Oversized responses](docs/reference.md#oversized-responses)
-- [Reporting](docs/reference.md#reporting), [attribution windows and async reports](docs/reference.md#attribution-windows-and-async-reports)
-- [Creative fatigue, ad search and asset reads](docs/reference.md#creative-fatigue-ad-search-and-asset-reads)
+- [Large responses](docs/reference.md#large-responses)
+- [Reports](docs/reference.md#reports) and [async reports](docs/reference.md#async-reports)
+- [Creative fatigue report](docs/reference.md#creative-fatigue-report)
+- [Finding ads by name](docs/reference.md#finding-ads-by-name), [landing pages](docs/reference.md#landing-pages) and [image rules on an ad](docs/reference.md#image-rules-on-an-ad)
+- [Audiences](docs/reference.md#audiences)
+- [Change history](docs/reference.md#change-history)
 - [Read-only mode](docs/reference.md#read-only-mode) and [local file uploads](docs/reference.md#local-file-uploads)
-- [Errors and retries](docs/reference.md#errors-and-retries) and the [default account](docs/reference.md#default-account)
-- [Complete change history](docs/reference.md#complete-change-history)
+- [Errors and retries](docs/reference.md#errors-and-retries)
+- [API version 26](docs/reference.md#api-version-26) and [checking fields against Meta's SDK](docs/reference.md#checking-fields-against-metas-sdk)
 
 Don't have a token? Use the built-in auth helper tools (`generate_auth_url` → `exchange_code_for_token` → `refresh_to_long_lived_token`) to create one interactively.
 
