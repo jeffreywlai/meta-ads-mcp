@@ -355,6 +355,8 @@ request, otherwise `mocked`. Mocked tests use a fake client that accepts any
 endpoint name, so they cannot catch a wrong endpoint or field name. A write tool
 is `live` only if it ran in the live write tests of 2026-11-13, on a throwaway ad
 account and a test catalog, with everything created paused and deleted afterwards.
+Some of those tools were run again there on 2026-11-14 and 2026-11-15, after later
+changes to them.
 
 To find the tool for one of Meta's names, call
 `get_capabilities(official_tool="ads_get_opportunity_score")`. A Meta name
@@ -863,6 +865,34 @@ Once connected, just talk naturally:
 "Create an ad in this ad set using creative 123"
 ```
 
+### Creatives, Boosts & Uploads
+
+```
+"Upload banner.png from my upload folder and build a link ad creative with it"
+"Build a carousel creative with these three images and links, as a dry run first"
+"Which of my recent Instagram posts can be boosted?"
+"Boost this Instagram post for 6 days at 20 dollars a day, paused, and show me the plan first"
+"Turn off image touch-ups on this ad without changing anything else"
+```
+
+### Audiences & Experiments
+
+```
+"Create a customer-list audience and add the emails in customers.csv from my upload folder"
+"Set up a paused A/B test between these two campaigns, split 50/50, for two weeks"
+"Show me the results of this A/B test"
+```
+
+### Product Catalogs
+
+```
+"List my product catalogs and how many products each has"
+"What is wrong with this catalog? Show its diagnostics"
+"Update the price and availability of these 40 products in one batch, as a dry run first"
+"Create a product set of everything from brand Acme that is in stock"
+"Is this catalog's pixel matching events to products?"
+```
+
 ## 🏗️ Project Structure
 
 ```
@@ -873,26 +903,52 @@ meta-ads-mcp/
 │   ├── server.py              # Server entry point (Gemini / SSE)
 │   ├── config.py              # Configuration and env loading
 │   ├── auth.py                # Auth utilities
-│   ├── diagnostics.py         # Derived metrics & optimization heuristics
-│   ├── errors.py              # Error handling
+│   ├── build_info.py          # Non-secret identity of the running build
 │   ├── graph_api.py           # Meta Graph API client
-│   ├── money.py               # Account-currency resolution & exact conversion
-│   ├── normalize.py           # Response normalization
+│   ├── graph_payload.py       # Safe construction of write payloads
+│   ├── api_compat.py          # Checks that depend on the Graph API version
 │   ├── pagination.py          # Graph API pagination helpers
-│   ├── schemas.py             # Pydantic schemas
+│   ├── errors.py              # Error types
+│   ├── error_middleware.py    # Turns errors into stable MCP error envelopes
+│   ├── read_only.py           # Opt-in read-only mode (META_READ_ONLY)
+│   ├── local_files.py         # Reads upload files only from META_UPLOAD_DIR
+│   ├── overflow.py            # Bounded storage for oversized responses
+│   ├── money.py               # Account-currency resolution & exact conversion
+│   ├── normalize.py           # Response normalization and id comparison
+│   ├── schemas.py             # Shared response builders
+│   ├── diagnostics.py         # Derived metrics & optimization heuristics
+│   ├── tool_types.py          # Shared input types for tool parameters
+│   ├── input_compat.py        # Forgiving normalization of tool inputs
+│   ├── activity_scope.py      # Validation of change-history scope arguments
+│   ├── intent_routing.py      # Safety layer for tool search
+│   ├── tool_contracts.py      # Contracts derived from the live tool catalog
+│   ├── schema_audit.py        # Audits field contracts against Meta's SDK schemas
+│   ├── field_reference.py     # Static field reference for campaigns, ad sets, ads
+│   ├── official_parity.py     # Ledger mapping Meta's official tools to these tools
+│   ├── argument_privacy.py    # Keeps argument values out of logs and errors
+│   ├── secret_scrub.py        # Removes caller-supplied secrets from text and errors
+│   ├── url_secrets.py         # Keeps usernames and passwords out of shown URLs
 │   ├── tools/
-│   │   ├── ads.py             # Ad management
+│   │   ├── ads.py             # Ad creation and creative-image inspection
 │   │   ├── activity.py        # Activity and change-history reads
-│   │   ├── audiences.py       # Audience management
+│   │   ├── assets.py          # Pages, media libraries, asset usage, field metadata
+│   │   ├── audiences.py       # Audience management and customer-list uploads
 │   │   ├── auth_tools.py      # Auth helper tools
-│   │   ├── campaigns.py       # Campaign & ad set management
-│   │   ├── creatives.py       # Creative management
+│   │   ├── business_access.py # Businesses, people, partners, catalog access
+│   │   ├── campaigns.py       # Campaign & ad set management, copies, schedules
+│   │   ├── catalogs.py        # Product catalogs, products and product sets
+│   │   ├── catalog_feeds.py   # Catalog feeds, uploads, feed rules, event sources
+│   │   ├── creatives.py       # Creatives, image and video uploads, boosts
+│   │   ├── creative_formats.py # Creative builders from named inputs, enhancements
+│   │   ├── datasets.py        # Pixels and datasets, event quality, custom conversions
 │   │   ├── diagnostics.py     # Optimization & diagnostics
 │   │   ├── discovery.py       # Account & entity discovery
 │   │   ├── docs.py            # Built-in documentation tools
-│   │   ├── execution.py       # Write operations
+│   │   ├── execution.py       # Status, budget and bid changes
+│   │   ├── experiments.py     # A/B tests and lift studies
 │   │   ├── insights.py        # Reporting & analysis
-│   │   ├── recommendations.py # AI recommendations
+│   │   ├── performance_signals.py # Opportunity score, trends, anomalies, delivery errors
+│   │   ├── recommendations.py # Meta recommendations and opportunities
 │   │   ├── research.py        # Ad Library research
 │   │   ├── social_feedback.py # Comments & Page recommendations
 │   │   ├── targeting.py       # Targeting & planning
