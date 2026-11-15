@@ -99,14 +99,14 @@ def test_v26_creative_create_preserves_media_and_voiceover_specs(monkeypatch) ->
             assert edge == "adcreatives"
             assert data["media_optimization_spec"] == media_spec
             assert data["degrees_of_freedom_spec"] == freedom_spec
-            return {"id": "crt_123"}
+            return {"id": "300123"}
 
     monkeypatch.setattr(creatives, "get_graph_api_client", lambda: Client())
     result = asyncio.run(creatives.create_ad_creative(
         account_id="123", name="Fixture", degrees_of_freedom_spec=freedom_spec,
         params={"media_optimization_spec": media_spec},
     ))
-    assert result["created"]["id"] == "crt_123"
+    assert result["created"]["id"] == "300123"
 
 
 def test_v26_ad_create_preserves_dataset_and_persona_params(monkeypatch) -> None:

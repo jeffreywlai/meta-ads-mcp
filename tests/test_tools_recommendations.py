@@ -416,7 +416,7 @@ def test_native_filters_do_not_reuse_unfiltered_or_explicit_empty_filter_cache(m
     ({"recommendation_names": [123]}, "nonblank strings"),
     ({"recommendation_names": {"name": "AB_TEST"}}, "nonblank strings"),
     ({"recommendation_stages": ["MFR", "unknown"]}, "MFR, PCR, or PFR"),
-    ({"recommendation_stages": "mfr"}, "MFR, PCR, or PFR"),
+    ({"recommendation_stages": "mfx"}, "MFR, PCR, or PFR"),
     ({"recommendation_stages": "MFR,"}, "nonblank strings"),
 ])
 def test_native_recommendation_filters_reject_invalid_direct_input_before_client(

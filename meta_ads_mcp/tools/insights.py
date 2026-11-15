@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import re
 from datetime import date
 from decimal import Decimal, InvalidOperation, localcontext
 from io import StringIO
-from typing import Any, Literal
+from collections.abc import Callable
+from typing import Any, Literal, TypeVar
 
 from meta_ads_mcp.api_compat import validate_insights_fields
 from meta_ads_mcp.coordinator import mcp_server
@@ -55,6 +57,18 @@ DEFAULT_INSIGHTS_FIELDS = [
     "actions",
     "action_values",
 ]
+
+# Default fields for a sorted request when the caller names none. On a live account with more than 2,000 ads,
+# an account-wide sorted ad-level request that carried actions failed at Meta after about 30 seconds, while the
+# same request with a lean field list returned in about 5 seconds; so a sorted request leaves out the action
+# arrays unless the caller asks for them.
+SORTED_DEFAULT_INSIGHTS_FIELDS = [
+    field for field in DEFAULT_INSIGHTS_FIELDS if field not in ("actions", "action_values")
+]
+SORT_PATTERN = re.compile(r"^[A-Za-z0-9_.:]*[A-Za-z0-9]_(ascending|descending)$")
+# Meta's Insights reference makes the _ascending/_descending suffix optional, with ascending the default.
+BARE_SORT_PATTERN = re.compile(r"^[A-Za-z0-9_.:]*[A-Za-z0-9]$")
+SORT_DIRECTIONS = ("ascending", "descending")
 
 ASYNC_ID_FIELDS_BY_LEVEL = {
     "account": ["account_id", "account_name"],
@@ -210,15 +224,32 @@ def _build_date_params(
     if (normalized_since and not normalized_until) or (normalized_until and not normalized_since):
         raise ValidationError("Provide both since and until.")
     if normalized_since and normalized_until:
-        try:
-            since_date = date.fromisoformat(normalized_since)
-            until_date = date.fromisoformat(normalized_until)
-        except ValueError as exc:
-            raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.") from exc
+        since_date = parse_or_none(date.fromisoformat, normalized_since)
+        until_date = parse_or_none(date.fromisoformat, normalized_until)
+        if since_date is None or until_date is None:
+            raise ValidationError("since and until must be valid ISO dates in YYYY-MM-DD format.")
         if until_date < since_date:
             raise ValidationError("until must be on or after since.")
         return {"time_range": json.dumps({"since": normalized_since, "until": normalized_until})}
     return {"date_preset": normalized_date_preset or _normalize_date_preset(default_date_preset)}
+
+
+_T = TypeVar("_T")
+
+
+def parse_or_none(
+    parse: Callable[[Any], _T], text: Any, *, errors: tuple[type[BaseException], ...] = (ValueError, TypeError),
+) -> _T | None:
+    """parse(text), or None when it fails with one of errors.
+
+    The one place a parser runs on a value the caller typed. The parser's exception, whose message holds that
+    value, ends inside this function; the caller raises its own value-free ValidationError after a None, outside
+    any exception handler, so no chained exception (cause or context) carries the text into a logged traceback.
+    """
+    try:
+        return parse(text)
+    except errors:
+        return None
 
 
 def _normalize_date_preset(date_preset: str | None) -> str | None:
@@ -463,6 +494,30 @@ def _insights_params(
     if filtering:
         params["filtering"] = filtering
     return params
+
+
+def _normalize_sort(sort: str | None) -> str | None:
+    """Validate Meta's one-element insights sort before any call and return it with its direction written out.
+
+    Meta accepts <field>_ascending, <field>_descending, or a bare <field>, which it sorts ascending. A bare
+    field is returned as <field>_ascending, so the request and the reported sort both name the direction.
+    """
+    if sort is None:
+        return None
+    value = sort.strip() if isinstance(sort, str) else sort
+    if isinstance(value, str) and SORT_PATTERN.match(value):
+        return value
+    if (
+        isinstance(value, str)
+        and BARE_SORT_PATTERN.match(value)
+        and value.rpartition("_")[2] not in SORT_DIRECTIONS
+    ):
+        return f"{value}_ascending"
+    raise ValidationError(
+        "sort must be one field, optionally followed by _ascending or _descending, such as spend, "
+        "spend_descending or actions:link_click_descending. Without a direction Meta sorts ascending. "
+        "Meta accepts one sort key per request."
+    )
 
 
 def _normalize_reporting_object_id(level: str, object_id: str) -> str:
@@ -806,8 +861,15 @@ async def get_entity_insights(
     include_raw_actions: bool = False,
     filtering: list[dict[str, Any]] | None = None,
     fetch_all: bool = False,
+    sort: str | None = None,
 ) -> dict[str, Any]:
-    """Return paginated insights with optional named scalar actions such as purchase. flatten_actions removes full action maps unless include_raw_actions=true. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values."""
+    """Return paginated insights with optional named scalar actions such as purchase. flatten_actions removes full action maps unless include_raw_actions=true. level selects row granularity; object_id selects the parent scope. Set include_raw_actions=true for dimensional action_breakdowns, raw action arrays, or named click/view attribution-window comparisons; maps and derived metrics use Meta's generic action values. Optional sort, such as spend_descending; bare spend sorts ascending, sent as spend_ascending."""
+    sort_key = _normalize_sort(sort)
+    if sort_key is not None and fields is None:
+        fields = list(SORTED_DEFAULT_INSIGHTS_FIELDS)
+        lean_sort_default = True
+    else:
+        lean_sort_default = False
     action_types = _normalize_action_types(action_types)
     flatten_actions = _normalize_flatten_actions(flatten_actions)
     action_breakdowns = coerce_csv_string_list(action_breakdowns)
@@ -843,6 +905,8 @@ async def get_entity_insights(
         after=after,
         filtering=filtering,
     )
+    if sort_key is not None:
+        params["sort"] = [sort_key]
     client = get_graph_api_client()
     payload = await client.get_insights(
         resolved_object_id,
@@ -877,6 +941,13 @@ async def get_entity_insights(
     response["summary"]["pages_fetched"] = pages_fetched
     response["summary"]["metrics"] = _aggregate_metrics(rows)
     response["summary"]["complete"] = not bool(response["paging"].get("next"))
+    if sort_key is not None:
+        response["summary"]["sort"] = sort_key
+        if lean_sort_default:
+            response["summary"]["sort_fields_note"] = (
+                "No fields were given, so this sorted request used a lean default without the action arrays; "
+                "pass fields to add actions or other metrics."
+            )
     if dimensional_actions:
         response["summary"]["action_breakdown_note"] = (
             "Read actions/action_values for dimensional action records. Action maps, flattened "
@@ -1677,10 +1748,9 @@ async def summarize_async_insights_report(
                         if value is None or value == "":
                             totals[key][metric] = None
                             continue
-                        try:
-                            number = Decimal(str(value))
-                        except (InvalidOperation, ValueError) as exc:
-                            raise ValidationError(f"Report metric '{metric}' is not numeric.") from exc
+                        number = parse_or_none(Decimal, str(value), errors=(InvalidOperation, ValueError))
+                        if number is None:
+                            raise ValidationError(f"Report metric '{metric}' is not numeric.")
                         if not number.is_finite():
                             raise ValidationError(f"Report metric '{metric}' is not finite.")
                         if metric != "spend" and number != number.to_integral_value():

@@ -114,3 +114,58 @@ def test_read_only_typo_does_not_silently_disable_protection(monkeypatch) -> Non
         with pytest.raises(ValueError, match="META_READ_ONLY"):
             reload_settings()
     reload_settings()
+
+
+@pytest.mark.parametrize("group", ["assets", "signals", "experiments", "catalog", "access"])
+def test_new_read_groups_are_read_only_groups(monkeypatch, group) -> None:
+    monkeypatch.setitem(utility.TOOL_GROUPS, group, [*utility.TOOL_GROUPS[group], "probe_read_tool"])
+    assert "probe_read_tool" in read_only_tool_names()
+
+
+# Tools classified as writes that read-only mode deliberately still allows.
+# delete_overflow_artifact removes a local export file, not advertising state.
+READ_ONLY_WRITE_EXEMPTIONS = {"delete_overflow_artifact"}
+
+
+def test_no_write_classified_tool_is_allowed_in_read_only() -> None:
+    """A write tool listed in a read group would run in read-only mode; forbid it."""
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+
+    components = mcp_server.local_provider._components.values()
+    tools = [component for component in components if getattr(component, "name", None)]
+    writes = {name for name, contract in build_tool_contracts(tools).items() if contract.effect == "write"}
+    assert writes & read_only_tool_names() == READ_ONLY_WRITE_EXEMPTIONS
+
+
+def test_every_write_classified_tool_is_in_the_writes_or_blocked_set() -> None:
+    """Every write must be discoverable through the audited mutation list."""
+    from meta_ads_mcp.tool_contracts import build_tool_contracts
+
+    components = mcp_server.local_provider._components.values()
+    tools = [component for component in components if getattr(component, "name", None)]
+    writes = {name for name, contract in build_tool_contracts(tools).items() if contract.effect == "write"}
+    assert writes - READ_ONLY_WRITE_EXEMPTIONS <= set(BLOCKED_TOOLS)
+
+
+def test_read_only_refusal_repeats_a_real_tool_name_but_not_an_unknown_one(monkeypatch) -> None:
+    import asyncio
+
+    from fastmcp.exceptions import ToolError
+
+    from meta_ads_mcp.config import reload_settings
+    from meta_ads_mcp.coordinator import mcp_server
+
+    monkeypatch.setenv("META_READ_ONLY", "true")
+    reload_settings()
+    try:
+        with pytest.raises(ToolError) as real:
+            asyncio.run(mcp_server.call_tool("delete_campaign", {"campaign_id": "1"}))
+        assert "'delete_campaign' is not permitted" in str(real.value)
+        misplaced = "someone" + "@example.invalid"
+        with pytest.raises(ToolError) as unknown:
+            asyncio.run(mcp_server.call_tool(misplaced, {}))
+        assert misplaced not in str(unknown.value)
+        assert "META_READ_ONLY" in str(unknown.value)
+    finally:
+        monkeypatch.delenv("META_READ_ONLY", raising=False)
+        reload_settings()

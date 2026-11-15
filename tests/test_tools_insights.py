@@ -2285,3 +2285,179 @@ def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
     assert result.meta["overflow"]["archived"] is False
     assert RESPONSE_LIMIT_HINT.strip() in result.content[0].text
     assert len(pydantic_core.to_json(result, fallback=str)) <= MAX_TOOL_RESPONSE_BYTES
+
+
+# ---------------------------------------------------------------------------
+# sort (phase two, item 5)
+# ---------------------------------------------------------------------------
+
+
+class RecordingInsightsClient:
+    """Records every get_insights request exactly as the tool sends it."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def get_insights(self, object_id: str, *, fields, params):
+        self.calls.append({"object_id": object_id, "fields": list(fields), "params": dict(params)})
+        return {"data": [{"ad_id": "1", "spend": "10", "impressions": "100", "clicks": "1"}]}
+
+
+def test_get_entity_insights_without_sort_is_unchanged(monkeypatch) -> None:
+    """An old-style call sends exactly the request it sent before sort existed (captured at eb3ed36)."""
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+
+    asyncio.run(insights.get_entity_insights(level="ad", object_id="123", date_preset="last_7d", limit=50))
+    asyncio.run(insights.get_entity_insights(
+        level="campaign", object_id="cmp_1", since="2026-11-01", until="2026-11-07", fields=["spend", "actions"],
+        breakdowns=["age"], time_increment=1, filtering=[{"field": "spend", "operator": "GREATER_THAN", "value": 0}],
+    ))
+
+    assert client.calls == [
+        {
+            "object_id": "123",
+            "fields": [
+                "campaign_id", "campaign_name", "adset_id", "adset_name", "ad_id", "ad_name", "date_start",
+                "date_stop", "spend", "impressions", "reach", "clicks", "ctr", "cpc", "cpm", "frequency",
+                "actions", "action_values",
+            ],
+            "params": {
+                "level": "ad", "limit": 50, "use_unified_attribution_setting": "true", "date_preset": "last_7d",
+            },
+        },
+        {
+            "object_id": "cmp_1",
+            "fields": ["spend", "actions"],
+            "params": {
+                "level": "campaign", "limit": 100, "use_unified_attribution_setting": "true",
+                "time_range": json.dumps({"since": "2026-11-01", "until": "2026-11-07"}),
+                "breakdowns": "age", "time_increment": 1,
+                "filtering": [{"field": "spend", "operator": "GREATER_THAN", "value": 0}],
+            },
+        },
+    ]
+
+
+def test_get_entity_insights_sort_is_passed_to_meta(monkeypatch) -> None:
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(insights.get_entity_insights(
+        level="ad", object_id="act_123", sort="spend_descending", fields=["ad_id", "spend"], limit=10,
+    ))
+
+    assert client.calls[0]["params"]["sort"] == ["spend_descending"]
+    assert client.calls[0]["fields"] == ["ad_id", "spend"]
+    assert result["summary"]["sort"] == "spend_descending"
+
+
+def test_get_entity_insights_sort_without_fields_uses_a_lean_field_list(monkeypatch) -> None:
+    """A sorted account-wide request with action fields failed at Meta on a large account; the lean one worked."""
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", sort="impressions_ascending"))
+
+    fields = client.calls[0]["fields"]
+    assert fields == insights.SORTED_DEFAULT_INSIGHTS_FIELDS
+    assert "actions" not in fields and "action_values" not in fields
+    assert "lean" in result["summary"]["sort_fields_note"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "spend descending", "_descending", "_ascending", "descending", "ascending", "spend_",
+        "actions:", "spend_descending,reach_ascending", "spend,reach", "", " ", 7,
+    ],
+)
+def test_get_entity_insights_rejects_a_malformed_sort_before_any_call(monkeypatch, value) -> None:
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+    with pytest.raises(insights.ValidationError):
+        asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", sort=value))
+    assert client.calls == []
+
+
+def test_get_entity_insights_sort_accepts_action_sort_keys(monkeypatch) -> None:
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+    asyncio.run(insights.get_entity_insights(
+        level="ad", object_id="act_123", sort="actions:link_click_descending", fields=["ad_id", "actions"],
+    ))
+    assert client.calls[0]["params"]["sort"] == ["actions:link_click_descending"]
+
+
+@pytest.mark.parametrize(
+    ("value", "sent"),
+    [
+        ("spend", "spend_ascending"),
+        ("actions:link_click", "actions:link_click_ascending"),
+        (" cost_per_action_type:offsite_conversion.fb_pixel_purchase ",
+         "cost_per_action_type:offsite_conversion.fb_pixel_purchase_ascending"),
+    ],
+)
+def test_get_entity_insights_bare_sort_is_sent_with_metas_default_ascending_direction(monkeypatch, value, sent) -> None:
+    """Insights reference: the _ascending/_descending suffix is optional and ascending is the default.
+
+    A bare field is sent with _ascending written out, so the request and summary.sort both name the direction.
+    """
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(insights.get_entity_insights(
+        level="account", object_id="123", fields=["spend"], sort=value,
+    ))
+
+    assert client.calls[0]["params"]["sort"] == [sent]
+    assert result["summary"]["sort"] == sent
+
+
+def test_get_entity_insights_bare_sort_without_fields_still_uses_the_lean_field_list(monkeypatch) -> None:
+    client = RecordingInsightsClient()
+    monkeypatch.setattr(insights, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(insights.get_entity_insights(level="ad", object_id="act_123", sort="spend"))
+
+    assert client.calls[0]["fields"] == insights.SORTED_DEFAULT_INSIGHTS_FIELDS
+    assert client.calls[0]["params"]["sort"] == ["spend_ascending"]
+    assert "lean" in result["summary"]["sort_fields_note"]
+
+
+# Round fourteen (R12 S4): a date the caller typed never reaches a logged exception chain.
+
+
+def test_s4_insights_date_error_carries_no_chained_parser_exception() -> None:
+    private = "".join(["Synthetic", "Private", "Value"])
+    with pytest.raises(insights.ValidationError) as raised:
+        insights._build_date_params(date_preset=None, since=private, until="2026-11-01", default_date_preset="last_7d")
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert private not in str(raised.value)
+
+
+def test_s4_insights_tool_date_error_does_not_log_the_value(caplog) -> None:
+    import logging
+
+    private = "".join(["Synthetic", "Private", "Value", "_", "insights"])
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError) as raised:
+        asyncio.run(mcp_server.call_tool("get_entity_insights", {
+            "level": "campaign", "object_id": "10", "since": private, "until": "2026-11-01",
+        }))
+    assert private not in str(raised.value)
+    assert private not in caplog.text
+
+
+def test_s4_parse_or_none_ends_the_parser_failure_inside_it() -> None:
+    from datetime import date
+
+    assert insights.parse_or_none(date.fromisoformat, "2026-11-01") == date(2026, 11, 1)
+    assert insights.parse_or_none(date.fromisoformat, "not a date") is None
+    assert insights.parse_or_none(date.fromisoformat, None) is None
+
+    def lookup(_text: str) -> str:
+        return {}["missing"]
+
+    with pytest.raises(KeyError):
+        insights.parse_or_none(lookup, "a")  # only the named errors are absorbed

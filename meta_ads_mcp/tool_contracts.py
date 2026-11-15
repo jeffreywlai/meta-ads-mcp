@@ -32,6 +32,16 @@ _WRITE_NAMES = frozenset(
         "generate_system_user_token",
         "refresh_to_long_lived_token",
         "setup_ab_test",
+        "cancel_ad_study",
+        "connect_catalog_event_source",
+        "disconnect_catalog_event_source",
+        "add_audience_users",
+        "remove_audience_users",
+        "boost_instagram_post",
+        "duplicate_campaign",
+        "duplicate_adset",
+        "duplicate_ad",
+        "batch_update_catalog_products",
     }
 )
 _READ_TAGS = frozenset({"read", "read-only", "readonly"})

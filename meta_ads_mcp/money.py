@@ -9,37 +9,50 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.graph_api import normalize_account_id
 
 
+# How many decimal places an amount in each currency has when it is sent to Meta, from the
+# offset column of Meta's "Currencies" page (Marketing API documentation, read 2026-11-13):
+# offset 100 is two places (amounts are sent in hundredths), offset 1 is none (amounts are
+# sent in whole units). This follows Meta's offset, not ISO 4217: BHD and JOD have three
+# places in ISO and an offset of 100 here; COP, CRC, HUF, IDR and TWD have an offset of 1.
+# LKR is an ad account currency missing from that page and is kept at two places.
 SUPPORTED_CURRENCY_DECIMAL_PLACES = {
     "AED": 2,
     "ARS": 2,
     "AUD": 2,
     "BDT": 2,
+    "BGN": 2,
+    "BHD": 2,
     "BOB": 2,
     "BRL": 2,
     "CAD": 2,
     "CHF": 2,
     "CLP": 0,
     "CNY": 2,
-    "COP": 2,
-    "CRC": 2,
+    "COP": 0,
+    "CRC": 0,
     "CZK": 2,
     "DKK": 2,
     "DZD": 2,
     "EGP": 2,
     "EUR": 2,
+    "FBZ": 2,
     "GBP": 2,
     "GTQ": 2,
     "HKD": 2,
     "HNL": 2,
-    "HUF": 2,
-    "IDR": 2,
+    "HRK": 2,
+    "HUF": 0,
+    "IDR": 0,
     "ILS": 2,
     "INR": 2,
     "ISK": 0,
+    "JOD": 2,
     "JPY": 0,
     "KES": 2,
     "KRW": 0,
     "LKR": 2,
+    "LTL": 2,
+    "LVL": 2,
     "MOP": 2,
     "MXN": 2,
     "MYR": 2,
@@ -54,15 +67,20 @@ SUPPORTED_CURRENCY_DECIMAL_PLACES = {
     "PYG": 0,
     "QAR": 2,
     "RON": 2,
+    "RSD": 2,
+    "RUB": 2,
     "SAR": 2,
     "SEK": 2,
     "SGD": 2,
+    "SKK": 2,
     "THB": 2,
     "TRY": 2,
-    "TWD": 2,
+    "TWD": 0,
     "UAH": 2,
     "USD": 2,
     "UYU": 2,
+    "VEF": 2,
+    "VES": 2,
     "VND": 0,
     "ZAR": 2,
 }
@@ -118,12 +136,16 @@ def to_minor_units(
     currency: str | None,
     *,
     field_name: str = "amount",
+    allow_zero: bool = False,
 ) -> int:
-    """Encode a human currency value exactly, rejecting unsupported precision."""
+    """Encode a human currency value exactly, rejecting unsupported precision.
+
+    allow_zero is for the few fields where Meta documents 0 as a value of its own,
+    such as an ad set's minimum spend targets, where 0 removes the target.
+    """
     decimal_places = currency_decimal_places(currency)
     numeric = _decimal_value(value, field_name=field_name)
-    if numeric <= 0:
-        raise ValidationError(f"{field_name} must be greater than 0.")
+    _check_sign(numeric, field_name=field_name, allow_zero=allow_zero)
     scaled = numeric * (Decimal(10) ** decimal_places)
     if scaled != scaled.to_integral_value():
         raise ValidationError(
@@ -133,11 +155,17 @@ def to_minor_units(
     return int(scaled)
 
 
-def validate_positive_amount(value: Any, *, field_name: str) -> None:
-    """Fail fast before any API lookup when a write amount is not positive."""
-    numeric = _decimal_value(value, field_name=field_name)
-    if numeric <= 0:
+def _check_sign(numeric: Decimal, *, field_name: str, allow_zero: bool) -> None:
+    if allow_zero and numeric < 0:
+        raise ValidationError(f"{field_name} must be 0 or greater.")
+    if not allow_zero and numeric <= 0:
         raise ValidationError(f"{field_name} must be greater than 0.")
+
+
+def validate_positive_amount(value: Any, *, field_name: str, allow_zero: bool = False) -> None:
+    """Fail fast before any API lookup when a write amount is not positive (or, with allow_zero, negative)."""
+    numeric = _decimal_value(value, field_name=field_name)
+    _check_sign(numeric, field_name=field_name, allow_zero=allow_zero)
 
 
 def from_minor_units(
@@ -160,8 +188,19 @@ async def resolve_account_currency(client: ObjectReader, account_id: str | None)
         raise ValidationError(
             "Could not derive the owning ad account needed for monetary conversion."
         )
+    # Imported here: normalize imports this module, so a module-level import would be circular.
+    from meta_ads_mcp.normalize import names_other_object
+
     normalized_account_id = normalize_account_id(str(account_id).strip())
     account = await client.get_object(normalized_account_id, fields=["currency"])
+    # An answer that names a different account is not this account's currency, and every
+    # amount converted with it would be sent at the wrong scale. act_123 and 123 are one
+    # account; an answer without a readable id is read as before.
+    if names_other_object(normalized_account_id, account):
+        raise ValidationError(
+            f"Could not resolve currency for ad account {normalized_account_id}: Meta's answer was about a "
+            "different ad account, so its currency was not used."
+        )
     try:
         return normalize_currency(account.get("currency"))
     except ValidationError as exc:

@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from meta_ads_mcp.errors import UnsupportedFeatureError
+from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError
 from meta_ads_mcp.tools import discovery
 
 
@@ -283,6 +283,99 @@ def test_destination_projection_preserves_explicit_creative_selection(monkeypatc
     ))
     assert result["item"]["creative"] == destination_creative
     assert "https://shop.example/asset" in result["item"]["destination_urls"]
+
+
+CREATIVE_SUMMARY_SELECTION = (
+    "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+    "effective_instagram_media_id,object_story_spec}"
+)
+
+
+class RecordingAdClient:
+    """Records the fields of every get_object request exactly as the tool sends them."""
+
+    def __init__(self) -> None:
+        self.fields: list[list[str]] = []
+
+    async def get_object(self, object_id, *, fields):
+        self.fields.append(list(fields))
+        return {"id": object_id, "creative": {"id": "cr1", "image_hash": "hash1"}}
+
+
+@pytest.mark.parametrize(
+    ("fields", "sent"),
+    [
+        # Requests captured at e2cddee, before explicit creative selections were kept.
+        (None, ["id", "account_id", "name", "status", "effective_status", "campaign_id", "adset_id",
+                "bid_amount", CREATIVE_SUMMARY_SELECTION]),
+        (["id", "creative"], ["id", CREATIVE_SUMMARY_SELECTION]),
+        (["id", "name"], ["id", "name", CREATIVE_SUMMARY_SELECTION]),
+        ("id,destination_urls", [
+            "id",
+            "creative{link_url,object_url,object_store_url,template_url,link_deep_link_url,object_story_spec,"
+            "asset_feed_spec{link_urls},call_to_action,id,name,title,body,object_story_id,"
+            "effective_object_story_id,effective_instagram_media_id}",
+        ]),
+    ],
+)
+def test_creative_summary_without_an_explicit_creative_selection_is_unchanged(monkeypatch, fields, sent) -> None:
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    asyncio.run(discovery.get_ad("ad1", include_creative_summary=True, fields=fields))
+
+    assert client.fields == [sent]
+
+
+def test_creative_summary_keeps_the_callers_explicit_creative_fields(monkeypatch) -> None:
+    """Ad.creative is an AdCreative, whose image_hash is a readable field (Ad Creative reference)."""
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.get_ad(
+        "ad1", fields=["id", "creative{image_hash}"], include_creative_summary=True,
+    ))
+
+    assert client.fields == [[
+        "id",
+        "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+        "effective_instagram_media_id,object_story_spec,image_hash}",
+    ]]
+    assert result["item"]["creative"]["image_hash"] == "hash1"
+
+
+def test_creative_summary_merges_nested_and_overlapping_creative_selections(monkeypatch) -> None:
+    """Nested selections survive; a narrower selection of a summary field widens to the whole field."""
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    asyncio.run(discovery.get_ad(
+        "ad1",
+        fields="id,creative{name,asset_feed_spec{images,bodies},object_story_spec{link_data}},creative{url_tags}",
+        include_creative_summary=True,
+    ))
+
+    assert client.fields == [[
+        "id",
+        "creative{id,name,title,body,object_story_id,effective_object_story_id,"
+        "effective_instagram_media_id,object_story_spec,asset_feed_spec{images,bodies},url_tags}",
+    ]]
+
+
+def test_creative_summary_and_destination_urls_keep_explicit_creative_fields(monkeypatch) -> None:
+    client = RecordingAdClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    asyncio.run(discovery.get_ad(
+        "ad1", fields="id,creative{image_hash},destination_urls", include_creative_summary=True,
+    ))
+
+    assert client.fields == [[
+        "id",
+        "creative{link_url,object_url,object_store_url,template_url,link_deep_link_url,object_story_spec,"
+        "asset_feed_spec{link_urls},call_to_action,id,name,title,body,object_story_id,"
+        "effective_object_story_id,effective_instagram_media_id,image_hash}",
+    ]]
 
 
 @pytest.mark.parametrize("tool_name", ["list_ads", "get_ad"])
@@ -836,3 +929,255 @@ def test_list_instagram_accounts_handles_empty_result_and_paging(monkeypatch) ->
     result = asyncio.run(discovery.list_instagram_accounts(account_id="123"))
     assert result["summary"]["count"] == 0
     assert result["paging"]["after"] == "after_ig"
+
+
+# ---------------------------------------------------------------------------
+# list_ad_accounts readiness fields (phase two, item 27)
+# ---------------------------------------------------------------------------
+
+OLD_ACCOUNT_FIELDS = [
+    "id", "name", "account_id", "account_status", "currency", "timezone_name", "amount_spent", "balance",
+    "business_name",
+]
+OLD_ACCOUNT_ROW = {
+    "id": "act_1", "name": "Shop", "account_id": "1", "account_status": 1, "currency": "USD",
+    "timezone_name": "America/New_York", "amount_spent": "123456", "balance": "500", "business_name": "Shop Inc",
+}
+
+
+class AccountsClient:
+    def __init__(self, extra: dict | None = None, failing_fields: set[str] | None = None) -> None:
+        self.extra = extra or {}
+        self.failing_fields = failing_fields or set()
+        self.calls: list[dict] = []
+
+    async def list_objects(self, parent_id, edge, *, fields, params):
+        self.calls.append({"parent_id": parent_id, "edge": edge, "fields": list(fields), "params": dict(params)})
+        if self.failing_fields & set(fields):
+            raise MetaApiError(message="(#200) Requires MANAGE task", status_code=403, code=200)
+        row = dict(OLD_ACCOUNT_ROW)
+        row.update({key: value for key, value in self.extra.items() if any(field.startswith(key) for field in fields)})
+        return {"data": [row], "paging": {"cursors": {"after": "A"}}}
+
+
+def test_list_ad_accounts_keeps_every_field_it_returned_before(monkeypatch) -> None:
+    client = AccountsClient(extra={
+        "business": {"id": "77", "name": "Shop Inc"}, "disable_reason": 0, "min_daily_budget": 100,
+        "funding_source": "6000123",
+    })
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.list_ad_accounts(limit=10, after="X"))
+
+    call = client.calls[0]
+    assert (call["parent_id"], call["edge"]) == ("me", "adaccounts")
+    assert call["params"] == {"limit": 10, "after": "X"}
+    assert call["fields"][: len(OLD_ACCOUNT_FIELDS)] == OLD_ACCOUNT_FIELDS
+    item = result["items"][0]
+    assert {key: item[key] for key in OLD_ACCOUNT_FIELDS} == {
+        **OLD_ACCOUNT_ROW, "amount_spent": 1234.56, "balance": 5.0,
+    }
+    assert result["paging"]["after"] == "A"
+    assert item["business"] == {"id": "77", "name": "Shop Inc"}
+    assert item["disable_reason"] == 0 and item["disable_reason_label"] == "NONE"
+    assert item["min_daily_budget"] == 1.0
+    assert item["has_funding_source"] is True
+    assert "funding_source" not in item
+    assert result["summary"]["readiness_fields"]["unavailable"] == []
+
+
+def test_list_ad_accounts_absent_funding_source_is_unknown_not_false(monkeypatch) -> None:
+    client = AccountsClient(extra={"disable_reason": 3})
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+    result = asyncio.run(discovery.list_ad_accounts())
+    item = result["items"][0]
+    assert item["has_funding_source"] is None
+    assert item["disable_reason_label"] == "RISK_PAYMENT"
+    assert "MANAGE" in result["summary"]["readiness_fields"]["has_funding_source_note"]
+
+
+def test_list_ad_accounts_funding_permission_error_drops_only_that_field(monkeypatch) -> None:
+    client = AccountsClient(extra={"disable_reason": 0, "min_daily_budget": 250}, failing_fields={"funding_source"})
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.list_ad_accounts())
+
+    assert len(client.calls) == 2
+    assert "funding_source" not in client.calls[1]["fields"]
+    item = result["items"][0]
+    assert item["min_daily_budget"] == 2.5
+    assert "has_funding_source" not in item
+    readiness = result["summary"]["readiness_fields"]
+    assert readiness["unavailable"] == ["funding_source"]
+    assert "MANAGE" in readiness["error"]
+
+
+def test_list_ad_accounts_falls_back_to_the_old_request_when_readiness_fields_fail(monkeypatch) -> None:
+    client = AccountsClient(failing_fields={"disable_reason"})
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+
+    result = asyncio.run(discovery.list_ad_accounts())
+
+    assert [len(call["fields"]) for call in client.calls][-1] == len(OLD_ACCOUNT_FIELDS)
+    assert client.calls[-1]["fields"] == OLD_ACCOUNT_FIELDS
+    item = result["items"][0]
+    assert {key: item[key] for key in OLD_ACCOUNT_FIELDS}["amount_spent"] == 1234.56
+    assert result["summary"]["readiness_fields"]["unavailable"] == [
+        "business{id,name}", "disable_reason", "min_daily_budget", "funding_source",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Round-twelve review S5: a page Meta could not answer in full is not an ordinary page
+# ---------------------------------------------------------------------------
+
+
+class RawAccountsClient:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+
+    async def list_objects(self, *args, **kwargs):
+        return self.payload
+
+
+def test_changed_discovery_does_not_read_an_unreadable_page_as_empty(monkeypatch) -> None:
+    """Reviewer reproduction (round twelve, S5): {} was returned as an empty last page."""
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient({}))
+    result = asyncio.run(discovery.list_ad_accounts())
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["incomplete_reason"] == "Meta's answer had no list of results, so what it holds is not known."
+    assert result["items"] == [] and result["summary"]["count"] == 0
+    assert result["paging"] == {"before": None, "after": None, "next": None}
+    assert "readiness_fields" in result["summary"]
+
+
+@pytest.mark.parametrize("data", [None, "text", {"id": "act_1"}])
+def test_list_ad_accounts_data_that_is_not_a_list_is_unreadable(monkeypatch, data) -> None:
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient({"data": data}))
+    result = asyncio.run(discovery.list_ad_accounts())
+    assert result["items"] == [] and result["summary"]["complete"] is False
+
+
+def test_list_ad_accounts_entry_that_is_not_an_object_marks_the_page_incomplete(monkeypatch) -> None:
+    payload = {"data": [dict(OLD_ACCOUNT_ROW), None], "paging": {"cursors": {"after": "A"}, "next": "https://next"}}
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient(payload))
+    result = asyncio.run(discovery.list_ad_accounts())
+    assert [item["id"] for item in result["items"]] == ["act_1"]
+    assert result["items"][0]["amount_spent"] == 1234.56
+    assert result["summary"]["count"] == 1 and result["summary"]["complete"] is False
+    assert result["summary"]["incomplete_reason"].startswith("1 entry in Meta's answer could not be read")
+    # The rows that were read are still a page Meta can continue from.
+    assert result["paging"]["after"] == "A"
+
+
+@pytest.mark.parametrize("paging", [{}, {"paging": {"cursors": {"after": "A"}, "next": "https://next"}}])
+def test_list_ad_accounts_ordinary_answer_is_exactly_as_before(monkeypatch, paging) -> None:
+    """A normal page, empty or not, gets no completeness keys it did not have before."""
+    for data in ([], [dict(OLD_ACCOUNT_ROW)]):
+        monkeypatch.setattr(discovery, "get_graph_api_client", lambda: RawAccountsClient({"data": data, **paging}))
+        result = asyncio.run(discovery.list_ad_accounts())
+        assert set(result) == {"items", "paging", "summary"}
+        assert set(result["summary"]) == {"count", "readiness_fields"}
+        assert result["summary"]["count"] == len(data)
+        assert result["paging"]["after"] == (paging and "A" or None)
+
+
+def test_checked_collection_matches_normalize_collection_for_a_readable_page() -> None:
+    from meta_ads_mcp.normalize import normalize_collection
+
+    for payload in ({"data": []}, {"data": [{"id": "1"}], "paging": {"cursors": {"before": "B", "after": "A"}, "next": "n"}}):
+        assert discovery.checked_collection(payload) == normalize_collection(payload)
+
+
+# Round twenty-seven (review R26, G1): a part of a creative that Meta returns only when it is named
+# is kept when the tool also reads the field whole.
+
+def _r26_parts(text):
+    from meta_ads_mcp.tool_types import coerce_csv_string_list as split
+
+    return split(text)
+
+
+class _ExplicitStoryClient:
+    def __init__(self):
+        self.calls = []
+        self.phone = "+" + "1650555" + "1234"
+
+    def _creative(self, fields):
+        selected = list(fields or [])
+        creative_selection = next((f for f in selected if f.startswith("creative{")), None)
+        if creative_selection:
+            selected = _r26_parts(creative_selection[len("creative{"):-1])
+        full = {"page_id": "30", "link_data": {"link": "https://shop.example/item"}}
+        # A bare parent returns default content, without the explicit-only setting.
+        spec = __import__("copy").deepcopy(full) if "object_story_spec" in selected else {}
+        for field in selected:
+            if field.startswith("object_story_spec{"):
+                nested = _r26_parts(field[len("object_story_spec{"):-1])
+                for name in nested:
+                    if name == "whats_app_business_phone_number":
+                        spec[name] = self.phone
+                    elif name in full:
+                        spec[name] = __import__("copy").deepcopy(full[name])
+        return {"id": "20", "object_story_spec": spec}
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append((object_id, __import__("copy").deepcopy(fields)))
+        creative = self._creative(fields)
+        return creative if object_id == "20" else {"id": object_id, "creative": creative}
+
+    async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+        self.calls.append((parent_id, __import__("copy").deepcopy(fields)))
+        return {"data": [{"id": "10", "creative": self._creative(fields)}]}
+
+
+@pytest.mark.parametrize("summary,destinations", [(True, False), (False, True), (True, True)])
+def test_g1_get_ad_preserves_explicit_only_story_field(monkeypatch, summary, destinations):
+    client = _ExplicitStoryClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+    fields = ["id", "creative{object_story_spec{whats_app_business_phone_number}}"]
+    if destinations:
+        fields.append("destination_urls")
+    result = asyncio.run(discovery.get_ad("10", include_creative_summary=summary, fields=fields))
+    story = result["item"]["creative"]["object_story_spec"]
+    assert story.get("whats_app_business_phone_number") == client.phone, client.calls
+    assert story.get("page_id") == "30"
+    assert story.get("link_data", {}).get("link") == "https://shop.example/item"
+
+
+def test_g1_list_ads_preserves_explicit_only_story_field_with_destinations(monkeypatch):
+    client = _ExplicitStoryClient()
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: client)
+    fields = ["id", "creative{object_story_spec{whats_app_business_phone_number}}", "destination_urls"]
+    result = asyncio.run(discovery.list_ads("1", fields=fields))
+    story = result["items"][0]["creative"]["object_story_spec"]
+    assert story.get("whats_app_business_phone_number") == client.phone, client.calls
+
+
+def test_r26_whole_story_selection_names_the_default_parts_and_the_part_asked_for() -> None:
+    merged = discovery._merged_creative_selection(
+        discovery.CREATIVE_SUMMARY_FIELDS, ["id", "creative{object_story_spec{whats_app_business_phone_number}}"],
+    )
+    assert (
+        "object_story_spec{instagram_user_id,link_data,page_id,photo_data,product_data,template_data,"
+        "text_data,video_data,whats_app_business_phone_number}"
+    ) in merged
+
+
+@pytest.mark.parametrize("selection", [
+    "creative{object_story_spec{link_data}}", "creative{object_story_spec{link_data{link},page_id}}",
+    "creative{object_story_spec}",
+])
+def test_r26_a_selection_inside_the_default_parts_still_reads_the_field_whole(selection) -> None:
+    merged = discovery._merged_creative_selection(discovery.CREATIVE_SUMMARY_FIELDS, ["id", selection])
+    assert merged.endswith(",object_story_spec}") and "object_story_spec{" not in merged
+
+
+def test_r26_a_field_without_parts_returned_only_by_name_is_merged_as_before() -> None:
+    merged = discovery._merged_creative_selection(
+        discovery.DESTINATION_CREATIVE_FIELDS, ["creative{asset_feed_spec{bodies},image_hash}"],
+    )
+    assert merged == (
+        "creative{link_url,object_url,object_store_url,template_url,link_deep_link_url,object_story_spec,"
+        "asset_feed_spec,call_to_action,image_hash}"
+    )

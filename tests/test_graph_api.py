@@ -11,7 +11,7 @@ import pytest
 
 from meta_ads_mcp.auth import build_appsecret_proof
 from meta_ads_mcp.config import Settings, reload_settings
-from meta_ads_mcp.errors import MetaApiError, RateLimitError, UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, NotFoundError, RateLimitError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import (
     _CLIENT_POOL,
     GraphAPIClient,
@@ -336,6 +336,7 @@ def test_graph_client_accepts_csv_fields_for_direct_callers(
             "method": "GET",
             "endpoint": "crt_123",
             "params": {"fields": "id,name,url_tags"},
+            "single_object": True,
         }
     ]
 
@@ -502,6 +503,120 @@ def test_request_raises_rate_limit_error_for_exhausted_payload_throttle(monkeypa
     assert exc_info.value.retry_after_seconds == 1
     assert exc_info.value.code == 17
     assert exc_info.value.operation == "GET /retry-edge"
+
+
+# Meta's answer to a second edit of the same ad set within 30 seconds (live, 2026-11-13).
+_PER_OBJECT_EDIT_LIMIT = {
+    "error": {
+        "message": "(#613) Calls to this API have exceeded the concurrent request rate limit of 1 calls per 30 seconds.",
+        "type": "OAuthException",
+        "code": 613,
+        "error_subcode": 4841018,
+    }
+}
+
+
+def test_per_object_edit_limit_reports_the_window_from_metas_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, _PER_OBJECT_EDIT_LIMIT, headers={
+            "x-business-use-case-usage": '{"1":[{"estimated_time_to_regain_access":0}]}',
+        }),
+        FakeResponse(200, {"id": "must_not_be_sent"}),
+    ])
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client(max_retries=2).request("POST", "123", data={"name": "x"}))
+    public = exc_info.value.to_public_dict()
+    assert public["retry_after_seconds"] == 30.0
+    assert public["code"] == 613 and public["subcode"] == 4841018
+    assert public["retryable"] is True
+    # A write is never slept on or retried by the client.
+    assert sleeps == []
+    assert len(FakeAsyncClient.responses) == 1
+
+
+def test_per_object_edit_limit_keeps_a_longer_retry_after_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque([FakeResponse(400, _PER_OBJECT_EDIT_LIMIT, headers={"Retry-After": "45"})])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert exc_info.value.retry_after_seconds == 45.0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "(#613) Calls to this API have exceeded the rate limit.",
+        "(#613) rate limit of 1 calls per thirty seconds",
+        "(#613) rate limit of 1 calls per 30 minutes",
+        "(#613) rate limit of 1 calls per 0 seconds",
+    ],
+)
+def test_per_object_edit_limit_without_a_readable_window_keeps_todays_wait(
+    monkeypatch: pytest.MonkeyPatch, message: str,
+) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, {"error": {"message": message, "code": 613, "error_subcode": 4841018}}),
+    ])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert exc_info.value.retry_after_seconds == 1.0
+
+
+def test_window_in_the_message_of_another_code_is_not_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, {"error": {"message": "rate limit of 1 calls per 30 seconds", "code": 17}}),
+    ])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert exc_info.value.retry_after_seconds == 1.0
+
+
+def test_read_that_meets_the_edit_limit_waits_the_window_within_the_automatic_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, _PER_OBJECT_EDIT_LIMIT),
+        FakeResponse(200, {"id": "123"}),
+    ])
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    assert asyncio.run(_client(max_retries=1).request("GET", "123")) == {"id": "123"}
+    assert sleeps == [30.0]
+
+
+def test_read_that_meets_a_window_past_the_automatic_cap_is_not_slept_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    long_window = {"error": {**_PER_OBJECT_EDIT_LIMIT["error"],
+                             "message": "(#613) Calls to this API have exceeded the rate limit of 10 calls per 300 seconds."}}
+    FakeAsyncClient.responses = deque([
+        FakeResponse(400, long_window),
+        FakeResponse(200, {"id": "must_not_be_returned"}),
+    ])
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("meta_ads_mcp.graph_api.asyncio.sleep", fake_sleep)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client(max_retries=2).request("GET", "123"))
+    assert exc_info.value.retry_after_seconds == 300.0
+    assert sleeps == []
+    assert len(FakeAsyncClient.responses) == 1
 
 
 def test_read_rate_limit_respects_retry_after_and_returns_usage_when_exhausted(
@@ -886,3 +1001,626 @@ def test_close_graph_api_clients_closes_pooled_clients(monkeypatch: pytest.Monke
     asyncio.run(close_graph_api_clients())
     assert FakeAsyncClient.instances[0].is_closed is True
     assert _CLIENT_POOL == {}
+
+
+class _RecordingClient(FakeAsyncClient):
+    """Records every outbound request so tests can prove none was sent."""
+
+    sent: list[dict[str, object]] = []
+
+    async def request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        _RecordingClient.sent.append(kwargs)
+        return FakeResponse(200, {"id": "1"})
+
+
+@pytest.fixture
+def recording_client(monkeypatch):
+    _RecordingClient.sent = []
+    asyncio.run(close_graph_api_clients())
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", _RecordingClient)
+    yield _RecordingClient
+    asyncio.run(close_graph_api_clients())
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "123?method=delete",
+        "123/products?method=delete",
+        "123#fragment",
+        "123/../456",
+        "123/./456",
+        "123 456",
+        "123%3Fmethod%3Ddelete",
+        "123//products",
+        "123\\products",
+        "123&method=delete",
+        "123;method=delete",
+        "",
+    ],
+)
+def test_request_rejects_endpoints_that_could_change_the_request(recording_client, endpoint) -> None:
+    """A caller-supplied id must never be able to add a query string or change the path."""
+    with pytest.raises(ValidationError):
+        asyncio.run(_client().request("GET", endpoint))
+    assert recording_client.sent == []
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["me", "act_123", "act_123/insights", "123_456/comments", "oauth/access_token",
+     "debug_token", "/act_123/adimages", "17841400000000000/media", "dataset_quality"],
+)
+def test_request_accepts_ordinary_graph_endpoints(recording_client, endpoint) -> None:
+    asyncio.run(_client().request("GET", endpoint))
+    assert len(recording_client.sent) == 1
+
+
+@pytest.mark.parametrize("key", ["method", "METHOD", " Method "])
+@pytest.mark.parametrize("http_method,kind", [("GET", "params"), ("POST", "data"), ("POST", "params"), ("DELETE", "params")])
+def test_request_rejects_http_method_override(recording_client, key, http_method, kind) -> None:
+    """Graph honors a `method` parameter that turns a read into a delete; never send one."""
+    with pytest.raises(ValidationError, match="method"):
+        asyncio.run(_client().request(http_method, "123", **{kind: {key: "delete"}}))
+    assert recording_client.sent == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.get_object("123/products"),
+        lambda c: c.update_object("123/products", data={"name": "x"}),
+        lambda c: c.delete_object("123/products"),
+        lambda c: c.list_objects("123/products", "ads"),
+        lambda c: c.list_objects("123", "ads/456"),
+        lambda c: c.create_edge_object("123/products", "ads", data={"name": "x"}),
+        lambda c: c.create_edge_object("123", "ads/456", data={"name": "x"}),
+        lambda c: c.delete_edge_object("123/x", "users", data={"a": 1}),
+        lambda c: c.delete_edge_object("123", "users/9", data={"a": 1}),
+        lambda c: c.get_insights("act_1/campaigns", fields=["spend"], params={}),
+        lambda c: c.create_async_insights_report("act_1/campaigns", fields=["spend"], params={}),
+        lambda c: c.get_object(""),
+        lambda c: c.get_object("me/accounts"),
+    ],
+)
+def test_node_and_edge_helpers_require_single_segment_ids(recording_client, call) -> None:
+    """An id with a slash would turn an update of one object into a write on another edge."""
+    with pytest.raises(ValidationError):
+        asyncio.run(call(_client()))
+    assert recording_client.sent == []
+
+
+def test_node_and_edge_helpers_accept_ordinary_ids(recording_client) -> None:
+    client = _client()
+    asyncio.run(client.get_object("act_123", fields=["id"]))
+    asyncio.run(client.get_object("me"))
+    asyncio.run(client.list_objects("act_123", "ads"))
+    asyncio.run(client.update_object("123_456", data={"name": "x"}))
+    asyncio.run(client.create_edge_object("act_123", "adcreatives", data={"name": "x"}))
+    asyncio.run(client.delete_edge_object("123", "users", data={"a": 1}))
+    asyncio.run(client.get_insights("act_123", fields=["spend"], params={}))
+    assert len(recording_client.sent) == 7
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.estimate_audience_size(account_id="123/ads", targeting_spec={"geo_locations": {"countries": ["US"]}}),
+        lambda c: c.preview_ad(account_id="act_123/ads", creative={"object_story_id": "1_2"}, ad_format="DESKTOP_FEED_STANDARD"),
+        lambda c: c.get_ad_images_by_hashes("act_1/ads", hashes=["abc"]),
+    ],
+)
+def test_account_scoped_helpers_reject_an_account_id_with_a_path(recording_client, call) -> None:
+    with pytest.raises(ValidationError):
+        asyncio.run(call(_client()))
+    assert recording_client.sent == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014],
+)
+def test_business_use_case_throttling_codes_are_rate_limits(monkeypatch, code) -> None:
+    """Meta's per-product throttling codes carry messages that do not say "rate limit"."""
+    FakeAsyncClient.responses = deque(
+        [FakeResponse(400, {"error": {"message": "There have been too many requests for this object.", "code": code}})]
+    )
+    asyncio.run(close_graph_api_clients())
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError):
+        asyncio.run(_client().request("GET", "123/products"))
+    asyncio.run(close_graph_api_clients())
+
+
+def test_an_ordinary_error_code_is_not_a_rate_limit(monkeypatch) -> None:
+    FakeAsyncClient.responses = deque(
+        [FakeResponse(400, {"error": {"message": "Invalid parameter", "code": 100}})]
+    )
+    asyncio.run(close_graph_api_clients())
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("GET", "123/products"))
+    assert not isinstance(error.value, RateLimitError)
+    asyncio.run(close_graph_api_clients())
+
+
+def test_upload_ad_image_sends_checked_bytes_and_never_reads_a_path(monkeypatch) -> None:
+    """The client receives a file's name and bytes already checked by the tool; it has no path to read."""
+    import inspect
+
+    calls = []
+
+    async def fake_request(self, method, endpoint, **kwargs):
+        calls.append((method, endpoint, kwargs))
+        return {"images": {}}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    client = _client()
+    assert "file_path" not in inspect.signature(GraphAPIClient.upload_ad_image).parameters
+
+    asyncio.run(client.upload_ad_image("123", file_name="hero.png", file_content=b"image-bytes", name="Hero"))
+    asyncio.run(client.upload_ad_image("act_123", file_name="hero.png", file_content=b"image-bytes"))
+    asyncio.run(client.upload_ad_image("123", image_url="https://example.com/x.png", name="Hero"))
+
+    assert calls == [
+        ("POST", "act_123/adimages", {"data": {"name": "Hero"}, "files": {"filename": ("hero.png", b"image-bytes")}}),
+        ("POST", "act_123/adimages", {"data": {}, "files": {"filename": ("hero.png", b"image-bytes")}}),
+        ("POST", "act_123/adimages", {"data": {"url": "https://example.com/x.png", "name": "Hero"}, "files": None}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"file_name": "hero.png"},
+        {"file_content": b"image-bytes"},
+        {"file_name": "hero.png", "file_content": b""},
+        {"file_name": "", "file_content": b"image-bytes"},
+        {"file_name": "hero.png", "file_content": b"image-bytes", "image_url": "https://example.com/x.png"},
+    ],
+)
+def test_upload_ad_image_needs_exactly_one_complete_source(monkeypatch, arguments) -> None:
+    async def fake_request(self, method, endpoint, **kwargs):
+        pytest.fail("Nothing should be sent")
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    with pytest.raises(UnsupportedFeatureError):
+        asyncio.run(_client().upload_ad_image("123", **arguments))
+
+
+@pytest.mark.parametrize("body", [None, "ok", "an error word in plain text", 7, 1.5])
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+def test_a_json_answer_that_is_not_an_object_is_an_error_not_a_result(monkeypatch, body, method) -> None:
+    # Meta documents object answers. A bare null, text or number is unreadable: it must not
+    # crash the client (null and numbers raised TypeError), must not reach a caller as
+    # something that looks like an object (a read-before-write would then be followed by
+    # the write), and after a write it must say the outcome is not known.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data=None if method == "GET" else {"name": "x"}))
+    public = error.value.to_public_dict()
+    assert "not a JSON object" in public["message"]
+    assert error.value.status_code == 200
+    assert public["mutation_outcome_unknown"] is (method != "GET")
+    assert public["retryable"] is False
+    assert len(FakeAsyncClient.requests) == 1
+
+
+@pytest.mark.parametrize("body", [None, "refused", 7])
+def test_an_error_status_with_a_non_object_json_answer_is_a_meta_error(monkeypatch, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(400, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.status_code == 400
+    assert error.value.to_public_dict()["mutation_outcome_unknown"] is False
+
+
+@pytest.mark.parametrize("code", [[], {}, "613", 1.5, True])
+def test_an_error_code_of_the_wrong_type_does_not_crash_the_client(monkeypatch, code) -> None:
+    # A list code raised TypeError (unhashable) while classifying the error, after a write had gone out.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"error": {"message": "Malformed reply", "code": code, "error_subcode": code}})])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.message == "Malformed reply"
+    assert error.value.code is None and error.value.subcode is None
+
+
+def test_bool_and_list_answers_keep_their_existing_wrappers(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, True), FakeResponse(200, [{"id": "1"}])])
+    client = _client()
+    assert asyncio.run(client.request("GET", "123")) == {"success": True}
+    assert asyncio.run(client.request("GET", "123")) == {"data": [{"id": "1"}]}
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+@pytest.mark.parametrize("body", [False, {"success": False}, {"success": False, "id": "9"}])
+def test_a_write_meta_answers_with_success_false_is_an_error(monkeypatch, method, body) -> None:
+    # R16 X2: before, every write tool reported such a change as made.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert "success: false" in error.value.message
+    assert error.value.details == {"negative_acknowledgement": True}
+    assert error.value.status_code == 200
+    assert error.value.operation == f"{method} /123"
+    assert error.value.mutation_outcome_unknown is False
+    assert not error.value.is_transient
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+@pytest.mark.parametrize("body", [
+    True, {"success": True}, {"id": "9"}, {"success": None}, {"success": 0}, {"success": "false"},
+    {"id": "9", "is_published": False}, {"data": [{"success": False}]}, {},
+])
+def test_a_write_answer_without_an_explicit_false_acknowledgement_is_returned_as_before(monkeypatch, method, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    answer = asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert answer == ({"success": True} if body is True else body)
+
+
+def test_a_read_answered_false_keeps_its_wrapper(monkeypatch) -> None:
+    # Only a write is refused: a read holds no acknowledgement of a change.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, False), FakeResponse(200, {"success": False})])
+    client = _client()
+    assert asyncio.run(client.request("GET", "123")) == {"success": False}
+    assert asyncio.run(client.request("GET", "123")) == {"success": False}
+
+
+@pytest.mark.parametrize(("payload", "expected"), [
+    ({"success": True}, True), ({"success": False}, True), ({"data": []}, True), ({"data": [{"id": "1"}]}, True),
+    ({"id": "1"}, False), ({}, False), ({"success": True, "id": "1"}, False), ({"data": [], "paging": {}}, False),
+    ({"success": "true"}, False), ({"data": None}, False), (None, False), ([], False),
+])
+def test_bare_answer_wrapper_is_recognised_only_in_its_exact_form(payload, expected) -> None:
+    from meta_ads_mcp.graph_api import is_bare_answer_wrapper
+
+    assert is_bare_answer_wrapper(payload) is expected
+
+
+_THROTTLE = {"error": {"code": 4, "message": "Application request limit reached", "is_transient": True}}
+
+
+def test_a_throttling_error_behind_a_success_status_on_a_write_leaves_the_outcome_unknown(monkeypatch) -> None:
+    # R18 Z1: the wrapper kept none of this, so a tool said the request was refused.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, _THROTTLE)])
+    with pytest.raises(RateLimitError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is True
+    public = error.value.to_public_dict()
+    assert public["retryable"] is False and public["mutation_outcome_unknown"] is True
+    assert "before retrying" in public["next_step"]
+
+
+@pytest.mark.parametrize("status", [400, 429])
+def test_an_ordinary_throttle_of_a_write_is_still_a_refusal_that_can_be_retried(monkeypatch, status) -> None:
+    # Meta's throttling errors can carry is_transient: true; on an error status that is a
+    # refusal, as the live edit-limit error was (retried after the wait, and accepted).
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, _THROTTLE)])
+    with pytest.raises(RateLimitError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is False
+    public = error.value.to_public_dict()
+    assert public["retryable"] is True
+    assert "mutation_outcome_unknown" not in public and "next_step" not in public
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+def test_a_write_answer_holding_both_an_error_and_success_true_leaves_the_outcome_unknown(monkeypatch, method) -> None:
+    # R21 C1: the answer contradicts itself, so it is not read as a plain refusal.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"success": True, "error": {"code": 100, "message": "Rejected"}})])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is True
+    assert error.value.to_public_dict()["retryable"] is False
+
+
+@pytest.mark.parametrize("status", [200, 400])
+@pytest.mark.parametrize("body", [
+    {"error": {"code": 100, "message": "Rejected"}},
+    {"success": False, "error": {"code": 100, "message": "Rejected"}},
+])
+def test_an_ordinary_error_answer_to_a_write_is_still_a_refusal(monkeypatch, status, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.mutation_outcome_unknown is False
+
+
+def test_a_read_answer_holding_both_an_error_and_success_true_is_not_a_write_outcome(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, {"success": True, "error": {"code": 100, "message": "Rejected"}})])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("GET", "123"))
+    assert error.value.mutation_outcome_unknown is False
+
+
+_CONTRADICTIONS = [
+    (400, {"success": True, "error": {"code": 4, "message": "Too many calls"}}, RateLimitError),
+    (400, {"success": True, "error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, MetaApiError),
+    (404, {"success": True, "error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, MetaApiError),
+    (404, {"success": True}, MetaApiError),
+]
+
+
+@pytest.mark.parametrize(("status", "body", "error_type"), _CONTRADICTIONS)
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+def test_a_contradictory_write_answer_stays_unknown_through_every_specific_error(monkeypatch, status, body, error_type, method) -> None:
+    # R22 D1: the throttle, unsupported and not-found branches each dropped the contradiction.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(error_type) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert type(error.value) is error_type
+    assert error.value.mutation_outcome_unknown is True
+    assert error.value.to_public_dict()["retryable"] is False
+
+
+@pytest.mark.parametrize(("status", "body", "error_type"), [
+    (400, {"error": {"code": 4, "message": "Too many calls", "is_transient": True}}, RateLimitError),
+    (400, {"error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, UnsupportedFeatureError),
+    (404, {"error": {"code": 100, "message": "Unsupported post request. Object cannot be loaded."}}, NotFoundError),
+    (404, {"success": False}, NotFoundError),
+    (404, {}, NotFoundError),
+])
+def test_the_ordinary_specific_errors_for_a_write_are_unchanged(monkeypatch, status, body, error_type) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(error_type) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert type(error.value) is error_type
+    assert getattr(error.value, "mutation_outcome_unknown", False) is False
+
+
+@pytest.mark.parametrize(("status", "body", "error_type"), [
+    (404, {"success": True}, NotFoundError),
+    (400, {"success": True, "error": {"code": 100, "message": "Unsupported get request."}}, UnsupportedFeatureError),
+])
+def test_a_read_keeps_its_specific_error_whatever_the_body_says(monkeypatch, status, body, error_type) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(error_type) as error:
+        asyncio.run(_client().request("GET", "123"))
+    assert type(error.value) is error_type
+
+
+@pytest.mark.parametrize("status", [400, 404])
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+def test_a_transient_unsupported_or_not_found_answer_to_a_write_stays_unknown(monkeypatch, status, method) -> None:
+    # R24 F3: the unsupported and not-found branches turned a transient write error into a plain refusal.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    body = {"error": {"code": 100, "message": "Unsupported post request.", "is_transient": True}}
+    FakeAsyncClient.responses = deque([FakeResponse(status, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data={"name": "x"}))
+    assert type(error.value) is MetaApiError
+    assert error.value.mutation_outcome_unknown is True
+
+
+@pytest.mark.parametrize(("status", "error_type"), [(400, UnsupportedFeatureError), (404, NotFoundError)])
+def test_a_transient_unsupported_or_not_found_answer_to_a_read_is_unchanged(monkeypatch, status, error_type) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    body = {"error": {"code": 100, "message": "Unsupported get request.", "is_transient": True}}
+    FakeAsyncClient.responses = deque([FakeResponse(status, body) for _ in range(6)])
+    with pytest.raises(error_type):
+        asyncio.run(_client().request("GET", "123"))
+
+
+@pytest.mark.parametrize("body", [
+    {"success": True}, {"id": "972000"}, {"id": "972000", "success": True}, {"id": "972999"}, {"id": "972999", "success": True}, {},
+])
+@pytest.mark.parametrize("write", ["update", "delete"])
+def test_a_write_acknowledgement_is_returned_whatever_id_it_carries(monkeypatch, body, write) -> None:
+    """The client does not judge the id in an update's or a delete's acknowledgement.
+
+    A rule that did (round thirty-four) was taken out in round thirty-six: what Meta's ordinary
+    acknowledgement carries for eleven kinds of write has not been observed live, and a wrong
+    guess would report every such ordinary write as "outcome unknown".
+    """
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    client = _client()
+    call = client.update_object("972000", data={"name": "x"}) if write == "update" else client.delete_object("972000")
+    assert asyncio.run(call) == body
+
+
+class _TooDeepResponse(FakeResponse):
+    """A response whose body the JSON decoder cannot get through."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(status_code, {})
+        self.headers = {**getattr(self, "headers", {}), "content-type": "application/json"}
+
+    def json(self):
+        raise RecursionError("maximum recursion depth exceeded")
+
+
+@pytest.mark.parametrize(("method", "unknown"), [("GET", False), ("POST", True), ("DELETE", True)])
+def test_a_body_nested_too_deeply_to_decode_is_an_unreadable_answer(monkeypatch, method, unknown) -> None:
+    # R21 C2: before, the decoder's RecursionError escaped the client as it was.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([_TooDeepResponse(200)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data=None if method == "GET" else {"name": "x"}))
+    assert "was not JSON" in error.value.message
+    assert error.value.details["unreadable_answer"] is True
+    assert error.value.mutation_outcome_unknown is unknown
+
+
+@pytest.mark.parametrize("body", [True, False, [], [{"id": "1"}]])
+def test_a_read_of_one_object_answered_with_a_bare_boolean_or_array_is_unreadable(monkeypatch, body) -> None:
+    # R27 H1: wrapped as {"success": ...} or {"data": [...]}, it looked like an object with no
+    # fields, so a tool that reads before it writes took every field for absent and wrote.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().get_object("123", fields=["id", "name"]))
+    assert error.value.details == {"unreadable_answer": True, "json_type": type(body).__name__}
+    assert error.value.mutation_outcome_unknown is False
+    assert error.value.operation == "GET /123"
+
+
+@pytest.mark.parametrize("body", [{"id": "123"}, {}, {"data": []}, {"success": True}, {"id": "123", "name": None}])
+def test_a_read_of_one_object_answered_with_any_json_object_is_returned_as_before(monkeypatch, body) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, body)])
+    assert asyncio.run(_client().get_object("123", fields=["id"])) == body
+
+
+def test_list_reads_and_writes_keep_the_wrappers_for_a_bare_array_or_boolean(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([FakeResponse(200, [{"id": "1"}]), FakeResponse(200, True)])
+    client = _client()
+    assert asyncio.run(client.list_objects("123", "ads")) == {"data": [{"id": "1"}]}
+    assert asyncio.run(client.update_object("123", data={"name": "x"})) == {"success": True}
+
+
+class _TextResponse(FakeResponse):
+    """A response whose body is not JSON."""
+
+    def __init__(self, status_code: int, text: str, content_type: str = "text/html") -> None:
+        super().__init__(status_code, {})
+        self.text = text
+        self.headers = {**getattr(self, "headers", {}), "content-type": content_type}
+
+    def json(self):
+        raise ValueError("not JSON")
+
+
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+@pytest.mark.parametrize("text", ["<html>busy</html>", "", "ok"])
+def test_a_success_status_with_a_body_that_is_not_json_is_an_error(monkeypatch, method, text) -> None:
+    # Before, this reached the caller as an object ({"text_response": ...}); a tool that
+    # reads before it writes then wrote, and a write was reported as done.
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([_TextResponse(200, text)])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request(method, "123", data=None if method == "GET" else {"name": "x"}))
+    public = error.value.to_public_dict()
+    assert "was not JSON" in public["message"]
+    assert error.value.status_code == 200
+    assert public["mutation_outcome_unknown"] is (method != "GET")
+    assert public["retryable"] is False
+    assert len(FakeAsyncClient.requests) == 1
+    # the body is never carried in the error: it can hold anything
+    assert text == "" or text not in json.dumps(public)
+
+
+def test_an_error_status_with_a_body_that_is_not_json_is_unchanged(monkeypatch) -> None:
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([_TextResponse(400, "<html>bad</html>")])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.message == "Non-JSON error response from Meta API"
+    assert error.value.to_public_dict()["mutation_outcome_unknown"] is False
+
+
+# Round-twelve review S1 (the class beyond the reproduction): an HTTP library's own
+# exception can quote a request header. h11 refuses a header value with a line break
+# and quotes it, so a malformed token reached the Authorization header text of an
+# exception chained to MetaApiError, which FastMCP prints when it logs the tool error.
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_a_transport_failure_does_not_chain_the_http_library_message(monkeypatch, caplog, method) -> None:
+    import logging
+    import traceback
+
+    import httpcore
+    import httpx
+
+    token = "".join(["Synthetic", "Broken", "Token", "\n"])
+    caplog.set_level(logging.DEBUG)
+    transport = httpx.AsyncHTTPTransport()
+    transport._pool = httpcore.AsyncConnectionPool(network_backend=httpcore.AsyncMockBackend([]))
+    http_client = httpx.AsyncClient(transport=transport)
+    client = _client(access_token=token)
+    monkeypatch.setattr(GraphAPIClient, "_get_shared_client", lambda *a, **k: http_client)
+
+    async def scenario():
+        try:
+            await client.request(method, "act_10/adcreatives", params={"creative": "x"})
+        finally:
+            await http_client.aclose()
+
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(scenario())
+    assert error.value.details == {"exception_type": "LocalProtocolError"}
+    assert error.value.__cause__ is None and error.value.__context__ is None
+    rendered = "".join(traceback.format_exception(error.value))
+    assert "Synthetic" not in rendered and "Synthetic" not in caplog.text
+
+
+# Round-fourteen review V3 (the class beyond the reproduction): a header value and a body
+# are text the server chooses. An error keeps only numbers, values from a fixed list, or
+# a fixed note in their place; Meta's JSON error fields are handled elsewhere.
+
+
+def _echo() -> str:
+    return "".join(["Synthetic", "Echo", "Value"])
+
+
+@pytest.mark.parametrize("status", [200, 400])
+@pytest.mark.parametrize(("content_type", "shown"), [
+    ("text/html; charset=utf-8", "text/html"),
+    (None, None),
+    (f"text/html {_echo()}", "(not a media type; withheld)"),
+])
+def test_an_unreadable_answer_keeps_only_a_media_type_and_never_the_body(monkeypatch, status, content_type, shown) -> None:
+    response = _TextResponse(status, f"<html>{_echo()}</html>", content_type=content_type or "")
+    if content_type is None:
+        response.headers.pop("content-type")
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    FakeAsyncClient.responses = deque([response])
+    with pytest.raises(MetaApiError) as error:
+        asyncio.run(_client().request("POST", "123", data={"name": "x"}))
+    assert error.value.details["content_type"] == shown
+    assert error.value.details["status_code"] == status
+    assert "text_response" not in error.value.details
+    assert _echo() not in repr(error.value) and _echo() not in json.dumps(error.value.to_public_dict())
+
+
+def test_usage_headers_keep_documented_fields_ids_numbers_and_values_only(monkeypatch) -> None:
+    FakeAsyncClient.responses = deque([
+        FakeResponse(
+            429,
+            {"error": {"message": "Too many calls", "code": 17}},
+            headers={
+                "X-App-Usage": f"not json {_echo()}",
+                "X-Ad-Account-Usage": json.dumps({
+                    "acc_id_util_pct": 9.67, "reset_time_duration": 100, "ads_api_access_tier": "standard_access",
+                    _echo(): 1,
+                }),
+                "X-Business-Use-Case-Usage": json.dumps({"66782684": [{
+                    "type": "ads_management", "call_count": 95, "estimated_time_to_regain_access": 0,
+                    "ads_api_access_tier": _echo(),
+                }]}),
+            },
+        )
+    ])
+    monkeypatch.setattr("meta_ads_mcp.graph_api.httpx.AsyncClient", FakeAsyncClient)
+    with pytest.raises(RateLimitError) as exc_info:
+        asyncio.run(_client().request("GET", "act_1/campaigns"))
+    assert exc_info.value.usage == {
+        "x-app-usage": "(withheld)",
+        "x-ad-account-usage": {
+            "acc_id_util_pct": 9.67, "reset_time_duration": 100, "ads_api_access_tier": "standard_access",
+            "withheld_fields": 1,
+        },
+        "x-business-use-case-usage": {"66782684": [{
+            "type": "ads_management", "call_count": 95, "estimated_time_to_regain_access": 0,
+            "ads_api_access_tier": "(withheld)",
+        }]},
+    }
+    assert _echo() not in json.dumps(exc_info.value.to_public_dict())

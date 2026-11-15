@@ -37,6 +37,7 @@ class Settings:
     export_max_files: int = 100
     export_max_bytes: int = 1_000_000_000
     read_only: bool = False
+    upload_directory: str | None = None
 
 
 @lru_cache(maxsize=1)
@@ -65,6 +66,7 @@ def get_settings() -> Settings:
         export_max_files=int(os.getenv("META_EXPORT_MAX_FILES", "100")),
         export_max_bytes=int(os.getenv("META_EXPORT_MAX_BYTES", "1000000000")),
         read_only=read_only in {"true", "1"},
+        upload_directory=os.getenv("META_UPLOAD_DIR"),
     )
 
 

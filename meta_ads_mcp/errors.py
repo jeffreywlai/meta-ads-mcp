@@ -60,6 +60,10 @@ class RateLimitError(MetaAdsError):
     subcode: int | None = None
     usage: dict[str, Any] | None = None
     operation: str | None = None
+    # True only when a write's throttling error came behind a success status: the answer
+    # contradicts itself, so the change may have been made. An ordinary throttle (an error
+    # status) is Meta's refusal, and this stays False.
+    mutation_outcome_unknown: bool = False
 
     def __str__(self) -> str:
         return self.message
@@ -69,8 +73,11 @@ class RateLimitError(MetaAdsError):
         payload: dict[str, Any] = {
             "type": "rate_limit",
             "message": self.message,
-            "retryable": True,
+            "retryable": not self.mutation_outcome_unknown,
         }
+        if self.mutation_outcome_unknown:
+            payload["mutation_outcome_unknown"] = True
+            payload["next_step"] = "Verify the target object's current state before retrying this mutation."
         for key, value in (
             ("retry_after_seconds", self.retry_after_seconds),
             ("code", self.code),
@@ -89,6 +96,11 @@ class AsyncJobError(MetaAdsError):
 
 class UnsupportedFeatureError(MetaAdsError):
     """Raised when a Meta surface is unavailable or unsupported."""
+
+
+def _whole_number_or_none(value: Any) -> int | None:
+    """Meta documents error codes as whole numbers; anything else is treated as absent."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 @dataclass(slots=True)
@@ -162,8 +174,8 @@ class MetaApiError(MetaAdsError):
         return cls(
             message=str(error.get("message", "Unknown Meta API error")),
             status_code=status_code,
-            code=error.get("code"),
-            subcode=error.get("error_subcode"),
+            code=_whole_number_or_none(error.get("code")),
+            subcode=_whole_number_or_none(error.get("error_subcode")),
             details=payload,
             user_title=error.get("error_user_title"),
             user_message=error.get("error_user_msg"),

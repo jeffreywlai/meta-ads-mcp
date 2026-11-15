@@ -449,16 +449,20 @@ def test_historical_f10_argument_sets_are_supported_or_list_accepted_keywords(
             asyncio.run(mcp_server.call_tool(tool, call_arguments))
         schema = asyncio.run(mcp_server.get_tool(name)).parameters
         assert f"Accepted parameters: {', '.join(schema['properties'])}." in str(exc_info.value)
-        for rejected in set(arguments) - set(schema["properties"]):
-            assert rejected in str(exc_info.value)
+        rejected = set(arguments) - set(schema["properties"])
+        # Unknown names are counted, never repeated (round thirteen, U4).
+        assert f"{len(rejected)} unknown parameter{'s' if len(rejected) != 1 else ''} (names not repeated" in str(
+            exc_info.value
+        )
         assert not client_creations
 
 
 def test_compact_search_serializer_surfaces_required_archive_params() -> None:
     components = mcp_server.local_provider.__dict__["_components"]
     result = serialize_search_results_compact([components["tool:search_ads_archive@"]])
-    assert "`search_ads_archive` | req: search_terms (string), ad_reached_countries (string or list[string])" in result
-    assert "opt: ad_type (string), limit (integer), fields (string or list[string] or null)" in result
+    # search_terms became optional in phase two (search_page_ids is the other route); countries stay required.
+    assert "`search_ads_archive` | req: ad_reached_countries (string or list[string])" in result
+    assert "opt: search_terms (string or null), ad_type (string), limit (integer), fields (string or list[string] or null)" in result
 
 
 def test_compact_search_serializer_surfaces_required_targeting_category_params() -> None:

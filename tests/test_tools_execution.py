@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from meta_ads_mcp.errors import MetaApiError
 from meta_ads_mcp.tools import execution
 
 
@@ -170,6 +171,19 @@ def test_update_adset_bid_strategy_supports_bid_constraints(monkeypatch) -> None
     assert result["current"]["bid_constraints"] == {"roas_average_floor": 30000}
 
 
+def test_update_adset_bid_strategy_sends_empty_bid_constraints_to_remove_the_floor(monkeypatch) -> None:
+    """Meta's bid strategy guide removes roas_average_floor with bid_constraints={}; it is sent, not dropped."""
+    client = FakeExecutionClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(
+        execution.update_adset_bid_strategy(
+            adset_id="adset_123", bid_strategy="LOWEST_COST_WITHOUT_CAP", bid_constraints={},
+        )
+    )
+    assert client.updated_payloads[0][1] == {"bid_strategy": "LOWEST_COST_WITHOUT_CAP", "bid_constraints": {}}
+    assert result["current"]["bid_constraints"] == {}
+
+
 @pytest.mark.parametrize(
     ("tool", "kwargs", "malformed_field"),
     [
@@ -208,3 +222,139 @@ def test_execution_decodes_previous_money_before_mutating(
     with pytest.raises(execution.ValidationError, match=malformed_field):
         asyncio.run(tool(**kwargs))
     assert client.updated_payloads == []
+
+
+class RecordingStatusClient(FakeExecutionClient):
+    """Fake execution client that records every call in order."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.calls: list[tuple] = []
+
+    async def get_object(self, object_id, *, fields=None, params=None):
+        self.calls.append(("get", object_id, list(fields or []), params))
+        return await super().get_object(object_id, fields=fields, params=params)
+
+    async def update_object(self, object_id, *, data):
+        self.calls.append(("update", object_id, dict(data)))
+        return await super().update_object(object_id, data=data)
+
+
+STATUS_TOOLS = [
+    (execution.set_campaign_status, "campaign_id", "campaign"),
+    (execution.set_adset_status, "adset_id", "adset"),
+    (execution.set_ad_status, "ad_id", "ad"),
+]
+
+
+@pytest.mark.parametrize(("tool", "id_name", "object_type"), STATUS_TOOLS)
+@pytest.mark.parametrize("status", ["ACTIVE", "PAUSED"])
+def test_set_status_active_and_paused_calls_are_unchanged(monkeypatch, tool, id_name, object_type, status) -> None:
+    """ACTIVE and PAUSED read the same fields, send the same request and return the same response as before."""
+    client = RecordingStatusClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(tool(**{id_name: "obj_1", "status": status}))
+    assert client.calls == [
+        ("get", "obj_1", ["id", "status", "effective_status"], None),
+        ("update", "obj_1", {"status": status}),
+    ]
+    assert result == {
+        "ok": True,
+        "action": f"set_{object_type}_status",
+        "target": {id_name: "obj_1"},
+        "previous": {"status": "PAUSED"},
+        "current": {"status": status},
+    }
+
+
+@pytest.mark.parametrize(("tool", "id_name", "object_type"), STATUS_TOOLS)
+def test_set_status_accepts_archived(monkeypatch, tool, id_name, object_type) -> None:
+    client = RecordingStatusClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    result = asyncio.run(tool(**{id_name: "obj_1", "status": "ARCHIVED"}))
+    assert client.calls == [
+        ("get", "obj_1", ["id", "status", "effective_status"], None),
+        ("update", "obj_1", {"status": "ARCHIVED"}),
+    ]
+    assert result["previous"] == {"status": "PAUSED"}
+    assert result["current"] == {"status": "ARCHIVED"}
+
+
+@pytest.mark.parametrize(("tool", "id_name", "object_type"), STATUS_TOOLS)
+@pytest.mark.parametrize("status", ["DELETED", "archived", "", "INHERITED_FROM_SOURCE"])
+def test_set_status_rejects_other_values(monkeypatch, tool, id_name, object_type, status) -> None:
+    client = RecordingStatusClient()
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    with pytest.raises(execution.ValidationError, match="ACTIVE, PAUSED or ARCHIVED"):
+        asyncio.run(tool(**{id_name: "obj_1", "status": status}))
+    assert not [call for call in client.calls if call[0] == "update"]
+
+
+@pytest.mark.parametrize(("tool", "id_name", "object_type"), STATUS_TOOLS)
+def test_set_status_docstring_says_archiving_cannot_be_undone_here(tool, id_name, object_type) -> None:
+    doc = tool.__doc__ or ""
+    assert "ARCHIVED" in doc
+    assert "cannot be restored to active from this server" in doc
+    assert "+" not in doc
+
+
+# Round thirty-three (review R33, EE3): the object read supplies the account whose currency
+# prices the amount written. An answer naming a different object must not decide that amount.
+class _NamedReadClient(FakeExecutionClient):
+    def __init__(self, named) -> None:
+        super().__init__()
+        self.named = named
+
+    async def get_object(self, object_id: str, *, fields=None, params=None):
+        payload = await super().get_object(object_id, fields=fields, params=params)
+        if object_id.startswith("act_") or self.named == "same":
+            return payload
+        if self.named is None:
+            payload.pop("id")
+        else:
+            payload["id"] = self.named
+        return payload
+
+
+_MONEY_WRITES = [
+    (execution.update_campaign_budget, {"campaign_id": "970000", "daily_budget": 60}, {"daily_budget": 6000}),
+    (execution.update_adset_budget, {"adset_id": "970000", "lifetime_budget": 160}, {"lifetime_budget": 16000}),
+    (execution.update_adset_bid_amount, {"adset_id": "970000", "bid_amount": 2.5}, {"bid_amount": 250}),
+    (
+        execution.update_adset_bid_strategy,
+        {"adset_id": "970000", "bid_strategy": "COST_CAP", "bid_amount": 2.5},
+        {"bid_strategy": "COST_CAP", "bid_amount": 250},
+    ),
+]
+_MONEY_IDS = ["campaign-budget", "adset-budget", "bid-amount", "bid-strategy-with-amount"]
+
+
+@pytest.mark.parametrize(("tool", "kwargs", "sent"), _MONEY_WRITES, ids=_MONEY_IDS)
+def test_ee3_money_write_stops_when_the_read_names_another_object(monkeypatch, tool, kwargs, sent) -> None:
+    client = _NamedReadClient("970999")
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    with pytest.raises(MetaApiError, match="different object.*nothing was changed"):
+        asyncio.run(tool(**kwargs))
+    assert client.updated_payloads == []
+
+
+@pytest.mark.parametrize("named", ["same", 970000, None], ids=["same-text", "same-number", "no-id"])
+@pytest.mark.parametrize(("tool", "kwargs", "sent"), _MONEY_WRITES, ids=_MONEY_IDS)
+def test_money_write_reads_an_ordinary_answer_as_before(monkeypatch, tool, kwargs, sent, named) -> None:
+    client = _NamedReadClient(named)
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    asyncio.run(tool(**kwargs))
+    assert client.updated_payloads == [("970000", sent)]
+
+
+@pytest.mark.parametrize(("tool", "kwargs"), [
+    (execution.set_campaign_status, {"campaign_id": "970000", "status": "PAUSED"}),
+    (execution.update_campaign_bid_strategy, {"campaign_id": "970000", "bid_strategy": "COST_CAP"}),
+    (execution.update_adset_bid_strategy, {"adset_id": "970000", "bid_strategy": "COST_CAP"}),
+], ids=["status", "campaign-bid-strategy", "adset-bid-strategy-without-amount"])
+def test_display_only_read_naming_another_object_is_left_as_before(monkeypatch, tool, kwargs) -> None:
+    """Accepted class: the write does not depend on the read, which only supplies previous."""
+    client = _NamedReadClient("970999")
+    monkeypatch.setattr(execution, "get_graph_api_client", lambda: client)
+    asyncio.run(tool(**kwargs))
+    assert len(client.updated_payloads) == 1

@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from meta_ads_mcp.errors import ValidationError
+from meta_ads_mcp.official_parity import official_tool_guidance, resolve_official_tool
 
 TOOL_NAME_ALIASES = {
     "get_ad_set": "get_adset",
@@ -19,13 +20,22 @@ def canonical_tool_name(name: str) -> str:
     normalized = name.strip()
     if not normalized:
         raise ValidationError("name or tool_name must identify a tool.")
-    return TOOL_NAME_ALIASES.get(normalized, normalized)
+    alias = TOOL_NAME_ALIASES.get(normalized)
+    if alias is not None:
+        return alias
+    # A name from Meta's official Ads MCP server that one tool here serves.
+    return resolve_official_tool(normalized) or normalized
 
 
 def resolve_tool_name(name: str | None, tool_name: str | None) -> str:
     """Resolve the canonical and compatibility proxy name parameters."""
     normalized_name = name.strip() if isinstance(name, str) else None
     normalized_alias = tool_name.strip() if isinstance(tool_name, str) else None
+    for candidate in (normalized_name, normalized_alias):
+        # An official Meta name served by several tools, or by none, cannot be
+        # called as one tool; say which tools to use or why there is none.
+        if candidate and (guidance := official_tool_guidance(candidate)):
+            raise ValidationError(guidance)
     canonical_name = canonical_tool_name(normalized_name) if normalized_name else None
     canonical_alias = canonical_tool_name(normalized_alias) if normalized_alias else None
     if canonical_name and canonical_alias and canonical_name != canonical_alias:

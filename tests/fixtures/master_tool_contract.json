@@ -1,0 +1,1944 @@
+{
+ "compare_performance": {
+  "defaults": {
+   "action_breakdowns": null,
+   "action_types": null,
+   "breakdowns": null,
+   "date_preset": null,
+   "fields": null,
+   "limit": 100,
+   "metrics": null,
+   "since": null,
+   "time_increment": null,
+   "until": null
+  },
+  "parameters": [
+   "action_breakdowns",
+   "action_types",
+   "breakdowns",
+   "date_preset",
+   "fields",
+   "level",
+   "limit",
+   "metrics",
+   "object_ids",
+   "since",
+   "time_increment",
+   "until"
+  ],
+  "required": [
+   "level",
+   "object_ids"
+  ]
+ },
+ "compare_time_ranges": {
+  "defaults": {
+   "fields": null
+  },
+  "parameters": [
+   "current_since",
+   "current_until",
+   "fields",
+   "level",
+   "object_id",
+   "previous_since",
+   "previous_until"
+  ],
+  "required": [
+   "current_since",
+   "current_until",
+   "level",
+   "object_id",
+   "previous_since",
+   "previous_until"
+  ]
+ },
+ "create_ad": {
+  "defaults": {
+   "bid_amount": null,
+   "creative": null,
+   "creative_id": null,
+   "params": null,
+   "status": "PAUSED",
+   "tracking_specs": null,
+   "validate_only": false
+  },
+  "parameters": [
+   "account_id",
+   "adset_id",
+   "bid_amount",
+   "creative",
+   "creative_id",
+   "name",
+   "params",
+   "status",
+   "tracking_specs",
+   "validate_only"
+  ],
+  "required": [
+   "account_id",
+   "adset_id",
+   "name"
+  ]
+ },
+ "create_ad_creative": {
+  "defaults": {
+   "asset_feed_spec": null,
+   "body": null,
+   "degrees_of_freedom_spec": null,
+   "image_hash": null,
+   "object_story_spec": null,
+   "params": null,
+   "title": null
+  },
+  "parameters": [
+   "account_id",
+   "asset_feed_spec",
+   "body",
+   "degrees_of_freedom_spec",
+   "image_hash",
+   "name",
+   "object_story_spec",
+   "params",
+   "title"
+  ],
+  "required": [
+   "account_id",
+   "name"
+  ]
+ },
+ "create_ad_set": {
+  "defaults": {
+   "bid_amount": null,
+   "bid_constraints": null,
+   "bid_strategy": null,
+   "daily_budget": null,
+   "end_time": null,
+   "lifetime_budget": null,
+   "params": null,
+   "promoted_object": null,
+   "start_time": null,
+   "status": "PAUSED",
+   "validate_only": false
+  },
+  "parameters": [
+   "account_id",
+   "bid_amount",
+   "bid_constraints",
+   "bid_strategy",
+   "billing_event",
+   "campaign_id",
+   "daily_budget",
+   "end_time",
+   "lifetime_budget",
+   "name",
+   "optimization_goal",
+   "params",
+   "promoted_object",
+   "start_time",
+   "status",
+   "targeting",
+   "validate_only"
+  ],
+  "required": [
+   "account_id",
+   "billing_event",
+   "campaign_id",
+   "name",
+   "optimization_goal",
+   "targeting"
+  ]
+ },
+ "create_async_insights_report": {
+  "defaults": {
+   "action_breakdowns": null,
+   "breakdowns": null,
+   "date_preset": null,
+   "field_preset": "lean",
+   "fields": null,
+   "filtering": null,
+   "flatten_actions": null,
+   "limit": 100,
+   "since": null,
+   "time_increment": null,
+   "until": null
+  },
+  "parameters": [
+   "action_breakdowns",
+   "breakdowns",
+   "date_preset",
+   "field_preset",
+   "fields",
+   "filtering",
+   "flatten_actions",
+   "level",
+   "limit",
+   "object_id",
+   "since",
+   "time_increment",
+   "until"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "create_async_insights_report_batch": {
+  "defaults": {
+   "action_breakdowns": null,
+   "date_preset": null,
+   "field_preset": "lean",
+   "fields": null,
+   "filtering": null,
+   "flatten_actions": null,
+   "limit": 100,
+   "since": null,
+   "time_increment": null,
+   "until": null
+  },
+  "parameters": [
+   "action_breakdowns",
+   "breakdown_sets",
+   "date_preset",
+   "field_preset",
+   "fields",
+   "filtering",
+   "flatten_actions",
+   "level",
+   "limit",
+   "object_id",
+   "since",
+   "time_increment",
+   "until"
+  ],
+  "required": [
+   "breakdown_sets",
+   "level",
+   "object_id"
+  ]
+ },
+ "create_campaign": {
+  "defaults": {
+   "bid_strategy": null,
+   "buying_type": null,
+   "daily_budget": null,
+   "lifetime_budget": null,
+   "params": null,
+   "special_ad_categories": null,
+   "status": "PAUSED",
+   "validate_only": false
+  },
+  "parameters": [
+   "account_id",
+   "bid_strategy",
+   "buying_type",
+   "daily_budget",
+   "lifetime_budget",
+   "name",
+   "objective",
+   "params",
+   "special_ad_categories",
+   "status",
+   "validate_only"
+  ],
+  "required": [
+   "account_id",
+   "name",
+   "objective"
+  ]
+ },
+ "create_custom_audience": {
+  "defaults": {
+   "customer_file_source": null,
+   "description": null,
+   "params": null,
+   "prefill": false,
+   "retention_days": null,
+   "rule": null,
+   "subtype": "CUSTOM"
+  },
+  "parameters": [
+   "account_id",
+   "customer_file_source",
+   "description",
+   "name",
+   "params",
+   "prefill",
+   "retention_days",
+   "rule",
+   "subtype"
+  ],
+  "required": [
+   "account_id",
+   "name"
+  ]
+ },
+ "create_lookalike_audience": {
+  "defaults": {
+   "countries": null,
+   "country": null,
+   "description": null,
+   "lookalike_type": null,
+   "params": null,
+   "ratio": null,
+   "starting_ratio": null
+  },
+  "parameters": [
+   "account_id",
+   "countries",
+   "country",
+   "description",
+   "lookalike_type",
+   "name",
+   "origin_audience_id",
+   "params",
+   "ratio",
+   "starting_ratio"
+  ],
+  "required": [
+   "account_id",
+   "name",
+   "origin_audience_id"
+  ]
+ },
+ "delete_ad": {
+  "defaults": {},
+  "parameters": [
+   "ad_id"
+  ],
+  "required": [
+   "ad_id"
+  ]
+ },
+ "delete_adset": {
+  "defaults": {},
+  "parameters": [
+   "adset_id"
+  ],
+  "required": [
+   "adset_id"
+  ]
+ },
+ "delete_audience": {
+  "defaults": {},
+  "parameters": [
+   "audience_id"
+  ],
+  "required": [
+   "audience_id"
+  ]
+ },
+ "delete_campaign": {
+  "defaults": {},
+  "parameters": [
+   "campaign_id"
+  ],
+  "required": [
+   "campaign_id"
+  ]
+ },
+ "delete_creative": {
+  "defaults": {},
+  "parameters": [
+   "creative_id"
+  ],
+  "required": [
+   "creative_id"
+  ]
+ },
+ "delete_overflow_artifact": {
+  "defaults": {},
+  "parameters": [
+   "export_id"
+  ],
+  "required": [
+   "export_id"
+  ]
+ },
+ "detect_auction_overlap": {
+  "defaults": {
+   "campaign_ids": null,
+   "date_preset": "last_30d",
+   "max_campaigns": 12,
+   "min_platform_spend": 1.0,
+   "since": null,
+   "until": null
+  },
+  "parameters": [
+   "account_id",
+   "campaign_ids",
+   "date_preset",
+   "max_campaigns",
+   "min_platform_spend",
+   "since",
+   "until"
+  ],
+  "required": [
+   "account_id"
+  ]
+ },
+ "estimate_audience_size": {
+  "defaults": {
+   "account_id": null,
+   "optimization_goal": null
+  },
+  "parameters": [
+   "account_id",
+   "optimization_goal",
+   "targeting_spec"
+  ],
+  "required": [
+   "targeting_spec"
+  ]
+ },
+ "exchange_code_for_token": {
+  "defaults": {
+   "app_id": null,
+   "app_secret": null,
+   "redirect_uri": null
+  },
+  "parameters": [
+   "app_id",
+   "app_secret",
+   "code",
+   "redirect_uri"
+  ],
+  "required": [
+   "code"
+  ]
+ },
+ "export_change_history": {
+  "defaults": {
+   "account_id": null,
+   "ad_id": null,
+   "adset_id": null,
+   "after": null,
+   "business_id": null,
+   "campaign_id": null,
+   "category": null,
+   "data_source": null,
+   "extra_oids": null,
+   "include_descendants": true,
+   "inline_limit": 10,
+   "level": null,
+   "limit": 100,
+   "max_pages": 100,
+   "object_id": null,
+   "time_zone": "UTC",
+   "uid": null
+  },
+  "parameters": [
+   "account_id",
+   "ad_id",
+   "adset_id",
+   "after",
+   "business_id",
+   "campaign_id",
+   "category",
+   "data_source",
+   "extra_oids",
+   "include_descendants",
+   "inline_limit",
+   "level",
+   "limit",
+   "max_pages",
+   "object_id",
+   "since",
+   "time_zone",
+   "uid",
+   "until"
+  ],
+  "required": [
+   "since",
+   "until"
+  ]
+ },
+ "export_insights": {
+  "defaults": {
+   "action_breakdowns": null,
+   "action_types": null,
+   "after": null,
+   "allow_large_output": false,
+   "breakdowns": null,
+   "date_preset": null,
+   "fetch_all": false,
+   "fields": null,
+   "filtering": null,
+   "flatten_actions": null,
+   "format": "json",
+   "inline_limit": 100,
+   "limit": 100,
+   "since": null,
+   "time_increment": null,
+   "until": null
+  },
+  "parameters": [
+   "action_breakdowns",
+   "action_types",
+   "after",
+   "allow_large_output",
+   "breakdowns",
+   "date_preset",
+   "fetch_all",
+   "fields",
+   "filtering",
+   "flatten_actions",
+   "format",
+   "inline_limit",
+   "level",
+   "limit",
+   "object_id",
+   "since",
+   "time_increment",
+   "until"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "generate_auth_url": {
+  "defaults": {
+   "app_id": null,
+   "redirect_uri": null,
+   "response_type": "code",
+   "scopes": null,
+   "state": null
+  },
+  "parameters": [
+   "app_id",
+   "redirect_uri",
+   "response_type",
+   "scopes",
+   "state"
+  ],
+  "required": []
+ },
+ "generate_system_user_token": {
+  "defaults": {
+   "access_token": null,
+   "app_id": null,
+   "business_app": null
+  },
+  "parameters": [
+   "access_token",
+   "app_id",
+   "business_app",
+   "scope",
+   "system_user_id"
+  ],
+  "required": [
+   "scope",
+   "system_user_id"
+  ]
+ },
+ "get_account_health_snapshot": {
+  "defaults": {
+   "date_preset": "last_30d",
+   "include_previous": true,
+   "include_year_over_year": true,
+   "since": null,
+   "until": null
+  },
+  "parameters": [
+   "account_id",
+   "date_preset",
+   "include_previous",
+   "include_year_over_year",
+   "since",
+   "until"
+  ],
+  "required": [
+   "account_id"
+  ]
+ },
+ "get_account_optimization_snapshot": {
+  "defaults": {
+   "compare_to_previous": false,
+   "date_preset": "last_7d",
+   "since": null,
+   "top_n": 5,
+   "until": null
+  },
+  "parameters": [
+   "account_id",
+   "compare_to_previous",
+   "date_preset",
+   "since",
+   "top_n",
+   "until"
+  ],
+  "required": [
+   "account_id"
+  ]
+ },
+ "get_account_pages": {
+  "defaults": {
+   "account_id": "me",
+   "after": null,
+   "fields": null,
+   "limit": 50
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "fields",
+   "limit"
+  ],
+  "required": []
+ },
+ "get_ad": {
+  "defaults": {
+   "fields": null,
+   "include_creative_summary": false
+  },
+  "parameters": [
+   "ad_id",
+   "fields",
+   "include_creative_summary"
+  ],
+  "required": [
+   "ad_id"
+  ]
+ },
+ "get_ad_account": {
+  "defaults": {
+   "fields": null
+  },
+  "parameters": [
+   "account_id",
+   "fields"
+  ],
+  "required": [
+   "account_id"
+  ]
+ },
+ "get_ad_feedback_signals": {
+  "defaults": {
+   "account_id": null,
+   "ad_id": null,
+   "adset_id": null,
+   "campaign_id": null,
+   "date_preset": "last_30d",
+   "level": null,
+   "object_id": null,
+   "since": null,
+   "top_n": 10,
+   "until": null
+  },
+  "parameters": [
+   "account_id",
+   "ad_id",
+   "adset_id",
+   "campaign_id",
+   "date_preset",
+   "level",
+   "object_id",
+   "since",
+   "top_n",
+   "until"
+  ],
+  "required": []
+ },
+ "get_ad_image": {
+  "defaults": {
+   "ad_id": null,
+   "ad_ids": null
+  },
+  "parameters": [
+   "ad_id",
+   "ad_ids"
+  ],
+  "required": []
+ },
+ "get_ad_social_context": {
+  "defaults": {
+   "resolve_creative": true
+  },
+  "parameters": [
+   "ad_id",
+   "resolve_creative"
+  ],
+  "required": [
+   "ad_id"
+  ]
+ },
+ "get_adset": {
+  "defaults": {
+   "fields": null
+  },
+  "parameters": [
+   "adset_id",
+   "fields"
+  ],
+  "required": [
+   "adset_id"
+  ]
+ },
+ "get_async_insights_report": {
+  "defaults": {
+   "action_types": null,
+   "after": null,
+   "fields": null,
+   "flatten_actions": null,
+   "include_raw_actions": false,
+   "limit": 100,
+   "poll_interval_seconds": 2.0,
+   "wait": false,
+   "wait_timeout_seconds": 30.0
+  },
+  "parameters": [
+   "action_types",
+   "after",
+   "fields",
+   "flatten_actions",
+   "include_raw_actions",
+   "limit",
+   "poll_interval_seconds",
+   "report_run_id",
+   "wait",
+   "wait_timeout_seconds"
+  ],
+  "required": [
+   "report_run_id"
+  ]
+ },
+ "get_audience": {
+  "defaults": {
+   "fields": null
+  },
+  "parameters": [
+   "audience_id",
+   "fields"
+  ],
+  "required": [
+   "audience_id"
+  ]
+ },
+ "get_audience_opportunities": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "campaign_id": null,
+   "limit": 25,
+   "recommendation_names": null,
+   "recommendation_stages": null,
+   "refresh": false
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "campaign_id",
+   "limit",
+   "recommendation_names",
+   "recommendation_stages",
+   "refresh"
+  ],
+  "required": []
+ },
+ "get_audience_performance_report": {
+  "defaults": {
+   "date_preset": "last_7d",
+   "segment_by": "country",
+   "since": null,
+   "until": null
+  },
+  "parameters": [
+   "date_preset",
+   "level",
+   "object_id",
+   "segment_by",
+   "since",
+   "until"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "get_bidding_opportunities": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "campaign_id": null,
+   "limit": 25,
+   "recommendation_names": null,
+   "recommendation_stages": null,
+   "refresh": false
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "campaign_id",
+   "limit",
+   "recommendation_names",
+   "recommendation_stages",
+   "refresh"
+  ],
+  "required": []
+ },
+ "get_budget_opportunities": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "campaign_id": null,
+   "limit": 25,
+   "recommendation_names": null,
+   "recommendation_stages": null,
+   "refresh": false
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "campaign_id",
+   "limit",
+   "recommendation_names",
+   "recommendation_stages",
+   "refresh"
+  ],
+  "required": []
+ },
+ "get_budget_pacing_report": {
+  "defaults": {
+   "date_preset": "last_7d",
+   "include_full_daily_rows": false,
+   "since": null,
+   "until": null
+  },
+  "parameters": [
+   "date_preset",
+   "include_full_daily_rows",
+   "level",
+   "object_id",
+   "since",
+   "until"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "get_campaign": {
+  "defaults": {
+   "fields": null
+  },
+  "parameters": [
+   "campaign_id",
+   "fields"
+  ],
+  "required": [
+   "campaign_id"
+  ]
+ },
+ "get_campaign_optimization_snapshot": {
+  "defaults": {
+   "date_preset": "last_7d",
+   "include_native_signals": false,
+   "since": null,
+   "top_n_ads": 5,
+   "top_n_adsets": 5,
+   "until": null
+  },
+  "parameters": [
+   "campaign_id",
+   "date_preset",
+   "include_native_signals",
+   "since",
+   "top_n_ads",
+   "top_n_adsets",
+   "until"
+  ],
+  "required": [
+   "campaign_id"
+  ]
+ },
+ "get_capabilities": {
+  "defaults": {
+   "include_full_manifest": false,
+   "intent": null,
+   "tool_name": null
+  },
+  "parameters": [
+   "include_full_manifest",
+   "intent",
+   "tool_name"
+  ],
+  "required": []
+ },
+ "get_creative": {
+  "defaults": {
+   "fields": null
+  },
+  "parameters": [
+   "creative_id",
+   "fields"
+  ],
+  "required": [
+   "creative_id"
+  ]
+ },
+ "get_creative_fatigue_report": {
+  "defaults": {
+   "account_id": null,
+   "adset_id": null,
+   "campaign_id": null,
+   "current_window_days": 7,
+   "level": null,
+   "max_ads": 1000,
+   "max_creative_lookups": 100,
+   "min_impressions": 1000,
+   "object_id": null,
+   "previous_since": null,
+   "previous_until": null,
+   "previous_window_days": 7,
+   "since": null,
+   "until": null
+  },
+  "parameters": [
+   "account_id",
+   "adset_id",
+   "campaign_id",
+   "current_window_days",
+   "level",
+   "max_ads",
+   "max_creative_lookups",
+   "min_impressions",
+   "object_id",
+   "previous_since",
+   "previous_until",
+   "previous_window_days",
+   "since",
+   "until"
+  ],
+  "required": []
+ },
+ "get_creative_opportunities": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "campaign_id": null,
+   "limit": 25,
+   "recommendation_names": null,
+   "recommendation_stages": null,
+   "refresh": false
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "campaign_id",
+   "limit",
+   "recommendation_names",
+   "recommendation_stages",
+   "refresh"
+  ],
+  "required": []
+ },
+ "get_creative_performance_report": {
+  "defaults": {
+   "account_id": null,
+   "adset_id": null,
+   "campaign_id": null,
+   "date_preset": "last_7d",
+   "include_quality_rankings": true,
+   "level": null,
+   "object_id": null,
+   "since": null,
+   "top_n": 10,
+   "until": null
+  },
+  "parameters": [
+   "account_id",
+   "adset_id",
+   "campaign_id",
+   "date_preset",
+   "include_quality_rankings",
+   "level",
+   "object_id",
+   "since",
+   "top_n",
+   "until"
+  ],
+  "required": []
+ },
+ "get_delivery_opportunities": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "campaign_id": null,
+   "limit": 25,
+   "recommendation_names": null,
+   "recommendation_stages": null,
+   "refresh": false
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "campaign_id",
+   "limit",
+   "recommendation_names",
+   "recommendation_stages",
+   "refresh"
+  ],
+  "required": []
+ },
+ "get_delivery_risk_report": {
+  "defaults": {
+   "adset_id": null,
+   "campaign_id": null,
+   "date_preset": "last_7d",
+   "level": null,
+   "object_id": null,
+   "since": null,
+   "until": null
+  },
+  "parameters": [
+   "adset_id",
+   "campaign_id",
+   "date_preset",
+   "level",
+   "object_id",
+   "since",
+   "until"
+  ],
+  "required": []
+ },
+ "get_entity_insights": {
+  "defaults": {
+   "action_attribution_windows": null,
+   "action_breakdowns": null,
+   "action_types": null,
+   "after": null,
+   "breakdowns": null,
+   "date_preset": null,
+   "fetch_all": false,
+   "fields": null,
+   "filtering": null,
+   "flatten_actions": null,
+   "include_instagram_profile_follow": false,
+   "include_raw_actions": false,
+   "limit": 100,
+   "since": null,
+   "time_increment": null,
+   "until": null,
+   "use_unified_attribution_setting": true
+  },
+  "parameters": [
+   "action_attribution_windows",
+   "action_breakdowns",
+   "action_types",
+   "after",
+   "breakdowns",
+   "date_preset",
+   "fetch_all",
+   "fields",
+   "filtering",
+   "flatten_actions",
+   "include_instagram_profile_follow",
+   "include_raw_actions",
+   "level",
+   "limit",
+   "object_id",
+   "since",
+   "time_increment",
+   "until",
+   "use_unified_attribution_setting"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "get_insights": {
+  "defaults": {
+   "action_attribution_windows": null,
+   "action_breakdowns": null,
+   "action_types": null,
+   "after": null,
+   "breakdowns": null,
+   "date_preset": null,
+   "fetch_all": false,
+   "fields": null,
+   "filtering": null,
+   "flatten_actions": null,
+   "include_raw_actions": false,
+   "limit": 100,
+   "since": null,
+   "time_increment": null,
+   "time_range": null,
+   "until": null,
+   "use_unified_attribution_setting": true
+  },
+  "parameters": [
+   "action_attribution_windows",
+   "action_breakdowns",
+   "action_types",
+   "after",
+   "breakdowns",
+   "date_preset",
+   "fetch_all",
+   "fields",
+   "filtering",
+   "flatten_actions",
+   "include_raw_actions",
+   "level",
+   "limit",
+   "object_id",
+   "since",
+   "time_increment",
+   "time_range",
+   "until",
+   "use_unified_attribution_setting"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "get_interest_suggestions": {
+  "defaults": {
+   "after": null,
+   "limit": 25
+  },
+  "parameters": [
+   "after",
+   "interest_list",
+   "limit"
+  ],
+  "required": [
+   "interest_list"
+  ]
+ },
+ "get_learning_phase_report": {
+  "defaults": {
+   "adset_id": null,
+   "campaign_id": null,
+   "level": null,
+   "object_id": null
+  },
+  "parameters": [
+   "adset_id",
+   "campaign_id",
+   "level",
+   "object_id"
+  ],
+  "required": []
+ },
+ "get_meta_object_model": {
+  "defaults": {},
+  "parameters": [],
+  "required": []
+ },
+ "get_metrics_reference": {
+  "defaults": {},
+  "parameters": [],
+  "required": []
+ },
+ "get_native_optimization_signals": {
+  "defaults": {},
+  "parameters": [
+   "level",
+   "object_id"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "get_optimization_playbook": {
+  "defaults": {},
+  "parameters": [],
+  "required": []
+ },
+ "get_performance_breakdown": {
+  "defaults": {
+   "after": null,
+   "date_preset": null,
+   "fields": null,
+   "since": null,
+   "sort_by": "spend",
+   "until": null
+  },
+  "parameters": [
+   "after",
+   "breakdown",
+   "date_preset",
+   "fields",
+   "level",
+   "object_id",
+   "since",
+   "sort_by",
+   "until"
+  ],
+  "required": [
+   "breakdown",
+   "level",
+   "object_id"
+  ]
+ },
+ "get_reach_frequency_predictions": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "limit": 25
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "limit"
+  ],
+  "required": []
+ },
+ "get_recommendations": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "campaign_id": null,
+   "limit": 25,
+   "object_id": null,
+   "recommendation_names": null,
+   "recommendation_stages": null,
+   "refresh": false
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "campaign_id",
+   "limit",
+   "object_id",
+   "recommendation_names",
+   "recommendation_stages",
+   "refresh"
+  ],
+  "required": []
+ },
+ "get_targeting_categories": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "limit": 25,
+   "query": null
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "category_class",
+   "limit",
+   "query"
+  ],
+  "required": [
+   "category_class"
+  ]
+ },
+ "get_token_info": {
+  "defaults": {
+   "app_id": null,
+   "app_secret": null,
+   "debug_access_token": null,
+   "input_token": null
+  },
+  "parameters": [
+   "app_id",
+   "app_secret",
+   "debug_access_token",
+   "input_token"
+  ],
+  "required": []
+ },
+ "get_v25_notes": {
+  "defaults": {},
+  "parameters": [],
+  "required": []
+ },
+ "get_v26_notes": {
+  "defaults": {},
+  "parameters": [],
+  "required": []
+ },
+ "health_check": {
+  "defaults": {},
+  "parameters": [],
+  "required": []
+ },
+ "list_ad_accounts": {
+  "defaults": {
+   "after": null,
+   "limit": 25
+  },
+  "parameters": [
+   "after",
+   "limit"
+  ],
+  "required": []
+ },
+ "list_ad_comments": {
+  "defaults": {
+   "ad_id": null,
+   "after": null,
+   "comment_filter": "stream",
+   "include_author": false,
+   "include_replies": false,
+   "instagram_media_id": null,
+   "limit": 25,
+   "max_message_chars": 500,
+   "object_story_id": null,
+   "order": "reverse_chronological",
+   "reply_limit": 3,
+   "surface": "auto"
+  },
+  "parameters": [
+   "ad_id",
+   "after",
+   "comment_filter",
+   "include_author",
+   "include_replies",
+   "instagram_media_id",
+   "limit",
+   "max_message_chars",
+   "object_story_id",
+   "order",
+   "reply_limit",
+   "surface"
+  ],
+  "required": []
+ },
+ "list_ads": {
+  "defaults": {
+   "account_id": null,
+   "adset_id": null,
+   "after": null,
+   "campaign_id": null,
+   "effective_status": null,
+   "fields": null,
+   "limit": 50,
+   "name_contains": null,
+   "name_contains_any": null,
+   "whole_term_match": false
+  },
+  "parameters": [
+   "account_id",
+   "adset_id",
+   "after",
+   "campaign_id",
+   "effective_status",
+   "fields",
+   "limit",
+   "name_contains",
+   "name_contains_any",
+   "whole_term_match"
+  ],
+  "required": []
+ },
+ "list_adsets": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "campaign_id": null,
+   "effective_status": null,
+   "limit": 50,
+   "name_contains": null
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "campaign_id",
+   "effective_status",
+   "limit",
+   "name_contains"
+  ],
+  "required": []
+ },
+ "list_audiences": {
+  "defaults": {
+   "after": null,
+   "fields": null,
+   "limit": 50,
+   "subtype": null
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "fields",
+   "limit",
+   "subtype"
+  ],
+  "required": [
+   "account_id"
+  ]
+ },
+ "list_campaigns": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "effective_status": null,
+   "fields": null,
+   "limit": 50,
+   "name_contains": null
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "effective_status",
+   "fields",
+   "limit",
+   "name_contains"
+  ],
+  "required": []
+ },
+ "list_change_history": {
+  "defaults": {
+   "account_id": null,
+   "ad_id": null,
+   "adset_id": null,
+   "after": null,
+   "business_id": null,
+   "campaign_id": null,
+   "category": null,
+   "data_source": null,
+   "extra_oids": null,
+   "fields": null,
+   "include_descendants": false,
+   "level": null,
+   "limit": 50,
+   "object_id": null,
+   "since": null,
+   "time_zone": "UTC",
+   "uid": null,
+   "until": null
+  },
+  "parameters": [
+   "account_id",
+   "ad_id",
+   "adset_id",
+   "after",
+   "business_id",
+   "campaign_id",
+   "category",
+   "data_source",
+   "extra_oids",
+   "fields",
+   "include_descendants",
+   "level",
+   "limit",
+   "object_id",
+   "since",
+   "time_zone",
+   "uid",
+   "until"
+  ],
+  "required": []
+ },
+ "list_comment_replies": {
+  "defaults": {
+   "after": null,
+   "include_author": false,
+   "limit": 25,
+   "max_message_chars": 500
+  },
+  "parameters": [
+   "after",
+   "comment_id",
+   "include_author",
+   "limit",
+   "max_message_chars",
+   "surface"
+  ],
+  "required": [
+   "comment_id",
+   "surface"
+  ]
+ },
+ "list_creatives": {
+  "defaults": {
+   "after": null,
+   "fields": null,
+   "limit": 50
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "fields",
+   "limit"
+  ],
+  "required": [
+   "account_id"
+  ]
+ },
+ "list_instagram_accounts": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "fields": null,
+   "limit": 50
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "fields",
+   "limit"
+  ],
+  "required": []
+ },
+ "list_mutation_tools": {
+  "defaults": {},
+  "parameters": [],
+  "required": []
+ },
+ "list_page_recommendations": {
+  "defaults": {
+   "after": null,
+   "include_reviewer": false,
+   "limit": 25,
+   "max_message_chars": 500
+  },
+  "parameters": [
+   "after",
+   "include_reviewer",
+   "limit",
+   "max_message_chars",
+   "page_id"
+  ],
+  "required": [
+   "page_id"
+  ]
+ },
+ "preview_ad": {
+  "defaults": {
+   "account_id": null,
+   "ad_format": "DESKTOP_FEED_STANDARD",
+   "ad_id": null,
+   "creative": null,
+   "creative_id": null
+  },
+  "parameters": [
+   "account_id",
+   "ad_format",
+   "ad_id",
+   "creative",
+   "creative_id"
+  ],
+  "required": []
+ },
+ "read_overflow_artifact": {
+  "defaults": {
+   "item_limit": 100,
+   "item_offset": null,
+   "max_bytes": 44000,
+   "offset": null
+  },
+  "parameters": [
+   "export_id",
+   "item_limit",
+   "item_offset",
+   "max_bytes",
+   "offset"
+  ],
+  "required": [
+   "export_id"
+  ]
+ },
+ "refresh_to_long_lived_token": {
+  "defaults": {
+   "access_token": null,
+   "app_id": null,
+   "app_secret": null
+  },
+  "parameters": [
+   "access_token",
+   "app_id",
+   "app_secret"
+  ],
+  "required": []
+ },
+ "search_ads_archive": {
+  "defaults": {
+   "ad_type": "ALL",
+   "after": null,
+   "fields": null,
+   "limit": 25
+  },
+  "parameters": [
+   "ad_reached_countries",
+   "ad_type",
+   "after",
+   "fields",
+   "limit",
+   "search_terms"
+  ],
+  "required": [
+   "ad_reached_countries",
+   "search_terms"
+  ]
+ },
+ "search_behaviors": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "limit": 25,
+   "query": null
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "limit",
+   "query"
+  ],
+  "required": []
+ },
+ "search_demographics": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "demographic_class": "demographics",
+   "limit": 25,
+   "query": null
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "demographic_class",
+   "limit",
+   "query"
+  ],
+  "required": []
+ },
+ "search_geo_locations": {
+  "defaults": {
+   "after": null,
+   "limit": 25,
+   "location_types": null
+  },
+  "parameters": [
+   "after",
+   "limit",
+   "location_types",
+   "query"
+  ],
+  "required": [
+   "query"
+  ]
+ },
+ "search_interests": {
+  "defaults": {
+   "account_id": null,
+   "after": null,
+   "limit": 25
+  },
+  "parameters": [
+   "account_id",
+   "after",
+   "limit",
+   "query"
+  ],
+  "required": [
+   "query"
+  ]
+ },
+ "set_ad_status": {
+  "defaults": {},
+  "parameters": [
+   "ad_id",
+   "status"
+  ],
+  "required": [
+   "ad_id",
+   "status"
+  ]
+ },
+ "set_adset_status": {
+  "defaults": {},
+  "parameters": [
+   "adset_id",
+   "status"
+  ],
+  "required": [
+   "adset_id",
+   "status"
+  ]
+ },
+ "set_campaign_status": {
+  "defaults": {},
+  "parameters": [
+   "campaign_id",
+   "status"
+  ],
+  "required": [
+   "campaign_id",
+   "status"
+  ]
+ },
+ "setup_ab_test": {
+  "defaults": {
+   "ad_study_type": "SPLIT_TEST_V2",
+   "cell_ids": null,
+   "confidence_level": null,
+   "description": null,
+   "end_time": null,
+   "hypothesis": null,
+   "observation_type": null,
+   "params": null,
+   "start_time": null
+  },
+  "parameters": [
+   "ad_study_type",
+   "cell_ids",
+   "confidence_level",
+   "description",
+   "end_time",
+   "hypothesis",
+   "name",
+   "observation_type",
+   "owner_id",
+   "params",
+   "start_time"
+  ],
+  "required": [
+   "name",
+   "owner_id"
+  ]
+ },
+ "summarize_actions": {
+  "defaults": {
+   "action_types": null,
+   "after": null,
+   "breakdowns": null,
+   "date_preset": null,
+   "include_all_action_totals": false,
+   "include_rows": false,
+   "limit": 100,
+   "max_action_types": 25,
+   "since": null,
+   "time_increment": null,
+   "time_range": null,
+   "until": null
+  },
+  "parameters": [
+   "action_types",
+   "after",
+   "breakdowns",
+   "date_preset",
+   "include_all_action_totals",
+   "include_rows",
+   "level",
+   "limit",
+   "max_action_types",
+   "object_id",
+   "since",
+   "time_increment",
+   "time_range",
+   "until"
+  ],
+  "required": [
+   "level",
+   "object_id"
+  ]
+ },
+ "summarize_async_insights_report": {
+  "defaults": {
+   "after": null,
+   "group_by": null,
+   "max_pages": 250,
+   "metrics": null,
+   "page_size": 500,
+   "timeout_seconds": 30.0
+  },
+  "parameters": [
+   "after",
+   "group_by",
+   "max_pages",
+   "metrics",
+   "page_size",
+   "report_run_id",
+   "timeout_seconds"
+  ],
+  "required": [
+   "report_run_id"
+  ]
+ },
+ "update_ad_creative": {
+  "defaults": {},
+  "parameters": [
+   "ad_id",
+   "creative_id"
+  ],
+  "required": [
+   "ad_id",
+   "creative_id"
+  ]
+ },
+ "update_adset_bid_amount": {
+  "defaults": {},
+  "parameters": [
+   "adset_id",
+   "bid_amount"
+  ],
+  "required": [
+   "adset_id",
+   "bid_amount"
+  ]
+ },
+ "update_adset_bid_strategy": {
+  "defaults": {
+   "bid_amount": null,
+   "bid_constraints": null
+  },
+  "parameters": [
+   "adset_id",
+   "bid_amount",
+   "bid_constraints",
+   "bid_strategy"
+  ],
+  "required": [
+   "adset_id",
+   "bid_strategy"
+  ]
+ },
+ "update_adset_budget": {
+  "defaults": {
+   "daily_budget": null,
+   "lifetime_budget": null
+  },
+  "parameters": [
+   "adset_id",
+   "daily_budget",
+   "lifetime_budget"
+  ],
+  "required": [
+   "adset_id"
+  ]
+ },
+ "update_campaign": {
+  "defaults": {
+   "daily_budget": null,
+   "lifetime_budget": null,
+   "name": null,
+   "objective": null,
+   "params": null,
+   "status": null
+  },
+  "parameters": [
+   "campaign_id",
+   "daily_budget",
+   "lifetime_budget",
+   "name",
+   "objective",
+   "params",
+   "status"
+  ],
+  "required": [
+   "campaign_id"
+  ]
+ },
+ "update_campaign_bid_strategy": {
+  "defaults": {},
+  "parameters": [
+   "bid_strategy",
+   "campaign_id"
+  ],
+  "required": [
+   "bid_strategy",
+   "campaign_id"
+  ]
+ },
+ "update_campaign_budget": {
+  "defaults": {
+   "daily_budget": null,
+   "lifetime_budget": null
+  },
+  "parameters": [
+   "campaign_id",
+   "daily_budget",
+   "lifetime_budget"
+  ],
+  "required": [
+   "campaign_id"
+  ]
+ },
+ "update_creative": {
+  "defaults": {
+   "asset_feed_spec": null,
+   "body": null,
+   "name": null,
+   "object_story_spec": null,
+   "params": null,
+   "status": null,
+   "title": null
+  },
+  "parameters": [
+   "asset_feed_spec",
+   "body",
+   "creative_id",
+   "name",
+   "object_story_spec",
+   "params",
+   "status",
+   "title"
+  ],
+  "required": [
+   "creative_id"
+  ]
+ },
+ "update_custom_audience": {
+  "defaults": {
+   "customer_file_source": null,
+   "description": null,
+   "name": null,
+   "params": null,
+   "retention_days": null
+  },
+  "parameters": [
+   "audience_id",
+   "customer_file_source",
+   "description",
+   "name",
+   "params",
+   "retention_days"
+  ],
+  "required": [
+   "audience_id"
+  ]
+ },
+ "upload_creative_asset": {
+  "defaults": {
+   "file_path": null,
+   "image_url": null,
+   "name": null
+  },
+  "parameters": [
+   "account_id",
+   "file_path",
+   "image_url",
+   "name"
+  ],
+  "required": [
+   "account_id"
+  ]
+ },
+ "validate_interests": {
+  "defaults": {
+   "after": null,
+   "interest_ids": null,
+   "interest_list": null
+  },
+  "parameters": [
+   "after",
+   "interest_ids",
+   "interest_list"
+  ],
+  "required": []
+ },
+ "validate_token": {
+  "defaults": {
+   "app_id": null,
+   "app_secret": null,
+   "debug_access_token": null,
+   "input_token": null
+  },
+  "parameters": [
+   "app_id",
+   "app_secret",
+   "debug_access_token",
+   "input_token"
+  ],
+  "required": []
+ }
+}

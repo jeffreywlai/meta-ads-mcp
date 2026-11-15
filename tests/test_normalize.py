@@ -74,3 +74,88 @@ def test_derive_core_metrics_computes_kpis() -> None:
     assert metrics["cpm"] == 120.0
     assert metrics["cpa"] == 30.0
     assert round(metrics["roas"], 2) == 3.33
+
+
+def test_read_collection_page_only_reads_a_data_list() -> None:
+    import pytest
+    from meta_ads_mcp.normalize import read_collection_page
+
+    assert read_collection_page({"data": []}) == ([], 0, False)
+    assert read_collection_page({"data": [{"id": "1"}, None, "x", {"id": "2"}]}) == ([{"id": "1"}, {"id": "2"}], 2, False)
+    for unreadable in ({}, {"data": None}, {"data": {"id": "1"}}, {"data": "x"}, None, [], "text", 3):
+        assert read_collection_page(unreadable) == ([], 0, True), unreadable
+    assert pytest is not None
+
+
+def test_collection_fault_names_why_a_page_is_not_complete() -> None:
+    from meta_ads_mcp.normalize import collection_fault
+
+    assert collection_fault({"data": []}) is None
+    assert collection_fault({"data": [{"id": "1"}]}) is None
+    assert "no list of results" in collection_fault({})
+    assert "no list of results" in collection_fault({"data": None})
+    assert collection_fault({"data": [None]}).startswith("1 entry ")
+    assert collection_fault({"data": [{"id": "1"}, "x", 3]}).startswith("2 entries ")
+
+
+# Round thirty-three: the one comparison that says an answer is about a different object.
+
+
+@pytest.mark.parametrize(("requested", "answer", "expected"), [
+    ("123", {"id": "123"}, False), ("123", {"id": 123}, False), ("123", {"id": " 123 "}, False),
+    ("act_123", {"id": "act_123"}, False), ("act_123", {"id": "123"}, False), ("123", {"id": "act_123"}, False),
+    (123, {"id": "123"}, False),
+    ("123", {}, False), ("123", {"id": None}, False), ("123", {"id": ""}, False), ("123", {"name": "x"}, False),
+    ("me", {"id": "456"}, False), ("123", {"id": "me"}, False), ("123", {"id": True}, False),
+    ("123", {"id": ["456"]}, False), ("123", {"id": {"id": "456"}}, False), ("123", {"id": "12_34"}, False),
+    ("123", None, False), ("123", [{"id": "456"}], False), ("123", "456", False), (None, {"id": "456"}, False),
+    ("123", {"id": "456"}, True), ("123", {"id": 456}, True), ("act_123", {"id": "act_456"}, True),
+    ("act_123", {"id": "456"}, True), ("123", {"id": "0123"}, True),
+])
+def test_names_other_object_is_true_only_for_a_readable_different_id(requested, answer, expected) -> None:
+    from meta_ads_mcp.normalize import names_other_object
+
+    assert names_other_object(requested, answer) is expected
+
+
+def test_names_other_object_reads_the_key_it_is_given() -> None:
+    from meta_ads_mcp.normalize import names_other_object
+
+    assert names_other_object("123", {"audience_id": "456"}, key="audience_id") is True
+    assert names_other_object("123", {"audience_id": "123", "id": "456"}, key="audience_id") is False
+
+
+# Round thirty-four: one reader for "the id of an object a create just made".
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("123", "123"), (123, "123"), (" 123 ", "123"), ("act_123", "act_123"), ("111_222", "111_222"), ("0", "0"),
+    (True, None), (False, None), (-12, None), (1.5, None), (123.0, None), ("not_an_id", None), ("", None), (" ", None),
+    (None, None), (["123"], None), ({"id": "123"}, None), ("12a", None), ("act_", None), ("1__2", None), ("-12", None),
+])
+def test_graph_id_text_reads_only_an_id(value, expected) -> None:
+    from meta_ads_mcp.normalize import graph_id_text
+
+    assert graph_id_text(value) == expected
+
+
+@pytest.mark.parametrize(("first", "second", "expected"), [
+    ("123", "123", True), ("123", 123, True), (" 123 ", "123", True), ("act_123", "123", True), ("act_123", "act_123", True),
+    ("123", "456", False), ("123", None, False), (None, None, False), ("abc", "abc", False), ("111_222", "111_222", True),
+    ("111_222", "111", False),
+])
+def test_same_object_id_compares_by_value(first, second, expected) -> None:
+    from meta_ads_mcp.normalize import same_object_id
+
+    assert same_object_id(first, second) is expected
+
+
+@pytest.mark.parametrize(("value", "known", "expected"), [
+    ("123", (), "123"), ("123", ("456", None, "x", True), "123"), (123, ("456",), "123"),
+    ("123", ("123",), None), ("123", (123,), None), (" 123 ", ("act_123",), None), ("123", ("456", " 123 "), None),
+    (True, (), None), (-12, (), None), ("not_an_id", (), None), (None, (), None), ({"id": "1"}, (), None),
+])
+def test_new_object_id_is_an_id_the_call_does_not_already_know(value, known, expected) -> None:
+    from meta_ads_mcp.normalize import new_object_id
+
+    assert new_object_id(value, known=known) == expected

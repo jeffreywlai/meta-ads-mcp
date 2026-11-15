@@ -11,6 +11,28 @@ from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.errors import ValidationError
 
 
+# Strict id types for tools and parameters added after the master snapshot in
+# tests/fixtures/master_tool_contract.json. Tools already on master keep plain
+# `str` ids, because existing callers must not start failing validation.
+GraphId: TypeAlias = Annotated[
+    str,
+    Field(
+        strict=True,
+        pattern=r"^[0-9]+$",
+        description="A Meta object id: digits only, passed as a string.",
+    ),
+]
+
+AccountId: TypeAlias = Annotated[
+    str,
+    Field(
+        strict=True,
+        pattern=r"^(act_)?[0-9]+$",
+        description="An ad account id: digits, with or without the act_ prefix, passed as a string.",
+    ),
+]
+
+
 def coerce_csv_string_list(value: Any) -> Any:
     """Accept a list or a top-level comma-separated Graph field expression."""
     if not isinstance(value, str):
@@ -86,6 +108,41 @@ CurrencyAmount: TypeAlias = Annotated[
     ),
 ]
 
+def _refuse_true_false_amount(value: Any) -> Any:
+    """Refuse true or false where an amount is expected; MCP would otherwise read true as 1.0."""
+    if isinstance(value, bool):
+        raise ValueError("an amount must be a number, not true or false")
+    return value
+
+
+# For money parameters added after master. CurrencyAmount stays as it is for the
+# parameters that existing callers already use.
+StrictCurrencyAmount: TypeAlias = Annotated[
+    float,
+    BeforeValidator(_refuse_true_false_amount),
+    Field(
+        description=(
+            "Amount in major units of the owning ad account currency "
+            "(for example, 12.50 means USD 12.50, not 1,250 cents). "
+            "The server converts to Meta's minor units using the account currency."
+        )
+    ),
+]
+
+# A schedule time: ISO 8601 text, or whole Unix seconds as a number or as digit text.
+# Meta types these fields as datetime, which takes Unix seconds as a number. The value
+# is sent as given; the tool checks it (a UTC offset on text, a positive time). The
+# number is strict, so true, false and fractions are refused rather than read as seconds.
+ScheduleTime: TypeAlias = Annotated[
+    str | Annotated[int, Field(strict=True)],
+    Field(
+        description=(
+            "An ISO 8601 time with a UTC offset (2026-12-01T00:00:00-05:00), "
+            "or whole Unix seconds as a number or as digit text."
+        )
+    ),
+]
+
 BidConstraints: TypeAlias = Annotated[
     dict[str, Any],
     Field(
@@ -121,10 +178,12 @@ def normalize_recommendation_filters(
                 f"{parameter} must be a list of nonblank strings or a comma-separated string."
             )
         normalized = [item.strip() for item in normalized]
-        if parameter == "recommendation_stages" and any(
-            stage not in {"MFR", "PCR", "PFR"} for stage in normalized
-        ):
-            raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
+        if parameter == "recommendation_stages":
+            # Meta's guide writes the stages in lower case (mfr, pcr) and its SDK in upper case;
+            # either is accepted here and the upper-case form, the one the SDK lists, is sent.
+            normalized = [stage.upper() for stage in normalized]
+            if any(stage not in {"MFR", "PCR", "PFR"} for stage in normalized):
+                raise ValidationError("recommendation_stages must contain only MFR, PCR, or PFR.")
         filters.append(normalized)
     if any(value is not None for value in filters):
         api_version = get_settings().api_version if api_version is None else api_version

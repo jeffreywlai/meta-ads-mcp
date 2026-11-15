@@ -7,12 +7,14 @@ from typing import Any
 
 from meta_ads_mcp.config import get_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.errors import UnsupportedFeatureError, ValidationError
+from meta_ads_mcp.errors import MetaApiError, UnsupportedFeatureError, ValidationError
 from meta_ads_mcp.graph_api import get_graph_api_client, normalize_account_id
 from meta_ads_mcp.money import from_minor_units, resolve_account_currency
 from meta_ads_mcp.normalize import (
     blank_to_none,
+    collection_fault,
     normalize_collection,
+    read_collection_page,
 )
 from meta_ads_mcp.schemas import collection_response
 from meta_ads_mcp.tool_types import (
@@ -81,6 +83,11 @@ MONETARY_FIELDS = {
     "daily_budget", "lifetime_budget", "amount_spent", "balance", "bid_amount",
 }
 
+CREATIVE_SUMMARY_FIELDS = [
+    "id", "name", "title", "body", "object_story_id", "effective_object_story_id",
+    "effective_instagram_media_id", "object_story_spec",
+]
+
 DESTINATION_CREATIVE_FIELDS = [
     "link_url", "object_url", "object_store_url", "template_url", "link_deep_link_url",
     "object_story_spec", "asset_feed_spec{link_urls}", "call_to_action",
@@ -102,6 +109,32 @@ INSTAGRAM_ACCOUNT_FIELDS = [
     "profile_picture_url",
     "ig_id",
 ]
+
+
+def checked_collection(payload: Any) -> dict[str, Any]:
+    """Shape one Graph page like normalize_collection, saying so when it could not be read in full.
+
+    A page Meta answered normally comes back exactly as normalize_collection shapes it.
+    When collection_fault gives a reason (no data list, or entries that are not objects),
+    summary.complete is false and summary.incomplete_reason holds the reason: such a page
+    is never shown as an ordinary empty or last page. Entries that are not objects are
+    left out of items. A page with no data list has no items and no cursor, because
+    whether more pages follow is not known.
+    """
+    reason = collection_fault(payload)
+    if reason is None:
+        return normalize_collection(payload)
+    rows, _, page_unreadable = read_collection_page(payload)
+    if page_unreadable:
+        return {
+            "items": [],
+            "paging": {"before": None, "after": None, "next": None},
+            "summary": {"count": 0, "complete": False, "incomplete_reason": reason},
+        }
+    normalized = normalize_collection(payload)
+    normalized["items"] = rows
+    normalized["summary"].update({"count": len(rows), "complete": False, "incomplete_reason": reason})
+    return normalized
 
 
 def _resolve_account_id(account_id: str | None) -> str:
@@ -180,6 +213,62 @@ def _field_name(field: str) -> str:
     return re.split(r"[.{]", field, maxsplit=1)[0].strip()
 
 
+# The parts of object_story_spec that Meta returns when the field is read whole (the SDK's
+# AdCreativeObjectStorySpec fields). Read live on 2026-11-14: for 100 creatives, naming these
+# parts returned the same story as the bare field. Meta's reference says one more part,
+# whats_app_business_phone_number, is returned only when asked for by name, so "the whole
+# field" does not cover a part the caller names beyond these.
+_STORY_SPEC_DEFAULT_PARTS = (
+    "instagram_user_id", "link_data", "page_id", "photo_data", "product_data", "template_data",
+    "text_data", "video_data",
+)
+
+
+def _sub_selections(selection: str) -> list[str]:
+    """The fields inside a selection's braces; none when it has no braces."""
+    if "{" not in selection:
+        return []
+    return normalize_field_list(selection.partition("{")[2].rsplit("}", 1)[0]) or []
+
+
+def _whole_field_with(name: str, *selections: str) -> str:
+    """A selection that reads a structured field whole and also what the selections name in it.
+
+    For most fields the bare name does that. For object_story_spec it is the default parts
+    plus any other part a selection names, since a part outside the defaults is returned
+    only when named.
+    """
+    if name != "object_story_spec":
+        return name
+    extra: list[str] = []
+    for selection in selections:
+        for part in _sub_selections(selection):
+            if _field_name(part) not in _STORY_SPEC_DEFAULT_PARTS and part not in extra:
+                extra.append(part)
+    if not extra:
+        return name
+    return name + "{" + ",".join((*_STORY_SPEC_DEFAULT_PARTS, *extra)) + "}"
+
+
+def _merged_creative_selection(base_fields: list[str], selected_fields: list[str]) -> str:
+    """Return one creative{...} selection holding base_fields and every explicit creative sub-selection."""
+    creative_fields = list(base_fields)
+    for field in selected_fields:
+        if _field_name(field) != "creative" or "{" not in field:
+            continue
+        # Keep explicitly requested creative details. If two selections for one
+        # structured field differ, fetch that whole field (and any part of it that is
+        # returned only when named) rather than dropping either.
+        for selection in _sub_selections(field):
+            name = _field_name(selection)
+            position = next((i for i, value in enumerate(creative_fields) if _field_name(value) == name), None)
+            if position is None:
+                creative_fields.append(selection)
+            elif creative_fields[position] != selection:
+                creative_fields[position] = _whole_field_with(name, creative_fields[position], selection)
+    return "creative{" + ",".join(creative_fields) + "}"
+
+
 def _ad_graph_fields(selected_fields: list[str]) -> list[str]:
     """Replace the local destination_urls projection with creative URL sources."""
     if "destination_urls" not in selected_fields:
@@ -188,20 +277,7 @@ def _ad_graph_fields(selected_fields: list[str]) -> list[str]:
         field for field in selected_fields
         if field != "destination_urls" and _field_name(field) != "creative"
     ]
-    creative_fields = list(DESTINATION_CREATIVE_FIELDS)
-    for field in selected_fields:
-        if _field_name(field) != "creative" or "{" not in field:
-            continue
-        # Keep explicitly requested creative details. If two selections for one
-        # structured field differ, fetch that whole field rather than dropping either.
-        for selection in normalize_field_list(field.partition("{")[2].rsplit("}", 1)[0]) or []:
-            name = _field_name(selection)
-            position = next((i for i, value in enumerate(creative_fields) if _field_name(value) == name), None)
-            if position is None:
-                creative_fields.append(selection)
-            elif creative_fields[position] != selection:
-                creative_fields[position] = name
-    graph_fields.append("creative{" + ",".join(creative_fields) + "}")
+    graph_fields.append(_merged_creative_selection(DESTINATION_CREATIVE_FIELDS, selected_fields))
     return graph_fields
 
 
@@ -315,16 +391,90 @@ def _campaign_suggested_next_tools(items: list[dict[str, Any]], account_id: str)
     }
 
 
+# Readiness fields added to the account list, from Meta's AdAccount reference: the owning Business Manager,
+# disable_reason, min_daily_budget and funding_source. Meta says funding_source needs the MANAGE task on the
+# account and is not available when the account is disabled, so it is asked for last and dropped first.
+LIST_ACCOUNT_READINESS_FIELDS = ["business{id,name}", "disable_reason", "min_daily_budget", "funding_source"]
+FUNDING_SOURCE_NOTE = (
+    "has_funding_source is true when Meta returned a payment method id; it is null when Meta returned none, which "
+    "can mean no payment method, a disabled account, or no MANAGE task on the account. The payment method id "
+    "itself is not returned."
+)
+
+
+async def _read_account_list(client: Any, params: dict[str, Any]) -> tuple[dict[str, Any], list[str], str | None]:
+    """Read the account list with readiness fields, dropping them step by step if Meta rejects them.
+
+    The last attempt is the request this tool sent before the readiness fields existed; its failure is raised.
+    """
+    attempts = [
+        LIST_ACCOUNT_READINESS_FIELDS,
+        [field for field in LIST_ACCOUNT_READINESS_FIELDS if field != "funding_source"],
+        [],
+    ]
+    first_error: str | None = None
+    for extra in attempts:
+        try:
+            payload = await client.list_objects(
+                "me", "adaccounts", fields=[*ACCOUNT_FIELDS, *extra], params=params,
+            )
+        except MetaApiError as exc:
+            if not extra or exc.code == 190:
+                raise
+            first_error = first_error or exc.message
+            continue
+        return payload, list(extra), first_error
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _add_readiness(item: dict[str, Any], read: set[str]) -> None:
+    """Add plain readiness values to one account without changing any field the list returned before."""
+    from meta_ads_mcp.tools.performance_signals import DISABLE_REASON_LABELS
+
+    if "business{id,name}" in read:
+        business = item.get("business")
+        item["business"] = (
+            {"id": str(business["id"]) if business.get("id") is not None else None, "name": business.get("name")}
+            if isinstance(business, dict) else None
+        )
+    if "disable_reason" in read:
+        code = item.get("disable_reason")
+        try:
+            item["disable_reason_label"] = DISABLE_REASON_LABELS.get(int(code), "UNKNOWN") if code is not None else None
+        except (TypeError, ValueError):
+            item["disable_reason_label"] = "UNKNOWN"
+    if "min_daily_budget" in read and "min_daily_budget" in item:
+        item["min_daily_budget"] = from_minor_units(
+            item.get("min_daily_budget"), item.get("currency"), field_name="min_daily_budget",
+        )
+    funding = item.pop("funding_source", None)
+    if "funding_source" in read:
+        item["has_funding_source"] = True if funding not in (None, "", "0", 0) else None
+
+
 @mcp_server.tool()
 async def list_ad_accounts(limit: int = 25, after: str | None = None) -> dict[str, Any]:
-    """Use this first when the user needs to discover which ad accounts are available."""
+    """Use this first when the user needs to discover which ad accounts are available. Each account also carries its owning business, disable reason, minimum daily budget, and whether a payment method was returned."""
     client = get_graph_api_client()
     params: dict[str, Any] = {"limit": limit}
     if after:
         params["after"] = after
-    payload = await client.list_objects("me", "adaccounts", fields=ACCOUNT_FIELDS, params=params)
-    normalized = normalize_collection(payload)
+    payload, read, error = await _read_account_list(client, params)
+    normalized = checked_collection(payload)
     normalized["items"] = _normalize_monetary_fields(normalized["items"])
+    read_set = set(read)
+    for item in normalized["items"]:
+        if isinstance(item, dict):
+            _add_readiness(item, read_set)
+    readiness: dict[str, Any] = {
+        "requested": list(LIST_ACCOUNT_READINESS_FIELDS),
+        "unavailable": [field for field in LIST_ACCOUNT_READINESS_FIELDS if field not in read_set],
+        "error": error,
+        "money_units": "min_daily_budget is in major units of each account's currency",
+    }
+    if "funding_source" in read_set:
+        readiness["has_funding_source_note"] = FUNDING_SOURCE_NOTE
+    normalized["summary"]["readiness_fields"] = readiness
     return normalized
 
 
@@ -565,16 +715,14 @@ async def get_ad(
     include_creative_summary: bool = False,
     fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """Inspect one ad with selectable fields, optionally including a creative summary. fields may include destination_urls for configured creative links (no redirect/catalog resolution or url_tags expansion). Bid amounts use major units of the account currency."""
+    """Inspect one ad with selectable fields, optionally including a creative summary. include_creative_summary adds the summary fields to the creative selection and keeps any creative fields named in fields, such as creative{image_hash}. fields may include destination_urls for configured creative links (no redirect/catalog resolution or url_tags expansion). Bid amounts use major units of the account currency."""
     client = get_graph_api_client()
     selected_fields = normalize_field_list(fields) or None
     requested_fields = list(selected_fields or AD_FIELDS)
     if include_creative_summary:
+        creative_selection = _merged_creative_selection(CREATIVE_SUMMARY_FIELDS, requested_fields)
         requested_fields = [field for field in requested_fields if _field_name(field) != "creative"]
-        requested_fields.append(
-            "creative{id,name,title,body,object_story_id,effective_object_story_id,"
-            "effective_instagram_media_id,object_story_spec}"
-        )
+        requested_fields.append(creative_selection)
     ad = await client.get_object(ad_id, fields=_entity_read_fields(_ad_graph_fields(requested_fields), AD_FIELDS))
     item = (await _hydrate_and_normalize_monetary_fields(
         client, [ad], selected_fields=selected_fields,
