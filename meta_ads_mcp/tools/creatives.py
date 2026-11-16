@@ -99,7 +99,9 @@ def partnership_codes(*raw_inputs: Any) -> list[str]:
             if text[:1] in ("{", "["):
                 try:
                     pending.append((json.loads(text), depth + 1))
-                except ValueError:
+                except (ValueError, RecursionError):
+                    # Text nested too deeply to decode raises RecursionError on some Python
+                    # versions; it cannot be a spec Meta would read, so it holds no code.
                     pass
         elif isinstance(value, dict):
             for key, item in value.items():
