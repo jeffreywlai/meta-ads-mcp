@@ -163,6 +163,14 @@
       "what_changed": "get_targeting_categories now reads Meta's list of categories of category_class (the search route with type adTargetingCategory and that class) and keeps the rows whose name contains query, ignoring case; no query keeps every row. Before, it read the ad account's broadtargetingcategories edge, which lists only that account's custom categories, so it returned an empty list for every class with no error. Rows now carry the fields Meta's search route returns, as Meta returns them. The summary adds rows_read, rows_matched, pages_read, complete, truncated and next_after, and a note when nothing matched. paging.next is now always null. account_id is no longer needed. A limit below 1 is refused.",
       "why_better": "The tool returns Meta's real targeting categories instead of an empty list, and an empty result now says whether Meta sent rows that did not match the query or sent nothing for that class.",
       "migration": "Read id and name from each row as before. To get more rows, call again with after=summary.next_after until summary.complete is true; if summary.incomplete_reason says matches were cut by limit, raise limit."
+    },
+    {
+      "tool": "list_audiences",
+      "kind": "behaviour",
+      "parameter": "subtype",
+      "what_changed": "With subtype, the tool no longer sends subtype to Meta, which ignored it and returned the same mixed page for any value. It now reads the subtype field of every audience (removing it from the rows again when fields leaves it out) and keeps only the audiences whose subtype equals the one asked for, ignoring case. It reads pages of limit audiences until limit audiences match or Meta has no more, at most 10 pages per call, and returns every match on the pages it read, so a call can return more than limit rows. The summary adds rows_read, rows_matched and pages_read; complete is true only when Meta reported no further page; next_after continues from the last page read; paging.next is null. An audience without a readable subtype makes the list incomplete. A blank subtype counts as none. Calls without subtype are unchanged.",
+      "why_better": "Asking for lookalike audiences now returns only lookalike audiences. Before, the caller got every kind of audience back and could take a custom audience for a lookalike one.",
+      "migration": "Nothing to change to get the filtered list. Do not assume a page holds at most limit rows. Keep calling with after=summary.next_after until summary.complete is true, since a call can stop after 10 pages with few or no matches."
     }
   ]
 }

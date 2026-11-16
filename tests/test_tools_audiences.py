@@ -241,20 +241,162 @@ def test_create_lookalike_wrapper_accepts_country_csv_and_describes_params(monke
 def test_list_audiences_exposes_page_completeness_and_next_cursor(monkeypatch) -> None:
     class PagedAudienceClient(FakeAudienceClient):
         async def list_objects(self, parent_id, edge, *, fields, params):
-            assert params == {"limit": 200, "subtype": "LOOKALIKE", "after": "previous"}
+            assert params == {"limit": 200, "after": "previous"}
             return {"data": [{"id": "aud1"}], "paging": {
                 "next": "https://graph.facebook.com/customaudiences?after=next-cursor",
                 "cursors": {"after": "next-cursor"},
             }}
 
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: PagedAudienceClient())
-    result = asyncio.run(audiences.list_audiences(
-        account_id="123", subtype="LOOKALIKE", limit=200, after="previous",
-    ))
+    result = asyncio.run(audiences.list_audiences(account_id="123", limit=200, after="previous"))
     assert result["summary"] == {
         "count": 1, "complete": False, "truncated": True, "next_after": "next-cursor",
     }
     assert result["paging"]["after"] == "next-cursor"
+
+
+def _audience_page_payload(rows, after=None):
+    page = {"data": rows}
+    if after:
+        page["paging"] = {"next": f"https://graph.facebook.com/customaudiences?after={after}", "cursors": {"after": after}}
+    return page
+
+
+class SubtypePagesClient(FakeAudienceClient):
+    """Answers customaudiences pages by cursor (None for the first page)."""
+
+    def __init__(self, pages) -> None:
+        super().__init__()
+        self.pages = pages
+
+    async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+        self.list_calls.append({"parent_id": parent_id, "edge": edge, "fields": fields, "params": params})
+        return self.pages[(params or {}).get("after")]
+
+
+def test_list_audiences_subtype_is_filtered_here_not_sent_to_meta(monkeypatch) -> None:
+    """F2: Meta ignores subtype and returns the same mixed page for any value."""
+    client = SubtypePagesClient({None: _audience_page_payload([
+        {"id": "1", "name": "A", "subtype": "CUSTOM"},
+        {"id": "2", "name": "B", "subtype": "LOOKALIKE"},
+        {"id": "3", "name": "C", "subtype": "WEBSITE"},
+    ])})
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="lookalike"))
+    assert client.list_calls[0]["params"] == {"limit": 50}
+    assert client.list_calls[0]["fields"] == audiences.AUDIENCE_SUMMARY_FIELDS
+    assert result["items"] == [{"id": "2", "name": "B", "subtype": "LOOKALIKE"}]
+    assert result["summary"] == {
+        "count": 1, "rows_read": 3, "rows_matched": 1, "pages_read": 1,
+        "complete": True, "truncated": False, "next_after": None,
+    }
+    assert result["paging"] == {"before": None, "after": None, "next": None}
+
+
+def test_list_audiences_subtype_field_is_asked_for_and_removed_when_not_requested(monkeypatch) -> None:
+    client = SubtypePagesClient({None: _audience_page_payload([
+        {"id": "1", "name": "A", "subtype": "CUSTOM"},
+        {"id": "2", "name": "B", "subtype": "LOOKALIKE"},
+    ])})
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE", fields=["id", "name"]))
+    assert client.list_calls[0]["fields"] == ["id", "name", "subtype"]
+    assert result["items"] == [{"id": "2", "name": "B"}]
+
+    kept = asyncio.run(audiences.list_audiences(account_id="123", subtype="CUSTOM", fields="id,subtype"))
+    assert client.list_calls[1]["fields"] == ["id", "subtype"]
+    assert kept["items"] == [{"id": "1", "name": "A", "subtype": "CUSTOM"}]
+
+
+def test_list_audiences_subtype_reads_pages_until_limit_rows_match(monkeypatch) -> None:
+    client = SubtypePagesClient({
+        "start": _audience_page_payload([{"id": "1", "subtype": "CUSTOM"}, {"id": "2", "subtype": "CUSTOM"}], after="c2"),
+        "c2": _audience_page_payload([{"id": "3", "subtype": "LOOKALIKE"}, {"id": "4", "subtype": "CUSTOM"}], after="c3"),
+        "c3": _audience_page_payload([{"id": "5", "subtype": "LOOKALIKE"}, {"id": "6", "subtype": "LOOKALIKE"}], after="c4"),
+        "c4": _audience_page_payload([{"id": "7", "subtype": "LOOKALIKE"}]),
+    })
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE", limit=2, after="start"))
+    assert [call["params"] for call in client.list_calls] == [
+        {"limit": 2, "after": "start"}, {"limit": 2, "after": "c2"}, {"limit": 2, "after": "c3"},
+    ]
+    # Every match on the pages read is returned, so continuing from next_after skips nothing.
+    assert [item["id"] for item in result["items"]] == ["3", "5", "6"]
+    summary = result["summary"]
+    assert summary["rows_read"] == 6 and summary["rows_matched"] == 3 and summary["pages_read"] == 3
+    assert summary["complete"] is False and summary["truncated"] is True and summary["next_after"] == "c4"
+    assert result["paging"]["after"] == "c4"
+
+    rest = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE", limit=2, after="c4"))
+    assert [item["id"] for item in rest["items"]] == ["7"]
+    assert rest["summary"]["complete"] is True and rest["summary"]["next_after"] is None
+
+
+def test_list_audiences_subtype_reads_at_most_ten_pages(monkeypatch) -> None:
+    pages = {None: _audience_page_payload([{"id": "0", "subtype": "CUSTOM"}], after="c1")}
+    pages.update({f"c{n}": _audience_page_payload([{"id": str(n), "subtype": "CUSTOM"}], after=f"c{n + 1}") for n in range(1, 20)})
+    client = SubtypePagesClient(pages)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE"))
+    assert len(client.list_calls) == 10
+    assert result["items"] == []
+    summary = result["summary"]
+    assert summary["pages_read"] == 10 and summary["rows_read"] == 10 and summary["rows_matched"] == 0
+    assert summary["complete"] is False and summary["truncated"] is True and summary["next_after"] == "c10"
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": None}, {"data": "x"}])
+def test_list_audiences_subtype_unreadable_page_is_not_an_empty_complete_list(monkeypatch, payload) -> None:
+    client = SubtypePagesClient({
+        None: _audience_page_payload([{"id": "1", "subtype": "LOOKALIKE"}], after="c2"),
+        "c2": payload,
+    })
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE", limit=5))
+    assert [item["id"] for item in result["items"]] == ["1"]
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["incomplete_reason"] == collection_fault(payload)
+    assert summary["next_after"] == "c2", "the page that could not be read can be asked for again"
+
+    first = SubtypePagesClient({None: payload})
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: first)
+    nothing = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE"))
+    assert nothing["items"] == [] and nothing["summary"]["complete"] is False
+    assert nothing["summary"]["next_after"] is None and nothing["summary"]["incomplete_reason"]
+
+
+def test_list_audiences_subtype_rows_that_cannot_be_matched_leave_the_list_incomplete(monkeypatch) -> None:
+    client = SubtypePagesClient({None: _audience_page_payload([
+        {"id": "1", "subtype": "LOOKALIKE"}, {"id": "2"}, {"id": "3", "subtype": None}, None,
+    ])})
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE"))
+    assert [item["id"] for item in result["items"]] == ["1"]
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["rows_read"] == 3
+    assert "2 audience" in summary["incomplete_reason"] and "1 entry" in summary["incomplete_reason"]
+
+
+@pytest.mark.parametrize("bad_paging", [
+    {"next": "https://graph.facebook.com/customaudiences"},
+    {"next": "https://graph.facebook.com/customaudiences", "cursors": {"after": "same"}},
+])
+def test_list_audiences_subtype_stops_on_a_missing_or_repeated_cursor(monkeypatch, bad_paging) -> None:
+    client = SubtypePagesClient({"same": {"data": [{"id": "1", "subtype": "CUSTOM"}], "paging": bad_paging}})
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE", after="same"))
+    assert len(client.list_calls) == 1
+    assert result["summary"]["complete"] is False and result["summary"]["incomplete_reason"]
+    assert result["summary"]["next_after"] is None
+
+
+@pytest.mark.parametrize("subtype", [None, "", "  "])
+def test_list_audiences_without_subtype_sends_one_request_as_before(monkeypatch, subtype) -> None:
+    client = FakeAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype=subtype))
+    assert len(client.list_calls) == 1 and client.list_calls[0]["params"] == {"limit": 50}
+    assert result["summary"] == {"count": 1, "complete": True, "truncated": False, "next_after": None}
 
 
 def test_create_lookalike_audience_requires_country_or_countries(monkeypatch) -> None:
