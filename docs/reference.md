@@ -443,8 +443,9 @@ wrong field can hold private text.
 - **A web address with a login in it is refused** (`https://user:pass@host/...`)
   by the creative, video, boost and catalog tools, including
   `upload_creative_asset`, `create_ad_creative`, `update_creative` and
-  `preview_ad`, wherever the URL sits in the creative. Meta stores the URL on the
-  ad and shows it in responses.
+  `preview_ad`, wherever the URL sits in the creative, including inside a
+  sub-object sent as JSON text. Meta stores the URL on the ad and shows it in
+  responses.
 
 ## Errors and retries
 

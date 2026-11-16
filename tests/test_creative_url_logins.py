@@ -10,7 +10,9 @@ are still sent as before.
 from __future__ import annotations
 
 import asyncio
+import json
 
+import httpx
 import pytest
 from fastmcp.exceptions import ToolError
 
@@ -59,6 +61,17 @@ class Recorder:
     async def preview_ad(self, **kwargs):
         self.calls.append(("preview", kwargs))
         return {"body": "<iframe></iframe>"}
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fake that fails to attach must not reach the network."""
+
+    async def refuse(*args, **kwargs):
+        raise AssertionError("no request may be sent in this test")
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", refuse)
+    monkeypatch.setattr(httpx.AsyncClient, "send", refuse)
 
 
 @pytest.fixture
@@ -164,3 +177,58 @@ def test_preview_ad_still_previews_ordinary_urls(client: Recorder, url: str) -> 
     asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
     assert client.calls[-1][0] == "preview"
     assert client.calls[-1][1]["creative"] == draft
+
+
+# A sub-object sent as JSON text is examined like the object itself (review finding A6).
+
+ENCODED_SPEC = json.dumps(NESTED["object_story_spec"])
+
+
+def test_preview_ad_refuses_a_login_in_a_json_encoded_sub_object(client: Recorder) -> None:
+    draft = {"object_story_spec": ENCODED_SPEC}
+    _refused(creatives.preview_ad(account_id="1234567890", creative=draft), client, "creative")
+    _refused(mcp_server.call_tool("preview_ad", {"account_id": "1234567890", "creative": draft}), client, "creative")
+    _refused(
+        mcp_server.call_tool("call_tool", {"name": "preview_ad", "arguments": {"account_id": "1234567890", "creative": draft}}),
+        client, "creative",
+    )
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        ENCODED_SPEC,
+        f"  {ENCODED_SPEC}\n",
+        json.dumps([{"website_url": LOGIN_URL}]),
+        json.dumps({"link_data": json.dumps({"link": LOGIN_URL})}),
+    ],
+    ids=["object", "padded", "list", "json-inside-json"],
+)
+def test_create_ad_creative_refuses_a_login_in_json_text_inside_params(client: Recorder, encoded: str) -> None:
+    arguments = {"account_id": "1234567890", "name": "Spring", "params": {"object_story_spec": encoded}}
+    _refused(creatives.create_ad_creative(**arguments), client, "params")
+    _refused(mcp_server.call_tool("create_ad_creative", arguments), client, "params")
+
+
+def test_update_creative_refuses_a_login_in_json_text_inside_a_spec(client: Recorder) -> None:
+    spec = {"page_id": "1234567890", "link_data": json.dumps({"link": LOGIN_URL})}
+    _refused(creatives.update_creative(creative_id="1234567890", object_story_spec=spec), client, "object_story_spec")
+
+
+@pytest.mark.parametrize("url", ORDINARY)
+def test_json_text_without_a_login_is_sent_unchanged(client: Recorder, url: str) -> None:
+    encoded = json.dumps({"page_id": "1234567890", "link_data": {"link": url}})
+    draft = {"object_story_spec": encoded}
+    asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
+    assert client.calls[-1][1]["creative"] == {"object_story_spec": encoded}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["{not json", "[1, 2", "{}", "[]", "{\"a\": 1}", "[" * 5000 + "]" * 5000, json.dumps({"x": "y" * 300_000})],
+    ids=["broken-object", "broken-list", "empty-object", "empty-list", "plain", "very-deep", "very-long"],
+)
+def test_json_text_that_cannot_or_need_not_be_examined_is_sent_unchanged(client: Recorder, text: str) -> None:
+    draft = {"object_story_spec": {"page_id": "1234567890"}, "title": text}
+    asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
+    assert client.calls[-1][1]["creative"]["title"] == text

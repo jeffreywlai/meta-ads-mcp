@@ -294,21 +294,21 @@
     {
       "tool": "create_ad_creative",
       "kind": "behaviour",
-      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in object_story_spec, asset_feed_spec, degrees_of_freedom_spec or params is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in object_story_spec, asset_feed_spec, degrees_of_freedom_spec or params is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before. Text inside these inputs that is a JSON object or list (a sub-object sent encoded) is examined the same way, and is still sent as written when it holds no login.",
       "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
       "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
     },
     {
       "tool": "update_creative",
       "kind": "behaviour",
-      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in object_story_spec, asset_feed_spec or params is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in object_story_spec, asset_feed_spec or params is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before. Text inside these inputs that is a JSON object or list (a sub-object sent encoded) is examined the same way, and is still sent as written when it holds no login.",
       "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
       "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
     },
     {
       "tool": "preview_ad",
       "kind": "behaviour",
-      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in the creative payload is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in the creative payload is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before. Text inside these inputs that is a JSON object or list (a sub-object sent encoded) is examined the same way, and is still sent as written when it holds no login.",
       "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
       "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
     },

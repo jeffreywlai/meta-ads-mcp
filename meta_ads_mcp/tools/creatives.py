@@ -365,22 +365,49 @@ def _key_label(key: Any, known: frozenset[str]) -> str:
     return key if isinstance(key, str) and key in known else "<key>"
 
 
-def _refuse_url_logins(value: Any, name: str) -> None:
+# Bounds for examining a sub-object sent as JSON text: longer text is not decoded, JSON text
+# inside JSON text is followed this many levels, and decoded content this many levels deep.
+_JSON_TEXT_LIMIT = 100_000
+_JSON_TEXT_LEVELS = 3
+_JSON_DEPTH_LIMIT = 64
+
+
+def _json_sub_object(text: str) -> dict[str, Any] | list[Any] | None:
+    """The object or list that text encodes as JSON, or None when it is not one (or too long to decode)."""
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[" or len(stripped) > _JSON_TEXT_LIMIT:
+        return None
+    try:
+        decoded = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return None
+    return decoded if isinstance(decoded, (dict, list)) else None
+
+
+def _refuse_url_logins(value: Any, name: str, *, _levels: int = 0, _depth: int = 0) -> None:
     """Refuse a login embedded in any URL inside a nested input, before any request is built.
 
-    The message names a key only when it is a field Meta documents at that place
-    (_NAMED_KEYS); any other key, which may be pasted data or a token, as <key>.
+    Text that is a JSON object or list (a sub-object sent encoded) is examined the same
+    way, within the bounds above; the value sent on to Meta is not changed. The message
+    names a key only when it is a field Meta documents at that place (_NAMED_KEYS); any
+    other key, which may be pasted data or a token, as <key>.
     """
+    if _levels and _depth > _JSON_DEPTH_LIMIT:
+        return
+    inside = _depth + 1 if _levels else 0
     if isinstance(value, str):
-        if "://" in value or "@" in value:
+        decoded = _json_sub_object(value) if _levels < _JSON_TEXT_LEVELS else None
+        if decoded is not None:
+            _refuse_url_logins(decoded, name, _levels=_levels + 1, _depth=inside)
+        elif "://" in value or "@" in value:
             refuse_url_credentials(value, name)
     elif isinstance(value, dict):
         known = _NAMED_KEYS.get(name, frozenset())
         for key, item in value.items():
-            _refuse_url_logins(item, f"{name}.{_key_label(key, known)}")
+            _refuse_url_logins(item, f"{name}.{_key_label(key, known)}", _levels=_levels, _depth=inside)
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            _refuse_url_logins(item, f"{name}[{index}]")
+            _refuse_url_logins(item, f"{name}[{index}]", _levels=_levels, _depth=inside)
 
 
 def _refuse_payload_url_logins(**payloads: Any) -> None:
