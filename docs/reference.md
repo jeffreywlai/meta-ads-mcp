@@ -14,6 +14,7 @@ The details that do not fit in a tool table. Setup and the tool list are in the
 - [Audiences](#audiences)
 - [Change history](#change-history)
 - [Read-only mode](#read-only-mode)
+- [Tool markings](#tool-markings)
 - [Local file uploads](#local-file-uploads)
 - [Errors and retries](#errors-and-retries)
 - [Default account](#default-account)
@@ -359,6 +360,33 @@ Set `META_READ_ONLY=true` in the launch environment and restart.
 - Where you can, also use a token with only `ads_read`.
 
 The default is writable. Nothing turns read-only mode on for you.
+
+## Tool markings
+
+Every tool carries the four MCP markings. A client uses them to decide which
+calls it may run without asking you, and which it may safely retry.
+
+- `readOnlyHint`: the tool changes nothing at Meta and nothing on this machine.
+- `destructiveHint`: the worst the tool can do deletes, removes, disconnects,
+  cancels, archives or overwrites something that already exists. Every delete
+  and update is marked, and so are the three status tools, because `ARCHIVED`
+  cannot be undone from this server.
+- `idempotentHint`: running the same call twice leaves things as one call did.
+  Tools that make a new object or upload rows on every run are not marked.
+- `openWorldHint`: the tool reaches outside your own assets. Only
+  `search_ads_archive` (the public Ad Library) and the tools that have Meta
+  fetch a web address you give (image, video and product feed uploads) are
+  marked.
+
+The markings appear in the tool list and at the end of each `search_tools`
+match, for example `read-only: no, destructive: yes, idempotent: yes,
+open-world: no`. `search_tools` is marked read-only. `call_tool` carries the
+markings of the most dangerous tool it can run. It is not marked read-only even
+in read-only mode, because `delete_overflow_artifact` still runs there and
+deletes a saved file on this machine.
+
+All markings live in one table, `meta_ads_mcp/tool_annotations.py`. A new tool
+without an entry fails the tests.
 
 ## Local file uploads
 
