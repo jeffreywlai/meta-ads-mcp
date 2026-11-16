@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.tool_annotations import apply_tool_annotations
+
 from . import (
     activity,
     ads,
@@ -55,6 +58,8 @@ TOOL_MODULES = (
     targeting,
     utility,
 )
+
+apply_tool_annotations(mcp_server)
 
 __all__ = [
     "TOOL_MODULES",

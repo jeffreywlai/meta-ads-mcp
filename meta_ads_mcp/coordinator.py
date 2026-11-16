@@ -39,6 +39,11 @@ from meta_ads_mcp.error_middleware import (
     ToolParameterHelpMiddleware,
 )
 from meta_ads_mcp.read_only import ReadOnlyAdvertisingMiddleware
+from meta_ads_mcp.tool_annotations import (
+    SEARCH_TOOL_ANNOTATIONS,
+    call_tool_annotations,
+    describe_hints,
+)
 from meta_ads_mcp.overflow import (
     ArchivedResponseLimitingMiddleware,
     OverflowArtifactStore,
@@ -178,7 +183,17 @@ class IntentAwareBM25SearchTransform(BM25SearchTransform):
             normalized_arguments = normalize_tool_arguments(arguments)
             return await ctx.fastmcp.call_tool(resolved_name, normalized_arguments)
 
-        return Tool.from_function(fn=call_tool, name=self._call_tool_name)
+        return Tool.from_function(
+            fn=call_tool,
+            name=self._call_tool_name,
+            annotations=call_tool_annotations(read_only=get_settings().read_only),
+        )
+
+    def _make_search_tool(self) -> Tool:
+        """The search tool only reads the catalogue; say so in its annotations."""
+        return super()._make_search_tool().model_copy(
+            update={"annotations": SEARCH_TOOL_ANNOTATIONS}
+        )
 
     async def get_tool(self, name: str, call_next: Any, *, version: Any = None) -> Tool | None:
         """Resolve compatibility aliases even for clients that bypass call_tool."""
@@ -266,6 +281,9 @@ def serialize_search_results_compact(tools: list[Any]) -> str:
         line = f"- `{name}` | {args}"
         if description:
             line += f" | {description}"
+        hints = describe_hints(getattr(tool, "annotations", None))
+        if hints:
+            line += f" | {hints}"
         lines.append(line)
     lines.append("Next: use `call_tool` with the exact tool name and JSON arguments.")
     lines.append("For types, defaults, and constraints: `get_capabilities(tool_name='TOOL_NAME')`.")
