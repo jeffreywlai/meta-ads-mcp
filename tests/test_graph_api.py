@@ -1648,6 +1648,31 @@ def test_targeting_categories_read_metas_search_route(monkeypatch, after, expect
     assert calls == [{"method": "GET", "endpoint": "search", "params": expected_params}]
 
 
+@pytest.mark.parametrize(("after", "extra"), [(None, {}), ("CURSOR_2", {"after": "CURSOR_2"}), (" ", {})])
+def test_audiences_of_one_subtype_are_filtered_by_meta(monkeypatch, after, extra) -> None:
+    """F2: Meta ignores a plain subtype parameter but applies a filtering clause on subtype."""
+    calls: list[dict[str, object]] = []
+
+    async def fake_request(self, method, endpoint, **kwargs):
+        calls.append({"method": method, "endpoint": endpoint, **kwargs})
+        return {"data": []}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    asyncio.run(_client().list_audiences_of_subtype(
+        "111", subtype=" lookalike ", fields=["id", "subtype"], limit=25, after=after,
+    ))
+    assert calls == [{
+        "method": "GET",
+        "endpoint": "act_111/customaudiences",
+        "params": {
+            "limit": 25,
+            "filtering": '[{"field":"subtype","operator":"IN","value":["LOOKALIKE"]}]',
+            **extra,
+            "fields": "id,subtype",
+        },
+    }]
+
+
 def _recorded_preview_requests(monkeypatch, **kwargs) -> list[dict[str, object]]:
     calls: list[dict[str, object]] = []
 

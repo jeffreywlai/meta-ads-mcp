@@ -28,7 +28,6 @@ from meta_ads_mcp.normalize import (
     normalize_collection,
     read_collection_page,
 )
-from meta_ads_mcp.pagination import extract_paging
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list, normalize_field_list
 
@@ -101,7 +100,7 @@ async def list_audiences(
     after: str | None = None,
     fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """List one page of audience ids, sizes, or subtype metadata. Follow summary.next_after with after until summary.complete is true. subtype (for example CUSTOM, LOOKALIKE or WEBSITE, any case) is matched here because Meta ignores it: pages are read until limit audiences match or Meta has no more, at most 10 pages per call, and every match on those pages is returned; summary adds rows_read, rows_matched and pages_read."""
+    """List one page of audience ids, sizes, or subtype metadata. Follow summary.next_after with after until summary.complete is true. subtype (for example CUSTOM, LOOKALIKE or WEBSITE, any case) asks Meta for audiences of that type only; any row of another type is dropped and marks the page incomplete. summary adds rows_read and rows_matched."""
     if limit < 1:
         raise ValidationError("limit must be positive.")
     client = get_graph_api_client()
@@ -122,9 +121,6 @@ async def list_audiences(
     return _audience_page(payload)
 
 
-MAX_SUBTYPE_PAGES = 10
-
-
 async def _list_audiences_of_subtype(
     client: Any,
     account_id: str,
@@ -133,81 +129,47 @@ async def _list_audiences_of_subtype(
     after: str | None,
     fields: Any,
 ) -> dict[str, Any]:
-    """Read audience pages and keep the rows whose subtype equals the one asked for, ignoring case.
+    """Read one page of audiences of one subtype, filtered by Meta, and check what came back.
 
-    Meta ignores a subtype parameter on customaudiences (the same mixed page comes back for any
-    value), so it is not sent; the subtype field is always read and removed again when the caller
-    did not ask for it. Pages of limit rows are read until limit rows match at the end of a page,
-    Meta reports no further page, or MAX_SUBTYPE_PAGES pages were read. Every match on the pages read
-    is returned, so continuing from next_after skips nothing. complete is true only when Meta reported
-    no further page and every row read could be matched.
+    Meta ignores a plain subtype parameter but applies a filtering clause on subtype, so the
+    client sends that and limit and after work as for an unfiltered page. A silently ignored filter
+    must not pass as a filtered list: the subtype field is always read (and removed again when the
+    caller did not ask for it), and a row of another subtype, or without one, is dropped and makes
+    the page incomplete.
     """
     selected = normalize_field_list(fields) or list(AUDIENCE_SUMMARY_FIELDS)
     graph_fields = selected if "subtype" in selected else [*selected, "subtype"]
+    payload = await client.list_audiences_of_subtype(
+        account_id, subtype=subtype, fields=graph_fields, limit=limit, after=after,
+    )
+    page = _audience_page(payload)
+    rows = [item for item in page["items"] if isinstance(item, dict)]
     wanted = subtype.casefold()
-    cursor = after
-    seen: set[str] = set()
-    items: list[dict[str, Any]] = []
-    rows_read = pages_read = bad_entries = unmatchable = 0
-    reasons: list[str] = []
-    next_after: str | None = None
-    more_pages = False
-    while True:
-        params: dict[str, Any] = {"limit": limit}
-        if cursor:
-            params["after"] = cursor
-        payload = await client.list_objects(account_id, "customaudiences", fields=graph_fields, params=params)
-        pages_read += 1
-        rows, bad_rows, page_unreadable = read_collection_page(payload)
-        if page_unreadable:
-            reasons.append(collection_fault(payload) or "Meta's answer could not be read.")
-            # The page that could not be read can be asked for again; the first one is the caller's own after.
-            next_after = cursor if pages_read > 1 else None
-            break
-        bad_entries += bad_rows
-        rows_read += len(rows)
-        for row in rows:
-            row_subtype = row.get("subtype")
-            if not isinstance(row_subtype, str) or not row_subtype.strip():
-                unmatchable += 1
-            elif row_subtype.strip().casefold() == wanted:
-                items.append(row)
-        paging = extract_paging(payload)
-        if not paging.get("next"):
-            break
-        new_cursor = paging.get("after")
-        if not new_cursor:
-            reasons.append("Meta reported another page but gave no cursor to read it.")
-            break
-        if new_cursor == cursor or new_cursor in seen:
-            reasons.append("Meta returned the same page cursor twice, so the read stopped.")
-            break
-        seen.add(new_cursor)
-        cursor = new_cursor
-        if len(items) >= limit or pages_read >= MAX_SUBTYPE_PAGES:
-            more_pages, next_after = True, new_cursor
-            break
-    if unmatchable:
-        reasons.append(
-            f"{unmatchable} audience(s) came back without a readable subtype, so whether they match is not known."
-        )
-    if bad_entries:
-        entries = "1 entry" if bad_entries == 1 else f"{bad_entries} entries"
-        reasons.append(f"{entries} in Meta's answer could not be read, so the list may be missing rows.")
+    items = [
+        row for row in rows
+        if isinstance(row.get("subtype"), str) and row["subtype"].strip().casefold() == wanted
+    ]
+    dropped = len(rows) - len(items)
     if "subtype" not in selected:
         items = [{key: value for key, value in row.items() if key != "subtype"} for row in items]
+    old = page["summary"]
+    reasons = [old["incomplete_reason"]] if old.get("incomplete_reason") else []
+    if dropped:
+        reasons.append(
+            f"Meta returned {dropped} audience(s) of another type or without a type, so its filter may "
+            "not have been applied; they were left out, and further pages may hold more matches."
+        )
     summary: dict[str, Any] = {
         "count": len(items),
-        "rows_read": rows_read,
+        "rows_read": len(rows),
         "rows_matched": len(items),
-        "pages_read": pages_read,
-        "complete": not reasons and not more_pages,
-        "truncated": more_pages,
-        "next_after": next_after,
+        "complete": old["complete"] and not dropped,
+        "truncated": old["truncated"],
+        "next_after": old["next_after"],
     }
     if reasons:
         summary["incomplete_reason"] = " ".join(reasons)
-    return {"items": items, "paging": {"before": None, "after": next_after, "next": None}, "summary": summary}
+    return {"items": items, "paging": page["paging"], "summary": summary}
 
 
 def _audience_page(payload: Any) -> dict[str, Any]:

@@ -238,9 +238,9 @@ such.
 
 `list_audiences` returns `summary.complete`, `summary.truncated` and
 `summary.next_after`. Follow the cursor before treating the list as complete.
-Meta ignores `subtype`, so the server keeps only the audiences of that subtype
-itself. It reads up to 10 pages per call and reports `rows_read`,
-`rows_matched` and `pages_read`.
+With `subtype`, Meta is asked to return only audiences of that type. Any row of
+another type is dropped and the page is marked incomplete. The summary reports
+`rows_read` and `rows_matched`.
 
 `create_lookalike_audience(countries=["US","CA","AU"], ratio=0.01, ...)` builds
 Meta's `lookalike_spec` from those inputs. You cannot override it through
