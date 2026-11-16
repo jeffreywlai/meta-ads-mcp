@@ -13,7 +13,8 @@ from meta_ads_mcp.errors import ValidationError
 
 # Strict id types for tools and parameters added after the master snapshot in
 # tests/fixtures/master_tool_contract.json. Tools already on master keep plain
-# `str` ids, because existing callers must not start failing validation.
+# `str` ids in their signatures; meta_ads_mcp/id_formats.py checks those ids by
+# parameter name before the tool runs and adds the same pattern to their schemas.
 GraphId: TypeAlias = Annotated[
     str,
     Field(

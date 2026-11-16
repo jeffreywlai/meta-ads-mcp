@@ -130,10 +130,11 @@ def test_response_size_guard_is_configured() -> None:
     assert type(middleware).__name__ == "ArchivedResponseLimitingMiddleware"
     assert middleware.max_size == MAX_TOOL_RESPONSE_BYTES
     assert middleware.truncation_suffix == RESPONSE_LIMIT_HINT
-    assert mcp_server.middleware[-4] is RESPONSE_LIMITING_MIDDLEWARE
-    assert type(mcp_server.middleware[-3]).__name__ == "StructuredMetaErrorMiddleware"
-    assert type(mcp_server.middleware[-2]).__name__ == "ReadOnlyAdvertisingMiddleware"
-    assert type(mcp_server.middleware[-1]).__name__ == "ToolParameterHelpMiddleware"
+    assert mcp_server.middleware[-5] is RESPONSE_LIMITING_MIDDLEWARE
+    assert type(mcp_server.middleware[-4]).__name__ == "StructuredMetaErrorMiddleware"
+    assert type(mcp_server.middleware[-3]).__name__ == "ReadOnlyAdvertisingMiddleware"
+    assert type(mcp_server.middleware[-2]).__name__ == "ToolParameterHelpMiddleware"
+    assert type(mcp_server.middleware[-1]).__name__ == "IdFormatMiddleware"
 
 
 def test_list_tools_exposes_compact_search_surface() -> None:

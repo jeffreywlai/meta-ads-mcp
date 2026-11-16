@@ -73,11 +73,11 @@ SAMPLE_TARGETING = {
 }
 
 SAMPLE_INSIGHTS_ROW = {
-    "campaign_id": "cmp_123",
+    "campaign_id": "9100123",
     "campaign_name": "Campaign 123",
-    "adset_id": "adset_123",
+    "adset_id": "9200123",
     "adset_name": "Ad Set 123",
-    "ad_id": "ad_123",
+    "ad_id": "9300123",
     "ad_name": "Ad 123",
     "date_start": "2026-03-01",
     "date_stop": "2026-03-07",
@@ -94,9 +94,9 @@ SAMPLE_INSIGHTS_ROW = {
 }
 
 TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
-    "get_ad_image": {"ad_id": "ad_123"},
+    "get_ad_image": {"ad_id": "9300123"},
     "create_campaign": {"daily_budget": 50.0},
-    "create_ad": {"creative_id": "crt_123", "bid_amount": 12.34},
+    "create_ad": {"creative_id": "9400123", "bid_amount": 12.34},
     "create_ad_set": {"daily_budget": 25.0},
     "create_custom_audience": {"customer_file_source": "USER_PROVIDED_ONLY"},
     "create_lookalike_audience": {"country": "US", "ratio": 0.02},
@@ -109,7 +109,7 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "search_behaviors": {"account_id": "123"},
     "search_demographics": {"account_id": "123"},
     "validate_interests": {"interest_list": ["running"]},
-    "preview_ad": {"ad_id": "ad_123"},
+    "preview_ad": {"ad_id": "9300123"},
     "upload_creative_asset": {"image_url": "https://example.com/image.png"},
     "update_campaign": {"name": "Updated Campaign"},
     "update_campaign_budget": {"daily_budget": 40.0},
@@ -128,9 +128,9 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "get_delivery_opportunities": {"account_id": "123"},
     "get_bidding_opportunities": {"account_id": "123"},
     "get_creative_performance_report": {"level": "account", "object_id": "123"},
-    "get_creative_fatigue_report": {"level": "campaign", "object_id": "cmp_123"},
-    "get_delivery_risk_report": {"level": "campaign", "object_id": "cmp_123"},
-    "get_learning_phase_report": {"level": "campaign", "object_id": "cmp_123"},
+    "get_creative_fatigue_report": {"level": "campaign", "object_id": "9100123"},
+    "get_delivery_risk_report": {"level": "campaign", "object_id": "9100123"},
+    "get_learning_phase_report": {"level": "campaign", "object_id": "9100123"},
     "generate_auth_url": {"scopes": ["ads_management"], "state": "state_123"},
     "refresh_to_long_lived_token": {"access_token": "token_123"},
     "get_token_info": {"input_token": "token_123"},
@@ -147,87 +147,87 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "get_async_insights_report": {"fields": ["spend", "impressions"]},
     "search_ads_archive": {"ad_reached_countries": ["US"]},
     "list_ad_comments": {"object_story_id": "page_123_post_123"},
-    "list_page_recommendations": {"page_id": "page_123"},
+    "list_page_recommendations": {"page_id": "9600123"},
     "list_change_history": {"account_id": "123"},
     "export_change_history": {"account_id": "123", "since": "2026-03-01", "until": "2026-03-07"},
     "list_datasets": {"account_id": "123"},
-    "get_dataset": {"dataset_id": "px_123"},
-    "get_dataset_stats": {"dataset_id": "px_123", "since": "2026-03-01", "until": "2026-03-07"},
-    "get_dataset_quality": {"dataset_id": "px_123"},
+    "get_dataset": {"dataset_id": "9860123"},
+    "get_dataset_stats": {"dataset_id": "9860123", "since": "2026-03-01", "until": "2026-03-07"},
+    "get_dataset_quality": {"dataset_id": "9860123"},
     "list_ad_studies": {"account_id": "123"},
-    "get_ad_study": {"study_id": "study_123", "include_results": True},
-    "check_ab_test_eligibility": {"entity_ids": ["cmp_123", "cmp_456"]},
+    "get_ad_study": {"study_id": "9870123", "include_results": True},
+    "check_ab_test_eligibility": {"entity_ids": ["9100123", "9100456"]},
     "create_ab_test": {
-        "business_id": "biz_123",
+        "business_id": "9800123",
         "cells": [
-            {"name": "A", "treatment_percentage": 50, "adset_ids": ["adset_123"]},
-            {"name": "B", "treatment_percentage": 50, "adset_ids": ["adset_456"]},
+            {"name": "A", "treatment_percentage": 50, "adset_ids": ["9200123"]},
+            {"name": "B", "treatment_percentage": 50, "adset_ids": ["9200456"]},
         ],
         "start_time": "2099-01-01T00:00:00Z",
         "end_time": "2099-01-15T00:00:00Z",
     },
     "create_lift_study": {
-        "business_id": "biz_123",
+        "business_id": "9800123",
         "cells": [{"name": "Test", "treatment_percentage": 90, "control_percentage": 10}],
-        "objectives": [{"name": "Purchases", "adspixels": [{"id": "px_123", "event_names": ["fb_pixel_purchase"]}]}],
+        "objectives": [{"name": "Purchases", "adspixels": [{"id": "9860123", "event_names": ["fb_pixel_purchase"]}]}],
         "start_time": "2099-01-01T00:00:00Z",
         "end_time": "2099-01-15T00:00:00Z",
     },
-    "update_ad_study": {"study_id": "study_123", "name": "Updated Study"},
-    "cancel_ad_study": {"study_id": "study_123"},
-    "list_catalogs": {"business_id": "biz_123"},
-    "list_dpa_eligible_catalogs": {"business_id": "biz_123"},
-    "get_catalog_diagnostics": {"catalog_id": "cat_123"},
-    "get_catalog_dynamic_ads_health": {"catalog_id": "cat_123"},
-    "list_catalog_data_sources": {"catalog_id": "cat_123"},
-    "create_catalog": {"business_id": "biz_123"},
-    "update_catalog": {"catalog_id": "cat_123", "name": "Updated Catalog"},
-    "list_catalog_products": {"catalog_id": "cat_123"},
+    "update_ad_study": {"study_id": "9870123", "name": "Updated Study"},
+    "cancel_ad_study": {"study_id": "9870123"},
+    "list_catalogs": {"business_id": "9800123"},
+    "list_dpa_eligible_catalogs": {"business_id": "9800123"},
+    "get_catalog_diagnostics": {"catalog_id": "9810123"},
+    "get_catalog_dynamic_ads_health": {"catalog_id": "9810123"},
+    "list_catalog_data_sources": {"catalog_id": "9810123"},
+    "create_catalog": {"business_id": "9800123"},
+    "update_catalog": {"catalog_id": "9810123", "name": "Updated Catalog"},
+    "list_catalog_products": {"catalog_id": "9810123"},
     "create_catalog_product": {
-        "catalog_id": "cat_123", "retailer_id": "sku_123", "price": 12.5, "currency": "USD",
+        "catalog_id": "9810123", "retailer_id": "sku_123", "price": 12.5, "currency": "USD",
         "url": "https://example.com/p", "image_url": "https://example.com/p.png",
     },
     "update_catalog_product": {"product_id": "prod_123", "price": 9.99},
     "delete_catalog_product": {"product_id": "prod_123"},
     "build_product_set_filter": {
-        "catalog_id": "cat_123", "conditions": [{"field": "brand", "operator": "eq", "value": "Acme"}],
+        "catalog_id": "9810123", "conditions": [{"field": "brand", "operator": "eq", "value": "Acme"}],
     },
-    "list_product_sets": {"catalog_id": "cat_123"},
-    "create_product_set": {"catalog_id": "cat_123", "filter": {"brand": {"eq": "Acme"}}},
-    "update_product_set": {"product_set_id": "ps_123", "name": "Updated Set"},
-    "delete_product_set": {"product_set_id": "ps_123"},
+    "list_product_sets": {"catalog_id": "9810123"},
+    "create_product_set": {"catalog_id": "9810123", "filter": {"brand": {"eq": "Acme"}}},
+    "update_product_set": {"product_set_id": "9850123", "name": "Updated Set"},
+    "delete_product_set": {"product_set_id": "9850123"},
     "batch_update_catalog_products": {
         "catalog_id": "123", "items": [{"method": "update", "retailer_id": "sku_123", "name": "New"}],
         "allow_upsert": True, "wait_seconds": 0,
     },
     "list_catalog_attribute_values": {"catalog_id": "123", "attribute": "brand"},
-    "list_product_feeds": {"catalog_id": "cat_123"},
-    "create_product_feed": {"catalog_id": "cat_123", "schedule": {"url": "https://example.com/feed.csv", "interval": "DAILY"}},
-    "update_product_feed": {"feed_id": "feed_123", "name": "Updated Feed"},
-    "delete_product_feed": {"feed_id": "feed_123"},
-    "create_product_feed_upload": {"feed_id": "feed_123", "url": "https://example.com/feed.csv"},
-    "list_product_feed_uploads": {"feed_id": "feed_123"},
-    "list_feed_rules": {"feed_id": "feed_123"},
-    "create_feed_rule": {"feed_id": "feed_123", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}},
+    "list_product_feeds": {"catalog_id": "9810123"},
+    "create_product_feed": {"catalog_id": "9810123", "schedule": {"url": "https://example.com/feed.csv", "interval": "DAILY"}},
+    "update_product_feed": {"feed_id": "9820123", "name": "Updated Feed"},
+    "delete_product_feed": {"feed_id": "9820123"},
+    "create_product_feed_upload": {"feed_id": "9820123", "url": "https://example.com/feed.csv"},
+    "list_product_feed_uploads": {"feed_id": "9820123"},
+    "list_feed_rules": {"feed_id": "9820123"},
+    "create_feed_rule": {"feed_id": "9820123", "attribute": "title", "rule_type": "letter_case_rule", "params": {"type": "to_upper"}},
     "delete_feed_rule": {"rule_id": "rule_123"},
     "update_feed_rule": {"rule_id": "123", "params": {"type": "to_lower"}},
-    "list_catalog_event_sources": {"catalog_id": "cat_123"},
+    "list_catalog_event_sources": {"catalog_id": "9810123"},
     # business_id is given: this fake answers every unknown field with placeholder text, which is
     # not a Graph id, so the owner business it would otherwise read cannot be read.
     "list_event_source_catalogs": {"event_source_id": "external_event_sources_123", "business_id": "123"},
-    "get_catalog_event_source_health": {"catalog_id": "cat_123"},
-    "get_catalog_event_source_recommendations": {"catalog_id": "cat_123", "business_id": "123"},
-    "connect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "px_123"},
-    "disconnect_catalog_event_source": {"catalog_id": "cat_123", "event_source_id": "external_event_sources_123"},
+    "get_catalog_event_source_health": {"catalog_id": "9810123"},
+    "get_catalog_event_source_recommendations": {"catalog_id": "9810123", "business_id": "123"},
+    "connect_catalog_event_source": {"catalog_id": "9810123", "event_source_id": "9860123"},
+    "disconnect_catalog_event_source": {"catalog_id": "9810123", "event_source_id": "external_event_sources_123"},
     "list_pages": {"source": "ad_account", "account_id": "123"},
-    "list_instagram_media": {"instagram_account_id": "ig_123"},
+    "list_instagram_media": {"instagram_account_id": "9830123"},
     "list_creative_ads": {"account_id": "123"},
-    "get_field_reference": {"level": "ad", "field_names": ["name", "status"], "object_id": "ad_123"},
+    "get_field_reference": {"level": "ad", "field_names": ["name", "status"], "object_id": "9300123"},
     "update_adset": {"name": "Updated Ad Set"},
     "update_ad": {"name": "Updated Ad"},
     "add_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
     "remove_audience_users": {"schema": ["EMAIL"], "rows": [["person@example.com"]]},
-    "boost_instagram_post": {"instagram_media_id": "media_123", "instagram_account_id": "ig_123", "page_id": "page_123"},
+    "boost_instagram_post": {"instagram_media_id": "9840123", "instagram_account_id": "9830123", "page_id": "9600123"},
     "list_business_users": {"business_id": "123"},
     "list_catalog_assigned_users": {"catalog_id": "456", "business_id": "123"},
     "list_user_assigned_catalogs": {"user_id": "789"},
@@ -237,15 +237,15 @@ TOOL_OVERRIDES: dict[str, dict[str, Any]] = {
     "duplicate_campaign": {"campaign_id": "111", "deep_copy": True},
     "duplicate_adset": {"adset_id": "411", "campaign_id": "999"},
     "duplicate_ad": {"ad_id": "611", "new_name": "Copied ad"},
-    "get_performance_trend": {"object_id": "cmp_123"},
-    "detect_performance_anomalies": {"object_id": "cmp_123"},
-    "get_auction_ranking_report": {"object_id": "cmp_123"},
+    "get_performance_trend": {"object_id": "9100123"},
+    "detect_performance_anomalies": {"object_id": "9100123"},
+    "get_auction_ranking_report": {"object_id": "9100123"},
 }
 # search_terms became optional (search_page_ids is the other route), so the smoke run names it.
 TOOL_OVERRIDES["search_ads_archive"] = {**TOOL_OVERRIDES["search_ads_archive"], "search_terms": "shirts"}
 
 # Phase two, stream P1 (creatives, media and assets).
-TOOL_OVERRIDES["boost_instagram_post"] = {**TOOL_OVERRIDES["boost_instagram_post"], "adset_id": "adset_123"}
+TOOL_OVERRIDES["boost_instagram_post"] = {**TOOL_OVERRIDES["boost_instagram_post"], "adset_id": "9200123"}
 TOOL_OVERRIDES.update({
     "create_ad_creative_from_inputs": {"page_id": "111", "image_hash": "hash_123", "link_url": "https://example.com"},
     "update_ad_creative_enhancements": {"features": {"image_touchups": "OPT_OUT"}},
@@ -276,7 +276,7 @@ class UniversalFakeClient:
             return {
                 "data": [
                     {
-                        "id": "cmp_123",
+                        "id": "9100123",
                         "account_id": "123",
                         "name": "Campaign 123",
                         "status": "ACTIVE",
@@ -290,7 +290,7 @@ class UniversalFakeClient:
             return {
                 "data": [
                     {
-                        "id": "ig_123",
+                        "id": "9830123",
                         "username": "test_brand",
                         "name": "Test Brand",
                     }
@@ -300,7 +300,7 @@ class UniversalFakeClient:
             return {
                 "data": [
                     {
-                        "id": "page_123",
+                        "id": "9600123",
                         "name": "Test Page",
                         "category": "Retail",
                         "link": "https://facebook.com/test-page",
@@ -311,12 +311,12 @@ class UniversalFakeClient:
             return {
                 "data": [
                     {
-                        "id": "adset_123",
+                        "id": "9200123",
                         "account_id": "123",
                         "name": "Ad Set 123",
                         "status": "ACTIVE",
                         "effective_status": "ACTIVE",
-                        "campaign_id": "cmp_123",
+                        "campaign_id": "9100123",
                         "daily_budget": "3000",
                         "billing_event": "IMPRESSIONS",
                         "optimization_goal": "OFFSITE_CONVERSIONS",
@@ -328,15 +328,15 @@ class UniversalFakeClient:
             return {
                 "data": [
                     {
-                        "id": "ad_123",
+                        "id": "9300123",
                         "account_id": "123",
                         "name": "Ad 123",
                         "status": "ACTIVE",
                         "effective_status": "ACTIVE",
-                        "campaign_id": "cmp_123",
-                        "adset_id": "adset_123",
+                        "campaign_id": "9100123",
+                        "adset_id": "9200123",
                         "bid_amount": "1250",
-                        "creative": {"id": "crt_123"},
+                        "creative": {"id": "9400123"},
                     }
                 ]
             }
@@ -344,7 +344,7 @@ class UniversalFakeClient:
             return {
                 "data": [
                     {
-                        "id": "aud_123",
+                        "id": "9500123",
                         "name": "Audience 123",
                         "subtype": "CUSTOM",
                         "description": "Test audience",
@@ -356,7 +356,7 @@ class UniversalFakeClient:
             return {
                 "data": [
                     {
-                        "id": "crt_123",
+                        "id": "9400123",
                         "name": "Creative 123",
                         "title": "Creative title",
                         "body": "Creative body",
@@ -420,16 +420,16 @@ class UniversalFakeClient:
     async def get_object(self, object_id: str, *, fields=None, params=None):
         if object_id == "act_123":
             return {"id": object_id, "currency": "USD"}
-        if object_id == "ad_123":
+        if object_id == "9300123":
             return {
-                "id": "ad_123",
+                "id": "9300123",
                 "name": "Ad 123",
                 "account_id": "act_123",
-                "creative": {"id": "crt_123", "name": "Creative 123"},
+                "creative": {"id": "9400123", "name": "Creative 123"},
             }
-        if object_id == "crt_123":
+        if object_id == "9400123":
             return {
-                "id": "crt_123",
+                "id": "9400123",
                 "name": "Creative 123",
                 "image_hash": "hash_123",
                 "thumbnail_url": "https://example.com/thumb.png",
@@ -456,7 +456,7 @@ class UniversalFakeClient:
             "customer_file_source": "USER_PROVIDED_ONLY",
             "retention_days": 30,
             "description": "Old description",
-            "creative": {"id": "crt_123", "name": "Creative 123"},
+            "creative": {"id": "9400123", "name": "Creative 123"},
             "targeting": SAMPLE_TARGETING,
             "account_status": 1,
             "app_id": "app_123",
@@ -531,7 +531,7 @@ class UniversalFakeClient:
         return {
             "data": [
                 {
-                    "id": "cat_123",
+                    "id": "9810123",
                     "name": query or category_class,
                     "class": category_class,
                     "account_id": account_id,
@@ -651,9 +651,9 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
         return {
             "items": [
                 {
-                    "campaign_id": "cmp_123",
-                    "adset_id": "adset_123",
-                    "ad_id": "ad_123",
+                    "campaign_id": "9100123",
+                    "adset_id": "9200123",
+                    "ad_id": "9300123",
                     "spend": 100.0,
                     "roas": 4.0,
                     "reach": 800,
@@ -695,9 +695,9 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
             {
                 "id": f"{level}_1",
                 f"{level}_id": f"{level}_1",
-                "campaign_id": "cmp_123",
-                "adset_id": "adset_123",
-                "ad_id": "ad_123",
+                "campaign_id": "9100123",
+                "adset_id": "9200123",
+                "ad_id": "9300123",
                 "spend": 100.0,
                 "roas": 4.0,
                 "metrics": {
@@ -717,9 +717,9 @@ def _patch_clients(monkeypatch: pytest.MonkeyPatch) -> UniversalFakeClient:
             {
                 "id": f"{level}_2",
                 f"{level}_id": f"{level}_2",
-                "campaign_id": "cmp_456",
-                "adset_id": "adset_456",
-                "ad_id": "ad_456",
+                "campaign_id": "9100456",
+                "adset_id": "9200456",
+                "ad_id": "9300456",
                 "spend": 60.0,
                 "roas": 1.5,
                 "metrics": {
@@ -765,22 +765,22 @@ def _required_value(param_name: str) -> Any:
     """Return a sample value for a required parameter."""
     mapping = {
         "account_id": "123",
-        "campaign_id": "cmp_123",
-        "adset_id": "adset_123",
-        "ad_id": "ad_123",
-            "creative_id": "crt_123",
+        "campaign_id": "9100123",
+        "adset_id": "9200123",
+        "ad_id": "9300123",
+            "creative_id": "9400123",
             "comment_id": "comment_123",
-            "audience_id": "aud_123",
-        "origin_audience_id": "aud_origin_123",
+            "audience_id": "9500123",
+        "origin_audience_id": "9500999",
         "interest_list": ["running"],
         "ad_reached_countries": ["US"],
-        "system_user_id": "sys_123",
+        "system_user_id": "9700123",
         "report_run_id": "rpt_123",
         "export_id": "A" * 32,
         "owner_id": "act_123",
-        "page_id": "page_123",
-        "object_id": "cmp_123",
-        "object_ids": ["cmp_123", "cmp_456"],
+        "page_id": "9600123",
+        "object_id": "9100123",
+        "object_ids": ["9100123", "9100456"],
         "level": "campaign",
         "name": "Test Name",
         "objective": "OUTCOME_SALES",
@@ -911,7 +911,7 @@ def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) 
             campaigns.create_ad_set,
             {
                 "account_id": "123",
-                "campaign_id": "cmp_123",
+                "campaign_id": "9100123",
                 "name": "Bad Ad Set",
                 "billing_event": "IMPRESSIONS",
                 "optimization_goal": "OFFSITE_CONVERSIONS",
@@ -922,17 +922,17 @@ def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) 
         ),
         (creatives.preview_ad, {}),
         (creatives.upload_creative_asset, {"account_id": "123"}),
-        (ads.create_ad, {"account_id": "123", "name": "Bad Ad", "adset_id": "adset_123", "creative_id": "crt_123", "status": "DELETED"}),
+        (ads.create_ad, {"account_id": "123", "name": "Bad Ad", "adset_id": "9200123", "creative_id": "9400123", "status": "DELETED"}),
         (diagnostics.get_creative_performance_report, {}),
         (diagnostics.get_creative_fatigue_report, {}),
         (diagnostics.get_delivery_risk_report, {}),
         (diagnostics.get_learning_phase_report, {}),
-        (insights.export_insights, {"level": "campaign", "object_id": "cmp_123", "format": "xml"}),
+        (insights.export_insights, {"level": "campaign", "object_id": "9100123", "format": "xml"}),
         (
             insights.get_entity_insights,
             {
                 "level": "campaign",
-                "object_id": "cmp_123",
+                "object_id": "9100123",
                 "date_preset": "last_7d",
                 "since": "2026-03-01",
                 "until": "2026-03-07",
@@ -943,14 +943,14 @@ def test_every_tool_smoke_runs(monkeypatch: pytest.MonkeyPatch, tool_name: str) 
             {
                 "account_id": "123",
                 "name": "Bad LAL",
-                "origin_audience_id": "aud_123",
+                "origin_audience_id": "9500123",
             },
         ),
-        (execution.update_campaign_budget, {"campaign_id": "cmp_123"}),
-        (execution.update_campaign_bid_strategy, {"campaign_id": "cmp_123", "bid_strategy": ""}),
-        (execution.set_campaign_status, {"campaign_id": "cmp_123", "status": "DELETED"}),
-        (execution.update_adset_bid_amount, {"adset_id": "adset_123", "bid_amount": 0}),
-        (execution.update_adset_bid_strategy, {"adset_id": "adset_123", "bid_strategy": "COST_CAP", "bid_amount": -1}),
+        (execution.update_campaign_budget, {"campaign_id": "9100123"}),
+        (execution.update_campaign_bid_strategy, {"campaign_id": "9100123", "bid_strategy": ""}),
+        (execution.set_campaign_status, {"campaign_id": "9100123", "status": "DELETED"}),
+        (execution.update_adset_bid_amount, {"adset_id": "9200123", "bid_amount": 0}),
+        (execution.update_adset_bid_strategy, {"adset_id": "9200123", "bid_strategy": "COST_CAP", "bid_amount": -1}),
         (targeting.get_interest_suggestions, {"interest_list": []}),
         (targeting.get_targeting_categories, {"category_class": ""}),
         (targeting.validate_interests, {}),

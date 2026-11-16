@@ -1357,7 +1357,7 @@ def test_create_ab_test_creative_dry_run_through_mcp_boundary(monkeypatch) -> No
 
     client = use(monkeypatch, FakeStudyClient())
     result = run(mcp_server.call_tool("create_ab_test", {
-        "account_id": "123", "business_id": "biz_1", "name": "Creative", "cells": _ad_cells(50, 50),
+        "account_id": "123", "business_id": "9800001", "name": "Creative", "cells": _ad_cells(50, 50),
         "start_time": FUTURE_START, "end_time": FUTURE_END,
         "creative_test_lifetime_budget_percentage": 20, "dry_run": True,
     })).structured_content

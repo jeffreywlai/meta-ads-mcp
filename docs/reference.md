@@ -15,6 +15,7 @@ The details that do not fit in a tool table. Setup and the tool list are in the
 - [Change history](#change-history)
 - [Read-only mode](#read-only-mode)
 - [Local file uploads](#local-file-uploads)
+- [Input formats](#input-formats)
 - [Errors and retries](#errors-and-retries)
 - [Default account](#default-account)
 - [API version 26](#api-version-26)
@@ -373,6 +374,29 @@ local file through `file_path`: `upload_creative_asset` (images),
 The reason: the model also reads text written by strangers, such as ad comments.
 A file path it supplies must not be able to send some other file on your machine
 to Meta.
+
+## Input formats
+
+Some inputs are checked before the tool starts, so a wrong value is refused
+without a request to Meta. The message names the parameter and says what a
+valid value looks like. It never repeats the value, because a value put in the
+wrong field can hold private text.
+
+- **Ids that Meta defines as numbers must be digits.** This covers campaign,
+  ad set, ad, creative, custom audience, pixel or dataset, business, catalog,
+  product set, product feed, Page, Instagram account and media, study, video,
+  system user and app ids, and each entry of a list of them. Send the id as a
+  string: `'1234567890'`. A JSON number was refused before and still is.
+- An ad account id is digits or `act_` followed by digits. `object_id` on the
+  reporting tools takes an ad account, campaign, ad set or ad id.
+  `get_account_pages` also takes `me`.
+- Spaces around an id, and a blank optional id, are treated as before.
+- Ids of other forms are not checked: image hashes, Page post and comment ids
+  (`123_456`), paging cursors, `export_id`, `report_run_id`, retailer and product
+  ids, interest ids. The full list, with the reason for each, is in
+  `meta_ads_mcp/id_formats.py`.
+- Each checked id's pattern is in the tool's input schema, so
+  `get_capabilities(tool_name=...)` shows it.
 
 ## Errors and retries
 

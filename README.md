@@ -638,6 +638,7 @@ meta-ads-mcp/
 │   ├── diagnostics.py         # Derived metrics & optimization heuristics
 │   ├── tool_types.py          # Shared input types for tool parameters
 │   ├── input_compat.py        # Forgiving normalization of tool inputs
+│   ├── id_formats.py          # Ids Meta defines as numbers must be digits
 │   ├── activity_scope.py      # Validation of change-history scope arguments
 │   ├── intent_routing.py      # Safety layer for tool search
 │   ├── tool_contracts.py      # Contracts derived from the live tool catalog

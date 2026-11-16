@@ -70,7 +70,7 @@ def test_read_only_keeps_routed_reads_and_async_reporting_jobs(read_only, monkey
     monkeypatch.setattr(insights, "get_graph_api_client", lambda: ReadClient())
     for name in ("get_entity_insights", "create_async_insights_report"):
         result = asyncio.run(mcp_server.call_tool("call_tool", {
-            "name": name, "arguments": {"level": "ad", "object_id": "ad_1"},
+            "name": name, "arguments": {"level": "ad", "object_id": "1234567890"},
         }))
         assert result.structured_content is not None
 
@@ -98,7 +98,8 @@ def test_read_only_async_reports_reject_endpoint_injection(
     tool = "call_tool" if routed else name
     if routed:
         arguments = {"name": name, "arguments": arguments}
-    with pytest.raises(ToolError, match="numeric ID or act_<numeric>"):
+    # Refused by the shared id check (meta_ads_mcp/id_formats.py) before the tool's own check.
+    with pytest.raises(ToolError, match="object_id must be an ad account, campaign, ad set or ad id"):
         asyncio.run(mcp_server.call_tool(tool, arguments))
 
 
