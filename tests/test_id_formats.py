@@ -15,6 +15,8 @@ import re
 import httpx
 import pytest
 from fastmcp.exceptions import ToolError
+from fastmcp.tools.tool import Tool
+from jsonschema.validators import validator_for
 
 from meta_ads_mcp import stdio  # noqa: F401 - import registers all tools
 from meta_ads_mcp.config import reload_settings
@@ -59,7 +61,12 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         requests.append(f"{method} {url}")
         raise AssertionError("no request may be sent in this test")
 
+    async def refuse_send(self, request, *args, **kwargs):
+        requests.append(f"{request.method} {request.url}")
+        raise AssertionError("no request may be sent in this test")
+
     monkeypatch.setattr(httpx.AsyncClient, "request", refuse)
+    monkeypatch.setattr(httpx.AsyncClient, "send", refuse_send)
     monkeypatch.setenv("META_READ_ONLY", "false")
     reload_settings()
     return requests
@@ -248,19 +255,44 @@ def test_a_valid_id_reaches_the_tool(monkeypatch: pytest.MonkeyPatch, sent: list
     assert sent == []
 
 
+def _schema_without_id_patterns(tool: str) -> dict:
+    """The tool's input schema as its own signature makes it, before id patterns are added."""
+    return Tool.from_function(TOOLS[tool].fn, name=tool).parameters
+
+
+RAW_SCHEMAS = {tool: _schema_without_id_patterns(tool) for tool in {tool for tool, _ in CHECKED}}
+
+
+def _string_patterns(schema: dict) -> list[str]:
+    branches = schema.get("anyOf", [schema])
+    return [branch["pattern"] for branch in branches if branch.get("type") == "string" and "pattern" in branch]
+
+
+def _item_patterns(schema: dict) -> list[str]:
+    branches = schema.get("anyOf", [schema])
+    return [
+        branch["items"]["pattern"]
+        for branch in branches
+        if branch.get("type") == "array" and isinstance(branch.get("items"), dict) and "pattern" in branch["items"]
+    ]
+
+
 @pytest.mark.parametrize(("tool", "parameter"), CHECKED)
 def test_the_input_schema_carries_the_pattern(tool: str, parameter: str) -> None:
     expected, is_list = id_format(tool, parameter)
     schema = TOOLS[tool].parameters["properties"][parameter]
+    raw = RAW_SCHEMAS[tool]["properties"][parameter]
     branches = schema.get("anyOf", [schema])
     strings = [branch for branch in branches if branch.get("type") == "string"]
     arrays = [branch for branch in branches if branch.get("type") == "array"]
     assert strings or arrays
     assert all("pattern" in branch for branch in strings)
-    for branch in arrays:
-        assert branch["items"].get("pattern") == expected.pattern
+    # A pattern the tool's own type already had is kept; otherwise the one this check adds.
+    for pattern, before in zip(_item_patterns(schema), _item_patterns(raw) or [None] * len(arrays)):
+        assert pattern == (before or expected.schema_pattern())
     if not is_list:
-        assert all(branch["pattern"] == expected.pattern for branch in strings)
+        for pattern, before in zip(_string_patterns(schema), _string_patterns(raw) or [None] * len(strings)):
+            assert pattern == (before or expected.schema_pattern())
         assert "integer" not in json.dumps(schema) and "number" not in json.dumps(schema)
     for branch in strings:
         assert re.fullmatch(branch["pattern"], "1234567890")
@@ -271,10 +303,103 @@ def test_the_input_schema_carries_the_pattern(tool: str, parameter: str) -> None
 def test_a_comma_separated_list_pattern_matches_the_check() -> None:
     schema = TOOLS["detect_auction_overlap"].parameters["properties"]["campaign_ids"]
     text = next(branch for branch in schema["anyOf"] if branch.get("type") == "string")["pattern"]
-    for good in ("1234567890", "1, 2", "1,2,3"):
+    for good in ("1234567890", "1, 2", "1,2,3", "", " ", "1,,2", " 1 , 2 ,"):
         assert re.fullmatch(text, good)
-    for bad in ("1, two", "act_1", "one"):
+    for bad in ("1, two", "act_1", "one", "1 2"):
         assert not re.fullmatch(text, bad)
+
+
+# Building blocks for every value tried against each checked parameter. The spaces
+# include ones str.strip() removes beyond the ASCII space (a tab, a newline, a
+# no-break space, an em space, a file separator).
+SPACES = ("", " ", "\t", "\n", " ", " ", "\x1c")
+WRONG_TOKENS = ("Spring sale", "abc", "act_", "12 34", "1a", "<id>", "1/2", "١٢", "１２", "ACT_1")
+
+
+def _tokens(expected) -> tuple[str, ...]:
+    tokens = ["1234567890", "7"]
+    if "act_" in expected.pattern:
+        tokens.append("act_1234567890")
+    if "me" in expected.pattern:
+        tokens.append("me")
+    return (*tokens, *WRONG_TOKENS)
+
+
+def _single_values(expected) -> list[str]:
+    return [left + token + right for token in ("", *_tokens(expected)) for left in SPACES for right in SPACES]
+
+
+def _list_values(expected) -> list[object]:
+    pieces = ["", " ", "\t"] + [
+        left + token + right for token in _tokens(expected) for left, right in (("", ""), (" ", " "), (" ", ""))
+    ]
+    lists: list[object] = [[]] + [[piece] for piece in pieces] + [[a, b] for a in pieces[:8] for b in pieces]
+    texts = [",", ",,", " , "] + pieces + [f"{a},{b}" for a in pieces for b in pieces[:8]]
+    texts += [f"{a},{b},{c}" for a in pieces[:6] for b in pieces[:6] for c in pieces[:6]]
+    return lists + texts
+
+
+_VALIDATORS: dict[str, object] = {}
+
+
+def _validates(schema: dict, defs: dict, value: object) -> bool:
+    key = json.dumps([schema, defs], sort_keys=True)
+    if key not in _VALIDATORS:
+        whole = {**schema, "$defs": defs} if defs else schema
+        _VALIDATORS[key] = validator_for(whole)(whole)
+    return _VALIDATORS[key].is_valid(value)
+
+
+def _accepted_by_the_check(tool: str, parameter: str, value: object) -> bool:
+    try:
+        check_id_arguments(tool, {parameter: value})
+    except ValidationError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(("tool", "parameter"), CHECKED)
+def test_the_schema_accepts_exactly_what_the_check_accepts(tool: str, parameter: str) -> None:
+    """A value the id check lets through must not fail the advertised schema, or tool search drops the call.
+
+    Only the patterns this check adds are judged: a value the tool's own type already
+    refused (a strict id type that predates the check) is left out.
+    """
+    expected, is_list = id_format(tool, parameter)
+    final = TOOLS[tool].parameters
+    raw = RAW_SCHEMAS[tool]
+    final_property, raw_property = final["properties"][parameter], raw["properties"][parameter]
+    values = _list_values(expected) if is_list else _single_values(expected)
+    wrongly_refused, wrongly_accepted = [], []
+    for value in values:
+        if not _validates(raw_property, raw.get("$defs", {}), value):
+            continue
+        accepted = _accepted_by_the_check(tool, parameter, value)
+        valid = _validates(final_property, final.get("$defs", {}), value)
+        if accepted and not valid:
+            wrongly_refused.append(value)
+        if valid and not accepted:
+            wrongly_accepted.append(value)
+    assert not wrongly_refused, f"{tool}.{parameter}: the schema refuses values the check accepts: {wrongly_refused[:5]}"
+    assert not wrongly_accepted, f"{tool}.{parameter}: the schema accepts values the check refuses: {wrongly_accepted[:5]}"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        'list_campaigns(account_id="")',
+        'list_campaigns(account_id=" ")',
+        'list_campaigns(account_id=" 1234567890 ")',
+        'get_creative(creative_id=" 2222222222 ")',
+        'get_ad_image(ad_ids=[" 2222222222 "])',
+        'get_ad_image(ad_ids=" 2222222222 , 3333333333 ")',
+    ],
+)
+def test_tool_search_keeps_a_call_with_a_blank_or_padded_id(query: str, sent: list[str]) -> None:
+    result = _call("search_tools", {"query": query})
+    text = "\n".join(block.text for block in result.content)
+    assert f"- `{query.split('(', 1)[0]}`" in text
+    assert sent == []
 
 
 @pytest.mark.parametrize("parameter", sorted(LEFT_ALONE))

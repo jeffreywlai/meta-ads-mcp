@@ -45,6 +45,15 @@ class IdFormat:
     def matches(self, text: str) -> bool:
         return re.fullmatch(self.pattern, text) is not None
 
+    def schema_pattern(self) -> str:
+        """The pattern an input schema carries: this form, or a blank, with spaces allowed around it.
+
+        The check before a tool runs strips the value and skips a blank one, so the schema
+        accepts exactly that; otherwise tool search, which validates a call against the
+        schema, would drop calls the tool runs.
+        """
+        return rf"^\s*(?:{_inner(self.pattern)})?\s*$"
+
 
 def _digits(kind: str) -> IdFormat:
     return IdFormat(r"^[0-9]+$", f"{kind} id: digits only, passed as a string, for example '1234567890'")
@@ -180,10 +189,18 @@ def check_id_arguments(tool_name: str, arguments: dict[str, Any] | None) -> None
                 raise _refusal(f"{parameter}[{index}]", expected)
 
 
+def _inner(pattern: str) -> str:
+    return pattern.removeprefix("^").removesuffix("$")
+
+
 def _csv_pattern(pattern: str) -> str:
-    """The pattern for comma-separated text of ids of one form, spaces allowed around commas."""
-    inner = pattern.removeprefix("^").removesuffix("$")
-    return rf"^\s*{inner}(\s*,\s*{inner})*\s*$"
+    """The pattern for comma-separated text of ids of one form, as the check reads it.
+
+    Each piece between commas is an id or blank, with spaces allowed around it: the
+    check drops blank pieces and strips the others.
+    """
+    piece = rf"\s*(?:{_inner(pattern)})?\s*"
+    return rf"^{piece}(?:,{piece})*$"
 
 
 def _add_pattern(schema: dict[str, Any], expected: IdFormat, is_list: bool) -> None:
@@ -192,10 +209,10 @@ def _add_pattern(schema: dict[str, Any], expected: IdFormat, is_list: bool) -> N
         if not isinstance(branch, dict):
             continue
         if branch.get("type") == "string":
-            branch.setdefault("pattern", _csv_pattern(expected.pattern) if is_list else expected.pattern)
+            branch.setdefault("pattern", _csv_pattern(expected.pattern) if is_list else expected.schema_pattern())
         elif branch.get("type") == "array" and isinstance(branch.get("items"), dict):
             if branch["items"].get("type") == "string":
-                branch["items"].setdefault("pattern", expected.pattern)
+                branch["items"].setdefault("pattern", expected.schema_pattern())
     if is_list:
         schema.setdefault("description", f"A list of ids, each {expected.description}.")
     else:
