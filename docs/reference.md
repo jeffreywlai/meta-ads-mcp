@@ -431,8 +431,9 @@ wrong field can hold private text.
   ad and ad account ids in A/B test and lift study cells; the pixel, app,
   dataset, product set and catalog ids in lift study objectives; and
   `boost_instagram_post`'s `promoted_object.pixel_id` and
-  `promoted_object.application_id`. The message names the path, such as
-  `creative.id`.
+  `promoted_object.application_id`. A whole number there is judged by its
+  digits, and any other value that is not text (`true`, a fraction, an object)
+  is refused. The message names the path, such as `creative.id`.
 - An ad account id is digits or `act_` followed by digits. `object_id` on the
   reporting tools takes an ad account, campaign, ad set or ad id.
   `get_account_pages` also takes `me`.

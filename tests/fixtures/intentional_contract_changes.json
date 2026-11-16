@@ -315,7 +315,7 @@
     {
       "tool": "create_ad",
       "kind": "behaviour",
-      "what_changed": "An existing creative named inside creative, as creative={'creative_id': ...} or creative={'id': ...}, must now be digits, the same as the top-level creative_id; anything else is refused before the tool starts, with a message that names creative.creative_id or creative.id and never repeats the value. Before, the top-level creative_id was checked but the same id given inside creative was sent to Meta as written. Spaces around the id and a blank value are treated as before.",
+      "what_changed": "An existing creative named inside creative, as creative={'creative_id': ...} or creative={'id': ...}, must now be digits, the same as the top-level creative_id; anything else is refused before the tool starts, with a message that names creative.creative_id or creative.id and never repeats the value. Before, the top-level creative_id was checked but the same id given inside creative was sent to Meta as written. Spaces around the id and a blank value are treated as before. A value there that is neither text nor a whole number (true or false, a fraction, an object or a list) is refused the same way, and a whole number is judged by its digits; a null or missing value is handled as before.",
       "why_better": "All three ways of naming the creative get the same check, so a name or a placeholder given as the nested creative id no longer spends a rate-limited request and comes back as an unclear error from Meta, and private text pasted there is never echoed back or sent to Meta.",
       "migration": "Pass the creative's numeric id as a string, for example creative={'creative_id': '1234567890'}, or use the top-level creative_id. Numeric ids need no change."
     },
@@ -392,21 +392,21 @@
     {
       "tool": "create_ab_test",
       "kind": "behaviour",
-      "what_changed": "Each id inside cells (every entry of campaign_ids, adset_ids and ad_ids) must now be digits; anything else is refused before the tool starts, with a message that names the place, such as cells[1].campaign_ids[0], and never repeats the value. Before, these ids were checked only for being present and sent to Meta as written. Spaces around an id are treated as before.",
+      "what_changed": "Each id inside cells (every entry of campaign_ids, adset_ids and ad_ids) must now be digits; anything else is refused before the tool starts, with a message that names the place, such as cells[1].campaign_ids[0], and never repeats the value. Before, these ids were checked only for being present and sent to Meta as written. Spaces around an id are treated as before. A value there that is neither text nor a whole number (true or false, a fraction, an object or a list) is refused the same way, and a whole number is judged by its digits; a null or missing value is handled as before.",
       "why_better": "A name or a placeholder in a cell no longer spends a rate-limited request and comes back as an unclear error from Meta, and private text pasted there is never echoed back or sent to Meta.",
       "migration": "Pass each campaign, ad set or ad by its numeric id as a string, for example '1234567890'. Numeric ids need no change."
     },
     {
       "tool": "create_lift_study",
       "kind": "behaviour",
-      "what_changed": "Each id inside cells (campaign_ids digits, ad_account_ids digits or act_ followed by digits) and each source id inside objectives (adspixels, applications, offsite_datasets, offline_conversion_data_sets, product_sets and product_catalogs) must now be of that form; anything else is refused before the tool starts, with a message that names the place, such as objectives[0].adspixels[0].id, and never repeats the value. Before, these ids were checked only for being present. customconversions ids are unchanged. Spaces around an id are treated as before.",
+      "what_changed": "Each id inside cells (campaign_ids digits, ad_account_ids digits or act_ followed by digits) and each source id inside objectives (adspixels, applications, offsite_datasets, offline_conversion_data_sets, product_sets and product_catalogs) must now be of that form; anything else is refused before the tool starts, with a message that names the place, such as objectives[0].adspixels[0].id, and never repeats the value. Before, these ids were checked only for being present. customconversions ids are unchanged. Spaces around an id are treated as before. A value there that is neither text nor a whole number (true or false, a fraction, an object or a list) is refused the same way, and a whole number is judged by its digits; a null or missing value is handled as before.",
       "why_better": "A name or a placeholder in a cell or an objective no longer spends a rate-limited request and comes back as an unclear error from Meta, and private text pasted there is never echoed back or sent to Meta.",
       "migration": "Pass each campaign, account, pixel, app, dataset, product set or catalog by its numeric id as a string. Numeric ids need no change."
     },
     {
       "tool": "boost_instagram_post",
       "kind": "behaviour",
-      "what_changed": "promoted_object.pixel_id and promoted_object.application_id given as text must now be ASCII digits, checked before the tool starts with a message that names promoted_object.pixel_id or promoted_object.application_id and never repeats the value. Before, the tool's own check accepted any text Python reads as digits, including other scripts' digits, and only on the routes that use them. Numbers and spaces around the id are treated as before.",
+      "what_changed": "promoted_object.pixel_id and promoted_object.application_id given as text must now be ASCII digits, checked before the tool starts with a message that names promoted_object.pixel_id or promoted_object.application_id and never repeats the value. Before, the tool's own check accepted any text Python reads as digits, including other scripts' digits, and only on the routes that use them. Numbers and spaces around the id are treated as before. A value there that is neither text nor a whole number (true or false, a fraction, an object or a list) is refused the same way, and a whole number is judged by its digits; a null or missing value is handled as before.",
       "why_better": "The pixel or app id gets the same check as every other id parameter, so a value Meta would not read as an id is refused at once with a clear message.",
       "migration": "Pass the pixel or app id as its digits, for example '1234567890'. Numeric ids need no change."
     }
