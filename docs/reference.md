@@ -400,6 +400,11 @@ wrong field can hold private text.
 - **Budgets, bids, lookalike ratios and retention days refuse `true` and
   `false`.** Before, `true` was read as 1 and sent to Meta. Numbers and numeric
   text such as `'12.50'` work as before.
+- **A web address with a login in it is refused** (`https://user:pass@host/...`)
+  by the creative, video, boost and catalog tools, including
+  `upload_creative_asset`, `create_ad_creative`, `update_creative` and
+  `preview_ad`, wherever the URL sits in the creative. Meta stores the URL on the
+  ad and shows it in responses.
 
 ## Errors and retries
 

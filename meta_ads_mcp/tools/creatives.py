@@ -383,6 +383,13 @@ def _refuse_url_logins(value: Any, name: str) -> None:
             _refuse_url_logins(item, f"{name}[{index}]")
 
 
+def _refuse_payload_url_logins(**payloads: Any) -> None:
+    """Refuse a login embedded in any URL of a raw creative payload, named by its parameter."""
+    for name, value in payloads.items():
+        if value is not None:
+            _refuse_url_logins(value, name)
+
+
 def _ensure_v25_creative_payload(payload: Any) -> None:
     """Reject known deprecated Instagram creative keys for newer API versions."""
     deprecated_keys = {
@@ -451,6 +458,10 @@ async def create_ad_creative(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a reusable creative, including a replacement with an edited asset_feed_spec and preserved placement customization rules; attach it to an existing ad with update_ad_creative."""
+    _refuse_payload_url_logins(
+        object_story_spec=object_story_spec, asset_feed_spec=asset_feed_spec,
+        degrees_of_freedom_spec=degrees_of_freedom_spec, params=params,
+    )
     if object_story_spec:
         _ensure_v25_creative_payload(object_story_spec)
     if asset_feed_spec:
@@ -600,6 +611,7 @@ async def preview_ad(
 ) -> dict[str, Any]:
     """Use this when the user wants a rendered preview for an existing ad, creative id, or draft creative payload. ad_formats previews up to 10 placements in one call (one Meta request each) and reports any format Meta refused."""
     if creative:
+        _refuse_url_logins(creative, "creative")
         _ensure_v25_creative_payload(creative)
     if not ad_id and not creative_id and not creative:
         raise ValidationError("Provide ad_id, creative_id, or creative.")
@@ -675,6 +687,7 @@ async def upload_creative_asset(
     """Use this when the user needs an image asset uploaded before creating or updating a creative. Give exactly one of image_url or file_path. file_path is read only from the folder named by the META_UPLOAD_DIR environment variable (a path inside it, or a name relative to it); local files are refused while that variable is unset. Files must be JPG or PNG (.jpg, .jpeg or .png, the types Meta's Ads Guide lists for image ads) and at most 30 MB."""
     if bool(file_path) == bool(image_url):
         raise ValidationError("Provide exactly one of file_path or image_url.")
+    refuse_url_credentials(image_url, "image_url")
     image_file = _read_image_file(file_path) if file_path else None
     client = get_graph_api_client()
     if image_file is not None:
@@ -1588,6 +1601,7 @@ async def update_creative(
     adlabels_operation: str | None = None,
 ) -> dict[str, Any]:
     """Use this when the user already has a creative id and wants to change creative metadata or payload fields. adlabels with adlabels_operation set (replace all labels, the default), add, or remove changes the creative's ad labels; each label is {"name": ...} or {"id": ...}."""
+    _refuse_payload_url_logins(object_story_spec=object_story_spec, asset_feed_spec=asset_feed_spec, params=params)
     if object_story_spec is not None:
         _ensure_v25_creative_payload(object_story_spec)
     if asset_feed_spec is not None:
