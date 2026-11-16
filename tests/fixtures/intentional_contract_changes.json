@@ -325,6 +325,27 @@
       "what_changed": "business_app, the second name this tool takes for app_id, must now be digits like app_id; anything else is refused before the tool starts, with a message that names business_app and never repeats the value. Before, app_id was checked but the same app given as business_app was sent to Meta as written. Spaces around the id and a blank value are treated as before, and the input schema now carries the pattern.",
       "why_better": "Both names for the app get the same check, so a name or a placeholder given as business_app no longer spends a request and comes back as an unclear error from Meta, and private text pasted there is never echoed back or sent to Meta.",
       "migration": "Pass the app's numeric id as a string, for example business_app='1234567890', or use app_id. Numeric ids need no change."
+    },
+    {
+      "tool": "preview_ad",
+      "kind": "behaviour",
+      "what_changed": "A preview from a creative_id no longer needs account_id, and it now reads the creative's own previews edge (creative_id/previews). With an account_id as well, the tool used to send creative_id to the account's generatepreviews edge, which takes no creative_id, so that preview always failed with Meta's error that the parameter creative is required. A preview from an ad_id, or from a creative payload (which still needs account_id), is sent as before, and ad_formats works the same way for every route.",
+      "why_better": "Previewing an existing creative by its id now works, with or without an account id, instead of failing every time. The caller no longer has to look up the account to preview a creative it already has.",
+      "migration": "None needed: a call that passed account_id with creative_id keeps working and now returns the preview. account_id can be dropped from creative_id previews."
+    },
+    {
+      "tool": "add_audience_users",
+      "kind": "behaviour",
+      "what_changed": "When Meta's answer to a batch names a different upload session than the one the tool sent, that batch is no longer counted as accepted: the upload stops, no further batch is sent, and the tool raises an error that reports the outcome as unknown, with the progress so far (batches and rows already acknowledged for this session). Before, the session id in the answer was not checked, and the batch was counted as uploaded. Answers that name the session sent, written as text or as a number, are handled as before.",
+      "why_better": "An acknowledgement for another upload session does not show that this batch reached the audience, so the result no longer claims rows were added when that is not known. The caller is told to check the audience instead of trusting a wrong count.",
+      "migration": "On this error, read the audience with get_audience and upload again only the rows that are missing. Ordinary uploads need no change."
+    },
+    {
+      "tool": "remove_audience_users",
+      "kind": "behaviour",
+      "what_changed": "When Meta's answer to a batch names a different upload session than the one the tool sent, that batch is no longer counted as accepted: the removal stops, no further batch is sent, and the tool raises an error that reports the outcome as unknown, with the progress so far (batches and rows already acknowledged for this session). Before, the session id in the answer was not checked, and the batch was counted as removed. Answers that name the session sent, written as text or as a number, are handled as before.",
+      "why_better": "An acknowledgement for another upload session does not show that this batch was removed from the audience, so the result no longer claims rows were removed when that is not known. The caller is told to check the audience instead of trusting a wrong count.",
+      "migration": "On this error, read the audience with get_audience and send the removal again for the rows that may remain. Ordinary removals need no change."
     }
   ]
 }
