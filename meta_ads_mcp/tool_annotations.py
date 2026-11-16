@@ -13,8 +13,10 @@ table is the only place they are set.
   cancels, archives or overwrites something that already exists.
 - idempotentHint: running the same call twice leaves things as one call did.
   False for a tool that makes a new object each time it runs or uploads rows.
-- openWorldHint: the tool has a web address the caller supplies fetched, or
-  returns public content from outside the person's own assets.
+- openWorldHint: a call can give Meta the web address of a file (an image, a
+  video, a thumbnail, a feed or data file) for Meta to fetch, or the tool returns
+  public content from outside the person's own assets. A landing-page or other
+  destination link does not count; see the comment on the table.
 """
 
 from __future__ import annotations
@@ -38,19 +40,21 @@ def _hints(read_only: bool, destructive: bool, idempotent: bool, open_world: boo
 READ = _hints(True, False, True, False)
 # Changes nothing, and returns public content from outside the person's assets.
 READ_PUBLIC = _hints(True, False, True, True)
+# Changes nothing, but can give Meta the web address of a file to fetch and render.
+READ_FROM_WEB = _hints(True, False, True, True)
 # Makes something new each time it runs; loses nothing that exists.
 ADD = _hints(False, False, False, False)
-# Makes something new from a web address the caller supplies, which Meta fetches.
+# Makes something new, and can give Meta the web address of a file to fetch.
 ADD_FROM_WEB = _hints(False, False, False, True)
 # Switches a link on; running it again changes nothing more.
 SWITCH_ON = _hints(False, False, True, False)
 # Deletes, removes, archives or sets an absolute value over an existing one.
 OVERWRITE = _hints(False, True, True, False)
-# Overwrites, and Meta fetches a web address the caller supplies.
+# Overwrites, and can give Meta the web address of a file to fetch.
 OVERWRITE_FROM_WEB = _hints(False, True, True, True)
 # Can lose existing data and does something new on every run.
 OVERWRITE_EACH_RUN = _hints(False, True, False, False)
-# Can lose existing data, does something new on every run, fetches a caller's web address.
+# Can lose existing data, does something new on every run, and can give Meta a file's web address.
 OVERWRITE_EACH_RUN_FROM_WEB = _hints(False, True, False, True)
 
 
@@ -60,6 +64,13 @@ OVERWRITE_EACH_RUN_FROM_WEB = _hints(False, True, False, True)
 # response-limiting middleware); that does not count, so export_change_history, which
 # always saves one, is read-only like every other read.
 # delete_overflow_artifact is not read-only, because deleting a saved export is what it is for.
+#
+# Open world: a tool is marked when a call can give Meta the web address of a file (an image,
+# a video, a thumbnail, a feed or data file) for Meta to fetch and import or render, through a
+# named argument or a raw payload the tool forwards, or when it returns public content from
+# outside the person's own assets. A landing-page or destination link (link_url, a
+# call-to-action link, url_tags, a promoted_object or tracking URL) does not count: Meta
+# stores it as a destination and the call does not fetch it.
 _TABLE: dict[str, ToolAnnotations] = {
     # Accounts, structure and discovery
     "list_ad_accounts": READ,
@@ -83,7 +94,7 @@ _TABLE: dict[str, ToolAnnotations] = {
     "create_ad_set": ADD,
     "update_adset": OVERWRITE,
     "delete_adset": OVERWRITE,
-    "create_ad": ADD,
+    "create_ad": ADD_FROM_WEB,
     "update_ad": OVERWRITE,
     "delete_ad": OVERWRITE,
     "duplicate_campaign": ADD,
@@ -103,12 +114,12 @@ _TABLE: dict[str, ToolAnnotations] = {
     "get_creative": READ,
     "list_creative_ads": READ,
     "get_ad_image": READ,
-    "preview_ad": READ,
+    "preview_ad": READ_FROM_WEB,
     "list_ad_images": READ,
     "list_ad_videos": READ,
     "list_instagram_media": READ,
-    "create_ad_creative": ADD,
-    "create_ad_creative_from_inputs": ADD,
+    "create_ad_creative": ADD_FROM_WEB,
+    "create_ad_creative_from_inputs": ADD_FROM_WEB,
     "update_ad_creative": OVERWRITE,
     "update_creative": OVERWRITE,
     # Makes a new copy of the creative on every run and attaches it to the ad.
@@ -148,17 +159,17 @@ _TABLE: dict[str, ToolAnnotations] = {
     "get_catalog_dynamic_ads_health": READ,
     "list_catalog_data_sources": READ,
     "create_catalog": ADD,
-    "update_catalog": OVERWRITE,
+    "update_catalog": OVERWRITE_FROM_WEB,
     "list_catalog_products": READ,
     # allow_upsert=true overwrites the product that already has this retailer_id.
-    "create_catalog_product": OVERWRITE_EACH_RUN,
-    "update_catalog_product": OVERWRITE,
+    "create_catalog_product": OVERWRITE_EACH_RUN_FROM_WEB,
+    "update_catalog_product": OVERWRITE_FROM_WEB,
     "delete_catalog_product": OVERWRITE,
-    "batch_update_catalog_products": OVERWRITE_EACH_RUN,
+    "batch_update_catalog_products": OVERWRITE_EACH_RUN_FROM_WEB,
     "build_product_set_filter": READ,
     "list_catalog_attribute_values": READ,
     "list_product_sets": READ,
-    "create_product_set": ADD,
+    "create_product_set": ADD_FROM_WEB,
     "update_product_set": OVERWRITE,
     "delete_product_set": OVERWRITE,
     # Catalog feeds and event sources
@@ -170,8 +181,8 @@ _TABLE: dict[str, ToolAnnotations] = {
     "create_product_feed_upload": OVERWRITE_EACH_RUN_FROM_WEB,
     "list_product_feed_uploads": READ,
     "list_feed_rules": READ,
-    "create_feed_rule": ADD,
-    "update_feed_rule": OVERWRITE,
+    "create_feed_rule": ADD_FROM_WEB,
+    "update_feed_rule": OVERWRITE_FROM_WEB,
     "delete_feed_rule": OVERWRITE,
     "list_catalog_event_sources": READ,
     "list_event_source_catalogs": READ,

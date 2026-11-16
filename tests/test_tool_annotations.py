@@ -11,28 +11,63 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import re
 from pathlib import Path
 
-import pytest
-from fastmcp import Client, FastMCP
-from fastmcp.tools import Tool
-from mcp.types import ToolAnnotations
+import httpx
 
-from meta_ads_mcp import stdio  # noqa: F401 - import registers all tools
-from meta_ads_mcp import tool_annotations
-from meta_ads_mcp.config import reload_settings
-from meta_ads_mcp.coordinator import ALWAYS_VISIBLE_TOOLS, mcp_server, serialize_search_results_compact
-from meta_ads_mcp.read_only import read_only_tool_names
-from meta_ads_mcp.tool_annotations import (
+
+def _refuse_http(*_args, **_kwargs):
+    raise AssertionError("A test in test_tool_annotations.py tried an outgoing HTTP request.")
+
+
+async def _refuse_http_async(*_args, **_kwargs):
+    _refuse_http()
+
+
+# Block outgoing HTTP before the server is imported; restored after the imports so other
+# test modules keep their own HTTP fakes. The autouse fixture blocks it again per test.
+_HTTP_METHODS = [
+    (httpx.AsyncClient, "request", _refuse_http_async),
+    (httpx.AsyncClient, "send", _refuse_http_async),
+    (httpx.Client, "request", _refuse_http),
+    (httpx.Client, "send", _refuse_http),
+]
+_ORIGINAL_HTTP = [(owner, name, getattr(owner, name)) for owner, name, _ in _HTTP_METHODS]
+for _owner, _name, _blocker in _HTTP_METHODS:
+    setattr(_owner, _name, _blocker)
+
+import pytest  # noqa: E402
+from fastmcp import Client, FastMCP  # noqa: E402
+from fastmcp.tools import Tool  # noqa: E402
+from mcp.types import ToolAnnotations  # noqa: E402
+
+from meta_ads_mcp import stdio  # noqa: E402,F401 - import registers all tools
+from meta_ads_mcp import tool_annotations  # noqa: E402
+from meta_ads_mcp.config import reload_settings  # noqa: E402
+from meta_ads_mcp.coordinator import ALWAYS_VISIBLE_TOOLS, mcp_server, serialize_search_results_compact  # noqa: E402
+from meta_ads_mcp.read_only import read_only_tool_names  # noqa: E402
+from meta_ads_mcp.tool_annotations import (  # noqa: E402
     SEARCH_TOOL_ANNOTATIONS,
     TOOL_ANNOTATIONS,
     apply_tool_annotations,
     call_tool_annotations,
     describe_hints,
 )
-from meta_ads_mcp.tool_contracts import _tool_effect
-from meta_ads_mcp.tools import ads, campaigns, execution
+from meta_ads_mcp.tool_contracts import _tool_effect  # noqa: E402
+from meta_ads_mcp.tools import ads, campaigns, execution  # noqa: E402
+from meta_ads_mcp.graph_api import GraphAPIClient  # noqa: E402
+
+for _owner, _name, _original in _ORIGINAL_HTTP:
+    setattr(_owner, _name, _original)
+
+
+@pytest.fixture(autouse=True)
+def _no_outgoing_http(monkeypatch):
+    for owner, name, blocker in _HTTP_METHODS:
+        monkeypatch.setattr(owner, name, blocker)
+
 
 HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 
@@ -139,7 +174,7 @@ def test_marked_tools_count() -> None:
     assert len(names_where("readOnlyHint")) == 116
     assert len(names_where("destructiveHint")) == 39
     assert len(names_where("idempotentHint")) == 151
-    assert len(names_where("openWorldHint")) == 6
+    assert len(names_where("openWorldHint")) == 17
 
 
 # --- destructiveHint -------------------------------------------------------------
@@ -308,15 +343,232 @@ def test_deletes_status_sets_and_absolute_updates_are_idempotent() -> None:
 # --- openWorldHint -----------------------------------------------------------------
 
 
-def test_open_world_tools_are_the_public_ad_library_and_web_address_imports() -> None:
-    assert names_where("openWorldHint") == {
-        "search_ads_archive",
-        "upload_creative_asset",
-        "upload_ad_video",
-        "create_product_feed",
-        "update_product_feed",
-        "create_product_feed_upload",
-    }
+# The rule. openWorldHint is true when a call can give Meta the web address of a file
+# (an image, a video, a thumbnail, a feed or data file) for Meta to fetch and import or
+# render, through a named argument or a raw payload the tool forwards, or when the tool
+# returns public content from outside the person's own assets. A landing-page or other
+# destination link (link_url, a call-to-action link, url_tags, a promoted_object or
+# tracking URL) does not count.
+#
+# Each open-world tool, with the argument path that makes it so.
+OPEN_WORLD_PATHS = {
+    "search_ads_archive": "returns ads from the public Ad Library",
+    "upload_creative_asset": "image_url",
+    "upload_ad_video": "video_url",
+    "create_ad_creative": "object_story_spec.link_data.picture",
+    "create_ad_creative_from_inputs": "image_url",
+    "create_ad": "creative_spec.object_story_spec.link_data.picture",
+    "preview_ad": "creative.object_story_spec.link_data.picture",
+    "create_catalog_product": "image_url",
+    "update_catalog_product": "image_url",
+    "batch_update_catalog_products": "items[].image_url",
+    "update_catalog": "params.default_image_url",
+    "create_product_set": "params.metadata.cover_image_url",
+    "create_product_feed": "schedule.url",
+    "update_product_feed": "schedule.url",
+    "create_product_feed_upload": "url",
+    "create_feed_rule": "params.user_default_value (fallback_rule on image_link)",
+    "update_feed_rule": "params.user_default_value (fallback_rule on image_link)",
+}
+
+FILE_ADDRESS = "https://assets.example.invalid/annotation-probe.png"
+FEED_ADDRESS = "https://assets.example.invalid/annotation-probe-feed.csv"
+_STORY = {
+    "page_id": "5555555555",
+    "link_data": {"link": "https://shop.example.invalid/", "picture": FILE_ADDRESS, "message": "probe"},
+}
+
+# A real call per open-world tool, carrying a file address in the listed argument path.
+OPEN_WORLD_CALLS = {
+    "upload_creative_asset": ({"account_id": "1234567890", "image_url": FILE_ADDRESS}, FILE_ADDRESS),
+    "upload_ad_video": ({"account_id": "1234567890", "video_url": FILE_ADDRESS}, FILE_ADDRESS),
+    "create_ad_creative": (
+        {"account_id": "1234567890", "name": "probe", "object_story_spec": _STORY},
+        FILE_ADDRESS,
+    ),
+    "create_ad_creative_from_inputs": (
+        {
+            "account_id": "1234567890",
+            "name": "probe",
+            "page_id": "5555555555",
+            "link_url": "https://shop.example.invalid/",
+            "image_url": FILE_ADDRESS,
+        },
+        FILE_ADDRESS,
+    ),
+    "create_ad": (
+        {
+            "account_id": "1234567890",
+            "name": "probe",
+            "adset_id": "2222222222",
+            "creative_spec": {"object_story_spec": _STORY},
+        },
+        FILE_ADDRESS,
+    ),
+    "preview_ad": ({"account_id": "1234567890", "creative": {"object_story_spec": _STORY}}, FILE_ADDRESS),
+    "create_catalog_product": (
+        {
+            "catalog_id": "6666666666",
+            "retailer_id": "PROBE-SKU",
+            "name": "probe",
+            "price": 12.5,
+            "currency": "USD",
+            "url": "https://shop.example.invalid/probe",
+            "image_url": FILE_ADDRESS,
+        },
+        FILE_ADDRESS,
+    ),
+    "update_catalog_product": ({"product_id": "8888888888", "image_url": FILE_ADDRESS}, FILE_ADDRESS),
+    "batch_update_catalog_products": (
+        {
+            "catalog_id": "6666666666",
+            "wait_seconds": 0,
+            "items": [{"method": "update", "retailer_id": "PROBE-BATCH", "image_url": FILE_ADDRESS}],
+        },
+        FILE_ADDRESS,
+    ),
+    "update_catalog": (
+        {"catalog_id": "6666666666", "params": {"default_image_url": FILE_ADDRESS}},
+        FILE_ADDRESS,
+    ),
+    "create_product_set": (
+        {
+            "catalog_id": "6666666666",
+            "name": "probe",
+            "filter": {},
+            "params": {"metadata": {"cover_image_url": FILE_ADDRESS}},
+        },
+        FILE_ADDRESS,
+    ),
+    "create_product_feed": (
+        {
+            "catalog_id": "6666666666",
+            "name": "probe",
+            "schedule": {"url": FEED_ADDRESS, "interval": "DAILY", "hour": 3},
+        },
+        FEED_ADDRESS,
+    ),
+    "update_product_feed": (
+        {"feed_id": "7777777777", "schedule": {"url": FEED_ADDRESS, "interval": "DAILY", "hour": 3}},
+        FEED_ADDRESS,
+    ),
+    "create_product_feed_upload": ({"feed_id": "7777777777", "url": FEED_ADDRESS}, FEED_ADDRESS),
+    "create_feed_rule": (
+        {
+            "feed_id": "7777777777",
+            "attribute": "image_link",
+            "rule_type": "fallback_rule",
+            "params": {"user_default_value": FILE_ADDRESS},
+        },
+        FILE_ADDRESS,
+    ),
+    "update_feed_rule": (
+        {"rule_id": "4444444444", "params": {"user_default_value": FILE_ADDRESS}},
+        FILE_ADDRESS,
+    ),
+}
+
+# Top-level parameter names that say the value is a file's web address.
+_FILE_ADDRESS_NAME = re.compile(r"(image|video|thumbnail|file|picture|cover_image|feed)_url|image_link")
+
+
+def test_open_world_tools_are_exactly_the_listed_ones_and_each_has_a_path() -> None:
+    assert names_where("openWorldHint") == set(OPEN_WORLD_PATHS)
+    assert all(OPEN_WORLD_PATHS.values())
+    # Every listed tool except the public Ad Library search is proved by a real call below.
+    assert set(OPEN_WORLD_CALLS) == set(OPEN_WORLD_PATHS) - {"search_ads_archive"}
+
+
+class _RecordingGraph:
+    """Stands in for GraphAPIClient.request: records each request, answers with fixed data."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, dict]] = []
+
+    async def request(self, _client, method, endpoint, **kwargs):
+        self.requests.append((method, endpoint, kwargs))
+        if endpoint.endswith(("/previews", "/generatepreviews")):
+            return {"data": [{"body": "<iframe></iframe>"}]}
+        if endpoint == "ads_archive":
+            return {"data": []}
+        if method == "GET" and endpoint.endswith("/products") and "PROBE-BATCH" in json.dumps(kwargs):
+            # The batch tool reads the catalog first and updates only a product that exists.
+            return {"data": [{
+                "id": "8888888888", "retailer_id": "PROBE-BATCH", "name": "probe",
+                "image_url": "https://assets.example.invalid/old.png",
+            }]}
+        if method == "GET" and endpoint == "4444444444":
+            return {
+                "id": "4444444444",
+                "attribute": "image_link",
+                "rule_type": "fallback_rule",
+                "params": {"user_default_value": "https://assets.example.invalid/old.png"},
+            }
+        if method == "GET":
+            return {"id": endpoint.split("/")[0], "currency": "USD", "account_id": "1234567890", "data": []}
+        return {"id": "9999999999", "success": True, "handles": ["probe-handle"]}
+
+    def install(self, monkeypatch) -> None:
+        recorder = self
+
+        async def request(client, method, endpoint, **kwargs):
+            return await recorder.request(client, method, endpoint, **kwargs)
+
+        monkeypatch.setattr(GraphAPIClient, "request", request)
+
+    def sent(self) -> str:
+        """Everything the tool put in its requests, as one text, for a containment check."""
+        return json.dumps(
+            [{"endpoint": endpoint, **kwargs} for _method, endpoint, kwargs in self.requests],
+            default=str,
+        )
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("name", sorted(OPEN_WORLD_CALLS))
+def test_each_open_world_tool_really_sends_meta_the_file_address(monkeypatch, name, routed) -> None:
+    monkeypatch.setenv("META_READ_ONLY", "false")
+    reload_settings()
+    recorder = _RecordingGraph()
+    recorder.install(monkeypatch)
+    arguments, address = OPEN_WORLD_CALLS[name]
+    tool_name, tool_arguments = (
+        ("call_tool", {"name": name, "arguments": arguments}) if routed else (name, arguments)
+    )
+
+    asyncio.run(mcp_server.call_tool(tool_name, tool_arguments))
+
+    assert recorder.requests, f"{name} built no request"
+    assert address in recorder.sent(), f"{name}: the file address is not in any request it built"
+    assert hint(name, "openWorldHint") is True
+
+
+def test_the_ad_library_search_reads_meta_public_archive(monkeypatch) -> None:
+    recorder = _RecordingGraph()
+    recorder.install(monkeypatch)
+    asyncio.run(
+        mcp_server.call_tool("search_ads_archive", {"search_terms": "probe", "ad_reached_countries": ["US"]})
+    )
+    assert [endpoint for _method, endpoint, _kwargs in recorder.requests] == ["ads_archive"]
+
+
+def test_every_parameter_named_as_a_file_address_is_on_an_open_world_tool() -> None:
+    flagged = set()
+    for tool in registered_tools():
+        for parameter in tool.parameters.get("properties", {}):
+            names_a_file = bool(_FILE_ADDRESS_NAME.search(parameter)) or (
+                parameter == "url" and "feed" in tool.name
+            )
+            if names_a_file:
+                flagged.add(tool.name)
+                assert hint(tool.name, "openWorldHint") is True, (tool.name, parameter)
+    assert flagged >= {"upload_creative_asset", "upload_ad_video", "create_product_feed_upload"}
+
+
+def test_open_world_tools_shown_by_get_capabilities() -> None:
+    for name in sorted(OPEN_WORLD_PATHS):
+        answer = asyncio.run(mcp_server.call_tool("get_capabilities", {"tool_name": name}))
+        assert answer.structured_content["tool"]["annotations"]["openWorldHint"] is True, name
 
 
 # --- What a client receives --------------------------------------------------------
