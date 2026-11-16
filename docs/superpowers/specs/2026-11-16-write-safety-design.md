@@ -124,9 +124,13 @@ start-up, so no tool definition file needs editing.
 - `idempotentHint` is true for reads, deletes, status sets and updates that set
   an absolute value; false for anything that creates a new object each time it
   runs or uploads rows.
-- `openWorldHint` is false, except for a tool that fetches a web address the
-  caller or an ad supplies, or returns public content from outside the user's
-  own assets (the public ad library search, landing-page reads).
+- `openWorldHint` is true when a call can give Meta the web address of a file
+  for Meta to fetch and import or render (an image, a video, a thumbnail, a feed
+  or data file), through a named argument or through a raw payload the tool
+  forwards, or when the tool returns public content from outside the user's own
+  assets (the public ad library search). A landing-page or destination link does
+  not count: it is stored as a destination, not fetched and imported by the
+  call. The hint describes what a tool can do, not what it is mainly for.
 - `call_tool` can run any tool, so its hints are worked out from the tools it
   can reach in the current mode: read-only only if every one of them is,
   destructive if any one is. With `META_READ_ONLY` on it is still not read-only
