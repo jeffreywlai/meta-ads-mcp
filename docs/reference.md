@@ -431,8 +431,9 @@ wrong field can hold private text.
   ad and ad account ids in A/B test and lift study cells; the pixel, app,
   dataset, product set and catalog ids in lift study objectives; and
   `boost_instagram_post`'s `promoted_object.pixel_id` and
-  `promoted_object.application_id`. The message names the path, such as
-  `creative.id`.
+  `promoted_object.application_id`. A whole number there is judged by its
+  digits, and any other value that is not text (`true`, a fraction, an object)
+  is refused. The message names the path, such as `creative.id`.
 - An ad account id is digits or `act_` followed by digits. `object_id` on the
   reporting tools takes an ad account, campaign, ad set or ad id.
   `get_account_pages` also takes `me`.
@@ -456,7 +457,12 @@ wrong field can hold private text.
   `tracking_specs`, `params`), `update_ad` (`tracking_specs`, `params`) and
   `create_ad_set` (`promoted_object`, `params`) do the same, and so does the
   boost tool's `url_tags`. A login address inside longer text is found too, such
-  as `url_tags="landing=https://user:pass@host/"`. An email address
+  as `url_tags="landing=https://user:pass@host/"`, and in these payloads a
+  scheme-relative `//user:pass@host` with a password that starts the text or
+  follows a space, `=`, `&`, `?`, a quote, a bracket, a comma or a semicolon
+  (inside longer text, `//contact@example.com` with no password is accepted; as
+  a whole value it is refused). A tab or line break inside an address is ignored,
+  as URL parsers ignore it. An email address
   (`help@example.com`), a handle (`@brand`) or an `@` in a URL's path or query is
   not a login. Named free-text arguments (`title`, `body`, `name`) are not
   checked. Meta stores the URL on the ad and shows it in responses.

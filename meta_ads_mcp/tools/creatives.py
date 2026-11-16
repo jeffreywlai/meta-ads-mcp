@@ -406,8 +406,9 @@ def _refuse_url_logins(value: Any, name: str, *, _levels: int = 0, _depth: int =
         if decoded is not None:
             _refuse_url_logins(decoded, name, _levels=_levels + 1, _depth=inside)
         elif "@" in value:
-            # The whole text as a URL, and any scheme://login@ inside it (the catalog tools' scanner).
-            refuse_url_login_in_text(value, name)
+            # The whole text as a URL, any scheme://login@ inside it (the catalog tools' scanner),
+            # and any //user:password@ inside it at a boundary (this check's opt-in).
+            refuse_url_login_in_text(value, name, scheme_relative=True)
     elif isinstance(value, dict):
         known = _NAMED_KEYS.get(name, frozenset())
         for key, item in value.items():

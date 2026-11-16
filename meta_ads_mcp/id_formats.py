@@ -234,7 +234,14 @@ def check_id_arguments(tool_name: str, arguments: dict[str, Any] | None) -> None
     for parameter, value in (arguments or {}).items():
         for path, expected in NESTED_IDS.get((tool_name, parameter), ()) if isinstance(parameter, str) else ():
             for label, item in _values_at(value, path, parameter):
-                if isinstance(item, str) and item.strip() and not expected.matches(item.strip()):
+                if item is None:
+                    continue
+                # Inside an object argument the framework does not judge the type: text is checked
+                # as at the top level, a whole number by its digits, and anything else is refused.
+                if isinstance(item, bool) or not isinstance(item, (str, int)):
+                    raise _refusal(label, expected)
+                text = item.strip() if isinstance(item, str) else str(item)
+                if text and not expected.matches(text):
                     raise _refusal(label, expected)
 
 

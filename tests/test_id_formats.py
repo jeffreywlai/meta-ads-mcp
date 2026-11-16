@@ -471,6 +471,56 @@ def test_an_id_inside_an_object_argument_is_refused_before_any_request(
     assert sent == []
 
 
+# One example argument per nested id leaf, built around the value placed at that leaf.
+_NESTED_LEAVES = [
+    ("create_ad", "creative", lambda v: {"id": v}, "creative.id"),
+    ("create_ad", "creative", lambda v: {"creative_id": v}, "creative.creative_id"),
+    ("create_ab_test", "cells", lambda v: [{"campaign_ids": [v]}], "cells[0].campaign_ids[0]"),
+    ("create_ab_test", "cells", lambda v: [{"adset_ids": [v]}], "cells[0].adset_ids[0]"),
+    ("create_ab_test", "cells", lambda v: [{"ad_ids": [v]}], "cells[0].ad_ids[0]"),
+    ("create_lift_study", "cells", lambda v: [{"campaign_ids": [v]}], "cells[0].campaign_ids[0]"),
+    ("create_lift_study", "cells", lambda v: [{"ad_account_ids": [v]}], "cells[0].ad_account_ids[0]"),
+    *[
+        ("create_lift_study", "objectives", lambda v, s=source: [{s: [{"id": v}]}], f"objectives[0].{source}[0].id")
+        for source in ("adspixels", "applications", "offsite_datasets", "offline_conversion_data_sets",
+                       "product_sets", "product_catalogs")
+    ],
+    ("boost_instagram_post", "promoted_object", lambda v: {"pixel_id": v}, "promoted_object.pixel_id"),
+    ("boost_instagram_post", "promoted_object", lambda v: {"application_id": v}, "promoted_object.application_id"),
+]
+
+
+def test_every_nested_leaf_has_an_example() -> None:
+    leaves = {(tool, parameter, len(paths)) for (tool, parameter), paths in NESTED_IDS.items()}
+    counted = {(tool, parameter, sum(1 for t, p, _, _ in _NESTED_LEAVES if (t, p) == (tool, parameter)))
+               for tool, parameter, _ in leaves}
+    assert leaves == counted
+
+
+@pytest.mark.parametrize(("tool", "parameter", "build", "label"), _NESTED_LEAVES, ids=[leaf[3] + "@" + leaf[0] for leaf in _NESTED_LEAVES])
+def test_a_nested_id_of_another_type_is_refused_and_an_integer_is_judged_by_its_digits(
+    tool: str, parameter: str, build, label: str
+) -> None:
+    for wrong in (True, False, 1.5, 2.0, {"misplaced": "Spring sale"}, ["1234567890"], -5):
+        with pytest.raises(ValidationError) as info:
+            check_id_arguments(tool, {parameter: build(wrong)})
+        assert str(info.value).startswith(f"{label} must be ")
+        assert "Spring" not in str(info.value) and "misplaced" not in str(info.value)
+    for fine in (1234567890, 0, "1234567890", " 1234567890 ", "", None):
+        check_id_arguments(tool, {parameter: build(fine)})
+
+
+def test_a_boolean_lift_source_id_is_refused_before_any_request(sent: list[str]) -> None:
+    arguments = {**_STUDY, "name": "Lift", "cells": [{"name": "A", "treatment_percentage": 50, "control_percentage": 50}],
+                 "objectives": [{"name": "Buy", "adspixels": [{"id": True, "event_names": ["Purchase"]}]}]}
+    for name, call_arguments in (("create_lift_study", arguments),
+                                 ("call_tool", {"name": "create_lift_study", "arguments": arguments})):
+        with pytest.raises(ToolError) as info:
+            _call(name, call_arguments)
+        assert str(info.value).startswith("objectives[0].adspixels[0].id must be ")
+    assert sent == []
+
+
 def test_every_form_of_a_nested_id_is_still_accepted() -> None:
     for creative in ({"id": "1234567890"}, {"creative_id": " 1234567890 "}, {"id": ""}, {"creative_id": None},
                      {"id": "1234567890", "creative_id": "1234567890"}, {}, {"other": "not an id"}, "not an object"):
