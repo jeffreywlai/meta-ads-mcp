@@ -1356,8 +1356,10 @@ def test_create_ab_test_creative_dry_run_through_mcp_boundary(monkeypatch) -> No
     from meta_ads_mcp.coordinator import mcp_server
 
     client = use(monkeypatch, FakeStudyClient())
+    # Through the MCP boundary each cell's ad id must be digits, as ad_id must be anywhere.
+    cells = [{**cell, "ad_ids": [f"90000000{index}"]} for index, cell in enumerate(_ad_cells(50, 50))]
     result = run(mcp_server.call_tool("create_ab_test", {
-        "account_id": "123", "business_id": "9800001", "name": "Creative", "cells": _ad_cells(50, 50),
+        "account_id": "123", "business_id": "9800001", "name": "Creative", "cells": cells,
         "start_time": FUTURE_START, "end_time": FUTURE_END,
         "creative_test_lifetime_budget_percentage": 20, "dry_run": True,
     })).structured_content

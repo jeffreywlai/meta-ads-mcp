@@ -165,6 +165,28 @@ def test_rows_without_a_text_name_do_not_match_a_query(monkeypatch) -> None:
     assert [item["id"] for item in result["items"]] == ["3"]
 
 
+@pytest.mark.parametrize("row", [{"id": "6000000000001"}, {"id": "6000000000001", "name": None},
+                                 {"id": "6000000000001", "name": 7}, {"id": "6000000000001", "name": ["Travel"]}])
+def test_a_row_without_a_readable_name_leaves_a_query_unjudged(monkeypatch, row) -> None:
+    """Whether a row without a text name matches the query is not known, so the answer is not complete."""
+    client = FakeTargetingClient(pages={None: {"data": [row]}})
+    monkeypatch.setattr(targeting, "get_graph_api_client", lambda: client)
+    result = asyncio.run(targeting.search_behaviors(query="travel"))
+    summary = result["summary"]
+    assert result["items"] == []
+    assert summary["complete"] is False
+    assert "name" in summary["incomplete_reason"] and "1 row" in summary["incomplete_reason"]
+    assert "note" not in summary
+
+
+def test_a_row_without_a_name_changes_nothing_without_a_query(monkeypatch) -> None:
+    client = FakeTargetingClient(pages={None: {"data": [{"id": "1"}, {"id": "2", "name": "Travel"}]}})
+    monkeypatch.setattr(targeting, "get_graph_api_client", lambda: client)
+    result = asyncio.run(targeting.search_behaviors())
+    assert [item["id"] for item in result["items"]] == ["1", "2"]
+    assert result["summary"]["complete"] is True and "incomplete_reason" not in result["summary"]
+
+
 @pytest.mark.parametrize("payload", [{}, {"data": None}, {"data": "x"}, ["not", "an", "object"]])
 def test_an_unreadable_category_answer_is_not_an_empty_result(monkeypatch, payload) -> None:
     monkeypatch.setattr(targeting, "get_graph_api_client", lambda: FakeTargetingClient(pages={None: payload}))

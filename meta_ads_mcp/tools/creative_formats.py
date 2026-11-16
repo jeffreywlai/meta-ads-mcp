@@ -20,7 +20,7 @@ from meta_ads_mcp.errors import MetaAdsError, MetaApiError, RateLimitError, Vali
 from meta_ads_mcp.graph_api import get_graph_api_client, is_bare_answer_wrapper, normalize_account_id
 from meta_ads_mcp.normalize import blank_to_none, names_other_object
 from meta_ads_mcp.schemas import creation_response, mutation_response
-from meta_ads_mcp.tool_types import AccountId, GraphId, StringList, coerce_csv_string_list
+from meta_ads_mcp.tool_types import AccountId, GraphId, NonBoolInt, StringList, coerce_csv_string_list
 from meta_ads_mcp.tools.creatives import (
     PARTNERSHIP_CODE_FIELDS,
     PARTNERSHIP_CODE_SHOWN,
@@ -1213,7 +1213,7 @@ async def create_ad_creative_from_inputs(
     sponsor_page_id: GraphId | None = None,
     sponsor_instagram_account_id: GraphId | None = None,
     partnership_ad_code: str | None = None,
-    partnership_ad_format: int | None = None,
+    partnership_ad_format: NonBoolInt | None = None,
     dry_run: bool = False,
     multi_media: list[dict[str, Any]] | None = None,
     product_set_id: GraphId | None = None,

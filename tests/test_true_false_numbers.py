@@ -41,7 +41,10 @@ MONEY = [
 ]
 RATIOS = [("create_lookalike_audience", "ratio"), ("create_lookalike_audience", "starting_ratio")]
 DAYS = [("create_custom_audience", "retention_days"), ("update_custom_audience", "retention_days")]
-ALL = MONEY + RATIOS + DAYS
+# Other numbers sent to Meta: a split test's confidence level and a Partnership ad's format code.
+CONFIDENCE = [("setup_ab_test", "confidence_level")]
+FORMAT_CODES = [("create_ad_creative_from_inputs", "partnership_ad_format")]
+ALL = MONEY + RATIOS + DAYS + CONFIDENCE + FORMAT_CODES
 
 
 def _adapter(tool: str, parameter: str) -> TypeAdapter:
@@ -57,7 +60,12 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         requests.append(f"{method} {url}")
         raise AssertionError("no request may be sent in this test")
 
+    async def refuse_send(self, request, *args, **kwargs):
+        requests.append(f"{request.method} {request.url}")
+        raise AssertionError("no request may be sent in this test")
+
     monkeypatch.setattr(httpx.AsyncClient, "request", refuse)
+    monkeypatch.setattr(httpx.AsyncClient, "send", refuse_send)
     monkeypatch.setenv("META_READ_ONLY", "false")
     reload_settings()
     return requests
@@ -70,7 +78,8 @@ def test_true_and_false_are_refused_before_any_request(tool: str, parameter: str
             asyncio.run(mcp_server.call_tool(tool, {parameter: flag}))
         message = str(info.value)
         assert f"{parameter}: " in message
-        if tool not in {"create_ad"}:  # create_ad is a private tool: its validator text is withheld
+        # Private tools (their arguments can hold personal data) withhold the validator text.
+        if tool not in {"create_ad", "create_ad_creative_from_inputs"}:
             assert "not true or false" in message
     assert sent == []
 
@@ -110,6 +119,26 @@ def test_every_retention_form_that_worked_still_works(tool: str, parameter: str)
     assert adapter.validate_python("30") == 30
     assert adapter.validate_python(30.0) == 30
     assert adapter.validate_json("180") == 180
+    assert adapter.validate_python(None) is None
+
+
+@pytest.mark.parametrize(("tool", "parameter"), CONFIDENCE)
+def test_every_confidence_level_form_that_worked_still_works(tool: str, parameter: str) -> None:
+    adapter = _adapter(tool, parameter)
+    assert adapter.validate_python(80) == 80.0
+    assert adapter.validate_python(97.5) == 97.5
+    assert adapter.validate_python("95") == 95.0
+    assert adapter.validate_json("90") == 90.0
+    assert adapter.validate_python(None) is None
+
+
+@pytest.mark.parametrize(("tool", "parameter"), FORMAT_CODES)
+def test_every_format_code_form_that_worked_still_works(tool: str, parameter: str) -> None:
+    adapter = _adapter(tool, parameter)
+    assert adapter.validate_python(2) == 2
+    assert adapter.validate_python("3") == 3
+    assert adapter.validate_python(1.0) == 1
+    assert adapter.validate_json("1") == 1
     assert adapter.validate_python(None) is None
 
 

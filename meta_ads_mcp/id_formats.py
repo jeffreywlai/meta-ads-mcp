@@ -24,6 +24,7 @@ before is refused for them.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,6 +45,15 @@ class IdFormat:
 
     def matches(self, text: str) -> bool:
         return re.fullmatch(self.pattern, text) is not None
+
+    def schema_pattern(self) -> str:
+        """The pattern an input schema carries: this form, or a blank, with spaces allowed around it.
+
+        The check before a tool runs strips the value and skips a blank one, so the schema
+        accepts exactly that; otherwise tool search, which validates a call against the
+        schema, would drop calls the tool runs.
+        """
+        return rf"^\s*(?:{_inner(self.pattern)})?\s*$"
 
 
 def _digits(kind: str) -> IdFormat:
@@ -94,6 +104,8 @@ SINGLE_IDS: dict[str, IdFormat] = {
     "system_user_id": _digits("a system user"),
     "user_id": _digits("a business user or system user"),
     "app_id": _digits("an app"),
+    # generate_system_user_token takes the app as business_app or app_id.
+    "business_app": _digits("an app"),
     "partner_id": _digits("a business"),
     "lead_gen_form_id": _digits("a lead form"),
     "rf_prediction_id": _digits("a reach and frequency prediction"),
@@ -116,6 +128,47 @@ LIST_IDS: dict[str, IdFormat] = {
 TOOL_OVERRIDES: dict[tuple[str, str], IdFormat] = {
     # get_account_pages lists the Pages of the token's user; "me" is its default.
     ("get_account_pages", "account_id"): ACCOUNT_OR_ME,
+}
+
+# Ids a tool reads from inside an object or list argument and uses to name a Meta object.
+# (tool, parameter) -> each id's path inside the argument and its format. A path step is a
+# key, or EACH for every entry of a list (comma-separated text is read as a list, as the
+# tool reads it). The refusal names the path, such as creative.id or cells[1].campaign_ids[0].
+EACH = "[]"
+_CAMPAIGN = SINGLE_IDS["campaign_id"]
+_DATASET = SINGLE_IDS["dataset_id"]
+NESTED_IDS: dict[tuple[str, str], tuple[tuple[tuple[str, ...], IdFormat], ...]] = {
+    # create_ad takes an existing creative as creative={"creative_id": ...} or {"id": ...}.
+    ("create_ad", "creative"): (
+        (("id",), SINGLE_IDS["creative_id"]),
+        (("creative_id",), SINGLE_IDS["creative_id"]),
+    ),
+    # Each A/B test cell names the campaigns, ad sets or ads it holds.
+    ("create_ab_test", "cells"): (
+        ((EACH, "campaign_ids", EACH), _CAMPAIGN),
+        ((EACH, "adset_ids", EACH), SINGLE_IDS["adset_id"]),
+        ((EACH, "ad_ids", EACH), SINGLE_IDS["ad_id"]),
+    ),
+    # Each lift study cell names its campaigns or ad accounts.
+    ("create_lift_study", "cells"): (
+        ((EACH, "campaign_ids", EACH), _CAMPAIGN),
+        ((EACH, "ad_account_ids", EACH), ACCOUNT),
+    ),
+    # Each lift objective names its conversion sources by id. Custom conversion ids are
+    # not in the classes shown to be digits, so customconversions is left alone.
+    ("create_lift_study", "objectives"): (
+        ((EACH, "adspixels", EACH, "id"), SINGLE_IDS["pixel_id"]),
+        ((EACH, "applications", EACH, "id"), SINGLE_IDS["app_id"]),
+        ((EACH, "offsite_datasets", EACH, "id"), _DATASET),
+        ((EACH, "offline_conversion_data_sets", EACH, "id"), _DATASET),
+        ((EACH, "product_sets", EACH, "id"), SINGLE_IDS["product_set_id"]),
+        ((EACH, "product_catalogs", EACH, "id"), SINGLE_IDS["catalog_id"]),
+    ),
+    # The boost tool reads the pixel or the app it optimises for from promoted_object.
+    ("boost_instagram_post", "promoted_object"): (
+        (("pixel_id",), SINGLE_IDS["pixel_id"]),
+        (("application_id",), SINGLE_IDS["app_id"]),
+    ),
 }
 
 # Id-carrying parameters that keep their current form, and why.
@@ -178,12 +231,40 @@ def check_id_arguments(tool_name: str, arguments: dict[str, Any] | None) -> None
         for index, item in enumerate(items):
             if isinstance(item, str) and item.strip() and not expected.matches(item.strip()):
                 raise _refusal(f"{parameter}[{index}]", expected)
+    for parameter, value in (arguments or {}).items():
+        for path, expected in NESTED_IDS.get((tool_name, parameter), ()) if isinstance(parameter, str) else ():
+            for label, item in _values_at(value, path, parameter):
+                if isinstance(item, str) and item.strip() and not expected.matches(item.strip()):
+                    raise _refusal(label, expected)
+
+
+def _values_at(value: Any, path: tuple[str, ...], label: str) -> Iterator[tuple[str, Any]]:
+    """Every value found at path inside value, with its label; a step that does not fit finds nothing."""
+    if not path:
+        yield label, value
+        return
+    step, rest = path[0], path[1:]
+    if step == EACH:
+        items = coerce_csv_string_list(value) if isinstance(value, str) else value
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                yield from _values_at(item, rest, f"{label}[{index}]")
+    elif isinstance(value, dict) and step in value:
+        yield from _values_at(value[step], rest, f"{label}.{step}")
+
+
+def _inner(pattern: str) -> str:
+    return pattern.removeprefix("^").removesuffix("$")
 
 
 def _csv_pattern(pattern: str) -> str:
-    """The pattern for comma-separated text of ids of one form, spaces allowed around commas."""
-    inner = pattern.removeprefix("^").removesuffix("$")
-    return rf"^\s*{inner}(\s*,\s*{inner})*\s*$"
+    """The pattern for comma-separated text of ids of one form, as the check reads it.
+
+    Each piece between commas is an id or blank, with spaces allowed around it: the
+    check drops blank pieces and strips the others.
+    """
+    piece = rf"\s*(?:{_inner(pattern)})?\s*"
+    return rf"^{piece}(?:,{piece})*$"
 
 
 def _add_pattern(schema: dict[str, Any], expected: IdFormat, is_list: bool) -> None:
@@ -192,10 +273,10 @@ def _add_pattern(schema: dict[str, Any], expected: IdFormat, is_list: bool) -> N
         if not isinstance(branch, dict):
             continue
         if branch.get("type") == "string":
-            branch.setdefault("pattern", _csv_pattern(expected.pattern) if is_list else expected.pattern)
+            branch.setdefault("pattern", _csv_pattern(expected.pattern) if is_list else expected.schema_pattern())
         elif branch.get("type") == "array" and isinstance(branch.get("items"), dict):
             if branch["items"].get("type") == "string":
-                branch["items"].setdefault("pattern", expected.pattern)
+                branch["items"].setdefault("pattern", expected.schema_pattern())
     if is_list:
         schema.setdefault("description", f"A list of ids, each {expected.description}.")
     else:

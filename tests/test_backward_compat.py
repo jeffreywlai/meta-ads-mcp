@@ -88,10 +88,14 @@ def test_no_declaration_is_stale() -> None:
 
 
 def test_every_declaration_says_why_and_how_to_migrate() -> None:
+    registered = set(current_contract())
     for entry in DECLARED:
         label = f"{entry.get('tool')} {entry.get('kind')} {entry.get('parameter', '')}"
         every_tool = entry["tool"] == "*" and entry["kind"] == "behaviour"
-        assert every_tool or entry["tool"] in MASTER_CONTRACT, f"{label}: not a tool on master"
+        # A behaviour change may also be declared for a tool that reached master after the
+        # snapshot (the parity tools); it must still name a real tool.
+        later_tool = entry["kind"] == "behaviour" and entry["tool"] in registered
+        assert every_tool or later_tool or entry["tool"] in MASTER_CONTRACT, f"{label}: not a tool on master"
         assert entry["kind"] in ALL_KINDS, f"{label}: unknown kind"
         assert len(entry.get("why_better", "").strip()) >= 40, f"{label}: say why this is better for the user"
         assert len(entry.get("migration", "").strip()) >= 20, f"{label}: say what a caller must change"
@@ -110,3 +114,25 @@ def test_detector_catches_each_kind_of_change() -> None:
     assert detect_changes(before, {"t": {**same["t"], "defaults": {"b": 2}}}) == {("t", "default_changed", "b")}
     grown = {"t": {"parameters": {"a", "b", "c"}, "required": {"a"}, "defaults": {"b": 1, "c": None}}}
     assert detect_changes(before, grown) == set()
+
+
+# Behaviour changes of the write-safety branch that the signature does not show, by tool
+# and words its declaration must contain. Not detected automatically, so listed here.
+WRITE_SAFETY_BEHAVIOUR = {
+    "preview_ad": ("creative_id", "account_id", "previews"),
+    "add_audience_users": ("upload session", "unknown"),
+    "remove_audience_users": ("upload session", "unknown"),
+}
+
+
+def test_the_write_safety_behaviour_changes_are_declared() -> None:
+    missing = [
+        tool
+        for tool, words in WRITE_SAFETY_BEHAVIOUR.items()
+        if not any(
+            entry["tool"] == tool and entry["kind"] == "behaviour"
+            and all(word in entry["what_changed"] for word in words)
+            for entry in DECLARED
+        )
+    ]
+    assert not missing, f"Declare these behaviour changes in intentional_contract_changes.json: {missing}"

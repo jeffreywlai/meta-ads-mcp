@@ -10,13 +10,15 @@ are still sent as before.
 from __future__ import annotations
 
 import asyncio
+import json
 
+import httpx
 import pytest
 from fastmcp.exceptions import ToolError
 
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.tools import creatives
+from meta_ads_mcp.tools import ads, campaigns, creatives
 
 SECRET = "synthetic-pass-7f3a"
 LOGIN_URL = f"https://someone:{SECRET}@cdn.example.invalid/spring.jpg"
@@ -59,6 +61,17 @@ class Recorder:
     async def preview_ad(self, **kwargs):
         self.calls.append(("preview", kwargs))
         return {"body": "<iframe></iframe>"}
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fake that fails to attach must not reach the network."""
+
+    async def refuse(*args, **kwargs):
+        raise AssertionError("no request may be sent in this test")
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", refuse)
+    monkeypatch.setattr(httpx.AsyncClient, "send", refuse)
 
 
 @pytest.fixture
@@ -164,3 +177,177 @@ def test_preview_ad_still_previews_ordinary_urls(client: Recorder, url: str) -> 
     asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
     assert client.calls[-1][0] == "preview"
     assert client.calls[-1][1]["creative"] == draft
+
+
+# A sub-object sent as JSON text is examined like the object itself (review finding A6).
+
+ENCODED_SPEC = json.dumps(NESTED["object_story_spec"])
+
+
+def test_preview_ad_refuses_a_login_in_a_json_encoded_sub_object(client: Recorder) -> None:
+    draft = {"object_story_spec": ENCODED_SPEC}
+    _refused(creatives.preview_ad(account_id="1234567890", creative=draft), client, "creative")
+    _refused(mcp_server.call_tool("preview_ad", {"account_id": "1234567890", "creative": draft}), client, "creative")
+    _refused(
+        mcp_server.call_tool("call_tool", {"name": "preview_ad", "arguments": {"account_id": "1234567890", "creative": draft}}),
+        client, "creative",
+    )
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        ENCODED_SPEC,
+        f"  {ENCODED_SPEC}\n",
+        json.dumps([{"website_url": LOGIN_URL}]),
+        json.dumps({"link_data": json.dumps({"link": LOGIN_URL})}),
+    ],
+    ids=["object", "padded", "list", "json-inside-json"],
+)
+def test_create_ad_creative_refuses_a_login_in_json_text_inside_params(client: Recorder, encoded: str) -> None:
+    arguments = {"account_id": "1234567890", "name": "Spring", "params": {"object_story_spec": encoded}}
+    _refused(creatives.create_ad_creative(**arguments), client, "params")
+    _refused(mcp_server.call_tool("create_ad_creative", arguments), client, "params")
+
+
+def test_update_creative_refuses_a_login_in_json_text_inside_a_spec(client: Recorder) -> None:
+    spec = {"page_id": "1234567890", "link_data": json.dumps({"link": LOGIN_URL})}
+    _refused(creatives.update_creative(creative_id="1234567890", object_story_spec=spec), client, "object_story_spec")
+
+
+@pytest.mark.parametrize("url", ORDINARY)
+def test_json_text_without_a_login_is_sent_unchanged(client: Recorder, url: str) -> None:
+    encoded = json.dumps({"page_id": "1234567890", "link_data": {"link": url}})
+    draft = {"object_story_spec": encoded}
+    asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
+    assert client.calls[-1][1]["creative"] == {"object_story_spec": encoded}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["{not json", "[1, 2", "{}", "[]", "{\"a\": 1}", "[" * 5000 + "]" * 5000, json.dumps({"x": "y" * 300_000})],
+    ids=["broken-object", "broken-list", "empty-object", "empty-list", "plain", "very-deep", "very-long"],
+)
+def test_json_text_that_cannot_or_need_not_be_examined_is_sent_unchanged(client: Recorder, text: str) -> None:
+    draft = {"object_story_spec": {"page_id": "1234567890"}, "title": text}
+    asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
+    assert client.calls[-1][1]["creative"]["title"] == text
+
+
+# create_ad, update_ad and create_ad_set refuse a login in every argument that can carry a web address.
+
+
+@pytest.fixture
+def ad_client(monkeypatch: pytest.MonkeyPatch, client: Recorder) -> Recorder:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    return client
+
+
+AD = {"account_id": "1234567890", "name": "Spring", "adset_id": "2222222222"}
+AD_SET = {
+    "account_id": "1234567890", "campaign_id": "2222222222", "name": "Spring", "billing_event": "IMPRESSIONS",
+    "optimization_goal": "LINK_CLICKS", "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+AD_LOGIN_CASES = [
+    ("create_ad", ads.create_ad, {**AD, "creative_spec": NESTED["object_story_spec"] | {"name": "Spring"}}, "creative_spec"),
+    ("create_ad", ads.create_ad, {**AD, "creative_spec": {"name": "Spring", "object_story_spec": ENCODED_SPEC}},
+     "creative_spec"),
+    ("create_ad", ads.create_ad, {**AD, "creative_id": "3333333333", "tracking_specs": {"url": LOGIN_URL}},
+     "tracking_specs"),
+    ("create_ad", ads.create_ad, {**AD, "creative_id": "3333333333", "params": {"url_tags": LOGIN_URL}}, "params"),
+    ("update_ad", ads.update_ad, {"ad_id": "4444444444", "tracking_specs": [{"url": LOGIN_URL}]}, "tracking_specs"),
+    ("update_ad", ads.update_ad, {"ad_id": "4444444444", "params": {"display_url": LOGIN_URL}}, "params"),
+    ("update_ad", ads.update_ad, {"ad_id": "4444444444", "params": {"conversion_specs": [{"url": LOGIN_URL}]}}, "params"),
+    ("create_ad_set", campaigns.create_ad_set,
+     {**AD_SET, "promoted_object": {"application_id": "5555555555", "object_store_url": LOGIN_URL}},
+     "promoted_object.object_store_url"),
+    ("create_ad_set", campaigns.create_ad_set, {**AD_SET, "params": {"destination_url": LOGIN_URL}}, "params"),
+]
+
+
+@pytest.mark.parametrize(("tool", "function", "arguments", "name"), AD_LOGIN_CASES)
+def test_ad_and_ad_set_tools_refuse_a_login_in_a_web_address(
+    ad_client: Recorder, tool: str, function, arguments: dict, name: str
+) -> None:
+    _refused(function(**arguments), ad_client, name)
+    _refused(mcp_server.call_tool(tool, arguments), ad_client, name)
+    _refused(mcp_server.call_tool("call_tool", {"name": tool, "arguments": arguments}), ad_client, name)
+
+
+@pytest.mark.parametrize("url", ORDINARY)
+def test_ad_tools_still_send_ordinary_urls(ad_client: Recorder, url: str) -> None:
+    spec = {"name": "Spring", "object_story_spec": {"page_id": "1234567890", "link_data": {"link": url}}}
+    asyncio.run(ads.create_ad(**AD, creative_spec=spec, params={"url_tags": "utm_source=meta"}))
+    assert ad_client.calls[-1][0] == "create"
+    assert ad_client.calls[-1][3]["creative"] == spec
+
+
+# A login address inside longer text (URL parameters, a message) is found too, with the
+# catalog tools' scanner: it needs scheme:// followed by an @ before any space, /, ? or #.
+
+IN_TEXT = f"landing=https://someone:{SECRET}@cdn.example.invalid/spring&utm_source=meta"
+IN_TEXT_CASES = [
+    ("create_ad", ads.create_ad, {**AD, "creative_id": "3333333333", "params": {"url_tags": IN_TEXT}}, "params"),
+    ("update_ad", ads.update_ad, {"ad_id": "4444444444", "params": {"url_tags": IN_TEXT}}, "params"),
+    ("create_ad_set", campaigns.create_ad_set, {**AD_SET, "params": {"destination_note": f"see {IN_TEXT}"}}, "params"),
+    ("create_ad_creative", creatives.create_ad_creative,
+     {"account_id": "1234567890", "name": "Spring", "params": {"url_tags": IN_TEXT}}, "params"),
+    ("create_ad_creative", creatives.create_ad_creative, {
+        "account_id": "1234567890", "name": "Spring",
+        "object_story_spec": {"page_id": "1234567890", "link_data": {"link": "https://shop.example.com/",
+                                                                    "message": f"Order at {LOGIN_URL} today"}},
+    }, "object_story_spec"),
+    ("update_creative", creatives.update_creative, {"creative_id": "1234567890", "params": {"url_tags": IN_TEXT}},
+     "params"),
+    ("preview_ad", creatives.preview_ad, {"account_id": "1234567890", "creative": {"url_tags": IN_TEXT}}, "creative"),
+    ("upload_creative_asset", creatives.upload_creative_asset,
+     {"account_id": "1234567890", "image_url": f"spring: {LOGIN_URL}"}, "image_url"),
+]
+
+
+@pytest.mark.parametrize(("tool", "function", "arguments", "name"), IN_TEXT_CASES)
+def test_a_login_address_inside_longer_text_is_refused(
+    ad_client: Recorder, tool: str, function, arguments: dict, name: str
+) -> None:
+    _refused(function(**arguments), ad_client, name)
+    _refused(mcp_server.call_tool(tool, arguments), ad_client, name)
+
+
+def test_the_boost_tool_refuses_a_login_address_inside_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: pytest.fail("no client may be created"))
+    base = {"account_id": "1234567890", "instagram_media_id": "1234567890", "instagram_account_id": "1234567890",
+            "adset_id": "2222222222", "page_id": "3333333333"}
+    cta = {"type": "LEARN_MORE", "value": {"link": "https://shop.example.com/", "link_caption": f"via {LOGIN_URL}"}}
+    for arguments, name in (({"call_to_action": cta}, "call_to_action"), ({"url_tags": IN_TEXT}, "url_tags")):
+        with pytest.raises(creatives.ValidationError) as raised:
+            asyncio.run(creatives.boost_instagram_post(**base, **arguments))
+        message = str(raised.value)
+        assert name in message and "username or password" in message
+        assert SECRET not in message and "someone" not in message
+
+
+# Ordinary text with an @ or a colon that is not a login address; each must still be sent.
+ORDINARY_TEXT = [
+    "write to help@example.com",
+    "https://example.com/@handle",
+    "https://example.com/?to=a@b.com",
+    "@brand",
+    "Sale: 20% off @ our store",
+    "utm_source=meta&ref=https://example.com/@brand&mail=a@b.com",
+]
+
+
+@pytest.mark.parametrize("text", ORDINARY_TEXT)
+def test_ordinary_text_with_an_at_sign_is_still_sent(ad_client: Recorder, text: str) -> None:
+    spec = {"page_id": "1234567890", "link_data": {"link": "https://shop.example.com/", "message": text}}
+    asyncio.run(creatives.create_ad_creative(
+        account_id="1234567890", name="Spring", object_story_spec=spec, params={"url_tags": text},
+    ))
+    assert ad_client.calls[-1][3]["object_story_spec"] == spec
+    assert ad_client.calls[-1][3]["url_tags"] == text
+    asyncio.run(ads.create_ad(**AD, creative_id="3333333333", params={"url_tags": text}))
+    assert ad_client.calls[-1][3]["url_tags"] == text
+    draft = {"object_story_spec": spec, "url_tags": text}
+    asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
+    assert ad_client.calls[-1][1]["creative"] == draft

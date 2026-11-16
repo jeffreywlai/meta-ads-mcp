@@ -370,7 +370,13 @@ The default is writable. Nothing turns read-only mode on for you.
 Every tool carries the four MCP markings. A client uses them to decide which
 calls it may run without asking you, and which it may safely retry.
 
-- `readOnlyHint`: the tool changes nothing at Meta and nothing on this machine.
+- `readOnlyHint`: the tool changes nothing at Meta and none of your own files.
+  Any tool may save a large answer to the server's own export folder, where
+  files expire and the oldest are removed when the folder is full (see
+  [Large responses](#large-responses)); that does not count, so
+  `export_change_history`, which always saves one, is read-only.
+  `delete_overflow_artifact` is not read-only, because deleting a saved export
+  is what it is for.
 - `destructiveHint`: the worst the tool can do deletes, removes, disconnects,
   cancels, archives or overwrites something that already exists. Every delete
   and update is marked, and so are the three status tools, because `ARCHIVED`
@@ -382,8 +388,8 @@ calls it may run without asking you, and which it may safely retry.
   fetch a web address you give (image, video and product feed uploads) are
   marked.
 
-The markings appear in the tool list and at the end of each `search_tools`
-match, for example `read-only: no, destructive: yes, idempotent: yes,
+The markings appear in the tool list, in `get_capabilities(tool_name=...)` under
+`tool.annotations`, and at the end of each `search_tools` match, for example `read-only: no, destructive: yes, idempotent: yes,
 open-world: no`. `search_tools` is marked read-only. `call_tool` carries the
 markings of the most dangerous tool it can run. It is not marked read-only even
 in read-only mode, because `delete_overflow_artifact` still runs there and
@@ -416,8 +422,17 @@ wrong field can hold private text.
 - **Ids that Meta defines as numbers must be digits.** This covers campaign,
   ad set, ad, creative, custom audience, pixel or dataset, business, catalog,
   product set, product feed, Page, Instagram account and media, study, video,
-  system user and app ids, and each entry of a list of them. Send the id as a
+  system user and app ids (including `business_app`, the second name
+  `generate_system_user_token` takes for `app_id`), and each entry of a list of
+  them. Send the id as a
   string: `'1234567890'`. A JSON number was refused before and still is.
+- The same check covers these ids when they sit inside another argument:
+  `create_ad`'s `creative.creative_id` and `creative.id`; the campaign, ad set,
+  ad and ad account ids in A/B test and lift study cells; the pixel, app,
+  dataset, product set and catalog ids in lift study objectives; and
+  `boost_instagram_post`'s `promoted_object.pixel_id` and
+  `promoted_object.application_id`. The message names the path, such as
+  `creative.id`.
 - An ad account id is digits or `act_` followed by digits. `object_id` on the
   reporting tools takes an ad account, campaign, ad set or ad id.
   `get_account_pages` also takes `me`.
@@ -428,14 +443,23 @@ wrong field can hold private text.
   `meta_ads_mcp/id_formats.py`.
 - Each checked id's pattern is in the tool's input schema, so
   `get_capabilities(tool_name=...)` shows it.
-- **Budgets, bids, lookalike ratios and retention days refuse `true` and
+- **Budgets, bids, lookalike ratios, retention days, `setup_ab_test`'s
+  `confidence_level` and `create_ad_creative_from_inputs`'
+  `partnership_ad_format` refuse `true` and
   `false`.** Before, `true` was read as 1 and sent to Meta. Numbers and numeric
   text such as `'12.50'` work as before.
 - **A web address with a login in it is refused** (`https://user:pass@host/...`)
   by the creative, video, boost and catalog tools, including
   `upload_creative_asset`, `create_ad_creative`, `update_creative` and
-  `preview_ad`, wherever the URL sits in the creative. Meta stores the URL on the
-  ad and shows it in responses.
+  `preview_ad`, wherever the URL sits in the creative, including inside a
+  sub-object sent as JSON text. `create_ad` (`creative_spec`, `creative`,
+  `tracking_specs`, `params`), `update_ad` (`tracking_specs`, `params`) and
+  `create_ad_set` (`promoted_object`, `params`) do the same, and so does the
+  boost tool's `url_tags`. A login address inside longer text is found too, such
+  as `url_tags="landing=https://user:pass@host/"`. An email address
+  (`help@example.com`), a handle (`@brand`) or an `@` in a URL's path or query is
+  not a login. Named free-text arguments (`title`, `body`, `name`) are not
+  checked. Meta stores the URL on the ad and shows it in responses.
 
 ## Errors and retries
 

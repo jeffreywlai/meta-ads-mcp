@@ -37,7 +37,7 @@ from meta_ads_mcp.tool_types import (
     StrictStringList,
     coerce_strict_csv_string_list,
 )
-from meta_ads_mcp.tools.creatives import SecretArguments, keeps_call_secrets
+from meta_ads_mcp.tools.creatives import SecretArguments, _refuse_payload_url_logins, keeps_call_secrets
 
 AD_IMAGE_FIELDS = [
     "hash",
@@ -198,6 +198,8 @@ async def create_ad(
     engagement_audience: bool | None = None,
 ) -> dict[str, Any]:
     """Create or validate an ad from a top-level or nested creative id, or from an inline creative_spec (Meta's ad creative fields, such as name and object_story_spec) instead of an existing creative. tracking_specs is one tracking spec object or a list of them, sent as given. conversion_domain is the domain only (example.com), not a URL. adlabels is a list of {"name": ...} or {"id": ...}. ad_schedule_start_time and ad_schedule_end_time give this ad its own run window (ISO 8601 with a UTC offset, or whole Unix seconds as a number or digits); without them it follows the campaign's schedule, and Meta offers them only for Sales and App promotion campaigns. display_sequence is the ad's position in its campaign's sequence (a whole number from 0); engagement_audience true makes an audience of people who engage with this ad. A named parameter and the same key inside params cannot both be given. bid_amount is refused inside params, where Meta would read it in minor units; use the named bid_amount."""
+    # A login in a web address would be stored on the ad and shown back; refused before anything else.
+    _refuse_payload_url_logins(creative_spec=creative_spec, creative=creative, tracking_specs=tracking_specs, params=params)
     schedule_times = {"ad_schedule_start_time": ad_schedule_start_time, "ad_schedule_end_time": ad_schedule_end_time}
     named_later = {"display_sequence": display_sequence, "engagement_audience": engagement_audience}
     reject_named_and_params(
@@ -481,6 +483,8 @@ async def update_ad(
     ad_id = blank_to_none(ad_id)
     if ad_id is None:
         raise ValidationError("ad_id is required.")
+    # A login in a web address would be stored on the ad and shown back; refused before any request.
+    _refuse_payload_url_logins(tracking_specs=tracking_specs, params=params)
     reject_named_and_params({"adlabels": adlabels}, params)
     if adlabels is not None:
         validate_adlabels(adlabels)
