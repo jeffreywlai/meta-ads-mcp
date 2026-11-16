@@ -520,24 +520,8 @@ class UniversalFakeClient:
     async def search_geo_locations(self, *, query: str, location_types=None, limit: int = 25):
         return {"data": [{"key": "geo_123", "name": query, "type": "country"}]}
 
-    async def search_targeting_categories(
-        self,
-        *,
-        account_id: str,
-        category_class: str,
-        query: str | None = None,
-        limit: int = 25,
-    ):
-        return {
-            "data": [
-                {
-                    "id": "cat_123",
-                    "name": query or category_class,
-                    "class": category_class,
-                    "account_id": account_id,
-                }
-            ]
-        }
+    async def search_targeting_categories(self, *, category_class: str, after: str | None = None):
+        return {"data": [{"id": "cat_123", "name": category_class, "type": category_class}]}
 
     async def estimate_audience_size(self, account_id: str, *, targeting_spec, optimization_goal=None):
         return {"data": [{"users": 12345, "estimate_mau": 12000, "estimate_dau": 4000}]}

@@ -2429,6 +2429,7 @@ _AUDITED_INTERPOLATIONS: dict[str, dict[str, set[str]]] = {
         "_audience_labels": {"unknown"},
         "_audience_schema": {"', '.join(unsupported)"},  # positions
         "_hash_rows": {"key", "row_number"},  # key: a supported schema key
+        "_list_audiences_of_subtype": {"bad_entries", "entries", "unmatchable"},  # counts of rows read
         "_parse_customer_csv": {"', '.join(missing)", "lines_read + 1"},  # missing: supported schema keys
         # The upload's progress: the tool name, counts, the locally chosen session id and a fixed verb.
         "_upload_progress": {"accepted", "action", "batch_seq", "rows_accepted", "session_id", "total_batches", "verb"},

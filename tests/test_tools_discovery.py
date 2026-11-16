@@ -175,6 +175,12 @@ def test_entity_getters_accept_lean_fields_through_wrapper(monkeypatch, name, id
     (discovery.get_adset, "adset_id", "daily_budget"),
     (discovery.get_ad, "ad_id", "bid_amount"),
     (discovery.get_campaign, "campaign_id", "lifetime_budget"),
+    # F4: spend caps and minimum-spend targets are minor units too (confirmed live 2026-11-13).
+    (discovery.get_campaign, "campaign_id", "spend_cap"),
+    (discovery.get_adset, "adset_id", "daily_spend_cap"),
+    (discovery.get_adset, "adset_id", "lifetime_spend_cap"),
+    (discovery.get_adset, "adset_id", "daily_min_spend_target"),
+    (discovery.get_adset, "adset_id", "lifetime_min_spend_target"),
 ])
 @pytest.mark.parametrize(("currency", "expected"), [("USD", 12.5), ("JPY", 1250)])
 def test_selected_money_fields_keep_currency_conversion_without_dependency_columns(
@@ -203,6 +209,51 @@ def test_selected_account_money_fields_use_hidden_currency_dependency(monkeypatc
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: AccountClient())
     result = asyncio.run(discovery.get_ad_account("123", fields=["id", "amount_spent", "balance"]))
     assert result["item"] == {"id": "act_123", "amount_spent": 123.45, "balance": 12.5}
+
+
+@pytest.mark.parametrize(("currency", "expected"), [("USD", 250.0), ("JPY", 25000.0)])
+def test_get_ad_account_spend_cap_is_in_major_units(monkeypatch, currency, expected) -> None:
+    """F4: the account spend cap came back 100 times too large under a description saying major units."""
+    class AccountClient:
+        async def get_object(self, object_id, *, fields):
+            assert fields == ["id", "spend_cap", "currency"]
+            return {"id": object_id, "spend_cap": "25000", "currency": currency}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: AccountClient())
+    result = asyncio.run(discovery.get_ad_account("123", fields=["id", "spend_cap"]))
+    assert result["item"] == {"id": "act_123", "spend_cap": expected}
+
+
+def test_spend_limit_fields_are_a_named_set_of_their_own() -> None:
+    assert discovery.SPEND_LIMIT_FIELDS == {
+        "spend_cap", "daily_spend_cap", "lifetime_spend_cap", "daily_min_spend_target", "lifetime_min_spend_target",
+    }
+    assert not discovery.SPEND_LIMIT_FIELDS & discovery.MONETARY_FIELDS
+
+
+def test_normalize_monetary_fields_converts_spend_limits_and_keeps_no_cap_as_zero() -> None:
+    items = discovery._normalize_monetary_fields([
+        {"spend_cap": "0", "daily_spend_cap": "1250", "lifetime_min_spend_target": None, "currency": "USD"},
+        {"daily_min_spend_target": "500", "lifetime_spend_cap": "9000", "currency": "KRW"},
+    ])
+    assert items[0] == {"spend_cap": 0.0, "daily_spend_cap": 12.5, "lifetime_min_spend_target": None, "currency": "USD"}
+    assert items[1] == {"daily_min_spend_target": 500.0, "lifetime_spend_cap": 9000.0, "currency": "KRW"}
+
+
+def test_list_campaigns_selected_spend_cap_is_in_major_units(monkeypatch) -> None:
+    class CampaignListClient:
+        async def list_objects(self, parent_id, edge, *, fields=None, params=None):
+            assert fields == ["id", "spend_cap"]
+            return {"data": [{"id": "1", "spend_cap": "30000"}, {"id": "2"}]}
+
+        async def get_object(self, object_id, *, fields):
+            assert object_id == "act_123" and fields == ["currency"]
+            return {"currency": "USD"}
+
+    monkeypatch.setattr(discovery, "get_graph_api_client", lambda: CampaignListClient())
+    result = asyncio.run(discovery.list_campaigns(account_id="123", fields=["id", "spend_cap"]))
+    assert result["items"][0]["spend_cap"] == 300.0
+    assert "spend_cap" not in result["items"][1]
 
 
 @pytest.fixture
