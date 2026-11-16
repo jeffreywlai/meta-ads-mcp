@@ -105,8 +105,12 @@ One table, in a new module `meta_ads_mcp/tool_annotations.py`, gives each of the
 180 tools its four hints. The table is applied to the registered tools at
 start-up, so no tool definition file needs editing.
 
-- `readOnlyHint` is true when the tool changes nothing at Meta and nothing on
-  this machine.
+- `readOnlyHint` is true when the tool changes nothing at Meta and none of the
+  user's own files. Any tool may save an answer that is too large to the
+  server's own expiring export folder, and may push out an older export when
+  that folder is full; this does not count, because every tool does it.
+  `delete_overflow_artifact` is not read-only, because deleting a saved export
+  is what it is for.
 - `destructiveHint` is true when the tool deletes, removes, disconnects, cancels
   or overwrites an existing value: every `delete_*`, every `update_*`,
   `remove_audience_users`, `disconnect_catalog_event_source`, `cancel_ad_study`,
