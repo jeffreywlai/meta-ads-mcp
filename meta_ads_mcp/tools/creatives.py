@@ -598,13 +598,13 @@ async def preview_ad(
     ad_format: str = "DESKTOP_FEED_STANDARD",
     ad_formats: StringList | None = None,
 ) -> dict[str, Any]:
-    """Use this when the user wants a rendered preview for an existing ad, creative id, or draft creative payload. ad_formats previews up to 10 placements in one call (one Meta request each) and reports any format Meta refused."""
+    """Use this when the user wants a rendered preview for an existing ad, creative id, or draft creative payload. account_id is needed only with a creative payload; ad_id and creative_id are previewed directly. ad_formats previews up to 10 placements in one call (one Meta request each) and reports any format Meta refused."""
     if creative:
         _ensure_v25_creative_payload(creative)
     if not ad_id and not creative_id and not creative:
         raise ValidationError("Provide ad_id, creative_id, or creative.")
-    if (creative_id or creative) and not account_id and not ad_id:
-        raise ValidationError("account_id is required when previewing from creative_id or creative.")
+    if creative and not account_id and not ad_id:
+        raise ValidationError("account_id is required when previewing from a creative payload.")
     if ad_formats is not None:
         formats = _preview_formats(ad_formats, ad_format)
         return await _preview_many(

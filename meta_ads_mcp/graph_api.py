@@ -941,14 +941,19 @@ class GraphAPIClient:
         creative: dict[str, Any] | None = None,
         ad_format: str = "DESKTOP_FEED_STANDARD",
     ) -> dict[str, Any]:
-        """Generate an ad preview from an ad or creative."""
+        """Generate an ad preview from an ad, a draft creative payload, or a creative id, in that order.
+
+        An ad or a creative id is previewed through its own previews edge. A draft payload goes to
+        the account's generatepreviews edge, which takes the payload as creative and no creative_id
+        (sent alone, creative_id was refused with "The parameter creative is required").
+        """
         if ad_id:
             return await self.list_objects(ad_id, "previews", params={"ad_format": ad_format})
+        if creative_id and not creative:
+            return await self.list_objects(creative_id, "previews", params={"ad_format": ad_format})
         if not account_id:
-            raise UnsupportedFeatureError("account_id is required when previewing from creative input.")
+            raise UnsupportedFeatureError("account_id is required when previewing from a creative payload.")
         params: dict[str, Any] = {"ad_format": ad_format}
-        if creative_id:
-            params["creative_id"] = creative_id
         if creative:
             params["creative"] = creative
         return await self.request(
