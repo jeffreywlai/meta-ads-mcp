@@ -370,7 +370,13 @@ The default is writable. Nothing turns read-only mode on for you.
 Every tool carries the four MCP markings. A client uses them to decide which
 calls it may run without asking you, and which it may safely retry.
 
-- `readOnlyHint`: the tool changes nothing at Meta and nothing on this machine.
+- `readOnlyHint`: the tool changes nothing at Meta and none of your own files.
+  Any tool may save a large answer to the server's own export folder, where
+  files expire and the oldest are removed when the folder is full (see
+  [Large responses](#large-responses)); that does not count, so
+  `export_change_history`, which always saves one, is read-only.
+  `delete_overflow_artifact` is not read-only, because deleting a saved export
+  is what it is for.
 - `destructiveHint`: the worst the tool can do deletes, removes, disconnects,
   cancels, archives or overwrites something that already exists. Every delete
   and update is marked, and so are the three status tools, because `ARCHIVED`

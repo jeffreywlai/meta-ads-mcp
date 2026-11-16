@@ -4,8 +4,9 @@ A client reads these hints to decide which calls it may run without asking the
 person and which it should retry. The tool files carry no annotations; this
 table is the only place they are set.
 
-- readOnlyHint: the tool changes nothing at Meta and nothing on this machine.
-  It must equal what the name rules in ``tool_contracts._tool_effect`` say
+- readOnlyHint: the tool changes nothing at Meta and none of the person's own
+  files (the saved exports the server keeps are not counted; see the comment
+  on the table). It must equal what the name rules in ``tool_contracts._tool_effect`` say
   ("read"), because that function reads this hint first and intent routing
   relies on its answer.
 - destructiveHint: the worst the tool can do deletes, removes, disconnects,
@@ -53,6 +54,12 @@ OVERWRITE_EACH_RUN = _hints(False, True, False, False)
 OVERWRITE_EACH_RUN_FROM_WEB = _hints(False, True, False, True)
 
 
+# Read-only means the tool changes nothing at Meta and none of the person's own files.
+# Any tool may save a large answer to the server's own export folder, where files expire
+# and the oldest are removed when the folder is full (overflow.py, through the
+# response-limiting middleware); that does not count, so export_change_history, which
+# always saves one, is read-only like every other read.
+# delete_overflow_artifact is not read-only, because deleting a saved export is what it is for.
 _TABLE: dict[str, ToolAnnotations] = {
     # Accounts, structure and discovery
     "list_ad_accounts": READ,
