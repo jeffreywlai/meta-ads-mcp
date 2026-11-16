@@ -335,6 +335,17 @@ ORDINARY_TEXT = [
     "@brand",
     "Sale: 20% off @ our store",
     "utm_source=meta&ref=https://example.com/@brand&mail=a@b.com",
+    # Scheme-relative look-alikes that are not a login with a password at a boundary.
+    "a//b:c@d",
+    "see // me:x@example.com",
+    "path=//cdn.example.com/img@2x.png",
+    "write to //contact@example.com today",
+    "ratio 16//9: now @ home",
+    # A space still ends an address (parsers keep spaces), and a newline before a handle
+    # after an address with no password is not read as a login with a password.
+    "Visit //someone:pa ss@cdn.example.invalid",
+    "landing=https://someone:pa ss@cdn.example.invalid/",
+    "Shop at https://shop.example.com\n@brand",
 ]
 
 
@@ -351,3 +362,121 @@ def test_ordinary_text_with_an_at_sign_is_still_sent(ad_client: Recorder, text: 
     draft = {"object_story_spec": spec, "url_tags": text}
     asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
     assert ad_client.calls[-1][1]["creative"] == draft
+
+
+# A scheme-relative login (//user:pass@host) inside longer text: // at the start or after a
+# boundary character, a password in the user part, and the @ before any space, /, ? or #.
+
+RELATIVE_LOGIN = f"//someone:{SECRET}@cdn.example.invalid/path"
+RELATIVE_TEXTS = [
+    f"redirect={RELATIVE_LOGIN}&utm_campaign={{{{campaign.id}}}}",
+    f"Visit {RELATIVE_LOGIN}",
+    f"Visit //someone:{SECRET}@cdn.example.invalid",
+    f"utm_source=meta&next={RELATIVE_LOGIN}",
+    f'go "{RELATIVE_LOGIN}"',
+    f"links: ({RELATIVE_LOGIN})",
+    f"a,{RELATIVE_LOGIN};b",
+]
+
+
+@pytest.mark.parametrize("text", RELATIVE_TEXTS)
+def test_a_scheme_relative_login_inside_text_is_refused(ad_client: Recorder, text: str) -> None:
+    link_data = {"link": "https://shop.example.com/", "message": text}
+    cases = [
+        (creatives.create_ad_creative(account_id="1234567890", name="Spring", params={"url_tags": text}), "params"),
+        (creatives.create_ad_creative(
+            account_id="1234567890", name="Spring",
+            object_story_spec={"page_id": "1234567890", "link_data": link_data},
+        ), "object_story_spec"),
+        (creatives.preview_ad(account_id="1234567890", creative={
+            "object_story_spec": json.dumps({"page_id": "1234567890", "link_data": link_data}),
+        }), "creative"),
+        (ads.create_ad(**AD, creative_id="3333333333", params={"url_tags": text}), "params"),
+        (ads.update_ad(ad_id="4444444444", params={"url_tags": text}), "params"),
+        (campaigns.create_ad_set(**AD_SET, params={"destination_note": text}), "params"),
+    ]
+    for call, name in cases:
+        _refused(call, ad_client, name)
+    arguments = {"account_id": "1234567890", "name": "Spring", "params": {"url_tags": text}}
+    _refused(mcp_server.call_tool("call_tool", {"name": "create_ad_creative", "arguments": arguments}), ad_client, "params")
+
+
+@pytest.mark.parametrize("text", ["//contact@example.com", f"//someone:{SECRET}@cdn.example.invalid/path",
+                                  " //contact@example.com "])
+def test_a_whole_scheme_relative_address_with_a_user_name_is_still_refused(ad_client: Recorder, text: str) -> None:
+    _refused(creatives.create_ad_creative(account_id="1234567890", name="Spring", params={"url_tags": text}),
+             ad_client, "params")
+    _refused(ads.create_ad(**AD, creative_id="3333333333", params={"url_tags": text}), ad_client, "params")
+
+
+# URL parsers delete tab, CR and LF before reading an address, so a login split by one is
+# still a login to them; the check reads the text the same way.
+def _split_logins(ch: str) -> list[str]:
+    host = "cdn.example.invalid/path"
+    return [
+        f"Visit //some{ch}one:{SECRET}@{host}",
+        f"Visit //someone:{SECRET[:9]}{ch}{SECRET[9:]}@{host}",
+        f"Visit //{ch}someone:{SECRET}@{host}",
+        f"Visit /{ch}/someone:{SECRET}@{host}",
+        f"redirect=//someone:{SECRET}{ch}@{host}&utm_source=meta",
+        f"landing=https://some{ch}one:{SECRET}@{host}",
+        f"landing=https://someone:{SECRET[:9]}{ch}{SECRET[9:]}@{host}",
+        f"landing=https://{ch}someone:{SECRET}@{host}",
+        f"landing=ht{ch}tps://someone:{SECRET}@{host}",
+        f"landing=https{ch}://someone:{SECRET}@{host}",
+        f"landing=https:/{ch}/someone:{SECRET}@{host}",
+    ]
+
+
+@pytest.mark.parametrize("text", [text for ch in ("\t", "\r", "\n") for text in _split_logins(ch)])
+def test_a_login_split_by_a_tab_or_line_break_is_refused(ad_client: Recorder, text: str) -> None:
+    link_data = {"link": "https://shop.example.com/", "message": text}
+    _refused(creatives.create_ad_creative(account_id="1234567890", name="Spring", params={"url_tags": text}),
+             ad_client, "params")
+    _refused(creatives.create_ad_creative(
+        account_id="1234567890", name="Spring", object_story_spec={"page_id": "1234567890", "link_data": link_data},
+    ), ad_client, "object_story_spec")
+    _refused(ads.update_ad(ad_id="4444444444", params={"url_tags": text}), ad_client, "params")
+    for part in (SECRET[:9], SECRET[9:]):
+        with pytest.raises(creatives.ValidationError) as raised:
+            asyncio.run(ads.create_ad(**AD, creative_id="3333333333", params={"url_tags": text}))
+        assert part not in str(raised.value)
+
+
+def test_the_scheme_relative_scan_of_a_long_text_finishes_quickly() -> None:
+    import time
+
+    from meta_ads_mcp.url_secrets import refuse_url_login_in_text
+
+    text = "=//a:" * 200_000 + "x" * 200_000 + "@ " + "a" * 1_000_000
+    started = time.monotonic()
+    refuse_url_login_in_text("=// " * 200_000 + "@", "params", scheme_relative=True)
+    with pytest.raises(creatives.ValidationError):
+        refuse_url_login_in_text(text, "params", scheme_relative=True)
+    assert time.monotonic() - started < 5
+
+
+def test_the_catalog_tools_check_is_unchanged_by_the_scheme_relative_rule() -> None:
+    """The scheme-relative rule is an opt-in of the creative and ad tools; the catalog check is as it was."""
+    from meta_ads_mcp.tools.catalog_feeds import _refuse_url_logins as catalog_check
+    from meta_ads_mcp.url_secrets import refuse_url_login_in_text
+
+    for text in RELATIVE_TEXTS[:4]:
+        catalog_check(text, "params")
+        refuse_url_login_in_text(text, "params")
+        with pytest.raises(creatives.ValidationError):
+            refuse_url_login_in_text(text, "params", scheme_relative=True)
+    # A whole scheme-relative address with a user name is refused by the catalog check, as before.
+    for text in ("//contact@example.com", RELATIVE_LOGIN):
+        with pytest.raises(creatives.ValidationError):
+            catalog_check(text, "params")
+    # The catalog check reads text as given: a login split by a tab or line break inside longer
+    # text is not found there (left as it was; reported), while the creative and ad check finds it.
+    split = f"landing=https://someone:{SECRET[:9]}\t{SECRET[9:]}@cdn.example.invalid/"
+    catalog_check(split, "params")
+    with pytest.raises(creatives.ValidationError):
+        refuse_url_login_in_text(split, "params", scheme_relative=True)
+    # Ordinary text both checks accept.
+    for text in ("Shop at https://shop.example.com\n@brand", "write to //contact@example.com today"):
+        catalog_check(text, "params")
+        refuse_url_login_in_text(text, "params", scheme_relative=True)
