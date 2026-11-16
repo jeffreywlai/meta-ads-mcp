@@ -367,6 +367,13 @@
       "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in promoted_object (such as object_store_url) or params, including inside a sub-object sent as JSON text, is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
       "why_better": "A URL given to Meta is stored on the ad set and shown in responses, dry runs and errors, so a login in it would be shown to everyone who can read the object. The creative tools and the boost tool already refuse such URLs; this tool now does the same.",
       "migration": "Host the page or store listing at an address that needs no login, and pass that address. URLs without a login need no change."
+    },
+    {
+      "tool": "setup_ab_test",
+      "kind": "behaviour",
+      "what_changed": "confidence_level now refuses true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so confidence_level=true was sent to Meta as a confidence level of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A confidence level of true is no longer sent to Meta as 1, so a split test is not set up to declare a winner on a confidence nobody chose. The caller is told which parameter is wrong.",
+      "migration": "Send the confidence level as a number, for example 90. Numeric text such as '90' still works."
     }
   ]
 }

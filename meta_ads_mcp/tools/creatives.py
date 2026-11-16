@@ -38,6 +38,7 @@ from meta_ads_mcp.tool_types import (
     AccountId,
     FieldList,
     GraphId,
+    NonBoolFloat,
     StrictCurrencyAmount,
     StringList,
     coerce_csv_string_list,
@@ -1351,7 +1352,7 @@ async def setup_ab_test(
     start_time: str | None = None,
     end_time: str | None = None,
     observation_type: str | None = None,
-    confidence_level: float | None = None,
+    confidence_level: NonBoolFloat | None = None,
     hypothesis: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
