@@ -388,8 +388,8 @@ calls it may run without asking you, and which it may safely retry.
   fetch a web address you give (image, video and product feed uploads) are
   marked.
 
-The markings appear in the tool list and at the end of each `search_tools`
-match, for example `read-only: no, destructive: yes, idempotent: yes,
+The markings appear in the tool list, in `get_capabilities(tool_name=...)` under
+`tool.annotations`, and at the end of each `search_tools` match, for example `read-only: no, destructive: yes, idempotent: yes,
 open-world: no`. `search_tools` is marked read-only. `call_tool` carries the
 markings of the most dangerous tool it can run. It is not marked read-only even
 in read-only mode, because `delete_overflow_artifact` still runs there and

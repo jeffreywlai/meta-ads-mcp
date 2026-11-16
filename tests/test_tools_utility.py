@@ -41,6 +41,20 @@ def test_get_capabilities_returns_live_named_tool_schema() -> None:
     assert "flatten_actions" in result["tool"]["input_schema"]["properties"]
 
 
+@pytest.mark.parametrize("name", ["get_entity_insights", "delete_campaign", "create_ad", "search_ads_archive"])
+def test_get_capabilities_for_a_tool_includes_its_four_markings(name: str) -> None:
+    from meta_ads_mcp.tool_annotations import TOOL_ANNOTATIONS
+
+    expected = TOOL_ANNOTATIONS[name]
+    result = asyncio.run(utility.get_capabilities(tool_name=name))
+    assert result["tool"]["annotations"] == {
+        "readOnlyHint": expected.readOnlyHint,
+        "destructiveHint": expected.destructiveHint,
+        "idempotentHint": expected.idempotentHint,
+        "openWorldHint": expected.openWorldHint,
+    }
+
+
 @pytest.mark.parametrize(("query", "expected"), [("creative fatigue report", "get_creative_fatigue_report"), ("list_ads", "list_ads")])
 def test_free_text_capabilities_reuse_live_search(query, expected) -> None:
     result = asyncio.run(utility.get_capabilities(intent=query))

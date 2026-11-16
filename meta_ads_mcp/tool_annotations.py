@@ -292,6 +292,18 @@ def call_tool_annotations(*, read_only: bool) -> ToolAnnotations:
     )
 
 
+def hints_as_dict(annotations: ToolAnnotations | None) -> dict[str, bool | None] | None:
+    """The four hints by their MCP names, for an answer that describes one tool."""
+    if annotations is None:
+        return None
+    return {
+        "readOnlyHint": annotations.readOnlyHint,
+        "destructiveHint": annotations.destructiveHint,
+        "idempotentHint": annotations.idempotentHint,
+        "openWorldHint": annotations.openWorldHint,
+    }
+
+
 def describe_hints(annotations: ToolAnnotations | None) -> str:
     """The four hints as short plain text for the compact search output."""
     if annotations is None:
