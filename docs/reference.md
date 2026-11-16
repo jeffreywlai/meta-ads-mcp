@@ -416,7 +416,9 @@ wrong field can hold private text.
 - **Ids that Meta defines as numbers must be digits.** This covers campaign,
   ad set, ad, creative, custom audience, pixel or dataset, business, catalog,
   product set, product feed, Page, Instagram account and media, study, video,
-  system user and app ids, and each entry of a list of them. Send the id as a
+  system user and app ids (including `business_app`, the second name
+  `generate_system_user_token` takes for `app_id`), and each entry of a list of
+  them. Send the id as a
   string: `'1234567890'`. A JSON number was refused before and still is.
 - The same check covers these ids when they sit inside another argument:
   `create_ad`'s `creative.creative_id` and `creative.id`; the campaign, ad set,

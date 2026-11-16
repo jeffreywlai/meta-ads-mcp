@@ -104,6 +104,8 @@ SINGLE_IDS: dict[str, IdFormat] = {
     "system_user_id": _digits("a system user"),
     "user_id": _digits("a business user or system user"),
     "app_id": _digits("an app"),
+    # generate_system_user_token takes the app as business_app or app_id.
+    "business_app": _digits("an app"),
     "partner_id": _digits("a business"),
     "lead_gen_form_id": _digits("a lead form"),
     "rf_prediction_id": _digits("a reach and frequency prediction"),

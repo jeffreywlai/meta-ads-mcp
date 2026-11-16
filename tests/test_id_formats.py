@@ -491,3 +491,31 @@ def test_every_form_of_a_nested_id_is_still_accepted() -> None:
 def test_each_nested_id_rule_names_a_real_parameter() -> None:
     for tool, parameter in NESTED_IDS:
         assert parameter in TOOLS[tool].parameters["properties"], f"{tool}.{parameter}"
+
+
+# A parameter that a tool uses as a second name for an id it also takes under the checked name.
+SECOND_NAMES = {
+    ("generate_system_user_token", "business_app"): "app_id",
+    ("get_recommendations", "object_id"): "account_id",
+}
+
+
+@pytest.mark.parametrize(("tool", "parameter"), sorted(SECOND_NAMES))
+def test_a_second_name_for_an_id_gets_the_same_check(tool: str, parameter: str) -> None:
+    second, first = id_format(tool, parameter), id_format(tool, SECOND_NAMES[(tool, parameter)])
+    assert second is not None, f"{tool}.{parameter} is not checked"
+    assert second[0].pattern == first[0].pattern
+
+
+@pytest.mark.parametrize("routed", [False, True])
+def test_business_app_is_refused_like_app_id(routed: bool, sent: list[str]) -> None:
+    arguments = {"system_user_id": "2222222222", "scope": ["ads_read"], "business_app": MISPLACED}
+    name, call_arguments = (
+        ("call_tool", {"name": "generate_system_user_token", "arguments": arguments})
+        if routed else ("generate_system_user_token", arguments)
+    )
+    with pytest.raises(ToolError) as info:
+        _call(name, call_arguments)
+    assert str(info.value).startswith("business_app must be an app id: digits only")
+    assert "Spring" not in str(info.value)
+    assert sent == []

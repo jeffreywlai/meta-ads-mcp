@@ -318,6 +318,13 @@
       "what_changed": "An existing creative named inside creative, as creative={'creative_id': ...} or creative={'id': ...}, must now be digits, the same as the top-level creative_id; anything else is refused before the tool starts, with a message that names creative.creative_id or creative.id and never repeats the value. Before, the top-level creative_id was checked but the same id given inside creative was sent to Meta as written. Spaces around the id and a blank value are treated as before.",
       "why_better": "All three ways of naming the creative get the same check, so a name or a placeholder given as the nested creative id no longer spends a rate-limited request and comes back as an unclear error from Meta, and private text pasted there is never echoed back or sent to Meta.",
       "migration": "Pass the creative's numeric id as a string, for example creative={'creative_id': '1234567890'}, or use the top-level creative_id. Numeric ids need no change."
+    },
+    {
+      "tool": "generate_system_user_token",
+      "kind": "behaviour",
+      "what_changed": "business_app, the second name this tool takes for app_id, must now be digits like app_id; anything else is refused before the tool starts, with a message that names business_app and never repeats the value. Before, app_id was checked but the same app given as business_app was sent to Meta as written. Spaces around the id and a blank value are treated as before, and the input schema now carries the pattern.",
+      "why_better": "Both names for the app get the same check, so a name or a placeholder given as business_app no longer spends a request and comes back as an unclear error from Meta, and private text pasted there is never echoed back or sent to Meta.",
+      "migration": "Pass the app's numeric id as a string, for example business_app='1234567890', or use app_id. Numeric ids need no change."
     }
   ]
 }
