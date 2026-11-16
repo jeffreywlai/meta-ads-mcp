@@ -383,10 +383,15 @@ calls it may run without asking you, and which it may safely retry.
   cannot be undone from this server.
 - `idempotentHint`: running the same call twice leaves things as one call did.
   Tools that make a new object or upload rows on every run are not marked.
-- `openWorldHint`: the tool reaches outside your own assets. Only
-  `search_ads_archive` (the public Ad Library) and the tools that have Meta
-  fetch a web address you give (image, video and product feed uploads) are
-  marked.
+- `openWorldHint`: a call can give Meta the web address of a file (an image, a
+  video, a thumbnail, a feed or data file) for Meta to fetch, through a named
+  argument or a raw payload the tool passes on, or the tool returns public
+  content from outside your own assets, as `search_ads_archive` does. A
+  landing-page or other destination link does not count, because Meta stores it
+  and does not fetch it. The marked tools are the uploads, the creative and ad
+  creators, `preview_ad`, the catalog, product, product set and feed tools that
+  take an image or feed address, the two feed-rule tools, and
+  `search_ads_archive`.
 
 The markings appear in the tool list, in `get_capabilities(tool_name=...)` under
 `tool.annotations`, and at the end of each `search_tools` match, for example `read-only: no, destructive: yes, idempotent: yes,
