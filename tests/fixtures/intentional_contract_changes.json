@@ -374,6 +374,13 @@
       "what_changed": "confidence_level now refuses true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so confidence_level=true was sent to Meta as a confidence level of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
       "why_better": "A confidence level of true is no longer sent to Meta as 1, so a split test is not set up to declare a winner on a confidence nobody chose. The caller is told which parameter is wrong.",
       "migration": "Send the confidence level as a number, for example 90. Numeric text such as '90' still works."
+    },
+    {
+      "tool": "create_ad_creative_from_inputs",
+      "kind": "behaviour",
+      "what_changed": "partnership_ad_format now refuses true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so partnership_ad_format=true was sent to Meta as format 1 (both identities). Whole numbers and digit text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A Partnership ad's format of true is no longer sent to Meta as format 1, so the ad does not show both identities when nobody chose that. The caller is told which parameter is wrong.",
+      "migration": "Send the format as a whole number: 1, 2 or 3. Digit text such as '2' still works."
     }
   ]
 }
