@@ -43,7 +43,7 @@ from meta_ads_mcp.tool_types import (
     StringList,
     coerce_csv_string_list,
 )
-from meta_ads_mcp.url_secrets import refuse_url_credentials
+from meta_ads_mcp.url_secrets import refuse_url_credentials, refuse_url_login_in_text
 
 
 def _refuse_true_false(value: Any) -> Any:
@@ -388,7 +388,10 @@ def _json_sub_object(text: str) -> dict[str, Any] | list[Any] | None:
 def _refuse_url_logins(value: Any, name: str, *, _levels: int = 0, _depth: int = 0) -> None:
     """Refuse a login embedded in any URL inside a nested input, before any request is built.
 
-    Text that is a JSON object or list (a sub-object sent encoded) is examined the same
+    Each text value is checked as a URL and scanned for a scheme://login@ anywhere inside
+    it (URL parameters, a message), with the scanner the catalog tools use: an @ counts only
+    after a scheme:// and before any space, /, ? or #, so an email address, a handle or an
+    @ in a path or query is not a login. Text that is a JSON object or list (a sub-object sent encoded) is examined the same
     way, within the bounds above; the value sent on to Meta is not changed. The message
     names a key only when it is a field Meta documents at that place (_NAMED_KEYS); any
     other key, which may be pasted data or a token, as <key>.
@@ -400,8 +403,9 @@ def _refuse_url_logins(value: Any, name: str, *, _levels: int = 0, _depth: int =
         decoded = _json_sub_object(value) if _levels < _JSON_TEXT_LEVELS else None
         if decoded is not None:
             _refuse_url_logins(decoded, name, _levels=_levels + 1, _depth=inside)
-        elif "://" in value or "@" in value:
-            refuse_url_credentials(value, name)
+        elif "@" in value:
+            # The whole text as a URL, and any scheme://login@ inside it (the catalog tools' scanner).
+            refuse_url_login_in_text(value, name)
     elif isinstance(value, dict):
         known = _NAMED_KEYS.get(name, frozenset())
         for key, item in value.items():
@@ -715,7 +719,8 @@ async def upload_creative_asset(
     """Use this when the user needs an image asset uploaded before creating or updating a creative. Give exactly one of image_url or file_path. file_path is read only from the folder named by the META_UPLOAD_DIR environment variable (a path inside it, or a name relative to it); local files are refused while that variable is unset. Files must be JPG or PNG (.jpg, .jpeg or .png, the types Meta's Ads Guide lists for image ads) and at most 30 MB."""
     if bool(file_path) == bool(image_url):
         raise ValidationError("Provide exactly one of file_path or image_url.")
-    refuse_url_credentials(image_url, "image_url")
+    if isinstance(image_url, str):
+        refuse_url_login_in_text(image_url, "image_url")
     image_file = _read_image_file(file_path) if file_path else None
     client = get_graph_api_client()
     if image_file is not None:
@@ -2841,6 +2846,8 @@ async def _boost_instagram_post(
             raise ValidationError("call_to_action must be an object with a type, for example {\"type\": \"LEARN_MORE\", \"value\": {\"link\": \"https://...\"}}.")
         _ensure_v25_creative_payload(call_to_action)
         _refuse_url_logins(call_to_action, "call_to_action")
+    # url_tags is URL parameters added to the ad's links; a login address inside it is refused too.
+    _refuse_url_logins(url_tags, "url_tags")
     if promoted_object is not None and not isinstance(promoted_object, dict):
         raise ValidationError("promoted_object must be an object, for example {\"pixel_id\": \"123\", \"custom_event_type\": \"PURCHASE\"}.")
     if partnership_ad_format is not None:

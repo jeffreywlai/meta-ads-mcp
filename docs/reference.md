@@ -454,8 +454,12 @@ wrong field can hold private text.
   `preview_ad`, wherever the URL sits in the creative, including inside a
   sub-object sent as JSON text. `create_ad` (`creative_spec`, `creative`,
   `tracking_specs`, `params`), `update_ad` (`tracking_specs`, `params`) and
-  `create_ad_set` (`promoted_object`, `params`) do the same. Meta stores the URL
-  on the ad and shows it in responses.
+  `create_ad_set` (`promoted_object`, `params`) do the same, and so does the
+  boost tool's `url_tags`. A login address inside longer text is found too, such
+  as `url_tags="landing=https://user:pass@host/"`. An email address
+  (`help@example.com`), a handle (`@brand`) or an `@` in a URL's path or query is
+  not a login. Named free-text arguments (`title`, `body`, `name`) are not
+  checked. Meta stores the URL on the ad and shows it in responses.
 
 ## Errors and retries
 
