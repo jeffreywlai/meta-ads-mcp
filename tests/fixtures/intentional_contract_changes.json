@@ -149,6 +149,83 @@
       "what_changed": "An id that Meta defines as a number must now be digits, and an ad account id digits or act_ followed by digits; anything else is refused before the tool starts. This covers every parameter named campaign_id, adset_id, ad_id, creative_id, audience_id, origin_audience_id, pixel_id, dataset_id, event_source_id, business_id, catalog_id, product_set_id, feed_id, page_id, instagram_account_id, instagram_media_id, study_id, video_id, system_user_id, app_id and account_id, object_id (an ad account, campaign, ad set or ad), and each entry of campaign_ids, ad_ids, object_ids, video_ids, primary_feed_ids and search_page_ids. get_account_pages still takes 'me' as account_id. Spaces around an id and a blank optional id are treated as before. The message names the parameter and what a valid id looks like, and never repeats the value. Each of these parameters' input schemas now carries the pattern. Before, only an id holding a slash, ?, #, .. or a space was refused, and a name or a placeholder such as 'my campaign' or '<campaign_id>' was sent to Meta. Image hashes, Page post and comment ids (digits_digits), paging cursors, export_id, report_run_id, retailer and product ids, interest ids and the other ids listed in meta_ads_mcp/id_formats.py are unchanged.",
       "why_better": "A name or a placeholder in an id field no longer spends a rate-limited request and comes back as an unclear error from Meta. The caller is told at once which parameter is wrong and what it should hold, and private text pasted into an id field by mistake is never echoed back or sent to Meta.",
       "migration": "Pass the numeric id Meta gave the object, as a string, for example '1234567890', and an ad account as '1234567890' or 'act_1234567890'. Find ids with the list_ and search tools, not by name. An id sent as a JSON number was refused before and still is: send it as a string."
+    },
+    {
+      "tool": "create_ad",
+      "kind": "behaviour",
+      "what_changed": "bid_amount now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "create_ad_set",
+      "kind": "behaviour",
+      "what_changed": "bid_amount, daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_campaign",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_campaign_budget",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_adset_budget",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_adset_bid_amount",
+      "kind": "behaviour",
+      "what_changed": "bid_amount now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_adset_bid_strategy",
+      "kind": "behaviour",
+      "what_changed": "bid_amount now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "create_lookalike_audience",
+      "kind": "behaviour",
+      "what_changed": "ratio and starting_ratio now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so ratio=true was sent to Meta as a ratio of 1 and starting_ratio=false as 0. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A lookalike ratio of true is no longer sent to Meta as a ratio of 1, and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of an audience being built from a size nobody chose.",
+      "migration": "Send the ratio as a number, for example 0.01 for the closest 1 percent. Numeric text such as '0.01' still works."
+    },
+    {
+      "tool": "create_custom_audience",
+      "kind": "behaviour",
+      "what_changed": "retention_days now refuses true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so retention_days=true kept people in the audience for one day. Whole numbers and digit text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A retention period of true is no longer sent to Meta as one day, so people are not dropped from the audience after a day nobody chose. The caller is told which parameter is wrong.",
+      "migration": "Send the number of days as a whole number, for example 30. Digit text such as '30' still works."
+    },
+    {
+      "tool": "update_custom_audience",
+      "kind": "behaviour",
+      "what_changed": "retention_days now refuses true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so retention_days=true kept people in the audience for one day. Whole numbers and digit text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A retention period of true is no longer sent to Meta as one day, so people are not dropped from the audience after a day nobody chose. The caller is told which parameter is wrong.",
+      "migration": "Send the number of days as a whole number, for example 30. Digit text such as '30' still works."
     }
   ]
 }

@@ -1900,7 +1900,7 @@ def test_a_message_that_repeats_the_input_is_replaced():
 def test_every_validator_this_server_defines_for_tool_arguments_has_a_fixed_message():
     """The custom messages a tool argument can produce; none of them is built from the input."""
     sources = {
-        "tool_types.py": ['"an amount must be a number, not true or false"'],
+        "tool_types.py": ['"an amount must be a number, not true or false"', '"a number is expected here, not true or false"'],
         "tools/catalogs.py": ['"a price must be a number, not true or false"'],
         "tools/experiments.py": ['"expected a number or time, not true or false"'],
         "tools/creatives.py": ['"must be a whole number, not true or false"'],

@@ -98,17 +98,6 @@ StrictStringList: TypeAlias = Annotated[
 # Graph fields use the same top-level CSV grammar, including nested field expressions.
 FieldList: TypeAlias = StringList
 
-CurrencyAmount: TypeAlias = Annotated[
-    float,
-    Field(
-        description=(
-            "Amount in major units of the owning ad account currency "
-            "(for example, 12.50 means USD 12.50, not 1,250 cents). "
-            "The server converts to Meta's minor units using the account currency."
-        )
-    ),
-]
-
 def _refuse_true_false_amount(value: Any) -> Any:
     """Refuse true or false where an amount is expected; MCP would otherwise read true as 1.0."""
     if isinstance(value, bool):
@@ -116,9 +105,16 @@ def _refuse_true_false_amount(value: Any) -> Any:
     return value
 
 
-# For money parameters added after master. CurrencyAmount stays as it is for the
-# parameters that existing callers already use.
-StrictCurrencyAmount: TypeAlias = Annotated[
+def _refuse_true_false_number(value: Any) -> Any:
+    """Refuse true or false where a number is expected; MCP would otherwise read true as 1."""
+    if isinstance(value, bool):
+        raise ValueError("a number is expected here, not true or false")
+    return value
+
+
+# Every money parameter. Numbers and numeric text are accepted as before; true and
+# false are refused (design part C2: they used to reach Meta as 1 and 0).
+CurrencyAmount: TypeAlias = Annotated[
     float,
     BeforeValidator(_refuse_true_false_amount),
     Field(
@@ -129,6 +125,14 @@ StrictCurrencyAmount: TypeAlias = Annotated[
         )
     ),
 ]
+
+# The name the parameters added after master use; the same type as CurrencyAmount.
+StrictCurrencyAmount: TypeAlias = CurrencyAmount
+
+# A number or whole number sent to Meta that is not money (a lookalike ratio, a
+# retention period). Numbers and numeric text are accepted as before; true and false are refused.
+NonBoolFloat: TypeAlias = Annotated[float, BeforeValidator(_refuse_true_false_number)]
+NonBoolInt: TypeAlias = Annotated[int, BeforeValidator(_refuse_true_false_number)]
 
 # A schedule time: ISO 8601 text, or whole Unix seconds as a number or as digit text.
 # Meta types these fields as datetime, which takes Unix seconds as a number. The value
