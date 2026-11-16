@@ -717,6 +717,30 @@ class GraphAPIClient:
         )
         return {"status": status, "rows": rows}
 
+    async def list_audiences_of_subtype(
+        self,
+        account_id: str,
+        *,
+        subtype: str,
+        fields: FieldList | None = None,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        """Read one page of an account's custom audiences of one subtype, filtered by Meta.
+
+        Meta ignores a plain subtype parameter on customaudiences, but applies
+        filtering=[{"field":"subtype","operator":"IN","value":["WEBSITE"]}] (read live
+        2026-11-16: the 20 WEBSITE audiences of an account came back in one request).
+        """
+        clause = {"field": "subtype", "operator": "IN", "value": [subtype.strip().upper()]}
+        params: dict[str, Any] = {"limit": limit, "filtering": json.dumps([clause], separators=(",", ":"))}
+        cursor = _normalize_cursor(after)
+        if cursor:
+            params["after"] = cursor
+        return await self.list_objects(
+            normalize_account_id(account_id), "customaudiences", fields=fields, params=params,
+        )
+
     async def search_interests(
         self,
         *,
