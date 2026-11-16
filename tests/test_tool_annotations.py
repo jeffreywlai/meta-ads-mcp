@@ -174,7 +174,7 @@ def test_marked_tools_count() -> None:
     assert len(names_where("readOnlyHint")) == 116
     assert len(names_where("destructiveHint")) == 39
     assert len(names_where("idempotentHint")) == 151
-    assert len(names_where("openWorldHint")) == 17
+    assert len(names_where("openWorldHint")) == 18
 
 
 # --- destructiveHint -------------------------------------------------------------
@@ -369,6 +369,9 @@ OPEN_WORLD_PATHS = {
     "create_product_feed_upload": "url",
     "create_feed_rule": "params.user_default_value (fallback_rule on image_link)",
     "update_feed_rule": "params.user_default_value (fallback_rule on image_link)",
+    # Meta documents only name, status and labels on this route, but the tool forwards the
+    # spec and no live call has shown Meta refuses it, so the cautious marking applies.
+    "update_creative": "object_story_spec.link_data.picture",
 }
 
 FILE_ADDRESS = "https://assets.example.invalid/annotation-probe.png"
@@ -462,6 +465,7 @@ OPEN_WORLD_CALLS = {
         },
         FILE_ADDRESS,
     ),
+    "update_creative": ({"creative_id": "3333333333", "object_story_spec": _STORY}, FILE_ADDRESS),
     "update_feed_rule": (
         {"rule_id": "4444444444", "params": {"user_default_value": FILE_ADDRESS}},
         FILE_ADDRESS,

@@ -389,9 +389,11 @@ calls it may run without asking you, and which it may safely retry.
   content from outside your own assets, as `search_ads_archive` does. A
   landing-page or other destination link does not count, because Meta stores it
   and does not fetch it. The marked tools are the uploads, the creative and ad
-  creators, `preview_ad`, the catalog, product, product set and feed tools that
-  take an image or feed address, the two feed-rule tools, and
-  `search_ads_archive`.
+  creators, `update_creative`, `preview_ad`, the catalog, product, product set
+  and feed tools that take an image or feed address, the two feed-rule tools,
+  and `search_ads_archive`. `update_creative` is marked because it passes an
+  image address on to Meta; Meta's documentation says that route ignores it, but
+  no live call has confirmed that.
 
 The markings appear in the tool list, in `get_capabilities(tool_name=...)` under
 `tool.annotations`, and at the end of each `search_tools` match, for example `read-only: no, destructive: yes, idempotent: yes,
