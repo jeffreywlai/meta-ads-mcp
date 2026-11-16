@@ -346,6 +346,27 @@
       "what_changed": "When Meta's answer to a batch names a different upload session than the one the tool sent, that batch is no longer counted as accepted: the removal stops, no further batch is sent, and the tool raises an error that reports the outcome as unknown, with the progress so far (batches and rows already acknowledged for this session). Before, the session id in the answer was not checked, and the batch was counted as removed. Answers that name the session sent, written as text or as a number, are handled as before.",
       "why_better": "An acknowledgement for another upload session does not show that this batch was removed from the audience, so the result no longer claims rows were removed when that is not known. The caller is told to check the audience instead of trusting a wrong count.",
       "migration": "On this error, read the audience with get_audience and send the removal again for the rows that may remain. Ordinary removals need no change."
+    },
+    {
+      "tool": "create_ad",
+      "kind": "behaviour",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in creative_spec, creative, tracking_specs or params, including inside a sub-object sent as JSON text, is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The creative tools already refuse such URLs; the ad tools now do the same.",
+      "migration": "Host the page or file at an address that needs no login, and pass that address. URLs without a login need no change."
+    },
+    {
+      "tool": "update_ad",
+      "kind": "behaviour",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in tracking_specs or params, including inside a sub-object sent as JSON text, is now refused before any request is sent, including the read of the ad, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The creative tools already refuse such URLs; the ad tools now do the same.",
+      "migration": "Host the page or file at an address that needs no login, and pass that address. URLs without a login need no change."
+    },
+    {
+      "tool": "create_ad_set",
+      "kind": "behaviour",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in promoted_object (such as object_store_url) or params, including inside a sub-object sent as JSON text, is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "why_better": "A URL given to Meta is stored on the ad set and shown in responses, dry runs and errors, so a login in it would be shown to everyone who can read the object. The creative tools and the boost tool already refuse such URLs; this tool now does the same.",
+      "migration": "Host the page or store listing at an address that needs no login, and pass that address. URLs without a login need no change."
     }
   ]
 }

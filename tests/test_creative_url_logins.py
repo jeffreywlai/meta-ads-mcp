@@ -18,7 +18,7 @@ from fastmcp.exceptions import ToolError
 
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
-from meta_ads_mcp.tools import creatives
+from meta_ads_mcp.tools import ads, campaigns, creatives
 
 SECRET = "synthetic-pass-7f3a"
 LOGIN_URL = f"https://someone:{SECRET}@cdn.example.invalid/spring.jpg"
@@ -232,3 +232,52 @@ def test_json_text_that_cannot_or_need_not_be_examined_is_sent_unchanged(client:
     draft = {"object_story_spec": {"page_id": "1234567890"}, "title": text}
     asyncio.run(creatives.preview_ad(account_id="1234567890", creative=draft))
     assert client.calls[-1][1]["creative"]["title"] == text
+
+
+# create_ad, update_ad and create_ad_set refuse a login in every argument that can carry a web address.
+
+
+@pytest.fixture
+def ad_client(monkeypatch: pytest.MonkeyPatch, client: Recorder) -> Recorder:
+    monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(campaigns, "get_graph_api_client", lambda: client)
+    return client
+
+
+AD = {"account_id": "1234567890", "name": "Spring", "adset_id": "2222222222"}
+AD_SET = {
+    "account_id": "1234567890", "campaign_id": "2222222222", "name": "Spring", "billing_event": "IMPRESSIONS",
+    "optimization_goal": "LINK_CLICKS", "targeting": {"geo_locations": {"countries": ["US"]}},
+}
+AD_LOGIN_CASES = [
+    ("create_ad", ads.create_ad, {**AD, "creative_spec": NESTED["object_story_spec"] | {"name": "Spring"}}, "creative_spec"),
+    ("create_ad", ads.create_ad, {**AD, "creative_spec": {"name": "Spring", "object_story_spec": ENCODED_SPEC}},
+     "creative_spec"),
+    ("create_ad", ads.create_ad, {**AD, "creative_id": "3333333333", "tracking_specs": {"url": LOGIN_URL}},
+     "tracking_specs"),
+    ("create_ad", ads.create_ad, {**AD, "creative_id": "3333333333", "params": {"url_tags": LOGIN_URL}}, "params"),
+    ("update_ad", ads.update_ad, {"ad_id": "4444444444", "tracking_specs": [{"url": LOGIN_URL}]}, "tracking_specs"),
+    ("update_ad", ads.update_ad, {"ad_id": "4444444444", "params": {"display_url": LOGIN_URL}}, "params"),
+    ("update_ad", ads.update_ad, {"ad_id": "4444444444", "params": {"conversion_specs": [{"url": LOGIN_URL}]}}, "params"),
+    ("create_ad_set", campaigns.create_ad_set,
+     {**AD_SET, "promoted_object": {"application_id": "5555555555", "object_store_url": LOGIN_URL}},
+     "promoted_object.object_store_url"),
+    ("create_ad_set", campaigns.create_ad_set, {**AD_SET, "params": {"destination_url": LOGIN_URL}}, "params"),
+]
+
+
+@pytest.mark.parametrize(("tool", "function", "arguments", "name"), AD_LOGIN_CASES)
+def test_ad_and_ad_set_tools_refuse_a_login_in_a_web_address(
+    ad_client: Recorder, tool: str, function, arguments: dict, name: str
+) -> None:
+    _refused(function(**arguments), ad_client, name)
+    _refused(mcp_server.call_tool(tool, arguments), ad_client, name)
+    _refused(mcp_server.call_tool("call_tool", {"name": tool, "arguments": arguments}), ad_client, name)
+
+
+@pytest.mark.parametrize("url", ORDINARY)
+def test_ad_tools_still_send_ordinary_urls(ad_client: Recorder, url: str) -> None:
+    spec = {"name": "Spring", "object_story_spec": {"page_id": "1234567890", "link_data": {"link": url}}}
+    asyncio.run(ads.create_ad(**AD, creative_spec=spec, params={"url_tags": "utm_source=meta"}))
+    assert ad_client.calls[-1][0] == "create"
+    assert ad_client.calls[-1][3]["creative"] == spec

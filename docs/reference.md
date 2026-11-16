@@ -450,8 +450,10 @@ wrong field can hold private text.
   by the creative, video, boost and catalog tools, including
   `upload_creative_asset`, `create_ad_creative`, `update_creative` and
   `preview_ad`, wherever the URL sits in the creative, including inside a
-  sub-object sent as JSON text. Meta stores the URL on the ad and shows it in
-  responses.
+  sub-object sent as JSON text. `create_ad` (`creative_spec`, `creative`,
+  `tracking_specs`, `params`), `update_ad` (`tracking_specs`, `params`) and
+  `create_ad_set` (`promoted_object`, `params`) do the same. Meta stores the URL
+  on the ad and shows it in responses.
 
 ## Errors and retries
 
