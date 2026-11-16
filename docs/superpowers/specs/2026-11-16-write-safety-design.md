@@ -66,15 +66,17 @@ is tightened to expect at least one behaviour row for an empty query.
 **F2. `list_audiences(subtype=...)` does not filter.** Meta ignores the
 `subtype` parameter; the same mixed page comes back for any value.
 
-Fix: stop sending `subtype`. Always request the `subtype` field (add it when the
-caller's `fields` leaves it out, and remove it from the rows again if the caller
-did not ask for it). Keep only rows whose subtype equals the requested one,
-compared without regard to case. Because a page can hold few or no matches, keep
-reading pages until `limit` matching rows are found or Meta reports no more,
-with a ceiling of 10 pages per call. The summary reports rows read, rows
-matched, and pages read; `summary.complete` is true only when Meta reported no
-further page; `summary.next_after` continues from the last page read. Calls
-without `subtype` behave exactly as before.
+Fix: stop sending `subtype` and send
+`filtering=[{"field":"subtype","operator":"IN","value":["<SUBTYPE>"]}]` instead,
+with the subtype upper-cased. A live read on 2026-11-16 showed Meta applies this
+filter itself: one request returned exactly the audiences of the type asked for,
+where filtering rows locally had needed ten requests and found a quarter of
+them. One request per call; `limit`, `after`, `summary.complete` and
+`summary.next_after` work as they do without `subtype`. As a guard, always
+request the `subtype` field (and remove it from the rows again if the caller did
+not ask for it) and drop any row of another type; if any row is dropped the
+summary says how many and marks the list incomplete. The summary reports rows
+read and rows matched. Calls without `subtype` behave exactly as before.
 
 **F3. `preview_ad(account_id, creative_id)` always fails** with "(#100) ... The
 parameter creative is required": the account preview edge takes no
