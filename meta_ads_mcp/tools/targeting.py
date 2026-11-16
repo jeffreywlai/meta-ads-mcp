@@ -121,7 +121,8 @@ async def _search_categories(
 
     Reading stops when limit rows have matched at the end of a page, when Meta reports no
     further page, or after MAX_CATEGORY_PAGES pages. complete is true only when Meta reported
-    no further page, every entry read was an object, and every matching row is returned. A
+    no further page, every entry read was an object, every row could be judged against the
+    query (with a query, a row needs a text name), and every matching row is returned. A
     page without a readable data list stops the read and is never shown as an empty result.
     """
     if limit < 1:
@@ -132,7 +133,7 @@ async def _search_categories(
     cursor = blank_to_none(after)
     seen: set[str] = set()
     matched: list[dict[str, Any]] = []
-    rows_read = pages_read = unreadable_rows = 0
+    rows_read = pages_read = unreadable_rows = unnamed_rows = 0
     reasons: list[str] = []
     next_after: str | None = None
     more_pages = False
@@ -145,6 +146,9 @@ async def _search_categories(
             break
         unreadable_rows += bad_rows
         rows_read += len(rows)
+        if needle is not None:
+            # A row without a text name can be neither kept nor ruled out by the query.
+            unnamed_rows += sum(1 for row in rows if not isinstance(row.get("name"), str))
         matched.extend(row for row in rows if _name_matches(row, needle))
         paging = extract_paging(payload)
         if not paging.get("next"):
@@ -168,6 +172,12 @@ async def _search_categories(
     if unreadable_rows:
         entries = "1 entry" if unreadable_rows == 1 else f"{unreadable_rows} entries"
         reasons.append(f"{entries} in Meta's answer could not be read, so the list may be missing rows.")
+    if unnamed_rows:
+        unnamed = "1 row" if unnamed_rows == 1 else f"{unnamed_rows} rows"
+        reasons.append(
+            f"{unnamed} in Meta's answer had no readable name, so whether "
+            f"{'it matches' if unnamed_rows == 1 else 'they match'} the query is not known."
+        )
     items = matched[:limit]
     cut = len(matched) - len(items)
     if cut:
