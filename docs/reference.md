@@ -418,6 +418,13 @@ wrong field can hold private text.
   product set, product feed, Page, Instagram account and media, study, video,
   system user and app ids, and each entry of a list of them. Send the id as a
   string: `'1234567890'`. A JSON number was refused before and still is.
+- The same check covers these ids when they sit inside another argument:
+  `create_ad`'s `creative.creative_id` and `creative.id`; the campaign, ad set,
+  ad and ad account ids in A/B test and lift study cells; the pixel, app,
+  dataset, product set and catalog ids in lift study objectives; and
+  `boost_instagram_post`'s `promoted_object.pixel_id` and
+  `promoted_object.application_id`. The message names the path, such as
+  `creative.id`.
 - An ad account id is digits or `act_` followed by digits. `object_id` on the
   reporting tools takes an ad account, campaign, ad set or ad id.
   `get_account_pages` also takes `me`.

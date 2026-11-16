@@ -311,6 +311,13 @@
       "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in the creative payload is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
       "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
       "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
+    },
+    {
+      "tool": "create_ad",
+      "kind": "behaviour",
+      "what_changed": "An existing creative named inside creative, as creative={'creative_id': ...} or creative={'id': ...}, must now be digits, the same as the top-level creative_id; anything else is refused before the tool starts, with a message that names creative.creative_id or creative.id and never repeats the value. Before, the top-level creative_id was checked but the same id given inside creative was sent to Meta as written. Spaces around the id and a blank value are treated as before.",
+      "why_better": "All three ways of naming the creative get the same check, so a name or a placeholder given as the nested creative id no longer spends a rate-limited request and comes back as an unclear error from Meta, and private text pasted there is never echoed back or sent to Meta.",
+      "migration": "Pass the creative's numeric id as a string, for example creative={'creative_id': '1234567890'}, or use the top-level creative_id. Numeric ids need no change."
     }
   ]
 }

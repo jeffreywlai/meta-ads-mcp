@@ -25,6 +25,7 @@ from meta_ads_mcp.errors import ValidationError
 from meta_ads_mcp.id_formats import (
     LEFT_ALONE,
     LIST_IDS,
+    NESTED_IDS,
     SINGLE_IDS,
     TOOL_OVERRIDES,
     check_id_arguments,
@@ -412,3 +413,81 @@ def test_the_schema_of_a_class_left_alone_gains_no_pattern(parameter: str) -> No
         if parameter in {"rule_id", "time_based_ad_rotation_id_blocks"} and "pattern" in rendered:
             continue  # these types already asked for digits before this check
         assert '"pattern"' not in rendered, f"{tool}.{parameter}"
+
+
+# Ids a tool reads from inside an object or list argument get the same check, named by path.
+_STUDY = {"account_id": "1234567890", "start_time": "2026-12-01T00:00:00+00:00", "end_time": "2026-12-08T00:00:00+00:00"}
+_PIXEL_OBJECTIVE = [{"name": "Buy", "adspixels": [{"id": "1234567890", "event_names": ["Purchase"]}]}]
+NESTED_CASES = [
+    ("create_ad", {"account_id": "1234567890", "name": "Ad", "adset_id": "2222222222", "creative": {"id": MISPLACED}},
+     "creative.id"),
+    ("create_ad", {"account_id": "1234567890", "name": "Ad", "adset_id": "2222222222",
+                   "creative": {"creative_id": MISPLACED}}, "creative.creative_id"),
+    ("create_ab_test", {**_STUDY, "name": "Test", "cells": [
+        {"name": "A", "treatment_percentage": 50, "campaign_ids": ["1234567890"]},
+        {"name": "B", "treatment_percentage": 50, "campaign_ids": f"2222222222, {MISPLACED}"},
+    ]}, "cells[1].campaign_ids[1]"),
+    ("create_ab_test", {**_STUDY, "name": "Test", "cells": [
+        {"name": "A", "treatment_percentage": 50, "adset_ids": [MISPLACED]},
+        {"name": "B", "treatment_percentage": 50, "adset_ids": ["2222222222"]},
+    ]}, "cells[0].adset_ids[0]"),
+    ("create_ab_test", {**_STUDY, "name": "Test", "cells": [
+        {"name": "A", "treatment_percentage": 50, "ad_ids": ["1234567890"]},
+        {"name": "B", "treatment_percentage": 50, "ad_ids": [MISPLACED]},
+    ]}, "cells[1].ad_ids[0]"),
+    ("create_lift_study", {**_STUDY, "name": "Lift", "objectives": _PIXEL_OBJECTIVE, "cells": [
+        {"name": "A", "treatment_percentage": 50, "control_percentage": 50, "campaign_ids": [MISPLACED]},
+    ]}, "cells[0].campaign_ids[0]"),
+    ("create_lift_study", {**_STUDY, "name": "Lift", "objectives": _PIXEL_OBJECTIVE, "cells": [
+        {"name": "A", "treatment_percentage": 50, "control_percentage": 50, "ad_account_ids": [MISPLACED]},
+    ]}, "cells[0].ad_account_ids[0]"),
+    ("create_lift_study", {**_STUDY, "name": "Lift", "cells": [
+        {"name": "A", "treatment_percentage": 50, "control_percentage": 50},
+    ], "objectives": [{"name": "Buy", "adspixels": [{"id": MISPLACED, "event_names": ["Purchase"]}]}]},
+     "objectives[0].adspixels[0].id"),
+    ("boost_instagram_post", {
+        "account_id": "1234567890", "instagram_media_id": "1234567890", "objective": "OUTCOME_SALES",
+        "promoted_object": {"pixel_id": MISPLACED, "custom_event_type": "PURCHASE"},
+    }, "promoted_object.pixel_id"),
+    ("boost_instagram_post", {
+        "account_id": "1234567890", "instagram_media_id": "1234567890", "objective": "OUTCOME_APP_PROMOTION",
+        "promoted_object": {"application_id": MISPLACED, "object_store_url": "https://example.com/app"},
+    }, "promoted_object.application_id"),
+]
+
+
+@pytest.mark.parametrize(("tool", "arguments", "label"), NESTED_CASES)
+@pytest.mark.parametrize("routed", [False, True])
+def test_an_id_inside_an_object_argument_is_refused_before_any_request(
+    tool: str, arguments: dict, label: str, routed: bool, sent: list[str]
+) -> None:
+    name, call_arguments = ("call_tool", {"name": tool, "arguments": arguments}) if routed else (tool, arguments)
+    with pytest.raises(ToolError) as info:
+        _call(name, call_arguments)
+    message = str(info.value)
+    assert message.startswith(f"{label} must be ")
+    assert "digits" in message
+    assert "Spring" not in message and "jane" not in message
+    assert sent == []
+
+
+def test_every_form_of_a_nested_id_is_still_accepted() -> None:
+    for creative in ({"id": "1234567890"}, {"creative_id": " 1234567890 "}, {"id": ""}, {"creative_id": None},
+                     {"id": "1234567890", "creative_id": "1234567890"}, {}, {"other": "not an id"}, "not an object"):
+        check_id_arguments("create_ad", {"creative": creative})
+    for cells in ([{"campaign_ids": "1, 2"}, {"adset_ids": ["3", " 4 "]}, {"ad_ids": []}], "not a list", [None, "x"]):
+        check_id_arguments("create_ab_test", {"cells": cells})
+    check_id_arguments("create_lift_study", {
+        "cells": [{"campaign_ids": ["1"], "ad_account_ids": ["act_1", "2"]}],
+        "objectives": [{"adspixels": [{"id": "1"}], "applications": [{"id": "2"}], "offsite_datasets": [{"id": "3"}],
+                        "offline_conversion_data_sets": [{"id": "4"}], "product_sets": [{"id": "5"}],
+                        "product_catalogs": [{"id": "6"}], "customconversions": [{"id": "left alone"}]}],
+    })
+    check_id_arguments("boost_instagram_post", {"promoted_object": {"pixel_id": 1234567890, "page_id": "left alone"}})
+    # The same key in an argument no nested rule names is not judged.
+    check_id_arguments("preview_ad", {"creative": {"id": "not checked here"}})
+
+
+def test_each_nested_id_rule_names_a_real_parameter() -> None:
+    for tool, parameter in NESTED_IDS:
+        assert parameter in TOOLS[tool].parameters["properties"], f"{tool}.{parameter}"

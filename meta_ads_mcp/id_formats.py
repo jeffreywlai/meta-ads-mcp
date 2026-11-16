@@ -24,6 +24,7 @@ before is refused for them.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -127,6 +128,47 @@ TOOL_OVERRIDES: dict[tuple[str, str], IdFormat] = {
     ("get_account_pages", "account_id"): ACCOUNT_OR_ME,
 }
 
+# Ids a tool reads from inside an object or list argument and uses to name a Meta object.
+# (tool, parameter) -> each id's path inside the argument and its format. A path step is a
+# key, or EACH for every entry of a list (comma-separated text is read as a list, as the
+# tool reads it). The refusal names the path, such as creative.id or cells[1].campaign_ids[0].
+EACH = "[]"
+_CAMPAIGN = SINGLE_IDS["campaign_id"]
+_DATASET = SINGLE_IDS["dataset_id"]
+NESTED_IDS: dict[tuple[str, str], tuple[tuple[tuple[str, ...], IdFormat], ...]] = {
+    # create_ad takes an existing creative as creative={"creative_id": ...} or {"id": ...}.
+    ("create_ad", "creative"): (
+        (("id",), SINGLE_IDS["creative_id"]),
+        (("creative_id",), SINGLE_IDS["creative_id"]),
+    ),
+    # Each A/B test cell names the campaigns, ad sets or ads it holds.
+    ("create_ab_test", "cells"): (
+        ((EACH, "campaign_ids", EACH), _CAMPAIGN),
+        ((EACH, "adset_ids", EACH), SINGLE_IDS["adset_id"]),
+        ((EACH, "ad_ids", EACH), SINGLE_IDS["ad_id"]),
+    ),
+    # Each lift study cell names its campaigns or ad accounts.
+    ("create_lift_study", "cells"): (
+        ((EACH, "campaign_ids", EACH), _CAMPAIGN),
+        ((EACH, "ad_account_ids", EACH), ACCOUNT),
+    ),
+    # Each lift objective names its conversion sources by id. Custom conversion ids are
+    # not in the classes shown to be digits, so customconversions is left alone.
+    ("create_lift_study", "objectives"): (
+        ((EACH, "adspixels", EACH, "id"), SINGLE_IDS["pixel_id"]),
+        ((EACH, "applications", EACH, "id"), SINGLE_IDS["app_id"]),
+        ((EACH, "offsite_datasets", EACH, "id"), _DATASET),
+        ((EACH, "offline_conversion_data_sets", EACH, "id"), _DATASET),
+        ((EACH, "product_sets", EACH, "id"), SINGLE_IDS["product_set_id"]),
+        ((EACH, "product_catalogs", EACH, "id"), SINGLE_IDS["catalog_id"]),
+    ),
+    # The boost tool reads the pixel or the app it optimises for from promoted_object.
+    ("boost_instagram_post", "promoted_object"): (
+        (("pixel_id",), SINGLE_IDS["pixel_id"]),
+        (("application_id",), SINGLE_IDS["app_id"]),
+    ),
+}
+
 # Id-carrying parameters that keep their current form, and why.
 LEFT_ALONE: dict[str, str] = {
     "image_hash": "an image hash is letters and digits",
@@ -187,6 +229,26 @@ def check_id_arguments(tool_name: str, arguments: dict[str, Any] | None) -> None
         for index, item in enumerate(items):
             if isinstance(item, str) and item.strip() and not expected.matches(item.strip()):
                 raise _refusal(f"{parameter}[{index}]", expected)
+    for parameter, value in (arguments or {}).items():
+        for path, expected in NESTED_IDS.get((tool_name, parameter), ()) if isinstance(parameter, str) else ():
+            for label, item in _values_at(value, path, parameter):
+                if isinstance(item, str) and item.strip() and not expected.matches(item.strip()):
+                    raise _refusal(label, expected)
+
+
+def _values_at(value: Any, path: tuple[str, ...], label: str) -> Iterator[tuple[str, Any]]:
+    """Every value found at path inside value, with its label; a step that does not fit finds nothing."""
+    if not path:
+        yield label, value
+        return
+    step, rest = path[0], path[1:]
+    if step == EACH:
+        items = coerce_csv_string_list(value) if isinstance(value, str) else value
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                yield from _values_at(item, rest, f"{label}[{index}]")
+    elif isinstance(value, dict) and step in value:
+        yield from _values_at(value[step], rest, f"{label}.{step}")
 
 
 def _inner(pattern: str) -> str:
