@@ -109,20 +109,23 @@ start-up, so no tool definition file needs editing.
   or overwrites an existing value: every `delete_*`, every `update_*`,
   `remove_audience_users`, `disconnect_catalog_event_source`, `cancel_ad_study`,
   `set_catalog_access`, `batch_update_catalog_products`,
-  `delete_overflow_artifact`. It is false for creates, uploads, duplicates,
-  `add_audience_users`, `connect_catalog_event_source`, the boost tool, and the
-  three `set_*_status` tools (a status is a switch that can be set back, which
-  is how the official server marks its activate tool).
+  `delete_overflow_artifact`, and the three `set_*_status` tools. The hint
+  describes the worst thing a tool can do, and the status tools accept
+  `ARCHIVED`, which cannot be undone from this server. (The official server's
+  activate tool is not destructive because it can only activate.) It is false
+  for creates, uploads, duplicates, `add_audience_users`,
+  `connect_catalog_event_source` and the boost tool.
 - `idempotentHint` is true for reads, deletes, status sets and updates that set
   an absolute value; false for anything that creates a new object each time it
   runs or uploads rows.
 - `openWorldHint` is false, except for a tool that fetches a web address the
   caller or an ad supplies, or returns public content from outside the user's
   own assets (the public ad library search, landing-page reads).
-- `call_tool` can run any tool, so it carries the hints of the most dangerous
-  tool it can reach: not read-only, destructive. When `META_READ_ONLY` is on it
-  can reach only read tools; mark it read-only then if FastMCP allows a
-  per-configuration value, and otherwise leave it at the dangerous marking.
+- `call_tool` can run any tool, so its hints are worked out from the tools it
+  can reach in the current mode: read-only only if every one of them is,
+  destructive if any one is. With `META_READ_ONLY` on it is still not read-only
+  and still destructive, because `delete_overflow_artifact` (which deletes a
+  saved file on this machine) stays reachable in that mode.
 
 Tests:
 - Every registered tool has exactly one entry, and every entry names a
@@ -132,6 +135,8 @@ Tests:
 - For every tool, `tool_contracts._tool_effect` gives the same answer with the
   annotations as it gave from the name rules alone. Annotations take precedence
   in that function, so this is what keeps routing unchanged.
+- Every tool that accepts `ARCHIVED` or `DELETED` as a status is marked
+  destructive.
 - The annotations are present in what a client receives: the directly listed
   tools, and each tool returned by `search_tools`. Most clients see tools only
   through search, so this second place matters most.
