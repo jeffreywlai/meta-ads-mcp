@@ -1624,3 +1624,25 @@ def test_usage_headers_keep_documented_fields_ids_numbers_and_values_only(monkey
         }]},
     }
     assert _echo() not in json.dumps(exc_info.value.to_public_dict())
+
+
+@pytest.mark.parametrize(
+    ("after", "expected_params"),
+    [
+        (None, {"type": "adTargetingCategory", "class": "behaviors"}),
+        ("CURSOR_2", {"type": "adTargetingCategory", "class": "behaviors", "after": "CURSOR_2"}),
+        (" ", {"type": "adTargetingCategory", "class": "behaviors"}),
+    ],
+)
+def test_targeting_categories_read_metas_search_route(monkeypatch, after, expected_params) -> None:
+    """F1: the account edge broadtargetingcategories lists only custom categories (0 rows live);
+    Meta's documented route is search?type=adTargetingCategory&class=<class>."""
+    calls: list[dict[str, object]] = []
+
+    async def fake_request(self, method, endpoint, **kwargs):
+        calls.append({"method": method, "endpoint": endpoint, **kwargs})
+        return {"data": []}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    asyncio.run(_client().search_targeting_categories(category_class="behaviors", after=after))
+    assert calls == [{"method": "GET", "endpoint": "search", "params": expected_params}]

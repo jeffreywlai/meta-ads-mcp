@@ -142,6 +142,27 @@
       "what_changed": "When Meta answers the read of one object with a success status and a bare true, false or array where an object belongs, the tool now raises a Meta API error saying the answer could not be read. Before, that answer was handed to the tool as an object with no fields: a tool that reads an object before changing it went on to write and reported every previous value as absent, and a read reported the object as found with nothing set. Any JSON object, including an empty one, is returned exactly as before; list reads and writes are not affected.",
       "why_better": "An answer that is not the object asked for is no longer read as an object with nothing set, so no tool writes on a before-state it never read.",
       "migration": "Nothing to change for a normal answer. Treat the error like any other failed read."
+    },
+    {
+      "tool": "search_behaviors",
+      "kind": "behaviour",
+      "what_changed": "search_behaviors now reads Meta's list of behavior categories (the search route with type adTargetingCategory and class behaviors) and keeps the rows whose name contains query, ignoring case; no query keeps every row. Before, it read the ad account's broadtargetingcategories edge, which lists only that account's custom categories, so it returned an empty list for every query with no error. Rows now carry the fields Meta's search route returns, as Meta returns them. The summary adds rows_read, rows_matched, pages_read, complete, truncated and next_after, and a note when nothing matched. paging.next is now always null. account_id is no longer needed. A limit below 1 is refused.",
+      "why_better": "The tool returns Meta's real behavior categories instead of an empty list, and an empty result now says whether Meta sent rows that did not match the query or sent nothing at all.",
+      "migration": "Read id and name from each row as before. To get more rows, call again with after=summary.next_after until summary.complete is true; if summary.incomplete_reason says matches were cut by limit, raise limit."
+    },
+    {
+      "tool": "search_demographics",
+      "kind": "behaviour",
+      "what_changed": "search_demographics now reads Meta's list of categories of demographic_class (the search route with type adTargetingCategory and that class) and keeps the rows whose name contains query, ignoring case; no query keeps every row. Before, it read the ad account's broadtargetingcategories edge, which lists only that account's custom categories, so it returned an empty list for every query with no error. Rows now carry the fields Meta's search route returns, as Meta returns them. The summary adds rows_read, rows_matched, pages_read, complete, truncated and next_after, and a note when nothing matched. paging.next is now always null. account_id is no longer needed. A limit below 1 is refused.",
+      "why_better": "The tool returns Meta's real demographic categories instead of an empty list, and an empty result now says whether Meta sent rows that did not match the query or sent nothing at all.",
+      "migration": "Read id and name from each row as before. To get more rows, call again with after=summary.next_after until summary.complete is true; if summary.incomplete_reason says matches were cut by limit, raise limit."
+    },
+    {
+      "tool": "get_targeting_categories",
+      "kind": "behaviour",
+      "what_changed": "get_targeting_categories now reads Meta's list of categories of category_class (the search route with type adTargetingCategory and that class) and keeps the rows whose name contains query, ignoring case; no query keeps every row. Before, it read the ad account's broadtargetingcategories edge, which lists only that account's custom categories, so it returned an empty list for every class with no error. Rows now carry the fields Meta's search route returns, as Meta returns them. The summary adds rows_read, rows_matched, pages_read, complete, truncated and next_after, and a note when nothing matched. paging.next is now always null. account_id is no longer needed. A limit below 1 is refused.",
+      "why_better": "The tool returns Meta's real targeting categories instead of an empty list, and an empty result now says whether Meta sent rows that did not match the query or sent nothing for that class.",
+      "migration": "Read id and name from each row as before. To get more rows, call again with after=summary.next_after until summary.complete is true; if summary.incomplete_reason says matches were cut by limit, raise limit."
     }
   ]
 }

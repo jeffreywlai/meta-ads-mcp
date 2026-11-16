@@ -799,27 +799,21 @@ class GraphAPIClient:
     async def search_targeting_categories(
         self,
         *,
-        account_id: str,
         category_class: str,
-        query: str | None = None,
-        limit: int = 25,
         after: str | None = None,
     ) -> dict[str, Any]:
-        """Search targeting categories such as behaviors or demographics."""
+        """Read one page of Meta's targeting categories of one class, such as behaviors.
+
+        The route is search?type=adTargetingCategory&class=<class>. It takes no name filter,
+        so callers match names themselves. The account edge broadtargetingcategories is not
+        used: it lists only an account's custom categories (0 rows on 2026-11-13, when this
+        route returned 285 behaviors). No limit is sent, matching the request read live.
+        """
         cursor = _normalize_cursor(after)
-        params: dict[str, Any] = {
-            "class": category_class,
-            "limit": limit,
-        }
-        if query:
-            params["query"] = query
+        params: dict[str, Any] = {"type": "adTargetingCategory", "class": category_class}
         if cursor:
             params["after"] = cursor
-        return await self.request(
-            "GET",
-            f"{_segment(normalize_account_id(account_id))}/broadtargetingcategories",
-            params=params,
-        )
+        return await self.request("GET", "search", params=params)
 
     async def estimate_audience_size(
         self,
