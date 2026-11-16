@@ -270,8 +270,8 @@ def test_bulk_image_cache_is_account_scoped_and_preserves_unresolved_hashes(monk
 
     class AccountImagesClient:
         async def get_object(self, object_id, *, fields=None):
-            if object_id.startswith("ad_"):
-                return {"id": object_id, "account_id": "123" if object_id == "ad_1" else "456", "creative": {"id": "crt"}}
+            if object_id in {"9300001", "9300002"}:
+                return {"id": object_id, "account_id": "123" if object_id == "9300001" else "456", "creative": {"id": "crt"}}
             return {"image_hash": "same_hash"}
 
         async def get_ad_images_by_hashes(self, account_id, *, hashes, fields=None):
@@ -279,7 +279,7 @@ def test_bulk_image_cache_is_account_scoped_and_preserves_unresolved_hashes(monk
             return {"data": [{"hash": "same_hash", "url": "https://example.com/123"}]} if account_id == "123" else {"data": []}
 
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: AccountImagesClient())
-    result = asyncio.run(mcp_server.call_tool("get_ad_image", {"ad_ids": "ad_1,ad_1,ad_2"})).structured_content
+    result = asyncio.run(mcp_server.call_tool("get_ad_image", {"ad_ids": "9300001,9300001,9300002"})).structured_content
     assert accounts == ["123", "456"]
     assert result["summary"]["count"] == 2
     assert result["items"][0]["resolved_images"][0]["url"] == "https://example.com/123"
@@ -951,7 +951,7 @@ def test_create_ad_round_four_fields_are_accepted_at_the_mcp_boundary(monkeypatc
     client = RecordingAdsClient()
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
     asyncio.run(mcp_server.call_tool(
-        "create_ad", {**AD_BASE, "creative_id": "1", "display_sequence": 3, "engagement_audience": True},
+        "create_ad", {**AD_BASE, "adset_id": "9200123", "creative_id": "1", "display_sequence": 3, "engagement_audience": True},
     ))
     assert client.calls[-1][3]["display_sequence"] == 3
     assert client.calls[-1][3]["engagement_audience"] is True
@@ -1104,7 +1104,7 @@ def test_r25_tracking_specs_object_or_list_is_sent_as_given(monkeypatch, tool, s
 
     client = RecordingAdsClient() if tool == "create_ad" else _R25UpdateAdClient()
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
-    args = {**AD_BASE, "creative_id": "crt_123"} if tool == "create_ad" else {"ad_id": "10"}
+    args = {**AD_BASE, "adset_id": "9200123", "creative_id": "9400123"} if tool == "create_ad" else {"ad_id": "10"}
     asyncio.run(mcp_server.call_tool(tool, {**args, "tracking_specs": spec}))
     writes = [call for call in client.calls if call[0] in {"create", "update"}]
     assert len(writes) == 1
@@ -1143,7 +1143,7 @@ def test_r25_numeric_ad_schedule_times_are_sent_as_given(monkeypatch, times, thr
 
     client = RecordingAdsClient()
     monkeypatch.setattr(ads, "get_graph_api_client", lambda: client)
-    args = {**AD_BASE, "creative_id": "crt_123", **times}
+    args = {**AD_BASE, "adset_id": "9200123", "creative_id": "9400123", **times}
     asyncio.run(mcp_server.call_tool("create_ad", args) if through_mcp else ads.create_ad(**args))
     sent = client.calls[-1][3]
     assert {key: sent[key] for key in times} == times

@@ -61,6 +61,17 @@ TOOL_MODULES = (
 
 apply_tool_annotations(mcp_server)
 
+
+def _apply_id_formats() -> None:
+    """After every tool is registered: show each checked id's pattern in its input schema."""
+    from meta_ads_mcp.coordinator import mcp_server
+    from meta_ads_mcp.id_formats import apply_id_formats
+
+    apply_id_formats(mcp_server)
+
+
+_apply_id_formats()
+
 __all__ = [
     "TOOL_MODULES",
     "activity",

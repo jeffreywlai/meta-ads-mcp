@@ -1372,7 +1372,7 @@ def test_creative_fatigue_report_blank_dates_use_default_windows(monkeypatch, ro
 
     monkeypatch.setattr(diagnostics, "_child_insights", fake_child_insights)
     monkeypatch.setattr(diagnostics, "date", FixedDate)
-    arguments = {"campaign_id": "cmp_123", "current_window_days": 3, "previous_window_days": 5, **dates}
+    arguments = {"campaign_id": "9100123", "current_window_days": 3, "previous_window_days": 5, **dates}
     result = asyncio.run(diagnostics.mcp_server.call_tool(
         "call_tool" if routed else "get_creative_fatigue_report",
         {"name": "get_creative_fatigue_report", "arguments": arguments} if routed else arguments,

@@ -199,6 +199,118 @@
       "what_changed": "daily_spend_cap, lifetime_spend_cap, daily_min_spend_target and lifetime_min_spend_target, when named in fields, are now returned in major units of the account currency, like the budgets and bids: a cap of 250.00 USD comes back as 250.0, not 25000. For a currency with no minor unit, such as JPY, the numbers are unchanged.",
       "why_better": "A cap or minimum spend read 100 times too large could be mistaken for a much higher amount, next to budgets and bids that were already in major units. update_adset takes these four in major units and reports their previous values in major units, so reads and writes now use the same scale.",
       "migration": "If you divided these four fields by 100 (or by the currency's minor-unit factor) yourself, stop: use the values as returned."
+    },
+    {
+      "tool": "*",
+      "kind": "behaviour",
+      "what_changed": "An id that Meta defines as a number must now be digits, and an ad account id digits or act_ followed by digits; anything else is refused before the tool starts. This covers every parameter named campaign_id, adset_id, ad_id, creative_id, audience_id, origin_audience_id, pixel_id, dataset_id, event_source_id, business_id, catalog_id, product_set_id, feed_id, page_id, instagram_account_id, instagram_media_id, study_id, video_id, system_user_id, app_id and account_id, object_id (an ad account, campaign, ad set or ad), and each entry of campaign_ids, ad_ids, object_ids, video_ids, primary_feed_ids and search_page_ids. get_account_pages still takes 'me' as account_id. Spaces around an id and a blank optional id are treated as before. The message names the parameter and what a valid id looks like, and never repeats the value. Each of these parameters' input schemas now carries the pattern. Before, only an id holding a slash, ?, #, .. or a space was refused, and a name or a placeholder such as 'my campaign' or '<campaign_id>' was sent to Meta. Image hashes, Page post and comment ids (digits_digits), paging cursors, export_id, report_run_id, retailer and product ids, interest ids and the other ids listed in meta_ads_mcp/id_formats.py are unchanged.",
+      "why_better": "A name or a placeholder in an id field no longer spends a rate-limited request and comes back as an unclear error from Meta. The caller is told at once which parameter is wrong and what it should hold, and private text pasted into an id field by mistake is never echoed back or sent to Meta.",
+      "migration": "Pass the numeric id Meta gave the object, as a string, for example '1234567890', and an ad account as '1234567890' or 'act_1234567890'. Find ids with the list_ and search tools, not by name. An id sent as a JSON number was refused before and still is: send it as a string."
+    },
+    {
+      "tool": "create_ad",
+      "kind": "behaviour",
+      "what_changed": "bid_amount now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "create_ad_set",
+      "kind": "behaviour",
+      "what_changed": "bid_amount, daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "create_campaign",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_campaign",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_campaign_budget",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_adset_budget",
+      "kind": "behaviour",
+      "what_changed": "daily_budget and lifetime_budget now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_adset_bid_amount",
+      "kind": "behaviour",
+      "what_changed": "bid_amount now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "update_adset_bid_strategy",
+      "kind": "behaviour",
+      "what_changed": "bid_amount now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so true was sent to Meta as an amount of 1. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A budget or bid of true is no longer sent to Meta as 1 (a budget of 1.00 in the account currency, or a 1.00 bid), and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of a change going through with an amount nobody chose.",
+      "migration": "Send the amount as a number in major units of the account currency, for example 12.50. Numeric text such as '12.50' still works."
+    },
+    {
+      "tool": "create_lookalike_audience",
+      "kind": "behaviour",
+      "what_changed": "ratio and starting_ratio now refuse true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so ratio=true was sent to Meta as a ratio of 1 and starting_ratio=false as 0. Numbers and numeric text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A lookalike ratio of true is no longer sent to Meta as a ratio of 1, and false no longer reaches the tool as 0. The caller is told which parameter is wrong instead of an audience being built from a size nobody chose.",
+      "migration": "Send the ratio as a number, for example 0.01 for the closest 1 percent. Numeric text such as '0.01' still works."
+    },
+    {
+      "tool": "create_custom_audience",
+      "kind": "behaviour",
+      "what_changed": "retention_days now refuses true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so retention_days=true kept people in the audience for one day. Whole numbers and digit text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A retention period of true is no longer sent to Meta as one day, so people are not dropped from the audience after a day nobody chose. The caller is told which parameter is wrong.",
+      "migration": "Send the number of days as a whole number, for example 30. Digit text such as '30' still works."
+    },
+    {
+      "tool": "update_custom_audience",
+      "kind": "behaviour",
+      "what_changed": "retention_days now refuses true and false before the tool starts, with a message that names the parameter. Before, MCP validation read true as 1 and false as 0, so retention_days=true kept people in the audience for one day. Whole numbers and digit text are accepted exactly as before, and the input schema is unchanged.",
+      "why_better": "A retention period of true is no longer sent to Meta as one day, so people are not dropped from the audience after a day nobody chose. The caller is told which parameter is wrong.",
+      "migration": "Send the number of days as a whole number, for example 30. Digit text such as '30' still works."
+    },
+    {
+      "tool": "upload_creative_asset",
+      "kind": "behaviour",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in image_url is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
+      "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
+    },
+    {
+      "tool": "create_ad_creative",
+      "kind": "behaviour",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in object_story_spec, asset_feed_spec, degrees_of_freedom_spec or params is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
+      "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
+    },
+    {
+      "tool": "update_creative",
+      "kind": "behaviour",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in object_story_spec, asset_feed_spec or params is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
+      "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
+    },
+    {
+      "tool": "preview_ad",
+      "kind": "behaviour",
+      "what_changed": "A web address that carries a username or password (https://user:pass@host/...) anywhere in the creative payload is now refused before any request is sent, with a message that names the parameter and never repeats the address. Before, it was sent to Meta as written. Addresses without a login, including ones with an @ in the path or query, are sent exactly as before.",
+      "why_better": "A URL given to Meta is stored on the ad object and shown in responses, previews, dry runs and errors, so a login in it would be shown to everyone who can read the object. The tools added with the parity work already refused such URLs; these four now do the same.",
+      "migration": "Host the file or page at an address that needs no login, and pass that address. URLs without a login need no change."
     }
   ]
 }

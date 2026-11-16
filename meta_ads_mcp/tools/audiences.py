@@ -30,6 +30,7 @@ from meta_ads_mcp.normalize import (
 )
 from meta_ads_mcp.schemas import mutation_response
 from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list, normalize_field_list
+from meta_ads_mcp.tool_types import NonBoolFloat, NonBoolInt
 
 AUDIENCE_SUMMARY_FIELDS = [
     "id",
@@ -264,7 +265,7 @@ async def create_custom_audience(
     subtype: str = "CUSTOM",
     description: str | None = None,
     customer_file_source: str | None = None,
-    retention_days: int | None = None,
+    retention_days: NonBoolInt | None = None,
     rule: dict[str, Any] | None = None,
     prefill: bool = False,
     params: dict[str, Any] | None = None,
@@ -319,8 +320,8 @@ async def create_lookalike_audience(
     origin_audience_id: str,
     country: str | None = None,
     countries: StringList | None = None,
-    ratio: float | None = None,
-    starting_ratio: float | None = None,
+    ratio: NonBoolFloat | None = None,
+    starting_ratio: NonBoolFloat | None = None,
     lookalike_type: Annotated[
         str | None,
         Field(description="Defaults to custom_ratio when ratio is supplied, otherwise similarity. Explicit types are preserved and Meta validates their compatibility."),
@@ -388,7 +389,7 @@ async def update_custom_audience(
     audience_id: str,
     name: str | None = None,
     description: str | None = None,
-    retention_days: int | None = None,
+    retention_days: NonBoolInt | None = None,
     customer_file_source: str | None = None,
     params: dict[str, Any] | None = None,
     rule: dict[str, Any] | str | None = None,

@@ -51,7 +51,7 @@ def test_multi_name_search_pages_graph_filters_and_deduplicates_union(monkeypatc
     class NameClient:
         async def list_objects(self, parent_id, edge, *, fields, params):
             calls.append(dict(params))
-            assert parent_id == "cmp_1"
+            assert parent_id == "9100001"
             assert fields == ["id", "name"]
             assert params["effective_status"] == ["ACTIVE"]
             assert len(params["filtering"]) == 1
@@ -69,7 +69,7 @@ def test_multi_name_search_pages_graph_filters_and_deduplicates_union(monkeypatc
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: NameClient())
     result = asyncio.run(mcp_server.call_tool("list_ads", {
-        "campaign_id": "cmp_1", "fields": ["id", "name"], "effective_status": ["ACTIVE"],
+        "campaign_id": "9100001", "fields": ["id", "name"], "effective_status": ["ACTIVE"],
         "name_contains_any": "ADA, grâce", "whole_term_match": whole_term,
     })).structured_content
     assert len(calls) == 3
@@ -304,7 +304,7 @@ def test_destination_urls_projection_is_compact_and_excludes_asset_urls(monkeypa
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DestinationClient())
     arguments = {"fields": ["id", "name", "destination_urls"]}
     arguments.update({"account_id": "123", "name_contains_any": ["Ada"], "effective_status": ["ACTIVE"]}
-                     if tool_name == "list_ads" else {"ad_id": "ad1"})
+                     if tool_name == "list_ads" else {"ad_id": "9300001"})
     result = asyncio.run(mcp_server.call_tool("call_tool", {
         "name": tool_name, "arguments": arguments,
     })).structured_content
@@ -461,7 +461,7 @@ def test_destination_projection_keeps_app_and_store_cta_links(monkeypatch, tool_
             return {"data": [{"id": "ad1", "creative": creative}]}
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DestinationClient())
-    scope = {"account_id": "123"} if tool_name == "list_ads" else {"ad_id": "ad1"}
+    scope = {"account_id": "123"} if tool_name == "list_ads" else {"ad_id": "9300001"}
     result = asyncio.run(mcp_server.call_tool("call_tool", {
         "name": tool_name, "arguments": {**scope, "fields": ["id", "destination_urls"]},
     })).structured_content
@@ -500,7 +500,7 @@ def test_destination_projection_keeps_carousel_and_platform_app_links(monkeypatc
             return {"data": [{"id": "ad1", "creative": creative}]}
 
     monkeypatch.setattr(discovery, "get_graph_api_client", lambda: DestinationClient())
-    scope = {"account_id": "123"} if tool_name == "list_ads" else {"ad_id": "ad1"}
+    scope = {"account_id": "123"} if tool_name == "list_ads" else {"ad_id": "9300001"}
     result = asyncio.run(mcp_server.call_tool("call_tool", {
         "name": tool_name, "arguments": {**scope, "fields": ["id", "destination_urls"]},
     })).structured_content

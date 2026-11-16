@@ -63,10 +63,10 @@ def test_v26_insights_fields_and_breakdowns_preserve_vendor_values(monkeypatch, 
 
 @pytest.mark.parametrize(("tool_name", "arguments", "expected_field", "value"), [
     ("list_campaigns", {"account_id": "123"}, "bid_constraints", {"roas_average_floor": 10000}),
-    ("get_campaign", {"campaign_id": "cmp_123"}, "bid_constraints", {"roas_average_floor": 10000}),
+    ("get_campaign", {"campaign_id": "9100123"}, "bid_constraints", {"roas_average_floor": 10000}),
     ("list_ads", {"account_id": "123"}, "dataset_split_specs", [{"fixture_only": True}]),
     ("list_ads", {"account_id": "123"}, "creative_audience_pairing_persona", {"age_min": 25}),
-    ("get_creative", {"creative_id": "crt_123"}, "media_optimization_spec", {"fixture_only": True}),
+    ("get_creative", {"creative_id": "9400123"}, "media_optimization_spec", {"fixture_only": True}),
 ])
 def test_v26_entity_fields_use_existing_read_tools(monkeypatch, tool_name, arguments, expected_field, value) -> None:
     fields = ["id", expected_field]

@@ -227,7 +227,7 @@ def test_create_lookalike_wrapper_accepts_country_csv_and_describes_params(monke
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: FakeAudienceClient())
     result = asyncio.run(mcp_server.call_tool("call_tool", {
         "name": "create_lookalike_audience",
-        "arguments": {"account_id": "123", "name": "LAL", "origin_audience_id": "seed",
+        "arguments": {"account_id": "123", "name": "LAL", "origin_audience_id": "9500999",
                       "countries": "us, CA, US", "ratio": 0.01},
     })).structured_content
     assert result["created"]["payload"]["lookalike_spec"] == {
@@ -747,7 +747,7 @@ def test_audience_users_never_echo_rows(monkeypatch, caplog, tool) -> None:
         caplog.clear()
         with pytest.raises(ToolError) as tool_error:
             asyncio.run(mcp_server.call_tool(tool, {
-                "audience_id": "aud_1", "schema": "EMAIL", "rows": [[raw]],
+                "audience_id": "9500001", "schema": "EMAIL", "rows": [[raw]],
             }))
         assert json.loads(str(tool_error.value))["error"]["type"] in {"meta_api", "rate_limit"}
         _assert_nothing_echoed(tool_error.value, caplog, raw)
@@ -963,7 +963,7 @@ def test_audience_users_mcp_call_with_valid_arguments_still_uploads(monkeypatch)
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(mcp_server.call_tool("call_tool", {
         "name": "add_audience_users",
-        "arguments": {"audience_id": "aud_1", "schema": "EMAIL,PHONE", "rows": [["a@example.com", None]],
+        "arguments": {"audience_id": "9500001", "schema": "EMAIL,PHONE", "rows": [["a@example.com", None]],
                       "pre_hashed": "false"},
     }))
     assert result.structured_content["rows_sent"] == 1
@@ -1265,9 +1265,9 @@ def test_update_custom_audience_rule_through_mcp_boundary(monkeypatch, rule) -> 
     client = RecordingAudienceClient()
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(mcp_server.call_tool(
-        "update_custom_audience", {"audience_id": "aud_1", "rule": rule},
+        "update_custom_audience", {"audience_id": "9500001", "rule": rule},
     )).structured_content
-    assert client.calls[-1] == ("update", "aud_1", {"rule": WEBSITE_RULE})
+    assert client.calls[-1] == ("update", "9500001", {"rule": WEBSITE_RULE})
     assert result["current"] == {"rule": WEBSITE_RULE}
 
 
@@ -1619,9 +1619,9 @@ def test_update_custom_audience_labels_through_mcp_boundary(monkeypatch) -> None
     client = RecordingAudienceClient()
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(mcp_server.call_tool(
-        "update_custom_audience", {"audience_id": "aud_1", "audience_labels": "qualified_leads"},
+        "update_custom_audience", {"audience_id": "9500001", "audience_labels": "qualified_leads"},
     )).structured_content
-    assert client.calls[-1] == ("update", "aud_1", {"audience_labels": ["QUALIFIED_LEADS"]})
+    assert client.calls[-1] == ("update", "9500001", {"audience_labels": ["QUALIFIED_LEADS"]})
     assert result["current"] == {"audience_labels": ["QUALIFIED_LEADS"]}
 
 
@@ -1690,7 +1690,7 @@ def test_empty_audience_labels_pass_the_mcp_boundary(monkeypatch, tool) -> None:
 
     client.create_edge_object = create_edge_object
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
-    args = {"account_id": "1", "name": "Example"} if tool.startswith("create") else {"audience_id": "aud_1"}
+    args = {"account_id": "1", "name": "Example"} if tool.startswith("create") else {"audience_id": "9500001"}
     asyncio.run(mcp_server.call_tool(tool, {**args, "audience_labels": []}))
     assert client.calls[-1][-1]["audience_labels"] == []
 
