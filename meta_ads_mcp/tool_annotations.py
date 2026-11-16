@@ -121,7 +121,10 @@ _TABLE: dict[str, ToolAnnotations] = {
     "create_ad_creative": ADD_FROM_WEB,
     "create_ad_creative_from_inputs": ADD_FROM_WEB,
     "update_ad_creative": OVERWRITE,
-    "update_creative": OVERWRITE,
+    # Forwards object_story_spec and asset_feed_spec, which can hold a picture address. Meta's
+    # documentation says this route takes only name, status and labels, but no live call has
+    # settled whether Meta refuses or accepts that content, so it is marked open world.
+    "update_creative": OVERWRITE_FROM_WEB,
     # Makes a new copy of the creative on every run and attaches it to the ad.
     "update_ad_creative_enhancements": OVERWRITE_EACH_RUN,
     "delete_creative": OVERWRITE,
