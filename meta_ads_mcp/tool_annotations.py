@@ -95,7 +95,10 @@ _TABLE: dict[str, ToolAnnotations] = {
     "update_adset": OVERWRITE,
     "delete_adset": OVERWRITE,
     "create_ad": ADD_FROM_WEB,
-    "update_ad": OVERWRITE,
+    # params.creative_asset_groups_spec (an updatable ad field in Meta's SDK) can hold an image
+    # address, and the tool forwards it. Whether Meta imports an address given there on an
+    # update is not settled (the guide shows only hashes and ids), so it is marked open world.
+    "update_ad": OVERWRITE_FROM_WEB,
     "delete_ad": OVERWRITE,
     "duplicate_campaign": ADD,
     "duplicate_adset": ADD,
