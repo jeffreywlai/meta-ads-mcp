@@ -29,7 +29,8 @@ from meta_ads_mcp.normalize import (
     read_collection_page,
 )
 from meta_ads_mcp.schemas import mutation_response
-from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list
+from meta_ads_mcp.tool_types import FieldList, StringList, coerce_csv_string_list, normalize_field_list
+from meta_ads_mcp.tool_types import NonBoolFloat, NonBoolInt
 
 AUDIENCE_SUMMARY_FIELDS = [
     "id",
@@ -100,13 +101,16 @@ async def list_audiences(
     after: str | None = None,
     fields: FieldList | None = None,
 ) -> dict[str, Any]:
-    """List one page of audience ids, sizes, or subtype metadata. Follow summary.next_after with after until summary.complete is true."""
+    """List one page of audience ids, sizes, or subtype metadata. Follow summary.next_after with after until summary.complete is true. subtype (for example CUSTOM, LOOKALIKE or WEBSITE, any case) asks Meta for audiences of that type only; any row of another type is dropped and marks the page incomplete. summary adds rows_read and rows_matched."""
     if limit < 1:
         raise ValidationError("limit must be positive.")
     client = get_graph_api_client()
+    wanted_subtype = blank_to_none(subtype)
+    if wanted_subtype:
+        return await _list_audiences_of_subtype(
+            client, normalize_account_id(account_id), wanted_subtype.strip(), limit, blank_to_none(after), fields,
+        )
     params: dict[str, Any] = {"limit": limit}
-    if subtype:
-        params["subtype"] = subtype
     if after:
         params["after"] = after
     payload = await client.list_objects(
@@ -116,6 +120,57 @@ async def list_audiences(
         params=params,
     )
     return _audience_page(payload)
+
+
+async def _list_audiences_of_subtype(
+    client: Any,
+    account_id: str,
+    subtype: str,
+    limit: int,
+    after: str | None,
+    fields: Any,
+) -> dict[str, Any]:
+    """Read one page of audiences of one subtype, filtered by Meta, and check what came back.
+
+    Meta ignores a plain subtype parameter but applies a filtering clause on subtype, so the
+    client sends that and limit and after work as for an unfiltered page. A silently ignored filter
+    must not pass as a filtered list: the subtype field is always read (and removed again when the
+    caller did not ask for it), and a row of another subtype, or without one, is dropped and makes
+    the page incomplete.
+    """
+    selected = normalize_field_list(fields) or list(AUDIENCE_SUMMARY_FIELDS)
+    graph_fields = selected if "subtype" in selected else [*selected, "subtype"]
+    payload = await client.list_audiences_of_subtype(
+        account_id, subtype=subtype, fields=graph_fields, limit=limit, after=after,
+    )
+    page = _audience_page(payload)
+    rows = [item for item in page["items"] if isinstance(item, dict)]
+    wanted = subtype.casefold()
+    items = [
+        row for row in rows
+        if isinstance(row.get("subtype"), str) and row["subtype"].strip().casefold() == wanted
+    ]
+    dropped = len(rows) - len(items)
+    if "subtype" not in selected:
+        items = [{key: value for key, value in row.items() if key != "subtype"} for row in items]
+    old = page["summary"]
+    reasons = [old["incomplete_reason"]] if old.get("incomplete_reason") else []
+    if dropped:
+        reasons.append(
+            f"Meta returned {dropped} audience(s) of another type or without a type, so its filter may "
+            "not have been applied; they were left out, and further pages may hold more matches."
+        )
+    summary: dict[str, Any] = {
+        "count": len(items),
+        "rows_read": len(rows),
+        "rows_matched": len(items),
+        "complete": old["complete"] and not dropped,
+        "truncated": old["truncated"],
+        "next_after": old["next_after"],
+    }
+    if reasons:
+        summary["incomplete_reason"] = " ".join(reasons)
+    return {"items": items, "paging": page["paging"], "summary": summary}
 
 
 def _audience_page(payload: Any) -> dict[str, Any]:
@@ -210,7 +265,7 @@ async def create_custom_audience(
     subtype: str = "CUSTOM",
     description: str | None = None,
     customer_file_source: str | None = None,
-    retention_days: int | None = None,
+    retention_days: NonBoolInt | None = None,
     rule: dict[str, Any] | None = None,
     prefill: bool = False,
     params: dict[str, Any] | None = None,
@@ -265,8 +320,8 @@ async def create_lookalike_audience(
     origin_audience_id: str,
     country: str | None = None,
     countries: StringList | None = None,
-    ratio: float | None = None,
-    starting_ratio: float | None = None,
+    ratio: NonBoolFloat | None = None,
+    starting_ratio: NonBoolFloat | None = None,
     lookalike_type: Annotated[
         str | None,
         Field(description="Defaults to custom_ratio when ratio is supplied, otherwise similarity. Explicit types are preserved and Meta validates their compatibility."),
@@ -334,7 +389,7 @@ async def update_custom_audience(
     audience_id: str,
     name: str | None = None,
     description: str | None = None,
-    retention_days: int | None = None,
+    retention_days: NonBoolInt | None = None,
     customer_file_source: str | None = None,
     params: dict[str, Any] | None = None,
     rule: dict[str, Any] | str | None = None,
@@ -763,20 +818,21 @@ def _upload_progress(
     )
 
 
-def _other_audience_error(
+def _other_identity_error(
     *,
     action: str,
-    audience_id: str,
+    what: str,
+    asked: Any,
     answered_id: Any,
     batch_seq: int,
     total_batches: int,
     rows_accepted: int,
     session_id: int,
 ) -> MetaApiError:
-    """A batch whose answer named a different audience: its acceptance is unknown, and no batch follows.
+    """A batch whose answer named a different audience or upload session: its acceptance is unknown, and no batch follows.
 
-    The message holds the upload's progress and the two audience ids (diagnostic context the tool
-    already shows), never an uploaded value or hash.
+    The message holds the upload's progress and the two ids (diagnostic context the tool already
+    shows), never an uploaded value or hash.
     """
     progress = _upload_progress(
         action, "stopped", batch_seq=batch_seq, total_batches=total_batches, rows_accepted=rows_accepted,
@@ -784,8 +840,8 @@ def _other_audience_error(
     )
     return MetaApiError(
         message=(
-            f"{progress} Meta's answer to batch {batch_seq} named a different audience ({str(answered_id).strip()}) "
-            f"than {audience_id}, so whether this batch was accepted is not known, and no further batch was sent. "
+            f"{progress} Meta's answer to batch {batch_seq} named a different {what} ({str(answered_id).strip()}) "
+            f"than {asked}, so whether this batch was accepted is not known, and no further batch was sent. "
             "Check the audience with get_audience before uploading again."
         ),
         mutation_outcome_unknown=True,
@@ -955,17 +1011,21 @@ async def _send_audience_users(
             # Raised outside the except block so the original error, which can
             # echo uploaded values, is not chained as __context__.
             raise failure
-        if names_other_object(audience_id, result, key="audience_id"):
-            # An acknowledgement for another audience does not say this batch was accepted.
-            raise _other_audience_error(
-                action=action,
-                audience_id=audience_id,
-                answered_id=result.get("audience_id"),
-                batch_seq=batch_seq,
-                total_batches=len(batches),
-                rows_accepted=rows_accepted,
-                session_id=session_id,
-            )
+        # An acknowledgement for another audience, or for another upload session (Meta's guide: the
+        # answer's session_id is the one the caller passed), does not say this batch was accepted.
+        # Compared by value; how Meta writes the session id back has not been seen in a live answer.
+        for what, asked, key in (("audience", audience_id, "audience_id"), ("upload session", session_id, "session_id")):
+            if names_other_object(asked, result, key=key):
+                raise _other_identity_error(
+                    action=action,
+                    what=what,
+                    asked=asked,
+                    answered_id=result.get(key),
+                    batch_seq=batch_seq,
+                    total_batches=len(batches),
+                    rows_accepted=rows_accepted,
+                    session_id=session_id,
+                )
         counts = {
             key: result.get(key) if _is_count(result.get(key)) else None
             for key in ("num_received", "num_invalid_entries")

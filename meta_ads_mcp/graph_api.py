@@ -717,6 +717,30 @@ class GraphAPIClient:
         )
         return {"status": status, "rows": rows}
 
+    async def list_audiences_of_subtype(
+        self,
+        account_id: str,
+        *,
+        subtype: str,
+        fields: FieldList | None = None,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        """Read one page of an account's custom audiences of one subtype, filtered by Meta.
+
+        Meta ignores a plain subtype parameter on customaudiences, but applies
+        filtering=[{"field":"subtype","operator":"IN","value":["WEBSITE"]}] (read live
+        2026-11-16: the 20 WEBSITE audiences of an account came back in one request).
+        """
+        clause = {"field": "subtype", "operator": "IN", "value": [subtype.strip().upper()]}
+        params: dict[str, Any] = {"limit": limit, "filtering": json.dumps([clause], separators=(",", ":"))}
+        cursor = _normalize_cursor(after)
+        if cursor:
+            params["after"] = cursor
+        return await self.list_objects(
+            normalize_account_id(account_id), "customaudiences", fields=fields, params=params,
+        )
+
     async def search_interests(
         self,
         *,
@@ -799,27 +823,21 @@ class GraphAPIClient:
     async def search_targeting_categories(
         self,
         *,
-        account_id: str,
         category_class: str,
-        query: str | None = None,
-        limit: int = 25,
         after: str | None = None,
     ) -> dict[str, Any]:
-        """Search targeting categories such as behaviors or demographics."""
+        """Read one page of Meta's targeting categories of one class, such as behaviors.
+
+        The route is search?type=adTargetingCategory&class=<class>. It takes no name filter,
+        so callers match names themselves. The account edge broadtargetingcategories is not
+        used: it lists only an account's custom categories (0 rows on 2026-11-13, when this
+        route returned 285 behaviors). No limit is sent, matching the request read live.
+        """
         cursor = _normalize_cursor(after)
-        params: dict[str, Any] = {
-            "class": category_class,
-            "limit": limit,
-        }
-        if query:
-            params["query"] = query
+        params: dict[str, Any] = {"type": "adTargetingCategory", "class": category_class}
         if cursor:
             params["after"] = cursor
-        return await self.request(
-            "GET",
-            f"{_segment(normalize_account_id(account_id))}/broadtargetingcategories",
-            params=params,
-        )
+        return await self.request("GET", "search", params=params)
 
     async def estimate_audience_size(
         self,
@@ -947,14 +965,19 @@ class GraphAPIClient:
         creative: dict[str, Any] | None = None,
         ad_format: str = "DESKTOP_FEED_STANDARD",
     ) -> dict[str, Any]:
-        """Generate an ad preview from an ad or creative."""
+        """Generate an ad preview from an ad, a draft creative payload, or a creative id, in that order.
+
+        An ad or a creative id is previewed through its own previews edge. A draft payload goes to
+        the account's generatepreviews edge, which takes the payload as creative and no creative_id
+        (sent alone, creative_id was refused with "The parameter creative is required").
+        """
         if ad_id:
             return await self.list_objects(ad_id, "previews", params={"ad_format": ad_format})
+        if creative_id and not creative:
+            return await self.list_objects(creative_id, "previews", params={"ad_format": ad_format})
         if not account_id:
-            raise UnsupportedFeatureError("account_id is required when previewing from creative input.")
+            raise UnsupportedFeatureError("account_id is required when previewing from a creative payload.")
         params: dict[str, Any] = {"ad_format": ad_format}
-        if creative_id:
-            params["creative_id"] = creative_id
         if creative:
             params["creative"] = creative
         return await self.request(

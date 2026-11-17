@@ -84,9 +84,24 @@ def test_preview_ad_supports_creative_payload(monkeypatch) -> None:
     assert result["item"]["request"]["account_id"] == "act_123"
 
 
-def test_preview_ad_requires_account_for_creative_inputs() -> None:
-    with pytest.raises(creatives.ValidationError):
-        asyncio.run(creatives.preview_ad(creative_id="crt_123"))
+def test_preview_ad_requires_account_for_a_creative_payload() -> None:
+    with pytest.raises(creatives.ValidationError, match="account_id"):
+        asyncio.run(creatives.preview_ad(creative={"object_story_id": "1_2"}))
+
+
+def test_preview_ad_from_a_creative_id_needs_no_account(monkeypatch) -> None:
+    """F3: a creative's previews are read from the creative itself, so no account is needed."""
+    client = RecordingCreativeClient()
+    monkeypatch.setattr(creatives, "get_graph_api_client", lambda: client)
+    single = asyncio.run(creatives.preview_ad(creative_id="crt_1"))
+    several = asyncio.run(creatives.preview_ad(creative_id="crt_1", ad_formats=["MOBILE_FEED_STANDARD", "INSTAGRAM_STORY"]))
+    assert client.requests == [
+        ("preview", {"ad_id": None, "account_id": None, "creative_id": "crt_1", "creative": None, "ad_format": "DESKTOP_FEED_STANDARD"}),
+        ("preview", {"ad_id": None, "account_id": None, "creative_id": "crt_1", "creative": None, "ad_format": "MOBILE_FEED_STANDARD"}),
+        ("preview", {"ad_id": None, "account_id": None, "creative_id": "crt_1", "creative": None, "ad_format": "INSTAGRAM_STORY"}),
+    ]
+    assert single["summary"] == {"count": 1}
+    assert [item["ad_format"] for item in several["items"]] == ["MOBILE_FEED_STANDARD", "INSTAGRAM_STORY"]
 
 
 def test_upload_creative_asset_passes_account(monkeypatch) -> None:

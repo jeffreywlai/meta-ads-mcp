@@ -1624,3 +1624,98 @@ def test_usage_headers_keep_documented_fields_ids_numbers_and_values_only(monkey
         }]},
     }
     assert _echo() not in json.dumps(exc_info.value.to_public_dict())
+
+
+@pytest.mark.parametrize(
+    ("after", "expected_params"),
+    [
+        (None, {"type": "adTargetingCategory", "class": "behaviors"}),
+        ("CURSOR_2", {"type": "adTargetingCategory", "class": "behaviors", "after": "CURSOR_2"}),
+        (" ", {"type": "adTargetingCategory", "class": "behaviors"}),
+    ],
+)
+def test_targeting_categories_read_metas_search_route(monkeypatch, after, expected_params) -> None:
+    """F1: the account edge broadtargetingcategories lists only custom categories (0 rows live);
+    Meta's documented route is search?type=adTargetingCategory&class=<class>."""
+    calls: list[dict[str, object]] = []
+
+    async def fake_request(self, method, endpoint, **kwargs):
+        calls.append({"method": method, "endpoint": endpoint, **kwargs})
+        return {"data": []}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    asyncio.run(_client().search_targeting_categories(category_class="behaviors", after=after))
+    assert calls == [{"method": "GET", "endpoint": "search", "params": expected_params}]
+
+
+@pytest.mark.parametrize(("after", "extra"), [(None, {}), ("CURSOR_2", {"after": "CURSOR_2"}), (" ", {})])
+def test_audiences_of_one_subtype_are_filtered_by_meta(monkeypatch, after, extra) -> None:
+    """F2: Meta ignores a plain subtype parameter but applies a filtering clause on subtype."""
+    calls: list[dict[str, object]] = []
+
+    async def fake_request(self, method, endpoint, **kwargs):
+        calls.append({"method": method, "endpoint": endpoint, **kwargs})
+        return {"data": []}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    asyncio.run(_client().list_audiences_of_subtype(
+        "111", subtype=" lookalike ", fields=["id", "subtype"], limit=25, after=after,
+    ))
+    assert calls == [{
+        "method": "GET",
+        "endpoint": "act_111/customaudiences",
+        "params": {
+            "limit": 25,
+            "filtering": '[{"field":"subtype","operator":"IN","value":["LOOKALIKE"]}]',
+            **extra,
+            "fields": "id,subtype",
+        },
+    }]
+
+
+def _recorded_preview_requests(monkeypatch, **kwargs) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+
+    async def fake_request(self, method, endpoint, **request_kwargs):
+        calls.append({"method": method, "endpoint": endpoint, **request_kwargs})
+        return {"data": [{"body": "<iframe></iframe>"}]}
+
+    monkeypatch.setattr(GraphAPIClient, "request", fake_request)
+    asyncio.run(_client().preview_ad(**kwargs))
+    return calls
+
+
+@pytest.mark.parametrize("account_id", [None, "act_111"])
+def test_preview_from_a_creative_id_reads_the_creatives_own_previews(monkeypatch, account_id) -> None:
+    """F3: the account preview edge takes no creative_id ("The parameter creative is required")."""
+    calls = _recorded_preview_requests(
+        monkeypatch, account_id=account_id, creative_id="222", ad_format="MOBILE_FEED_STANDARD",
+    )
+    assert calls == [{"method": "GET", "endpoint": "222/previews", "params": {"ad_format": "MOBILE_FEED_STANDARD"}}]
+
+
+def test_preview_from_a_creative_payload_sends_only_the_payload_to_the_account(monkeypatch) -> None:
+    creative = {"object_story_id": "1_2"}
+    calls = _recorded_preview_requests(
+        monkeypatch, account_id="act_111", creative_id="222", creative=creative, ad_format="DESKTOP_FEED_STANDARD",
+    )
+    assert calls == [{
+        "method": "GET", "endpoint": "act_111/generatepreviews",
+        "params": {"ad_format": "DESKTOP_FEED_STANDARD", "creative": creative},
+    }]
+
+
+def test_preview_from_an_ad_id_is_unchanged(monkeypatch) -> None:
+    calls = _recorded_preview_requests(monkeypatch, ad_id="333", creative_id="222", ad_format="DESKTOP_FEED_STANDARD")
+    assert calls == [{"method": "GET", "endpoint": "333/previews", "params": {"ad_format": "DESKTOP_FEED_STANDARD"}}]
+
+
+def test_preview_from_a_creative_payload_still_needs_an_account(monkeypatch) -> None:
+    with pytest.raises(UnsupportedFeatureError, match="account_id"):
+        _recorded_preview_requests(monkeypatch, creative={"object_story_id": "1_2"})
+
+
+def test_preview_creative_id_with_a_path_is_refused(recording_client) -> None:
+    with pytest.raises(ValidationError):
+        asyncio.run(_client().preview_ad(creative_id="222/adcreatives"))
+    assert recording_client.sent == []

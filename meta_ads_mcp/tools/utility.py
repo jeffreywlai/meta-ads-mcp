@@ -15,6 +15,7 @@ from meta_ads_mcp.coordinator import (
 )
 from meta_ads_mcp.graph_api import get_graph_api_client
 from meta_ads_mcp.official_parity import OFFICIAL_TOOLS, parity_summary
+from meta_ads_mcp.tool_annotations import TOOL_ANNOTATIONS, hints_as_dict
 from meta_ads_mcp.overflow import (
     DEFAULT_ARTIFACT_CHUNK_BYTES,
     DEFAULT_ARTIFACT_ITEM_LIMIT,
@@ -1014,9 +1015,16 @@ async def get_capabilities(
         tool = await mcp_server.get_tool(tool_name.strip())
         if tool is None:
             raise ValidationError(_unknown_tool_name_message(tool_name.strip()))
+        # The registered tool carries its entry from the annotation table; the table is the fallback.
+        annotations = getattr(tool, "annotations", None) or TOOL_ANNOTATIONS.get(tool.name)
         return {
             "server": _server_metadata(),
-            "tool": {"name": tool.name, "description": tool.description, "input_schema": tool.parameters},
+            "tool": {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+                "annotations": hints_as_dict(annotations),
+            },
         }
     if intent is not None:
         route = INTENT_GUIDE.get(intent)

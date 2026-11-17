@@ -227,7 +227,7 @@ def test_create_lookalike_wrapper_accepts_country_csv_and_describes_params(monke
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: FakeAudienceClient())
     result = asyncio.run(mcp_server.call_tool("call_tool", {
         "name": "create_lookalike_audience",
-        "arguments": {"account_id": "123", "name": "LAL", "origin_audience_id": "seed",
+        "arguments": {"account_id": "123", "name": "LAL", "origin_audience_id": "9500999",
                       "countries": "us, CA, US", "ratio": 0.01},
     })).structured_content
     assert result["created"]["payload"]["lookalike_spec"] == {
@@ -241,20 +241,128 @@ def test_create_lookalike_wrapper_accepts_country_csv_and_describes_params(monke
 def test_list_audiences_exposes_page_completeness_and_next_cursor(monkeypatch) -> None:
     class PagedAudienceClient(FakeAudienceClient):
         async def list_objects(self, parent_id, edge, *, fields, params):
-            assert params == {"limit": 200, "subtype": "LOOKALIKE", "after": "previous"}
+            assert params == {"limit": 200, "after": "previous"}
             return {"data": [{"id": "aud1"}], "paging": {
                 "next": "https://graph.facebook.com/customaudiences?after=next-cursor",
                 "cursors": {"after": "next-cursor"},
             }}
 
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: PagedAudienceClient())
-    result = asyncio.run(audiences.list_audiences(
-        account_id="123", subtype="LOOKALIKE", limit=200, after="previous",
-    ))
+    result = asyncio.run(audiences.list_audiences(account_id="123", limit=200, after="previous"))
     assert result["summary"] == {
         "count": 1, "complete": False, "truncated": True, "next_after": "next-cursor",
     }
     assert result["paging"]["after"] == "next-cursor"
+
+
+def _audience_page_payload(rows, after=None):
+    page = {"data": rows}
+    if after:
+        page["paging"] = {"next": f"https://graph.facebook.com/customaudiences?after={after}", "cursors": {"after": after}}
+    return page
+
+
+class SubtypeFilterClient(FakeAudienceClient):
+    """Answers the subtype-filtered audience read with a fixed payload and records each call."""
+
+    def __init__(self, payload) -> None:
+        super().__init__()
+        self.payload = payload
+        self.subtype_calls: list[dict[str, object]] = []
+
+    async def list_objects(self, parent_id: str, edge: str, *, fields=None, params=None):
+        raise AssertionError("a subtype read goes through list_audiences_of_subtype")
+
+    async def list_audiences_of_subtype(self, account_id, *, subtype, fields=None, limit=50, after=None):
+        self.subtype_calls.append({"account_id": account_id, "subtype": subtype, "fields": fields, "limit": limit, "after": after})
+        return self.payload
+
+
+def test_list_audiences_subtype_asks_meta_to_filter_in_one_request(monkeypatch) -> None:
+    """F2: Meta ignores a plain subtype parameter, so the client sends a filtering clause instead."""
+    client = SubtypeFilterClient(_audience_page_payload([
+        {"id": "2", "name": "B", "subtype": "LOOKALIKE"},
+        {"id": "4", "name": "D", "subtype": "lookalike"},
+    ]))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype=" lookalike "))
+    assert client.subtype_calls == [{
+        "account_id": "act_123", "subtype": "lookalike", "fields": audiences.AUDIENCE_SUMMARY_FIELDS,
+        "limit": 50, "after": None,
+    }]
+    assert [item["id"] for item in result["items"]] == ["2", "4"]
+    assert result["summary"] == {
+        "count": 2, "rows_read": 2, "rows_matched": 2, "complete": True, "truncated": False, "next_after": None,
+    }
+
+
+def test_list_audiences_subtype_follows_metas_paging_like_an_unfiltered_call(monkeypatch) -> None:
+    client = SubtypeFilterClient(_audience_page_payload([{"id": "1", "subtype": "WEBSITE"}], after="c2"))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="WEBSITE", limit=1, after="start"))
+    assert len(client.subtype_calls) == 1
+    assert client.subtype_calls[0]["limit"] == 1 and client.subtype_calls[0]["after"] == "start"
+    assert result["summary"] == {
+        "count": 1, "rows_read": 1, "rows_matched": 1, "complete": False, "truncated": True, "next_after": "c2",
+    }
+    assert result["paging"]["after"] == "c2"
+
+
+def test_list_audiences_subtype_field_is_asked_for_and_removed_when_not_requested(monkeypatch) -> None:
+    client = SubtypeFilterClient(_audience_page_payload([{"id": "2", "name": "B", "subtype": "LOOKALIKE"}]))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE", fields=["id", "name"]))
+    assert client.subtype_calls[0]["fields"] == ["id", "name", "subtype"]
+    assert result["items"] == [{"id": "2", "name": "B"}]
+
+    kept = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE", fields="id,subtype"))
+    assert client.subtype_calls[1]["fields"] == ["id", "subtype"]
+    assert kept["items"] == [{"id": "2", "name": "B", "subtype": "LOOKALIKE"}]
+
+
+@pytest.mark.parametrize("more", [False, True])
+def test_list_audiences_subtype_rows_of_another_type_are_dropped_and_reported(monkeypatch, more) -> None:
+    """A filter Meta silently ignored must never pass as a filtered list."""
+    client = SubtypeFilterClient(_audience_page_payload([
+        {"id": "1", "subtype": "LOOKALIKE"}, {"id": "2", "subtype": "CUSTOM"}, {"id": "3"}, {"id": "4", "subtype": None},
+    ], after="c2" if more else None))
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE"))
+    assert [item["id"] for item in result["items"]] == ["1"]
+    summary = result["summary"]
+    assert summary["rows_read"] == 4 and summary["rows_matched"] == 1 and summary["count"] == 1
+    assert summary["complete"] is False
+    assert "3 audience(s) of another type" in summary["incomplete_reason"]
+    assert "filter may not have been applied" in summary["incomplete_reason"]
+    assert summary["next_after"] == ("c2" if more else None) and summary["truncated"] is more
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": None}, {"data": "x"}])
+def test_list_audiences_subtype_unreadable_page_is_not_an_empty_complete_list(monkeypatch, payload) -> None:
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: SubtypeFilterClient(payload))
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE"))
+    assert result["items"] == []
+    summary = result["summary"]
+    assert summary["complete"] is False and summary["next_after"] is None
+    assert summary["incomplete_reason"] == collection_fault(payload)
+
+
+def test_list_audiences_subtype_entry_that_is_not_an_object_leaves_the_page_incomplete(monkeypatch) -> None:
+    payload = {"data": [{"id": "1", "subtype": "LOOKALIKE"}, None]}
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: SubtypeFilterClient(payload))
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype="LOOKALIKE"))
+    assert result["items"] == [{"id": "1", "subtype": "LOOKALIKE"}]
+    assert result["summary"]["complete"] is False
+    assert result["summary"]["incomplete_reason"] == collection_fault(payload)
+
+
+@pytest.mark.parametrize("subtype", [None, "", "  "])
+def test_list_audiences_without_subtype_sends_one_request_as_before(monkeypatch, subtype) -> None:
+    client = FakeAudienceClient()
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    result = asyncio.run(audiences.list_audiences(account_id="123", subtype=subtype))
+    assert len(client.list_calls) == 1 and client.list_calls[0]["params"] == {"limit": 50}
+    assert result["summary"] == {"count": 1, "complete": True, "truncated": False, "next_after": None}
 
 
 def test_create_lookalike_audience_requires_country_or_countries(monkeypatch) -> None:
@@ -639,7 +747,7 @@ def test_audience_users_never_echo_rows(monkeypatch, caplog, tool) -> None:
         caplog.clear()
         with pytest.raises(ToolError) as tool_error:
             asyncio.run(mcp_server.call_tool(tool, {
-                "audience_id": "aud_1", "schema": "EMAIL", "rows": [[raw]],
+                "audience_id": "9500001", "schema": "EMAIL", "rows": [[raw]],
             }))
         assert json.loads(str(tool_error.value))["error"]["type"] in {"meta_api", "rate_limit"}
         _assert_nothing_echoed(tool_error.value, caplog, raw)
@@ -855,7 +963,7 @@ def test_audience_users_mcp_call_with_valid_arguments_still_uploads(monkeypatch)
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(mcp_server.call_tool("call_tool", {
         "name": "add_audience_users",
-        "arguments": {"audience_id": "aud_1", "schema": "EMAIL,PHONE", "rows": [["a@example.com", None]],
+        "arguments": {"audience_id": "9500001", "schema": "EMAIL,PHONE", "rows": [["a@example.com", None]],
                       "pre_hashed": "false"},
     }))
     assert result.structured_content["rows_sent"] == 1
@@ -968,6 +1076,8 @@ def test_remove_audience_users_sends_delete_with_body_not_query(monkeypatch) -> 
     from meta_ads_mcp.graph_api import GraphAPIClient
 
     seen = []
+    # The answer names session 1, the session sent: Meta's guide says it is the session id the caller passed.
+    monkeypatch.setattr(audiences.secrets, "randbelow", lambda bound: 0)
 
     def handler(request):
         seen.append(request)
@@ -1155,9 +1265,9 @@ def test_update_custom_audience_rule_through_mcp_boundary(monkeypatch, rule) -> 
     client = RecordingAudienceClient()
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(mcp_server.call_tool(
-        "update_custom_audience", {"audience_id": "aud_1", "rule": rule},
+        "update_custom_audience", {"audience_id": "9500001", "rule": rule},
     )).structured_content
-    assert client.calls[-1] == ("update", "aud_1", {"rule": WEBSITE_RULE})
+    assert client.calls[-1] == ("update", "9500001", {"rule": WEBSITE_RULE})
     assert result["current"] == {"rule": WEBSITE_RULE}
 
 
@@ -1509,9 +1619,9 @@ def test_update_custom_audience_labels_through_mcp_boundary(monkeypatch) -> None
     client = RecordingAudienceClient()
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
     result = asyncio.run(mcp_server.call_tool(
-        "update_custom_audience", {"audience_id": "aud_1", "audience_labels": "qualified_leads"},
+        "update_custom_audience", {"audience_id": "9500001", "audience_labels": "qualified_leads"},
     )).structured_content
-    assert client.calls[-1] == ("update", "aud_1", {"audience_labels": ["QUALIFIED_LEADS"]})
+    assert client.calls[-1] == ("update", "9500001", {"audience_labels": ["QUALIFIED_LEADS"]})
     assert result["current"] == {"audience_labels": ["QUALIFIED_LEADS"]}
 
 
@@ -1580,7 +1690,7 @@ def test_empty_audience_labels_pass_the_mcp_boundary(monkeypatch, tool) -> None:
 
     client.create_edge_object = create_edge_object
     monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
-    args = {"account_id": "1", "name": "Example"} if tool.startswith("create") else {"audience_id": "aud_1"}
+    args = {"account_id": "1", "name": "Example"} if tool.startswith("create") else {"audience_id": "9500001"}
     asyncio.run(mcp_server.call_tool(tool, {**args, "audience_labels": []}))
     assert client.calls[-1][-1]["audience_labels"] == []
 
@@ -1717,3 +1827,63 @@ def test_ee4_upload_control_ordinary_acknowledgements_as_before(monkeypatch, too
     assert result["ok"] is True
     assert result["meta"]["num_received"] == 2
     assert [batch["rows_sent"] for batch in result["batches"]] == [1, 1]
+
+
+# The answer's session_id (Meta's guide: the session id the caller passed), compared by value.
+# How Meta writes it back (text, a number) has not been seen in a live answer.
+
+R33_SESSION = 954010
+
+
+class R33SessionUsersClient(FakeUsersClient):
+    """Answers every batch for the audience asked about, with the session id session_answer(sent) gives."""
+
+    def __init__(self, session_answer) -> None:
+        super().__init__()
+        self.session_answer = session_answer
+
+    def _record(self, method: str, parent_id: str, edge: str, data: dict) -> dict:
+        answer = super()._record(method, parent_id, edge, data)
+        answered = self.session_answer(data["session"]["session_id"])
+        if isinstance(answered, str) and answered == R33_MISSING:
+            answer.pop("session_id")
+        else:
+            answer["session_id"] = answered
+        return answer
+
+
+def _r33_session_upload(monkeypatch, tool: str, session_answer):
+    monkeypatch.setattr(audiences.secrets, "randbelow", lambda bound: R33_SESSION - 1)
+    client = R33SessionUsersClient(session_answer)
+    monkeypatch.setattr(audiences, "get_graph_api_client", lambda: client)
+    monkeypatch.setattr(audiences, "AUDIENCE_USERS_BATCH_SIZE", 1)
+    return client, (lambda: asyncio.run(_users_tool(tool)(
+        audience_id="954001", schema=["EMAIL"], rows=[[email] for email in R33_EMAILS],
+    )))
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+def test_ee4_upload_does_not_claim_success_from_another_session(monkeypatch, tool) -> None:
+    client, run = _r33_session_upload(monkeypatch, tool, lambda sent: "954098")
+    with pytest.raises(audiences.MetaApiError) as raised:
+        run()
+    assert len(client.requests) == 1
+    assert raised.value.mutation_outcome_unknown is True
+    message = str(raised.value)
+    assert f"{tool} stopped on batch 1 of 2 in session {R33_SESSION}" in message
+    assert f"named a different upload session (954098) than {R33_SESSION}" in message
+    _r33_assert_no_values(message)
+
+
+@pytest.mark.parametrize("tool", USER_TOOLS)
+@pytest.mark.parametrize("form", ["text", "whole number", "spaced text", "missing", "number with a fraction"])
+def test_ee4_upload_control_ordinary_session_ids_as_before(monkeypatch, tool, form) -> None:
+    """Control: the session id sent, as text, a whole number or spaced text; none; or a form that cannot be compared."""
+    answer = {
+        "text": str, "whole number": int, "spaced text": lambda sent: f" {sent} ",
+        "missing": lambda sent: R33_MISSING, "number with a fraction": float,
+    }[form]
+    client, run = _r33_session_upload(monkeypatch, tool, answer)
+    result = run()
+    assert len(client.requests) == 2
+    assert result["ok"] is True and result["session"]["session_id"] == str(R33_SESSION)

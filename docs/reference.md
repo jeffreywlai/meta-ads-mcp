@@ -14,7 +14,9 @@ The details that do not fit in a tool table. Setup and the tool list are in the
 - [Audiences](#audiences)
 - [Change history](#change-history)
 - [Read-only mode](#read-only-mode)
+- [Tool markings](#tool-markings)
 - [Local file uploads](#local-file-uploads)
+- [Input formats](#input-formats)
 - [Errors and retries](#errors-and-retries)
 - [Default account](#default-account)
 - [API version 26](#api-version-26)
@@ -238,6 +240,9 @@ such.
 
 `list_audiences` returns `summary.complete`, `summary.truncated` and
 `summary.next_after`. Follow the cursor before treating the list as complete.
+With `subtype`, Meta is asked to return only audiences of that type. Any row of
+another type is dropped and the page is marked incomplete. The summary reports
+`rows_read` and `rows_matched`.
 
 `create_lookalike_audience(countries=["US","CA","AU"], ratio=0.01, ...)` builds
 Meta's `lookalike_spec` from those inputs. You cannot override it through
@@ -360,6 +365,48 @@ Set `META_READ_ONLY=true` in the launch environment and restart.
 
 The default is writable. Nothing turns read-only mode on for you.
 
+## Tool markings
+
+Every tool carries the four MCP markings. A client uses them to decide which
+calls it may run without asking you, and which it may safely retry.
+
+- `readOnlyHint`: the tool changes nothing at Meta and none of your own files.
+  Any tool may save a large answer to the server's own export folder, where
+  files expire and the oldest are removed when the folder is full (see
+  [Large responses](#large-responses)); that does not count, so
+  `export_change_history`, which always saves one, is read-only.
+  `delete_overflow_artifact` is not read-only, because deleting a saved export
+  is what it is for.
+- `destructiveHint`: the worst the tool can do deletes, removes, disconnects,
+  cancels, archives or overwrites something that already exists. Every delete
+  and update is marked, and so are the three status tools, because `ARCHIVED`
+  cannot be undone from this server.
+- `idempotentHint`: running the same call twice leaves things as one call did.
+  Tools that make a new object or upload rows on every run are not marked.
+- `openWorldHint`: a call can give Meta the web address of a file (an image, a
+  video, a thumbnail, a feed or data file) for Meta to fetch, through a named
+  argument or a raw payload the tool passes on, or the tool returns public
+  content from outside your own assets, as `search_ads_archive` does. A
+  landing-page or other destination link does not count, because Meta stores it
+  and does not fetch it. The marked tools are the uploads, the creative and ad
+  creators, `update_creative`, `update_ad`, `preview_ad`, the catalog, product,
+  product set and feed tools that take an image or feed address, the two
+  feed-rule tools, and `search_ads_archive`. `update_creative` is marked because
+  it passes an image address on to Meta; Meta's documentation says that route
+  ignores it, but no live call has confirmed that. `update_ad` is marked because
+  it passes on an image address inside `params.creative_asset_groups_spec`, and
+  no live call has shown whether Meta imports it on an update.
+
+The markings appear in the tool list, in `get_capabilities(tool_name=...)` under
+`tool.annotations`, and at the end of each `search_tools` match, for example `read-only: no, destructive: yes, idempotent: yes,
+open-world: no`. `search_tools` is marked read-only. `call_tool` carries the
+markings of the most dangerous tool it can run. It is not marked read-only even
+in read-only mode, because `delete_overflow_artifact` still runs there and
+deletes a saved file on this machine.
+
+All markings live in one table, `meta_ads_mcp/tool_annotations.py`. A new tool
+without an entry fails the tests.
+
 ## Local file uploads
 
 Set `META_UPLOAD_DIR` to one folder and put the file there. Five tools read a
@@ -373,6 +420,61 @@ local file through `file_path`: `upload_creative_asset` (images),
 The reason: the model also reads text written by strangers, such as ad comments.
 A file path it supplies must not be able to send some other file on your machine
 to Meta.
+
+## Input formats
+
+Some inputs are checked before the tool starts, so a wrong value is refused
+without a request to Meta. The message names the parameter and says what a
+valid value looks like. It never repeats the value, because a value put in the
+wrong field can hold private text.
+
+- **Ids that Meta defines as numbers must be digits.** This covers campaign,
+  ad set, ad, creative, custom audience, pixel or dataset, business, catalog,
+  product set, product feed, Page, Instagram account and media, study, video,
+  system user and app ids (including `business_app`, the second name
+  `generate_system_user_token` takes for `app_id`), and each entry of a list of
+  them. Send the id as a
+  string: `'1234567890'`. A JSON number was refused before and still is.
+- The same check covers these ids when they sit inside another argument:
+  `create_ad`'s `creative.creative_id` and `creative.id`; the campaign, ad set,
+  ad and ad account ids in A/B test and lift study cells; the pixel, app,
+  dataset, product set and catalog ids in lift study objectives; and
+  `boost_instagram_post`'s `promoted_object.pixel_id` and
+  `promoted_object.application_id`. A whole number there is judged by its
+  digits, and any other value that is not text (`true`, a fraction, an object)
+  is refused. The message names the path, such as `creative.id`.
+- An ad account id is digits or `act_` followed by digits. `object_id` on the
+  reporting tools takes an ad account, campaign, ad set or ad id.
+  `get_account_pages` also takes `me`.
+- Spaces around an id, and a blank optional id, are treated as before.
+- Ids of other forms are not checked: image hashes, Page post and comment ids
+  (`123_456`), paging cursors, `export_id`, `report_run_id`, retailer and product
+  ids, interest ids. The full list, with the reason for each, is in
+  `meta_ads_mcp/id_formats.py`.
+- Each checked id's pattern is in the tool's input schema, so
+  `get_capabilities(tool_name=...)` shows it.
+- **Budgets, bids, lookalike ratios, retention days, `setup_ab_test`'s
+  `confidence_level` and `create_ad_creative_from_inputs`'
+  `partnership_ad_format` refuse `true` and
+  `false`.** Before, `true` was read as 1 and sent to Meta. Numbers and numeric
+  text such as `'12.50'` work as before.
+- **A web address with a login in it is refused** (`https://user:pass@host/...`)
+  by the creative, video, boost and catalog tools, including
+  `upload_creative_asset`, `create_ad_creative`, `update_creative` and
+  `preview_ad`, wherever the URL sits in the creative, including inside a
+  sub-object sent as JSON text. `create_ad` (`creative_spec`, `creative`,
+  `tracking_specs`, `params`), `update_ad` (`tracking_specs`, `params`) and
+  `create_ad_set` (`promoted_object`, `params`) do the same, and so does the
+  boost tool's `url_tags`. A login address inside longer text is found too, such
+  as `url_tags="landing=https://user:pass@host/"`, and in these payloads a
+  scheme-relative `//user:pass@host` with a password that starts the text or
+  follows a space, `=`, `&`, `?`, a quote, a bracket, a comma or a semicolon
+  (inside longer text, `//contact@example.com` with no password is accepted; as
+  a whole value it is refused). A tab or line break inside an address is ignored,
+  as URL parsers ignore it. An email address
+  (`help@example.com`), a handle (`@brand`) or an `@` in a URL's path or query is
+  not a login. Named free-text arguments (`title`, `body`, `name`) are not
+  checked. Meta stores the URL on the ad and shows it in responses.
 
 ## Errors and retries
 

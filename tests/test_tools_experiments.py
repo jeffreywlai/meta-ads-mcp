@@ -1356,8 +1356,10 @@ def test_create_ab_test_creative_dry_run_through_mcp_boundary(monkeypatch) -> No
     from meta_ads_mcp.coordinator import mcp_server
 
     client = use(monkeypatch, FakeStudyClient())
+    # Through the MCP boundary each cell's ad id must be digits, as ad_id must be anywhere.
+    cells = [{**cell, "ad_ids": [f"90000000{index}"]} for index, cell in enumerate(_ad_cells(50, 50))]
     result = run(mcp_server.call_tool("create_ab_test", {
-        "account_id": "123", "business_id": "biz_1", "name": "Creative", "cells": _ad_cells(50, 50),
+        "account_id": "123", "business_id": "9800001", "name": "Creative", "cells": cells,
         "start_time": FUTURE_START, "end_time": FUTURE_END,
         "creative_test_lifetime_budget_percentage": 20, "dry_run": True,
     })).structured_content
@@ -2429,12 +2431,14 @@ _AUDITED_INTERPOLATIONS: dict[str, dict[str, set[str]]] = {
         "_audience_labels": {"unknown"},
         "_audience_schema": {"', '.join(unsupported)"},  # positions
         "_hash_rows": {"key", "row_number"},  # key: a supported schema key
+        "_list_audiences_of_subtype": {"dropped"},  # a count of rows read
         "_parse_customer_csv": {"', '.join(missing)", "lines_read + 1"},  # missing: supported schema keys
         # The upload's progress: the tool name, counts, the locally chosen session id and a fixed verb.
         "_upload_progress": {"accepted", "action", "batch_seq", "rows_accepted", "session_id", "total_batches", "verb"},
         "_sanitized_upload_error": {"progress", "type(exc).__name__", "withheld"},
-        # The audience asked for and the audience id Meta's answer named (a plain id: names_other_object read it).
-        "_other_audience_error": {"audience_id", "batch_seq", "progress", "str(answered_id).strip()"},
+        # The audience or session asked for and the id Meta's answer named (a plain id: names_other_object
+        # read it); what is "audience" or "upload session".
+        "_other_identity_error": {"asked", "batch_seq", "progress", "str(answered_id).strip()", "what"},
     },
     "business_access": {
         "_lookup_identity": {"copies", "problems[0]", "scan['reason']", "task_field", "unidentified"},

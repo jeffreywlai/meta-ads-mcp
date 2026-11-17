@@ -34,6 +34,7 @@ from meta_ads_mcp.argument_privacy import (
 )
 from meta_ads_mcp.config import reload_settings
 from meta_ads_mcp.coordinator import mcp_server
+from meta_ads_mcp.id_formats import id_format
 
 SECRET = "synthetic.private.person@example.invalid"
 
@@ -313,7 +314,12 @@ def _private_cases(tool) -> list[tuple[str, dict]]:
     required = list(tool.parameters.get("required", []))
     cases: list[tuple[str, dict]] = []
     if required:
-        others = {name: SECRET for name in properties if name != required[0]}
+        # An id parameter gets a valid id: a malformed one is refused (without the value) by the
+        # id check before the framework reports the missing argument this case is about.
+        others = {
+            name: "1234567890" if id_format(tool.name, name) else SECRET
+            for name in properties if name != required[0]
+        }
         cases.append(("missing", others or {}))
     cases.append(("unknown", {**{name: "1" for name in required}, SECRET: SECRET, f"{SECRET}-2": "x"}))
     for name, schema in properties.items():
@@ -1640,7 +1646,8 @@ def test_other_new_validation_paths_do_not_expose_pasted_private_text(caplog, to
     _assert_not_logged(caplog, private)
     # The error still says where the problem is.
     assert {
-        "search_ads_archive": "not numeric: entry 2, counting from 1",
+        # The shared id check (meta_ads_mcp/id_formats.py) answers first; positions count from 0.
+        "search_ads_archive": "search_page_ids[1] must be a Facebook Page id: digits only",
         "get_capabilities_official_tool": "official_tool value is not one of Meta's official",
         "get_capabilities_tool_name": "tool_name value matches no tool on this server",
     }[tool_name] in str(caught.value)
@@ -1893,7 +1900,7 @@ def test_a_message_that_repeats_the_input_is_replaced():
 def test_every_validator_this_server_defines_for_tool_arguments_has_a_fixed_message():
     """The custom messages a tool argument can produce; none of them is built from the input."""
     sources = {
-        "tool_types.py": ['"an amount must be a number, not true or false"'],
+        "tool_types.py": ['"an amount must be a number, not true or false"', '"a number is expected here, not true or false"'],
         "tools/catalogs.py": ['"a price must be a number, not true or false"'],
         "tools/experiments.py": ['"expected a number or time, not true or false"'],
         "tools/creatives.py": ['"must be a whole number, not true or false"'],

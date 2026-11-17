@@ -430,7 +430,7 @@ def test_live_targeting_and_opportunity_surfaces(monkeypatch: pytest.MonkeyPatch
     context = _run(_discover_active_context(account_id))
 
     categories = _run(targeting.get_targeting_categories(category_class="life_events", account_id=account_id, limit=10))
-    behaviors = _run(targeting.search_behaviors(query="Engaged", account_id=account_id, limit=10))
+    behaviors = _run(targeting.search_behaviors(account_id=account_id, limit=10))
     demographics = _run(targeting.search_demographics(query="Parents", account_id=account_id, limit=10))
     audience = _run(
         targeting.estimate_audience_size(
@@ -442,7 +442,8 @@ def test_live_targeting_and_opportunity_surfaces(monkeypatch: pytest.MonkeyPatch
     budget_recs = _run(recommendations.get_budget_opportunities(account_id=account_id, campaign_id=context["campaign_id"]))
 
     assert categories["summary"]["count"] >= 0
-    assert behaviors["summary"]["count"] >= 0
+    # Meta's behavior list is never empty (285 rows on 2026-11-13); 0 rows means the wrong route.
+    assert behaviors["summary"]["count"] >= 1 and behaviors["summary"]["rows_read"] >= 1
     assert demographics["summary"]["count"] >= 0
     assert audience["summary"]["count"] == 1
     assert "supported" in all_recs

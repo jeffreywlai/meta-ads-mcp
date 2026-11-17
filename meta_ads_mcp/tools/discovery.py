@@ -83,6 +83,16 @@ MONETARY_FIELDS = {
     "daily_budget", "lifetime_budget", "amount_spent", "balance", "bid_amount",
 }
 
+# Spend caps and minimum-spend targets, which Meta also returns in the account currency's minor
+# units. A live read on 2026-11-13 confirmed these five. Add a field here only once a live read
+# confirms it.
+SPEND_LIMIT_FIELDS = {
+    "spend_cap", "daily_spend_cap", "lifetime_spend_cap", "daily_min_spend_target", "lifetime_min_spend_target",
+}
+
+# Every field read back from minor units into major units of the account currency.
+MINOR_UNIT_FIELDS = MONETARY_FIELDS | SPEND_LIMIT_FIELDS
+
 CREATIVE_SUMMARY_FIELDS = [
     "id", "name", "title", "body", "object_story_id", "effective_object_story_id",
     "effective_instagram_media_id", "object_story_spec",
@@ -150,13 +160,7 @@ def _normalize_monetary_fields(items: list[dict[str, Any]]) -> list[dict[str, An
     """Normalize every Graph minor-unit monetary field in-place."""
     for item in items:
         currency = item.get("currency")
-        for key in (
-            "daily_budget",
-            "lifetime_budget",
-            "amount_spent",
-            "balance",
-            "bid_amount",
-        ):
+        for key in sorted(MINOR_UNIT_FIELDS):
             if key in item:
                 item[key] = from_minor_units(item.get(key), currency, field_name=key)
     return items
@@ -174,7 +178,7 @@ async def _hydrate_and_normalize_monetary_fields(
     for item in items:
         if not any(
             key in item and item.get(key) not in (None, "", "null")
-            for key in MONETARY_FIELDS
+            for key in MINOR_UNIT_FIELDS
         ):
             if item.get("account_id"):
                 item["account_id"] = normalize_account_id(str(item["account_id"]))
@@ -203,7 +207,7 @@ async def _hydrate_and_normalize_monetary_fields(
 def _entity_read_fields(fields: FieldList | None, defaults: list[str]) -> list[str]:
     """Include account context only when needed to decode selected money fields."""
     requested_fields = list(normalize_field_list(fields) or defaults)
-    if MONETARY_FIELDS.intersection(requested_fields) and "account_id" not in requested_fields:
+    if MINOR_UNIT_FIELDS.intersection(requested_fields) and "account_id" not in requested_fields:
         requested_fields.append("account_id")
     return requested_fields
 
@@ -483,7 +487,7 @@ async def get_ad_account(account_id: str, fields: FieldList | None = None) -> di
     """Inspect one account with selectable fields. Monetary amounts use major units of the account currency."""
     selected_fields = normalize_field_list(fields) or None
     requested_fields = list(selected_fields or ACCOUNT_FIELDS)
-    if MONETARY_FIELDS.intersection(requested_fields) and "currency" not in requested_fields:
+    if MINOR_UNIT_FIELDS.intersection(requested_fields) and "currency" not in requested_fields:
         requested_fields.append("currency")
     client = get_graph_api_client()
     account = await client.get_object(_resolve_account_id(account_id), fields=requested_fields)
@@ -537,7 +541,7 @@ async def list_campaigns(
 
 @mcp_server.tool()
 async def get_campaign(campaign_id: str, fields: FieldList | None = None) -> dict[str, Any]:
-    """Inspect one campaign's configuration with optional fields. Meta validates field availability."""
+    """Inspect one campaign's configuration with optional fields. Meta validates field availability. Budgets and spend_cap use major units of the account currency."""
     requested_fields = _entity_read_fields(fields, CAMPAIGN_FIELDS)
     client = get_graph_api_client()
     campaign = await client.get_object(campaign_id, fields=requested_fields)
@@ -584,7 +588,7 @@ async def list_adsets(
 
 @mcp_server.tool()
 async def get_adset(adset_id: str, fields: FieldList | None = None) -> dict[str, Any]:
-    """Inspect one ad set with selectable fields. Budgets and bids use major units of the account currency; ROAS floors remain raw x10000 integers."""
+    """Inspect one ad set with selectable fields. Budgets, bids, spend caps and minimum spend targets use major units of the account currency; ROAS floors remain raw x10000 integers."""
     client = get_graph_api_client()
     adset = await client.get_object(adset_id, fields=_entity_read_fields(fields, ADSET_FIELDS))
     return {

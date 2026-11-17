@@ -2198,7 +2198,7 @@ def test_mcp_response_guard_archives_complete_oversized_insights(
     result = asyncio.run(
         mcp_server.call_tool(
             "get_insights",
-            {"level": "ad", "object_id": "ad_1", "time_increment": 1},
+            {"level": "ad", "object_id": "9300001", "time_increment": 1},
         )
     )
 
@@ -2277,7 +2277,7 @@ def test_mcp_response_guard_returns_explicit_fallback_when_archive_fails(
     result = asyncio.run(
         mcp_server.call_tool(
             "get_insights",
-            {"level": "ad", "object_id": "ad_1", "time_increment": 1},
+            {"level": "ad", "object_id": "9300001", "time_increment": 1},
         )
     )
 

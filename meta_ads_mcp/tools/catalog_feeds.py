@@ -6,12 +6,11 @@ server's own tool catalog.
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import inspect
 import json
 import re
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -48,7 +47,7 @@ from meta_ads_mcp.secret_scrub import (  # noqa: F401 - the length thresholds st
     scrub_value,
 )
 from meta_ads_mcp.tool_types import GraphId, StringList, coerce_csv_string_list
-from meta_ads_mcp.url_secrets import refuse_url_credentials
+from meta_ads_mcp.url_secrets import refuse_url_login_in_text, url_logins
 
 UPLOAD_FIELDS = [
     "id",
@@ -231,11 +230,6 @@ FEED_FILE_TYPES = {
 }
 # This server's own limit on a local feed file read into memory; Meta publishes none.
 MAX_FEED_FILE_BYTES = 100 * 1024 * 1024
-# Where the login part of a URL ends at the latest: white space, or the start of the path,
-# query or fragment (see _url_logins).
-_LOGIN_STOP = re.compile(r"[\s/?#]")
-_SCHEME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-")
-_SCHEME_FIRST = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
 # Parameters that can carry a secret or pasted data. The framework accepts any value for
 # them and the tool validates it, because the framework's own type errors quote the input.
 _OptionalText = Annotated[Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})]
@@ -649,47 +643,8 @@ def _mask_text(text: str) -> str:
     return _mask_url_passwords(text)
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _UrlLogin:
-    """The login part of one scheme://user:password@ in a text: [start, end) ends after the @."""
-
-    start: int
-    end: int
-    scheme: str
-    login: str
-
-
-def _url_logins(text: str) -> Iterator[_UrlLogin]:
-    """Every scheme://login@ in the text, left to right, in one pass.
-
-    The scheme is a letter followed by letters, digits, '+', '.' or '-', directly before
-    '://'. The login runs to the last @ before white space or the path, query or fragment,
-    which is where a URL parser ends it: a user name may itself contain @ (an email
-    address), and a password may contain @ or :, so the split into user and password is
-    made at the first colon afterwards (see _mask_url_passwords). A scan, not a regular
-    expression, so a long run of letters cannot make it slow: each character is looked at
-    a fixed number of times.
-    """
-    if "@" not in text or "://" not in text:
-        return
-    allowed_from = 0
-    search = 0
-    while (separator := text.find("://", search)) >= 0:
-        search = separator + 1
-        start = separator
-        while start > allowed_from and text[start - 1] in _SCHEME_CHARS:
-            start -= 1
-        while start < separator and text[start] not in _SCHEME_FIRST:
-            start += 1
-        if start == separator:
-            continue
-        login_from = separator + 3
-        stop = _LOGIN_STOP.search(text, login_from)
-        at = text.rfind("@", login_from, stop.start() if stop else len(text))
-        if at < 0:
-            continue
-        yield _UrlLogin(start, at + 1, text[start:login_from], text[login_from:at])
-        allowed_from = search = at + 1
+# The scanner for scheme://login@ in a text is shared with the creative and ad tools.
+_url_logins = url_logins
 
 
 def _mask_url_passwords(text: str) -> str:
@@ -936,10 +891,7 @@ def _refuse_url_logins(value: Any, name: str, known_keys: frozenset[str] = froze
         _refuse_url_login_text(value, name)
 
 
-def _refuse_url_login_text(text: str, name: str) -> None:
-    refuse_url_credentials(text, name)
-    if (login := next(_url_logins(text), None)) is not None:
-        refuse_url_credentials(text[login.start:].split()[0], name)
+_refuse_url_login_text = refuse_url_login_in_text
 
 
 def _bounded_int(value: Any, *, name: str, low: int, high: int | None) -> None:

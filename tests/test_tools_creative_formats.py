@@ -450,7 +450,7 @@ def test_name_is_required_and_bounded(monkeypatch) -> None:
 def test_mcp_boundary_rejects_non_numeric_ids() -> None:
     from meta_ads_mcp.coordinator import mcp_server
 
-    with pytest.raises(Exception, match="pattern|string_pattern_mismatch|should match"):
+    with pytest.raises(Exception, match="page_id must be a Facebook Page id: digits only"):
         asyncio.run(mcp_server.call_tool(
             "create_ad_creative_from_inputs",
             {"account_id": "act_123", "name": "C", "page_id": "page_one", "image_hash": "h", "link_url": "https://x", "dry_run": True},
