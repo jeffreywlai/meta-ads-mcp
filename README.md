@@ -467,6 +467,7 @@ The details are in [docs/reference.md](docs/reference.md):
 - [Audiences](docs/reference.md#audiences)
 - [Change history](docs/reference.md#change-history)
 - [Read-only mode](docs/reference.md#read-only-mode) and [local file uploads](docs/reference.md#local-file-uploads)
+- [Tool markings](docs/reference.md#tool-markings) and [input formats](docs/reference.md#input-formats)
 - [Errors and retries](docs/reference.md#errors-and-retries)
 - [API version 26](docs/reference.md#api-version-26) and [checking fields against Meta's SDK](docs/reference.md#checking-fields-against-metas-sdk)
 
@@ -642,6 +643,7 @@ meta-ads-mcp/
 │   ├── activity_scope.py      # Validation of change-history scope arguments
 │   ├── intent_routing.py      # Safety layer for tool search
 │   ├── tool_contracts.py      # Contracts derived from the live tool catalog
+│   ├── tool_annotations.py    # Read-only, destructive and open-world markings for every tool
 │   ├── schema_audit.py        # Audits field contracts against Meta's SDK schemas
 │   ├── field_reference.py     # Static field reference for campaigns, ad sets, ads
 │   ├── official_parity.py     # Ledger mapping Meta's official tools to these tools

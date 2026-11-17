@@ -190,9 +190,9 @@ added by the parity PR already do this.
 
 ## Part D: preview, then confirm
 
-Design not settled. It is written after the owner chooses between the options
-put to them on 2026-11-16, and this section is replaced then. Parts A to C do
-not depend on it.
+Not in this PR. The official server confirms on two tools only, so what this
+server should do for deletes and activations is the owner's choice and has not
+been made. It will be its own PR. Parts A to C and E do not depend on it.
 
 ## Part E: audience upload session check
 
